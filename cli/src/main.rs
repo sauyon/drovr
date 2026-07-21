@@ -1,6 +1,7 @@
 mod compress;
 mod herdr;
 mod phase;
+mod review;
 mod run;
 
 fn main() {

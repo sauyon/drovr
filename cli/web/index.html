@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Relay Review Loop</title>
+<script src="/web/vendor/markdown-it.min.js"></script>
+<script src="/web/vendor/html-diff.js"></script>
+<style>
+  /* ---- CSS reset + design tokens ---- */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #f9f9f9;
+    --surface: #ffffff;
+    --border: #d0d0d0;
+    --text: #1a1a1a;
+    --muted: #666;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --danger: #dc2626;
+    --success: #16a34a;
+    --warn-bg: #fef9c3;
+    --warn-border: #ca8a04;
+    --ins-bg: #d1fae5;
+    --del-bg: #fee2e2;
+    --del-text: #991b1b;
+    --ins-text: #065f46;
+    --radius: 6px;
+    --font: system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111;
+      --surface: #1e1e1e;
+      --border: #333;
+      --text: #e8e8e8;
+      --muted: #999;
+      --accent: #60a5fa;
+      --accent-hover: #93c5fd;
+      --danger: #f87171;
+      --success: #4ade80;
+      --warn-bg: #422006;
+      --warn-border: #d97706;
+      --ins-bg: #064e3b;
+      --del-bg: #450a0a;
+      --del-text: #fca5a5;
+      --ins-text: #6ee7b7;
+    }
+  }
+
+  [data-theme="dark"] {
+    --bg: #111;
+    --surface: #1e1e1e;
+    --border: #333;
+    --text: #e8e8e8;
+    --muted: #999;
+    --accent: #60a5fa;
+    --accent-hover: #93c5fd;
+    --danger: #f87171;
+    --success: #4ade80;
+    --warn-bg: #422006;
+    --warn-border: #d97706;
+    --ins-bg: #064e3b;
+    --del-bg: #450a0a;
+    --del-text: #fca5a5;
+    --ins-text: #6ee7b7;
+  }
+
+  [data-theme="light"] {
+    --bg: #f9f9f9;
+    --surface: #ffffff;
+    --border: #d0d0d0;
+    --text: #1a1a1a;
+    --muted: #666;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --danger: #dc2626;
+    --success: #16a34a;
+    --warn-bg: #fef9c3;
+    --warn-border: #ca8a04;
+    --ins-bg: #d1fae5;
+    --del-bg: #fee2e2;
+    --del-text: #991b1b;
+    --ins-text: #065f46;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ---- Layout ---- */
+  .shell {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px 16px 60px;
+  }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    gap: 12px;
+  }
+
+  .topbar h1 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .turn-badge {
+    font-size: 0.78rem;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  /* ---- Theme toggle ---- */
+  #theme-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    color: var(--text);
+  }
+  #theme-btn:hover { border-color: var(--accent); }
+
+  /* ---- Summary banner ---- */
+  .summary-banner {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    margin-bottom: 18px;
+    font-size: 0.9rem;
+  }
+  .summary-banner strong { display: block; margin-bottom: 4px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+
+  /* ---- Panels ---- */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    overflow-x: auto;
+  }
+
+  .panel-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+
+  /* ---- Markdown content ---- */
+  .md-content h1, .md-content h2, .md-content h3 { margin: 1em 0 .4em; line-height: 1.3; }
+  .md-content h1 { font-size: 1.5rem; }
+  .md-content h2 { font-size: 1.25rem; }
+  .md-content h3 { font-size: 1.05rem; }
+  .md-content p { margin: .6em 0; }
+  .md-content ul, .md-content ol { padding-left: 1.6em; margin: .5em 0; }
+  .md-content li { margin: .25em 0; }
+  .md-content code { background: var(--border); border-radius: 3px; padding: 1px 5px; font-family: var(--mono); font-size: .87em; }
+  .md-content pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; overflow-x: auto; margin: .8em 0; }
+  .md-content pre code { background: none; padding: 0; }
+  .md-content blockquote { border-left: 3px solid var(--border); margin: .6em 0; padding-left: 1em; color: var(--muted); }
+  .md-content table { border-collapse: collapse; width: 100%; margin: .8em 0; }
+  .md-content th, .md-content td { border: 1px solid var(--border); padding: 6px 10px; }
+  .md-content th { background: var(--bg); }
+  .md-content a { color: var(--accent); }
+  .md-content hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+
+  /* ---- Diff highlighting ---- */
+  .diff-content ins, .diff-content .diffins {
+    background: var(--ins-bg);
+    color: var(--ins-text);
+    text-decoration: none;
+    border-radius: 2px;
+  }
+  .diff-content del, .diff-content .diffmod, .diff-content .diffdel {
+    background: var(--del-bg);
+    color: var(--del-text);
+    border-radius: 2px;
+  }
+
+  /* ---- Per-line annotation affordance ---- */
+  .annotatable {
+    position: relative;
+  }
+  .annotatable .annot-trigger {
+    position: absolute;
+    left: -28px;
+    top: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    line-height: 22px;
+    text-align: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .15s;
+    user-select: none;
+    font-weight: 700;
+    border: none;
+  }
+  .annotatable:hover .annot-trigger { opacity: 1; }
+  .annotation-box {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    margin-top: 6px;
+  }
+  .annotation-box textarea {
+    min-height: 60px;
+    margin-bottom: 6px;
+    font-size: 0.85rem;
+  }
+  .annotation-box .btn-row { gap: 6px; }
+  .annotation-box button.primary { padding: 4px 12px; font-size: 0.82rem; }
+  .annotation-save-btn { background: var(--success) !important; }
+  .annotation-cancel-btn {
+    background: none !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text) !important;
+    border-radius: var(--radius);
+    padding: 4px 12px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .saved-annotations {
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .saved-annot-chip {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 0.82rem;
+  }
+  .saved-annot-chip .annot-comment { flex: 1; color: var(--text); }
+  .saved-annot-chip .annot-remove {
+    cursor: pointer;
+    color: var(--danger);
+    font-size: 0.9rem;
+    font-weight: 700;
+    background: none;
+    border: none;
+    padding: 0 2px;
+    line-height: 1;
+  }
+
+  /* ---- Open questions (multiple choice) ---- */
+  .questions-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+  .questions-panel .panel-title { margin-bottom: 12px; }
+  .question-item {
+    margin-bottom: 14px;
+  }
+  .question-item:last-child { margin-bottom: 0; }
+  .question-prompt {
+    font-size: 0.92rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text);
+  }
+  .question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .question-options label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.88rem;
+    cursor: pointer;
+  }
+  .rec-badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.7rem;
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-weight: 600;
+    letter-spacing: .03em;
+  }
+
+  /* ---- Form / controls ---- */
+  .form-section { margin-top: 24px; }
+
+  .radio-group {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+
+  .radio-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 120px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 0.9rem;
+    padding: 10px 12px;
+    resize: vertical;
+    margin-bottom: 12px;
+    transition: border-color .15s;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+
+  .btn-row { display: flex; gap: 10px; }
+
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    padding: 8px 20px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  button.primary:hover { background: var(--accent-hover); }
+  button.primary:disabled { opacity: .5; cursor: default; }
+
+  /* ---- State overlays ---- */
+  .state-overlay {
+    text-align: center;
+    padding: 40px 20px;
+  }
+  .state-overlay .icon { font-size: 2.5rem; display: block; margin-bottom: 10px; }
+  .state-overlay p { color: var(--muted); font-size: 0.92rem; margin-top: 6px; }
+
+  .spinner {
+    display: inline-block;
+    width: 22px; height: 22px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    margin: 0 auto 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .approved-msg .icon { color: var(--success); }
+  .error-msg { color: var(--danger); font-size: 0.88rem; margin-top: 8px; }
+
+  /* doc-panel needs relative+overflow-visible so annotation triggers can peek left */
+  #doc-panel {
+    overflow: visible;
+    padding-left: 40px;
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="topbar">
+    <div style="display:flex;align-items:center;gap:10px">
+      <h1>Relay Review Loop</h1>
+      <span class="turn-badge" id="turn-badge"></span>
+    </div>
+    <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+  </div>
+
+  <div id="summary-banner" style="display:none" class="summary-banner">
+    <strong>Agent change summary</strong>
+    <span id="summary-text"></span>
+  </div>
+
+  <div id="diff-panel" style="display:none" class="panel">
+    <div class="panel-title">Changes this turn</div>
+    <div id="diff-content" class="diff-content md-content"></div>
+  </div>
+
+  <div id="doc-panel" class="panel">
+    <div class="panel-title">Current spec</div>
+    <div id="doc-content" class="md-content"></div>
+  </div>
+
+  <div id="waiting-overlay" style="display:none" class="panel">
+    <div class="state-overlay">
+      <div class="spinner"></div>
+      <strong>Waiting for agent revision&hellip;</strong>
+      <p>Polling for state change. The page will reload when ready.</p>
+    </div>
+  </div>
+
+  <div id="approved-overlay" style="display:none" class="panel">
+    <div class="state-overlay approved-msg">
+      <span class="icon">&#10003;</span>
+      <strong>Approved!</strong>
+      <p>The spec has been approved. The review loop is complete.</p>
+    </div>
+  </div>
+
+  <div id="form-section" class="panel form-section">
+    <div class="panel-title">Your decision</div>
+    <div class="radio-group">
+      <label>
+        <input type="radio" name="decision" value="request-changes" checked> Request changes
+      </label>
+      <label>
+        <input type="radio" name="decision" value="approve"> Approve
+      </label>
+    </div>
+
+    <!-- Open questions (multiple choice) — populated dynamically -->
+    <div id="questions-area"></div>
+
+    <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes)…"></textarea>
+    <div class="btn-row">
+      <button class="primary" id="submit-btn" onclick="submitDecision()">Submit</button>
+    </div>
+    <div id="form-error" class="error-msg" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+// ---- Theme ----
+(function() {
+  var saved = localStorage.getItem('rl-theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+})();
+
+function toggleTheme() {
+  var current = document.documentElement.getAttribute('data-theme');
+  var next;
+  if (!current) {
+    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    next = prefersDark ? 'light' : 'dark';
+  } else {
+    next = current === 'dark' ? 'light' : 'dark';
+  }
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('rl-theme', next);
+}
+
+// ---- markdown-it with source-line injection ----
+// Override the renderer so block-level elements get data-source-line="N"
+// Token.map = [startLine, endLine], both 0-indexed; we emit startLine+1 (1-based).
+var md = (function() {
+  if (!window.markdownit) return null;
+  var instance = window.markdownit();
+
+  // Patch renderToken to inject data-source-line on opening block tokens that have .map
+  var origRenderToken = instance.renderer.renderToken.bind(instance.renderer);
+  instance.renderer.renderToken = function(tokens, idx, options) {
+    var token = tokens[idx];
+    // Only inject on opening tags (not self-closing inline) that carry source map info
+    if (token.map && token.map.length >= 2 && token.nesting === 1) {
+      // Inject attribute before rendering
+      token.attrSet('data-source-line', String(token.map[0] + 1));
+    }
+    return origRenderToken(tokens, idx, options);
+  };
+
+  return instance;
+})();
+
+function renderMd(text) {
+  if (!md) return '<pre>' + escHtml(text) + '</pre>';
+  return md.render(text);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ---- HtmlDiff ----
+function htmlDiff(oldHtml, newHtml) {
+  if (window.HtmlDiff && typeof HtmlDiff.execute === 'function') {
+    try { return HtmlDiff.execute(oldHtml, newHtml); }
+    catch(e) { console.warn('HtmlDiff error', e); }
+  }
+  return newHtml;
+}
+
+// ---- Per-line annotations ----
+// annotations: Map<lineNum(1-based), {quote, comments:[{id, text}]}>
+var annotations = {};
+var _annotIdSeq = 0;
+var currentTurn = 0;
+
+// Persist annotations across page refreshes (incl. the loop's own reload after
+// each turn). Keyed by turn: a manual refresh mid-turn restores in-progress
+// comments; a new turn starts clean (the prior turn's were already submitted).
+var ANNOT_KEY = 'rl-annotations';
+function saveAnnotations() {
+  try {
+    localStorage.setItem(ANNOT_KEY, JSON.stringify({
+      turn: currentTurn, seq: _annotIdSeq, annotations: annotations
+    }));
+  } catch (e) {}
+}
+function loadAnnotations(turn) {
+  try {
+    var raw = localStorage.getItem(ANNOT_KEY);
+    if (!raw) return;
+    var stored = JSON.parse(raw);
+    if (stored && stored.turn === turn && stored.annotations) {
+      annotations = stored.annotations;
+      _annotIdSeq = stored.seq || _annotIdSeq;
+    } else if (stored && stored.turn !== turn) {
+      localStorage.removeItem(ANNOT_KEY); // stale (new turn) — clear
+      annotations = {};
+    }
+  } catch (e) {}
+}
+
+// After rendering doc content, wire up annotation triggers on each block with data-source-line
+function wireAnnotations(container, sourceLines) {
+  // sourceLines: array of strings (0-indexed), the raw markdown source split by \n
+  // Only annotate leaf-most blocks: skip any element that contains another
+  // [data-source-line] descendant (a <ul>/<ol> wrapping <li>s, or an <li>
+  // wrapping a <p>). Otherwise lists get nested, overlapping "+" triggers.
+  var all = Array.prototype.slice.call(container.querySelectorAll('[data-source-line]'));
+  var seenLine = {};
+  var blocks = all.filter(function(b) {
+    if (b.querySelector('[data-source-line]')) return false; // not a leaf
+    var l = b.getAttribute('data-source-line');
+    if (seenLine[l]) return false;                           // dedupe by source line
+    seenLine[l] = 1;
+    return true;
+  });
+  blocks.forEach(function(block) {
+    var lineNum = parseInt(block.getAttribute('data-source-line'), 10);
+    var quote = (lineNum >= 1 && lineNum <= sourceLines.length)
+      ? sourceLines[lineNum - 1]
+      : '';
+
+    // Make the block position:relative so the trigger can be absolute
+    block.classList.add('annotatable');
+
+    // Create trigger button
+    var trigger = document.createElement('button');
+    trigger.className = 'annot-trigger';
+    trigger.setAttribute('type', 'button');
+    trigger.setAttribute('title', 'Add annotation to line ' + lineNum);
+    trigger.textContent = '+';
+    block.appendChild(trigger);
+
+    // Saved annotations display for this line
+    var savedEl = document.createElement('div');
+    savedEl.className = 'saved-annotations';
+    savedEl.id = 'saved-annots-' + lineNum;
+    block.appendChild(savedEl);
+
+    // Render any existing saved annotations (carried over from previous render)
+    renderSavedAnnotations(lineNum, savedEl, quote);
+
+    trigger.addEventListener('click', function(e) {
+      e.stopPropagation();
+      openAnnotationBox(block, lineNum, quote, savedEl);
+    });
+  });
+}
+
+function renderSavedAnnotations(lineNum, container, quote) {
+  container.innerHTML = '';
+  var entry = annotations[lineNum];
+  if (!entry || !entry.comments.length) return;
+  entry.comments.forEach(function(c) {
+    var chip = document.createElement('div');
+    chip.className = 'saved-annot-chip';
+    var commentEl = document.createElement('span');
+    commentEl.className = 'annot-comment';
+    commentEl.textContent = c.text;
+    var removeBtn = document.createElement('button');
+    removeBtn.className = 'annot-remove';
+    removeBtn.setAttribute('type', 'button');
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', function() {
+      removeAnnotation(lineNum, c.id);
+      renderSavedAnnotations(lineNum, container, quote);
+    });
+    chip.appendChild(commentEl);
+    chip.appendChild(removeBtn);
+    container.appendChild(chip);
+  });
+}
+
+function openAnnotationBox(block, lineNum, quote, savedEl) {
+  // If a box is already open on this block, remove it
+  var existing = block.querySelector('.annotation-box');
+  if (existing) { existing.remove(); return; }
+
+  var box = document.createElement('div');
+  box.className = 'annotation-box';
+
+  var ta = document.createElement('textarea');
+  ta.placeholder = 'Annotation for line ' + lineNum + '…';
+  ta.className = '';
+  ta.style.minHeight = '60px';
+
+  var btnRow = document.createElement('div');
+  btnRow.className = 'btn-row';
+
+  var saveBtn = document.createElement('button');
+  saveBtn.setAttribute('type', 'button');
+  saveBtn.className = 'primary annotation-save-btn';
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) return;
+    _annotIdSeq++;
+    if (!annotations[lineNum]) annotations[lineNum] = { quote: quote, comments: [] };
+    annotations[lineNum].quote = quote;
+    annotations[lineNum].comments.push({ id: _annotIdSeq, text: text });
+    saveAnnotations();
+    renderSavedAnnotations(lineNum, savedEl, quote);
+    box.remove();
+  });
+
+  var cancelBtn = document.createElement('button');
+  cancelBtn.setAttribute('type', 'button');
+  cancelBtn.className = 'annotation-cancel-btn';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', function() { box.remove(); });
+
+  box.appendChild(ta);
+  btnRow.appendChild(saveBtn);
+  btnRow.appendChild(cancelBtn);
+  box.appendChild(btnRow);
+  block.insertBefore(box, savedEl);
+  ta.focus();
+}
+
+function removeAnnotation(lineNum, id) {
+  var entry = annotations[lineNum];
+  if (!entry) return;
+  entry.comments = entry.comments.filter(function(c) { return c.id !== id; });
+  if (!entry.comments.length) delete annotations[lineNum];
+  saveAnnotations();
+}
+
+function collectAnnotations() {
+  var result = [];
+  Object.keys(annotations).forEach(function(lineStr) {
+    var lineNum = parseInt(lineStr, 10);
+    var entry = annotations[lineNum];
+    entry.comments.forEach(function(c) {
+      result.push({ line: lineNum, quote: entry.quote, comment: c.text });
+    });
+  });
+  return result;
+}
+
+// ---- Open questions (multiple choice) ----
+var currentQuestions = [];
+
+function renderQuestions(questions) {
+  currentQuestions = questions || [];
+  var area = document.getElementById('questions-area');
+  if (!currentQuestions.length) { area.innerHTML = ''; return; }
+
+  var html = '<div class="questions-panel"><div class="panel-title">Open questions</div>';
+  currentQuestions.forEach(function(q, qi) {
+    html += '<div class="question-item">';
+    html += '<div class="question-prompt">' + escHtml(q.prompt) + '</div>';
+    html += '<div class="question-options">';
+    (q.options || []).forEach(function(opt, oi) {
+      var inputId = 'q_' + qi + '_' + oi;
+      var checked = opt.recommended ? ' checked' : '';
+      html += '<label for="' + inputId + '">';
+      html += '<input type="radio" id="' + inputId + '" name="q_' + escHtml(q.id) + '" value="' + escHtml(opt.value) + '"' + checked + '>';
+      html += escHtml(opt.label);
+      if (opt.recommended) html += ' <span class="rec-badge">recommended</span>';
+      html += '</label>';
+    });
+    html += '</div></div>';
+  });
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+function collectAnswers() {
+  var answers = {};
+  currentQuestions.forEach(function(q) {
+    var checked = document.querySelector('input[name="q_' + q.id + '"]:checked');
+    if (checked) answers[q.id] = checked.value;
+  });
+  return answers;
+}
+
+// ---- State ----
+var pollTimer = null;
+var currentDocText = '';
+
+function showEl(id) { document.getElementById(id).style.display = ''; }
+function hideEl(id) { document.getElementById(id).style.display = 'none'; }
+
+async function fetchText(url) {
+  var r = await fetch(url);
+  if (r.status === 204) return '';
+  if (!r.ok) return '';
+  return r.text();
+}
+
+async function refresh() {
+  clearTimeout(pollTimer);
+
+  var [stateRes, docText, priorText, summaryText, questionsData] = await Promise.all([
+    fetch('/state').then(function(r){ return r.json(); }),
+    fetchText('/doc'),
+    fetchText('/prior'),
+    fetchText('/summary'),
+    fetch('/questions').then(function(r){ return r.json(); }).catch(function(){ return []; })
+  ]);
+
+  currentDocText = docText;
+  var state = stateRes.state;
+  var turn = stateRes.turn;
+  currentTurn = turn;
+  loadAnnotations(turn);
+
+  // turn badge
+  document.getElementById('turn-badge').textContent = 'turn ' + turn + ' · ' + state;
+
+  // summary banner
+  if (summaryText && turn > 0) {
+    document.getElementById('summary-text').textContent = summaryText;
+    showEl('summary-banner');
+  } else {
+    hideEl('summary-banner');
+  }
+
+  // doc panel — render with source-line attributes then wire annotations
+  if (docText) {
+    var docContentEl = document.getElementById('doc-content');
+    docContentEl.innerHTML = renderMd(docText);
+    var sourceLines = docText.split('\n');
+    wireAnnotations(docContentEl, sourceLines);
+  }
+
+  // diff panel
+  if (priorText && priorText.trim().length > 0) {
+    var oldHtml = renderMd(priorText);
+    var newHtml = renderMd(docText);
+    var diffHtml = htmlDiff(oldHtml, newHtml);
+    document.getElementById('diff-content').innerHTML = diffHtml;
+    showEl('diff-panel');
+  } else {
+    hideEl('diff-panel');
+  }
+
+  // questions
+  renderQuestions(questionsData);
+
+  // Show correct overlay / form
+  if (state === 'approved') {
+    hideEl('form-section');
+    hideEl('waiting-overlay');
+    showEl('approved-overlay');
+    return;
+  }
+
+  if (state === 'waiting') {
+    hideEl('form-section');
+    hideEl('approved-overlay');
+    showEl('waiting-overlay');
+    pollTimer = setTimeout(pollState, 1000);
+    return;
+  }
+
+  // idle or ready: show form
+  hideEl('waiting-overlay');
+  hideEl('approved-overlay');
+  showEl('form-section');
+}
+
+async function pollState() {
+  try {
+    var r = await fetch('/state');
+    var data = await r.json();
+    if (data.state === 'ready' || data.state === 'approved') {
+      await refresh();
+    } else {
+      pollTimer = setTimeout(pollState, 1000);
+    }
+  } catch(e) {
+    pollTimer = setTimeout(pollState, 2000);
+  }
+}
+
+async function submitDecision() {
+  var btn = document.getElementById('submit-btn');
+  var errEl = document.getElementById('form-error');
+  errEl.style.display = 'none';
+
+  var decision = document.querySelector('input[name="decision"]:checked');
+  if (!decision) { showError('Select a decision.'); return; }
+  var decisionVal = decision.value;
+  var feedbackVal = document.getElementById('feedback').value.trim();
+
+  if (decisionVal === 'request-changes' && !feedbackVal) {
+    showError('Feedback is required when requesting changes.');
+    return;
+  }
+
+  btn.disabled = true;
+
+  var payload = {
+    decision: decisionVal,
+    feedback: feedbackVal,
+    answers: collectAnswers(),
+    annotations: collectAnnotations()
+  };
+
+  try {
+    var r = await fetch('/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    var data = await r.json();
+    if (!data.ok) { showError('Submit failed.'); btn.disabled = false; return; }
+    // State flipped; refresh to reflect
+    await refresh();
+  } catch(e) {
+    showError('Network error: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+function showError(msg) {
+  var el = document.getElementById('form-error');
+  el.textContent = msg;
+  el.style.display = '';
+}
+
+// ---- Init ----
+refresh().catch(console.error);
+</script>
+</body>
+</html>
