@@ -241,7 +241,7 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
     let workspace = match herdr.workspace_create(&format!("relay:{name}")) {
-        Ok(ws) => Some(ws),
+        Ok(ws) => Some(ws.id),
         Err(e) => {
             eprintln!("relay: warning: could not create herdr workspace: {e}");
             None

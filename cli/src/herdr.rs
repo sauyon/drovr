@@ -1,15 +1,26 @@
 use std::io;
 use std::process::Command;
+use std::time::Duration;
 
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 
+/// A freshly created herdr workspace: just its id. The workspace's auto-created
+/// root shell pane is left alone for the life of the run — closing any pane
+/// makes herdr reassign focus and disturbs the user — and is torn down together
+/// with every phase pane by the single `workspace_close` at `relay cleanup`.
+#[derive(Debug)]
+pub struct Workspace {
+    pub id: String,
+}
+
 pub trait Herdr {
-    /// Create a new herdr workspace with the given label; returns its workspace id.
-    fn workspace_create(&self, label: &str) -> io::Result<String>;
-    /// Close a herdr workspace (closes all its panes).
+    /// Create a new herdr workspace with the given label; returns its id.
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace>;
+    /// Close a herdr workspace (closes all its panes). This is the only pane
+    /// teardown relay performs — once, at end-of-run.
     fn workspace_close(&self, id: &str) -> io::Result<()>;
     fn agent_start(
         &self,
@@ -31,6 +42,12 @@ pub trait Herdr {
 // SystemHerdr — shells the real `herdr` binary
 // ---------------------------------------------------------------------------
 
+/// Pause between writing a message and sending the submit CR. A CR sent
+/// immediately after a large `agent send` is swallowed by claude's
+/// bracketed-paste handling and never submits; a CR sent after the paste
+/// settles submits reliably (verified against the live claude TUI).
+const PASTE_SETTLE: Duration = Duration::from_millis(150);
+
 pub struct SystemHerdr;
 
 impl SystemHerdr {
@@ -44,7 +61,7 @@ impl SystemHerdr {
 }
 
 impl Herdr for SystemHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<String> {
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
         let out = self.run(&["workspace", "create", "--label", label, "--no-focus"])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -53,11 +70,12 @@ impl Herdr for SystemHerdr {
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        parse_workspace_id(&stdout).ok_or_else(|| {
+        let id = parse_workspace_id(&stdout).ok_or_else(|| {
             io::Error::other(
                 format!("herdr workspace create: could not parse workspace_id from: {stdout}"),
             )
-        })
+        })?;
+        Ok(Workspace { id })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -104,9 +122,13 @@ impl Herdr for SystemHerdr {
                 format!("herdr agent send failed: {stderr}"),
             ));
         }
-        // Send a carriage return to submit the message; herdr writes the text
-        // into the pane's input box without pressing Enter, so the CR is
-        // required to actually dispatch it to the claude agent.
+        // Submit the message with a carriage return. herdr writes the text into
+        // the pane's input box without pressing Enter, so a CR is required to
+        // dispatch it. It MUST be a separately-timed keypress: claude's TUI
+        // treats a large message as a bracketed paste, and a CR sent in the same
+        // burst is absorbed into the paste instead of submitting. Pausing for the
+        // paste to settle first makes the CR land as a distinct Enter.
+        std::thread::sleep(PASTE_SETTLE);
         let cr_out = self.run(&["agent", "send", target, "\r"])?;
         if !cr_out.status.success() {
             let stderr = String::from_utf8_lossy(&cr_out.stderr);
@@ -279,13 +301,13 @@ impl FakeHerdr {
 
 #[cfg(test)]
 impl Herdr for FakeHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<String> {
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
         let mut c = self.counter.borrow_mut();
         *c += 1;
         let ws_id = format!("ws-{}", *c);
         drop(c);
         self.record(format!("workspace_create label={label} -> {ws_id}"));
-        Ok(ws_id)
+        Ok(Workspace { id: ws_id })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -424,6 +446,29 @@ mod tests {
         assert!(calls[0].contains("do the thing"), "call: {}", calls[0]);
         // FakeHerdr does NOT inject a CR — that's a SystemHerdr submit detail
         assert!(!calls[0].contains("\\r"), "unexpected CR in fake call: {}", calls[0]);
+    }
+
+    // -- Fix 1: the submit CR is sent as a separately-timed keypress, not
+    //    inline with the paste. The delay is what makes it a distinct keypress;
+    //    guard that it is never zeroed out.
+    #[test]
+    fn paste_settle_is_nonzero() {
+        assert!(
+            PASTE_SETTLE > Duration::ZERO,
+            "PASTE_SETTLE must be > 0 so the submit CR is a separate keypress, \
+             not swallowed by claude's bracketed paste"
+        );
+    }
+
+    // workspace_create returns a workspace id; the root pane is never surfaced
+    // because relay never closes it (teardown is a single workspace_close).
+    #[test]
+    fn fake_workspace_create_returns_id() {
+        let h = FakeHerdr::new();
+        let ws = h.workspace_create("relay:demo").unwrap();
+        assert!(!ws.id.is_empty());
+        let call = &h.calls()[0];
+        assert!(call.contains("workspace_create"), "call: {call}");
     }
 
     // -- Bug B: build_agent_start_args includes --env when CLAUDE_CONFIG_DIR is set

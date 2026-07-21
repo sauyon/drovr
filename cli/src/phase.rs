@@ -76,6 +76,11 @@ pub fn phase_start<H: Herdr>(
     run.phases[idx].herdr_session = None;
     run.phases[idx].pane_id = Some(pane_id);
     run.phases[idx].status = PhaseStatus::Running;
+
+    // Panes are never closed mid-run: closing any pane makes herdr reassign
+    // focus, disturbing the user. The run's workspace (root pane + every phase
+    // pane) is torn down in one shot at the end by `relay cleanup`
+    // (`workspace_close`), once the user confirms.
     run.save()?;
     Ok(())
 }
@@ -295,6 +300,25 @@ mod tests {
         let calls = h.calls();
         assert!(!calls[0].contains("--seed"), "argv must not contain --seed: {}", calls[0]);
         assert!(!calls[0].contains("/tmp/seed.md"), "argv must not contain seed path: {}", calls[0]);
+    }
+
+    // Panes are never closed mid-run (herdr reassigns focus on any close);
+    // cleanup is a single `workspace_close` at end-of-run. `phase_start` must
+    // therefore never close a pane.
+    #[test]
+    fn phase_start_never_closes_a_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("no-mid-run-close-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_close")),
+            "phase_start must never close a pane mid-run: {:?}",
+            h.calls()
+        );
     }
 
     #[test]
