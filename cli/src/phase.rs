@@ -37,7 +37,17 @@ pub fn phase_start<H: Herdr>(
     phase: &str,
     seed: Option<&Path>,
 ) -> io::Result<()> {
-    let cwd = run_dir(&run.name).to_string_lossy().into_owned();
+    if run.project_dir.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no project_dir (created before this fix); \
+                 please recreate the run with `relay new`",
+                run.name
+            ),
+        ));
+    }
+    let cwd = run.project_dir.clone();
 
     // Spawn a plain `claude` pane; seed injection happens via the first
     // agent_send (the skill reads handoff_doc and sends the seed text).
@@ -145,6 +155,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            project_dir: "/tmp/relay-proj-test".into(),
         }
     }
 
@@ -326,5 +337,35 @@ mod tests {
         let run = make_run("collect-missing-test");
         let result = collect(&run, "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn phase_start_uses_project_dir_as_cwd() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("proj-cwd-test");
+        run.project_dir = "/home/user/my-project".into();
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        let calls = h.calls();
+        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        assert!(
+            start_call.contains("cwd=/home/user/my-project"),
+            "agent_start must use project_dir as cwd, got: {start_call}"
+        );
+    }
+
+    #[test]
+    fn phase_start_empty_project_dir_returns_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("empty-proj-dir-test");
+        run.project_dir = String::new();
+
+        let result = phase_start(&h, &mut run, "brainstorm", None);
+        assert!(result.is_err(), "must error when project_dir is empty");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("project_dir"), "error should mention project_dir: {msg}");
     }
 }

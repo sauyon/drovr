@@ -35,6 +35,9 @@ enum Commands {
         name: String,
         #[arg(long)]
         task: Option<String>,
+        /// Project directory phases will run in (must exist; defaults to cwd).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 
     /// Print each phase + status + resume point for a run.
@@ -208,7 +211,7 @@ fn cmd_list() {
     }
 }
 
-fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
+fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &SystemHerdr) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("relay: {e}");
         process::exit(1);
@@ -217,6 +220,23 @@ fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
         eprintln!("prerequisite missing: run 'herdr integration install claude'");
         process::exit(1);
     }
+
+    let project_dir = match dir {
+        Some(d) => {
+            if !d.exists() {
+                eprintln!("relay: --dir path does not exist: {}", d.display());
+                process::exit(1);
+            }
+            d.to_string_lossy().into_owned()
+        }
+        None => std::env::current_dir()
+            .unwrap_or_else(|e| {
+                eprintln!("relay: cannot determine current directory: {e}");
+                process::exit(1);
+            })
+            .to_string_lossy()
+            .into_owned(),
+    };
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
@@ -231,6 +251,7 @@ fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
     let run = RunState {
         name: name.to_owned(),
         task: task_str,
+        project_dir,
         phases: vec![
             run::Phase {
                 name: "brainstorm".into(),
@@ -505,7 +526,7 @@ fn main() {
 
     match cli.command {
         Commands::List => cmd_list(),
-        Commands::New { name, task } => cmd_new(&name, task, &herdr),
+        Commands::New { name, task, dir } => cmd_new(&name, task, dir, &herdr),
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
@@ -551,14 +572,14 @@ mod tests {
     #[test]
     fn parse_new_no_task() {
         let cli = parse(&["relay", "new", "myrun"]).unwrap();
-        assert!(matches!(cli.command, Commands::New { name, task: None } if name == "myrun"));
+        assert!(matches!(cli.command, Commands::New { name, task: None, .. } if name == "myrun"));
     }
 
     #[test]
     fn parse_new_with_task() {
         let cli = parse(&["relay", "new", "myrun", "--task", "build a thing"]).unwrap();
         match cli.command {
-            Commands::New { name, task } => {
+            Commands::New { name, task, .. } => {
                 assert_eq!(name, "myrun");
                 assert_eq!(task.as_deref(), Some("build a thing"));
             }
@@ -743,6 +764,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);
         assert!(s.contains("0/2"), "got: {s}");
@@ -761,6 +783,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");
