@@ -240,11 +240,11 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    let workspace = match herdr.workspace_create(&format!("relay:{name}")) {
-        Ok(ws) => Some(ws),
+    let (workspace, default_pane) = match herdr.workspace_create(&format!("relay:{name}")) {
+        Ok(ws) => (Some(ws.id), ws.root_pane),
         Err(e) => {
             eprintln!("relay: warning: could not create herdr workspace: {e}");
-            None
+            (None, None)
         }
     };
 
@@ -285,6 +285,7 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
         gate: "spec".into(),
         cursor: 0,
         workspace,
+        default_pane,
     };
 
     save_run(&run);
@@ -764,6 +765,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            default_pane: None,
             project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);
@@ -783,6 +785,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            default_pane: None,
             project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);

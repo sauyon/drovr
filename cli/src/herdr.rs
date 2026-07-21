@@ -1,16 +1,31 @@
 use std::io;
 use std::process::Command;
+use std::time::Duration;
 
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 
+/// A freshly created herdr workspace: its id plus the id of the empty shell
+/// pane herdr auto-spawns as the workspace root. That root pane is junk for our
+/// purposes — once a phase pane exists we close it so a run's tab holds exactly
+/// the phase pane (see `phase_start`). `root_pane` is `None` if it could not be
+/// parsed from herdr's output (best-effort: we simply skip the cleanup then).
+#[derive(Debug)]
+pub struct Workspace {
+    pub id: String,
+    pub root_pane: Option<String>,
+}
+
 pub trait Herdr {
-    /// Create a new herdr workspace with the given label; returns its workspace id.
-    fn workspace_create(&self, label: &str) -> io::Result<String>;
+    /// Create a new herdr workspace with the given label; returns its id and
+    /// the auto-created root pane id.
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace>;
     /// Close a herdr workspace (closes all its panes).
     fn workspace_close(&self, id: &str) -> io::Result<()>;
+    /// Close a single pane by id.
+    fn pane_close(&self, pane_id: &str) -> io::Result<()>;
     fn agent_start(
         &self,
         name: &str,
@@ -31,6 +46,12 @@ pub trait Herdr {
 // SystemHerdr — shells the real `herdr` binary
 // ---------------------------------------------------------------------------
 
+/// Pause between writing a message and sending the submit CR. A CR sent
+/// immediately after a large `agent send` is swallowed by claude's
+/// bracketed-paste handling and never submits; a CR sent after the paste
+/// settles submits reliably (verified against the live claude TUI).
+const PASTE_SETTLE: Duration = Duration::from_millis(150);
+
 pub struct SystemHerdr;
 
 impl SystemHerdr {
@@ -44,7 +65,7 @@ impl SystemHerdr {
 }
 
 impl Herdr for SystemHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<String> {
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
         let out = self.run(&["workspace", "create", "--label", label, "--no-focus"])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -53,11 +74,14 @@ impl Herdr for SystemHerdr {
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        parse_workspace_id(&stdout).ok_or_else(|| {
+        let id = parse_workspace_id(&stdout).ok_or_else(|| {
             io::Error::other(
                 format!("herdr workspace create: could not parse workspace_id from: {stdout}"),
             )
-        })
+        })?;
+        // Best-effort: skip cleanup if the root pane can't be parsed.
+        let root_pane = parse_root_pane_id(&stdout);
+        Ok(Workspace { id, root_pane })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -66,6 +90,17 @@ impl Herdr for SystemHerdr {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(
                 format!("herdr workspace close failed: {stderr}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        let out = self.run(&["pane", "close", pane_id])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr pane close failed: {stderr}"),
             ));
         }
         Ok(())
@@ -104,9 +139,13 @@ impl Herdr for SystemHerdr {
                 format!("herdr agent send failed: {stderr}"),
             ));
         }
-        // Send a carriage return to submit the message; herdr writes the text
-        // into the pane's input box without pressing Enter, so the CR is
-        // required to actually dispatch it to the claude agent.
+        // Submit the message with a carriage return. herdr writes the text into
+        // the pane's input box without pressing Enter, so a CR is required to
+        // dispatch it. It MUST be a separately-timed keypress: claude's TUI
+        // treats a large message as a bracketed paste, and a CR sent in the same
+        // burst is absorbed into the paste instead of submitting. Pausing for the
+        // paste to settle first makes the CR land as a distinct Enter.
+        std::thread::sleep(PASTE_SETTLE);
         let cr_out = self.run(&["agent", "send", target, "\r"])?;
         if !cr_out.status.success() {
             let stderr = String::from_utf8_lossy(&cr_out.stderr);
@@ -216,6 +255,20 @@ fn parse_pane_id(json: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
+/// Parse the root pane id from herdr's `workspace create` output: the
+/// `pane_id` inside the top-level `root_pane` object (the auto-created shell
+/// pane). Anchors on `"root_pane"` first so it can't grab a `pane_id` that
+/// appears elsewhere in the payload if herdr's schema grows one.
+fn parse_root_pane_id(json: &str) -> Option<String> {
+    let anchor = json.find("\"root_pane\"")?;
+    let rest = &json[anchor..];
+    let key = "\"pane_id\":\"";
+    let start = rest.find(key)? + key.len();
+    let end = rest[start..].find('"')? + start;
+    let id = &rest[start..end];
+    if id.is_empty() { None } else { Some(id.to_owned()) }
+}
+
 /// Parse `workspace_id` from herdr's `workspace create` JSON output.
 /// Looks for `"workspace_id":"<value>"` inside the top-level `workspace` object.
 /// The output shape is: `{"result":{"workspace":{"workspace_id":"wN",...},...}}`.
@@ -279,17 +332,28 @@ impl FakeHerdr {
 
 #[cfg(test)]
 impl Herdr for FakeHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<String> {
+    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
         let mut c = self.counter.borrow_mut();
         *c += 1;
         let ws_id = format!("ws-{}", *c);
         drop(c);
-        self.record(format!("workspace_create label={label} -> {ws_id}"));
-        Ok(ws_id)
+        let root_pane = format!("{ws_id}:p1");
+        self.record(format!(
+            "workspace_create label={label} -> {ws_id} root_pane={root_pane}"
+        ));
+        Ok(Workspace {
+            id: ws_id,
+            root_pane: Some(root_pane),
+        })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
         self.record(format!("workspace_close id={id}"));
+        Ok(())
+    }
+
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        self.record(format!("pane_close pane_id={pane_id}"));
         Ok(())
     }
 
@@ -414,6 +478,27 @@ mod tests {
         assert!(parse_pane_id(r#"{"no":"pane"}"#).is_none());
     }
 
+    #[test]
+    fn parse_root_pane_id_extracts_from_workspace_create() {
+        // Realistic `workspace create` shape: pane_id is nested inside root_pane,
+        // after several other keys (agent_status, cwd, ...).
+        let json = r#"{"id":"cli:workspace:create","result":{"root_pane":{"agent_status":"unknown","cwd":"/x","focused":false,"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},"tab":{"tab_id":"w1:t1","workspace_id":"w1"},"type":"workspace_created","workspace":{"workspace_id":"w1"}}}"#;
+        assert_eq!(parse_root_pane_id(json).as_deref(), Some("w1:p1"));
+    }
+
+    #[test]
+    fn parse_root_pane_id_ignores_pane_id_outside_root_pane() {
+        // A pane_id appearing before root_pane must NOT be picked up — the
+        // parser anchors on the root_pane object specifically.
+        let json = r#"{"result":{"active_pane":{"pane_id":"w1:pWRONG"},"root_pane":{"pane_id":"w1:p1"}}}"#;
+        assert_eq!(parse_root_pane_id(json).as_deref(), Some("w1:p1"));
+    }
+
+    #[test]
+    fn parse_root_pane_id_missing_returns_none() {
+        assert!(parse_root_pane_id(r#"{"result":{"workspace":{"workspace_id":"w1"}}}"#).is_none());
+    }
+
     // -- Bug A: agent_send via FakeHerdr records the text (CR is a real-herdr detail)
     #[test]
     fn fake_agent_send_records_text_not_cr() {
@@ -424,6 +509,41 @@ mod tests {
         assert!(calls[0].contains("do the thing"), "call: {}", calls[0]);
         // FakeHerdr does NOT inject a CR — that's a SystemHerdr submit detail
         assert!(!calls[0].contains("\\r"), "unexpected CR in fake call: {}", calls[0]);
+    }
+
+    // -- Fix 1: the submit CR is sent as a separately-timed keypress, not
+    //    inline with the paste. The delay is what makes it a distinct keypress;
+    //    guard that it is never zeroed out.
+    #[test]
+    fn paste_settle_is_nonzero() {
+        assert!(
+            PASTE_SETTLE > Duration::ZERO,
+            "PASTE_SETTLE must be > 0 so the submit CR is a separate keypress, \
+             not swallowed by claude's bracketed paste"
+        );
+    }
+
+    // -- Fix 2: workspace_create surfaces the auto-created root pane so it can
+    //    be closed once a phase pane exists.
+    #[test]
+    fn fake_workspace_create_returns_root_pane() {
+        let h = FakeHerdr::new();
+        let ws = h.workspace_create("relay:demo").unwrap();
+        assert!(!ws.id.is_empty());
+        assert!(ws.root_pane.is_some(), "root_pane must be surfaced");
+        // The call is recorded with both ids for assertion in higher-level tests.
+        let call = &h.calls()[0];
+        assert!(call.contains("workspace_create"), "call: {call}");
+        assert!(call.contains("root_pane="), "call: {call}");
+    }
+
+    #[test]
+    fn fake_pane_close_records() {
+        let h = FakeHerdr::new();
+        h.pane_close("ws-1:p1").unwrap();
+        let calls = h.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("pane_close pane_id=ws-1:p1"), "call: {}", calls[0]);
     }
 
     // -- Bug B: build_agent_start_args includes --env when CLAUDE_CONFIG_DIR is set

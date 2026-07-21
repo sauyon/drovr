@@ -76,6 +76,17 @@ pub fn phase_start<H: Herdr>(
     run.phases[idx].herdr_session = None;
     run.phases[idx].pane_id = Some(pane_id);
     run.phases[idx].status = PhaseStatus::Running;
+
+    // Close the workspace's auto-created root shell pane now that a phase pane
+    // exists, leaving exactly the phase pane in the run's tab. Only the first
+    // `phase start` does this (the id is taken, so later starts are no-ops).
+    // Best-effort: a failed close is cosmetic, so warn and continue.
+    if let Some(dp) = run.default_pane.take()
+        && let Err(e) = h.pane_close(&dp)
+    {
+        eprintln!("relay: warning: could not close default pane {dp}: {e}");
+    }
+
     run.save()?;
     Ok(())
 }
@@ -155,6 +166,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            default_pane: None,
             project_dir: "/tmp/relay-proj-test".into(),
         }
     }
@@ -295,6 +307,59 @@ mod tests {
         let calls = h.calls();
         assert!(!calls[0].contains("--seed"), "argv must not contain --seed: {}", calls[0]);
         assert!(!calls[0].contains("/tmp/seed.md"), "argv must not contain seed path: {}", calls[0]);
+    }
+
+    // -- Fix 2: the workspace's junk root pane is closed on the first phase
+    //    start, leaving exactly the phase pane in the tab.
+    #[test]
+    fn phase_start_closes_default_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("default-pane-close-test");
+        run.default_pane = Some("ws-1:p1".into());
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        // pane_close was called with the default pane id
+        let calls = h.calls();
+        let close_call = calls
+            .iter()
+            .find(|c| c.contains("pane_close"))
+            .unwrap_or_else(|| panic!("expected a pane_close call, got: {calls:?}"));
+        assert!(close_call.contains("ws-1:p1"), "wrong pane closed: {close_call}");
+        // and the pending default pane is cleared so it isn't closed twice
+        assert!(run.default_pane.is_none(), "default_pane must be cleared");
+    }
+
+    #[test]
+    fn phase_start_no_default_pane_skips_close() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("no-default-pane-test"); // default_pane: None
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_close")),
+            "no pane_close expected when default_pane is None: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn phase_start_closes_default_pane_only_once() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("default-pane-once-test");
+        run.default_pane = Some("ws-1:p1".into());
+
+        // First phase closes the junk pane...
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        // ...a second phase in the same workspace must NOT close another pane.
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        let close_count = h.calls().iter().filter(|c| c.contains("pane_close")).count();
+        assert_eq!(close_count, 1, "default pane must be closed exactly once");
     }
 
     #[test]
