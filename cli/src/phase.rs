@@ -1,0 +1,291 @@
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::herdr::Herdr;
+use crate::run::{Phase, PhaseStatus, RunState, run_dir};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn find_phase_idx(run: &RunState, phase: &str) -> Option<usize> {
+    run.phases.iter().position(|p| p.name == phase)
+}
+
+fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
+    let idx = find_phase_idx(run, phase).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
+    })?;
+    run.phases[idx].pane_id.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("phase has no pane_id: {phase}"),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Spawn a persistent claude pane for `phase`, record pane_id + herdr_session,
+/// set status Running, and save.  If the phase already exists (e.g. resume) its
+/// entry is reused; if not, it is appended.
+pub fn phase_start<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    seed: Option<&Path>,
+) -> io::Result<()> {
+    let cwd = run_dir(&run.name).to_string_lossy().into_owned();
+
+    // Build the argv: `claude` + optional seed flag
+    let mut argv: Vec<String> = vec!["claude".into()];
+    if let Some(seed_path) = seed {
+        argv.push("--seed".into());
+        argv.push(seed_path.to_string_lossy().into_owned());
+    }
+
+    let pane_id = h.agent_start(phase, &cwd, &argv)?;
+
+    // Find existing phase or append a new one
+    let idx = match find_phase_idx(run, phase) {
+        Some(i) => i,
+        None => {
+            run.phases.push(Phase {
+                name: phase.to_owned(),
+                status: PhaseStatus::Pending,
+                handoff_doc: None,
+                herdr_session: None,
+                pane_id: None,
+            });
+            run.phases.len() - 1
+        }
+    };
+
+    let seed_str = seed.map(|p| p.to_string_lossy().into_owned());
+    run.phases[idx].handoff_doc = seed_str;
+    run.phases[idx].herdr_session = Some(pane_id.clone());
+    run.phases[idx].pane_id = Some(pane_id);
+    run.phases[idx].status = PhaseStatus::Running;
+    run.save()?;
+    Ok(())
+}
+
+/// Send `text` to the running phase pane.
+pub fn phase_send<H: Herdr>(
+    h: &H,
+    run: &RunState,
+    phase: &str,
+    text: &str,
+) -> io::Result<()> {
+    let pane_id = require_pane_id(run, phase)?;
+    h.agent_send(&pane_id, text)
+}
+
+/// Poll whether the phase is done.  Marks Done (and saves) on true; marks
+/// Failed (and saves) on Err; leaves Running on false.
+pub fn phase_wait<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    timeout_ms: u64,
+) -> io::Result<bool> {
+    let pane_id = require_pane_id(run, phase)?;
+    match h.agent_wait_done(&pane_id, timeout_ms) {
+        Ok(true) => {
+            let idx = find_phase_idx(run, phase).unwrap();
+            run.phases[idx].status = PhaseStatus::Done;
+            run.save()?;
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(e) => {
+            let idx = find_phase_idx(run, phase).unwrap();
+            run.phases[idx].status = PhaseStatus::Failed;
+            run.save()?;
+            Err(e)
+        }
+    }
+}
+
+/// Read `HANDOFF.md` written by the compressor into the run directory.
+pub fn collect(run: &RunState, phase: &str) -> io::Result<String> {
+    let path: PathBuf = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
+    std::fs::read_to_string(&path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("collect({phase}): cannot read {}: {e}", path.display()),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::FakeHerdr;
+    use crate::run::{Phase, PhaseStatus, RunState};
+    use std::io;
+    use std::sync::Mutex;
+
+    /// Serialise all phase tests so XDG_DATA_HOME set_var doesn't race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn make_run(name: &str) -> RunState {
+        // Caller must hold ENV_LOCK before calling.
+        unsafe {
+            std::env::set_var(
+                "XDG_DATA_HOME",
+                format!("/tmp/relay-phase-test-{name}"),
+            );
+        }
+        RunState {
+            name: name.to_owned(),
+            task: "test task".into(),
+            phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+        }
+    }
+
+    // -- RED: write failing test first, then implement -----------------------
+
+    #[test]
+    fn start_records_pane_id_and_status_running() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("start-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        // Phase should be appended and marked Running
+        assert_eq!(run.phases.len(), 1);
+        let p = &run.phases[0];
+        assert_eq!(p.name, "brainstorm");
+        assert_eq!(p.status, PhaseStatus::Running);
+        assert!(p.pane_id.is_some(), "pane_id must be recorded");
+        assert_eq!(p.herdr_session, p.pane_id, "herdr_session == pane_id");
+        // agent_start was called
+        assert!(h.calls()[0].contains("agent_start"));
+        assert!(h.calls()[0].contains("brainstorm"));
+    }
+
+    #[test]
+    fn wait_done_marks_phase_done() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-done-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // Default FakeHerdr.agent_wait_done returns Ok(true)
+        let done = phase_wait(&h, &mut run, "plan", 5000).unwrap();
+        assert!(done);
+        assert_eq!(run.phases[0].status, PhaseStatus::Done);
+    }
+
+    #[test]
+    fn wait_timeout_leaves_running() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-timeout-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        h.set_wait_result(Ok(false));
+        let done = phase_wait(&h, &mut run, "plan", 100).unwrap();
+        assert!(!done);
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn wait_error_marks_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-err-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        h.set_wait_result(Err(io::Error::new(io::ErrorKind::Other, "boom")));
+        let result = phase_wait(&h, &mut run, "plan", 100);
+        assert!(result.is_err());
+        assert_eq!(run.phases[0].status, PhaseStatus::Failed);
+    }
+
+    #[test]
+    fn send_routes_to_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        phase_send(&h, &run, "code", "hello agent").unwrap();
+
+        // Last call should be agent_send
+        let calls = h.calls();
+        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        assert!(send_call.contains("hello agent"));
+        // Target should match the pane_id recorded
+        let pane_id = run.phases[0].pane_id.as_ref().unwrap();
+        assert!(send_call.contains(pane_id.as_str()));
+    }
+
+    #[test]
+    fn start_with_seed_records_handoff_doc() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("seed-test");
+        let seed = Path::new("/tmp/seed.md");
+
+        phase_start(&h, &mut run, "brainstorm", Some(seed)).unwrap();
+
+        let p = &run.phases[0];
+        assert_eq!(p.handoff_doc.as_deref(), Some("/tmp/seed.md"));
+        // argv should include --seed
+        let calls = h.calls();
+        assert!(calls[0].contains("--seed"));
+    }
+
+    #[test]
+    fn start_reuses_existing_phase_entry() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("reuse-test");
+
+        // Pre-populate a Pending phase
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Pending,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: None,
+        });
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // Still only one phase
+        assert_eq!(run.phases.len(), 1);
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn collect_reads_handoff_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("collect-reads-test");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brainstorm-HANDOFF.md"), "## handoff content").unwrap();
+        run.phases = vec![];  // phases not relevant for collect
+
+        let content = collect(&run, "brainstorm").unwrap();
+        assert_eq!(content, "## handoff content");
+    }
+
+    #[test]
+    fn collect_missing_file_returns_err() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = make_run("collect-missing-test");
+        let result = collect(&run, "nonexistent");
+        assert!(result.is_err());
+    }
+}
