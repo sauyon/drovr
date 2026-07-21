@@ -1,8 +1,11 @@
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
 
 use crate::herdr::Herdr;
 use crate::run::{RunState, run_dir};
@@ -36,8 +39,7 @@ impl CmdRunner for SystemRunner {
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!(
                     "{cmd} exited with status {}",
                     output.status.code().unwrap_or(-1)
@@ -49,11 +51,13 @@ impl CmdRunner for SystemRunner {
 }
 
 /// Fake runner for tests: records invocations, returns scripted stdout FIFO.
+#[cfg(test)]
 pub struct FakeRunner {
     calls: RefCell<Vec<(String, Vec<String>, String)>>,
     stdout_queue: RefCell<VecDeque<String>>,
 }
 
+#[cfg(test)]
 impl FakeRunner {
     pub fn new() -> Self {
         Self {
@@ -73,6 +77,7 @@ impl FakeRunner {
     }
 }
 
+#[cfg(test)]
 impl CmdRunner for FakeRunner {
     fn run(&self, cmd: &str, args: &[&str], stdin: &str) -> io::Result<String> {
         self.calls.borrow_mut().push((

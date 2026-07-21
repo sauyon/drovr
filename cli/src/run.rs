@@ -28,14 +28,14 @@ impl RunState {
     pub fn load(name: &str) -> io::Result<RunState> {
         let p = run_dir(name).join("state.json");
         serde_json::from_str(&fs::read_to_string(p)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
     pub fn save(&self) -> io::Result<()> {
         let dir = run_dir(&self.name);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("state.json"),
             serde_json::to_string_pretty(self)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?)?;
+                .map_err(io::Error::other)?)?;
         Ok(())
     }
     pub fn first_incomplete(&self) -> Option<usize> {

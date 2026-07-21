@@ -316,7 +316,7 @@ pub fn serve(run: &str, host: &str, port: u16) -> io::Result<()> {
 
     let addr = format!("{}:{}", host, port);
     let server = Server::http(&addr)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     // Write the actual bound address (important when port=0 → OS-assigned).
     let bound_addr = server
@@ -371,8 +371,7 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     if !response.starts_with("HTTP/1") || (!response.contains(" 200 ") && !response.contains("\r\n200\r\n")) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("unexpected response from review server: {}", response.lines().next().unwrap_or("")),
         ));
     }

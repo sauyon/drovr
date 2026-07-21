@@ -1,7 +1,10 @@
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io;
 use std::process::Command;
+
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
 
 pub trait Herdr {
     fn agent_start(&self, name: &str, cwd: &str, argv: &[String]) -> io::Result<String>;
@@ -36,16 +39,14 @@ impl Herdr for SystemHerdr {
         let out = self.run(&args)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("herdr agent start failed: {stderr}"),
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         // herdr agent start emits JSON; extract pane_id from the result
         parse_pane_id(&stdout).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("herdr agent start: could not parse pane_id from: {stdout}"),
             )
         })
@@ -55,8 +56,7 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["agent", "send", target, text])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("herdr agent send failed: {stderr}"),
             ));
         }
@@ -81,8 +81,7 @@ impl Herdr for SystemHerdr {
             let code = out.status.code().unwrap_or(1);
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.is_empty() && code != 1 {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(io::Error::other(
                     format!("herdr wait agent-status error: {stderr}"),
                 ))
             } else {
@@ -95,8 +94,7 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["agent", "read", target, "--source", "recent"])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("herdr agent read failed: {stderr}"),
             ));
         }
@@ -107,8 +105,7 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["session", "stop", name])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("herdr session stop failed: {stderr}"),
             ));
         }
@@ -142,6 +139,7 @@ fn parse_pane_id(json: &str) -> Option<String> {
 // FakeHerdr — records calls; scripted return values for tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub struct FakeHerdr {
     calls: RefCell<Vec<String>>,
     counter: RefCell<u32>,
@@ -151,6 +149,7 @@ pub struct FakeHerdr {
     wait_result: RefCell<Option<io::Result<bool>>>,
 }
 
+#[cfg(test)]
 impl FakeHerdr {
     pub fn new() -> Self {
         Self {
@@ -186,6 +185,7 @@ impl FakeHerdr {
     }
 }
 
+#[cfg(test)]
 impl Herdr for FakeHerdr {
     fn agent_start(&self, name: &str, cwd: &str, argv: &[String]) -> io::Result<String> {
         let id = self.next_id();
