@@ -172,7 +172,6 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
-            default_pane: None,
             project_dir: "/tmp/relay-proj-test".into(),
         }
     }

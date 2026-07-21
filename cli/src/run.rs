@@ -18,11 +18,6 @@ pub struct RunState {
     /// The herdr workspace id created for this run (set by `relay new`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    /// The workspace's auto-created root shell pane, pending cleanup. The first
-    /// `phase start` closes it (once a phase pane exists) and clears this back to
-    /// `None` so a run's tab holds exactly the phase pane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_pane: Option<String>,
     /// The project directory phases should run in (trusted by claude).
     /// Captured at `relay new` time; defaults to empty string for old runs.
     #[serde(default)]
@@ -73,7 +68,7 @@ mod tests {
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},
                 Phase{name:"plan".into(), status:PhaseStatus::Pending, handoff_doc:None, herdr_session:None, pane_id:None},
-            ], gate:"spec".into(), cursor:1, workspace: None, default_pane: None, project_dir: "/tmp/proj".into() };
+            ], gate:"spec".into(), cursor:1, workspace: None, project_dir: "/tmp/proj".into() };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
         assert_eq!(loaded.phases.len(), 2);
