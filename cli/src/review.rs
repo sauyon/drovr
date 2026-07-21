@@ -620,6 +620,7 @@ mod tests {
 
     #[test]
     fn review_summary_fn_posts_to_server() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
         // Use a unique run name and set XDG_DATA_HOME so run_dir() points to
         // our temp dir. The server must be started in that same run_dir so
         // review_summary() and the server agree on where to write summary.txt.
