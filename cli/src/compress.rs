@@ -171,6 +171,7 @@ mod tests {
             phases: vec![],
             gate: "spec".into(),
             cursor: 0,
+            workspace: None,
         }
     }
 

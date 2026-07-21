@@ -15,6 +15,9 @@ pub struct Phase {
 pub struct RunState {
     pub name: String, pub task: String, pub phases: Vec<Phase>,
     pub gate: String, pub cursor: usize,
+    /// The herdr workspace id created for this run (set by `relay new`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 pub fn run_dir(name: &str) -> PathBuf {
@@ -61,7 +64,7 @@ mod tests {
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},
                 Phase{name:"plan".into(), status:PhaseStatus::Pending, handoff_doc:None, herdr_session:None, pane_id:None},
-            ], gate:"spec".into(), cursor:1 };
+            ], gate:"spec".into(), cursor:1, workspace: None };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
         assert_eq!(loaded.phases.len(), 2);

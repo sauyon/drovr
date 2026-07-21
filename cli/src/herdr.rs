@@ -7,10 +7,22 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 pub trait Herdr {
-    fn agent_start(&self, name: &str, cwd: &str, argv: &[String]) -> io::Result<String>;
+    /// Create a new herdr workspace with the given label; returns its workspace id.
+    fn workspace_create(&self, label: &str) -> io::Result<String>;
+    /// Close a herdr workspace (closes all its panes).
+    fn workspace_close(&self, id: &str) -> io::Result<()>;
+    fn agent_start(
+        &self,
+        name: &str,
+        cwd: &str,
+        workspace: Option<&str>,
+        argv: &[String],
+    ) -> io::Result<String>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
     fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
+    /// Kept for forward compatibility; currently unused (cleanup uses `workspace_close`).
+    #[allow(dead_code)]
     fn session_stop(&self, name: &str) -> io::Result<()>;
     fn integration_present(&self) -> bool;
 }
@@ -32,8 +44,45 @@ impl SystemHerdr {
 }
 
 impl Herdr for SystemHerdr {
-    fn agent_start(&self, name: &str, cwd: &str, argv: &[String]) -> io::Result<String> {
-        let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", cwd, "--"];
+    fn workspace_create(&self, label: &str) -> io::Result<String> {
+        let out = self.run(&["workspace", "create", "--label", label, "--no-focus"])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr workspace create failed: {stderr}"),
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        parse_workspace_id(&stdout).ok_or_else(|| {
+            io::Error::other(
+                format!("herdr workspace create: could not parse workspace_id from: {stdout}"),
+            )
+        })
+    }
+
+    fn workspace_close(&self, id: &str) -> io::Result<()> {
+        let out = self.run(&["workspace", "close", id])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr workspace close failed: {stderr}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn agent_start(
+        &self,
+        name: &str,
+        cwd: &str,
+        workspace: Option<&str>,
+        argv: &[String],
+    ) -> io::Result<String> {
+        let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", cwd, "--no-focus"];
+        if let Some(ws) = workspace {
+            args.extend_from_slice(&["--workspace", ws]);
+        }
+        args.push("--");
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         args.extend(argv_refs.iter());
         let out = self.run(&args)?;
@@ -135,6 +184,17 @@ fn parse_pane_id(json: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
+/// Parse `workspace_id` from herdr's `workspace create` JSON output.
+/// Looks for `"workspace_id":"<value>"` inside the top-level `workspace` object.
+/// The output shape is: `{"result":{"workspace":{"workspace_id":"wN",...},...}}`.
+fn parse_workspace_id(json: &str) -> Option<String> {
+    let key = "\"workspace_id\":\"";
+    let start = json.find(key)? + key.len();
+    let end = json[start..].find('"')? + start;
+    let id = &json[start..end];
+    if id.is_empty() { None } else { Some(id.to_owned()) }
+}
+
 // ---------------------------------------------------------------------------
 // FakeHerdr — records calls; scripted return values for tests
 // ---------------------------------------------------------------------------
@@ -187,10 +247,30 @@ impl FakeHerdr {
 
 #[cfg(test)]
 impl Herdr for FakeHerdr {
-    fn agent_start(&self, name: &str, cwd: &str, argv: &[String]) -> io::Result<String> {
+    fn workspace_create(&self, label: &str) -> io::Result<String> {
+        let mut c = self.counter.borrow_mut();
+        *c += 1;
+        let ws_id = format!("ws-{}", *c);
+        drop(c);
+        self.record(format!("workspace_create label={label} -> {ws_id}"));
+        Ok(ws_id)
+    }
+
+    fn workspace_close(&self, id: &str) -> io::Result<()> {
+        self.record(format!("workspace_close id={id}"));
+        Ok(())
+    }
+
+    fn agent_start(
+        &self,
+        name: &str,
+        cwd: &str,
+        workspace: Option<&str>,
+        argv: &[String],
+    ) -> io::Result<String> {
         let id = self.next_id();
         self.record(format!(
-            "agent_start name={name} cwd={cwd} argv={argv:?} -> {id}"
+            "agent_start name={name} cwd={cwd} workspace={workspace:?} argv={argv:?} -> {id}"
         ));
         Ok(id)
     }
@@ -243,7 +323,7 @@ mod tests {
     #[test]
     fn fake_records_and_returns() {
         let h = FakeHerdr::new();
-        let id = h.agent_start("brainstorm", "/tmp", &["claude".into()]).unwrap();
+        let id = h.agent_start("brainstorm", "/tmp", None, &["claude".into()]).unwrap();
         assert!(!id.is_empty());
         h.agent_send(&id, "hello").unwrap();
         assert_eq!(h.calls().len(), 2);
@@ -253,8 +333,8 @@ mod tests {
     #[test]
     fn fake_sequential_ids() {
         let h = FakeHerdr::new();
-        let id1 = h.agent_start("a", "/tmp", &[]).unwrap();
-        let id2 = h.agent_start("b", "/tmp", &[]).unwrap();
+        let id1 = h.agent_start("a", "/tmp", None, &[]).unwrap();
+        let id2 = h.agent_start("b", "/tmp", None, &[]).unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -262,7 +342,7 @@ mod tests {
     fn fake_read_queue() {
         let h = FakeHerdr::new();
         h.push_read("output text");
-        let id = h.agent_start("x", "/", &[]).unwrap();
+        let id = h.agent_start("x", "/", None, &[]).unwrap();
         let text = h.agent_read(&id).unwrap();
         assert_eq!(text, "output text");
     }

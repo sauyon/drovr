@@ -220,6 +220,14 @@ fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
+    let workspace = match herdr.workspace_create(&format!("relay:{name}")) {
+        Ok(ws) => Some(ws),
+        Err(e) => {
+            eprintln!("relay: warning: could not create herdr workspace: {e}");
+            None
+        }
+    };
+
     let run = RunState {
         name: name.to_owned(),
         task: task_str,
@@ -255,6 +263,7 @@ fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
         ],
         gate: "spec".into(),
         cursor: 0,
+        workspace,
     };
 
     save_run(&run);
@@ -330,19 +339,12 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
     }
     let run = load_run(name);
 
-    // Stop the herdr session if any phase has one recorded
-    let sessions: Vec<String> = run
-        .phases
-        .iter()
-        .filter_map(|p| p.herdr_session.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    for session in &sessions {
-        if let Err(e) = herdr.session_stop(session) {
-            eprintln!("relay: warning: session_stop({session}) failed: {e}");
-        }
+    // Close the run's workspace (this closes all phase panes within it).
+    // Older runs without a recorded workspace id are skipped gracefully.
+    if let Some(ws_id) = &run.workspace
+        && let Err(e) = herdr.workspace_close(ws_id)
+    {
+        eprintln!("relay: warning: workspace_close({ws_id}) failed: {e}");
     }
 
     if purge {
@@ -740,6 +742,7 @@ mod tests {
             ],
             gate: "spec".into(),
             cursor: 0,
+            workspace: None,
         };
         let s = format_progress(&run);
         assert!(s.contains("0/2"), "got: {s}");
@@ -757,6 +760,7 @@ mod tests {
             ],
             gate: "spec".into(),
             cursor: 0,
+            workspace: None,
         };
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");

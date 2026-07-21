@@ -43,7 +43,7 @@ pub fn phase_start<H: Herdr>(
     // agent_send (the skill reads handoff_doc and sends the seed text).
     let argv: Vec<String> = vec!["claude".into()];
 
-    let pane_id = h.agent_start(phase, &cwd, &argv)?;
+    let pane_id = h.agent_start(phase, &cwd, run.workspace.as_deref(), &argv)?;
 
     // Find existing phase or append a new one
     let idx = match find_phase_idx(run, phase) {
@@ -62,7 +62,8 @@ pub fn phase_start<H: Herdr>(
 
     let seed_str = seed.map(|p| p.to_string_lossy().into_owned());
     run.phases[idx].handoff_doc = seed_str;
-    run.phases[idx].herdr_session = Some(pane_id.clone());
+    // pane_id only — herdr_session is not used for cleanup (workspace_close handles that)
+    run.phases[idx].herdr_session = None;
     run.phases[idx].pane_id = Some(pane_id);
     run.phases[idx].status = PhaseStatus::Running;
     run.save()?;
@@ -143,7 +144,14 @@ mod tests {
             phases: vec![],
             gate: "spec".into(),
             cursor: 0,
+            workspace: None,
         }
+    }
+
+    fn make_run_with_workspace(name: &str, ws_id: &str) -> RunState {
+        let mut run = make_run(name);
+        run.workspace = Some(ws_id.to_owned());
+        run
     }
 
     // -- RED: write failing test first, then implement -----------------------
@@ -162,10 +170,44 @@ mod tests {
         assert_eq!(p.name, "brainstorm");
         assert_eq!(p.status, PhaseStatus::Running);
         assert!(p.pane_id.is_some(), "pane_id must be recorded");
-        assert_eq!(p.herdr_session, p.pane_id, "herdr_session == pane_id");
+        // herdr_session is no longer written (cleanup uses workspace_close, not session_stop)
+        assert!(p.herdr_session.is_none(), "herdr_session must be None");
         // agent_start was called
         assert!(h.calls()[0].contains("agent_start"));
         assert!(h.calls()[0].contains("brainstorm"));
+    }
+
+    #[test]
+    fn agent_start_called_with_no_focus_and_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-isolation-test", "ws-42");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        let calls = h.calls();
+        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        // workspace id must be threaded through
+        assert!(
+            start_call.contains("workspace=Some(\"ws-42\")"),
+            "workspace id not found in call: {start_call}"
+        );
+    }
+
+    #[test]
+    fn agent_start_no_workspace_passes_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("no-ws-test"); // workspace: None
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        let calls = h.calls();
+        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        assert!(
+            start_call.contains("workspace=None"),
+            "expected workspace=None in call: {start_call}"
+        );
     }
 
     #[test]
