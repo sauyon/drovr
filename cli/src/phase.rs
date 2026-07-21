@@ -39,12 +39,9 @@ pub fn phase_start<H: Herdr>(
 ) -> io::Result<()> {
     let cwd = run_dir(&run.name).to_string_lossy().into_owned();
 
-    // Build the argv: `claude` + optional seed flag
-    let mut argv: Vec<String> = vec!["claude".into()];
-    if let Some(seed_path) = seed {
-        argv.push("--seed".into());
-        argv.push(seed_path.to_string_lossy().into_owned());
-    }
+    // Spawn a plain `claude` pane; seed injection happens via the first
+    // agent_send (the skill reads handoff_doc and sends the seed text).
+    let argv: Vec<String> = vec!["claude".into()];
 
     let pane_id = h.agent_start(phase, &cwd, &argv)?;
 
@@ -237,11 +234,14 @@ mod tests {
 
         phase_start(&h, &mut run, "brainstorm", Some(seed)).unwrap();
 
+        // (a) handoff_doc stores the seed path for later injection via agent_send
         let p = &run.phases[0];
         assert_eq!(p.handoff_doc.as_deref(), Some("/tmp/seed.md"));
-        // argv should include --seed
+        // (b) spawned argv must NOT contain "--seed" or the seed path —
+        //     seed injection happens via the first agent_send, not the spawn argv
         let calls = h.calls();
-        assert!(calls[0].contains("--seed"));
+        assert!(!calls[0].contains("--seed"), "argv must not contain --seed: {}", calls[0]);
+        assert!(!calls[0].contains("/tmp/seed.md"), "argv must not contain seed path: {}", calls[0]);
     }
 
     #[test]

@@ -18,7 +18,7 @@ const COMPRESS_PROMPT: &str = include_str!("../assets/compress-prompt.md");
 
 pub trait CmdRunner {
     /// Run `cmd` with `args`, writing `stdin` to the child's stdin.
-    /// Returns trimmed stdout on success.
+    /// Returns stdout on success (trimmed by `SystemRunner`; raw by `FakeRunner`).
     fn run(&self, cmd: &str, args: &[&str], stdin: &str) -> io::Result<String>;
 }
 

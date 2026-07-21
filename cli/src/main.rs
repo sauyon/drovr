@@ -10,6 +10,7 @@ use herdr::{Herdr, SystemHerdr};
 use phase::{collect, phase_send, phase_start, phase_wait};
 use review::{review_summary, serve};
 use run::{PhaseStatus, RunState, run_dir};
+use std::io;
 use std::path::PathBuf;
 use std::process;
 
@@ -119,6 +120,18 @@ enum ReviewCmd {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Reject run names that are empty or contain path-separator characters.
+/// Prevents path traversal in commands that touch the filesystem.
+fn validate_run_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid run name {:?}: must not be empty or contain '/', '\\\\', or '..'", name),
+        ));
+    }
+    Ok(())
+}
+
 fn load_run(name: &str) -> RunState {
     RunState::load(name).unwrap_or_else(|e| {
         eprintln!("relay: failed to load run '{name}': {e}");
@@ -162,7 +175,7 @@ fn cmd_list() {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share")
         });
     let runs_dir = base.join("relay").join("runs");
 
@@ -174,23 +187,32 @@ fn cmd_list() {
         }
     };
 
-    let mut found = false;
-    for entry in entries.flatten() {
-        let state_path = entry.path().join("state.json");
-        if let Some(run) = std::fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<RunState>(&s).ok())
-        {
-            println!("{:20}  {}", run.name, format_progress(&run));
-            found = true;
-        }
-    }
-    if !found {
+    let mut runs: Vec<RunState> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let state_path = entry.path().join("state.json");
+            std::fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<RunState>(&s).ok())
+        })
+        .collect();
+
+    if runs.is_empty() {
         println!("no runs found");
+        return;
+    }
+
+    runs.sort_by(|a, b| a.name.cmp(&b.name));
+    for run in &runs {
+        println!("{:20}  {}", run.name, format_progress(run));
     }
 }
 
 fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     if !herdr.integration_present() {
         eprintln!("prerequisite missing: run 'herdr integration install claude'");
         process::exit(1);
@@ -240,6 +262,10 @@ fn cmd_new(name: &str, task: Option<String>, herdr: &SystemHerdr) {
 }
 
 fn cmd_status(name: &str) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     let run = load_run(name);
     println!("run: {}", run.name);
     println!("task: {}", run.task);
@@ -261,6 +287,10 @@ fn cmd_status(name: &str) {
 }
 
 fn cmd_attach(name: &str) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     let run = load_run(name);
     // Find the current/last-running phase pane
     let pane_id = run
@@ -294,6 +324,10 @@ fn cmd_attach(name: &str) {
 }
 
 fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     let run = load_run(name);
 
     // Stop the herdr session if any phase has one recorded
@@ -324,6 +358,10 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
 }
 
 fn cmd_resurrect(name: &str) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     let run = load_run(name);
     match run.first_incomplete() {
         Some(idx) => {
@@ -348,6 +386,10 @@ fn cmd_resurrect(name: &str) {
 }
 
 fn cmd_serve(name: &str, host: &str, port: u16) {
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     if let Err(e) = serve(name, host, port) {
         eprintln!("relay: serve failed: {e}");
         process::exit(1);
@@ -364,6 +406,10 @@ fn cmd_phase(sub: PhaseCmd) {
 
     match sub {
         PhaseCmd::Start { run, phase_name, seed } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
             let mut state = load_run(&run);
             if let Err(e) = phase_start(&h, &mut state, &phase_name, seed.as_deref()) {
                 eprintln!("relay: phase start failed: {e}");
@@ -372,6 +418,10 @@ fn cmd_phase(sub: PhaseCmd) {
             println!("started phase '{phase_name}' for run '{run}'");
         }
         PhaseCmd::Send { run, phase_name, text } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
             let state = load_run(&run);
             if let Err(e) = phase_send(&h, &state, &phase_name, &text) {
                 eprintln!("relay: phase send failed: {e}");
@@ -379,6 +429,10 @@ fn cmd_phase(sub: PhaseCmd) {
             }
         }
         PhaseCmd::Wait { run, phase_name, timeout_ms } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
             let mut state = load_run(&run);
             match phase_wait(&h, &mut state, &phase_name, timeout_ms) {
                 Ok(true) => println!("phase '{phase_name}' done"),
@@ -393,6 +447,10 @@ fn cmd_phase(sub: PhaseCmd) {
             }
         }
         PhaseCmd::Compress { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
             let state = load_run(&run);
             match phase_compress(&h, &r, &state, &phase_name) {
                 Ok(path) => println!("handoff written to {}", path.display()),
@@ -406,6 +464,10 @@ fn cmd_phase(sub: PhaseCmd) {
 }
 
 fn cmd_collect(run: &str, phase_name: &str) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("relay: {e}");
+        process::exit(1);
+    }
     let state = load_run(run);
     match collect(&state, phase_name) {
         Ok(content) => print!("{content}"),
@@ -419,6 +481,10 @@ fn cmd_collect(run: &str, phase_name: &str) {
 fn cmd_review(sub: ReviewCmd) {
     match sub {
         ReviewCmd::Summary { run, text } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
             if let Err(e) = review_summary(&run, &text) {
                 eprintln!("relay: review summary failed: {e}");
                 process::exit(1);
@@ -640,6 +706,23 @@ mod tests {
     #[test]
     fn unknown_subcommand_errors() {
         assert!(parse(&["relay", "bogus"]).is_err());
+    }
+
+    // -- validate_run_name tests -----------------------------------------------
+
+    #[test]
+    fn validate_run_name_accepts_normal_name() {
+        assert!(validate_run_name("my-feature-run").is_ok());
+        assert!(validate_run_name("run1").is_ok());
+        assert!(validate_run_name("abc").is_ok());
+    }
+
+    #[test]
+    fn validate_run_name_rejects_path_traversal() {
+        assert!(validate_run_name("../x").is_err());
+        assert!(validate_run_name("a/b").is_err());
+        assert!(validate_run_name("a\\b").is_err());
+        assert!(validate_run_name("").is_err());
     }
 
     // -- format_progress helper -------------------------------------------------

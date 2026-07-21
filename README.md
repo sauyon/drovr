@@ -38,7 +38,7 @@ Add `target/debug` to your `PATH` or copy the binary to a location on your
 | `relay status <name>` | Print each phase, its status, and the resume point. |
 | `relay attach <name>` | Attach to the current phase's agent pane. |
 | `relay resurrect <name>` | Reload a stopped run and print the resume point. |
-| `relay serve <name> [--host H] [--port P]` | Start the review HTTP server (default `127.0.0.1:8791`). Blocks until killed. |
+| `relay serve <name> [--host H] [--port P]` | Start the review HTTP server (default `127.0.0.1:8791`). Blocks until killed. The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
 | `relay cleanup <name> [--purge]` | Stop herdr sessions. With `--purge`, remove the run directory. |
 
 ### Plumbing
