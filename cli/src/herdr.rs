@@ -78,14 +78,9 @@ impl Herdr for SystemHerdr {
         workspace: Option<&str>,
         argv: &[String],
     ) -> io::Result<String> {
-        let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", cwd, "--no-focus"];
-        if let Some(ws) = workspace {
-            args.extend_from_slice(&["--workspace", ws]);
-        }
-        args.push("--");
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        args.extend(argv_refs.iter());
-        let out = self.run(&args)?;
+        let args = build_agent_start_args(name, cwd, workspace, argv);
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = self.run(&args_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(
@@ -107,6 +102,16 @@ impl Herdr for SystemHerdr {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(
                 format!("herdr agent send failed: {stderr}"),
+            ));
+        }
+        // Send a carriage return to submit the message; herdr writes the text
+        // into the pane's input box without pressing Enter, so the CR is
+        // required to actually dispatch it to the claude agent.
+        let cr_out = self.run(&["agent", "send", target, "\r"])?;
+        if !cr_out.status.success() {
+            let stderr = String::from_utf8_lossy(&cr_out.stderr);
+            return Err(io::Error::other(
+                format!("herdr agent send (CR) failed: {stderr}"),
             ));
         }
         Ok(())
@@ -171,6 +176,33 @@ impl Herdr for SystemHerdr {
             line.starts_with("claude:") && !line.contains("not installed")
         })
     }
+}
+
+/// Build the `herdr agent start` argv, including `--env` flags for claude auth
+/// vars that are set in the current process environment.
+fn build_agent_start_args(
+    name: &str,
+    cwd: &str,
+    workspace: Option<&str>,
+    argv: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> =
+        vec!["agent".into(), "start".into(), name.into(), "--cwd".into(), cwd.into(), "--no-focus".into()];
+    if let Some(ws) = workspace {
+        args.push("--workspace".into());
+        args.push(ws.into());
+    }
+    // Propagate claude auth env vars to the spawned agent so it uses the
+    // caller's authenticated profile rather than the default ~/.claude dir.
+    for var in &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"] {
+        if let Ok(val) = std::env::var(var) {
+            args.push("--env".into());
+            args.push(format!("{var}={val}"));
+        }
+    }
+    args.push("--".into());
+    args.extend(argv.iter().cloned());
+    args
 }
 
 /// Parse `pane_id` from herdr's JSON output.
@@ -380,5 +412,77 @@ mod tests {
     #[test]
     fn parse_pane_id_missing_returns_none() {
         assert!(parse_pane_id(r#"{"no":"pane"}"#).is_none());
+    }
+
+    // -- Bug A: agent_send via FakeHerdr records the text (CR is a real-herdr detail)
+    #[test]
+    fn fake_agent_send_records_text_not_cr() {
+        let h = FakeHerdr::new();
+        h.agent_send("pane-1", "do the thing").unwrap();
+        let calls = h.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("do the thing"), "call: {}", calls[0]);
+        // FakeHerdr does NOT inject a CR — that's a SystemHerdr submit detail
+        assert!(!calls[0].contains("\\r"), "unexpected CR in fake call: {}", calls[0]);
+    }
+
+    // -- Bug B: build_agent_start_args includes --env when CLAUDE_CONFIG_DIR is set
+    #[test]
+    fn build_agent_start_args_includes_env_when_set() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let args = build_agent_start_args("plan", "/proj", None, &["claude".into()]);
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--env CLAUDE_CONFIG_DIR=/home/user/.config/claude-work"),
+            "args did not contain expected --env flag: {joined}"
+        );
+        // Unset vars must NOT appear
+        assert!(!joined.contains("ANTHROPIC_API_KEY"), "unexpected key in args: {joined}");
+        assert!(!joined.contains("ANTHROPIC_MODEL"), "unexpected model in args: {joined}");
+    }
+
+    #[test]
+    fn build_agent_start_args_omits_env_when_unset() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let args = build_agent_start_args("code", "/tmp", Some("ws-1"), &[]);
+        let joined = args.join(" ");
+        assert!(!joined.contains("--env"), "no --env flags expected when vars unset: {joined}");
+        assert!(joined.contains("--workspace ws-1"), "workspace must be present: {joined}");
+    }
+
+    #[test]
+    fn build_agent_start_args_includes_all_set_vars() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+            std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
+        }
+        let args = build_agent_start_args("x", "/", None, &[]);
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let joined = args.join(" ");
+        assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
+        assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
+        assert!(joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"), "{joined}");
     }
 }
