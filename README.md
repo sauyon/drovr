@@ -115,6 +115,23 @@ relay serve <name>
    State becomes `ready`; refresh the browser to see the new spec.
 4. Repeat until you choose **Approve** → state becomes `approved`.
 
+## Skills
+
+The `skills/` directory holds three superpowers-style skills that DRIVE this CLI. They are
+the intended interface for agents — the CLI is the mechanism, the skills are the discipline.
+
+| Skill | Use when |
+|---|---|
+| `relay:using-relay` | Orientation: prerequisites, the single-writer rule, and choosing handoff vs pipeline. |
+| `relay:handoff` | Carry finished work across one phase boundary to a fresh agent (start → **inject seed** → wait → compress → collect). |
+| `relay:pipeline` | Run a whole change through brainstorm → plan → implement → review with a human spec gate. |
+
+**The load-bearing contract:** `relay phase start` spawns a plain `claude` and only records
+the seed *path* — it does **not** inject the briefing. The skill injects it via
+`relay phase send`. At the spec gate, the agent must run `relay review summary <run> "<text>"`
+after **every** edit to `spec.md`, and `relay phase compress` writes exactly
+`<phase>-HANDOFF.md` (the filename `relay collect` reads).
+
 ## Running tests
 
 ```
