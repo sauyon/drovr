@@ -33,7 +33,7 @@ impl Herdr for SystemHerdr {
         let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", cwd, "--"];
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         args.extend(argv_refs.iter());
-        let out = Command::new("herdr").args(&args).output()?;
+        let out = self.run(&args)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::new(
@@ -66,27 +66,24 @@ impl Herdr for SystemHerdr {
     fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool> {
         let ms_str = timeout_ms.to_string();
         let out = self.run(&[
-            "agent",
             "wait",
+            "agent-status",
             target,
             "--status",
-            "idle",
+            "done",
             "--timeout",
             &ms_str,
         ])?;
-        // exit 0 = condition met (done/idle), non-zero = timeout or error
-        // treat any non-zero as timeout (Ok(false)) unless stderr suggests a hard error
+        // exit 0 = condition met (done), non-zero = timeout or error
         if out.status.success() {
             Ok(true)
         } else {
             let code = out.status.code().unwrap_or(1);
-            // timeout exits with a specific code; treat non-zero as timeout unless stderr
-            // contains something that looks like a hard failure
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.is_empty() && code != 1 {
                 Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("herdr agent wait error: {stderr}"),
+                    format!("herdr wait agent-status error: {stderr}"),
                 ))
             } else {
                 Ok(false)
@@ -208,7 +205,10 @@ impl Herdr for FakeHerdr {
             "agent_wait_done target={target} timeout_ms={timeout_ms}"
         ));
         let scripted = self.wait_result.borrow_mut().take();
-        Ok(scripted.and_then(|r| r.ok()).unwrap_or(true))
+        match scripted {
+            Some(result) => result,
+            None => Ok(true),
+        }
     }
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
@@ -273,6 +273,15 @@ mod tests {
         h.set_wait_result(Ok(false));
         let done = h.agent_wait_done("pane-1", 1000).unwrap();
         assert!(!done);
+    }
+
+    #[test]
+    fn fake_wait_scripted_err_propagates() {
+        let h = FakeHerdr::new();
+        h.set_wait_result(Err(io::Error::new(io::ErrorKind::Other, "scripted failure")));
+        let result = h.agent_wait_done("pane-1", 1000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("scripted failure"));
     }
 
     #[test]
