@@ -129,11 +129,8 @@ mod tests {
     use super::*;
     use crate::herdr::FakeHerdr;
     use crate::run::{Phase, PhaseStatus, RunState};
+    use crate::test_util::ENV_LOCK;
     use std::io;
-    use std::sync::Mutex;
-
-    /// Serialise all phase tests so XDG_DATA_HOME set_var doesn't race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_run(name: &str) -> RunState {
         // Caller must hold ENV_LOCK before calling.

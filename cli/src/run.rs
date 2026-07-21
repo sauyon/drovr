@@ -46,17 +46,18 @@ impl RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::ENV_LOCK;
     #[test]
     fn run_dir_uses_xdg() {
-        // SAFETY: single-threaded test; no other threads read XDG_DATA_HOME concurrently
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/relay-xdg-test"); }
         assert_eq!(run_dir("demo"), PathBuf::from("/tmp/relay-xdg-test/relay/runs/demo"));
     }
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {
-        // SAFETY: single-threaded test; no other threads read XDG_DATA_HOME concurrently
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/relay-xdg-test2"); }
-        let mut s = RunState { name:"demo".into(), task:"t".into(),
+        let s = RunState { name:"demo".into(), task:"t".into(),
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},
                 Phase{name:"plan".into(), status:PhaseStatus::Pending, handoff_doc:None, herdr_session:None, pane_id:None},
