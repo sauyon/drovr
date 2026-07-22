@@ -141,16 +141,22 @@ impl Herdr for SystemHerdr {
 
     fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool> {
         let ms_str = timeout_ms.to_string();
+        // A claude pane reports `idle` (not `done`) when a turn completes and it
+        // is awaiting input — `done` is never emitted, so waiting on it would
+        // hang until timeout. `idle` is the real "turn finished" signal.
+        // (A pane awaiting a permission prompt reports `blocked`; a phase that
+        // asks the orchestrator a question also lands on `idle` — the caller
+        // reads the pane to tell a completion report from a question.)
         let out = self.run(&[
             "wait",
             "agent-status",
             target,
             "--status",
-            "done",
+            "idle",
             "--timeout",
             &ms_str,
         ])?;
-        // exit 0 = condition met (done), non-zero = timeout or error
+        // exit 0 = condition met (idle), non-zero = timeout or error
         if out.status.success() {
             Ok(true)
         } else {
