@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "drovr",
+  "description": "drovr — drive single-writer, compressed-handoff agent phases on herdr",
+  "owner": {
+    "name": "Sauyon Lee"
+  },
+  "plugins": [
+    {
+      "name": "drovr",
+      "description": "Single-writer + read-only-explorer workflow discipline: bounded clean-context phases with compressed handoffs and a human spec gate.",
+      "author": {
+        "name": "Sauyon Lee"
+      },
+      "category": "workflow",
+      "source": "./"
+    }
+  ]
+}
