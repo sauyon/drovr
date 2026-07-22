@@ -39,12 +39,22 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    `relay phase send` writes the text and submits it (adds the carriage return). For the
    first phase, the briefing is the task itself, not a prior handoff.
 
+   The instructions you inject MUST end with the completion contract: tell the agent that
+   its **final action** is to run `relay phase done <run> <phase>`, and that any review
+   subagents it launches must run in the **foreground** (never `run_in_background`, never
+   yield waiting on them). This is what lets step 3 detect completion; without it the agent
+   finishes its work but never signals, and `wait` times out.
+
 3. **Wait for done.**
    ```
    relay phase wait <run> <phase> --timeout-ms 600000
    ```
-   Exit `0` = done · exit `2` = still running (timed out; wait again or investigate) ·
-   exit `1` = the phase FAILED. Use a generous timeout — real phases take minutes.
+   This POLLS the filesystem for the marker the agent drops via `relay phase done` (step 2's
+   injected final action). It deliberately does NOT watch herdr's agent status: `idle` is not
+   a completion signal — it also fires while the agent is parked awaiting its own subagent, so
+   watching it returns a false "done" mid-phase. Exit `0` = done · exit `2` = still running
+   (timed out; wait again or investigate) · exit `1` = an I/O error. Use a generous timeout —
+   real phases take minutes.
 
 4. **Compress → `<phase>-HANDOFF.md`.**
    ```
@@ -66,8 +76,9 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 | Step | Command | Note |
 |---|---|---|
 | start | `relay phase start <run> <phase> [--seed <path>]` | plain claude; records seed path only |
-| **inject** | `relay phase send <run> <phase> "<text>"` | **you must do this — CLI won't** |
-| wait | `relay phase wait <run> <phase> --timeout-ms <ms>` | 0=done 2=timeout 1=failed |
+| **inject** | `relay phase send <run> <phase> "<text>"` | **you must do this — CLI won't**; end the text with the `phase done` contract |
+| wait | `relay phase wait <run> <phase> --timeout-ms <ms>` | polls for the `done` marker (not herdr idle); 0=done 2=timeout 1=io-error |
+| done | `relay phase done <run> <phase>` | run by the AGENT as its final action; drops the marker `wait` polls |
 | compress | `relay phase compress <run> <phase>` | writes `<phase>-HANDOFF.md` |
 | collect | `relay collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
 

@@ -23,7 +23,11 @@ tasks; later tasks run as their own fresh phases.
    `subagent_type: general-purpose`, model `sonnet`) to adversarially review the change you
    just made — correctness bugs, spec/plan compliance, and whether the tests actually exercise
    the behavior. Review subagents are read-only, so relay's single-writer discipline still
-   holds: they find, you fix. **Address every Critical and Important finding** (re-run the
+   holds: they find, you fix. **Run these subagents in the FOREGROUND (blocking) — do NOT set
+   `run_in_background`, and do NOT yield or schedule a wakeup waiting on them.** A backgrounded
+   subagent leaves you parked mid-turn, which relay cannot distinguish from completion and
+   which stalls the run until a human nudges the pane; blocking keeps you working straight
+   through to your final step. **Address every Critical and Important finding** (re-run the
    tests after fixing), and record any finding you consciously chose not to fix, with the
    reason. Only after this may you report done. This is IN ADDITION to the pipeline's final
    review phase — catch it here, cheaply, before it cascades.
@@ -35,11 +39,19 @@ tasks; later tasks run as their own fresh phases.
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.
+6. **Signal completion — your FINAL action.** After the report is written, run:
+   ```
+   relay phase done <run> implement-task-<N>
+   ```
+   This marker is the ONLY signal the driver uses to detect that this phase finished — herdr
+   "idle" does not count (it also fires while you are merely waiting on a subagent). Run it
+   last, once, after everything else; do not run it if you are stopping blocked.
 
 ## Done when
 
-The task's tests pass, you have run read-only review subagents and addressed their
-Critical/Important findings, and `task<N>-report.md` is written. Your compressed handoff folds
+The task's tests pass, you have run read-only review subagents (in the foreground) and
+addressed their Critical/Important findings, `task<N>-report.md` is written, and you have run
+`relay phase done <run> implement-task-<N>` as your final action. Your compressed handoff folds
 your real interfaces forward to the next task, so record exact signatures. Reference source by
 path; do not paste large diffs into the report.
 

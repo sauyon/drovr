@@ -28,9 +28,16 @@ You did not write this code — review it as a skeptic, not its author.
 
 ## Done when
 
-`verdict.md` is written with a clear overall call and evidence-backed findings. Be specific
-and cite `file:line`; the driver surfaces this verdict as the run's result. Reference source
-by path; do not paste large code blocks.
+`verdict.md` is written with a clear overall call and evidence-backed findings, and — as your
+FINAL action — you have run:
+
+```
+relay phase done <run> review
+```
+
+This marker is the ONLY signal the driver uses to detect that this phase finished; herdr
+"idle" does not count. Be specific and cite `file:line`; the driver surfaces this verdict as
+the run's result. Reference source by path; do not paste large code blocks.
 
 ---
 IMPLEMENT REPORTS / HANDOFFS:

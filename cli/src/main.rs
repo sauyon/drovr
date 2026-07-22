@@ -7,7 +7,7 @@ mod run;
 use clap::{Parser, Subcommand};
 use compress::{SystemRunner, phase_compress};
 use herdr::{Herdr, SystemHerdr};
-use phase::{collect, phase_send, phase_start, phase_wait};
+use phase::{collect, phase_done, phase_send, phase_start, phase_wait};
 use review::{review_summary, serve};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
@@ -99,12 +99,18 @@ enum PhaseCmd {
         phase_name: String,
         text: String,
     },
-    /// Wait for a phase to complete.
+    /// Wait for a phase to complete (polls for the `done` marker).
     Wait {
         run: String,
         phase_name: String,
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
+    },
+    /// Mark a phase complete. Run by the phase AGENT itself as its final
+    /// action — it drops the completion marker `relay phase wait` polls for.
+    Done {
+        run: String,
+        phase_name: String,
     },
     /// Compress a finished phase into a handoff doc.
     Compress {
@@ -457,7 +463,7 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
-            match phase_wait(&h, &mut state, &phase_name, timeout_ms) {
+            match phase_wait(&mut state, &phase_name, timeout_ms) {
                 Ok(true) => println!("phase '{phase_name}' done"),
                 Ok(false) => {
                     println!("phase '{phase_name}' still running (timeout)");
@@ -465,6 +471,20 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("relay: phase wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Done { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("relay: {e}");
+                process::exit(1);
+            }
+            let state = load_run(&run);
+            match phase_done(&state, &phase_name) {
+                Ok(path) => println!("marked phase '{phase_name}' done ({})", path.display()),
+                Err(e) => {
+                    eprintln!("relay: phase done failed: {e}");
                     process::exit(1);
                 }
             }

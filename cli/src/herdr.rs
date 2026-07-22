@@ -30,7 +30,6 @@ pub trait Herdr {
         argv: &[String],
     ) -> io::Result<String>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
-    fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
     /// Kept for forward compatibility; currently unused (cleanup uses `workspace_close`).
     #[allow(dead_code)]
@@ -139,39 +138,6 @@ impl Herdr for SystemHerdr {
         Ok(())
     }
 
-    fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool> {
-        let ms_str = timeout_ms.to_string();
-        // A claude pane reports `idle` (not `done`) when a turn completes and it
-        // is awaiting input — `done` is never emitted, so waiting on it would
-        // hang until timeout. `idle` is the real "turn finished" signal.
-        // (A pane awaiting a permission prompt reports `blocked`; a phase that
-        // asks the orchestrator a question also lands on `idle` — the caller
-        // reads the pane to tell a completion report from a question.)
-        let out = self.run(&[
-            "wait",
-            "agent-status",
-            target,
-            "--status",
-            "idle",
-            "--timeout",
-            &ms_str,
-        ])?;
-        // exit 0 = condition met (idle), non-zero = timeout or error
-        if out.status.success() {
-            Ok(true)
-        } else {
-            let code = out.status.code().unwrap_or(1);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() && code != 1 {
-                Err(io::Error::other(
-                    format!("herdr wait agent-status error: {stderr}"),
-                ))
-            } else {
-                Ok(false)
-            }
-        }
-    }
-
     fn agent_read(&self, target: &str) -> io::Result<String> {
         let out = self.run(&["agent", "read", target, "--source", "recent"])?;
         if !out.status.success() {
@@ -265,8 +231,6 @@ pub struct FakeHerdr {
     counter: RefCell<u32>,
     /// Queued return strings for agent_read (FIFO)
     read_queue: RefCell<VecDeque<String>>,
-    /// If set, agent_wait_done returns this value instead of true
-    wait_result: RefCell<Option<io::Result<bool>>>,
 }
 
 #[cfg(test)]
@@ -276,7 +240,6 @@ impl FakeHerdr {
             calls: RefCell::new(Vec::new()),
             counter: RefCell::new(0),
             read_queue: RefCell::new(VecDeque::new()),
-            wait_result: RefCell::new(None),
         }
     }
 
@@ -287,11 +250,6 @@ impl FakeHerdr {
     /// Queue a string to be returned by the next `agent_read` call.
     pub fn push_read(&self, text: impl Into<String>) {
         self.read_queue.borrow_mut().push_back(text.into());
-    }
-
-    /// Script the next `agent_wait_done` return value.
-    pub fn set_wait_result(&self, result: io::Result<bool>) {
-        *self.wait_result.borrow_mut() = Some(result);
     }
 
     fn record(&self, call: String) {
@@ -338,17 +296,6 @@ impl Herdr for FakeHerdr {
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
         Ok(())
-    }
-
-    fn agent_wait_done(&self, target: &str, timeout_ms: u64) -> io::Result<bool> {
-        self.record(format!(
-            "agent_wait_done target={target} timeout_ms={timeout_ms}"
-        ));
-        let scripted = self.wait_result.borrow_mut().take();
-        match scripted {
-            Some(result) => result,
-            None => Ok(true),
-        }
     }
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
@@ -405,23 +352,6 @@ mod tests {
         let id = h.agent_start("x", "/", None, &[]).unwrap();
         let text = h.agent_read(&id).unwrap();
         assert_eq!(text, "output text");
-    }
-
-    #[test]
-    fn fake_wait_scripted_false() {
-        let h = FakeHerdr::new();
-        h.set_wait_result(Ok(false));
-        let done = h.agent_wait_done("pane-1", 1000).unwrap();
-        assert!(!done);
-    }
-
-    #[test]
-    fn fake_wait_scripted_err_propagates() {
-        let h = FakeHerdr::new();
-        h.set_wait_result(Err(io::Error::new(io::ErrorKind::Other, "scripted failure")));
-        let result = h.agent_wait_done("pane-1", 1000);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("scripted failure"));
     }
 
     #[test]

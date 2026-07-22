@@ -1,8 +1,18 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::herdr::Herdr;
 use crate::run::{Phase, PhaseStatus, RunState, run_dir};
+
+/// How often `phase_wait` polls the filesystem for the completion marker.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Path of the completion marker a phase agent drops via `relay phase done`.
+fn done_marker(run: &str, phase: &str) -> PathBuf {
+    run_dir(run).join(format!("{phase}.done"))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,29 +106,47 @@ pub fn phase_send<H: Herdr>(
     h.agent_send(&pane_id, text)
 }
 
-/// Poll whether the phase is done.  Marks Done (and saves) on true; marks
-/// Failed (and saves) on Err; leaves Running on false.
-pub fn phase_wait<H: Herdr>(
-    h: &H,
-    run: &mut RunState,
-    phase: &str,
-    timeout_ms: u64,
-) -> io::Result<bool> {
-    let pane_id = require_pane_id(run, phase)?;
-    match h.agent_wait_done(&pane_id, timeout_ms) {
-        Ok(true) => {
+/// Mark a phase complete by dropping its completion marker. Run BY the phase
+/// agent itself as its final action (via `relay phase done`), NOT by the
+/// orchestrator — it is the only reliable "the agent finished" signal, since
+/// herdr's `idle` status also fires while an agent is merely parked awaiting a
+/// subagent. Writing a marker file (rather than mutating `state.json`) keeps
+/// the orchestrator the sole writer of run state.
+pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
+    find_phase_idx(run, phase).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
+    })?;
+    let marker = done_marker(&run.name, phase);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&marker, b"")?;
+    Ok(marker)
+}
+
+/// Poll the filesystem for the phase's completion marker (dropped by the phase
+/// agent via `relay phase done`) until it appears or `timeout_ms` elapses.
+/// Marks the phase Done (and saves) when found; leaves it Running on timeout.
+/// Deliberately does NOT consult herdr status: `idle` is not a completion
+/// signal (it also fires when an agent is parked awaiting its own subagent).
+pub fn phase_wait(run: &mut RunState, phase: &str, timeout_ms: u64) -> io::Result<bool> {
+    find_phase_idx(run, phase).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
+    })?;
+    let marker = done_marker(&run.name, phase);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if marker.exists() {
             let idx = find_phase_idx(run, phase).unwrap();
             run.phases[idx].status = PhaseStatus::Done;
             run.save()?;
-            Ok(true)
+            return Ok(true);
         }
-        Ok(false) => Ok(false),
-        Err(e) => {
-            let idx = find_phase_idx(run, phase).unwrap();
-            run.phases[idx].status = PhaseStatus::Failed;
-            run.save()?;
-            Err(e)
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
         }
+        thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
 }
 
@@ -143,7 +171,6 @@ mod tests {
     use crate::herdr::FakeHerdr;
     use crate::run::{Phase, PhaseStatus, RunState};
     use crate::test_util::ENV_LOCK;
-    use std::io;
 
     fn make_run(name: &str) -> RunState {
         // Caller must hold ENV_LOCK before calling.
@@ -153,6 +180,9 @@ mod tests {
                 format!("/tmp/relay-phase-test-{name}"),
             );
         }
+        // Start each test from a clean run dir so a stale `.done` marker or
+        // state.json from a prior run can't leak across test invocations.
+        let _ = std::fs::remove_dir_all(run_dir(name));
         RunState {
             name: name.to_owned(),
             task: "test task".into(),
@@ -227,14 +257,17 @@ mod tests {
     }
 
     #[test]
-    fn wait_done_marks_phase_done() {
+    fn wait_sees_marker_and_marks_phase_done() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("wait-done-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        // Default FakeHerdr.agent_wait_done returns Ok(true)
-        let done = phase_wait(&h, &mut run, "plan", 5000).unwrap();
+        // The phase agent signals completion by dropping the marker.
+        let marker = phase_done(&run, "plan").unwrap();
+        assert!(marker.exists(), "marker should exist at {}", marker.display());
+
+        let done = phase_wait(&mut run, "plan", 5000).unwrap();
         assert!(done);
         assert_eq!(run.phases[0].status, PhaseStatus::Done);
     }
@@ -246,23 +279,19 @@ mod tests {
         let mut run = make_run("wait-timeout-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        h.set_wait_result(Ok(false));
-        let done = phase_wait(&h, &mut run, "plan", 100).unwrap();
+        // No marker dropped → wait times out quickly and leaves the phase Running.
+        let done = phase_wait(&mut run, "plan", 50).unwrap();
         assert!(!done);
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
     }
 
     #[test]
-    fn wait_error_marks_failed() {
+    fn done_on_unknown_phase_errors() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let h = FakeHerdr::new();
-        let mut run = make_run("wait-err-test");
-
-        phase_start(&h, &mut run, "plan", None).unwrap();
-        h.set_wait_result(Err(io::Error::new(io::ErrorKind::Other, "boom")));
-        let result = phase_wait(&h, &mut run, "plan", 100);
-        assert!(result.is_err());
-        assert_eq!(run.phases[0].status, PhaseStatus::Failed);
+        let run = make_run("done-unknown-test");
+        // No phases registered → phase_done must reject rather than write a
+        // stray marker.
+        assert!(phase_done(&run, "nonexistent").is_err());
     }
 
     #[test]

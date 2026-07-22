@@ -27,13 +27,22 @@ implementation plan broken into independently-executable tasks. You are NOT impl
    Code Agent tool, `subagent_type: general-purpose`, model `sonnet`) to adversarially review
    the plan: are the tasks independent, correctly ordered, each small enough for one
    clean-context phase, and are the interfaces concrete enough to bind to? Review subagents
-   are read-only, so relay's single-writer discipline holds — they find, you fix. Address
+   are read-only, so relay's single-writer discipline holds — they find, you fix. **Run them
+   in the FOREGROUND (blocking) — do NOT set `run_in_background` or yield waiting on them; a
+   backgrounded subagent parks you mid-turn, which relay cannot tell from completion.** Address
    every Critical/Important finding before finishing.
+4. **Signal completion — your FINAL action.** After `plan.md` is complete, run:
+   ```
+   relay phase done <run> plan
+   ```
+   This marker is the ONLY signal the driver uses to detect that this phase finished — herdr
+   "idle" does not count. Run it last, once.
 
 ## Done when
 
-`plan.md` is complete with per-task interfaces and you have run read-only review subagents
-and addressed their Critical/Important findings. The implement phase runs each task as its
+`plan.md` is complete with per-task interfaces, you have run read-only review subagents (in
+the foreground) and addressed their Critical/Important findings, and you have run
+`relay phase done <run> plan` as your final action. The implement phase runs each task as its
 own fresh agent seeded from your compressed handoff, so the handoff must carry the task list
 and the interface contracts. Reference source by path; do not paste implementations.
 

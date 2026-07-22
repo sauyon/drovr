@@ -42,9 +42,17 @@ A review server renders `spec.md` in a browser for the reviewer. The loop:
 
 ## Done when
 
-`spec.md` is approved by the reviewer. Leave `spec.md` complete and current — the next
-phase (plan) is seeded from your compressed handoff plus this file. Reference source by path;
-do not paste large code blocks into the spec.
+`spec.md` is approved by the reviewer, and — as your FINAL action, once approved — you have
+run:
+
+```
+relay phase done <run> brainstorm
+```
+
+This marker is the ONLY signal the driver uses to detect that this phase finished; herdr
+"idle" does not count. Leave `spec.md` complete and current — the next phase (plan) is seeded
+from your compressed handoff plus this file. Reference source by path; do not paste large code
+blocks into the spec.
 
 ---
 TASK:
