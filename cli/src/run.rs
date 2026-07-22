@@ -15,11 +15,11 @@ pub struct Phase {
 pub struct RunState {
     pub name: String, pub task: String, pub phases: Vec<Phase>,
     pub gate: String, pub cursor: usize,
-    /// The herdr workspace id created for this run (set by `relay new`).
+    /// The herdr workspace id created for this run (set by `drovr new`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     /// The project directory phases should run in (trusted by claude).
-    /// Captured at `relay new` time; defaults to empty string for old runs.
+    /// Captured at `drovr new` time; defaults to empty string for old runs.
     #[serde(default)]
     pub project_dir: String,
 }
@@ -28,7 +28,7 @@ pub fn run_dir(name: &str) -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
-    base.join("relay").join("runs").join(name)
+    base.join("drovr").join("runs").join(name)
 }
 
 impl RunState {
@@ -57,13 +57,13 @@ mod tests {
     #[test]
     fn run_dir_uses_xdg() {
         let _lock = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/relay-xdg-test"); }
-        assert_eq!(run_dir("demo"), PathBuf::from("/tmp/relay-xdg-test/relay/runs/demo"));
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test"); }
+        assert_eq!(run_dir("demo"), PathBuf::from("/tmp/drovr-xdg-test/drovr/runs/demo"));
     }
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {
         let _lock = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/relay-xdg-test2"); }
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test2"); }
         let s = RunState { name:"demo".into(), task:"t".into(),
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},

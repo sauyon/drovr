@@ -1,4 +1,4 @@
-//! Gated end-to-end smoke test for the `relay` CLI.
+//! Gated end-to-end smoke test for the `drovr` CLI.
 //!
 //! Prerequisites checked at test start:
 //!   1. `herdr` is on PATH.
@@ -14,11 +14,11 @@
 //! session is not appropriate in CI.
 //!
 //! Runnable assertions (no integration agent required):
-//!   • `relay new`  → state.json exists with 4 seeded phases.
-//!   • `relay serve` in background → `/state` returns `idle`.
+//!   • `drovr new`  → state.json exists with 4 seeded phases.
+//!   • `drovr serve` in background → `/state` returns `idle`.
 //!   • `POST /submit` (request-changes) → `/state` becomes `waiting`.
-//!   • `relay review summary` → `/state` becomes `ready`.
-//!   • `relay cleanup --purge` → run dir removed.
+//!   • `drovr review summary` → `/state` becomes `ready`.
+//!   • `drovr cleanup --purge` → run dir removed.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -116,19 +116,19 @@ fn free_port() -> u16 {
 }
 
 // ---------------------------------------------------------------------------
-// Locate the relay binary
+// Locate the drovr binary
 // ---------------------------------------------------------------------------
 
-fn relay_binary() -> PathBuf {
+fn drovr_binary() -> PathBuf {
     // Prefer the binary produced by `cargo test` (same profile).
     // CARGO_TARGET_DIR may be set; fall back to conventional location.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = manifest.join("target/debug/relay");
+    let bin = manifest.join("target/debug/drovr");
     if bin.exists() {
         return bin;
     }
     // Workspace target dir (one level up from cli/)
-    let ws_bin = manifest.parent().unwrap_or(&manifest).join("target/debug/relay");
+    let ws_bin = manifest.parent().unwrap_or(&manifest).join("target/debug/drovr");
     if ws_bin.exists() {
         return ws_bin;
     }
@@ -172,33 +172,33 @@ fn e2e_smoke() {
     // ---- Setup: isolated XDG_DATA_HOME -------------------------------------
 
     let tmp = tempfile::Builder::new()
-        .prefix("relay-e2e-")
+        .prefix("drovr-e2e-")
         .tempdir()
         .expect("tempdir");
     let xdg = tmp.path().to_path_buf();
 
     let run_name = "e2e-smoke";
-    let run_dir: PathBuf = xdg.join("relay/runs").join(run_name);
+    let run_dir: PathBuf = xdg.join("drovr/runs").join(run_name);
 
-    let relay = relay_binary();
-    assert!(relay.exists(), "relay binary not found at {:?}; run `cargo build` first", relay);
+    let drovr = drovr_binary();
+    assert!(drovr.exists(), "drovr binary not found at {:?}; run `cargo build` first", drovr);
 
-    // Helper: run relay with our XDG_DATA_HOME set
+    // Helper: run drovr with our XDG_DATA_HOME set
     let base_cmd = || {
-        let mut c = Command::new(&relay);
+        let mut c = Command::new(&drovr);
         c.env("XDG_DATA_HOME", &xdg);
         c
     };
 
-    // ---- Step 1: relay new -------------------------------------------------
+    // ---- Step 1: drovr new -------------------------------------------------
 
     let out = base_cmd()
         .args(["new", run_name, "--task", "demo"])
         .output()
-        .expect("relay new");
+        .expect("drovr new");
     assert!(
         out.status.success(),
-        "relay new failed: {}",
+        "drovr new failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -223,20 +223,20 @@ fn e2e_smoke() {
         "unexpected phase names: {:?}",
         phase_names
     );
-    println!("e2e: relay new OK — state.json exists with {} phases", phases.len());
+    println!("e2e: drovr new OK — state.json exists with {} phases", phases.len());
 
-    // ---- Step 2: relay serve + review cycle --------------------------------
+    // ---- Step 2: drovr serve + review cycle --------------------------------
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    // Start `relay serve` in a background child process.
+    // Start `drovr serve` in a background child process.
     let serve_child = base_cmd()
         .args(["serve", run_name, "--host", "127.0.0.1", "--port", &port.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("relay serve");
+        .expect("drovr serve");
     let _guard = KillOnDrop(serve_child);
 
     // Poll until the server is reachable and reports `idle`.
@@ -244,7 +244,7 @@ fn e2e_smoke() {
         poll_state(&addr, "idle", Duration::from_secs(5)),
         "timed out waiting for serve to reach idle state at {addr}"
     );
-    println!("e2e: relay serve started — state=idle");
+    println!("e2e: drovr serve started — state=idle");
 
     // POST /submit (request-changes + feedback) → state should become `waiting`
     let submit_payload =
@@ -264,14 +264,14 @@ fn e2e_smoke() {
         "GET /state should be waiting: {state_body}"
     );
 
-    // `relay review summary` → state should become `ready`
+    // `drovr review summary` → state should become `ready`
     let out = base_cmd()
         .args(["review", "summary", run_name, "agent completed the requested changes"])
         .output()
-        .expect("relay review summary");
+        .expect("drovr review summary");
     assert!(
         out.status.success(),
-        "relay review summary failed: {}",
+        "drovr review summary failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -280,9 +280,9 @@ fn e2e_smoke() {
         state_body.contains(r#""state":"ready""#),
         "GET /state should be ready after summary: {state_body}"
     );
-    println!("e2e: relay review summary OK — state=ready");
+    println!("e2e: drovr review summary OK — state=ready");
 
-    // ---- Step 3: relay cleanup --purge ------------------------------------
+    // ---- Step 3: drovr cleanup --purge ------------------------------------
 
     // Drop the serve guard first to free the port cleanly.
     drop(_guard);
@@ -290,10 +290,10 @@ fn e2e_smoke() {
     let out = base_cmd()
         .args(["cleanup", run_name, "--purge"])
         .output()
-        .expect("relay cleanup");
+        .expect("drovr cleanup");
     assert!(
         out.status.success(),
-        "relay cleanup failed: {}",
+        "drovr cleanup failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
@@ -301,7 +301,7 @@ fn e2e_smoke() {
         "run dir still exists after --purge: {:?}",
         run_dir
     );
-    println!("e2e: relay cleanup --purge OK — run dir removed");
+    println!("e2e: drovr cleanup --purge OK — run dir removed");
 
     println!("e2e: all assertions passed");
 }

@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 /// A freshly created herdr workspace: just its id. The workspace's auto-created
 /// root shell pane is left alone for the life of the run — closing any pane
 /// makes herdr reassign focus and disturbs the user — and is torn down together
-/// with every phase pane by the single `workspace_close` at `relay cleanup`.
+/// with every phase pane by the single `workspace_close` at `drovr cleanup`.
 #[derive(Debug)]
 pub struct Workspace {
     pub id: String,
@@ -20,7 +20,7 @@ pub trait Herdr {
     /// Create a new herdr workspace with the given label; returns its id.
     fn workspace_create(&self, label: &str) -> io::Result<Workspace>;
     /// Close a herdr workspace (closes all its panes). This is the only pane
-    /// teardown relay performs — once, at end-of-run.
+    /// teardown drovr performs — once, at end-of-run.
     fn workspace_close(&self, id: &str) -> io::Result<()>;
     fn agent_start(
         &self,
@@ -397,11 +397,11 @@ mod tests {
     }
 
     // workspace_create returns a workspace id; the root pane is never surfaced
-    // because relay never closes it (teardown is a single workspace_close).
+    // because drovr never closes it (teardown is a single workspace_close).
     #[test]
     fn fake_workspace_create_returns_id() {
         let h = FakeHerdr::new();
-        let ws = h.workspace_create("relay:demo").unwrap();
+        let ws = h.workspace_create("drovr:demo").unwrap();
         assert!(!ws.id.is_empty());
         let call = &h.calls()[0];
         assert!(call.contains("workspace_create"), "call: {call}");

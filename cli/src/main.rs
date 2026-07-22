@@ -19,7 +19,7 @@ use std::process;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Parser)]
-#[command(name = "relay", about = "Relay workflow manager")]
+#[command(name = "drovr", about = "Drovr workflow manager")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -107,7 +107,7 @@ enum PhaseCmd {
         timeout_ms: u64,
     },
     /// Mark a phase complete. Run by the phase AGENT itself as its final
-    /// action — it drops the completion marker `relay phase wait` polls for.
+    /// action — it drops the completion marker `drovr phase wait` polls for.
     Done {
         run: String,
         phase_name: String,
@@ -143,14 +143,14 @@ fn validate_run_name(name: &str) -> io::Result<()> {
 
 fn load_run(name: &str) -> RunState {
     RunState::load(name).unwrap_or_else(|e| {
-        eprintln!("relay: failed to load run '{name}': {e}");
+        eprintln!("drovr: failed to load run '{name}': {e}");
         process::exit(1);
     })
 }
 
 fn save_run(run: &RunState) {
     run.save().unwrap_or_else(|e| {
-        eprintln!("relay: failed to save run '{}': {e}", run.name);
+        eprintln!("drovr: failed to save run '{}': {e}", run.name);
         process::exit(1);
     });
 }
@@ -186,7 +186,7 @@ fn cmd_list() {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share")
         });
-    let runs_dir = base.join("relay").join("runs");
+    let runs_dir = base.join("drovr").join("runs");
 
     let entries = match std::fs::read_dir(&runs_dir) {
         Ok(e) => e,
@@ -219,7 +219,7 @@ fn cmd_list() {
 
 fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &SystemHerdr) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     if !herdr.integration_present() {
@@ -230,14 +230,14 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
     let project_dir = match dir {
         Some(d) => {
             if !d.exists() {
-                eprintln!("relay: --dir path does not exist: {}", d.display());
+                eprintln!("drovr: --dir path does not exist: {}", d.display());
                 process::exit(1);
             }
             d.to_string_lossy().into_owned()
         }
         None => std::env::current_dir()
             .unwrap_or_else(|e| {
-                eprintln!("relay: cannot determine current directory: {e}");
+                eprintln!("drovr: cannot determine current directory: {e}");
                 process::exit(1);
             })
             .to_string_lossy()
@@ -246,10 +246,10 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    let workspace = match herdr.workspace_create(&format!("relay:{name}")) {
+    let workspace = match herdr.workspace_create(&format!("drovr:{name}")) {
         Ok(ws) => Some(ws.id),
         Err(e) => {
-            eprintln!("relay: warning: could not create herdr workspace: {e}");
+            eprintln!("drovr: warning: could not create herdr workspace: {e}");
             None
         }
     };
@@ -299,7 +299,7 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
 
 fn cmd_status(name: &str) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
@@ -324,7 +324,7 @@ fn cmd_status(name: &str) {
 
 fn cmd_attach(name: &str) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
@@ -345,7 +345,7 @@ fn cmd_attach(name: &str) {
                 .args(["agent", "attach", id])
                 .status()
                 .unwrap_or_else(|e| {
-                    eprintln!("relay: failed to exec herdr: {e}");
+                    eprintln!("drovr: failed to exec herdr: {e}");
                     process::exit(1);
                 });
             if !status.success() {
@@ -353,7 +353,7 @@ fn cmd_attach(name: &str) {
             }
         }
         None => {
-            eprintln!("relay: no active pane for run '{name}'; try 'relay phase start {name} <phase>'");
+            eprintln!("drovr: no active pane for run '{name}'; try 'drovr phase start {name} <phase>'");
             process::exit(1);
         }
     }
@@ -361,7 +361,7 @@ fn cmd_attach(name: &str) {
 
 fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
@@ -371,13 +371,13 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
     if let Some(ws_id) = &run.workspace
         && let Err(e) = herdr.workspace_close(ws_id)
     {
-        eprintln!("relay: warning: workspace_close({ws_id}) failed: {e}");
+        eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
     }
 
     if purge {
         let dir = run_dir(name);
         if let Err(e) = std::fs::remove_dir_all(&dir) {
-            eprintln!("relay: failed to remove run dir {}: {e}", dir.display());
+            eprintln!("drovr: failed to remove run dir {}: {e}", dir.display());
             process::exit(1);
         }
         println!("cleaned up and purged run '{name}'");
@@ -388,7 +388,7 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
 
 fn cmd_resurrect(name: &str) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
@@ -404,7 +404,7 @@ fn cmd_resurrect(name: &str) {
             }
             println!();
             println!(
-                "To resume: relay phase start {name} {}",
+                "To resume: drovr phase start {name} {}",
                 run.phases[idx].name
             );
         }
@@ -416,11 +416,11 @@ fn cmd_resurrect(name: &str) {
 
 fn cmd_serve(name: &str, host: &str, port: u16) {
     if let Err(e) = validate_run_name(name) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     if let Err(e) = serve(name, host, port) {
-        eprintln!("relay: serve failed: {e}");
+        eprintln!("drovr: serve failed: {e}");
         process::exit(1);
     }
 }
@@ -436,30 +436,30 @@ fn cmd_phase(sub: PhaseCmd) {
     match sub {
         PhaseCmd::Start { run, phase_name, seed } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             let mut state = load_run(&run);
             if let Err(e) = phase_start(&h, &mut state, &phase_name, seed.as_deref()) {
-                eprintln!("relay: phase start failed: {e}");
+                eprintln!("drovr: phase start failed: {e}");
                 process::exit(1);
             }
             println!("started phase '{phase_name}' for run '{run}'");
         }
         PhaseCmd::Send { run, phase_name, text } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             let state = load_run(&run);
             if let Err(e) = phase_send(&h, &state, &phase_name, &text) {
-                eprintln!("relay: phase send failed: {e}");
+                eprintln!("drovr: phase send failed: {e}");
                 process::exit(1);
             }
         }
         PhaseCmd::Wait { run, phase_name, timeout_ms } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             let mut state = load_run(&run);
@@ -470,35 +470,35 @@ fn cmd_phase(sub: PhaseCmd) {
                     process::exit(2);
                 }
                 Err(e) => {
-                    eprintln!("relay: phase wait failed: {e}");
+                    eprintln!("drovr: phase wait failed: {e}");
                     process::exit(1);
                 }
             }
         }
         PhaseCmd::Done { run, phase_name } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             let state = load_run(&run);
             match phase_done(&state, &phase_name) {
                 Ok(path) => println!("marked phase '{phase_name}' done ({})", path.display()),
                 Err(e) => {
-                    eprintln!("relay: phase done failed: {e}");
+                    eprintln!("drovr: phase done failed: {e}");
                     process::exit(1);
                 }
             }
         }
         PhaseCmd::Compress { run, phase_name } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             let state = load_run(&run);
             match phase_compress(&h, &r, &state, &phase_name) {
                 Ok(path) => println!("handoff written to {}", path.display()),
                 Err(e) => {
-                    eprintln!("relay: phase compress failed: {e}");
+                    eprintln!("drovr: phase compress failed: {e}");
                     process::exit(1);
                 }
             }
@@ -508,14 +508,14 @@ fn cmd_phase(sub: PhaseCmd) {
 
 fn cmd_collect(run: &str, phase_name: &str) {
     if let Err(e) = validate_run_name(run) {
-        eprintln!("relay: {e}");
+        eprintln!("drovr: {e}");
         process::exit(1);
     }
     let state = load_run(run);
     match collect(&state, phase_name) {
         Ok(content) => print!("{content}"),
         Err(e) => {
-            eprintln!("relay: collect failed: {e}");
+            eprintln!("drovr: collect failed: {e}");
             process::exit(1);
         }
     }
@@ -525,11 +525,11 @@ fn cmd_review(sub: ReviewCmd) {
     match sub {
         ReviewCmd::Summary { run, text } => {
             if let Err(e) = validate_run_name(&run) {
-                eprintln!("relay: {e}");
+                eprintln!("drovr: {e}");
                 process::exit(1);
             }
             if let Err(e) = review_summary(&run, &text) {
-                eprintln!("relay: review summary failed: {e}");
+                eprintln!("drovr: review summary failed: {e}");
                 process::exit(1);
             }
         }
@@ -585,19 +585,19 @@ mod tests {
 
     #[test]
     fn parse_list() {
-        let cli = parse(&["relay", "list"]).unwrap();
+        let cli = parse(&["drovr", "list"]).unwrap();
         assert!(matches!(cli.command, Commands::List));
     }
 
     #[test]
     fn parse_new_no_task() {
-        let cli = parse(&["relay", "new", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "new", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::New { name, task: None, .. } if name == "myrun"));
     }
 
     #[test]
     fn parse_new_with_task() {
-        let cli = parse(&["relay", "new", "myrun", "--task", "build a thing"]).unwrap();
+        let cli = parse(&["drovr", "new", "myrun", "--task", "build a thing"]).unwrap();
         match cli.command {
             Commands::New { name, task, .. } => {
                 assert_eq!(name, "myrun");
@@ -609,37 +609,37 @@ mod tests {
 
     #[test]
     fn parse_status() {
-        let cli = parse(&["relay", "status", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "status", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Status { name } if name == "myrun"));
     }
 
     #[test]
     fn parse_attach() {
-        let cli = parse(&["relay", "attach", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "attach", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Attach { name } if name == "myrun"));
     }
 
     #[test]
     fn parse_cleanup_no_purge() {
-        let cli = parse(&["relay", "cleanup", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "cleanup", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Cleanup { name, purge: false } if name == "myrun"));
     }
 
     #[test]
     fn parse_cleanup_purge() {
-        let cli = parse(&["relay", "cleanup", "myrun", "--purge"]).unwrap();
+        let cli = parse(&["drovr", "cleanup", "myrun", "--purge"]).unwrap();
         assert!(matches!(cli.command, Commands::Cleanup { name, purge: true } if name == "myrun"));
     }
 
     #[test]
     fn parse_resurrect() {
-        let cli = parse(&["relay", "resurrect", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "resurrect", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Resurrect { name } if name == "myrun"));
     }
 
     #[test]
     fn parse_serve_defaults() {
-        let cli = parse(&["relay", "serve", "myrun"]).unwrap();
+        let cli = parse(&["drovr", "serve", "myrun"]).unwrap();
         match cli.command {
             Commands::Serve { name, host, port } => {
                 assert_eq!(name, "myrun");
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn parse_serve_custom_port() {
-        let cli = parse(&["relay", "serve", "demo", "--port", "9000"]).unwrap();
+        let cli = parse(&["drovr", "serve", "demo", "--port", "9000"]).unwrap();
         match cli.command {
             Commands::Serve { name, port, .. } => {
                 assert_eq!(name, "demo");
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn parse_phase_start() {
-        let cli = parse(&["relay", "phase", "start", "myrun", "brainstorm"]).unwrap();
+        let cli = parse(&["drovr", "phase", "start", "myrun", "brainstorm"]).unwrap();
         match cli.command {
             Commands::Phase { sub: PhaseCmd::Start { run, phase_name, seed } } => {
                 assert_eq!(run, "myrun");
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn parse_phase_start_with_seed() {
-        let cli = parse(&["relay", "phase", "start", "myrun", "brainstorm", "--seed", "/tmp/seed.md"]).unwrap();
+        let cli = parse(&["drovr", "phase", "start", "myrun", "brainstorm", "--seed", "/tmp/seed.md"]).unwrap();
         match cli.command {
             Commands::Phase { sub: PhaseCmd::Start { seed, .. } } => {
                 assert_eq!(seed.as_deref(), Some(std::path::Path::new("/tmp/seed.md")));
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn parse_phase_send() {
-        let cli = parse(&["relay", "phase", "send", "myrun", "plan", "hello"]).unwrap();
+        let cli = parse(&["drovr", "phase", "send", "myrun", "plan", "hello"]).unwrap();
         match cli.command {
             Commands::Phase { sub: PhaseCmd::Send { run, phase_name, text } } => {
                 assert_eq!(run, "myrun");
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn parse_phase_wait_default_timeout() {
-        let cli = parse(&["relay", "phase", "wait", "myrun", "plan"]).unwrap();
+        let cli = parse(&["drovr", "phase", "wait", "myrun", "plan"]).unwrap();
         match cli.command {
             Commands::Phase { sub: PhaseCmd::Wait { timeout_ms, .. } } => {
                 assert_eq!(timeout_ms, 30_000);
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn parse_phase_compress() {
-        let cli = parse(&["relay", "phase", "compress", "demo", "plan"]).unwrap();
+        let cli = parse(&["drovr", "phase", "compress", "demo", "plan"]).unwrap();
         match cli.command {
             Commands::Phase { sub: PhaseCmd::Compress { run, phase_name } } => {
                 assert_eq!(run, "demo");
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn parse_collect() {
-        let cli = parse(&["relay", "collect", "myrun", "brainstorm"]).unwrap();
+        let cli = parse(&["drovr", "collect", "myrun", "brainstorm"]).unwrap();
         match cli.command {
             Commands::Collect { run, phase_name } => {
                 assert_eq!(run, "myrun");
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn parse_review_summary() {
-        let cli = parse(&["relay", "review", "summary", "myrun", "the text"]).unwrap();
+        let cli = parse(&["drovr", "review", "summary", "myrun", "the text"]).unwrap();
         match cli.command {
             Commands::Review { sub: ReviewCmd::Summary { run, text } } => {
                 assert_eq!(run, "myrun");
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_errors() {
-        assert!(parse(&["relay", "bogus"]).is_err());
+        assert!(parse(&["drovr", "bogus"]).is_err());
     }
 
     // -- validate_run_name tests -----------------------------------------------

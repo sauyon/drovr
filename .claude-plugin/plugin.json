@@ -1,12 +1,12 @@
 {
-  "name": "relay",
-  "description": "Single-writer + read-only-explorer workflow discipline: drive the relay CLI to run bounded, clean-context phases with compressed handoffs and a human spec gate",
+  "name": "drovr",
+  "description": "Single-writer + read-only-explorer workflow discipline: drive the drovr CLI to run bounded, clean-context phases with compressed handoffs and a human spec gate",
   "version": "0.1.0",
   "author": {
     "name": "Sauyon Lee"
   },
   "keywords": [
-    "relay",
+    "drovr",
     "handoff",
     "pipeline",
     "phases",

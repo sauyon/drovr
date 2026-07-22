@@ -301,7 +301,7 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
 /// Start the review HTTP server.
 ///
 /// The bound address is written to `<run_dir>/review.addr` immediately after
-/// the socket opens, so `relay review summary` can discover the port.
+/// the socket opens, so `drovr review summary` can discover the port.
 ///
 /// `spec_path` is `run_dir(run)/spec.md`; missing spec is handled gracefully
 /// (`GET /doc` returns an empty body).
@@ -326,7 +326,7 @@ pub fn serve(run: &str, host: &str, port: u16) -> io::Result<()> {
         .unwrap_or_else(|| addr.clone());
     fs::write(&addr_file, bound_addr.as_bytes())?;
 
-    eprintln!("relay review listening on http://{}", bound_addr);
+    eprintln!("drovr review listening on http://{}", bound_addr);
     eprintln!("  run:  {}", run);
     eprintln!("  spec: {:?}", spec_path);
 
@@ -340,7 +340,7 @@ pub fn serve(run: &str, host: &str, port: u16) -> io::Result<()> {
     Ok(())
 }
 
-/// POST summary text to the running review server (`relay review summary`).
+/// POST summary text to the running review server (`drovr review summary`).
 ///
 /// Reads the bound address from `<run_dir>/review.addr` written by [`serve`].
 pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
@@ -348,7 +348,7 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     let addr = fs::read_to_string(&addr_file).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("review server address not found ({}); is `relay serve` running for run {:?}? ({})", addr_file.display(), run, e),
+            format!("review server address not found ({}); is `drovr serve` running for run {:?}? ({})", addr_file.display(), run, e),
         )
     })?;
     let addr = addr.trim();
@@ -451,7 +451,7 @@ mod tests {
 
     fn make_workdir(suffix: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
-            .prefix(&format!("relay-review-test-{suffix}"))
+            .prefix(&format!("drovr-review-test-{suffix}"))
             .tempdir()
             .expect("tempdir")
     }
@@ -590,7 +590,7 @@ mod tests {
 
         let (status, body) = http_get(&addr, "/");
         assert_eq!(status, 200);
-        assert!(body.contains("Relay Review"), "body should contain title: {}", &body[..200.min(body.len())]);
+        assert!(body.contains("Drovr Review"), "body should contain title: {}", &body[..200.min(body.len())]);
     }
 
     #[test]
@@ -626,7 +626,7 @@ mod tests {
         let tmp = make_workdir("rev-summary");
         let run_name = "test-review-summary-fn";
         let fake_base = tmp.path().to_path_buf();
-        let fake_run_dir = fake_base.join("relay/runs").join(run_name);
+        let fake_run_dir = fake_base.join("drovr/runs").join(run_name);
         fs::create_dir_all(&fake_run_dir).unwrap();
         let spec = fake_run_dir.join("spec.md");
         fs::write(&spec, b"# Spec").unwrap();

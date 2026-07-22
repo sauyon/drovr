@@ -1,6 +1,6 @@
 <!--
-  Contract for `<phase>-HANDOFF.md` — the doc `relay phase compress` writes and
-  `relay collect` reads. These seven sections and headings are fixed; they mirror the
+  Contract for `<phase>-HANDOFF.md` — the doc `drovr phase compress` writes and
+  `drovr collect` reads. These seven sections and headings are fixed; they mirror the
   compressor's own instructions (cli/assets/compress-prompt.md), so the compressed output
   will already look like this. Use this file to understand what each section is FOR — when
   reviewing a handoff, or when hand-writing one for a phase you ran without the compressor.

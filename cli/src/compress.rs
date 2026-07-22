@@ -162,7 +162,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "XDG_DATA_HOME",
-                format!("/tmp/relay-compress-test-{name}"),
+                format!("/tmp/drovr-compress-test-{name}"),
             );
         }
         RunState {
@@ -172,7 +172,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
-            project_dir: "/tmp/relay-proj-test".into(),
+            project_dir: "/tmp/drovr-proj-test".into(),
         }
     }
 
@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(args, &["-p", "--permission-mode", "plan"]);
         // stdin must contain the fixed COMPRESS_PROMPT prefix
         assert!(
-            stdin.contains("You are relay's handoff compressor"),
+            stdin.contains("You are drovr's handoff compressor"),
             "stdin missing COMPRESS_PROMPT preamble"
         );
         // stdin must contain the section headings

@@ -9,7 +9,7 @@ use crate::run::{Phase, PhaseStatus, RunState, run_dir};
 /// How often `phase_wait` polls the filesystem for the completion marker.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Path of the completion marker a phase agent drops via `relay phase done`.
+/// Path of the completion marker a phase agent drops via `drovr phase done`.
 fn done_marker(run: &str, phase: &str) -> PathBuf {
     run_dir(run).join(format!("{phase}.done"))
 }
@@ -52,7 +52,7 @@ pub fn phase_start<H: Herdr>(
             io::ErrorKind::InvalidInput,
             format!(
                 "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `relay new`",
+                 please recreate the run with `drovr new`",
                 run.name
             ),
         ));
@@ -89,7 +89,7 @@ pub fn phase_start<H: Herdr>(
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
     // focus, disturbing the user. The run's workspace (root pane + every phase
-    // pane) is torn down in one shot at the end by `relay cleanup`
+    // pane) is torn down in one shot at the end by `drovr cleanup`
     // (`workspace_close`), once the user confirms.
     run.save()?;
     Ok(())
@@ -107,7 +107,7 @@ pub fn phase_send<H: Herdr>(
 }
 
 /// Mark a phase complete by dropping its completion marker. Run BY the phase
-/// agent itself as its final action (via `relay phase done`), NOT by the
+/// agent itself as its final action (via `drovr phase done`), NOT by the
 /// orchestrator — it is the only reliable "the agent finished" signal, since
 /// herdr's `idle` status also fires while an agent is merely parked awaiting a
 /// subagent. Writing a marker file (rather than mutating `state.json`) keeps
@@ -125,7 +125,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
 }
 
 /// Poll the filesystem for the phase's completion marker (dropped by the phase
-/// agent via `relay phase done`) until it appears or `timeout_ms` elapses.
+/// agent via `drovr phase done`) until it appears or `timeout_ms` elapses.
 /// Marks the phase Done (and saves) when found; leaves it Running on timeout.
 /// Deliberately does NOT consult herdr status: `idle` is not a completion
 /// signal (it also fires when an agent is parked awaiting its own subagent).
@@ -177,7 +177,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "XDG_DATA_HOME",
-                format!("/tmp/relay-phase-test-{name}"),
+                format!("/tmp/drovr-phase-test-{name}"),
             );
         }
         // Start each test from a clean run dir so a stale `.done` marker or
@@ -190,7 +190,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
-            project_dir: "/tmp/relay-proj-test".into(),
+            project_dir: "/tmp/drovr-proj-test".into(),
         }
     }
 
