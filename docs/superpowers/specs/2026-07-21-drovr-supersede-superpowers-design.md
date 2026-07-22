@@ -211,7 +211,9 @@ session-start hook fires                    session-start hook NO-OPS
   HANDOFF and a correct resume pointer, mirroring the existing compress tests.
 - **Docs:** grep-level check that "context rot" attribution and the
   three-levers framing are corrected everywhere.
-- Existing 59 tests must stay green.
+- Existing tests must stay green (baseline was 70 at the start of this work; the
+  drovr-v2 implementation brought it to 85). The "59" figure in earlier drafts was
+  stale.
 
 ## Open questions
 

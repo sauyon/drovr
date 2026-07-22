@@ -28,7 +28,10 @@ The single instruction to the next agent: what to do first.
 
 ## Artifact pointers
 Paths to the real files (specs, code, logs) — pointers, NOT pasted content. The next agent
-re-reads source on demand.
+re-reads source on demand. This section MUST include git references — the branch and the
+commit range/SHAs that carry this phase's work — so the next agent reads `git log`/`git diff`
+to reconstruct state from history, not just trust this summary. Git is the durable
+cross-check against lossy compression.
 
 Rules:
 - Compress hard. Drop process narration, tool logs, retries, restated instructions,

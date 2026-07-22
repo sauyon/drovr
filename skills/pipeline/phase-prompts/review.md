@@ -14,12 +14,11 @@ You did not write this code — review it as a skeptic, not its author.
    `~/.local/share/drovr/runs/<run>/spec.md`, the task reports appended below, and then the
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the
    reports.
-2. **Check, in order:**
-   - **Spec compliance** — does the change do what `spec.md` agreed to, no more, no less?
-   - **Correctness** — real bugs, unhandled cases, broken invariants.
-   - **Verification** — do the claimed tests exist and actually exercise the behavior? Run
-     them if you can.
-   - **Quality** — reuse, simplification, and consistency with surrounding code.
+2. **Review against the checklist — apply the check discipline from `drovr:code-review`
+   directly; do NOT dispatch review subagents.** You *are* the reviewer this phase, so work its
+   "Check, in order" list yourself — spec compliance → correctness → verification → quality —
+   as a skeptic, not the author, and run the claimed tests if you can. (That skill's "How to
+   run it" section is written for a phase that *launches* reviewers; it does not apply here.)
 3. **Write the verdict** to `~/.local/share/drovr/runs/<run>/verdict.md`:
    - an overall call: **approve / approve-with-fixes / changes-required**,
    - each finding with file:line, severity, and why it matters,

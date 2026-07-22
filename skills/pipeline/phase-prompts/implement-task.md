@@ -13,24 +13,20 @@ tasks; later tasks run as their own fresh phases.
 
 1. **Read** the task brief and the accumulated interfaces below, then read the real code you
    will touch (read-only explorers for anything you only need to understand, not change).
-2. **Implement test-first.** Write the failing test named in the task's verification, watch
-   it fail, then write the minimal code to pass. Keep changes scoped to this task's
-   interfaces so the folded-forward contracts stay accurate.
-3. **Verify before claiming done.** Run the task's tests (and the build/linter) and confirm
-   they pass — evidence, not assertion.
-4. **Self-review before reporting done — REQUIRED.** Do NOT declare the task done off your own
-   judgment. Launch one or more **read-only review subagents** (Claude Code Agent tool,
-   `subagent_type: general-purpose`, model `sonnet`) to adversarially review the change you
-   just made — correctness bugs, spec/plan compliance, and whether the tests actually exercise
-   the behavior. Review subagents are read-only, so drovr's single-writer discipline still
-   holds: they find, you fix. **Run these subagents in the FOREGROUND (blocking) — do NOT set
-   `run_in_background`, and do NOT yield or schedule a wakeup waiting on them.** A backgrounded
-   subagent leaves you parked mid-turn, which drovr cannot distinguish from completion and
-   which stalls the run until a human nudges the pane; blocking keeps you working straight
-   through to your final step. **Address every Critical and Important finding** (re-run the
-   tests after fixing), and record any finding you consciously chose not to fix, with the
-   reason. Only after this may you report done. This is IN ADDITION to the pipeline's final
-   review phase — catch it here, cheaply, before it cascades.
+2. **Implement test-first — apply `drovr:tdd`.** The test to write first is the one named in
+   this task's verification; keep it scoped to this task's interfaces so the folded-forward
+   contracts stay accurate.
+3. **Verify before claiming done — apply `drovr:verification-before-completion`** on this
+   task's tests and the build/linter.
+4. **Self-review before reporting done — apply `drovr:code-review`** (read-only review
+   subagents, foreground). Do NOT declare the task done off your own judgment. The skill has
+   the how-to and the check order; the one constraint below is repeated here because the whole
+   run depends on it: **run the review subagents in the
+   FOREGROUND (blocking) — do NOT set `run_in_background`, and do NOT yield or schedule a
+   wakeup waiting on them.** A backgrounded subagent leaves you parked mid-turn, which drovr
+   cannot distinguish from completion and which stalls the run until a human nudges the pane;
+   blocking keeps you working straight through to your final step. This is IN ADDITION to the
+   pipeline's final review phase — catch it here, cheaply, before it cascades.
 5. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
    - what changed (files + the interfaces you actually implemented, verbatim),
    - test/verification output proving it works,

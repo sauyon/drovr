@@ -6,6 +6,14 @@ review), routes each phase to a Claude agent pane via
 [herdr](https://github.com/sauyon/herdr), compresses finished phases into
 handoff docs, and runs a local HTTP server for the human review loop.
 
+Drovr leans on all three context-engineering levers
+(anthropic.com/engineering/effective-context-engineering-for-ai-agents), not compaction alone:
+**compaction** (the handoff docs), **note-taking / git** (phases re-read source from artifact
+pointers rather than carrying a transcript forward), and **sub-agents** (read-only explorers
+do fan-out investigation). Fresh, bounded contexts are what guard against Chroma's *context
+rot* (trychroma.com/research/context-rot) — the output degradation that sets in as a window
+fills.
+
 ## Prerequisites
 
 - **herdr** — terminal-based AI agent session manager.

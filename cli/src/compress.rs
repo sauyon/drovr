@@ -112,6 +112,27 @@ pub fn compress<R: CmdRunner>(
 }
 
 // ---------------------------------------------------------------------------
+// handoff_self
+// ---------------------------------------------------------------------------
+
+/// Compress `transcript` into a 7-section HANDOFF and write it to `out`. Returns `out`.
+pub fn handoff_self<R: CmdRunner>(
+    r: &R,
+    transcript: &str,
+    objective: &str,
+    out: &std::path::Path,
+) -> io::Result<std::path::PathBuf> {
+    let doc = compress(r, transcript, objective)?;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, &doc)?;
+    Ok(out.to_path_buf())
+}
+
+// ---------------------------------------------------------------------------
 // phase_compress
 // ---------------------------------------------------------------------------
 
@@ -208,6 +229,25 @@ mod tests {
         // stdin must contain the caller-supplied content
         assert!(stdin.contains("do the objective"), "stdin missing objective text");
         assert!(stdin.contains("the transcript text"), "stdin missing transcript");
+    }
+
+    #[test]
+    fn compress_prompt_requires_git_pointers() {
+        // The Artifact-pointers guidance must require git references (branch +
+        // commit range/SHAs) so a fresh phase can re-derive load-bearing
+        // decisions from history rather than trusting the lossy summary alone.
+        // Scope the "git" check to the Artifact-pointers section itself so the
+        // test fails if the requirement is removed even should "git" appear
+        // elsewhere in the prompt later.
+        let section = COMPRESS_PROMPT
+            .split("## Artifact pointers")
+            .nth(1)
+            .expect("compress prompt missing '## Artifact pointers' section");
+        assert!(
+            section.to_lowercase().contains("git"),
+            "compress prompt's Artifact-pointers section must require git references \
+             (branch + commit range) — guards against lossy compression"
+        );
     }
 
     #[test]
@@ -325,5 +365,46 @@ mod tests {
 
         let result = phase_compress(&h, &runner, &run, "ghost");
         assert!(result.is_err());
+    }
+
+    // -- handoff_self ------------------------------------------------------------
+
+    #[test]
+    fn handoff_self_writes_doc() {
+        let runner = FakeRunner::new();
+        runner.push_stdout("## Objective\nSelf-serve handoff content.");
+
+        let out = std::path::PathBuf::from("/tmp/drovr-handoff-self-test/HANDOFF.md");
+        let _ = std::fs::remove_file(&out);
+
+        let path = handoff_self(&runner, "the transcript text", "my objective", &out).unwrap();
+
+        assert_eq!(path, out);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "## Objective\nSelf-serve handoff content.");
+    }
+
+    #[test]
+    fn handoff_self_uses_compress_prompt() {
+        let runner = FakeRunner::new();
+        runner.push_stdout("handoff doc");
+
+        let out = std::path::PathBuf::from("/tmp/drovr-handoff-self-test/prompt-check.md");
+        handoff_self(&runner, "the transcript text", "do the objective", &out).unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        let (cmd, args, stdin) = &calls[0];
+        assert_eq!(cmd, "claude");
+        assert_eq!(args, &["-p", "--permission-mode", "plan"]);
+        // The COMPRESS_PROMPT preamble is what proves handoff_self routed
+        // through compress() rather than building its own prompt.
+        assert!(
+            stdin.contains("You are drovr's handoff compressor"),
+            "stdin missing COMPRESS_PROMPT preamble — handoff_self did not route through compress()"
+        );
+        assert!(stdin.contains("## OBJECTIVE"), "stdin missing ## OBJECTIVE heading");
+        assert!(stdin.contains("do the objective"), "stdin missing objective text");
+        assert!(stdin.contains("the transcript text"), "stdin missing transcript");
     }
 }

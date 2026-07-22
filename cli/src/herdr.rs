@@ -27,6 +27,7 @@ pub trait Herdr {
         name: &str,
         cwd: &str,
         workspace: Option<&str>,
+        phase_id: Option<&str>,
         argv: &[String],
     ) -> io::Result<String>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
@@ -93,9 +94,10 @@ impl Herdr for SystemHerdr {
         name: &str,
         cwd: &str,
         workspace: Option<&str>,
+        phase_id: Option<&str>,
         argv: &[String],
     ) -> io::Result<String> {
-        let args = build_agent_start_args(name, cwd, workspace, argv);
+        let args = build_agent_start_args(name, cwd, workspace, phase_id, argv);
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = self.run(&args_refs)?;
         if !out.status.success() {
@@ -178,6 +180,7 @@ fn build_agent_start_args(
     name: &str,
     cwd: &str,
     workspace: Option<&str>,
+    phase_id: Option<&str>,
     argv: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> =
@@ -193,6 +196,12 @@ fn build_agent_start_args(
             args.push("--env".into());
             args.push(format!("{var}={val}"));
         }
+    }
+    // Mark this as a drovr-spawned phase agent so the reflex hook no-ops
+    // (presence of DROVR_PHASE ⇒ drovr-spawned; absence ⇒ human agent).
+    if let Some(id) = phase_id {
+        args.push("--env".into());
+        args.push(format!("DROVR_PHASE={id}"));
     }
     args.push("--".into());
     args.extend(argv.iter().cloned());
@@ -284,11 +293,12 @@ impl Herdr for FakeHerdr {
         name: &str,
         cwd: &str,
         workspace: Option<&str>,
+        phase_id: Option<&str>,
         argv: &[String],
     ) -> io::Result<String> {
         let id = self.next_id();
         self.record(format!(
-            "agent_start name={name} cwd={cwd} workspace={workspace:?} argv={argv:?} -> {id}"
+            "agent_start name={name} cwd={cwd} workspace={workspace:?} phase_id={phase_id:?} argv={argv:?} -> {id}"
         ));
         Ok(id)
     }
@@ -330,7 +340,7 @@ mod tests {
     #[test]
     fn fake_records_and_returns() {
         let h = FakeHerdr::new();
-        let id = h.agent_start("brainstorm", "/tmp", None, &["claude".into()]).unwrap();
+        let id = h.agent_start("brainstorm", "/tmp", None, None, &["claude".into()]).unwrap();
         assert!(!id.is_empty());
         h.agent_send(&id, "hello").unwrap();
         assert_eq!(h.calls().len(), 2);
@@ -340,8 +350,8 @@ mod tests {
     #[test]
     fn fake_sequential_ids() {
         let h = FakeHerdr::new();
-        let id1 = h.agent_start("a", "/tmp", None, &[]).unwrap();
-        let id2 = h.agent_start("b", "/tmp", None, &[]).unwrap();
+        let id1 = h.agent_start("a", "/tmp", None, None, &[]).unwrap();
+        let id2 = h.agent_start("b", "/tmp", None, None, &[]).unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -349,7 +359,7 @@ mod tests {
     fn fake_read_queue() {
         let h = FakeHerdr::new();
         h.push_read("output text");
-        let id = h.agent_start("x", "/", None, &[]).unwrap();
+        let id = h.agent_start("x", "/", None, None, &[]).unwrap();
         let text = h.agent_read(&id).unwrap();
         assert_eq!(text, "output text");
     }
@@ -417,7 +427,7 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let args = build_agent_start_args("plan", "/proj", None, &["claude".into()]);
+        let args = build_agent_start_args("plan", "/proj", None, None, &["claude".into()]);
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
@@ -440,7 +450,7 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let args = build_agent_start_args("code", "/tmp", Some("ws-1"), &[]);
+        let args = build_agent_start_args("code", "/tmp", Some("ws-1"), None, &[]);
         let joined = args.join(" ");
         assert!(!joined.contains("--env"), "no --env flags expected when vars unset: {joined}");
         assert!(joined.contains("--workspace ws-1"), "workspace must be present: {joined}");
@@ -455,7 +465,7 @@ mod tests {
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
         }
-        let args = build_agent_start_args("x", "/", None, &[]);
+        let args = build_agent_start_args("x", "/", None, None, &[]);
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
@@ -465,5 +475,43 @@ mod tests {
         assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
         assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
         assert!(joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"), "{joined}");
+    }
+
+    // -- A1: DROVR_PHASE env plumbing --------------------------------------
+    // When a phase_id is supplied, the spawned agent must carry
+    // `--env DROVR_PHASE=<run>/<phase>` so the reflex hook can detect and
+    // suppress on drovr-spawned phases.
+    #[test]
+    fn build_agent_start_args_includes_drovr_phase() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let args = build_agent_start_args("plan", "/proj", None, Some("r/p"), &["claude".into()]);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--env DROVR_PHASE=r/p"),
+            "args must carry DROVR_PHASE when phase_id is set: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_agent_start_args_omits_drovr_phase_when_none() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let args = build_agent_start_args("plan", "/proj", None, None, &["claude".into()]);
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains("DROVR_PHASE"),
+            "no DROVR_PHASE expected when phase_id is None: {joined}"
+        );
     }
 }

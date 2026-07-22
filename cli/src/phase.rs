@@ -63,7 +63,10 @@ pub fn phase_start<H: Herdr>(
     // agent_send (the skill reads handoff_doc and sends the seed text).
     let argv: Vec<String> = vec!["claude".into()];
 
-    let pane_id = h.agent_start(phase, &cwd, run.workspace.as_deref(), &argv)?;
+    // Tag the spawned agent with DROVR_PHASE=<run>/<phase> so the reflex hook
+    // detects a drovr-spawned phase and suppresses the human-facing reflex.
+    let phase_id = format!("{}/{}", run.name, phase);
+    let pane_id = h.agent_start(phase, &cwd, run.workspace.as_deref(), Some(phase_id.as_str()), &argv)?;
 
     // Find existing phase or append a new one
     let idx = match find_phase_idx(run, phase) {
@@ -406,6 +409,23 @@ mod tests {
         assert!(
             start_call.contains("cwd=/home/user/my-project"),
             "agent_start must use project_dir as cwd, got: {start_call}"
+        );
+    }
+
+    // -- A1: phase_start sets DROVR_PHASE=<run>/<phase> on the spawned agent --
+    #[test]
+    fn phase_start_sets_drovr_phase() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("start-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+
+        let calls = h.calls();
+        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        assert!(
+            start_call.contains("phase_id=Some(\"start-test/brainstorm\")"),
+            "agent_start must carry phase_id=<run>/<phase>: {start_call}"
         );
     }
 

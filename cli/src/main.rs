@@ -5,8 +5,9 @@ mod review;
 mod run;
 
 use clap::{Parser, Subcommand};
-use compress::{SystemRunner, phase_compress};
+use compress::{SystemRunner, handoff_self, phase_compress};
 use herdr::{Herdr, SystemHerdr};
+use std::io::Read as _;
 use phase::{collect, phase_done, phase_send, phase_start, phase_wait};
 use review::{review_summary, serve};
 use run::{PhaseStatus, RunState, run_dir};
@@ -65,6 +66,12 @@ enum Commands {
         port: u16,
     },
 
+    /// Self-serve mid-task handoff (compress caller's own context).
+    Handoff {
+        #[command(subcommand)]
+        sub: HandoffCmd,
+    },
+
     /// Plumbing: phase lifecycle operations.
     Phase {
         #[command(subcommand)]
@@ -116,6 +123,22 @@ enum PhaseCmd {
     Compress {
         run: String,
         phase_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HandoffCmd {
+    /// Compress the caller's own context into a HANDOFF doc and print the resume pointer.
+    #[command(name = "self")] // `self` is a reserved word → rename the variant
+    Own {
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        transcript: Option<PathBuf>,
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -506,6 +529,78 @@ fn cmd_phase(sub: PhaseCmd) {
     }
 }
 
+/// Resolve the transcript to compress, by precedence:
+/// `transcript` file > `pane` (or `$HERDR_PANE_ID`) > the `stdin` reader.
+/// Returns the transcript text; returns an error rather than exiting so the
+/// precedence logic is unit-testable (the caller maps errors to `process::exit`).
+fn resolve_transcript<H: Herdr, R: io::Read>(
+    transcript: Option<&std::path::Path>,
+    pane: Option<String>,
+    herdr: &H,
+    mut stdin: R,
+) -> io::Result<String> {
+    if let Some(path) = transcript {
+        std::fs::read_to_string(path).map_err(|e| {
+            io::Error::new(e.kind(), format!("cannot read transcript {}: {e}", path.display()))
+        })
+    } else if let Some(pane_id) = pane.or_else(|| std::env::var("HERDR_PANE_ID").ok()) {
+        herdr
+            .agent_read(&pane_id)
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot read pane '{pane_id}': {e}")))
+    } else {
+        let mut buf = String::new();
+        stdin
+            .read_to_string(&mut buf)
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot read stdin: {e}")))?;
+        Ok(buf)
+    }
+}
+
+fn cmd_handoff(sub: HandoffCmd, herdr: &SystemHerdr) {
+    match sub {
+        HandoffCmd::Own { objective, transcript, pane, out } => {
+            // Resolve transcript by precedence:
+            //   --transcript file > --pane (or $HERDR_PANE_ID) > stdin
+            let transcript_text =
+                resolve_transcript(transcript.as_deref(), pane, herdr, io::stdin())
+                    .unwrap_or_else(|e| {
+                        eprintln!("drovr: {e}");
+                        process::exit(1);
+                    });
+
+            let objective =
+                objective.unwrap_or_else(|| "(self-serve mid-task handoff)".to_string());
+            let out = out.unwrap_or_else(|| PathBuf::from("./HANDOFF.md"));
+
+            match handoff_self(&SystemRunner, &transcript_text, &objective, &out) {
+                Ok(path) => {
+                    // Print an absolute resume pointer. canonicalize succeeds on
+                    // the success path (the file was just written); fall back to
+                    // joining cwd so a relative --out still prints absolute.
+                    let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| {
+                        if path.is_absolute() {
+                            path.clone()
+                        } else {
+                            std::env::current_dir()
+                                .map(|d| d.join(&path))
+                                .unwrap_or_else(|_| path.clone())
+                        }
+                    });
+                    println!("handoff written to {}", abs.display());
+                    println!(
+                        "resume: start a fresh agent and read {} as its only briefing",
+                        abs.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("drovr: handoff self failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 fn cmd_collect(run: &str, phase_name: &str) {
     if let Err(e) = validate_run_name(run) {
         eprintln!("drovr: {e}");
@@ -552,6 +647,7 @@ fn main() {
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
         Commands::Resurrect { name } => cmd_resurrect(&name),
         Commands::Serve { name, host, port } => cmd_serve(&name, &host, port),
+        Commands::Handoff { sub } => cmd_handoff(sub, &herdr),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
         Commands::Review { sub } => cmd_review(sub),
@@ -723,6 +819,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_handoff_self() {
+        let cli = parse(&[
+            "drovr", "handoff", "self", "--objective", "o", "--out", "/tmp/h.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Handoff { sub: HandoffCmd::Own { objective, transcript, pane, out } } => {
+                assert_eq!(objective.as_deref(), Some("o"));
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("/tmp/h.md")));
+                assert!(transcript.is_none());
+                assert!(pane.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_handoff_self_all_none() {
+        let cli = parse(&["drovr", "handoff", "self"]).unwrap();
+        match cli.command {
+            Commands::Handoff { sub: HandoffCmd::Own { objective, transcript, pane, out } } => {
+                assert!(objective.is_none());
+                assert!(transcript.is_none());
+                assert!(pane.is_none());
+                assert!(out.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn parse_collect() {
         let cli = parse(&["drovr", "collect", "myrun", "brainstorm"]).unwrap();
         match cli.command {
@@ -808,5 +935,41 @@ mod tests {
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");
         assert!(s.contains("all done"), "got: {s}");
+    }
+
+    // -- resolve_transcript: the `drovr handoff self` source-precedence helper ----
+    // (transcript file > pane / $HERDR_PANE_ID > stdin). ENV_LOCK guards the tests
+    // that depend on HERDR_PANE_ID being unset.
+
+    #[test]
+    fn resolve_transcript_prefers_file_over_pane_and_stdin() {
+        let _lock = crate::test_util::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.txt");
+        std::fs::write(&p, "FILE CONTENT").unwrap();
+        let h = herdr::FakeHerdr::new();
+        h.push_read("PANE CONTENT");
+        let out =
+            resolve_transcript(Some(p.as_path()), Some("w1:p1".into()), &h, &b"STDIN"[..]).unwrap();
+        assert_eq!(out, "FILE CONTENT");
+    }
+
+    #[test]
+    fn resolve_transcript_uses_pane_when_no_file() {
+        let _lock = crate::test_util::ENV_LOCK.lock().unwrap();
+        let h = herdr::FakeHerdr::new();
+        h.push_read("PANE CONTENT");
+        let out = resolve_transcript(None, Some("w1:p1".into()), &h, &b"STDIN"[..]).unwrap();
+        assert_eq!(out, "PANE CONTENT");
+    }
+
+    #[test]
+    fn resolve_transcript_falls_back_to_stdin() {
+        let _lock = crate::test_util::ENV_LOCK.lock().unwrap();
+        // The pane branch consults $HERDR_PANE_ID; unset it so we reach stdin.
+        unsafe { std::env::remove_var("HERDR_PANE_ID") };
+        let h = herdr::FakeHerdr::new();
+        let out = resolve_transcript(None, None, &h, &b"STDIN CONTENT"[..]).unwrap();
+        assert_eq!(out, "STDIN CONTENT");
     }
 }

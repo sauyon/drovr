@@ -14,8 +14,11 @@ is the building block `drovr:pipeline` loops over; use it directly for a single 
 **The load-bearing move is compression by a dedicated fresh reader — never self-summary.**
 `drovr phase compress` spawns a one-shot read-only `claude -p` that reads the finished
 phase's *entire* transcript and writes the briefing. The finishing agent does NOT summarize
-itself (end-of-phase context rot produces bad briefings). Preserve decisions + interfaces,
-drop narration.
+itself: a summary written from a full end-of-phase context suffers *context rot* (Chroma's
+finding that output degrades as the window fills — trychroma.com/research/context-rot), so a
+fresh reader produces the better briefing. Preserve decisions + interfaces, drop narration.
+Compaction is one of drovr's three context-engineering levers (with note-taking/git and
+sub-agents — see `drovr:using-drovr`); this skill is the compaction lever.
 
 ## The five steps
 
@@ -88,7 +91,10 @@ The compressor emits a fixed 7-section document (objective · state · decisions
 interfaces/contracts · open questions · next step · artifact pointers). See
 `HANDOFF-template.md` in this directory for the contract and what each section is for.
 **Artifact pointers are paths, not pasted content** — the next agent re-reads source on
-demand (that is what keeps each phase's context small).
+demand (that is what keeps each phase's context small). Artifact pointers now also **include
+git references** — the branch and the commit range/SHAs carrying this phase's work — so the
+next agent re-derives load-bearing decisions from `git log`/`git diff`, using history as a
+durable cross-check against lossy compression rather than trusting the summary alone.
 
 ## Self-review before you compress
 
