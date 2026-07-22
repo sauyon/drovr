@@ -269,11 +269,13 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    let workspace = match herdr.workspace_create(&format!("drovr:{name}")) {
-        Ok(ws) => Some(ws.id),
+    // Create the workspace in the project dir so its root shell pane (reused by
+    // the first phase) and every later tab start already `cd`'d into the project.
+    let (workspace, root_pane) = match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
+        Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
         Err(e) => {
             eprintln!("drovr: warning: could not create herdr workspace: {e}");
-            None
+            (None, None)
         }
     };
 
@@ -314,6 +316,7 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
         gate: "spec".into(),
         cursor: 0,
         workspace,
+        root_pane,
     };
 
     save_run(&run);
@@ -911,6 +914,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            root_pane: None,
             project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);
@@ -930,6 +934,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            root_pane: None,
             project_dir: "/tmp/proj".into(),
         };
         let s = format_progress(&run);

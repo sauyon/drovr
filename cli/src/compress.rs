@@ -193,6 +193,7 @@ mod tests {
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
+            root_pane: None,
             project_dir: "/tmp/drovr-proj-test".into(),
         }
     }

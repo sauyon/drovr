@@ -22,6 +22,14 @@ fn find_phase_idx(run: &RunState, phase: &str) -> Option<usize> {
     run.phases.iter().position(|p| p.name == phase)
 }
 
+/// POSIX single-quote `s` so it becomes exactly one literal shell word when
+/// interpolated into a `herdr pane run` command. Neutralizes spaces and shell
+/// metacharacters (`;`, `$()`, `&&`, …); the enclosing single quotes are stripped
+/// by the shell, so the resulting env value is unchanged.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
     let idx = find_phase_idx(run, phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
@@ -59,14 +67,62 @@ pub fn phase_start<H: Herdr>(
     }
     let cwd = run.project_dir.clone();
 
-    // Spawn a plain `claude` pane; seed injection happens via the first
-    // agent_send (the skill reads handoff_doc and sends the seed text).
-    let argv: Vec<String> = vec!["claude".into()];
+    // Pick the pane this phase's `claude` will run in, WITHOUT splitting a new
+    // pane beside an empty shell:
+    //   * a restarting phase reuses its own recorded pane;
+    //   * the first phase reuses the workspace's root shell pane (taken here so
+    //     later phases don't);
+    //   * every later phase gets its own fresh tab (whose auto shell pane it
+    //     reuses).
+    let existing_pane = find_phase_idx(run, phase).and_then(|i| run.phases[i].pane_id.clone());
+    // `used_root` defers consuming `run.root_pane` until the launch actually
+    // succeeds — if `pane_run` fails, the root pane stays available for a retry
+    // instead of being silently forfeited to a fresh tab.
+    let mut used_root = false;
+    let target_pane = if let Some(pane) = existing_pane {
+        pane
+    } else if let Some(root) = run.root_pane.clone() {
+        used_root = true;
+        root
+    } else if let Some(ws) = run.workspace.as_deref() {
+        h.tab_create(ws, phase, &cwd)?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no herdr workspace (creation failed at `drovr new`); \
+                 please recreate the run with `drovr new`",
+                run.name
+            ),
+        ));
+    };
 
-    // Tag the spawned agent with DROVR_PHASE=<run>/<phase> so the reflex hook
-    // detects a drovr-spawned phase and suppresses the human-facing reflex.
-    let phase_id = format!("{}/{}", run.name, phase);
-    let pane_id = h.agent_start(phase, &cwd, run.workspace.as_deref(), Some(phase_id.as_str()), &argv)?;
+    // Capture focus so pane operations (which lack a --no-focus flag) don't steal
+    // it from the user. Restored after the pane is launched.
+    let prev_focus = h.focused_workspace();
+
+    // Launch `claude` inside the target pane. DROVR_PHASE=<run>/<phase> tags it so
+    // the reflex hook detects a drovr-spawned phase and suppresses the human
+    // reflex. It is not a secret, so it rides inline on the command; auth secrets
+    // travel via herdr `--env` at pane creation, never in this string. The value
+    // is single-quoted so a run/phase name with a space or shell metacharacter
+    // stays one literal word and cannot break out of the command.
+    let command = format!(
+        "DROVR_PHASE={} claude",
+        shell_single_quote(&format!("{}/{}", run.name, phase))
+    );
+    h.pane_run(&target_pane, &command)?;
+    // The launch succeeded, so this phase has now claimed the root pane (if it
+    // used it); clear it so later phases don't try to reuse the same pane.
+    if used_root {
+        run.root_pane = None;
+    }
+    // Cosmetic pane label; best-effort (a rename failure must not fail the phase).
+    let _ = h.pane_rename(&target_pane, phase);
+    // Restore focus if a pane operation moved it.
+    if let Some(prev) = prev_focus {
+        let _ = h.workspace_focus(&prev);
+    }
 
     // Find existing phase or append a new one
     let idx = match find_phase_idx(run, phase) {
@@ -87,7 +143,7 @@ pub fn phase_start<H: Herdr>(
     run.phases[idx].handoff_doc = seed_str;
     // pane_id only — herdr_session is not used for cleanup (workspace_close handles that)
     run.phases[idx].herdr_session = None;
-    run.phases[idx].pane_id = Some(pane_id);
+    run.phases[idx].pane_id = Some(target_pane);
     run.phases[idx].status = PhaseStatus::Running;
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
@@ -192,7 +248,10 @@ mod tests {
             phases: vec![],
             gate: "spec".into(),
             cursor: 0,
-            workspace: None,
+            // `drovr new` always creates a workspace + root shell pane; the first
+            // phase reuses the root pane, later phases each get their own tab.
+            workspace: Some("ws-mk".into()),
+            root_pane: Some("root-mk".into()),
             project_dir: "/tmp/drovr-proj-test".into(),
         }
     }
@@ -200,6 +259,7 @@ mod tests {
     fn make_run_with_workspace(name: &str, ws_id: &str) -> RunState {
         let mut run = make_run(name);
         run.workspace = Some(ws_id.to_owned());
+        run.root_pane = Some(format!("{ws_id}:root"));
         run
     }
 
@@ -221,13 +281,18 @@ mod tests {
         assert!(p.pane_id.is_some(), "pane_id must be recorded");
         // herdr_session is no longer written (cleanup uses workspace_close, not session_stop)
         assert!(p.herdr_session.is_none(), "herdr_session must be None");
-        // agent_start was called
-        assert!(h.calls()[0].contains("agent_start"));
-        assert!(h.calls()[0].contains("brainstorm"));
+        // claude is launched via `pane run`, NOT a split-creating `agent start`.
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_start")),
+            "must not use agent_start (it splits a new pane): {calls:?}"
+        );
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(run_call.contains("claude"), "pane_run must launch claude: {run_call}");
     }
 
     #[test]
-    fn agent_start_called_with_no_focus_and_workspace() {
+    fn first_phase_reuses_root_pane() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("ws-isolation-test", "ws-42");
@@ -235,27 +300,74 @@ mod tests {
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
         let calls = h.calls();
-        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
-        // workspace id must be threaded through
+        // The first phase reuses the workspace root pane — no tab is created,
+        // and no empty shell is left dangling.
         assert!(
-            start_call.contains("workspace=Some(\"ws-42\")"),
-            "workspace id not found in call: {start_call}"
+            !calls.iter().any(|c| c.contains("tab_create")),
+            "first phase must not create a tab: {calls:?}"
+        );
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains("pane=ws-42:root"),
+            "first phase must run claude in the root pane: {run_call}"
+        );
+        assert_eq!(run.phases[0].pane_id.as_deref(), Some("ws-42:root"));
+        assert!(run.root_pane.is_none(), "root_pane must be consumed after first use");
+    }
+
+    #[test]
+    fn later_phase_creates_its_own_tab() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("later-tab-test", "ws-7");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap(); // consumes root pane
+        phase_start(&h, &mut run, "plan", None).unwrap(); // must get its own tab
+
+        let calls = h.calls();
+        let tab_call = calls.iter().find(|c| c.contains("tab_create")).unwrap();
+        assert!(tab_call.contains("workspace=ws-7"), "tab must be in the run workspace: {tab_call}");
+        assert!(tab_call.contains("label=plan"), "tab must be labelled with the phase: {tab_call}");
+        // claude runs in the new tab's pane
+        let plan_pane = run.phases[1].pane_id.clone().unwrap();
+        assert!(
+            calls.iter().any(|c| c.contains(&format!("pane_run pane={plan_pane}"))),
+            "claude must run in the new tab's pane: {calls:?}"
         );
     }
 
     #[test]
-    fn agent_start_no_workspace_passes_none() {
+    fn no_workspace_and_no_root_pane_errors() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
-        let mut run = make_run("no-ws-test"); // workspace: None
+        let mut run = make_run("no-ws-test");
+        run.workspace = None;
+        run.root_pane = None;
 
-        phase_start(&h, &mut run, "plan", None).unwrap();
+        let res = phase_start(&h, &mut run, "plan", None);
+        assert!(res.is_err(), "must error when there is no workspace or root pane");
+        assert!(res.unwrap_err().to_string().contains("workspace"));
+    }
+
+    #[test]
+    fn phase_start_preserves_focus() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("focus-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
         let calls = h.calls();
-        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        let capture = calls.iter().position(|c| c.contains("focused_workspace"));
+        let run_at = calls.iter().position(|c| c.contains("pane_run"));
+        let restore = calls.iter().position(|c| c.contains("workspace_focus"));
+        let (capture, run_at, restore) = (capture.unwrap(), run_at.unwrap(), restore.unwrap());
+        assert!(capture < run_at, "focus must be captured before pane_run: {calls:?}");
+        assert!(restore > run_at, "focus must be restored after pane_run: {calls:?}");
         assert!(
-            start_call.contains("workspace=None"),
-            "expected workspace=None in call: {start_call}"
+            calls[restore].contains("workspace_focus id=ws-focused"),
+            "focus must be restored to the previously-focused workspace: {}",
+            calls[restore]
         );
     }
 
@@ -327,11 +439,12 @@ mod tests {
         // (a) handoff_doc stores the seed path for later injection via agent_send
         let p = &run.phases[0];
         assert_eq!(p.handoff_doc.as_deref(), Some("/tmp/seed.md"));
-        // (b) spawned argv must NOT contain "--seed" or the seed path —
-        //     seed injection happens via the first agent_send, not the spawn argv
+        // (b) the launch command must NOT contain "--seed" or the seed path —
+        //     seed injection happens via the first agent_send, not the launch command
         let calls = h.calls();
-        assert!(!calls[0].contains("--seed"), "argv must not contain --seed: {}", calls[0]);
-        assert!(!calls[0].contains("/tmp/seed.md"), "argv must not contain seed path: {}", calls[0]);
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(!run_call.contains("--seed"), "command must not contain --seed: {run_call}");
+        assert!(!run_call.contains("/tmp/seed.md"), "command must not contain seed path: {run_call}");
     }
 
     // Panes are never closed mid-run (herdr reassigns focus on any close);
@@ -346,10 +459,14 @@ mod tests {
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         phase_start(&h, &mut run, "plan", None).unwrap();
 
+        let calls = h.calls();
         assert!(
-            !h.calls().iter().any(|c| c.contains("pane_close")),
-            "phase_start must never close a pane mid-run: {:?}",
-            h.calls()
+            !calls.iter().any(|c| c.contains("pane_close")),
+            "phase_start must never close a pane mid-run: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_start")),
+            "phase_start must not use agent_start: {calls:?}"
         );
     }
 
@@ -402,17 +519,20 @@ mod tests {
         let mut run = make_run("proj-cwd-test");
         run.project_dir = "/home/user/my-project".into();
 
+        // First phase reuses the root pane (whose cwd was set at workspace
+        // create); a later phase's tab must carry project_dir as its cwd.
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        phase_start(&h, &mut run, "plan", None).unwrap();
 
         let calls = h.calls();
-        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        let tab_call = calls.iter().find(|c| c.contains("tab_create")).unwrap();
         assert!(
-            start_call.contains("cwd=/home/user/my-project"),
-            "agent_start must use project_dir as cwd, got: {start_call}"
+            tab_call.contains("cwd=/home/user/my-project"),
+            "tab_create must use project_dir as cwd, got: {tab_call}"
         );
     }
 
-    // -- A1: phase_start sets DROVR_PHASE=<run>/<phase> on the spawned agent --
+    // -- A1: phase_start tags the launch with DROVR_PHASE=<run>/<phase> --------
     #[test]
     fn phase_start_sets_drovr_phase() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -422,10 +542,60 @@ mod tests {
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
         let calls = h.calls();
-        let start_call = calls.iter().find(|c| c.contains("agent_start")).unwrap();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(
-            start_call.contains("phase_id=Some(\"start-test/brainstorm\")"),
-            "agent_start must carry phase_id=<run>/<phase>: {start_call}"
+            run_call.contains(r"DROVR_PHASE='start-test/brainstorm' claude"),
+            "pane_run command must carry a single-quoted DROVR_PHASE=<run>/<phase>: {run_call}"
+        );
+        // Auth secrets must never be inlined into the launch command.
+        assert!(!run_call.contains("ANTHROPIC_API_KEY"), "no secret in command: {run_call}");
+        assert!(!run_call.contains("CLAUDE_CONFIG_DIR"), "no secret in command: {run_call}");
+    }
+
+    // -- F1 (agy security): a phase/run name with shell metacharacters must be
+    //    quoted into one literal word, not break out of the pane_run command.
+    #[test]
+    fn phase_start_shell_quotes_unsafe_phase_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("inject-test");
+
+        // A phase name carrying a shell injection attempt.
+        phase_start(&h, &mut run, "p; rm -rf ~", None).unwrap();
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        // The value is a single quoted word; the metacharacters are inert.
+        assert!(
+            run_call.contains(r"DROVR_PHASE='inject-test/p; rm -rf ~' claude"),
+            "unsafe phase name must be single-quoted: {run_call}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_single_quote("a/b"), "'a/b'");
+        assert_eq!(shell_single_quote("a; rm -rf ~"), "'a; rm -rf ~'");
+        assert_eq!(shell_single_quote("$(id)"), "'$(id)'");
+        // An embedded single quote is escaped, not terminated.
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    // -- F2 (agy correctness): a failed launch must NOT consume the root pane, so
+    //    a retry can still reuse it rather than forfeiting it to a fresh tab.
+    #[test]
+    fn first_phase_keeps_root_pane_on_launch_failure() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+        let mut run = make_run_with_workspace("launch-fail-test", "ws-9");
+
+        let res = phase_start(&h, &mut run, "brainstorm", None);
+        assert!(res.is_err(), "phase_start must propagate the pane_run failure");
+        assert_eq!(
+            run.root_pane.as_deref(),
+            Some("ws-9:root"),
+            "root_pane must be retained when the launch fails"
         );
     }
 

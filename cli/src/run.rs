@@ -18,6 +18,13 @@ pub struct RunState {
     /// The herdr workspace id created for this run (set by `drovr new`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The workspace's auto-created root shell pane id (set by `drovr new`). The
+    /// first phase runs `claude` *inside* this pane instead of splitting a new
+    /// pane beside it, so no empty shell is left dangling. `phase_start` takes it
+    /// (leaving `None`) so later phases each get their own tab. `None` for pre-fix
+    /// runs → the first phase falls back to a fresh tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_pane: Option<String>,
     /// The project directory phases should run in (trusted by claude).
     /// Captured at `drovr new` time; defaults to empty string for old runs.
     #[serde(default)]
@@ -68,7 +75,7 @@ mod tests {
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},
                 Phase{name:"plan".into(), status:PhaseStatus::Pending, handoff_doc:None, herdr_session:None, pane_id:None},
-            ], gate:"spec".into(), cursor:1, workspace: None, project_dir: "/tmp/proj".into() };
+            ], gate:"spec".into(), cursor:1, workspace: None, root_pane: None, project_dir: "/tmp/proj".into() };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
         assert_eq!(loaded.phases.len(), 2);

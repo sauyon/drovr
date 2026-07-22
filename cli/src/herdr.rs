@@ -7,34 +7,42 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 
-/// A freshly created herdr workspace: just its id. The workspace's auto-created
-/// root shell pane is left alone for the life of the run — closing any pane
-/// makes herdr reassign focus and disturbs the user — and is torn down together
-/// with every phase pane by the single `workspace_close` at `drovr cleanup`.
+/// A freshly created herdr workspace: its id plus the id of its auto-created root
+/// shell pane. drovr runs the first phase's `claude` *inside* `root_pane` (via
+/// `pane_run`) rather than splitting a new pane beside it, so no empty shell is
+/// left dangling. The root pane is never closed mid-run — closing any pane makes
+/// herdr reassign focus and disturbs the user — and is torn down together with
+/// every phase pane by the single `workspace_close` at `drovr cleanup`.
 #[derive(Debug)]
 pub struct Workspace {
     pub id: String,
+    pub root_pane: String,
 }
 
 pub trait Herdr {
-    /// Create a new herdr workspace with the given label; returns its id.
-    fn workspace_create(&self, label: &str) -> io::Result<Workspace>;
+    /// Create a new `--no-focus` herdr workspace (label + cwd); returns its id and
+    /// its auto-created root shell pane id.
+    fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace>;
     /// Close a herdr workspace (closes all its panes). This is the only pane
     /// teardown drovr performs — once, at end-of-run.
     fn workspace_close(&self, id: &str) -> io::Result<()>;
-    fn agent_start(
-        &self,
-        name: &str,
-        cwd: &str,
-        workspace: Option<&str>,
-        phase_id: Option<&str>,
-        argv: &[String],
-    ) -> io::Result<String>;
+    /// Create a new `--no-focus` tab in `workspace` (label + cwd); returns the
+    /// tab's auto-created shell pane id. Every phase after the first gets its own
+    /// tab so each phase agent occupies a full pane with no split.
+    fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String>;
+    /// Launch `command` inside an existing pane (`herdr pane run`). drovr runs
+    /// `claude` in a tab's shell pane instead of splitting a second pane beside it.
+    fn pane_run(&self, pane_id: &str, command: &str) -> io::Result<()>;
+    /// Cosmetically label a pane with its phase name (best-effort).
+    fn pane_rename(&self, pane_id: &str, label: &str) -> io::Result<()>;
+    /// The currently-focused workspace id, if any. Captured before pane
+    /// operations that can move focus so it can be restored afterward.
+    fn focused_workspace(&self) -> Option<String>;
+    /// Restore focus to a workspace (best-effort). `pane_run`/`pane_rename` have
+    /// no `--no-focus` flag, so drovr captures focus before and restores it after.
+    fn workspace_focus(&self, id: &str) -> io::Result<()>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
-    /// Kept for forward compatibility; currently unused (cleanup uses `workspace_close`).
-    #[allow(dead_code)]
-    fn session_stop(&self, name: &str) -> io::Result<()>;
     fn integration_present(&self) -> bool;
 }
 
@@ -61,8 +69,16 @@ impl SystemHerdr {
 }
 
 impl Herdr for SystemHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
-        let out = self.run(&["workspace", "create", "--label", label, "--no-focus"])?;
+    fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace> {
+        let mut args: Vec<String> = vec![
+            "workspace".into(), "create".into(),
+            "--label".into(), label.into(),
+            "--cwd".into(), cwd.into(),
+            "--no-focus".into(),
+        ];
+        args.extend(auth_env_flags());
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = self.run(&args_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(
@@ -75,7 +91,14 @@ impl Herdr for SystemHerdr {
                 format!("herdr workspace create: could not parse workspace_id from: {stdout}"),
             )
         })?;
-        Ok(Workspace { id })
+        // The output's first `pane_id` is `result.root_pane.pane_id` — the shell
+        // pane the first phase will reuse.
+        let root_pane = parse_pane_id(&stdout).ok_or_else(|| {
+            io::Error::other(
+                format!("herdr workspace create: could not parse root_pane pane_id from: {stdout}"),
+            )
+        })?;
+        Ok(Workspace { id, root_pane })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -89,30 +112,78 @@ impl Herdr for SystemHerdr {
         Ok(())
     }
 
-    fn agent_start(
-        &self,
-        name: &str,
-        cwd: &str,
-        workspace: Option<&str>,
-        phase_id: Option<&str>,
-        argv: &[String],
-    ) -> io::Result<String> {
-        let args = build_agent_start_args(name, cwd, workspace, phase_id, argv);
+    fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
+        let mut args: Vec<String> = vec![
+            "tab".into(), "create".into(),
+            "--workspace".into(), workspace.into(),
+            "--label".into(), label.into(),
+            "--cwd".into(), cwd.into(),
+            "--no-focus".into(),
+        ];
+        args.extend(auth_env_flags());
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = self.run(&args_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(
-                format!("herdr agent start failed: {stderr}"),
+                format!("herdr tab create failed: {stderr}"),
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // herdr agent start emits JSON; extract pane_id from the result
+        // `tab create` returns `result.root_pane.pane_id` — the new tab's shell pane.
         parse_pane_id(&stdout).ok_or_else(|| {
             io::Error::other(
-                format!("herdr agent start: could not parse pane_id from: {stdout}"),
+                format!("herdr tab create: could not parse pane_id from: {stdout}"),
             )
         })
+    }
+
+    fn pane_run(&self, pane_id: &str, command: &str) -> io::Result<()> {
+        let out = self.run(&["pane", "run", pane_id, command])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr pane run failed: {stderr}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn pane_rename(&self, pane_id: &str, label: &str) -> io::Result<()> {
+        let out = self.run(&["pane", "rename", pane_id, label])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr pane rename failed: {stderr}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn focused_workspace(&self) -> Option<String> {
+        let out = self.run(&["workspace", "list"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+        let workspaces = v.get("result")?.get("workspaces")?.as_array()?;
+        workspaces
+            .iter()
+            .find(|w| w.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))
+            .and_then(|w| w.get("workspace_id").and_then(|i| i.as_str()))
+            .map(|s| s.to_owned())
+    }
+
+    fn workspace_focus(&self, id: &str) -> io::Result<()> {
+        let out = self.run(&["workspace", "focus", id])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(
+                format!("herdr workspace focus failed: {stderr}"),
+            ));
+        }
+        Ok(())
     }
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
@@ -151,17 +222,6 @@ impl Herdr for SystemHerdr {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    fn session_stop(&self, name: &str) -> io::Result<()> {
-        let out = self.run(&["session", "stop", name])?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr session stop failed: {stderr}"),
-            ));
-        }
-        Ok(())
-    }
-
     fn integration_present(&self) -> bool {
         let Ok(out) = self.run(&["integration", "status"]) else {
             return false;
@@ -174,38 +234,20 @@ impl Herdr for SystemHerdr {
     }
 }
 
-/// Build the `herdr agent start` argv, including `--env` flags for claude auth
-/// vars that are set in the current process environment.
-fn build_agent_start_args(
-    name: &str,
-    cwd: &str,
-    workspace: Option<&str>,
-    phase_id: Option<&str>,
-    argv: &[String],
-) -> Vec<String> {
-    let mut args: Vec<String> =
-        vec!["agent".into(), "start".into(), name.into(), "--cwd".into(), cwd.into(), "--no-focus".into()];
-    if let Some(ws) = workspace {
-        args.push("--workspace".into());
-        args.push(ws.into());
-    }
-    // Propagate claude auth env vars to the spawned agent so it uses the
-    // caller's authenticated profile rather than the default ~/.claude dir.
+/// `--env KEY=VALUE` flags for the claude auth vars set in this process's
+/// environment. Shared by `workspace create` and `tab create` so a phase's
+/// `claude` (launched via `pane run` in that pane's shell) inherits the caller's
+/// authenticated profile. Secrets travel as herdr's `--env` argv, never inlined
+/// into a `pane run` command string (which would echo into the terminal buffer).
+fn auth_env_flags() -> Vec<String> {
+    let mut flags = Vec::new();
     for var in &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"] {
         if let Ok(val) = std::env::var(var) {
-            args.push("--env".into());
-            args.push(format!("{var}={val}"));
+            flags.push("--env".into());
+            flags.push(format!("{var}={val}"));
         }
     }
-    // Mark this as a drovr-spawned phase agent so the reflex hook no-ops
-    // (presence of DROVR_PHASE ⇒ drovr-spawned; absence ⇒ human agent).
-    if let Some(id) = phase_id {
-        args.push("--env".into());
-        args.push(format!("DROVR_PHASE={id}"));
-    }
-    args.push("--".into());
-    args.extend(argv.iter().cloned());
-    args
+    flags
 }
 
 /// Parse `pane_id` from herdr's JSON output.
@@ -240,6 +282,8 @@ pub struct FakeHerdr {
     counter: RefCell<u32>,
     /// Queued return strings for agent_read (FIFO)
     read_queue: RefCell<VecDeque<String>>,
+    /// When true, the next `pane_run` returns an error (tests the failure path).
+    fail_pane_run: RefCell<bool>,
 }
 
 #[cfg(test)]
@@ -249,6 +293,7 @@ impl FakeHerdr {
             calls: RefCell::new(Vec::new()),
             counter: RefCell::new(0),
             read_queue: RefCell::new(VecDeque::new()),
+            fail_pane_run: RefCell::new(false),
         }
     }
 
@@ -259,6 +304,11 @@ impl FakeHerdr {
     /// Queue a string to be returned by the next `agent_read` call.
     pub fn push_read(&self, text: impl Into<String>) {
         self.read_queue.borrow_mut().push_back(text.into());
+    }
+
+    /// Make the next `pane_run` fail, so a caller's error handling can be tested.
+    pub fn fail_pane_run(&self) {
+        *self.fail_pane_run.borrow_mut() = true;
     }
 
     fn record(&self, call: String) {
@@ -274,13 +324,16 @@ impl FakeHerdr {
 
 #[cfg(test)]
 impl Herdr for FakeHerdr {
-    fn workspace_create(&self, label: &str) -> io::Result<Workspace> {
+    fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace> {
         let mut c = self.counter.borrow_mut();
         *c += 1;
         let ws_id = format!("ws-{}", *c);
         drop(c);
-        self.record(format!("workspace_create label={label} -> {ws_id}"));
-        Ok(Workspace { id: ws_id })
+        let root_pane = format!("{ws_id}:root");
+        self.record(format!(
+            "workspace_create label={label} cwd={cwd} -> {ws_id} root_pane={root_pane}"
+        ));
+        Ok(Workspace { id: ws_id, root_pane })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -288,19 +341,35 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
-    fn agent_start(
-        &self,
-        name: &str,
-        cwd: &str,
-        workspace: Option<&str>,
-        phase_id: Option<&str>,
-        argv: &[String],
-    ) -> io::Result<String> {
+    fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
         let id = self.next_id();
         self.record(format!(
-            "agent_start name={name} cwd={cwd} workspace={workspace:?} phase_id={phase_id:?} argv={argv:?} -> {id}"
+            "tab_create workspace={workspace} label={label} cwd={cwd} -> {id}"
         ));
         Ok(id)
+    }
+
+    fn pane_run(&self, pane_id: &str, command: &str) -> io::Result<()> {
+        self.record(format!("pane_run pane={pane_id} command={command:?}"));
+        if *self.fail_pane_run.borrow() {
+            return Err(io::Error::other("scripted pane_run failure"));
+        }
+        Ok(())
+    }
+
+    fn pane_rename(&self, pane_id: &str, label: &str) -> io::Result<()> {
+        self.record(format!("pane_rename pane={pane_id} label={label}"));
+        Ok(())
+    }
+
+    fn focused_workspace(&self) -> Option<String> {
+        self.record("focused_workspace".to_string());
+        Some("ws-focused".to_string())
+    }
+
+    fn workspace_focus(&self, id: &str) -> io::Result<()> {
+        self.record(format!("workspace_focus id={id}"));
+        Ok(())
     }
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
@@ -316,11 +385,6 @@ impl Herdr for FakeHerdr {
             .pop_front()
             .unwrap_or_default();
         Ok(text)
-    }
-
-    fn session_stop(&self, name: &str) -> io::Result<()> {
-        self.record(format!("session_stop name={name}"));
-        Ok(())
     }
 
     fn integration_present(&self) -> bool {
@@ -340,18 +404,21 @@ mod tests {
     #[test]
     fn fake_records_and_returns() {
         let h = FakeHerdr::new();
-        let id = h.agent_start("brainstorm", "/tmp", None, None, &["claude".into()]).unwrap();
-        assert!(!id.is_empty());
-        h.agent_send(&id, "hello").unwrap();
-        assert_eq!(h.calls().len(), 2);
-        assert!(h.calls()[1].contains("send"));
+        let pane = h.tab_create("ws-1", "brainstorm", "/tmp").unwrap();
+        assert!(!pane.is_empty());
+        h.pane_run(&pane, "claude").unwrap();
+        h.agent_send(&pane, "hello").unwrap();
+        assert_eq!(h.calls().len(), 3);
+        assert!(h.calls()[0].contains("tab_create"));
+        assert!(h.calls()[1].contains("pane_run"));
+        assert!(h.calls()[2].contains("send"));
     }
 
     #[test]
     fn fake_sequential_ids() {
         let h = FakeHerdr::new();
-        let id1 = h.agent_start("a", "/tmp", None, None, &[]).unwrap();
-        let id2 = h.agent_start("b", "/tmp", None, None, &[]).unwrap();
+        let id1 = h.tab_create("ws-1", "a", "/tmp").unwrap();
+        let id2 = h.tab_create("ws-1", "b", "/tmp").unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -359,8 +426,9 @@ mod tests {
     fn fake_read_queue() {
         let h = FakeHerdr::new();
         h.push_read("output text");
-        let id = h.agent_start("x", "/", None, None, &[]).unwrap();
-        let text = h.agent_read(&id).unwrap();
+        let pane = h.tab_create("ws-1", "x", "/").unwrap();
+        h.pane_run(&pane, "claude").unwrap();
+        let text = h.agent_read(&pane).unwrap();
         assert_eq!(text, "output text");
     }
 
@@ -406,20 +474,31 @@ mod tests {
         );
     }
 
-    // workspace_create returns a workspace id; the root pane is never surfaced
-    // because drovr never closes it (teardown is a single workspace_close).
+    // workspace_create returns both the workspace id and its root shell pane id;
+    // the first phase reuses the root pane rather than splitting a new one.
     #[test]
-    fn fake_workspace_create_returns_id() {
+    fn fake_workspace_create_returns_id_and_root_pane() {
         let h = FakeHerdr::new();
-        let ws = h.workspace_create("drovr:demo").unwrap();
+        let ws = h.workspace_create("drovr:demo", "/proj").unwrap();
         assert!(!ws.id.is_empty());
+        assert!(!ws.root_pane.is_empty(), "root_pane must be populated");
         let call = &h.calls()[0];
         assert!(call.contains("workspace_create"), "call: {call}");
+        assert!(call.contains("cwd=/proj"), "cwd must be threaded: {call}");
     }
 
-    // -- Bug B: build_agent_start_args includes --env when CLAUDE_CONFIG_DIR is set
+    // parse_pane_id extracts `result.root_pane.pane_id` from a real
+    // `workspace create` / `tab create` payload (root_pane is the first pane_id).
     #[test]
-    fn build_agent_start_args_includes_env_when_set() {
+    fn parse_pane_id_extracts_root_pane_from_create_output() {
+        let json = r#"{"result":{"root_pane":{"pane_id":"w9:p1","tab_id":"w9:t1","workspace_id":"w9"},"workspace":{"workspace_id":"w9"}}}"#;
+        assert_eq!(parse_pane_id(json).as_deref(), Some("w9:p1"));
+        assert_eq!(parse_workspace_id(json).as_deref(), Some("w9"));
+    }
+
+    // -- auth_env_flags: secrets travel via herdr --env, never inlined ---------
+    #[test]
+    fn auth_env_flags_includes_set_vars_only() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -427,22 +506,20 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let args = build_agent_start_args("plan", "/proj", None, None, &["claude".into()]);
+        let joined = auth_env_flags().join(" ");
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
-        let joined = args.join(" ");
         assert!(
             joined.contains("--env CLAUDE_CONFIG_DIR=/home/user/.config/claude-work"),
-            "args did not contain expected --env flag: {joined}"
+            "expected --env flag for set var: {joined}"
         );
-        // Unset vars must NOT appear
-        assert!(!joined.contains("ANTHROPIC_API_KEY"), "unexpected key in args: {joined}");
-        assert!(!joined.contains("ANTHROPIC_MODEL"), "unexpected model in args: {joined}");
+        assert!(!joined.contains("ANTHROPIC_API_KEY"), "unset key must not appear: {joined}");
+        assert!(!joined.contains("ANTHROPIC_MODEL"), "unset model must not appear: {joined}");
     }
 
     #[test]
-    fn build_agent_start_args_omits_env_when_unset() {
+    fn auth_env_flags_empty_when_unset() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -450,14 +527,11 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let args = build_agent_start_args("code", "/tmp", Some("ws-1"), None, &[]);
-        let joined = args.join(" ");
-        assert!(!joined.contains("--env"), "no --env flags expected when vars unset: {joined}");
-        assert!(joined.contains("--workspace ws-1"), "workspace must be present: {joined}");
+        assert!(auth_env_flags().is_empty(), "no flags expected when vars unset");
     }
 
     #[test]
-    fn build_agent_start_args_includes_all_set_vars() {
+    fn auth_env_flags_includes_all_set_vars() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -465,53 +539,27 @@ mod tests {
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
         }
-        let args = build_agent_start_args("x", "/", None, None, &[]);
+        let joined = auth_env_flags().join(" ");
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let joined = args.join(" ");
         assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
         assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
         assert!(joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"), "{joined}");
     }
 
-    // -- A1: DROVR_PHASE env plumbing --------------------------------------
-    // When a phase_id is supplied, the spawned agent must carry
-    // `--env DROVR_PHASE=<run>/<phase>` so the reflex hook can detect and
-    // suppress on drovr-spawned phases.
+    // Fake focus capture/restore primitives are recorded so phase_start can be
+    // asserted to preserve focus around pane operations.
     #[test]
-    fn build_agent_start_args_includes_drovr_phase() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-        }
-        let args = build_agent_start_args("plan", "/proj", None, Some("r/p"), &["claude".into()]);
-        let joined = args.join(" ");
-        assert!(
-            joined.contains("--env DROVR_PHASE=r/p"),
-            "args must carry DROVR_PHASE when phase_id is set: {joined}"
-        );
-    }
-
-    #[test]
-    fn build_agent_start_args_omits_drovr_phase_when_none() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-        }
-        let args = build_agent_start_args("plan", "/proj", None, None, &["claude".into()]);
-        let joined = args.join(" ");
-        assert!(
-            !joined.contains("DROVR_PHASE"),
-            "no DROVR_PHASE expected when phase_id is None: {joined}"
-        );
+    fn fake_focus_primitives_recorded() {
+        let h = FakeHerdr::new();
+        let prev = h.focused_workspace();
+        assert!(prev.is_some());
+        h.workspace_focus(prev.as_deref().unwrap()).unwrap();
+        let calls = h.calls();
+        assert!(calls.iter().any(|c| c.contains("focused_workspace")));
+        assert!(calls.iter().any(|c| c.contains("workspace_focus")));
     }
 }
