@@ -238,6 +238,66 @@
     text-decoration: none;
     border-radius: 2px;
   }
+  .diff-line.meta, .diff-line.hunk {
+    color: var(--muted);
+    opacity: .8;
+  }
+  .diff-line.hunk { background: var(--bg); }
+
+  /* ---- Code-review findings ---- */
+  .review-verdict {
+    font-size: .82rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+  }
+  .review-verdict.clean { color: var(--ins-text); }
+  .review-verdict.changes { color: var(--del-text); }
+  .review-findings { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+  .finding {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    background: var(--bg);
+  }
+  .finding-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sev-badge {
+    font-size: .68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    border-radius: 3px;
+    padding: 1px 6px;
+    color: #fff;
+  }
+  .sev-badge.critical { background: #c0392b; }
+  .sev-badge.important { background: #d97706; }
+  .sev-badge.nit { background: #6b7280; }
+  .angle-tag {
+    font-size: .68rem;
+    font-family: var(--mono);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  .finding-loc { font-family: var(--mono); font-size: .74rem; color: var(--accent); }
+  .finding-summary { margin: 5px 0 0; font-size: .88rem; }
+  .finding-rationale { margin: 3px 0 0; font-size: .8rem; color: var(--muted); }
+  /* inline finding markers layered over the reviewed diff */
+  .diff-line .finding-mark {
+    display: inline-block;
+    margin-left: 8px;
+    font-size: .66rem;
+    font-weight: 700;
+    border-radius: 3px;
+    padding: 0 5px;
+    color: #fff;
+    vertical-align: middle;
+  }
+  .diff-line .finding-mark.critical { background: #c0392b; }
+  .diff-line .finding-mark.important { background: #d97706; }
+  .diff-line .finding-mark.nit { background: #6b7280; }
+  .review-empty { color: var(--muted); font-size: .85rem; }
 
   /* ---- Per-line annotation affordance ---- */
   .annotatable {
@@ -451,6 +511,16 @@
     <span id="summary-text"></span>
   </div>
 
+  <!-- Code-review surface: merged findings + the reviewed base..HEAD diff.
+       Only shown when the page is opened with ?task=<task>. -->
+  <div id="review-panel" style="display:none" class="panel">
+    <div class="panel-title">Code review &middot; <span id="review-task"></span></div>
+    <div id="review-verdict" class="review-verdict"></div>
+    <div id="review-findings" class="review-findings"></div>
+    <div class="panel-title" style="margin-top:18px">Reviewed diff (base&hellip;HEAD)</div>
+    <div id="review-diff" class="diff-content"></div>
+  </div>
+
   <div id="diff-panel" style="display:none" class="panel">
     <div class="panel-title">Changes this turn</div>
     <div id="diff-content" class="diff-content md-content"></div>
@@ -634,6 +704,129 @@ function renderSourceDiff(oldText, newText) {
     }
   }
   return '<div class="diff-lines">' + rows.join('') + '</div>';
+}
+
+// ---- Code-review surface (findings + reviewed diff) ----
+// Task label from the page URL (?task=<task>); absent → panel stays hidden.
+function reviewTask() {
+  try { return new URLSearchParams(window.location.search).get('task') || ''; }
+  catch (e) { return ''; }
+}
+
+// Map findings to a "file:line" lookup so they can be layered inline over the
+// reviewed diff. Findings without a line are shown in the list only.
+function findingsByLoc(findings) {
+  var map = {};
+  (findings || []).forEach(function(f) {
+    if (f.file && f.line != null) {
+      var key = f.file + ':' + f.line;
+      (map[key] = map[key] || []).push(f);
+    }
+  });
+  return map;
+}
+
+// Render one merged Review's findings as a list (severity badge, angle tag,
+// file:line, summary, rationale). Empty/clean → a neutral note.
+function renderFindings(findings) {
+  if (!findings || !findings.length) {
+    return '<div class="review-empty">No findings.</div>';
+  }
+  return findings.map(function(f) {
+    var sev = (f.severity || 'nit').toLowerCase();
+    var loc = escHtml(f.file || '') + (f.line != null ? ':' + escHtml(String(f.line)) : '');
+    var html = '<div class="finding">'
+      + '<div class="finding-head">'
+      + '<span class="sev-badge ' + escHtml(sev) + '">' + escHtml(sev) + '</span>'
+      + (f.angle ? '<span class="angle-tag">' + escHtml(f.angle) + '</span>' : '')
+      + '<span class="finding-loc">' + loc + '</span>'
+      + '</div>'
+      + '<div class="finding-summary">' + escHtml(f.summary || '') + '</div>'
+      + (f.rationale ? '<div class="finding-rationale">' + escHtml(f.rationale) + '</div>' : '')
+      + '</div>';
+    return html;
+  }).join('');
+}
+
+// Render a unified `git diff` (base..HEAD) reusing the same green/red diff-line
+// styling as renderSourceDiff, and layer inline finding markers keyed by the
+// new-side file:line. Defensive: unknown lines render as context.
+function renderReviewDiff(diffText, locMap) {
+  var lines = diffText.replace(/\n$/, '').split('\n');
+  var rows = [];
+  var curFile = '';
+  var newNo = 0;
+  function marks(file, line) {
+    var hits = locMap[file + ':' + line];
+    if (!hits) return '';
+    return hits.map(function(f) {
+      var sev = (f.severity || 'nit').toLowerCase();
+      return '<span class="finding-mark ' + escHtml(sev) + '" title="'
+        + escHtml(f.summary || '') + '">' + escHtml(sev) + '</span>';
+    }).join('');
+  }
+  function row(cls, gutter, text, extra) {
+    rows.push('<div class="diff-line ' + cls + '">'
+      + '<span class="gutter">' + gutter + '</span>'
+      + '<span class="text">' + escHtml(text) + (extra || '') + '</span></div>');
+  }
+  lines.forEach(function(line) {
+    if (line.indexOf('diff --git') === 0 || line.indexOf('index ') === 0) {
+      row('meta', ' ', line); return;
+    }
+    if (line.indexOf('--- ') === 0) { row('meta', ' ', line); return; }
+    if (line.indexOf('+++ ') === 0) {
+      curFile = line.slice(4).replace(/^b\//, '');
+      row('meta', ' ', line); return;
+    }
+    if (line.indexOf('@@') === 0) {
+      var m = line.match(/\+(\d+)/);
+      // Keep the running counter on a malformed header rather than resetting to
+      // 0, which would misplace every subsequent inline finding marker.
+      newNo = m ? parseInt(m[1], 10) : newNo;
+      row('hunk', ' ', line); return;
+    }
+    var c = line.charAt(0);
+    if (c === '+') { row('add', '+', line.slice(1), marks(curFile, newNo)); newNo++; }
+    else if (c === '-') { row('del', '−', line.slice(1)); }
+    else { row('ctx', ' ', line.slice(1), marks(curFile, newNo)); newNo++; }
+  });
+  return '<div class="diff-lines">' + rows.join('') + '</div>';
+}
+
+// Fetch merged findings + the reviewed diff and populate the review panel.
+// Additive and defensive: absent endpoints render an empty panel; any error
+// leaves the panel hidden so the spec-review loop is unaffected.
+async function refreshReview() {
+  var task = reviewTask();
+  if (!task) { hideEl('review-panel'); return; }
+  var q = '?task=' + encodeURIComponent(task);
+
+  var review = {};
+  try {
+    var fr = await fetch('/review/findings' + q);
+    if (fr.ok) review = await fr.json();
+  } catch (e) { review = {}; }
+  var findings = (review && review.findings) || [];
+
+  document.getElementById('review-task').textContent = task;
+
+  var verdictEl = document.getElementById('review-verdict');
+  var verdict = review && review.verdict ? review.verdict : '';
+  verdictEl.className = 'review-verdict ' + (verdict === 'clean' ? 'clean' : (verdict === 'changes' ? 'changes' : ''));
+  verdictEl.textContent = verdict ? ('verdict: ' + verdict) : '';
+
+  document.getElementById('review-findings').innerHTML = renderFindings(findings);
+
+  var diffText = await fetchText('/review/diff' + q);
+  var diffEl = document.getElementById('review-diff');
+  if (diffText && diffText.trim().length > 0) {
+    diffEl.innerHTML = renderReviewDiff(diffText, findingsByLoc(findings));
+  } else {
+    diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
+  }
+
+  showEl('review-panel');
 }
 
 // ---- Per-line annotations ----
@@ -902,6 +1095,10 @@ async function refresh() {
   } else {
     hideEl('diff-panel');
   }
+
+  // code-review surface (findings + reviewed diff) — independent of the spec
+  // loop state; only renders when the page was opened with ?task=<task>.
+  refreshReview().catch(function(){});
 
   // questions
   renderQuestions(questionsData);

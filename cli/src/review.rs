@@ -17,13 +17,14 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-use crate::run::run_dir;
+use crate::run::{RunState, run_dir};
 
 /// How often [`review_wait`] polls the live server for a reviewer decision.
 /// Mirrors `phase::POLL_INTERVAL` — a filesystem/state poll, not a hot loop.
@@ -64,15 +65,19 @@ struct AppState {
     turn: u32,
     spec_path: PathBuf,
     workdir: PathBuf,
+    /// Git repo to diff for the code-review surface (`GET /review/diff`).
+    /// Empty when the run could not be loaded — the diff endpoint then 204s.
+    project_dir: PathBuf,
 }
 
 impl AppState {
-    fn new(spec_path: PathBuf, workdir: PathBuf) -> Self {
+    fn new(spec_path: PathBuf, workdir: PathBuf, project_dir: PathBuf) -> Self {
         AppState {
             state: LoopState::Idle,
             turn: 0,
             spec_path,
             workdir,
+            project_dir,
         }
     }
 
@@ -136,6 +141,37 @@ fn read_body(req: &mut Request) -> String {
     let mut buf = String::new();
     let _ = req.as_reader().read_to_string(&mut buf);
     buf
+}
+
+/// Extract a query-string parameter by key from a raw request URL
+/// (e.g. `/review/findings?task=t` → `task` → `"t"`). No percent-decoding:
+/// task labels are plain filename components (validated by [`safe_task`]).
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return Some(it.next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+/// A `task` is safe as a single filename component: non-empty and free of path
+/// separators, traversal, or a null byte. Mirrors `main::validate_label`.
+fn safe_task(task: &str) -> bool {
+    !task.is_empty()
+        && !task.contains('/')
+        && !task.contains('\\')
+        && !task.contains("..")
+        && !task.contains('\0')
+}
+
+/// A recorded base is a bare git object id (hex, ≤64 chars for SHA-256). Reject
+/// anything else so it can never be interpreted as a git rev-arg or flag when
+/// interpolated into `git diff <base>..HEAD`.
+fn safe_sha(sha: &str) -> bool {
+    !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn content_type_for(path: &str) -> &'static str {
@@ -243,6 +279,65 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         return;
     }
 
+    // GET /review/findings?task=<task> — merged <task>-review.json (or {} if absent).
+    if method == Method::Get && path == "/review/findings" {
+        let task = query_param(&url, "task").unwrap_or_default();
+        if !safe_task(&task) {
+            respond_str(req, 400, "text/plain", "invalid task".into());
+            return;
+        }
+        let st = shared.lock().unwrap();
+        let file = st.workdir.join(format!("{task}-review.json"));
+        drop(st);
+        let body = fs::read_to_string(&file).unwrap_or_else(|_| "{}".into());
+        respond_str(req, 200, "application/json", body);
+        return;
+    }
+
+    // GET /review/diff?task=<task> — unified `git diff <base>..HEAD`, base from
+    // <workdir>/<task>-base.sha. 204 when the base SHA has not been recorded.
+    if method == Method::Get && path == "/review/diff" {
+        let task = query_param(&url, "task").unwrap_or_default();
+        if !safe_task(&task) {
+            respond_str(req, 400, "text/plain", "invalid task".into());
+            return;
+        }
+        let st = shared.lock().unwrap();
+        let base_file = st.workdir.join(format!("{task}-base.sha"));
+        let project_dir = st.project_dir.clone();
+        drop(st);
+
+        let base = match fs::read_to_string(&base_file) {
+            Ok(s) if safe_sha(s.trim()) => s.trim().to_string(),
+            // Absent, empty, or a non-SHA value (a compromised/buggy writer could
+            // slip a git rev-arg or flag in) → no diff rather than trusting it.
+            _ => {
+                respond_empty(req, 204);
+                return;
+            }
+        };
+        if project_dir.as_os_str().is_empty() {
+            respond_empty(req, 204);
+            return;
+        }
+        match Command::new("git")
+            .arg("-C")
+            .arg(&project_dir)
+            .arg("diff")
+            .arg(format!("{base}..HEAD"))
+            .output()
+        {
+            // Non-zero git exit (e.g. base SHA not in the repo) → 204, not a
+            // misleading empty 200. stderr is dropped; stdout carries the diff.
+            Ok(out) if out.status.success() => {
+                let body = String::from_utf8_lossy(&out.stdout).into_owned();
+                respond_str(req, 200, "text/plain; charset=utf-8", body);
+            }
+            _ => respond_empty(req, 204),
+        }
+        return;
+    }
+
     // POST /submit — JSON body: {decision, feedback, answers, annotations}
     if method == Method::Post && path == "/submit" {
         let body = read_body(&mut req);
@@ -332,7 +427,13 @@ pub fn serve(run: &str, host: &str, port: u16) -> io::Result<()> {
     eprintln!("  run:  {}", run);
     eprintln!("  spec: {:?}", spec_path);
 
-    let shared = Arc::new(Mutex::new(AppState::new(spec_path, workdir)));
+    // Load the run to find the project dir to diff for the code-review surface.
+    // On load failure, pass an empty path — `GET /review/diff` then 204s.
+    let project_dir = RunState::load(run)
+        .map(|s| PathBuf::from(s.project_dir))
+        .unwrap_or_default();
+
+    let shared = Arc::new(Mutex::new(AppState::new(spec_path, workdir, project_dir)));
 
     for req in server.incoming_requests() {
         let shared = Arc::clone(&shared);
@@ -458,6 +559,14 @@ mod tests {
     /// Start a review server on 127.0.0.1:0 in a background thread.
     /// Returns the bound address string (e.g. "127.0.0.1:54321").
     fn start_server(workdir: PathBuf, spec_path: PathBuf) -> String {
+        // Default project_dir to the workdir; the diff endpoint 204s without a
+        // base.sha regardless. Use `start_server_pd` to diff a real git repo.
+        let pd = workdir.clone();
+        start_server_pd(workdir, spec_path, pd)
+    }
+
+    /// Like `start_server` but with an explicit `project_dir` for `/review/diff`.
+    fn start_server_pd(workdir: PathBuf, spec_path: PathBuf, project_dir: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server
             .server_addr()
@@ -465,7 +574,7 @@ mod tests {
             .expect("ip addr")
             .to_string();
 
-        let shared = Arc::new(Mutex::new(AppState::new(spec_path, workdir)));
+        let shared = Arc::new(Mutex::new(AppState::new(spec_path, workdir, project_dir)));
         thread::spawn(move || {
             for req in server.incoming_requests() {
                 let shared = Arc::clone(&shared);
@@ -798,5 +907,139 @@ mod tests {
         let run_dir = tmp.path().join("drovr/runs").join(&run_name);
         let fb = fs::read_to_string(run_dir.join("feedback.json")).expect("feedback.json");
         assert!(fb.contains("needs work"), "feedback.json must hold the turn: {fb}");
+    }
+
+    // -- code-review surface (/review/findings, /review/diff) ----------------
+
+    #[test]
+    fn findings_served_when_file_present() {
+        let tmp = make_workdir("findings-present");
+        let spec = tmp.path().join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+        let merged = r#"{"verdict":"changes","findings":[{"file":"a.rs","line":3,"severity":"important","angle":"correctness","summary":"off by one","rationale":"loop bound"}]}"#;
+        fs::write(tmp.path().join("t-review.json"), merged).unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec);
+
+        let (status, body) = http_get(&addr, "/review/findings?task=t");
+        assert_eq!(status, 200);
+        assert!(body.contains("off by one"), "body={body}");
+        assert!(body.contains("correctness"), "body={body}");
+    }
+
+    #[test]
+    fn findings_empty_when_absent() {
+        let tmp = make_workdir("findings-absent");
+        let spec = tmp.path().join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec);
+
+        let (status, body) = http_get(&addr, "/review/findings?task=t");
+        assert_eq!(status, 200);
+        assert_eq!(body.trim(), "{}", "expected empty object, got: {body}");
+    }
+
+    #[test]
+    fn findings_rejects_traversal_task() {
+        let tmp = make_workdir("findings-traversal");
+        let spec = tmp.path().join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec);
+
+        let (status, _) = http_get(&addr, "/review/findings?task=../etc/passwd");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn diff_204_when_no_base() {
+        let tmp = make_workdir("diff-no-base");
+        let spec = tmp.path().join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec);
+
+        let (status, _) = http_get(&addr, "/review/diff?task=t");
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn diff_served_with_base_and_git_repo() {
+        let tmp = make_workdir("diff-git");
+        let workdir = tmp.path().join("work");
+        fs::create_dir_all(&workdir).unwrap();
+        let spec = workdir.join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+
+        // A throwaway git repo as the project_dir: one commit (the base), then a
+        // change so `git diff base..HEAD` is non-empty.
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(repo.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        let base = base.trim().to_string();
+        fs::write(repo.join("f.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "change"]);
+
+        // Record the base SHA where the diff endpoint reads it.
+        fs::write(workdir.join("t-base.sha"), format!("{base}\n")).unwrap();
+
+        let addr = start_server_pd(workdir.clone(), spec, repo.clone());
+        let (status, body) = http_get(&addr, "/review/diff?task=t");
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains("+two"), "diff body should show the added line: {body}");
+    }
+
+    #[test]
+    fn diff_204_when_base_is_not_a_sha() {
+        // A non-hex base value (e.g. a git flag) must never reach `git diff`.
+        let tmp = make_workdir("diff-bad-sha");
+        let spec = tmp.path().join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+        fs::write(tmp.path().join("t-base.sha"), "--no-index\n").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec);
+
+        let (status, _) = http_get(&addr, "/review/diff?task=t");
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn diff_204_when_git_fails() {
+        // A well-formed but unknown SHA → git exits non-zero → 204, not empty 200.
+        let tmp = make_workdir("diff-git-fail");
+        let workdir = tmp.path().join("work");
+        fs::create_dir_all(&workdir).unwrap();
+        let spec = workdir.join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(&repo).args(args).output().expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(repo.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // 40 hex chars that are (almost certainly) not a real object → git errors.
+        fs::write(workdir.join("t-base.sha"), "0".repeat(40)).unwrap();
+        let addr = start_server_pd(workdir, spec, repo);
+
+        let (status, _) = http_get(&addr, "/review/diff?task=t");
+        assert_eq!(status, 204);
     }
 }
