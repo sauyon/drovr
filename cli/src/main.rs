@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use compress::{SystemRunner, handoff_self, phase_compress};
 use herdr::{Herdr, SystemHerdr};
 use std::io::Read as _;
-use phase::{collect, phase_done, phase_send, phase_start, phase_wait};
+use phase::{collect, diagnose_stuck_phase, phase_done, phase_send, phase_start, phase_wait};
 use review::{review_summary, serve};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
@@ -492,7 +492,17 @@ fn cmd_phase(sub: PhaseCmd) {
             match phase_wait(&mut state, &phase_name, timeout_ms) {
                 Ok(true) => println!("phase '{phase_name}' done"),
                 Ok(false) => {
-                    println!("phase '{phase_name}' still running (timeout)");
+                    // Liveness net: a timeout can mean the agent is genuinely
+                    // still working, OR it parked on a first-run prompt with no
+                    // human to answer it. Read the pane once (read-only,
+                    // focus-safe) and, if it matches a known "waiting on a
+                    // prompt" signature, surface an actionable diagnostic instead
+                    // of the bare timeout line.
+                    if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
+                        eprintln!("drovr: {diag}");
+                    } else {
+                        println!("phase '{phase_name}' still running (timeout)");
+                    }
                     process::exit(2);
                 }
                 Err(e) => {

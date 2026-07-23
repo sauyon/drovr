@@ -76,7 +76,7 @@ impl Herdr for SystemHerdr {
             "--cwd".into(), cwd.into(),
             "--no-focus".into(),
         ];
-        args.extend(auth_env_flags());
+        args.extend(spawn_env_flags());
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = self.run(&args_refs)?;
         if !out.status.success() {
@@ -120,7 +120,7 @@ impl Herdr for SystemHerdr {
             "--cwd".into(), cwd.into(),
             "--no-focus".into(),
         ];
-        args.extend(auth_env_flags());
+        args.extend(spawn_env_flags());
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = self.run(&args_refs)?;
         if !out.status.success() {
@@ -234,12 +234,23 @@ impl Herdr for SystemHerdr {
     }
 }
 
-/// `--env KEY=VALUE` flags for the claude auth vars set in this process's
-/// environment. Shared by `workspace create` and `tab create` so a phase's
-/// `claude` (launched via `pane run` in that pane's shell) inherits the caller's
-/// authenticated profile. Secrets travel as herdr's `--env` argv, never inlined
-/// into a `pane run` command string (which would echo into the terminal buffer).
-fn auth_env_flags() -> Vec<String> {
+/// `--env KEY=VALUE` flags applied to every phase-agent pane drovr creates
+/// (via `workspace create` / `tab create`). Two groups, both scoped to the
+/// phase's `claude`:
+///
+///   * the claude auth vars set in this process's environment, so the spawned
+///     `claude` inherits the caller's authenticated profile rather than the
+///     default `~/.claude`. Secrets travel as herdr's `--env` argv, never
+///     inlined into a `pane run` command string (which would echo into the
+///     terminal buffer);
+///   * `CLAUDE_CODE_NO_FLICKER=1`, which makes claude enable the fullscreen
+///     renderer directly and SKIP the first-run "Try the new fullscreen
+///     renderer?" upsell. A freshly-spawned interactive claude has no human to
+///     answer that prompt, so without this it blocks first-run until
+///     `phase wait` times out. (Verified: this flag preserves full transcript
+///     reads via `agent read --source recent`, so `phase compress` still works;
+///     `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` does NOT and must not be used.)
+fn spawn_env_flags() -> Vec<String> {
     let mut flags = Vec::new();
     for var in &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"] {
         if let Ok(val) = std::env::var(var) {
@@ -247,6 +258,10 @@ fn auth_env_flags() -> Vec<String> {
             flags.push(format!("{var}={val}"));
         }
     }
+    // Suppress claude's first-run renderer upsell so the spawned agent reaches
+    // its composer instead of parking on an unanswerable prompt.
+    flags.push("--env".into());
+    flags.push("CLAUDE_CODE_NO_FLICKER=1".into());
     flags
 }
 
@@ -496,9 +511,9 @@ mod tests {
         assert_eq!(parse_workspace_id(json).as_deref(), Some("w9"));
     }
 
-    // -- auth_env_flags: secrets travel via herdr --env, never inlined ---------
+    // -- spawn_env_flags: secrets travel via herdr --env, never inlined --------
     #[test]
-    fn auth_env_flags_includes_set_vars_only() {
+    fn spawn_env_flags_includes_set_vars_only() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -506,7 +521,7 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let joined = auth_env_flags().join(" ");
+        let joined = spawn_env_flags().join(" ");
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
@@ -518,8 +533,10 @@ mod tests {
         assert!(!joined.contains("ANTHROPIC_MODEL"), "unset model must not appear: {joined}");
     }
 
+    // Even with no auth vars set, the flicker-suppression flag is always emitted
+    // so the spawned claude skips its first-run renderer upsell.
     #[test]
-    fn auth_env_flags_empty_when_unset() {
+    fn spawn_env_flags_only_flicker_when_auth_unset() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -527,11 +544,46 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        assert!(auth_env_flags().is_empty(), "no flags expected when vars unset");
+        let joined = spawn_env_flags().join(" ");
+        assert!(
+            joined.contains("--env CLAUDE_CODE_NO_FLICKER=1"),
+            "flicker-suppression flag must always be present: {joined}"
+        );
+        assert!(!joined.contains("CLAUDE_CONFIG_DIR"), "no auth flags expected when unset: {joined}");
+        assert!(!joined.contains("ANTHROPIC_API_KEY"), "no auth flags expected when unset: {joined}");
+        assert!(!joined.contains("ANTHROPIC_MODEL"), "no auth flags expected when unset: {joined}");
+    }
+
+    // The flicker flag must ride on every phase-agent pane. Without it a freshly
+    // spawned interactive claude parks on "Try the new fullscreen renderer?" with
+    // no human to answer, hanging the phase until `phase wait` times out.
+    #[test]
+    fn spawn_env_flags_always_suppresses_flicker_upsell() {
+        use crate::test_util::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        let joined = spawn_env_flags().join(" ");
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        assert!(
+            joined.contains("--env CLAUDE_CODE_NO_FLICKER=1"),
+            "flicker-suppression flag must be present alongside auth flags: {joined}"
+        );
+        // We must NOT reach for the alternate-screen disable knob: it empties
+        // `agent read --source recent` and would break `phase compress`.
+        assert!(
+            !joined.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "must not disable the alternate screen (breaks phase compress): {joined}"
+        );
     }
 
     #[test]
-    fn auth_env_flags_includes_all_set_vars() {
+    fn spawn_env_flags_includes_all_set_vars() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -539,7 +591,7 @@ mod tests {
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
         }
-        let joined = auth_env_flags().join(" ");
+        let joined = spawn_env_flags().join(" ");
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
@@ -548,6 +600,7 @@ mod tests {
         assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
         assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
         assert!(joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"), "{joined}");
+        assert!(joined.contains("CLAUDE_CODE_NO_FLICKER=1"), "{joined}");
     }
 
     // Fake focus capture/restore primitives are recorded so phase_start can be

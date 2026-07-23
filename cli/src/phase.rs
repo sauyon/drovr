@@ -209,6 +209,98 @@ pub fn phase_wait(run: &mut RunState, phase: &str, timeout_ms: u64) -> io::Resul
     }
 }
 
+// ---------------------------------------------------------------------------
+// Liveness net — detect a phase pane parked on a first-run prompt
+// ---------------------------------------------------------------------------
+//
+// A freshly-spawned interactive `claude` can PARK on a prompt with no human to
+// answer it — a first-run upsell, a workspace-trust dialog, a future onboarding
+// step — and then it never reaches its composer, never runs `drovr phase done`,
+// and `phase wait` just times out with no explanation. The renderer upsell is
+// handled at the source (`CLAUDE_CODE_NO_FLICKER=1`, see herdr::spawn_env_flags),
+// but other prompts are unforeseeable, so this net catches the general case:
+// when a wait times out, read the pane once and, if it matches a known
+// "waiting on a prompt" signature, surface a clear, actionable diagnostic
+// (naming the run/phase, quoting the pane, suggesting `drovr attach`) instead of
+// a silent timeout.
+//
+// Design choices:
+//   * SURFACE, never auto-dismiss. Guessing a keypress to clear an unknown
+//     prompt is fragile — a wrong guess corrupts the agent's input — so we tell
+//     the human exactly where to look rather than gambling.
+//   * Read-only. `agent read` never moves focus (it is the same call `phase
+//     compress` uses without any focus capture), so this is focus-safe by
+//     construction and needs no capture/restore.
+//   * No busy-poll. This runs exactly once, on the wait's timeout — not in a
+//     loop.
+
+/// Substrings that mark a pane as parked on an interactive prompt awaiting a
+/// human. Kept deliberately specific to avoid matching normal agent output.
+/// Matching is case-insensitive.
+const STUCK_PROMPT_SIGNATURES: &[&str] = &[
+    // claude's first-run fullscreen-renderer upsell (belt-and-suspenders: it is
+    // suppressed at spawn via CLAUDE_CODE_NO_FLICKER, but a future variant might
+    // slip through).
+    "try the new fullscreen",
+    // Generic numbered-choice prompt cursor, e.g. "❯ 1. Yes".
+    "❯ 1.",
+    // Workspace / directory trust dialog.
+    "do you trust",
+    // Common confirmation affordances.
+    "enter to confirm",
+    "press enter to continue",
+    "1. yes",
+];
+
+/// If `pane` looks like it is parked on an interactive prompt awaiting a human,
+/// return the signature that matched (for the diagnostic); otherwise `None`.
+/// Pure and case-insensitive so it is trivially unit-testable.
+fn detect_stuck_prompt(pane: &str) -> Option<&'static str> {
+    let haystack = pane.to_lowercase();
+    STUCK_PROMPT_SIGNATURES
+        .iter()
+        .copied()
+        .find(|sig| haystack.contains(&sig.to_lowercase()))
+}
+
+/// The last `n` non-blank lines of `pane`, joined — a compact snippet to quote
+/// in the diagnostic so the human can recognize the prompt without attaching.
+fn tail_snippet(pane: &str, n: usize) -> String {
+    let lines: Vec<&str> = pane.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Read the phase pane once and, if it is parked on a known interactive prompt,
+/// return a clear, actionable diagnostic (naming the run/phase, quoting the
+/// pane tail, suggesting `drovr attach`). Returns `None` when the pane is not
+/// recognizably stuck (it may just be mid-work) or has no pane_id yet.
+///
+/// Read-only and focus-safe: `agent_read` never moves focus, so no capture /
+/// restore is needed. Intended to be called ONCE on a `phase wait` timeout, not
+/// in a poll loop. A failed pane read is swallowed (returns `None`) — a
+/// best-effort diagnostic must never mask the underlying timeout with a new
+/// error.
+pub fn diagnose_stuck_phase<H: Herdr>(
+    h: &H,
+    run: &RunState,
+    phase: &str,
+) -> Option<String> {
+    let idx = find_phase_idx(run, phase)?;
+    let pane_id = run.phases[idx].pane_id.clone()?;
+    let pane = h.agent_read(&pane_id).ok()?;
+    let matched = detect_stuck_prompt(&pane)?;
+    let snippet = tail_snippet(&pane, 6);
+    Some(format!(
+        "phase '{phase}' of run '{run_name}' appears STUCK on an interactive prompt \
+         (matched \"{matched}\") rather than working — it will never signal `drovr phase done`, \
+         so `phase wait` timed out.\n\
+         Pane {pane_id}:\n{snippet}\n\
+         Attach to answer the prompt: drovr attach {run_name}",
+        run_name = run.name,
+    ))
+}
+
 /// Read `HANDOFF.md` written by the compressor into the run directory.
 pub fn collect(run: &RunState, phase: &str) -> io::Result<String> {
     let path: PathBuf = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
@@ -596,6 +688,90 @@ mod tests {
             run.root_pane.as_deref(),
             Some("ws-9:root"),
             "root_pane must be retained when the launch fails"
+        );
+    }
+
+    // -- Task B: liveness net -------------------------------------------------
+
+    #[test]
+    fn detect_stuck_prompt_matches_renderer_upsell() {
+        let pane = "some output\nTry the new fullscreen renderer?\n❯ 1. Yes\n  2. Not now";
+        assert_eq!(detect_stuck_prompt(pane), Some("try the new fullscreen"));
+    }
+
+    #[test]
+    fn detect_stuck_prompt_matches_trust_dialog() {
+        let pane = "Do you trust the files in this folder?\n❯ 1. Yes, proceed";
+        // The first signature scanned that matches wins; both are present here.
+        assert!(detect_stuck_prompt(pane).is_some());
+    }
+
+    #[test]
+    fn detect_stuck_prompt_is_case_insensitive() {
+        assert!(detect_stuck_prompt("TRY THE NEW FULLSCREEN RENDERER?").is_some());
+        assert!(detect_stuck_prompt("Enter To Confirm").is_some());
+    }
+
+    #[test]
+    fn detect_stuck_prompt_none_on_normal_output() {
+        // Ordinary agent working output must NOT be flagged as a stuck prompt.
+        let pane = "Reading files...\nEditing src/main.rs\nRunning cargo test\nAll tests pass.";
+        assert_eq!(detect_stuck_prompt(pane), None);
+    }
+
+    #[test]
+    fn tail_snippet_returns_last_nonblank_lines() {
+        let pane = "a\n\nb\n\n\nc\nd\n\n";
+        assert_eq!(tail_snippet(pane, 2), "c\nd");
+        // Fewer lines than requested returns all of them.
+        assert_eq!(tail_snippet("only\n", 6), "only");
+    }
+
+    #[test]
+    fn diagnose_stuck_phase_surfaces_actionable_diagnostic() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("stuck-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        // The pane read on the next timeout returns a parked prompt.
+        h.push_read("Try the new fullscreen renderer?\n❯ 1. Yes\n  2. Not now");
+
+        let diag = diagnose_stuck_phase(&h, &run, "brainstorm")
+            .expect("a parked prompt must yield a diagnostic");
+        // Names the run + phase, quotes the pane, and points at `drovr attach`.
+        assert!(diag.contains("stuck-test"), "diag must name the run: {diag}");
+        assert!(diag.contains("brainstorm"), "diag must name the phase: {diag}");
+        assert!(diag.contains("Try the new fullscreen"), "diag must quote the pane: {diag}");
+        assert!(diag.contains("drovr attach stuck-test"), "diag must suggest attach: {diag}");
+    }
+
+    #[test]
+    fn diagnose_stuck_phase_none_when_working() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("working-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        // The pane shows ordinary working output — not a stuck prompt.
+        h.push_read("Editing src/main.rs\nRunning cargo test\nAll tests pass.");
+
+        assert!(
+            diagnose_stuck_phase(&h, &run, "brainstorm").is_none(),
+            "working output must not be reported as stuck"
+        );
+    }
+
+    #[test]
+    fn diagnose_stuck_phase_none_without_pane_id() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let run = make_run("no-pane-test"); // no phase started → no pane_id
+        // No phase registered at all: nothing to diagnose, no pane read.
+        assert!(diagnose_stuck_phase(&h, &run, "brainstorm").is_none());
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_read")),
+            "must not read a pane that does not exist yet"
         );
     }
 
