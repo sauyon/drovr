@@ -78,3 +78,35 @@ revision supersedes it. Options: (a) a `drovr review revise` command (or `review
 variant) that snapshots `spec.md`→`prior.md` then accepts the new spec; (b) the skill workflow
 copies `spec.md`→`prior.md` immediately before writing the new `spec.md`. Goal: each turn's
 diff = (previous revision) vs (this revision), regardless of how many revisions per submit.
+
+## Phase agents in a nested git worktree edit the OUTER repo, not the worktree
+
+**Severity:** high (breaks driving drovr against a worktree — the intended isolation model).
+**Found:** 2026-07-23, dogfooding the pipeline to implement drovr:code-review.
+
+### Symptom
+
+`drovr new --dir <worktree>` + phase spawn: the phase agent's pane cwd is correctly the
+worktree, and `plan.md` uses relative paths — yet the agent's edits (`cli/src/config.rs` etc.)
+land in the **outer/main checkout**, not the worktree. `git status` in the worktree stays
+clean; the outer repo's working tree goes dirty.
+
+### Root cause
+
+A linked git worktree shares the outer repo's `.git` (`git rev-parse --git-common-dir` →
+`<main>/.git`). Claude Code anchors its workspace root to that common repo, so relative file
+edits resolve against the outer checkout, not the worktree cwd. Nesting the worktree under the
+main repo (`.claude/worktrees/`) makes it worse.
+
+### Workaround (used to unblock)
+
+Set the run's `project_dir` to the **repo root itself** on the target branch (check the branch
+out at the main location), so there is no outer repo to stray into. Not real isolation.
+
+### Fix ideas
+
+1. drovr spawns phases in a **full clone** (independent `.git`), not a shared-`.git` worktree,
+   for true isolation.
+2. Inject an explicit absolute-project-root guard into the phase briefing/CLAUDE.md.
+3. Investigate whether a non-nested (sibling) worktree + an explicit `--add-dir`/workspace-root
+   hint to the spawned `claude` avoids the common-dir anchoring.
