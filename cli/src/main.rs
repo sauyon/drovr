@@ -1,6 +1,3 @@
-// The whole module is unused until Task 6 wires `drovr code-review run|base` into the
-// CLI; suppress the dead-code noise until then (Task 6 drops this attribute).
-#[allow(dead_code)]
 mod code_review;
 mod compress;
 mod config;
@@ -11,6 +8,7 @@ mod review;
 mod run;
 
 use clap::{Parser, Subcommand};
+use code_review::{ReviewOutcome, code_review_run, head_sha};
 use compress::{SystemRunner, handoff_self, phase_compress};
 use herdr::{Herdr, SystemHerdr};
 use std::io::Read as _;
@@ -95,6 +93,12 @@ enum Commands {
         #[command(subcommand)]
         sub: ReviewCmd,
     },
+
+    /// Automatic review-until-clean panel (see drovr:code-review).
+    CodeReview {
+        #[command(subcommand)]
+        sub: CodeReviewCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,20 +169,41 @@ enum ReviewCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CodeReviewCmd {
+    /// Record HEAD as the review base for `task` (run by the implement phase at
+    /// task start, before any code is written, so HEAD is the pre-task SHA).
+    Base { run: String, task: String },
+    /// Spawn one review panel for `task`, wait, merge, exit 0/3/2/1.
+    Run {
+        run: String,
+        task: String,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Reject run names that are empty or contain path-separator characters.
-/// Prevents path traversal in commands that touch the filesystem.
-fn validate_run_name(name: &str) -> io::Result<()> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+/// Reject a label (run name, task, ...) that is empty or contains path-separator
+/// characters. `kind` names the label in the error message. Prevents path traversal
+/// in commands that touch the filesystem with the value as a path component.
+fn validate_label(kind: &str, s: &str) -> io::Result<()> {
+    if s.is_empty() || s.contains('/') || s.contains('\\') || s.contains("..") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid run name {:?}: must not be empty or contain '/', '\\\\', or '..'", name),
+            format!("invalid {kind} {s:?}: must not be empty or contain '/', '\\\\', or '..'"),
         ));
     }
     Ok(())
+}
+
+/// Reject run names that are empty or contain path-separator characters.
+/// Thin wrapper over the shared [`validate_label`] predicate.
+fn validate_run_name(name: &str) -> io::Result<()> {
+    validate_label("run name", name)
 }
 
 fn load_run(name: &str) -> RunState {
@@ -685,6 +710,94 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+fn cmd_code_review(sub: CodeReviewCmd) {
+    match sub {
+        CodeReviewCmd::Base { run, task } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("task", &task) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let state = load_run(&run);
+            // A run created before project_dir existed can't resolve a HEAD to
+            // record; mirror `phase_start`'s guidance rather than recording a
+            // base from the wrong directory.
+            if state.project_dir.is_empty() {
+                eprintln!(
+                    "drovr: run '{run}' has no project_dir (created before this fix); \
+                     please recreate the run with `drovr new`"
+                );
+                process::exit(1);
+            }
+            let sha = head_sha(&state.project_dir).unwrap_or_else(|e| {
+                eprintln!("drovr: cannot read HEAD in '{}': {e}", state.project_dir);
+                process::exit(1);
+            });
+            let dir = run_dir(&run);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("drovr: cannot create run dir: {e}");
+                process::exit(1);
+            }
+            let path = dir.join(format!("{task}-base.sha"));
+            if let Err(e) = std::fs::write(&path, format!("{sha}\n")) {
+                eprintln!("drovr: cannot write {}: {e}", path.display());
+                process::exit(1);
+            }
+            println!("recorded review base for '{task}' = {sha} ({})", path.display());
+        }
+        CodeReviewCmd::Run { run, task, timeout_ms } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("task", &task) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let h = SystemHerdr::new();
+            let mut state = load_run(&run);
+            let outcome = code_review_run(&h, &mut state, &task, timeout_ms);
+            // Persist the review_phases progress the panel recorded (spawned
+            // reviewers, done/running status) BEFORE handling the result:
+            // `code_review_run` appends reviewer phases as it spawns them and can
+            // then fail (e.g. a mid-spawn `phase_send` error) with those phases
+            // only in memory, so an unconditional save here keeps disk and memory
+            // in sync on every path — including the `Err` early-exit below.
+            save_run(&state);
+            let outcome = outcome.unwrap_or_else(|e| {
+                eprintln!("drovr: code-review run failed: {e}");
+                process::exit(1);
+            });
+            match outcome {
+                ReviewOutcome::Clean => {
+                    println!("code-review: clean for '{task}' — no blocking findings");
+                }
+                ReviewOutcome::Findings => {
+                    let merged = run_dir(&run).join(format!("{task}-review.json"));
+                    println!(
+                        "code-review: changes requested for '{task}' (see {})",
+                        merged.display()
+                    );
+                    process::exit(3);
+                }
+                ReviewOutcome::Timeout => {
+                    println!(
+                        "code-review: reviewers did not finish for '{task}' within timeout (re-run to resume)"
+                    );
+                    process::exit(2);
+                }
+                ReviewOutcome::Error => {
+                    eprintln!("code-review: could not run panel for '{task}' (see message above)");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -705,6 +818,7 @@ fn main() {
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
         Commands::Review { sub } => cmd_review(sub),
+        Commands::CodeReview { sub } => cmd_code_review(sub),
     }
 }
 
@@ -953,11 +1067,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_code_review_base() {
+        let cli = parse(&["drovr", "code-review", "base", "myrun", "task-1"]).unwrap();
+        match cli.command {
+            Commands::CodeReview { sub: CodeReviewCmd::Base { run, task } } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(task, "task-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_code_review_run_default_timeout() {
+        let cli = parse(&["drovr", "code-review", "run", "myrun", "task-1"]).unwrap();
+        match cli.command {
+            Commands::CodeReview { sub: CodeReviewCmd::Run { run, task, timeout_ms } } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(task, "task-1");
+                // Generous default (30 min), matching `review wait`.
+                assert_eq!(timeout_ms, 1_800_000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_code_review_run_custom_timeout() {
+        let cli =
+            parse(&["drovr", "code-review", "run", "myrun", "task-1", "--timeout-ms", "5000"]).unwrap();
+        match cli.command {
+            Commands::CodeReview { sub: CodeReviewCmd::Run { timeout_ms, .. } } => {
+                assert_eq!(timeout_ms, 5000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn unknown_subcommand_errors() {
         assert!(parse(&["drovr", "bogus"]).is_err());
     }
 
-    // -- validate_run_name tests -----------------------------------------------
+    // -- validate_run_name / validate_label tests ------------------------------
 
     #[test]
     fn validate_run_name_accepts_normal_name() {
@@ -972,6 +1124,15 @@ mod tests {
         assert!(validate_run_name("a/b").is_err());
         assert!(validate_run_name("a\\b").is_err());
         assert!(validate_run_name("").is_err());
+    }
+
+    #[test]
+    fn validate_label_rejects_unsafe_filename_components() {
+        assert!(validate_label("task", "task-1").is_ok());
+        assert!(validate_label("task", "..").is_err());
+        assert!(validate_label("task", "a/b").is_err());
+        assert!(validate_label("task", "a\\b").is_err());
+        assert!(validate_label("task", "").is_err());
     }
 
     // -- format_progress helper -------------------------------------------------
