@@ -9,7 +9,7 @@ use compress::{SystemRunner, handoff_self, phase_compress};
 use herdr::{Herdr, SystemHerdr};
 use std::io::Read as _;
 use phase::{collect, diagnose_stuck_phase, phase_done, phase_send, phase_start, phase_wait};
-use review::{review_summary, serve};
+use review::{review_summary, review_wait, serve, WaitOutcome};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
 use std::path::PathBuf;
@@ -146,6 +146,17 @@ enum HandoffCmd {
 enum ReviewCmd {
     /// POST summary text to the running review server.
     Summary { run: String, text: String },
+    /// Block until the reviewer acts, then exit with the outcome.
+    ///
+    /// Run in the background after posting a summary: the process exits when
+    /// the reviewer acts (harness wakes the driver on exit) — no busy-poll.
+    /// Exit codes: 0 = approved, 3 = changes requested (`feedback.json` holds
+    /// the turn), 2 = timeout (re-run to resume), 1 = error.
+    Wait {
+        run: String,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +652,29 @@ fn cmd_review(sub: ReviewCmd) {
                 process::exit(1);
             }
         }
+        ReviewCmd::Wait { run, timeout_ms } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            match review_wait(&run, timeout_ms) {
+                Ok(WaitOutcome::Approved) => {
+                    println!("review approved for run '{run}'");
+                }
+                Ok(WaitOutcome::ChangesRequested) => {
+                    println!("review: changes requested for run '{run}' (see feedback.json)");
+                    process::exit(3);
+                }
+                Ok(WaitOutcome::Timeout) => {
+                    println!("review: no reviewer action for run '{run}' within timeout (re-run to resume)");
+                    process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("drovr: review wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -881,6 +915,31 @@ mod tests {
             Commands::Review { sub: ReviewCmd::Summary { run, text } } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(text, "the text");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_review_wait_default_timeout() {
+        let cli = parse(&["drovr", "review", "wait", "myrun"]).unwrap();
+        match cli.command {
+            Commands::Review { sub: ReviewCmd::Wait { run, timeout_ms } } => {
+                assert_eq!(run, "myrun");
+                // Generous default (30 min) — not a short silent cap.
+                assert_eq!(timeout_ms, 1_800_000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_review_wait_custom_timeout() {
+        let cli = parse(&["drovr", "review", "wait", "myrun", "--timeout-ms", "5000"]).unwrap();
+        match cli.command {
+            Commands::Review { sub: ReviewCmd::Wait { run, timeout_ms } } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(timeout_ms, 5000);
             }
             _ => panic!("wrong variant"),
         }

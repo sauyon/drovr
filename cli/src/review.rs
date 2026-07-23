@@ -14,14 +14,20 @@
 //! reads that file to find the server.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::run::run_dir;
+
+/// How often [`review_wait`] polls the live server for a reviewer decision.
+/// Mirrors `phase::POLL_INTERVAL` — a filesystem/state poll, not a hot loop.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Embedded assets (single-binary shape)
@@ -363,7 +369,6 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     let mut stream = TcpStream::connect(addr)
         .map_err(|e| io::Error::new(e.kind(), format!("could not connect to review server at {addr}: {e}")))?;
 
-    use std::io::Write;
     stream.write_all(request.as_bytes())?;
     stream.write_all(body)?;
 
@@ -379,6 +384,72 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Terminal outcome of a [`review_wait`] blocking wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Reviewer approved — the `approved` marker is present.
+    Approved,
+    /// Reviewer requested changes — `feedback.json` holds this turn's feedback.
+    ChangesRequested,
+    /// No reviewer action within the timeout; the caller may re-run to resume.
+    Timeout,
+}
+
+/// GET `/state` from the live review server, returning the `state` string.
+fn fetch_state(addr: &str) -> io::Result<String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| {
+        io::Error::new(e.kind(), format!("could not connect to review server at {addr}: {e}"))
+    })?;
+    write!(stream, "GET /state HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp)?;
+    let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or_default();
+    parsed["state"]
+        .as_str()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| io::Error::other(format!("malformed /state response from {addr}: {body:?}")))
+}
+
+/// Block until the reviewer acts on the spec gate, then return the outcome.
+///
+/// Reads `<run_dir>/review.addr` (written by [`serve`]) and polls the live
+/// server's authoritative `GET /state` at [`POLL_INTERVAL`] until either the
+/// reviewer submits or `timeout_ms` elapses. Blocks while state is `idle`/
+/// `ready`; returns [`WaitOutcome::Approved`] once the `approved` marker lands
+/// and [`WaitOutcome::ChangesRequested`] once the reviewer requests changes
+/// (`feedback.json` holds the turn). On timeout it returns
+/// [`WaitOutcome::Timeout`] — the wait is resumable, so a driver just re-runs
+/// it. A missing `review.addr` or an unreachable server is an `Err`.
+///
+/// Mirrors [`crate::phase::phase_wait`]: a bounded poll with a deadline and no
+/// hot loop, so a driver can background it and be woken on process exit.
+pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
+    let addr_file = run_dir(run).join("review.addr");
+    let addr = fs::read_to_string(&addr_file).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("review server address not found ({}); is `drovr serve` running for run {:?}? ({})", addr_file.display(), run, e),
+        )
+    })?;
+    let addr = addr.trim().to_owned();
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match fetch_state(&addr)?.as_str() {
+            "approved" => return Ok(WaitOutcome::Approved),
+            "waiting" => return Ok(WaitOutcome::ChangesRequested),
+            // "idle" / "ready" — reviewer has not acted yet; keep blocking.
+            _ => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(WaitOutcome::Timeout);
+        }
+        thread::sleep(POLL_INTERVAL.min(deadline - now));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -386,10 +457,7 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::net::TcpStream;
-    use std::thread;
-    use std::time::Duration;
 
     /// Start a review server on 127.0.0.1:0 in a background thread.
     /// Returns the bound address string (e.g. "127.0.0.1:54321").
@@ -644,5 +712,97 @@ mod tests {
         // Confirm summary.txt was written by the server into the run dir.
         let summary = fs::read_to_string(fake_run_dir.join("summary.txt")).expect("summary.txt");
         assert_eq!(summary, "Agent summary text.");
+    }
+
+    // -- review_wait ---------------------------------------------------------
+
+    /// Spin a real review server in the run dir that `run_dir(run)` resolves to,
+    /// write `review.addr`, and return `(addr, run_name, tempdir)`. Caller must
+    /// already hold ENV_LOCK (this sets XDG_DATA_HOME).
+    fn wait_fixture(suffix: &str) -> (String, String, tempfile::TempDir) {
+        let tmp = make_workdir(suffix);
+        let run_name = format!("wait-{suffix}");
+        let fake_base = tmp.path().to_path_buf();
+        let fake_run_dir = fake_base.join("drovr/runs").join(&run_name);
+        fs::create_dir_all(&fake_run_dir).unwrap();
+        let spec = fake_run_dir.join("spec.md");
+        fs::write(&spec, b"# Spec").unwrap();
+
+        let addr = start_server(fake_run_dir.clone(), spec);
+        fs::write(fake_run_dir.join("review.addr"), addr.as_bytes()).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", fake_base.to_str().unwrap()); }
+        (addr, run_name, tmp)
+    }
+
+    #[test]
+    fn wait_missing_addr_errors() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let tmp = make_workdir("wait-no-addr");
+        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap()); }
+        // No review.addr written → unreachable server → error (exit 1 at CLI).
+        let res = review_wait("does-not-exist", 100);
+        assert!(res.is_err(), "missing review.addr must be an error");
+    }
+
+    #[test]
+    fn wait_times_out_while_idle() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (_addr, run_name, _tmp) = wait_fixture("idle-timeout");
+        // State is `idle` (no summary posted) → wait blocks then times out.
+        let outcome = review_wait(&run_name, 60).expect("wait");
+        assert_eq!(outcome, WaitOutcome::Timeout);
+    }
+
+    #[test]
+    fn wait_returns_approved_when_reviewer_approves() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (addr, run_name, _tmp) = wait_fixture("approve");
+        // Driver posted a summary → state `ready`; wait must BLOCK here.
+        http_post(&addr, "/summary", "text/plain", "please review");
+
+        let run_for_thread = run_name.clone();
+        let handle = thread::spawn(move || review_wait(&run_for_thread, 10_000));
+
+        // While the reviewer has not acted, the wait must not have returned.
+        thread::sleep(Duration::from_millis(200));
+        assert!(!handle.is_finished(), "wait must block while state is `ready`");
+
+        // Reviewer approves → wait wakes and exits with Approved.
+        http_post(
+            &addr,
+            "/submit",
+            "application/json",
+            r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#,
+        );
+        let outcome = handle.join().unwrap().expect("wait");
+        assert_eq!(outcome, WaitOutcome::Approved);
+    }
+
+    #[test]
+    fn wait_returns_changes_requested() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (addr, run_name, tmp) = wait_fixture("changes");
+        http_post(&addr, "/summary", "text/plain", "please review");
+
+        let run_for_thread = run_name.clone();
+        let handle = thread::spawn(move || review_wait(&run_for_thread, 10_000));
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(!handle.is_finished(), "wait must block while state is `ready`");
+
+        // Reviewer requests changes → wait exits ChangesRequested (exit 3).
+        http_post(
+            &addr,
+            "/submit",
+            "application/json",
+            r#"{"decision":"request-changes","feedback":"needs work","answers":{},"annotations":[]}"#,
+        );
+        let outcome = handle.join().unwrap().expect("wait");
+        assert_eq!(outcome, WaitOutcome::ChangesRequested);
+
+        // feedback.json holds this turn's feedback for the driver to forward.
+        let run_dir = tmp.path().join("drovr/runs").join(&run_name);
+        let fb = fs::read_to_string(run_dir.join("feedback.json")).expect("feedback.json");
+        assert!(fb.contains("needs work"), "feedback.json must hold the turn: {fb}");
     }
 }
