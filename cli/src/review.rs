@@ -29,7 +29,6 @@ use crate::run::run_dir;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const MARKDOWN_IT_JS: &[u8] = include_bytes!("../web/vendor/markdown-it.min.js");
-const HTML_DIFF_JS: &[u8] = include_bytes!("../web/vendor/html-diff.js");
 
 // ---------------------------------------------------------------------------
 // State
@@ -170,9 +169,6 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         match rel {
             "vendor/markdown-it.min.js" => {
                 respond_bytes(req, 200, "application/javascript; charset=utf-8", MARKDOWN_IT_JS.to_vec());
-            }
-            "vendor/html-diff.js" => {
-                respond_bytes(req, 200, "application/javascript; charset=utf-8", HTML_DIFF_JS.to_vec());
             }
             other => {
                 let ct = content_type_for(other);
@@ -602,8 +598,6 @@ mod tests {
 
         let (status, _) = http_get(&addr, "/web/vendor/markdown-it.min.js");
         assert_eq!(status, 200);
-        let (status2, _) = http_get(&addr, "/web/vendor/html-diff.js");
-        assert_eq!(status2, 200);
     }
 
     #[test]
