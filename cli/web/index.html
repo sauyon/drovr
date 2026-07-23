@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <title>Drovr Review Loop</title>
 <script src="/web/vendor/markdown-it.min.js"></script>
-<script src="/web/vendor/html-diff.js"></script>
 <style>
   /* ---- CSS reset + design tokens ---- */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -192,6 +191,51 @@
   .diff-content del, .diff-content .diffmod, .diff-content .diffdel {
     background: var(--del-bg);
     color: var(--del-text);
+    border-radius: 2px;
+  }
+
+  /* ---- Source (before→after) line diff ---- */
+  .diff-lines {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    tab-size: 2;
+  }
+  .diff-line {
+    display: flex;
+    padding: 0 4px;
+    border-radius: 2px;
+  }
+  .diff-line .gutter {
+    flex: 0 0 auto;
+    width: 1.4em;
+    color: var(--muted);
+    user-select: none;
+    opacity: .7;
+  }
+  .diff-line .text { flex: 1 1 auto; white-space: pre-wrap; }
+  .diff-line.ctx { color: var(--muted); }
+  .diff-line.add {
+    background: var(--ins-bg);
+    color: var(--ins-text);
+  }
+  .diff-line.add .gutter { color: var(--ins-text); }
+  .diff-line.del {
+    background: var(--del-bg);
+    color: var(--del-text);
+  }
+  .diff-line.del .gutter { color: var(--del-text); }
+  /* word-level emphasis inside a changed line */
+  .diff-line.add ins {
+    background: color-mix(in srgb, var(--ins-text) 22%, transparent);
+    text-decoration: none;
+    border-radius: 2px;
+  }
+  .diff-line.del del {
+    background: color-mix(in srgb, var(--del-text) 22%, transparent);
+    text-decoration: none;
     border-radius: 2px;
   }
 
@@ -506,13 +550,90 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ---- HtmlDiff ----
-function htmlDiff(oldHtml, newHtml) {
-  if (window.HtmlDiff && typeof HtmlDiff.execute === 'function') {
-    try { return HtmlDiff.execute(oldHtml, newHtml); }
-    catch(e) { console.warn('HtmlDiff error', e); }
+// ---- Source diff (before → after) ----
+// A simple LCS-based diff over an array of tokens, returning an ordered list of
+// ops: {type: 'eq'|'del'|'add', a, b} where a/b are the token values.
+function lcsDiff(a, b) {
+  var n = a.length, m = b.length;
+  // DP table of LCS lengths. Bounded by document size (fine for specs).
+  var dp = [];
+  for (var i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+  for (var i = n - 1; i >= 0; i--) {
+    for (var j = m - 1; j >= 0; j--) {
+      dp[i][j] = (a[i] === b[j])
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
   }
-  return newHtml;
+  var ops = [];
+  var i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ type: 'eq', a: a[i], b: b[j] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ type: 'del', a: a[i] }); i++; }
+    else { ops.push({ type: 'add', b: b[j] }); j++; }
+  }
+  while (i < n) { ops.push({ type: 'del', a: a[i] }); i++; }
+  while (j < m) { ops.push({ type: 'add', b: b[j] }); j++; }
+  return ops;
+}
+
+// Split a line into diff tokens for word-level highlighting: words and the
+// whitespace between them, preserved so re-joined output equals the input.
+function wordTokens(line) {
+  return line.match(/\s+|\S+/g) || [];
+}
+
+// Word-level diff of a removed/added line pair → { del: html, add: html }.
+function refineLinePair(oldLine, newLine) {
+  var ops = lcsDiff(wordTokens(oldLine), wordTokens(newLine));
+  var delHtml = '', addHtml = '';
+  ops.forEach(function(op) {
+    if (op.type === 'eq') { delHtml += escHtml(op.a); addHtml += escHtml(op.b); }
+    else if (op.type === 'del') { delHtml += '<del>' + escHtml(op.a) + '</del>'; }
+    else { addHtml += '<ins>' + escHtml(op.b) + '</ins>'; }
+  });
+  return { del: delHtml, add: addHtml };
+}
+
+// Render a readable unified before→after diff of two markdown SOURCE strings.
+// Unchanged lines are neutral; removed lines red, added lines green, with
+// word-level emphasis on lines that were changed (a del immediately followed
+// by an add).
+function renderSourceDiff(oldText, newText) {
+  var oldLines = oldText.replace(/\n$/, '').split('\n');
+  var newLines = newText.replace(/\n$/, '').split('\n');
+  var ops = lcsDiff(oldLines, newLines);
+
+  var rows = [];
+  function pushLine(cls, gutter, html) {
+    rows.push('<div class="diff-line ' + cls + '">'
+      + '<span class="gutter">' + gutter + '</span>'
+      + '<span class="text">' + html + '</span></div>');
+  }
+
+  for (var k = 0; k < ops.length; ) {
+    var op = ops[k];
+    if (op.type === 'eq') {
+      pushLine('ctx', ' ', escHtml(op.a));
+      k++;
+      continue;
+    }
+    // Gather the run of consecutive removals, then consecutive additions.
+    var delRun = [], addRun = [];
+    while (k < ops.length && ops[k].type === 'del') { delRun.push(ops[k].a); k++; }
+    while (k < ops.length && ops[k].type === 'add') { addRun.push(ops[k].b); k++; }
+    if (delRun.length === 1 && addRun.length === 1) {
+      // A modified line: word-level refine the single del/add pair.
+      var refined = refineLinePair(delRun[0], addRun[0]);
+      pushLine('del', '−', refined.del);
+      pushLine('add', '+', refined.add);
+    } else {
+      // Distinct block of removals and/or additions: whole-line highlight.
+      delRun.forEach(function(l) { pushLine('del', '−', escHtml(l)); });
+      addRun.forEach(function(l) { pushLine('add', '+', escHtml(l)); });
+    }
+  }
+  return '<div class="diff-lines">' + rows.join('') + '</div>';
 }
 
 // ---- Per-line annotations ----
@@ -772,12 +893,11 @@ async function refresh() {
     wireAnnotations(docContentEl, sourceLines);
   }
 
-  // diff panel
+  // diff panel — before→after diff of the raw markdown SOURCE (not rendered
+  // HTML): unchanged lines neutral, removals red, additions green.
   if (priorText && priorText.trim().length > 0) {
-    var oldHtml = renderMd(priorText);
-    var newHtml = renderMd(docText);
-    var diffHtml = htmlDiff(oldHtml, newHtml);
-    document.getElementById('diff-content').innerHTML = diffHtml;
+    document.getElementById('diff-content').innerHTML =
+      renderSourceDiff(priorText, docText);
     showEl('diff-panel');
   } else {
     hideEl('diff-panel');
@@ -805,6 +925,7 @@ async function refresh() {
   // idle or ready: show form
   hideEl('waiting-overlay');
   hideEl('approved-overlay');
+  document.getElementById('submit-btn').disabled = false;
   showEl('form-section');
 }
 
