@@ -1,5 +1,6 @@
 mod compress;
 mod config;
+mod findings;
 mod herdr;
 mod phase;
 mod review;
