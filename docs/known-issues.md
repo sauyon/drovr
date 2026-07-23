@@ -73,3 +73,27 @@ red for removals** — a plain, familiar diff view, instead of whatever is rende
 diffing/rendering lives in the `cli/web/` frontend. The fix is in the frontend rendering (a
 line/word-level before→after diff with red/green highlighting), possibly with a server-side
 diff if that's cleaner than diffing in the browser.
+
+## Review server: Submit button stays greyed out after a successful submit
+
+**Severity:** high (blocks the reviewer from submitting a later turn).
+**Found:** 2026-07-22, on the second review turn of a spec gate.
+
+### Symptom
+
+After the reviewer requests changes once and the agent re-serves a revised spec (state →
+`ready`), the browser re-shows the form but the **Submit button is greyed out** (disabled) —
+the reviewer can't submit again. A full page reload works around it.
+
+### Root cause
+
+`cli/web/index.html` `submitDecision()` sets `btn.disabled = true` before POSTing and only
+re-enables it on the failure / network-error paths — **never after a successful submit**.
+`refresh()` (which re-shows the form when state returns to `ready`) doesn't reset `disabled`
+either, so the button carries `disabled = true` into the next turn.
+
+### Fix
+
+Reset `submit-btn.disabled = false` whenever the form is (re)shown — in `refresh()`'s
+"idle or ready: show form" branch (or re-enable at the end of `submitDecision` on success).
+One line.
