@@ -97,3 +97,31 @@ either, so the button carries `disabled = true` into the next turn.
 Reset `submit-btn.disabled = false` whenever the form is (re)shown — in `refresh()`'s
 "idle or ready: show form" branch (or re-enable at the end of `submitDecision` on success).
 One line.
+
+## Review server: diff baseline (`prior.md`) doesn't advance on agent revisions
+
+**Severity:** medium (the "what changed this turn" diff is wrong when the agent revises more
+than once between reviewer submits).
+**Found:** 2026-07-22, after posting two `review summary` revisions for one reviewer turn.
+
+### Symptom
+
+The diff panel shows the change since the reviewer's **last submit**, not since the previous
+revision. If the agent posts multiple `drovr review summary` revisions between reviewer
+submits, they all diff against the same stale `prior.md`, so a later revision shows the
+accumulated change (e.g. v1→v3) instead of just the latest (v2→v3).
+
+### Root cause
+
+`cli/src/review.rs` snapshots `prior.md` **only** in the POST `/submit` handler (on reviewer
+submit). `drovr review summary` (a new agent revision) does not re-baseline `prior.md`, and
+the agent overwrites `spec.md` before calling `review summary`, so the pre-revision version is
+already lost.
+
+### Fix
+
+Re-baseline per revision: snapshot the outgoing `spec.md` → `prior.md` **before** the new
+revision supersedes it. Options: (a) a `drovr review revise` command (or `review summary`
+variant) that snapshots `spec.md`→`prior.md` then accepts the new spec; (b) the skill workflow
+copies `spec.md`→`prior.md` immediately before writing the new `spec.md`. Goal: each turn's
+diff = (previous revision) vs (this revision), regardless of how many revisions per submit.
