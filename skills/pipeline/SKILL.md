@@ -120,6 +120,51 @@ include those in the next task's injected briefing so later tasks bind to real s
 `drovr phase start` appends any unseen phase name, so `implement-task-<N>` phases are created
 on demand alongside the four seeded phases.
 
+### Review each task until clean — driver-run panel
+
+After a task's `drovr phase compress`, and **before** starting the next task, the **driver**
+runs the automatic review panel (see `drovr:code-review`). The implementer records the base at
+task start — `implement-task.md` has it run `drovr code-review base <run> task-<N>` before
+writing any code, so `HEAD` is the pre-task SHA. Then the driver runs the blocking panel and
+branches on its exit code:
+
+```
+drovr phase compress <run> implement-task-<N>
+drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle
+case $? in
+  0)  # clean — proceed to task N+1
+  3)  # findings — re-enter implement, forward the review, re-run the panel (loop)
+  2)  # timeout — re-run the panel (resumable; the re-run bumps the iteration)
+  1)  # error — STOP and diagnose (see Failure model)
+esac
+```
+
+On **exit 3**, re-enter the implement phase for task N and forward the merged findings:
+
+```
+drovr phase send <run> implement-task-<N> "Review found changes (see <run_dir>/task-<N>-review.json). Fix every Important AND every nit, then report."
+drovr phase wait <run> implement-task-<N> --timeout-ms 900000
+drovr phase compress <run> implement-task-<N>
+drovr code-review run <run> task-<N>          # re-run the panel
+```
+
+Re-entry needs **no `drovr phase start`**: `drovr phase done` only writes a marker — it never
+closes the pane (panes live until `drovr cleanup`), so the task's agent is still alive and
+`drovr phase send` reaches it directly. The agent drops a fresh `drovr phase done` marker when
+it finishes the fix, which the following `phase wait` consumes.
+
+Loop with **impact-scaled judgement** — no hardcoded floor or ceiling on iterations. Stop when
+the panel is clean *and* converged for the change's impact (a small change may need one pass; a
+risky one, several), or when iteration stops converging (the same class of finding recurs
+without the diff improving) — then surface it rather than looping forever. The reviewer fixes
+Important **and** nits on re-entry; only critical/important block the clean gate, but a clean
+task should not ship known nits it can cheaply fix.
+
+**Single-writer invariant:** the panel is the only reviewer activity in flight, and every
+reviewer exits (drops its `drovr phase done` marker) before the implementer re-enters to fix.
+Never have a reviewer pane alive while the implementer writes — that breaks the single-writer
+rule. `code-review run` blocks until all angles finish, so the driver naturally serializes them.
+
 ## Self-review before a phase reports done — REQUIRED
 
 Every phase that produces an artifact (plan, and each implement task) must **review its own
@@ -157,3 +202,6 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |
+| Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task's compress; loop on exit 3. |
+| Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
+| Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |

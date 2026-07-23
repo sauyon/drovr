@@ -10,10 +10,8 @@ description: Use when a drovr phase has produced an artifact (code, spec, plan) 
 **They find, you fix.** Do not declare work done on your own judgment. Launch
 one or more **read-only review subagents** to adversarially review the change,
 then address what they find. Read-only reviewers preserve drovr's single-writer
-rule: the subagent finds, the phase agent fixes.
-
-This is in addition to the pipeline's final review phase — catch defects here,
-cheaply, before they cascade into the next phase's briefing.
+rule: the subagent finds, the phase agent fixes. This is in addition to the
+pipeline's final review phase — catch defects here, before they cascade.
 
 ## How to run it
 
@@ -41,3 +39,13 @@ Review as a skeptic, not the author.
 Address **every Critical and Important finding**, then re-run the tests. Record
 any finding you consciously chose not to fix, with the reason. Only after this
 may you report done.
+
+## Automatic panel — `drovr code-review run <run> <task>`
+
+The pipeline runs this per task (see `drovr:pipeline`): one read-only reviewer per
+configured angle over `git diff <base>..HEAD` (`<base>` = `<task>-base.sha`, taken
+at task start). Each reviewer reads the diff + working tree, may run tests, writes
+`<task>-review-<angle>.json`, runs `drovr phase done`, then exits — it never edits
+project source or `state.json` (the read-only trust boundary; they find, you fix).
+Findings union-merge into `<task>-review.json`, each tagged with its angle. Exit
+codes: 0 clean, 3 findings, 2 timeout, 1 error.

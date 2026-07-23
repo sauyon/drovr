@@ -13,12 +13,19 @@ tasks; later tasks run as their own fresh phases.
 
 1. **Read** the task brief and the accumulated interfaces below, then read the real code you
    will touch (read-only explorers for anything you only need to understand, not change).
-2. **Implement test-first — apply `drovr:tdd`.** The test to write first is the one named in
+2. **Record the review base — before writing any code.** Run
+   `drovr code-review base <run> task-<N>` so `HEAD` is captured as this task's pre-task SHA
+   (the automatic review panel diffs `base..HEAD`). Do this first; editing before recording
+   would move the base past your own changes. **Re-entry:** if this message seeds you with a
+   `~/.local/share/drovr/runs/<run>/task-<N>-review.json` (the driver re-entered you after the
+   panel found changes), do NOT re-record the base — fix **every Important AND every nit** in
+   that file, then run the rest of the steps (verify, self-review, report — steps 4–7).
+3. **Implement test-first — apply `drovr:tdd`.** The test to write first is the one named in
    this task's verification; keep it scoped to this task's interfaces so the folded-forward
    contracts stay accurate.
-3. **Verify before claiming done — apply `drovr:verification-before-completion`** on this
+4. **Verify before claiming done — apply `drovr:verification-before-completion`** on this
    task's tests and the build/linter.
-4. **Self-review before reporting done — apply `drovr:code-review`** (read-only review
+5. **Self-review before reporting done — apply `drovr:code-review`** (read-only review
    subagents, foreground). Do NOT declare the task done off your own judgment. The skill has
    the how-to and the check order; the one constraint below is repeated here because the whole
    run depends on it: **run the review subagents in the
@@ -27,7 +34,7 @@ tasks; later tasks run as their own fresh phases.
    cannot distinguish from completion and which stalls the run until a human nudges the pane;
    blocking keeps you working straight through to your final step. This is IN ADDITION to the
    pipeline's final review phase — catch it here, cheaply, before it cascades.
-5. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
+6. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
    - what changed (files + the interfaces you actually implemented, verbatim),
    - test/verification output proving it works,
    - the self-review: what the review subagents found and how you resolved each Critical/
@@ -35,7 +42,7 @@ tasks; later tasks run as their own fresh phases.
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.
-6. **Signal completion — your FINAL action.** After the report is written, run:
+7. **Signal completion — your FINAL action.** After the report is written, run:
    ```
    drovr phase done <run> implement-task-<N>
    ```
