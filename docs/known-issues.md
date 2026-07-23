@@ -51,53 +51,6 @@ followed by the empty-submit flush.
    run dir, send a one-line pointer) to keep pastes tiny.
 4. Add an e2e/integration test that asserts a large `agent_send` actually submits.
 
-## Review server diff rendering is hard to read
-
-**Severity:** medium (usability of the human spec gate — reviewers struggle to see what changed).
-**Found:** 2026-07-22, reviewing a spec through `drovr serve`.
-
-### Symptom
-
-The review server's browser UI renders the spec change in a way that's hard to read — a
-reviewer can't quickly tell what actually changed between the prior version (`prior.md`) and
-the current `spec.md`.
-
-### Desired behavior
-
-Just show **before + after**, with only the changed bits highlighted — **green for additions,
-red for removals** — a plain, familiar diff view, instead of whatever is rendered now.
-
-### Where
-
-`cli/src/review.rs` serves `/doc` (current `spec.md`) and `/prior` (previous `prior.md`); the
-diffing/rendering lives in the `cli/web/` frontend. The fix is in the frontend rendering (a
-line/word-level before→after diff with red/green highlighting), possibly with a server-side
-diff if that's cleaner than diffing in the browser.
-
-## Review server: Submit button stays greyed out after a successful submit
-
-**Severity:** high (blocks the reviewer from submitting a later turn).
-**Found:** 2026-07-22, on the second review turn of a spec gate.
-
-### Symptom
-
-After the reviewer requests changes once and the agent re-serves a revised spec (state →
-`ready`), the browser re-shows the form but the **Submit button is greyed out** (disabled) —
-the reviewer can't submit again. A full page reload works around it.
-
-### Root cause
-
-`cli/web/index.html` `submitDecision()` sets `btn.disabled = true` before POSTing and only
-re-enables it on the failure / network-error paths — **never after a successful submit**.
-`refresh()` (which re-shows the form when state returns to `ready`) doesn't reset `disabled`
-either, so the button carries `disabled = true` into the next turn.
-
-### Fix
-
-Reset `submit-btn.disabled = false` whenever the form is (re)shown — in `refresh()`'s
-"idle or ready: show form" branch (or re-enable at the end of `submitDecision` on success).
-One line.
-
 ## Review server: diff baseline (`prior.md`) doesn't advance on agent revisions
 
 **Severity:** medium (the "what changed this turn" diff is wrong when the agent revises more
