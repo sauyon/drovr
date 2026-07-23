@@ -14,6 +14,14 @@ pub struct Phase {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RunState {
     pub name: String, pub task: String, pub phases: Vec<Phase>,
+    /// Reviewer phases (`review:<task>:<iter>:<angle>`), kept OUT of `phases` so
+    /// they never pollute pipeline progress: `first_incomplete` and
+    /// `format_progress` (main.rs) walk `phases` only, and that omission IS the
+    /// isolation. Only `find_phase` (and the marker/pane-id lookups that delegate
+    /// to it) consult this list. `#[serde(default)]` so pre-existing state.json
+    /// files (written before this field) load with an empty list.
+    #[serde(default)]
+    pub review_phases: Vec<Phase>,
     pub gate: String, pub cursor: usize,
     /// The herdr workspace id created for this run (set by `drovr new`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +63,16 @@ impl RunState {
     pub fn first_incomplete(&self) -> Option<usize> {
         self.phases.iter().position(|p| p.status != PhaseStatus::Done)
     }
+    /// Look up a phase by name across BOTH `phases` and `review_phases`. Reviewer
+    /// lookups (marker-drop, seed injection) need to resolve names living in
+    /// `review_phases`; pipeline progress deliberately does NOT use this (it stays
+    /// bound to `phases` only — see `first_incomplete`). Searches `phases` first,
+    /// then `review_phases`.
+    pub fn find_phase(&self, name: &str) -> Option<&Phase> {
+        self.phases.iter()
+            .chain(self.review_phases.iter())
+            .find(|p| p.name == name)
+    }
 }
 
 #[cfg(test)]
@@ -75,10 +93,54 @@ mod tests {
             phases: vec![
                 Phase{name:"brainstorm".into(), status:PhaseStatus::Done, handoff_doc:None, herdr_session:None, pane_id:None},
                 Phase{name:"plan".into(), status:PhaseStatus::Pending, handoff_doc:None, herdr_session:None, pane_id:None},
-            ], gate:"spec".into(), cursor:1, workspace: None, root_pane: None, project_dir: "/tmp/proj".into() };
+            ],
+            // A populated review_phases list must NOT influence pipeline progress:
+            // it round-trips but `first_incomplete` (and `format_progress`) ignore it.
+            review_phases: vec![
+                Phase{name:"review:task-1:1:correctness".into(), status:PhaseStatus::Running, handoff_doc:None, herdr_session:None, pane_id:Some("p1".into())},
+            ],
+            gate:"spec".into(), cursor:1, workspace: None, root_pane: None, project_dir: "/tmp/proj".into() };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
         assert_eq!(loaded.phases.len(), 2);
+        assert_eq!(loaded.review_phases.len(), 1, "review_phases must round-trip");
+        // first_incomplete walks `phases` only — the pending "plan" at index 1 wins,
+        // and the Running review phase is invisible to it.
         assert_eq!(loaded.first_incomplete(), Some(1));
+    }
+
+    #[test]
+    fn missing_review_phases_defaults_to_empty() {
+        // A pre-existing state.json written before `review_phases` existed has no
+        // such key; serde's #[serde(default)] must yield an empty vec, not an error.
+        let json = r#"{
+            "name":"old","task":"t",
+            "phases":[{"name":"plan","status":"Pending","handoff_doc":null,"herdr_session":null,"pane_id":null}],
+            "gate":"spec","cursor":0,"project_dir":"/tmp/proj"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        assert!(loaded.review_phases.is_empty(), "absent review_phases must default to []");
+    }
+
+    #[test]
+    fn find_phase_searches_both_lists() {
+        let mk = |name: &str| Phase {
+            name: name.into(), status: PhaseStatus::Running,
+            handoff_doc: None, herdr_session: None, pane_id: None,
+        };
+        let s = RunState {
+            name: "r".into(), task: "t".into(),
+            phases: vec![mk("plan")],
+            review_phases: vec![mk("review:task-1:1:correctness")],
+            gate: "spec".into(), cursor: 0, workspace: None, root_pane: None,
+            project_dir: "/tmp/proj".into(),
+        };
+        assert_eq!(s.find_phase("plan").map(|p| p.name.as_str()), Some("plan"));
+        assert_eq!(
+            s.find_phase("review:task-1:1:correctness").map(|p| p.name.as_str()),
+            Some("review:task-1:1:correctness"),
+            "find_phase must also search review_phases"
+        );
+        assert!(s.find_phase("nonexistent").is_none());
     }
 }

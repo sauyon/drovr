@@ -190,6 +190,7 @@ mod tests {
             name: name.to_owned(),
             task: "compress the brainstorm phase output".into(),
             phases: vec![],
+            review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,
             workspace: None,

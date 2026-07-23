@@ -326,6 +326,7 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
                 pane_id: None,
             },
         ],
+        review_phases: vec![],
         gate: "spec".into(),
         cursor: 0,
         workspace,
@@ -982,6 +983,12 @@ mod tests {
                 run::Phase { name: "plan".into(), status: PhaseStatus::Pending,
                     handoff_doc: None, herdr_session: None, pane_id: None },
             ],
+            // A populated review_phases list must not shift the "0/2" progress or
+            // the "current" phase — format_progress walks `phases` only.
+            review_phases: vec![
+                run::Phase { name: "review:task-1:1:correctness".into(), status: PhaseStatus::Running,
+                    handoff_doc: None, herdr_session: None, pane_id: None },
+            ],
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
@@ -1002,6 +1009,7 @@ mod tests {
                 run::Phase { name: "brainstorm".into(), status: PhaseStatus::Done,
                     handoff_doc: None, herdr_session: None, pane_id: None },
             ],
+            review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,
             workspace: None,

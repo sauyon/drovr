@@ -10,7 +10,9 @@ use crate::run::{Phase, PhaseStatus, RunState, run_dir};
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Path of the completion marker a phase agent drops via `drovr phase done`.
-fn done_marker(run: &str, phase: &str) -> PathBuf {
+/// `pub(crate)` so the code-review orchestrator can compute reviewer marker paths
+/// without duplicating the naming.
+pub(crate) fn done_marker(run: &str, phase: &str) -> PathBuf {
     run_dir(run).join(format!("{phase}.done"))
 }
 
@@ -30,11 +32,14 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Resolve a phase's pane id, searching `phases` then `review_phases` (via
+/// `RunState::find_phase`) so `phase_send` can seed a reviewer pane registered in
+/// `review_phases`, not just a pipeline phase.
 fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
-    let idx = find_phase_idx(run, phase).ok_or_else(|| {
+    let p = run.find_phase(phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
-    run.phases[idx].pane_id.clone().ok_or_else(|| {
+    p.pane_id.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("phase has no pane_id: {phase}"),
@@ -172,7 +177,10 @@ pub fn phase_send<H: Herdr>(
 /// subagent. Writing a marker file (rather than mutating `state.json`) keeps
 /// the orchestrator the sole writer of run state.
 pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
-    find_phase_idx(run, phase).ok_or_else(|| {
+    // `find_phase` (not `find_phase_idx`) so a reviewer phase living only in
+    // `review_phases` can drop its marker: `drovr phase done <run>
+    // review:<task>:<iter>:<angle>` is run by the reviewer agent itself.
+    run.find_phase(phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
     let marker = done_marker(&run.name, phase);
@@ -188,6 +196,11 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
 /// Marks the phase Done (and saves) when found; leaves it Running on timeout.
 /// Deliberately does NOT consult herdr status: `idle` is not a completion
 /// signal (it also fires when an agent is parked awaiting its own subagent).
+///
+/// Source-of-truth note: this stays bound to `run.phases` ONLY (via
+/// `find_phase_idx`). Reviewer phases live in `review_phases` and are NEVER waited
+/// on here — the code-review orchestrator runs its own marker poll loop and updates
+/// `review_phases` status directly. Do not switch this to `find_phase`.
 pub fn phase_wait(run: &mut RunState, phase: &str, timeout_ms: u64) -> io::Result<bool> {
     find_phase_idx(run, phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
@@ -338,6 +351,7 @@ mod tests {
             name: name.to_owned(),
             task: "test task".into(),
             phases: vec![],
+            review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,
             // `drovr new` always creates a workspace + root shell pane; the first
@@ -495,10 +509,51 @@ mod tests {
     #[test]
     fn done_on_unknown_phase_errors() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let run = make_run("done-unknown-test");
+        let mut run = make_run("done-unknown-test");
         // No phases registered → phase_done must reject rather than write a
         // stray marker.
         assert!(phase_done(&run, "nonexistent").is_err());
+        // Even with a review phase present, a name in NEITHER list is rejected.
+        run.review_phases.push(Phase {
+            name: "review:t:1:correctness".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None, herdr_session: None, pane_id: None,
+        });
+        assert!(phase_done(&run, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn done_succeeds_for_review_phase() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("done-review-test");
+        // A reviewer phase lives only in `review_phases`, yet must be able to drop
+        // its completion marker via `drovr phase done` (which calls phase_done).
+        run.review_phases.push(Phase {
+            name: "review:t:1:correctness".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None, herdr_session: None, pane_id: Some("rp1".into()),
+        });
+        let marker = phase_done(&run, "review:t:1:correctness").unwrap();
+        assert!(marker.exists(), "marker should exist at {}", marker.display());
+    }
+
+    #[test]
+    fn send_routes_to_review_phase_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-review-test");
+        // A reviewer pane registered only in `review_phases` must still be
+        // reachable by `phase_send` (require_pane_id falls back to review_phases).
+        run.review_phases.push(Phase {
+            name: "review:t:1:correctness".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None, herdr_session: None, pane_id: Some("review-pane-9".into()),
+        });
+        phase_send(&h, &run, "review:t:1:correctness", "seed text").unwrap();
+        let calls = h.calls();
+        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        assert!(send_call.contains("review-pane-9"), "must route to the reviewer pane: {send_call}");
+        assert!(send_call.contains("seed text"));
     }
 
     #[test]
