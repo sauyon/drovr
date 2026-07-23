@@ -805,6 +805,7 @@ async function refresh() {
   // idle or ready: show form
   hideEl('waiting-overlay');
   hideEl('approved-overlay');
+  document.getElementById('submit-btn').disabled = false;
   showEl('form-section');
 }
 
