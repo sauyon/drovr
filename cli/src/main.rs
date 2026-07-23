@@ -1,4 +1,5 @@
 mod compress;
+mod config;
 mod herdr;
 mod phase;
 mod review;
