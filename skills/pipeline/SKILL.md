@@ -67,16 +67,34 @@ single writer of `spec.md`; you convey the reviewer's decisions.
    never sees the change. The agent edits the markdown; the server owns rendering and
    diffing (a real markdown parser — zero LLM drift).
 
-4. **Drovr feedback.** When state is `waiting`, the reviewer's turn is in
+4. **Wait for the reviewer — do NOT busy-poll `GET /state`.** After the summary is posted,
+   block on:
+   ```
+   drovr review wait <run>   # background it; exits when the reviewer acts
+   ```
+   It blocks while state is `idle`/`ready` and exits when the reviewer submits — the harness
+   wakes you on the process exit. It is **resumable**: on timeout (exit 2, default 30 min)
+   just re-run it, since the on-disk `approved`/`feedback.json` markers are the source of
+   truth. Exit codes:
+
+   | Exit | Meaning | Next |
+   |---|---|---|
+   | 0 | approved | Compress brainstorm; proceed to plan. |
+   | 3 | changes requested | Forward `feedback.json` (step 5); wait again. |
+   | 2 | timeout | Re-run `drovr review wait <run>`. |
+   | 1 | error (no `review.addr` / server down) | Ensure `drovr serve <run>` is running. |
+
+5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
    `{turn, decision, feedback, answers, annotations}`. Forward it to the agent:
    ```
    drovr phase send <run> brainstorm "Reviewer requested changes (see feedback.json). Revise spec.md, then run: drovr review summary <run> \"<what changed>\""
    ```
-   The agent revises, calls `drovr review summary`, state → `ready`, human refreshes.
+   The agent revises, calls `drovr review summary`, state → `ready`; re-run `drovr review wait`.
 
-5. **Gate passes** when state is `approved` (the server has written the `approved` marker
-   file in the run dir). Only then compress brainstorm and proceed to plan.
+6. **Gate passes** when `drovr review wait` exits **0** (state `approved`; the server has
+   written the `approved` marker file in the run dir). Only then compress brainstorm and
+   proceed to plan.
 
 If a reviewer submits **before** the agent's first `drovr review summary`, the server goes
 straight `idle → waiting` — unusual but possible. It self-heals: the agent's next
@@ -135,6 +153,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 |---|---|
 | Expecting `drovr new` to serve the gate | Start `drovr serve <run> &` yourself before the gate. |
 | Agent edits `spec.md` but reviewer sees nothing | Agent must run `drovr review summary` after each edit. |
+| Busy-polling `GET /state` for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |

@@ -59,6 +59,7 @@ Add `target/debug` to your `PATH` or copy the binary to a location on your
 | `drovr phase compress <run> <phase>` | Read the phase transcript and write `<phase>-HANDOFF.md` via `claude -p`. |
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the running review server, flipping state to `ready`. |
+| `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
 
 ## Run directory and state contracts
 
@@ -98,7 +99,7 @@ The review server (`drovr serve`) reads and writes these files in the run dir:
 
 | File | Written by | Purpose |
 |---|---|---|
-| `review.addr` | `drovr serve` | Bound `host:port`; read by `drovr review summary`. |
+| `review.addr` | `drovr serve` | Bound `host:port`; read by `drovr review summary` and `drovr review wait`. |
 | `spec.md` | agent (implement phase) | The spec document shown in the browser UI. |
 | `prior.md` | server on each submit | Snapshot of the previous spec version for diffing. |
 | `feedback.json` | server on submit | Human feedback JSON for the current turn. |
@@ -115,13 +116,22 @@ drovr serve <name>
 1. Open `http://127.0.0.1:8791` in a browser. State starts as `idle`.
 2. Read the spec, leave annotations, answer questions, and choose
    **Request changes** or **Approve**.
-3. **Request changes** → server writes `feedback.json`, state becomes
-   `waiting`. The agent reads the feedback, edits the spec, and then calls:
+3. The driver posts a summary, then **waits** for the reviewer instead of
+   busy-polling `GET /state`:
    ```
    drovr review summary <name> "<what changed>"
+   drovr review wait <name>   # blocks; run in the background
    ```
-   State becomes `ready`; refresh the browser to see the new spec.
-4. Repeat until you choose **Approve** → state becomes `approved`.
+   `wait` blocks while state is `idle`/`ready` and exits when the reviewer acts.
+   It is resumable: on timeout (exit 2) just re-run it — the on-disk markers are
+   the source of truth, so no reviewer action is ever missed. The harness wakes
+   the driver on the process exit; no hot poll loop is needed.
+4. **Request changes** → server writes `feedback.json`, state becomes
+   `waiting`, and `wait` exits **3**. The agent reads the feedback, edits the
+   spec, calls `drovr review summary` (state → `ready`), and the driver runs
+   `drovr review wait` again.
+5. **Approve** → server writes the `approved` marker, state becomes `approved`,
+   and `wait` exits **0**.
 
 ## Skills
 
