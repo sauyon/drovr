@@ -32,6 +32,49 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Launch an agent invocation inside an already-chosen `pane`, tagged with
+/// `DROVR_PHASE=<run>/<phase>` (single-quoted so a name with spaces or shell
+/// metacharacters stays one literal word), then best-effort rename the pane to
+/// `phase`. Focus is captured before and restored after, because `pane_run` /
+/// `pane_rename` have no `--no-focus` flag and would otherwise steal focus from
+/// the user.
+///
+/// `command` is the full agent invocation (e.g. `"claude"` for a pipeline phase,
+/// or `"claude --permission-mode plan"` for a read-only reviewer). This helper is
+/// PURE pane mechanics: it performs NO phase-list lookup and NO state mutation, so
+/// callers stay in control of where (and whether) the phase is registered — a
+/// reviewer name must never collide into a pipeline phase's pane.
+fn launch_in_pane<H: Herdr>(
+    h: &H,
+    run_name: &str,
+    phase: &str,
+    pane: &str,
+    command: &str,
+) -> io::Result<()> {
+    // Capture focus so the pane operations below don't steal it from the user.
+    let prev_focus = h.focused_workspace();
+
+    // DROVR_PHASE=<run>/<phase> tags the launch so the reflex hook detects a
+    // drovr-spawned phase and suppresses the human reflex. It is not a secret, so
+    // it rides inline on the command; auth secrets travel via herdr `--env` at
+    // pane creation, never in this string. The value is single-quoted so a
+    // run/phase name with a space or shell metacharacter stays one literal word
+    // and cannot break out of the command.
+    let full = format!(
+        "DROVR_PHASE={} {}",
+        shell_single_quote(&format!("{run_name}/{phase}")),
+        command
+    );
+    h.pane_run(pane, &full)?;
+    // Cosmetic pane label; best-effort (a rename failure must not fail the phase).
+    let _ = h.pane_rename(pane, phase);
+    // Restore focus if a pane operation moved it.
+    if let Some(prev) = prev_focus {
+        let _ = h.workspace_focus(&prev);
+    }
+    Ok(())
+}
+
 /// Resolve a phase's pane id, searching `phases` then `review_phases` (via
 /// `RunState::find_phase`) so `phase_send` can seed a reviewer pane registered in
 /// `review_phases`, not just a pipeline phase.
@@ -102,31 +145,13 @@ pub fn phase_start<H: Herdr>(
         ));
     };
 
-    // Capture focus so pane operations (which lack a --no-focus flag) don't steal
-    // it from the user. Restored after the pane is launched.
-    let prev_focus = h.focused_workspace();
-
-    // Launch `claude` inside the target pane. DROVR_PHASE=<run>/<phase> tags it so
-    // the reflex hook detects a drovr-spawned phase and suppresses the human
-    // reflex. It is not a secret, so it rides inline on the command; auth secrets
-    // travel via herdr `--env` at pane creation, never in this string. The value
-    // is single-quoted so a run/phase name with a space or shell metacharacter
-    // stays one literal word and cannot break out of the command.
-    let command = format!(
-        "DROVR_PHASE={} claude",
-        shell_single_quote(&format!("{}/{}", run.name, phase))
-    );
-    h.pane_run(&target_pane, &command)?;
+    // Launch `claude` inside the target pane (focus capture/restore + best-effort
+    // rename live in the shared helper). A pipeline phase runs bare `claude`.
+    launch_in_pane(h, &run.name, phase, &target_pane, "claude")?;
     // The launch succeeded, so this phase has now claimed the root pane (if it
     // used it); clear it so later phases don't try to reuse the same pane.
     if used_root {
         run.root_pane = None;
-    }
-    // Cosmetic pane label; best-effort (a rename failure must not fail the phase).
-    let _ = h.pane_rename(&target_pane, phase);
-    // Restore focus if a pane operation moved it.
-    if let Some(prev) = prev_focus {
-        let _ = h.workspace_focus(&prev);
     }
 
     // Find existing phase or append a new one
@@ -155,6 +180,62 @@ pub fn phase_start<H: Herdr>(
     // focus, disturbing the user. The run's workspace (root pane + every phase
     // pane) is torn down in one shot at the end by `drovr cleanup`
     // (`workspace_close`), once the user confirms.
+    run.save()?;
+    Ok(())
+}
+
+/// Spawn a read-only reviewer agent pane for `phase` (a
+/// `review:<task>:<iter>:<angle>` name), registering it in `run.review_phases`
+/// (NOT `run.phases`, so reviewers never pollute the pipeline's progress).
+///
+/// `launch_command` is the composed agent invocation including its read-only flag,
+/// e.g. `"claude --permission-mode plan"` (built by the caller from
+/// `Config::reviewer_launch`). The pane runs
+/// `DROVR_PHASE='<run>/<phase>' <launch_command>` via the shared `launch_in_pane`
+/// helper (DROVR_PHASE single-quoted; focus captured/restored).
+///
+/// Reviewers ALWAYS get a fresh tab in the run workspace — they never consume
+/// `run.root_pane` (that belongs to the pipeline) — so a workspace is required;
+/// this errors clearly if `run.workspace` is `None`.
+///
+/// `seed` (if any) is recorded on the phase's `handoff_doc` for the caller to
+/// inject via `phase_send`; it is NOT placed on the command line.
+pub fn spawn_reviewer<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    seed: Option<&Path>,
+    launch_command: &str,
+) -> io::Result<()> {
+    // Reviewers can't reuse the pipeline root pane; they need their own tab, which
+    // requires a workspace.
+    let ws = run.workspace.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no herdr workspace; cannot spawn a reviewer \
+                 (reviewers need their own tab and never reuse the root pane)",
+                run.name
+            ),
+        )
+    })?;
+
+    // A fresh tab (with its auto shell pane) in the run workspace — never the root
+    // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
+    // launch itself.
+    let pane = h.tab_create(&ws, phase, &run.project_dir)?;
+    launch_in_pane(h, &run.name, phase, &pane, launch_command)?;
+
+    // Register the reviewer in `review_phases` only. The seed path rides on
+    // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
+    let seed_str = seed.map(|p| p.to_string_lossy().into_owned());
+    run.review_phases.push(Phase {
+        name: phase.to_owned(),
+        status: PhaseStatus::Running,
+        handoff_doc: seed_str,
+        herdr_session: None,
+        pane_id: Some(pane),
+    });
     run.save()?;
     Ok(())
 }
@@ -828,6 +909,187 @@ mod tests {
             !h.calls().iter().any(|c| c.contains("agent_read")),
             "must not read a pane that does not exist yet"
         );
+    }
+
+    // -- Task 4: spawn_reviewer --------------------------------------------------
+
+    #[test]
+    fn spawn_reviewer_registers_in_review_phases() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("spawn-rev-test", "ws-rv");
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:task-1:1:correctness",
+            None,
+            "claude --permission-mode plan",
+        )
+        .unwrap();
+
+        // Registered in review_phases, NOT the pipeline `phases` list.
+        assert!(run.phases.is_empty(), "reviewer must not touch pipeline phases");
+        assert_eq!(run.review_phases.len(), 1);
+        let p = &run.review_phases[0];
+        assert_eq!(p.name, "review:task-1:1:correctness");
+        assert_eq!(p.status, PhaseStatus::Running);
+        assert!(p.pane_id.is_some(), "pane_id must be recorded");
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(r"DROVR_PHASE='spawn-rev-test/review:task-1:1:correctness'"),
+            "pane_run must carry a single-quoted DROVR_PHASE=<run>/<phase>: {run_call}"
+        );
+        assert!(
+            run_call.contains("claude --permission-mode plan"),
+            "pane_run must launch the full launch_command: {run_call}"
+        );
+    }
+
+    #[test]
+    fn spawn_reviewer_always_creates_tab_never_root_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-tab-test", "ws-rt");
+        // root_pane is Some — a pipeline phase would reuse it, but a reviewer must NOT.
+        assert!(run.root_pane.is_some());
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:task-1:1:security",
+            None,
+            "claude --permission-mode plan",
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let tab_call = calls
+            .iter()
+            .find(|c| c.contains("tab_create"))
+            .expect("reviewer must create its own tab");
+        assert!(tab_call.contains("workspace=ws-rt"), "tab in the run workspace: {tab_call}");
+        // Root pane untouched — still available for the pipeline.
+        assert_eq!(
+            run.root_pane.as_deref(),
+            Some("ws-rt:root"),
+            "reviewer must not consume the pipeline root pane"
+        );
+        let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
+        assert_ne!(reviewer_pane, "ws-rt:root", "reviewer must not run in the root pane");
+    }
+
+    #[test]
+    fn spawn_reviewer_shell_quotes_unsafe_phase_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-inject-test", "ws-ri");
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:p; rm -rf ~",
+            None,
+            "claude --permission-mode plan",
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(r"DROVR_PHASE='rev-inject-test/review:t:1:p; rm -rf ~'"),
+            "unsafe phase name must be single-quoted: {run_call}"
+        );
+    }
+
+    #[test]
+    fn spawn_reviewer_errors_without_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("rev-no-ws-test");
+        run.workspace = None;
+
+        let res = spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            "claude --permission-mode plan",
+        );
+        assert!(res.is_err(), "must error when the run has no workspace");
+        assert!(res.unwrap_err().to_string().contains("workspace"));
+    }
+
+    #[test]
+    fn spawn_reviewer_records_seed_and_phase_send_routes_to_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-seed-test", "ws-rs");
+        let seed = Path::new("/tmp/review-seed.md");
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            Some(seed),
+            "claude --permission-mode plan",
+        )
+        .unwrap();
+
+        // Seed path recorded on handoff_doc for later injection — NOT on the command line.
+        assert_eq!(
+            run.review_phases[0].handoff_doc.as_deref(),
+            Some("/tmp/review-seed.md")
+        );
+        let run_call = h
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("pane_run"))
+            .unwrap();
+        assert!(
+            !run_call.contains("/tmp/review-seed.md"),
+            "seed must not be on the command line: {run_call}"
+        );
+
+        // phase_send routes to the reviewer pane registered in review_phases.
+        phase_send(&h, &run, "review:t:1:correctness", "here is your brief").unwrap();
+        let send_call = h
+            .calls()
+            .into_iter()
+            .rev()
+            .find(|c| c.contains("agent_send"))
+            .unwrap();
+        let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
+        assert!(
+            send_call.contains(&reviewer_pane),
+            "send must route to the reviewer pane: {send_call}"
+        );
+        assert!(send_call.contains("here is your brief"));
+    }
+
+    #[test]
+    fn spawn_reviewer_preserves_focus() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-focus-test", "ws-rf");
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            "claude --permission-mode plan",
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let capture = calls.iter().position(|c| c.contains("focused_workspace")).unwrap();
+        let run_at = calls.iter().position(|c| c.contains("pane_run")).unwrap();
+        let restore = calls.iter().position(|c| c.contains("workspace_focus")).unwrap();
+        assert!(capture < run_at, "focus must be captured before pane_run: {calls:?}");
+        assert!(restore > run_at, "focus must be restored after pane_run: {calls:?}");
     }
 
     #[test]
