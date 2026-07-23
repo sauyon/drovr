@@ -1,3 +1,7 @@
+// The whole module is unused until Task 6 wires `drovr code-review run|base` into the
+// CLI; suppress the dead-code noise until then (Task 6 drops this attribute).
+#[allow(dead_code)]
+mod code_review;
 mod compress;
 mod config;
 mod findings;
