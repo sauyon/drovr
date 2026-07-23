@@ -272,20 +272,48 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     Ok(marker)
 }
 
+/// The outcome of `phase_wait`. Maps 1:1 to a `drovr phase wait` exit code (see
+/// `main.rs`): `Done` = 0, `TimedOut` = 2, `Blocked` = 4. (An io error is exit 1,
+/// surfaced via the `Err` arm, not this enum.)
+#[derive(Debug, PartialEq, Eq)]
+pub enum PhaseWaitOutcome {
+    /// The completion marker appeared — the phase agent ran `drovr phase done`.
+    Done,
+    /// `timeout_ms` elapsed with neither a marker nor a `blocked` status.
+    TimedOut,
+    /// herdr reported the phase pane's `agent_status` as `blocked` — the agent
+    /// hit a Claude Code safety/permission prompt with no human at the pane.
+    Blocked,
+}
+
 /// Poll the filesystem for the phase's completion marker (dropped by the phase
-/// agent via `drovr phase done`) until it appears or `timeout_ms` elapses.
-/// Marks the phase Done (and saves) when found; leaves it Running on timeout.
-/// Deliberately does NOT consult herdr status: `idle` is not a completion
-/// signal (it also fires when an agent is parked awaiting its own subagent).
+/// agent via `drovr phase done`) AND the phase pane's herdr `agent_status` until
+/// the marker appears, the pane goes `blocked`, or `timeout_ms` elapses. Marks
+/// the phase Done (and saves) when the marker is found; leaves it Running on
+/// timeout or block.
+///
+/// herdr status is consulted ONLY to catch `blocked` early — a proactive signal
+/// that the agent hit a safety/permission prompt and will otherwise hang until the
+/// full timeout. Every other status (`idle`, `working`, `done`, `unknown`) is
+/// ignored: `idle` in particular is NOT a completion signal (it also fires when an
+/// agent is parked awaiting its own subagent), so only the `.done` marker counts
+/// as done. The status query is read-only (`pane get`) and never moves focus, so
+/// polling it each iteration does not disturb the user.
 ///
 /// Source-of-truth note: this stays bound to `run.phases` ONLY (via
 /// `find_phase_idx`). Reviewer phases live in `review_phases` and are NEVER waited
 /// on here — the code-review orchestrator runs its own marker poll loop and updates
 /// `review_phases` status directly. Do not switch this to `find_phase`.
-pub fn phase_wait(run: &mut RunState, phase: &str, timeout_ms: u64) -> io::Result<bool> {
-    find_phase_idx(run, phase).ok_or_else(|| {
+pub fn phase_wait<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    timeout_ms: u64,
+) -> io::Result<PhaseWaitOutcome> {
+    let idx = find_phase_idx(run, phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
+    let pane_id = run.phases[idx].pane_id.clone();
     let marker = done_marker(&run.name, phase);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
@@ -293,11 +321,19 @@ pub fn phase_wait(run: &mut RunState, phase: &str, timeout_ms: u64) -> io::Resul
             let idx = find_phase_idx(run, phase).unwrap();
             run.phases[idx].status = PhaseStatus::Done;
             run.save()?;
-            return Ok(true);
+            return Ok(PhaseWaitOutcome::Done);
+        }
+        // Proactively catch a blocked pane so the driver is signalled immediately
+        // instead of hanging until the wait's full timeout. Only `blocked` short-
+        // circuits; every other status keeps waiting for the marker.
+        if let Some(pid) = pane_id.as_deref() {
+            if h.agent_status(pid).as_deref() == Some("blocked") {
+                return Ok(PhaseWaitOutcome::Blocked);
+            }
         }
         let now = Instant::now();
         if now >= deadline {
-            return Ok(false);
+            return Ok(PhaseWaitOutcome::TimedOut);
         }
         thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
@@ -393,6 +429,191 @@ pub fn diagnose_stuck_phase<H: Herdr>(
          Attach to answer the prompt: drovr attach {run_name}",
         run_name = run.name,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Blocked-phase triage — classify a safety/permission prompt and escalate
+// ---------------------------------------------------------------------------
+//
+// When herdr reports a phase pane as `blocked`, the agent hit a Claude Code
+// safety/permission prompt (a "Dangerous rm operation … 1. Yes / 2. No"
+// confirmation, a tool-permission dialog, …) with no human at the pane. This
+// module classifies what it is blocked on and decides whether to escalate to a
+// human or auto-answer:
+//
+//   * DESTRUCTIVE / dangerous prompts are NEVER auto-answered — a wrong guess on
+//     an `rm -rf` / `reset --hard` / force-push confirmation is unrecoverable.
+//     We surface a clear diagnostic and let the driver escalate to a human.
+//   * ROUTINE, clearly-safe tool-permission prompts on a small allow-list MAY be
+//     auto-answered by sending the accept keystroke (conservative + opt-in).
+//   * UNKNOWN prompts escalate — when in doubt, ask a human.
+//
+// The classifier is a PURE function (`classify_blocked_prompt`) so it is trivially
+// unit-tested. Destructive is checked FIRST and wins over routine, so a prompt
+// that mentions both (e.g. a Bash permission dialog whose command is `rm -rf`)
+// escalates rather than being auto-answered.
+
+/// How a `blocked` phase pane is triaged.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum BlockedClass {
+    /// A destructive / dangerous confirmation (rm, delete, reset --hard, force,
+    /// overwrite, …). NEVER auto-answered — always escalate to a human.
+    Destructive,
+    /// An ordinary, clearly-safe tool-permission prompt on the allow-list. May be
+    /// auto-answered with the accept keystroke.
+    Routine,
+    /// A prompt that is neither recognizably destructive nor on the routine
+    /// allow-list. Escalate to a human rather than guessing.
+    Unknown,
+}
+
+/// Substrings that mark a blocked pane as a DESTRUCTIVE / dangerous confirmation.
+/// These MUST take precedence over the routine allow-list. Matching is
+/// case-insensitive. Kept broad on the danger side deliberately: a false positive
+/// only means "ask a human", which is always safe.
+const DESTRUCTIVE_SIGNATURES: &[&str] = &[
+    "dangerous",
+    "dangerous rm",
+    "rm -rf",
+    "delete",
+    "reset --hard",
+    "force",         // covers "force push", "--force", "force overwrite"
+    "overwrite",
+    "drop table",
+    "truncate",
+    "destroy",
+];
+
+/// Substrings that mark a blocked pane as a ROUTINE, clearly-safe tool-permission
+/// prompt eligible for conservative auto-answer. Deliberately small; anything not
+/// listed here (and not destructive) is treated as Unknown and escalated.
+/// Matching is case-insensitive.
+const ROUTINE_SIGNATURES: &[&str] = &[
+    "do you want to make this edit",
+    "do you want to create",
+    "do you want to read",
+    "would you like to proceed with reading",
+];
+
+/// Classify what a blocked phase pane is waiting on. Pure and case-insensitive so
+/// it is trivially unit-testable. Destructive is checked FIRST so a prompt that
+/// matches both a danger word and a routine phrase escalates rather than being
+/// auto-answered.
+pub fn classify_blocked_prompt(pane: &str) -> BlockedClass {
+    let haystack = pane.to_lowercase();
+    if DESTRUCTIVE_SIGNATURES
+        .iter()
+        .any(|sig| haystack.contains(&sig.to_lowercase()))
+    {
+        return BlockedClass::Destructive;
+    }
+    if ROUTINE_SIGNATURES
+        .iter()
+        .any(|sig| haystack.contains(&sig.to_lowercase()))
+    {
+        return BlockedClass::Routine;
+    }
+    BlockedClass::Unknown
+}
+
+/// The result of triaging a blocked phase: the classification, the human-facing
+/// diagnostic to print, and whether drovr auto-answered the prompt (and may keep
+/// waiting). Only routine, allow-listed prompts are auto-answered; destructive and
+/// unknown prompts always escalate (`auto_answered == false`).
+#[derive(Debug)]
+pub struct BlockedTriage {
+    pub class: BlockedClass,
+    pub diagnostic: String,
+    pub auto_answered: bool,
+}
+
+/// The keystroke sent to accept a routine, allow-listed permission prompt.
+/// Claude Code's numbered prompts default the highlighted choice to the safe
+/// "yes" (option 1); a bare Enter accepts it. We send exactly that and nothing
+/// else — never a chosen digit, which could land on the wrong option.
+const ACCEPT_KEYSTROKE: &str = "\r";
+
+/// Triage a phase pane that herdr reported as `blocked`: read it once, classify
+/// the prompt, and either escalate (destructive/unknown) or conservatively
+/// auto-answer (routine allow-list). Returns a `BlockedTriage` with the human
+/// diagnostic and whether it auto-answered.
+///
+/// Read-only up to the auto-answer decision: `agent_read` never moves focus.
+/// Auto-answer sends the accept keystroke via `agent_send` (which drovr already
+/// uses to seed panes); a failed read or send degrades gracefully to an escalation
+/// diagnostic rather than erroring.
+pub fn triage_blocked_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> BlockedTriage {
+    let escalate = |class: BlockedClass, body: String| BlockedTriage {
+        class,
+        diagnostic: format!(
+            "phase '{phase}' of run '{run_name}' is BLOCKED on a Claude Code \
+             safety/permission prompt with no human at the pane.\n{body}\n\
+             Attach to answer it: drovr attach {run_name}",
+            run_name = run.name,
+        ),
+        auto_answered: false,
+    };
+
+    let Some(idx) = find_phase_idx(run, phase) else {
+        return escalate(
+            BlockedClass::Unknown,
+            "(phase has no recorded pane; cannot read the prompt)".into(),
+        );
+    };
+    let Some(pane_id) = run.phases[idx].pane_id.clone() else {
+        return escalate(
+            BlockedClass::Unknown,
+            "(phase has no pane_id; cannot read the prompt)".into(),
+        );
+    };
+    let Ok(pane) = h.agent_read(&pane_id) else {
+        return escalate(
+            BlockedClass::Unknown,
+            format!("(pane {pane_id} blocked, but its contents could not be read)"),
+        );
+    };
+    let snippet = tail_snippet(&pane, 6);
+    let class = classify_blocked_prompt(&pane);
+    match class {
+        BlockedClass::Destructive => escalate(
+            BlockedClass::Destructive,
+            format!(
+                "The prompt looks DESTRUCTIVE — drovr will NOT auto-answer it.\n\
+                 Pane {pane_id}:\n{snippet}"
+            ),
+        ),
+        BlockedClass::Unknown => escalate(
+            BlockedClass::Unknown,
+            format!(
+                "The prompt is not on the safe auto-answer allow-list — escalating \
+                 rather than guessing.\nPane {pane_id}:\n{snippet}"
+            ),
+        ),
+        BlockedClass::Routine => {
+            // Conservative auto-answer: accept the routine, allow-listed prompt.
+            // A send failure falls back to escalation so the human still gets a
+            // clear signal.
+            match h.agent_send(&pane_id, ACCEPT_KEYSTROKE) {
+                Ok(()) => BlockedTriage {
+                    class: BlockedClass::Routine,
+                    diagnostic: format!(
+                        "phase '{phase}' of run '{run_name}' blocked on a routine, \
+                         allow-listed permission prompt; drovr auto-answered it \
+                         (accept) and is continuing.\nPane {pane_id}:\n{snippet}",
+                        run_name = run.name,
+                    ),
+                    auto_answered: true,
+                },
+                Err(e) => escalate(
+                    BlockedClass::Routine,
+                    format!(
+                        "A routine prompt was detected but auto-answer failed ({e}); \
+                         escalating.\nPane {pane_id}:\n{snippet}"
+                    ),
+                ),
+            }
+        }
+    }
 }
 
 /// Read `HANDOFF.md` written by the compressor into the run directory.
@@ -569,8 +790,8 @@ mod tests {
         let marker = phase_done(&run, "plan").unwrap();
         assert!(marker.exists(), "marker should exist at {}", marker.display());
 
-        let done = phase_wait(&mut run, "plan", 5000).unwrap();
-        assert!(done);
+        let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
+        assert_eq!(outcome, PhaseWaitOutcome::Done);
         assert_eq!(run.phases[0].status, PhaseStatus::Done);
     }
 
@@ -581,10 +802,213 @@ mod tests {
         let mut run = make_run("wait-timeout-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        // No marker dropped → wait times out quickly and leaves the phase Running.
-        let done = phase_wait(&mut run, "plan", 50).unwrap();
-        assert!(!done);
+        // No marker dropped and no blocked status → wait times out quickly and
+        // leaves the phase Running.
+        let outcome = phase_wait(&h, &mut run, "plan", 50).unwrap();
+        assert_eq!(outcome, PhaseWaitOutcome::TimedOut);
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    // -- Task 1: phase_wait detects a blocked pane early ----------------------
+
+    #[test]
+    fn wait_blocked_short_circuits_before_timeout() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-blocked-fast-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        h.push_status(Some("blocked"));
+
+        let start = Instant::now();
+        let outcome = phase_wait(&h, &mut run, "plan", 60_000).unwrap();
+        assert_eq!(outcome, PhaseWaitOutcome::Blocked);
+        // Must have short-circuited on the first poll, not waited out the timeout.
+        assert!(start.elapsed() < Duration::from_secs(5), "blocked must return promptly");
+        // Blocked leaves the phase Running (not Done) — the driver escalates.
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn wait_idle_status_keeps_waiting_not_blocked_or_done() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-idle-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // idle is NOT a completion or block signal (a parked agent awaiting a
+        // subagent is idle) — it must keep waiting and then time out.
+        h.push_status(Some("idle"));
+        h.push_status(Some("working"));
+
+        let outcome = phase_wait(&h, &mut run, "plan", 50).unwrap();
+        assert_eq!(outcome, PhaseWaitOutcome::TimedOut);
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn wait_marker_wins_over_status_check() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("wait-marker-wins-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // Marker present AND a blocked status queued: the marker is checked first,
+        // so the phase is Done and the status is never consulted.
+        phase_done(&run, "plan").unwrap();
+        h.push_status(Some("blocked"));
+
+        let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
+        assert_eq!(outcome, PhaseWaitOutcome::Done);
+        assert_eq!(run.phases[0].status, PhaseStatus::Done);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_status")),
+            "marker must be checked before status: {:?}",
+            h.calls()
+        );
+    }
+
+    // -- Task 2: classify_blocked_prompt (pure) -------------------------------
+
+    #[test]
+    fn classify_destructive_rm() {
+        assert_eq!(
+            classify_blocked_prompt("Dangerous rm operation detected. 1. Yes 2. No"),
+            BlockedClass::Destructive
+        );
+        assert_eq!(
+            classify_blocked_prompt("run `git reset --hard origin/main`? 1. Yes"),
+            BlockedClass::Destructive
+        );
+        assert_eq!(
+            classify_blocked_prompt("force push to main? 1. Yes 2. No"),
+            BlockedClass::Destructive
+        );
+    }
+
+    #[test]
+    fn classify_routine_edit_permission() {
+        assert_eq!(
+            classify_blocked_prompt("Do you want to make this edit to src/main.rs? 1. Yes"),
+            BlockedClass::Routine
+        );
+    }
+
+    #[test]
+    fn classify_unknown_escalates() {
+        // A permission-style prompt not on the allow-list is Unknown, not Routine.
+        assert_eq!(
+            classify_blocked_prompt("Allow the WebFetch tool to run? 1. Yes 2. No"),
+            BlockedClass::Unknown
+        );
+        assert_eq!(classify_blocked_prompt("ordinary working output"), BlockedClass::Unknown);
+    }
+
+    #[test]
+    fn classify_destructive_wins_over_routine() {
+        // A prompt that reads like an edit permission but whose target is a
+        // destructive command must escalate, never auto-answer.
+        let pane = "Do you want to make this edit? It will delete the whole directory. 1. Yes";
+        assert_eq!(classify_blocked_prompt(pane), BlockedClass::Destructive);
+    }
+
+    #[test]
+    fn classify_is_case_insensitive() {
+        assert_eq!(classify_blocked_prompt("DANGEROUS RM"), BlockedClass::Destructive);
+        assert_eq!(
+            classify_blocked_prompt("DO YOU WANT TO MAKE THIS EDIT"),
+            BlockedClass::Routine
+        );
+    }
+
+    // -- Task 2: triage_blocked_phase -----------------------------------------
+
+    #[test]
+    fn triage_destructive_escalates_and_never_auto_answers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("triage-destructive-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_read("Dangerous rm operation detected.\n❯ 1. Yes\n  2. No");
+
+        let t = triage_blocked_phase(&h, &run, "code");
+        assert_eq!(t.class, BlockedClass::Destructive);
+        assert!(!t.auto_answered, "destructive prompts must never be auto-answered");
+        assert!(t.diagnostic.contains("triage-destructive-test"), "names run: {}", t.diagnostic);
+        assert!(t.diagnostic.contains("code"), "names phase: {}", t.diagnostic);
+        assert!(t.diagnostic.contains("Dangerous rm"), "quotes prompt: {}", t.diagnostic);
+        assert!(t.diagnostic.contains("drovr attach triage-destructive-test"), "suggests attach: {}", t.diagnostic);
+        // Crucially, NO keystroke was sent to the pane.
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send")),
+            "must not send any keystroke on a destructive prompt: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn triage_routine_auto_answers_and_continues() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("triage-routine-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_read("Do you want to make this edit to src/lib.rs?\n❯ 1. Yes\n  2. No");
+
+        let t = triage_blocked_phase(&h, &run, "code");
+        assert_eq!(t.class, BlockedClass::Routine);
+        assert!(t.auto_answered, "routine allow-listed prompt should be auto-answered");
+        assert!(t.diagnostic.contains("auto-answered"), "diagnostic notes auto-answer: {}", t.diagnostic);
+        // The accept keystroke was sent to the phase pane.
+        let pane_id = run.phases[0].pane_id.clone().unwrap();
+        assert!(
+            h.calls().iter().any(|c| c.contains("agent_send") && c.contains(&pane_id)),
+            "must send accept keystroke to the pane: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn triage_unknown_escalates_without_answering() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("triage-unknown-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_read("Allow the WebFetch tool to run?\n❯ 1. Yes\n  2. No");
+
+        let t = triage_blocked_phase(&h, &run, "code");
+        assert_eq!(t.class, BlockedClass::Unknown);
+        assert!(!t.auto_answered, "unknown prompts must escalate, not auto-answer");
+        assert!(t.diagnostic.contains("drovr attach"), "suggests attach: {}", t.diagnostic);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send")),
+            "must not answer an unknown prompt: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn triage_no_pane_id_escalates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("triage-no-pane-test");
+        // A phase with no pane_id yet.
+        run.phases.push(Phase {
+            name: "code".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None, herdr_session: None, pane_id: None,
+        });
+
+        let t = triage_blocked_phase(&h, &run, "code");
+        assert_eq!(t.class, BlockedClass::Unknown);
+        assert!(!t.auto_answered);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_read")),
+            "must not read a nonexistent pane: {:?}",
+            h.calls()
+        );
     }
 
     #[test]

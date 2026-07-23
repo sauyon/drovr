@@ -12,7 +12,10 @@ use code_review::{ReviewOutcome, code_review_run, head_sha};
 use compress::{SystemRunner, handoff_self, phase_compress};
 use herdr::{Herdr, SystemHerdr};
 use std::io::Read as _;
-use phase::{collect, diagnose_stuck_phase, phase_done, phase_send, phase_start, phase_wait};
+use phase::{
+    PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
+    phase_wait, triage_blocked_phase,
+};
 use review::{review_summary, review_wait, serve, WaitOutcome};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
@@ -116,7 +119,9 @@ enum PhaseCmd {
         phase_name: String,
         text: String,
     },
-    /// Wait for a phase to complete (polls for the `done` marker).
+    /// Wait for a phase to complete (polls for the `done` marker and the pane's
+    /// herdr status). Exit 0 = done, 2 = timeout, 4 = blocked (agent hit a
+    /// safety/permission prompt — see the triage diagnostic), 1 = io error.
     Wait {
         run: String,
         phase_name: String,
@@ -532,9 +537,25 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
-            match phase_wait(&mut state, &phase_name, timeout_ms) {
-                Ok(true) => println!("phase '{phase_name}' done"),
-                Ok(false) => {
+            match phase_wait(&h, &mut state, &phase_name, timeout_ms) {
+                Ok(PhaseWaitOutcome::Done) => println!("phase '{phase_name}' done"),
+                Ok(PhaseWaitOutcome::Blocked) => {
+                    // Proactive triage: herdr reported the phase pane as `blocked`
+                    // (a Claude Code safety/permission prompt with no human at the
+                    // pane). Classify it and either escalate (destructive/unknown)
+                    // or conservatively auto-answer a routine, allow-listed prompt.
+                    let t = triage_blocked_phase(&h, &state, &phase_name);
+                    if t.auto_answered {
+                        // A routine prompt was auto-answered; the agent should
+                        // continue. Report on stdout and still exit 4 so the driver
+                        // re-waits (the phase is not done yet).
+                        println!("drovr: [{:?}] {}", t.class, t.diagnostic);
+                    } else {
+                        eprintln!("drovr: [{:?}] {}", t.class, t.diagnostic);
+                    }
+                    process::exit(4);
+                }
+                Ok(PhaseWaitOutcome::TimedOut) => {
                     // Liveness net: a timeout can mean the agent is genuinely
                     // still working, OR it parked on a first-run prompt with no
                     // human to answer it. Read the pane once (read-only,

@@ -43,6 +43,11 @@ pub trait Herdr {
     fn workspace_focus(&self, id: &str) -> io::Result<()>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
+    /// The pane's `agent_status` (`idle|working|blocked|done|unknown`) as reported
+    /// by herdr, or `None` if it cannot be read/parsed. READ-ONLY: it must never
+    /// move focus (it shells `herdr pane get`, which does not focus), so
+    /// `phase_wait` can poll it every iteration without disturbing the user.
+    fn agent_status(&self, pane_id: &str) -> Option<String>;
     fn integration_present(&self) -> bool;
 }
 
@@ -222,6 +227,17 @@ impl Herdr for SystemHerdr {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    fn agent_status(&self, pane_id: &str) -> Option<String> {
+        // `pane get` is a read-only query and does not move focus, so this is safe
+        // to poll from `phase_wait` on every iteration.
+        let out = self.run(&["pane", "get", pane_id]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        parse_agent_status(&stdout)
+    }
+
     fn integration_present(&self) -> bool {
         let Ok(out) = self.run(&["integration", "status"]) else {
             return false;
@@ -276,6 +292,36 @@ fn parse_pane_id(json: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
+/// Parse a pane's `agent_status` from herdr's `pane get` / `pane list` JSON.
+/// The status may live directly on `result` (`pane get`) or on a pane object
+/// inside `result.panes` (`pane list`); this walks the value recursively and
+/// returns the first `"agent_status"` string it finds. Returns `None` when the
+/// field is absent or the JSON does not parse (a best-effort read must never
+/// panic the poll loop).
+fn parse_agent_status(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    find_agent_status(&v)
+}
+
+/// Recursively search a JSON value for the first `"agent_status"` string.
+fn find_agent_status(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get("agent_status") {
+                return Some(s.clone());
+            }
+            for child in map.values() {
+                if let Some(found) = find_agent_status(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_agent_status),
+        _ => None,
+    }
+}
+
 /// Parse `workspace_id` from herdr's `workspace create` JSON output.
 /// Looks for `"workspace_id":"<value>"` inside the top-level `workspace` object.
 /// The output shape is: `{"result":{"workspace":{"workspace_id":"wN",...},...}}`.
@@ -297,6 +343,9 @@ pub struct FakeHerdr {
     counter: RefCell<u32>,
     /// Queued return strings for agent_read (FIFO)
     read_queue: RefCell<VecDeque<String>>,
+    /// Queued return values for agent_status (FIFO). `None` entries model a pane
+    /// whose status could not be read/parsed; an empty queue also yields `None`.
+    status_queue: RefCell<VecDeque<Option<String>>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
 }
@@ -308,6 +357,7 @@ impl FakeHerdr {
             calls: RefCell::new(Vec::new()),
             counter: RefCell::new(0),
             read_queue: RefCell::new(VecDeque::new()),
+            status_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
         }
     }
@@ -319,6 +369,15 @@ impl FakeHerdr {
     /// Queue a string to be returned by the next `agent_read` call.
     pub fn push_read(&self, text: impl Into<String>) {
         self.read_queue.borrow_mut().push_back(text.into());
+    }
+
+    /// Queue a value to be returned by the next `agent_status` call. Pass
+    /// `Some("blocked")` to model a blocked pane, or `None` to model an
+    /// unreadable status. Mirrors `push_read`.
+    pub fn push_status(&self, status: Option<impl Into<String>>) {
+        self.status_queue
+            .borrow_mut()
+            .push_back(status.map(Into::into));
     }
 
     /// Make the next `pane_run` fail, so a caller's error handling can be tested.
@@ -402,6 +461,13 @@ impl Herdr for FakeHerdr {
         Ok(text)
     }
 
+    fn agent_status(&self, pane_id: &str) -> Option<String> {
+        self.record(format!("agent_status target={pane_id}"));
+        // An empty queue models a pane with no reportable status (yields None),
+        // so the default poll path (no scripted blocked status) keeps waiting.
+        self.status_queue.borrow_mut().pop_front().flatten()
+    }
+
     fn integration_present(&self) -> bool {
         self.record("integration_present".to_string());
         true
@@ -463,6 +529,39 @@ mod tests {
     #[test]
     fn parse_pane_id_missing_returns_none() {
         assert!(parse_pane_id(r#"{"no":"pane"}"#).is_none());
+    }
+
+    #[test]
+    fn parse_agent_status_from_pane_get() {
+        // `pane get` shape: status sits on the `result` object.
+        let json = r#"{"result":{"pane_id":"w1:p1","agent_status":"blocked"}}"#;
+        assert_eq!(parse_agent_status(json).as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn parse_agent_status_from_pane_list() {
+        // `pane list` shape: status sits on a pane object nested in an array.
+        let json = r#"{"result":{"panes":[{"pane_id":"w1:p1","agent_status":"idle"},{"pane_id":"w1:p2","agent_status":"working"}]}}"#;
+        // Returns the first agent_status found while walking the value.
+        assert_eq!(parse_agent_status(json).as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn parse_agent_status_missing_or_bad_json_returns_none() {
+        assert!(parse_agent_status(r#"{"result":{"pane_id":"w1:p1"}}"#).is_none());
+        assert!(parse_agent_status("not json at all").is_none());
+    }
+
+    #[test]
+    fn fake_status_queue() {
+        let h = FakeHerdr::new();
+        // Empty queue → None (default "keep waiting" path).
+        assert_eq!(h.agent_status("pane-1"), None);
+        h.push_status(Some("blocked"));
+        h.push_status(None::<String>);
+        assert_eq!(h.agent_status("pane-1").as_deref(), Some("blocked"));
+        assert_eq!(h.agent_status("pane-1"), None);
+        assert!(h.calls().iter().filter(|c| c.contains("agent_status")).count() >= 3);
     }
 
     // -- Bug A: agent_send via FakeHerdr records the text (CR is a real-herdr detail)
