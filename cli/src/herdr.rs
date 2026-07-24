@@ -55,11 +55,48 @@ pub trait Herdr {
 // SystemHerdr — shells the real `herdr` binary
 // ---------------------------------------------------------------------------
 
-/// Pause between writing a message and sending the submit CR. A CR sent
+/// Pause between writing a message and sending the primary submit CR. A CR sent
 /// immediately after a large `agent send` is swallowed by claude's
 /// bracketed-paste handling and never submits; a CR sent after the paste
-/// settles submits reliably (verified against the live claude TUI).
-const PASTE_SETTLE: Duration = Duration::from_millis(150);
+/// settles submits reliably (verified against the live claude TUI). Kept
+/// generous because the failure is timing-dependent (racy) and multi-KB pastes
+/// settle slowly.
+const PASTE_SETTLE: Duration = Duration::from_millis(250);
+
+/// Pause between the primary submit CR and the flush CR (see [`submit_handshake`]).
+/// The flush CR is a bare carriage return sent late enough that the paste has
+/// certainly settled, so it submits whatever the primary CR was absorbed into.
+/// A CR on an already-submitted (empty) buffer is a harmless no-op, so the flush
+/// is always safe. This bakes in the proven "second empty submit" workaround from
+/// docs/known-issues.md.
+const FLUSH_SETTLE: Duration = Duration::from_millis(900);
+
+/// Submit a just-written message by sending carriage returns as separately-timed
+/// keypresses. claude's TUI treats a large `agent send` as a bracketed paste; a
+/// CR in the same burst is absorbed into the paste and never submits. So we
+/// (1) wait `paste_settle` for the paste to land, then send a CR, and
+/// (2) wait `flush_settle`, then send a second, bare CR. The first CR submits
+/// when the paste settled in time; the second flushes any paste the first CR was
+/// swallowed into. This relies on one observed claude-TUI property: a bare CR on
+/// an already-submitted (empty) input box is a no-op, so the redundant flush never
+/// double-submits. If a future claude build instead submits an empty message on a
+/// bare CR, revisit this (poll the pane buffer before the single CR instead).
+///
+/// Durations are parameters so tests can drive it with `Duration::ZERO`.
+fn submit_handshake<F>(
+    mut send_cr: F,
+    paste_settle: Duration,
+    flush_settle: Duration,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    std::thread::sleep(paste_settle);
+    send_cr()?;
+    std::thread::sleep(flush_settle);
+    send_cr()?;
+    Ok(())
+}
 
 pub struct SystemHerdr;
 
@@ -199,21 +236,25 @@ impl Herdr for SystemHerdr {
                 format!("herdr agent send failed: {stderr}"),
             ));
         }
-        // Submit the message with a carriage return. herdr writes the text into
-        // the pane's input box without pressing Enter, so a CR is required to
-        // dispatch it. It MUST be a separately-timed keypress: claude's TUI
-        // treats a large message as a bracketed paste, and a CR sent in the same
-        // burst is absorbed into the paste instead of submitting. Pausing for the
-        // paste to settle first makes the CR land as a distinct Enter.
-        std::thread::sleep(PASTE_SETTLE);
-        let cr_out = self.run(&["agent", "send", target, "\r"])?;
-        if !cr_out.status.success() {
-            let stderr = String::from_utf8_lossy(&cr_out.stderr);
-            return Err(io::Error::other(
-                format!("herdr agent send (CR) failed: {stderr}"),
-            ));
-        }
-        Ok(())
+        // Submit the message. herdr writes the text into the pane's input box
+        // without pressing Enter, so a CR is required to dispatch it. The CR must
+        // be a separately-timed keypress, and we send two (see submit_handshake):
+        // a large paste can swallow the first CR, and the delayed flush CR then
+        // submits it reliably.
+        submit_handshake(
+            || {
+                let cr_out = self.run(&["agent", "send", target, "\r"])?;
+                if !cr_out.status.success() {
+                    let stderr = String::from_utf8_lossy(&cr_out.stderr);
+                    return Err(io::Error::other(
+                        format!("herdr agent send (CR) failed: {stderr}"),
+                    ));
+                }
+                Ok(())
+            },
+            PASTE_SETTLE,
+            FLUSH_SETTLE,
+        )
     }
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
@@ -586,6 +627,48 @@ mod tests {
             "PASTE_SETTLE must be > 0 so the submit CR is a separate keypress, \
              not swallowed by claude's bracketed paste"
         );
+    }
+
+    // -- Fix 1 (issue 1): the submit handshake sends TWO carriage returns — a
+    //    primary CR and a delayed flush CR — so a paste that swallows the first
+    //    CR is still submitted by the second. FLUSH_SETTLE must be nonzero so the
+    //    flush is a distinct keypress after the paste has settled.
+    #[test]
+    fn flush_settle_is_nonzero() {
+        assert!(
+            FLUSH_SETTLE > Duration::ZERO,
+            "FLUSH_SETTLE must be > 0 so the flush CR is a distinct keypress"
+        );
+    }
+
+    #[test]
+    fn submit_handshake_sends_two_crs() {
+        let mut count = 0;
+        submit_handshake(
+            || {
+                count += 1;
+                Ok(())
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(count, 2, "submit must send a primary CR and a flush CR");
+    }
+
+    #[test]
+    fn submit_handshake_short_circuits_on_error() {
+        let mut count = 0;
+        let r = submit_handshake(
+            || {
+                count += 1;
+                Err(io::Error::other("boom"))
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(r.is_err(), "an error on the primary CR must propagate");
+        assert_eq!(count, 1, "a failed primary CR must not attempt the flush");
     }
 
     // workspace_create returns both the workspace id and its root shell pane id;

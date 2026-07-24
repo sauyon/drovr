@@ -32,6 +32,30 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Build the workspace-root guard appended to every phase agent's `claude`
+/// invocation. In a git worktree that shares its `.git` with an outer repo, Claude
+/// Code anchors its workspace root to the shared common dir and resolves relative
+/// edits against the OUTER checkout, not the worktree — so a drovr run driven
+/// against a worktree silently dirties the wrong tree (see docs/known-issues.md).
+/// We pin the root two ways: `--add-dir <project_dir>` allow-lists the worktree as
+/// a working directory, and an appended system prompt tells the agent to resolve
+/// every path under that absolute root. `project_dir` is shell-quoted so a path
+/// with spaces or shell metacharacters stays one literal argument.
+fn workspace_root_guard(project_dir: &str) -> String {
+    let prompt = format!(
+        "Your project root is {project_dir}. Treat it as the absolute workspace \
+         root: resolve every file path against it, and never read or edit files \
+         outside it. If this checkout is a git worktree that shares its .git with \
+         another checkout, ignore that outer checkout entirely — edits belong in \
+         {project_dir}."
+    );
+    format!(
+        "--add-dir {} --append-system-prompt {}",
+        shell_single_quote(project_dir),
+        shell_single_quote(&prompt),
+    )
+}
+
 /// Launch an agent invocation inside an already-chosen `pane`, tagged with
 /// `DROVR_PHASE=<run>/<phase>` (single-quoted so a name with spaces or shell
 /// metacharacters stays one literal word), then best-effort rename the pane to
@@ -146,8 +170,10 @@ pub fn phase_start<H: Herdr>(
     };
 
     // Launch `claude` inside the target pane (focus capture/restore + best-effort
-    // rename live in the shared helper). A pipeline phase runs bare `claude`.
-    launch_in_pane(h, &run.name, phase, &target_pane, "claude")?;
+    // rename live in the shared helper). The workspace-root guard pins edits to the
+    // project dir so a worktree run can't stray into the outer checkout.
+    let command = format!("claude {}", workspace_root_guard(&cwd));
+    launch_in_pane(h, &run.name, phase, &target_pane, &command)?;
     // The launch succeeded, so this phase has now claimed the root pane (if it
     // used it); clear it so later phases don't try to reuse the same pane.
     if used_root {
@@ -207,6 +233,20 @@ pub fn spawn_reviewer<H: Herdr>(
     seed: Option<&Path>,
     launch_command: &str,
 ) -> io::Result<()> {
+    // Same guard as phase_start: a run with no project_dir can't anchor the
+    // workspace-root guard (or the tab cwd), so refuse rather than launch a
+    // reviewer with `--add-dir ''`.
+    if run.project_dir.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no project_dir (created before this fix); \
+                 please recreate the run with `drovr new`",
+                run.name
+            ),
+        ));
+    }
+
     // Reviewers can't reuse the pipeline root pane; they need their own tab, which
     // requires a workspace.
     let ws = run.workspace.clone().ok_or_else(|| {
@@ -224,7 +264,10 @@ pub fn spawn_reviewer<H: Herdr>(
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
     // launch itself.
     let pane = h.tab_create(&ws, phase, &run.project_dir)?;
-    launch_in_pane(h, &run.name, phase, &pane, launch_command)?;
+    // Append the same workspace-root guard so a read-only reviewer in a worktree
+    // reads the worktree, not the outer checkout.
+    let command = format!("{launch_command} {}", workspace_root_guard(&run.project_dir));
+    launch_in_pane(h, &run.name, phase, &pane, &command)?;
 
     // Register the reviewer in `review_phases` only. The seed path rides on
     // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
@@ -697,6 +740,53 @@ mod tests {
         );
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(run_call.contains("claude"), "pane_run must launch claude: {run_call}");
+        // The workspace-root guard pins edits to the project dir (issue 3): a
+        // worktree run must not stray into the outer checkout.
+        assert!(
+            run_call.contains("--add-dir '/tmp/drovr-proj-test'"),
+            "pane_run must add-dir the project root: {run_call}"
+        );
+        assert!(
+            run_call.contains("--append-system-prompt"),
+            "pane_run must append the workspace-root system prompt: {run_call}"
+        );
+    }
+
+    // -- Fix 3 (issue 3): the launch guard pins the workspace root -------------
+    #[test]
+    fn workspace_root_guard_pins_project_dir() {
+        let g = workspace_root_guard("/home/user/wt");
+        assert!(g.contains("--add-dir '/home/user/wt'"), "guard: {g}");
+        assert!(g.contains("--append-system-prompt"), "guard: {g}");
+        assert!(g.contains("/home/user/wt"), "guard must name the absolute root: {g}");
+    }
+
+    #[test]
+    fn workspace_root_guard_shell_quotes_unsafe_dir() {
+        // A path with a space or shell metacharacter must stay one literal word.
+        let g = workspace_root_guard("/tmp/a b; rm -rf ~");
+        assert!(g.contains("--add-dir '/tmp/a b; rm -rf ~'"), "guard: {g}");
+    }
+
+    #[test]
+    fn reviewer_launch_includes_workspace_root_guard() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-guard-test", "ws-g");
+
+        spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude --permission-mode plan")
+            .unwrap();
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains("claude --permission-mode plan"),
+            "reviewer must keep its read-only launch flags: {run_call}"
+        );
+        assert!(
+            run_call.contains("--add-dir '/tmp/drovr-proj-test'"),
+            "reviewer must also get the workspace-root guard: {run_call}"
+        );
     }
 
     #[test]
@@ -1525,6 +1615,19 @@ mod tests {
 
         let result = phase_start(&h, &mut run, "brainstorm", None);
         assert!(result.is_err(), "must error when project_dir is empty");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("project_dir"), "error should mention project_dir: {msg}");
+    }
+
+    #[test]
+    fn spawn_reviewer_empty_project_dir_returns_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-empty-proj-test", "ws-e");
+        run.project_dir = String::new();
+
+        let result = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude");
+        assert!(result.is_err(), "reviewer must error when project_dir is empty");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("project_dir"), "error should mention project_dir: {msg}");
     }

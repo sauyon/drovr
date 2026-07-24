@@ -89,6 +89,14 @@ impl AppState {
         self.workdir.join("prior.md")
     }
 
+    /// The spec content as of the last `review summary` post. The server keeps
+    /// this rolling copy so it can re-baseline `prior.md` to the *previous*
+    /// revision on each new summary — the agent overwrites `spec.md` before
+    /// calling `review summary`, so the pre-revision spec is otherwise lost.
+    fn last_summarized_path(&self) -> PathBuf {
+        self.workdir.join("last_summarized.md")
+    }
+
     fn summary_path(&self) -> PathBuf {
         self.workdir.join("summary.txt")
     }
@@ -355,9 +363,21 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
             drop(st);
             respond_str(req, 200, "application/json", r#"{"ok":true,"state":"approved"}"#.into());
         } else {
-            // Snapshot current spec → prior.md
+            // Snapshot the submitted spec as BOTH prior.md and last_summarized.md.
+            // The reviewer's next turn diffs from the version they just acted on, so
+            // prior = current spec. We also re-anchor last_summarized to the same
+            // value: without it, the next `/summary` would promote a stale
+            // last_summarized over this prior. (Today the two happen to coincide
+            // because the agent doesn't touch spec.md between its last `/summary`
+            // and the reviewer submit — anchoring here makes that no longer load-
+            // bearing.)
             let spec_bytes = fs::read(&st.spec_path).unwrap_or_default();
-            let _ = fs::write(st.prior_path(), &spec_bytes);
+            if let Err(e) = fs::write(st.prior_path(), &spec_bytes) {
+                eprintln!("drovr review: failed to snapshot prior.md: {e}");
+            }
+            if let Err(e) = fs::write(st.last_summarized_path(), &spec_bytes) {
+                eprintln!("drovr review: failed to snapshot last_summarized.md: {e}");
+            }
 
             st.turn += 1;
             let turn = st.turn;
@@ -381,6 +401,31 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
     if method == Method::Post && path == "/summary" {
         let body = read_body(&mut req);
         let mut st = shared.lock().unwrap();
+
+        // Re-baseline the diff per revision. The reviewer's diff is (current
+        // spec) vs prior.md; we want each revision to diff against the *previous*
+        // revision, not the accumulated change since the last reviewer submit. The
+        // agent overwrites spec.md before calling `review summary`, so we can't
+        // read the pre-revision spec here — instead the server keeps a rolling
+        // copy in last_summarized.md: promote it to prior.md, then re-snapshot the
+        // now-current spec as the baseline for the next revision.
+        let last = st.last_summarized_path();
+        match fs::read(&last) {
+            Ok(prev) if !prev.is_empty() => {
+                if let Err(e) = fs::write(st.prior_path(), &prev) {
+                    eprintln!("drovr review: failed to write prior.md: {e}");
+                }
+            }
+            _ => {}
+        }
+        // spec unreadable → keep the existing last_summarized baseline.
+        if let Ok(current) = fs::read(&st.spec_path) {
+            let refreshed = fs::write(&last, &current);
+            if let Err(e) = refreshed {
+                eprintln!("drovr review: failed to write last_summarized.md: {e}");
+            }
+        }
+
         let _ = fs::write(st.summary_path(), body.as_bytes());
         st.state = LoopState::Ready;
         drop(st);
@@ -656,6 +701,72 @@ mod tests {
         let (status2, body2) = http_get(&addr, "/state");
         assert_eq!(status2, 200);
         assert!(body2.contains(r#""state":"ready""#), "body2={body2}");
+    }
+
+    // -- Fix 2 (issue 2): prior.md re-baselines to the PREVIOUS revision on each
+    //    `review summary`, so the reviewer's diff is (previous revision → this
+    //    revision) — not the change accumulated across multiple self-revisions.
+    #[test]
+    fn summary_rebaselines_prior_per_revision() {
+        let tmp = make_workdir("rebaseline");
+        let spec = tmp.path().join("spec.md");
+
+        // Revision 1: no previous revision, so there is no prior yet.
+        fs::write(&spec, b"v1").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec.clone());
+        let (s1, _) = http_post(&addr, "/summary", "text/plain", "changed to v1");
+        assert_eq!(s1, 200);
+        let (ps, _) = http_get(&addr, "/prior");
+        assert_eq!(ps, 204, "no prior before a second revision exists");
+
+        // Revision 2: the agent overwrites spec.md, then posts a summary.
+        // prior.md must now be v1 (the previous revision), not empty.
+        fs::write(&spec, b"v2").unwrap();
+        let (s2, _) = http_post(&addr, "/summary", "text/plain", "changed to v2");
+        assert_eq!(s2, 200);
+        let (ps2, body2) = http_get(&addr, "/prior");
+        assert_eq!(ps2, 200);
+        assert_eq!(body2, "v1", "prior after v2 must be v1");
+
+        // Revision 3 (a second self-revision, no reviewer submit in between):
+        // prior must advance to v2 — the diff is v2→v3, not the stale v1→v3.
+        fs::write(&spec, b"v3").unwrap();
+        let (s3, _) = http_post(&addr, "/summary", "text/plain", "changed to v3");
+        assert_eq!(s3, 200);
+        let (ps3, body3) = http_get(&addr, "/prior");
+        assert_eq!(ps3, 200);
+        assert_eq!(body3, "v2", "prior after v3 must advance to v2, not stay at v1");
+    }
+
+    // -- Fix 2 (issue 2): a reviewer submit re-anchors last_summarized.md too, so
+    //    the first `/summary` after a submit does not promote a stale baseline
+    //    over the prior the submit just wrote. Covers summary → summary → submit
+    //    → summary interleaving.
+    #[test]
+    fn submit_reanchors_baseline_for_next_revision() {
+        let tmp = make_workdir("interleave");
+        let spec = tmp.path().join("spec.md");
+
+        fs::write(&spec, b"v1").unwrap();
+        let addr = start_server(tmp.path().to_path_buf(), spec.clone());
+        assert_eq!(http_post(&addr, "/summary", "text/plain", "v1").0, 200);
+
+        fs::write(&spec, b"v2").unwrap();
+        assert_eq!(http_post(&addr, "/summary", "text/plain", "v2").0, 200);
+
+        // Reviewer requests changes on v2 → prior must be v2.
+        let payload = r#"{"decision":"request-changes","feedback":"x","answers":{},"annotations":[]}"#;
+        assert_eq!(http_post(&addr, "/submit", "application/json", payload).0, 200);
+        let prior_after_submit = fs::read(tmp.path().join("prior.md")).unwrap();
+        assert_eq!(prior_after_submit, b"v2", "submit must snapshot the submitted spec");
+
+        // First revision after the submit: prior must ADVANCE to v2 (the submitted
+        // version), not regress to a stale last_summarized.
+        fs::write(&spec, b"v3").unwrap();
+        assert_eq!(http_post(&addr, "/summary", "text/plain", "v3").0, 200);
+        let (ps, body) = http_get(&addr, "/prior");
+        assert_eq!(ps, 200);
+        assert_eq!(body, "v2", "post-submit revision must diff against the submitted v2, not regress");
     }
 
     #[test]
