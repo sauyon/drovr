@@ -41,7 +41,10 @@ fn binary_on_path(name: &str) -> bool {
 }
 
 fn herdr_integration_installed() -> bool {
-    let Ok(out) = Command::new("herdr").args(["integration", "status"]).output() else {
+    let Ok(out) = Command::new("herdr")
+        .args(["integration", "status"])
+        .output()
+    else {
         return false;
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -128,7 +131,10 @@ fn drovr_binary() -> PathBuf {
         return bin;
     }
     // Workspace target dir (one level up from cli/)
-    let ws_bin = manifest.parent().unwrap_or(&manifest).join("target/debug/drovr");
+    let ws_bin = manifest
+        .parent()
+        .unwrap_or(&manifest)
+        .join("target/debug/drovr");
     if ws_bin.exists() {
         return ws_bin;
     }
@@ -165,7 +171,9 @@ fn e2e_smoke() {
         return;
     }
     if !herdr_integration_installed() {
-        println!("skipping e2e: herdr claude integration not installed (run `herdr integration install claude`)");
+        println!(
+            "skipping e2e: herdr claude integration not installed (run `herdr integration install claude`)"
+        );
         return;
     }
 
@@ -181,12 +189,17 @@ fn e2e_smoke() {
     let run_dir: PathBuf = xdg.join("drovr/runs").join(run_name);
 
     let drovr = drovr_binary();
-    assert!(drovr.exists(), "drovr binary not found at {:?}; run `cargo build` first", drovr);
+    assert!(
+        drovr.exists(),
+        "drovr binary not found at {:?}; run `cargo build` first",
+        drovr
+    );
 
     // Helper: run drovr with our XDG_DATA_HOME set
     let base_cmd = || {
         let mut c = Command::new(&drovr);
         c.env("XDG_DATA_HOME", &xdg);
+        c.env("DROVR_AGENT", "claude");
         c
     };
 
@@ -211,19 +224,25 @@ fn e2e_smoke() {
 
     let state_json = fs::read_to_string(&state_path).expect("read state.json");
     let state: serde_json::Value = serde_json::from_str(&state_json).expect("parse state.json");
+    assert_eq!(state["agent"], "claude");
     let phases = state["phases"].as_array().expect("phases array");
-    assert_eq!(phases.len(), 4, "expected 4 seeded phases, got {}", phases.len());
-    let phase_names: Vec<&str> = phases
-        .iter()
-        .filter_map(|p| p["name"].as_str())
-        .collect();
+    assert_eq!(
+        phases.len(),
+        4,
+        "expected 4 seeded phases, got {}",
+        phases.len()
+    );
+    let phase_names: Vec<&str> = phases.iter().filter_map(|p| p["name"].as_str()).collect();
     assert_eq!(
         phase_names,
         ["brainstorm", "plan", "implement", "review"],
         "unexpected phase names: {:?}",
         phase_names
     );
-    println!("e2e: drovr new OK — state.json exists with {} phases", phases.len());
+    println!(
+        "e2e: drovr new OK — state.json exists with {} phases",
+        phases.len()
+    );
 
     // ---- Step 2: drovr serve + review cycle --------------------------------
 
@@ -232,7 +251,14 @@ fn e2e_smoke() {
 
     // Start `drovr serve` in a background child process.
     let serve_child = base_cmd()
-        .args(["serve", run_name, "--host", "127.0.0.1", "--port", &port.to_string()])
+        .args([
+            "serve",
+            run_name,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -247,8 +273,7 @@ fn e2e_smoke() {
     println!("e2e: drovr serve started — state=idle");
 
     // POST /submit (request-changes + feedback) → state should become `waiting`
-    let submit_payload =
-        r#"{"decision":"request-changes","feedback":"please revise","answers":{},"annotations":[]}"#;
+    let submit_payload = r#"{"decision":"request-changes","feedback":"please revise","answers":{},"annotations":[]}"#;
     let (status, body) = http_post(&addr, "/submit", "application/json", submit_payload);
     assert_eq!(status, 200, "POST /submit failed: {body}");
     assert!(
@@ -266,7 +291,12 @@ fn e2e_smoke() {
 
     // `drovr review summary` → state should become `ready`
     let out = base_cmd()
-        .args(["review", "summary", run_name, "agent completed the requested changes"])
+        .args([
+            "review",
+            "summary",
+            run_name,
+            "agent completed the requested changes",
+        ])
         .output()
         .expect("drovr review summary");
     assert!(

@@ -2,33 +2,16 @@
 //!
 //! One call to [`code_review_run`] runs a single review pass for a task: read the
 //! `base..head` scope, load config, seed + spawn one read-only reviewer per angle,
-//! wait (bounded) for every reviewer's done marker, read + union-merge the per-angle
+//! wait (bounded) for every reviewer to finish, read + union-merge the per-angle
 //! findings, write the merged `<task>-review.json`, and return a [`ReviewOutcome`]
 //! (→ exit 0 / 3 / 2 / 1). It is BLOCKING; the pipeline driver — never a skill — calls
 //! it and reacts to the outcome.
 //!
-//! # Read-only findings path (chosen: file-first, transcript fallback)
+//! # Read-only findings path
 //!
-//! Per spec each reviewer writes its own `<task>-review-<angle>.json`. But a strict
-//! `readonly_flag` — claude's `--permission-mode plan` is a hard read-only planning
-//! gate with no per-directory carve-out — can block that write. So the "reviewer
-//! writes the file" primary path is NOT reliable on its own. This module therefore
-//! uses a **hybrid**:
-//!
-//!   1. After a reviewer's marker lands, read `<run_dir>/<task>-review-<angle>.json`.
-//!   2. If that file is absent (the readonly flag blocked the write), fall back to
-//!      reading the reviewer's pane transcript via [`Herdr::agent_read`] — exactly as
-//!      `compress::phase_compress` does — extract the fenced findings JSON, and have
-//!      **drovr** write `<task>-review-<angle>.json`.
-//!
-//! Either way [`code_review_run`]'s contract (the merged `<task>-review.json` + the
-//! outcome) is identical. The `drovr phase done` marker itself is drovr's own
-//! subcommand; a backend whose readonly flag blocks even that cannot serve as a
-//! reviewer at all (a config concern, outside this function's contract).
-//!
-//! The reviewer is "read-only" in the sense that matters: it is **not a writer of
-//! project source or `state.json`** (the single-writer invariant), NOT that it cannot
-//! write any file.
+//! Reviewers emit fenced findings JSON in their transcript and exit. Drovr
+//! observes herdr's `done` status, extracts the JSON, and writes all artifacts.
+//! Legacy file output and `.done` markers remain accepted for compatibility.
 
 use std::io;
 use std::path::Path;
@@ -89,8 +72,7 @@ const ANGLE_BRIEFS: &[(&str, &str)] = &[
 ];
 
 /// Brief used for an angle not present in [`ANGLE_BRIEFS`].
-const GENERIC_BRIEF: &str =
-    "Review the change for issues relevant to this angle; report anything a careful \
+const GENERIC_BRIEF: &str = "Review the change for issues relevant to this angle; report anything a careful \
      reviewer of that concern would flag.";
 
 fn angle_brief(angle: &str) -> &'static str {
@@ -157,18 +139,16 @@ fn next_iter(run: &RunState, task: &str) -> u64 {
         .unwrap_or(1)
 }
 
-/// Build the per-angle reviewer seed (angle brief + base/head + task description +
-/// the findings schema + the write-then-`phase done` instructions).
+/// Build the per-angle reviewer seed.
 fn build_seed(
-    run_name: &str,
+    _run_name: &str,
     task: &str,
     angle: &str,
     base: &str,
     head: &str,
     task_desc: &str,
-    iter: u64,
+    _iter: u64,
 ) -> String {
-    let phase = format!("review:{task}:{iter}:{angle}");
     format!(
         "# Review angle: {angle}\n\n\
          You are a READ-ONLY reviewer on the drovr review panel for task `{task}`.\n\
@@ -179,17 +159,13 @@ fn build_seed(
          the project. You may read any file and run tests. Base = `{base}`, head = `{head}`.\n\n\
          ## Task under review\n\n{task_desc}\n\n\
          ## Output\n\n\
-         Write your findings as JSON to `<run_dir>/{task}-review-{angle}.json` matching:\n\n\
+         Return your findings in a fenced JSON block matching:\n\n\
          ```json\n{schema}\n```\n\n\
          `severity` is one of `critical` | `important` | `nit`. Omit `angle` in each\n\
          finding — drovr stamps it from this file's angle (`{angle}`). Report only issues\n\
          introduced or exposed by this change; a clean review is `{{\"verdict\":\"clean\",\"findings\":[]}}`.\n\n\
          ## Finish\n\n\
-         After writing the JSON, run exactly:\n\n\
-         ```\n\
-         drovr phase done {run_name} {phase}\n\
-         ```\n\n\
-         then exit. Do not modify project files or `state.json`.\n",
+         Emit the fenced JSON, then exit. Do not modify any files or run `drovr phase done`.\n",
         brief = angle_brief(angle),
         schema = FINDINGS_SCHEMA,
     )
@@ -232,11 +208,8 @@ fn obtain_findings_json<H: Herdr>(
     phase_name: &str,
 ) -> io::Result<String> {
     let path = dir.join(format!("{task}-review-{angle}.json"));
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        return Ok(s);
-    }
-    // Fallback: the readonly flag blocked the reviewer's write. Recover the findings
-    // from its transcript (mirrors `phase_compress`) and write the file ourselves.
+    // Prefer this iteration's transcript so a canonical file left by an earlier
+    // pass cannot make resolved findings persist forever.
     let pane = run
         .find_phase(phase_name)
         .and_then(|p| p.pane_id.clone())
@@ -247,14 +220,17 @@ fn obtain_findings_json<H: Herdr>(
             )
         })?;
     let transcript = h.agent_read(&pane)?;
-    let json = extract_findings_json(&transcript).ok_or_else(|| {
+    if let Some(json) = extract_findings_json(&transcript) {
+        std::fs::write(&path, &json)?;
+        return Ok(json);
+    }
+    // Compatibility path for reviewers that wrote the canonical file.
+    std::fs::read_to_string(&path).map_err(|_| {
         io::Error::other(format!(
             "reviewer '{phase_name}' produced no findings JSON (no file written and \
              none found in its transcript)"
         ))
-    })?;
-    std::fs::write(&path, &json)?;
-    Ok(json)
+    })
 }
 
 /// Run ONE review panel for `task` and return the outcome. Blocking.
@@ -287,20 +263,26 @@ pub fn code_review_run<H: Herdr>(
         // Surface *why* (missing file vs. read error): a bare `Error` exit with no
         // explanation is painful to debug from the driver.
         Err(e) => {
-            eprintln!("code-review: no review base for '{task}' ({e}); run `drovr code-review base` at task start");
+            eprintln!(
+                "code-review: no review base for '{task}' ({e}); run `drovr code-review base` at task start"
+            );
             return Ok(ReviewOutcome::Error);
         }
     };
     let head = match head_sha(&run.project_dir) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("code-review: cannot read HEAD in '{}' ({e})", run.project_dir);
+            eprintln!(
+                "code-review: cannot read HEAD in '{}' ({e})",
+                run.project_dir
+            );
             return Ok(ReviewOutcome::Error);
         }
     };
 
     let cfg = load_config()?;
-    let launch = cfg.reviewer_launch(None)?;
+    let agent = run.agent.as_deref().unwrap_or("claude");
+    let launch = cfg.launch(agent, &run.project_dir, true)?;
     let iter = next_iter(run, task);
     std::fs::create_dir_all(&dir)?;
 
@@ -335,7 +317,14 @@ pub fn code_review_run<H: Herdr>(
     let mut pending: Vec<String> = phases.clone();
     loop {
         pending.retain(|name| {
-            if done_marker(&run.name, name).exists() {
+            let finished = done_marker(&run.name, name).exists()
+                || run
+                    .find_phase(name)
+                    .and_then(|phase| phase.pane_id.as_deref())
+                    .and_then(|pane| h.agent_status(pane))
+                    .as_deref()
+                    == Some("done");
+            if finished {
                 if let Some(i) = run.review_phases.iter().position(|p| &p.name == name) {
                     run.review_phases[i].status = PhaseStatus::Done;
                 }
@@ -415,7 +404,11 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t.t"]);
@@ -427,6 +420,7 @@ mod tests {
         let run = RunState {
             name: name.to_owned(),
             task: "implement the widget".into(),
+            agent: Some("claude".into()),
             phases: vec![],
             review_phases: vec![],
             gate: "spec".into(),
@@ -488,13 +482,47 @@ mod tests {
         assert!(run.phases.is_empty(), "pipeline phases must stay empty");
         assert_eq!(run.review_phases.len(), 4);
         assert!(
-            run.review_phases.iter().all(|p| p.name.starts_with("review:task-1:1:")),
+            run.review_phases
+                .iter()
+                .all(|p| p.name.starts_with("review:task-1:1:")),
             "all reviewers are iter 1: {:?}",
-            run.review_phases.iter().map(|p| &p.name).collect::<Vec<_>>()
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
         );
         assert!(
-            run.review_phases.iter().all(|p| p.status == PhaseStatus::Done),
+            run.review_phases
+                .iter()
+                .all(|p| p.status == PhaseStatus::Done),
             "every reviewer whose marker landed must be marked Done"
+        );
+    }
+
+    #[test]
+    fn readonly_reviewers_complete_from_herdr_status_and_transcript() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-readonly-done");
+        run.agent = Some("cursor".into());
+        write_base(&run, "task-1");
+        for _ in 0..4 {
+            h.push_status(Some("done"));
+            h.push_read(format!("```json\n{CLEAN}\n```"));
+        }
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Clean);
+        assert!(
+            run.review_phases
+                .iter()
+                .all(|phase| phase.status == PhaseStatus::Done)
+        );
+        let calls = h.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("agent --mode plan --workspace"))
         );
     }
 
@@ -527,6 +555,44 @@ mod tests {
     }
 
     #[test]
+    fn later_clean_pass_replaces_stale_finding_files() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-stale-findings");
+        write_base(&run, "task-1");
+        seed_angle_file(
+            &run,
+            "task-1",
+            "correctness",
+            r#"{"verdict":"changes","findings":[{"file":"a.rs","severity":"important","summary":"fixed later"}]}"#,
+        );
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", angle, CLEAN);
+        }
+        drop_markers(&run, "task-1", 1);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000).unwrap(),
+            ReviewOutcome::Findings
+        );
+
+        for _ in 0..4 {
+            h.push_read(format!("```json\n{CLEAN}\n```"));
+        }
+        drop_markers(&run, "task-1", 2);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000).unwrap(),
+            ReviewOutcome::Clean
+        );
+        let merged = run_dir(&run.name).join("task-1-review.json");
+        assert!(
+            parse_review(&std::fs::read_to_string(merged).unwrap())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn missing_base_sha_is_error() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
@@ -550,22 +616,35 @@ mod tests {
         assert_eq!(outcome, ReviewOutcome::Timeout);
         assert_eq!(run.review_phases.len(), 4);
         assert!(
-            run.review_phases.iter().all(|p| p.name.starts_with("review:task-1:1:")),
+            run.review_phases
+                .iter()
+                .all(|p| p.name.starts_with("review:task-1:1:")),
             "first pass phases are iter 1"
         );
         assert!(
-            run.review_phases.iter().all(|p| p.status == PhaseStatus::Running),
+            run.review_phases
+                .iter()
+                .all(|p| p.status == PhaseStatus::Running),
             "timed-out reviewers stay Running (resumable)"
         );
 
         // Second call bumps to iter 2 and waits on the fresh markers.
         let outcome = code_review_run(&h, &mut run, "task-1", 40).unwrap();
         assert_eq!(outcome, ReviewOutcome::Timeout);
-        assert_eq!(run.review_phases.len(), 8, "iter-1 leftovers remain + iter-2 added");
+        assert_eq!(
+            run.review_phases.len(),
+            8,
+            "iter-1 leftovers remain + iter-2 added"
+        );
         assert!(
-            run.review_phases.iter().any(|p| p.name == "review:task-1:2:correctness"),
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
             "second pass must produce iter-2 phase names: {:?}",
-            run.review_phases.iter().map(|p| &p.name).collect::<Vec<_>>()
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -603,6 +682,7 @@ mod tests {
         // transcript fallback. Queue one transcript read carrying fenced JSON.
         for a in ["correctness", "security", "error-handling"] {
             seed_angle_file(&run, "task-1", a, CLEAN);
+            h.push_read("");
         }
         h.push_read(
             "reviewer output...\n```json\n{\"verdict\":\"clean\",\"findings\":[]}\n```\ndone",
@@ -613,7 +693,10 @@ mod tests {
         assert_eq!(outcome, ReviewOutcome::Clean);
         // drovr wrote the missing per-angle file from the transcript.
         let recovered = run_dir(&run.name).join("task-1-review-type-design.json");
-        assert!(recovered.exists(), "fallback must persist the recovered findings file");
+        assert!(
+            recovered.exists(),
+            "fallback must persist the recovered findings file"
+        );
         // The pane was read (agent_read) exactly for the missing angle.
         assert!(h.calls().iter().any(|c| c.contains("agent_read")));
     }
@@ -638,6 +721,7 @@ mod tests {
         let base = RunState {
             name: "r".into(),
             task: "t".into(),
+            agent: None,
             phases: vec![],
             review_phases: vec![],
             gate: "spec".into(),
@@ -678,14 +762,31 @@ mod tests {
     }
 
     #[test]
-    fn seed_contains_scope_schema_and_done_instruction() {
-        let seed = build_seed("myrun", "task-1", "security", "aaa", "bbb", "do the thing", 3);
-        assert!(seed.contains("git diff aaa..bbb"), "seed must state the diff scope");
-        assert!(seed.contains("do the thing"), "seed must carry the task description");
-        assert!(seed.contains("task-1-review-security.json"), "seed must name the output file");
+    fn seed_contains_scope_schema_and_readonly_finish_instruction() {
+        let seed = build_seed(
+            "myrun",
+            "task-1",
+            "security",
+            "aaa",
+            "bbb",
+            "do the thing",
+            3,
+        );
         assert!(
-            seed.contains("drovr phase done myrun review:task-1:3:security"),
-            "seed must instruct the exact done marker command"
+            seed.contains("git diff aaa..bbb"),
+            "seed must state the diff scope"
+        );
+        assert!(
+            seed.contains("do the thing"),
+            "seed must carry the task description"
+        );
+        assert!(
+            seed.contains("fenced JSON block"),
+            "seed must request transcript JSON"
+        );
+        assert!(
+            seed.contains("Do not modify any files or run `drovr phase done`"),
+            "seed must preserve strict read-only behavior"
         );
         assert!(seed.contains("critical") && seed.contains("important") && seed.contains("nit"));
     }

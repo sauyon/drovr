@@ -48,7 +48,7 @@ pub trait Herdr {
     /// move focus (it shells `herdr pane get`, which does not focus), so
     /// `phase_wait` can poll it every iteration without disturbing the user.
     fn agent_status(&self, pane_id: &str) -> Option<String>;
-    fn integration_present(&self) -> bool;
+    fn integration_present(&self, agent: &str) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,9 +113,12 @@ impl SystemHerdr {
 impl Herdr for SystemHerdr {
     fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace> {
         let mut args: Vec<String> = vec![
-            "workspace".into(), "create".into(),
-            "--label".into(), label.into(),
-            "--cwd".into(), cwd.into(),
+            "workspace".into(),
+            "create".into(),
+            "--label".into(),
+            label.into(),
+            "--cwd".into(),
+            cwd.into(),
             "--no-focus".into(),
         ];
         args.extend(spawn_env_flags());
@@ -123,22 +126,22 @@ impl Herdr for SystemHerdr {
         let out = self.run(&args_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr workspace create failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr workspace create failed: {stderr}"
+            )));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         let id = parse_workspace_id(&stdout).ok_or_else(|| {
-            io::Error::other(
-                format!("herdr workspace create: could not parse workspace_id from: {stdout}"),
-            )
+            io::Error::other(format!(
+                "herdr workspace create: could not parse workspace_id from: {stdout}"
+            ))
         })?;
         // The output's first `pane_id` is `result.root_pane.pane_id` — the shell
         // pane the first phase will reuse.
         let root_pane = parse_pane_id(&stdout).ok_or_else(|| {
-            io::Error::other(
-                format!("herdr workspace create: could not parse root_pane pane_id from: {stdout}"),
-            )
+            io::Error::other(format!(
+                "herdr workspace create: could not parse root_pane pane_id from: {stdout}"
+            ))
         })?;
         Ok(Workspace { id, root_pane })
     }
@@ -147,19 +150,23 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["workspace", "close", id])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr workspace close failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr workspace close failed: {stderr}"
+            )));
         }
         Ok(())
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
         let mut args: Vec<String> = vec![
-            "tab".into(), "create".into(),
-            "--workspace".into(), workspace.into(),
-            "--label".into(), label.into(),
-            "--cwd".into(), cwd.into(),
+            "tab".into(),
+            "create".into(),
+            "--workspace".into(),
+            workspace.into(),
+            "--label".into(),
+            label.into(),
+            "--cwd".into(),
+            cwd.into(),
             "--no-focus".into(),
         ];
         args.extend(spawn_env_flags());
@@ -167,16 +174,16 @@ impl Herdr for SystemHerdr {
         let out = self.run(&args_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr tab create failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr tab create failed: {stderr}"
+            )));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         // `tab create` returns `result.root_pane.pane_id` — the new tab's shell pane.
         parse_pane_id(&stdout).ok_or_else(|| {
-            io::Error::other(
-                format!("herdr tab create: could not parse pane_id from: {stdout}"),
-            )
+            io::Error::other(format!(
+                "herdr tab create: could not parse pane_id from: {stdout}"
+            ))
         })
     }
 
@@ -184,9 +191,7 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["pane", "run", pane_id, command])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr pane run failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!("herdr pane run failed: {stderr}")));
         }
         Ok(())
     }
@@ -195,9 +200,9 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["pane", "rename", pane_id, label])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr pane rename failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr pane rename failed: {stderr}"
+            )));
         }
         Ok(())
     }
@@ -221,9 +226,9 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["workspace", "focus", id])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr workspace focus failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr workspace focus failed: {stderr}"
+            )));
         }
         Ok(())
     }
@@ -232,9 +237,9 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["agent", "send", target, text])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr agent send failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr agent send failed: {stderr}"
+            )));
         }
         // Submit the message. herdr writes the text into the pane's input box
         // without pressing Enter, so a CR is required to dispatch it. The CR must
@@ -246,9 +251,9 @@ impl Herdr for SystemHerdr {
                 let cr_out = self.run(&["agent", "send", target, "\r"])?;
                 if !cr_out.status.success() {
                     let stderr = String::from_utf8_lossy(&cr_out.stderr);
-                    return Err(io::Error::other(
-                        format!("herdr agent send (CR) failed: {stderr}"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "herdr agent send (CR) failed: {stderr}"
+                    )));
                 }
                 Ok(())
             },
@@ -261,9 +266,9 @@ impl Herdr for SystemHerdr {
         let out = self.run(&["agent", "read", target, "--source", "recent"])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(
-                format!("herdr agent read failed: {stderr}"),
-            ));
+            return Err(io::Error::other(format!(
+                "herdr agent read failed: {stderr}"
+            )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -279,15 +284,15 @@ impl Herdr for SystemHerdr {
         parse_agent_status(&stdout)
     }
 
-    fn integration_present(&self) -> bool {
+    fn integration_present(&self, agent: &str) -> bool {
         let Ok(out) = self.run(&["integration", "status"]) else {
             return false;
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // Look for a line starting with "claude:" that does NOT contain "not installed"
-        stdout.lines().any(|line| {
-            line.starts_with("claude:") && !line.contains("not installed")
-        })
+        let prefix = format!("{agent}:");
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&prefix) && !line.contains("not installed"))
     }
 }
 
@@ -330,7 +335,11 @@ fn parse_pane_id(json: &str) -> Option<String> {
     let start = json.find(key)? + key.len();
     let end = json[start..].find('"')? + start;
     let id = &json[start..end];
-    if id.is_empty() { None } else { Some(id.to_owned()) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_owned())
+    }
 }
 
 /// Parse a pane's `agent_status` from herdr's `pane get` / `pane list` JSON.
@@ -371,7 +380,11 @@ fn parse_workspace_id(json: &str) -> Option<String> {
     let start = json.find(key)? + key.len();
     let end = json[start..].find('"')? + start;
     let id = &json[start..end];
-    if id.is_empty() { None } else { Some(id.to_owned()) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +461,10 @@ impl Herdr for FakeHerdr {
         self.record(format!(
             "workspace_create label={label} cwd={cwd} -> {ws_id} root_pane={root_pane}"
         ));
-        Ok(Workspace { id: ws_id, root_pane })
+        Ok(Workspace {
+            id: ws_id,
+            root_pane,
+        })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
@@ -494,11 +510,7 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
-        let text = self
-            .read_queue
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or_default();
+        let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
         Ok(text)
     }
 
@@ -509,8 +521,8 @@ impl Herdr for FakeHerdr {
         self.status_queue.borrow_mut().pop_front().flatten()
     }
 
-    fn integration_present(&self) -> bool {
-        self.record("integration_present".to_string());
+    fn integration_present(&self, agent: &str) -> bool {
+        self.record(format!("integration_present agent={agent}"));
         true
     }
 }
@@ -557,7 +569,7 @@ mod tests {
     #[test]
     fn integration_present_recorded() {
         let h = FakeHerdr::new();
-        assert!(h.integration_present());
+        assert!(h.integration_present("claude"));
         assert!(h.calls()[0].contains("integration_present"));
     }
 
@@ -602,7 +614,13 @@ mod tests {
         h.push_status(None::<String>);
         assert_eq!(h.agent_status("pane-1").as_deref(), Some("blocked"));
         assert_eq!(h.agent_status("pane-1"), None);
-        assert!(h.calls().iter().filter(|c| c.contains("agent_status")).count() >= 3);
+        assert!(
+            h.calls()
+                .iter()
+                .filter(|c| c.contains("agent_status"))
+                .count()
+                >= 3
+        );
     }
 
     // -- Bug A: agent_send via FakeHerdr records the text (CR is a real-herdr detail)
@@ -614,7 +632,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("do the thing"), "call: {}", calls[0]);
         // FakeHerdr does NOT inject a CR — that's a SystemHerdr submit detail
-        assert!(!calls[0].contains("\\r"), "unexpected CR in fake call: {}", calls[0]);
+        assert!(
+            !calls[0].contains("\\r"),
+            "unexpected CR in fake call: {}",
+            calls[0]
+        );
     }
 
     // -- Fix 1: the submit CR is sent as a separately-timed keypress, not
@@ -711,8 +733,14 @@ mod tests {
             joined.contains("--env CLAUDE_CONFIG_DIR=/home/user/.config/claude-work"),
             "expected --env flag for set var: {joined}"
         );
-        assert!(!joined.contains("ANTHROPIC_API_KEY"), "unset key must not appear: {joined}");
-        assert!(!joined.contains("ANTHROPIC_MODEL"), "unset model must not appear: {joined}");
+        assert!(
+            !joined.contains("ANTHROPIC_API_KEY"),
+            "unset key must not appear: {joined}"
+        );
+        assert!(
+            !joined.contains("ANTHROPIC_MODEL"),
+            "unset model must not appear: {joined}"
+        );
     }
 
     // Even with no auth vars set, the flicker-suppression flag is always emitted
@@ -731,9 +759,18 @@ mod tests {
             joined.contains("--env CLAUDE_CODE_NO_FLICKER=1"),
             "flicker-suppression flag must always be present: {joined}"
         );
-        assert!(!joined.contains("CLAUDE_CONFIG_DIR"), "no auth flags expected when unset: {joined}");
-        assert!(!joined.contains("ANTHROPIC_API_KEY"), "no auth flags expected when unset: {joined}");
-        assert!(!joined.contains("ANTHROPIC_MODEL"), "no auth flags expected when unset: {joined}");
+        assert!(
+            !joined.contains("CLAUDE_CONFIG_DIR"),
+            "no auth flags expected when unset: {joined}"
+        );
+        assert!(
+            !joined.contains("ANTHROPIC_API_KEY"),
+            "no auth flags expected when unset: {joined}"
+        );
+        assert!(
+            !joined.contains("ANTHROPIC_MODEL"),
+            "no auth flags expected when unset: {joined}"
+        );
     }
 
     // The flicker flag must ride on every phase-agent pane. Without it a freshly
@@ -781,7 +818,10 @@ mod tests {
         }
         assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
         assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
-        assert!(joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"), "{joined}");
+        assert!(
+            joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"),
+            "{joined}"
+        );
         assert!(joined.contains("CLAUDE_CODE_NO_FLICKER=1"), "{joined}");
     }
 

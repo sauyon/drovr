@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::load_config;
 use crate::herdr::Herdr;
 use crate::run::{Phase, PhaseStatus, RunState, run_dir};
 
@@ -30,30 +31,6 @@ fn find_phase_idx(run: &RunState, phase: &str) -> Option<usize> {
 /// by the shell, so the resulting env value is unchanged.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Build the workspace-root guard appended to every phase agent's `claude`
-/// invocation. In a git worktree that shares its `.git` with an outer repo, Claude
-/// Code anchors its workspace root to the shared common dir and resolves relative
-/// edits against the OUTER checkout, not the worktree — so a drovr run driven
-/// against a worktree silently dirties the wrong tree (see docs/known-issues.md).
-/// We pin the root two ways: `--add-dir <project_dir>` allow-lists the worktree as
-/// a working directory, and an appended system prompt tells the agent to resolve
-/// every path under that absolute root. `project_dir` is shell-quoted so a path
-/// with spaces or shell metacharacters stays one literal argument.
-fn workspace_root_guard(project_dir: &str) -> String {
-    let prompt = format!(
-        "Your project root is {project_dir}. Treat it as the absolute workspace \
-         root: resolve every file path against it, and never read or edit files \
-         outside it. If this checkout is a git worktree that shares its .git with \
-         another checkout, ignore that outer checkout entirely — edits belong in \
-         {project_dir}."
-    );
-    format!(
-        "--add-dir {} --append-system-prompt {}",
-        shell_single_quote(project_dir),
-        shell_single_quote(&prompt),
-    )
 }
 
 /// Launch an agent invocation inside an already-chosen `pane`, tagged with
@@ -169,10 +146,11 @@ pub fn phase_start<H: Herdr>(
         ));
     };
 
-    // Launch `claude` inside the target pane (focus capture/restore + best-effort
-    // rename live in the shared helper). The workspace-root guard pins edits to the
-    // project dir so a worktree run can't stray into the outer checkout.
-    let command = format!("claude {}", workspace_root_guard(&cwd));
+    // Use the backend captured by `drovr new`, so every phase stays on the
+    // caller's agent even when later commands run from a plain shell.
+    let cfg = load_config()?;
+    let agent = run.agent.as_deref().unwrap_or("claude");
+    let command = cfg.launch(agent, &cwd, false)?;
     launch_in_pane(h, &run.name, phase, &target_pane, &command)?;
     // The launch succeeded, so this phase has now claimed the root pane (if it
     // used it); clear it so later phases don't try to reuse the same pane.
@@ -264,10 +242,7 @@ pub fn spawn_reviewer<H: Herdr>(
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
     // launch itself.
     let pane = h.tab_create(&ws, phase, &run.project_dir)?;
-    // Append the same workspace-root guard so a read-only reviewer in a worktree
-    // reads the worktree, not the outer checkout.
-    let command = format!("{launch_command} {}", workspace_root_guard(&run.project_dir));
-    launch_in_pane(h, &run.name, phase, &pane, &command)?;
+    launch_in_pane(h, &run.name, phase, &pane, launch_command)?;
 
     // Register the reviewer in `review_phases` only. The seed path rides on
     // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
@@ -284,12 +259,7 @@ pub fn spawn_reviewer<H: Herdr>(
 }
 
 /// Send `text` to the running phase pane.
-pub fn phase_send<H: Herdr>(
-    h: &H,
-    run: &RunState,
-    phase: &str,
-    text: &str,
-) -> io::Result<()> {
+pub fn phase_send<H: Herdr>(h: &H, run: &RunState, phase: &str, text: &str) -> io::Result<()> {
     let pane_id = require_pane_id(run, phase)?;
     h.agent_send(&pane_id, text)
 }
@@ -439,7 +409,11 @@ fn detect_stuck_prompt(pane: &str) -> Option<&'static str> {
 /// The last `n` non-blank lines of `pane`, joined — a compact snippet to quote
 /// in the diagnostic so the human can recognize the prompt without attaching.
 fn tail_snippet(pane: &str, n: usize) -> String {
-    let lines: Vec<&str> = pane.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = pane
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
 }
@@ -454,11 +428,7 @@ fn tail_snippet(pane: &str, n: usize) -> String {
 /// in a poll loop. A failed pane read is swallowed (returns `None`) — a
 /// best-effort diagnostic must never mask the underlying timeout with a new
 /// error.
-pub fn diagnose_stuck_phase<H: Herdr>(
-    h: &H,
-    run: &RunState,
-    phase: &str,
-) -> Option<String> {
+pub fn diagnose_stuck_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Option<String> {
     let idx = find_phase_idx(run, phase)?;
     let pane_id = run.phases[idx].pane_id.clone()?;
     let pane = h.agent_read(&pane_id).ok()?;
@@ -520,7 +490,7 @@ const DESTRUCTIVE_SIGNATURES: &[&str] = &[
     "rm -rf",
     "delete",
     "reset --hard",
-    "force",         // covers "force push", "--force", "force overwrite"
+    "force", // covers "force push", "--force", "force overwrite"
     "overwrite",
     "drop table",
     "truncate",
@@ -684,10 +654,7 @@ mod tests {
     fn make_run(name: &str) -> RunState {
         // Caller must hold ENV_LOCK before calling.
         unsafe {
-            std::env::set_var(
-                "XDG_DATA_HOME",
-                format!("/tmp/drovr-phase-test-{name}"),
-            );
+            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-phase-test-{name}"));
         }
         // Start each test from a clean run dir so a stale `.done` marker or
         // state.json from a prior run can't leak across test invocations.
@@ -695,6 +662,7 @@ mod tests {
         RunState {
             name: name.to_owned(),
             task: "test task".into(),
+            agent: Some("claude".into()),
             phases: vec![],
             review_phases: vec![],
             gate: "spec".into(),
@@ -739,7 +707,10 @@ mod tests {
             "must not use agent_start (it splits a new pane): {calls:?}"
         );
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
-        assert!(run_call.contains("claude"), "pane_run must launch claude: {run_call}");
+        assert!(
+            run_call.contains("claude"),
+            "pane_run must launch claude: {run_call}"
+        );
         // The workspace-root guard pins edits to the project dir (issue 3): a
         // worktree run must not stray into the outer checkout.
         assert!(
@@ -752,30 +723,20 @@ mod tests {
         );
     }
 
-    // -- Fix 3 (issue 3): the launch guard pins the workspace root -------------
-    #[test]
-    fn workspace_root_guard_pins_project_dir() {
-        let g = workspace_root_guard("/home/user/wt");
-        assert!(g.contains("--add-dir '/home/user/wt'"), "guard: {g}");
-        assert!(g.contains("--append-system-prompt"), "guard: {g}");
-        assert!(g.contains("/home/user/wt"), "guard must name the absolute root: {g}");
-    }
-
-    #[test]
-    fn workspace_root_guard_shell_quotes_unsafe_dir() {
-        // A path with a space or shell metacharacter must stay one literal word.
-        let g = workspace_root_guard("/tmp/a b; rm -rf ~");
-        assert!(g.contains("--add-dir '/tmp/a b; rm -rf ~'"), "guard: {g}");
-    }
-
     #[test]
     fn reviewer_launch_includes_workspace_root_guard() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("rev-guard-test", "ws-g");
 
-        spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude --permission-mode plan")
-            .unwrap();
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            "claude --permission-mode plan --add-dir '/tmp/drovr-proj-test'",
+        )
+        .unwrap();
 
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
@@ -810,7 +771,10 @@ mod tests {
             "first phase must run claude in the root pane: {run_call}"
         );
         assert_eq!(run.phases[0].pane_id.as_deref(), Some("ws-42:root"));
-        assert!(run.root_pane.is_none(), "root_pane must be consumed after first use");
+        assert!(
+            run.root_pane.is_none(),
+            "root_pane must be consumed after first use"
+        );
     }
 
     #[test]
@@ -824,12 +788,20 @@ mod tests {
 
         let calls = h.calls();
         let tab_call = calls.iter().find(|c| c.contains("tab_create")).unwrap();
-        assert!(tab_call.contains("workspace=ws-7"), "tab must be in the run workspace: {tab_call}");
-        assert!(tab_call.contains("label=plan"), "tab must be labelled with the phase: {tab_call}");
+        assert!(
+            tab_call.contains("workspace=ws-7"),
+            "tab must be in the run workspace: {tab_call}"
+        );
+        assert!(
+            tab_call.contains("label=plan"),
+            "tab must be labelled with the phase: {tab_call}"
+        );
         // claude runs in the new tab's pane
         let plan_pane = run.phases[1].pane_id.clone().unwrap();
         assert!(
-            calls.iter().any(|c| c.contains(&format!("pane_run pane={plan_pane}"))),
+            calls
+                .iter()
+                .any(|c| c.contains(&format!("pane_run pane={plan_pane}"))),
             "claude must run in the new tab's pane: {calls:?}"
         );
     }
@@ -843,7 +815,10 @@ mod tests {
         run.root_pane = None;
 
         let res = phase_start(&h, &mut run, "plan", None);
-        assert!(res.is_err(), "must error when there is no workspace or root pane");
+        assert!(
+            res.is_err(),
+            "must error when there is no workspace or root pane"
+        );
         assert!(res.unwrap_err().to_string().contains("workspace"));
     }
 
@@ -860,8 +835,14 @@ mod tests {
         let run_at = calls.iter().position(|c| c.contains("pane_run"));
         let restore = calls.iter().position(|c| c.contains("workspace_focus"));
         let (capture, run_at, restore) = (capture.unwrap(), run_at.unwrap(), restore.unwrap());
-        assert!(capture < run_at, "focus must be captured before pane_run: {calls:?}");
-        assert!(restore > run_at, "focus must be restored after pane_run: {calls:?}");
+        assert!(
+            capture < run_at,
+            "focus must be captured before pane_run: {calls:?}"
+        );
+        assert!(
+            restore > run_at,
+            "focus must be restored after pane_run: {calls:?}"
+        );
         assert!(
             calls[restore].contains("workspace_focus id=ws-focused"),
             "focus must be restored to the previously-focused workspace: {}",
@@ -878,7 +859,11 @@ mod tests {
         phase_start(&h, &mut run, "plan", None).unwrap();
         // The phase agent signals completion by dropping the marker.
         let marker = phase_done(&run, "plan").unwrap();
-        assert!(marker.exists(), "marker should exist at {}", marker.display());
+        assert!(
+            marker.exists(),
+            "marker should exist at {}",
+            marker.display()
+        );
 
         let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
         assert_eq!(outcome, PhaseWaitOutcome::Done);
@@ -914,7 +899,10 @@ mod tests {
         let outcome = phase_wait(&h, &mut run, "plan", 60_000).unwrap();
         assert_eq!(outcome, PhaseWaitOutcome::Blocked);
         // Must have short-circuited on the first poll, not waited out the timeout.
-        assert!(start.elapsed() < Duration::from_secs(5), "blocked must return promptly");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "blocked must return promptly"
+        );
         // Blocked leaves the phase Running (not Done) — the driver escalates.
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
     }
@@ -991,7 +979,10 @@ mod tests {
             classify_blocked_prompt("Allow the WebFetch tool to run? 1. Yes 2. No"),
             BlockedClass::Unknown
         );
-        assert_eq!(classify_blocked_prompt("ordinary working output"), BlockedClass::Unknown);
+        assert_eq!(
+            classify_blocked_prompt("ordinary working output"),
+            BlockedClass::Unknown
+        );
     }
 
     #[test]
@@ -1004,7 +995,10 @@ mod tests {
 
     #[test]
     fn classify_is_case_insensitive() {
-        assert_eq!(classify_blocked_prompt("DANGEROUS RM"), BlockedClass::Destructive);
+        assert_eq!(
+            classify_blocked_prompt("DANGEROUS RM"),
+            BlockedClass::Destructive
+        );
         assert_eq!(
             classify_blocked_prompt("DO YOU WANT TO MAKE THIS EDIT"),
             BlockedClass::Routine
@@ -1024,11 +1018,31 @@ mod tests {
 
         let t = triage_blocked_phase(&h, &run, "code");
         assert_eq!(t.class, BlockedClass::Destructive);
-        assert!(!t.auto_answered, "destructive prompts must never be auto-answered");
-        assert!(t.diagnostic.contains("triage-destructive-test"), "names run: {}", t.diagnostic);
-        assert!(t.diagnostic.contains("code"), "names phase: {}", t.diagnostic);
-        assert!(t.diagnostic.contains("Dangerous rm"), "quotes prompt: {}", t.diagnostic);
-        assert!(t.diagnostic.contains("drovr attach triage-destructive-test"), "suggests attach: {}", t.diagnostic);
+        assert!(
+            !t.auto_answered,
+            "destructive prompts must never be auto-answered"
+        );
+        assert!(
+            t.diagnostic.contains("triage-destructive-test"),
+            "names run: {}",
+            t.diagnostic
+        );
+        assert!(
+            t.diagnostic.contains("code"),
+            "names phase: {}",
+            t.diagnostic
+        );
+        assert!(
+            t.diagnostic.contains("Dangerous rm"),
+            "quotes prompt: {}",
+            t.diagnostic
+        );
+        assert!(
+            t.diagnostic
+                .contains("drovr attach triage-destructive-test"),
+            "suggests attach: {}",
+            t.diagnostic
+        );
         // Crucially, NO keystroke was sent to the pane.
         assert!(
             !h.calls().iter().any(|c| c.contains("agent_send")),
@@ -1048,12 +1062,21 @@ mod tests {
 
         let t = triage_blocked_phase(&h, &run, "code");
         assert_eq!(t.class, BlockedClass::Routine);
-        assert!(t.auto_answered, "routine allow-listed prompt should be auto-answered");
-        assert!(t.diagnostic.contains("auto-answered"), "diagnostic notes auto-answer: {}", t.diagnostic);
+        assert!(
+            t.auto_answered,
+            "routine allow-listed prompt should be auto-answered"
+        );
+        assert!(
+            t.diagnostic.contains("auto-answered"),
+            "diagnostic notes auto-answer: {}",
+            t.diagnostic
+        );
         // The accept keystroke was sent to the phase pane.
         let pane_id = run.phases[0].pane_id.clone().unwrap();
         assert!(
-            h.calls().iter().any(|c| c.contains("agent_send") && c.contains(&pane_id)),
+            h.calls()
+                .iter()
+                .any(|c| c.contains("agent_send") && c.contains(&pane_id)),
             "must send accept keystroke to the pane: {:?}",
             h.calls()
         );
@@ -1070,8 +1093,15 @@ mod tests {
 
         let t = triage_blocked_phase(&h, &run, "code");
         assert_eq!(t.class, BlockedClass::Unknown);
-        assert!(!t.auto_answered, "unknown prompts must escalate, not auto-answer");
-        assert!(t.diagnostic.contains("drovr attach"), "suggests attach: {}", t.diagnostic);
+        assert!(
+            !t.auto_answered,
+            "unknown prompts must escalate, not auto-answer"
+        );
+        assert!(
+            t.diagnostic.contains("drovr attach"),
+            "suggests attach: {}",
+            t.diagnostic
+        );
         assert!(
             !h.calls().iter().any(|c| c.contains("agent_send")),
             "must not answer an unknown prompt: {:?}",
@@ -1088,7 +1118,9 @@ mod tests {
         run.phases.push(Phase {
             name: "code".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None, herdr_session: None, pane_id: None,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: None,
         });
 
         let t = triage_blocked_phase(&h, &run, "code");
@@ -1112,7 +1144,9 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None, herdr_session: None, pane_id: None,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: None,
         });
         assert!(phase_done(&run, "nonexistent").is_err());
     }
@@ -1126,10 +1160,16 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None, herdr_session: None, pane_id: Some("rp1".into()),
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("rp1".into()),
         });
         let marker = phase_done(&run, "review:t:1:correctness").unwrap();
-        assert!(marker.exists(), "marker should exist at {}", marker.display());
+        assert!(
+            marker.exists(),
+            "marker should exist at {}",
+            marker.display()
+        );
     }
 
     #[test]
@@ -1142,12 +1182,17 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None, herdr_session: None, pane_id: Some("review-pane-9".into()),
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("review-pane-9".into()),
         });
         phase_send(&h, &run, "review:t:1:correctness", "seed text").unwrap();
         let calls = h.calls();
         let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
-        assert!(send_call.contains("review-pane-9"), "must route to the reviewer pane: {send_call}");
+        assert!(
+            send_call.contains("review-pane-9"),
+            "must route to the reviewer pane: {send_call}"
+        );
         assert!(send_call.contains("seed text"));
     }
 
@@ -1185,8 +1230,14 @@ mod tests {
         //     seed injection happens via the first agent_send, not the launch command
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
-        assert!(!run_call.contains("--seed"), "command must not contain --seed: {run_call}");
-        assert!(!run_call.contains("/tmp/seed.md"), "command must not contain seed path: {run_call}");
+        assert!(
+            !run_call.contains("--seed"),
+            "command must not contain --seed: {run_call}"
+        );
+        assert!(
+            !run_call.contains("/tmp/seed.md"),
+            "command must not contain seed path: {run_call}"
+        );
     }
 
     // Panes are never closed mid-run (herdr reassigns focus on any close);
@@ -1240,7 +1291,7 @@ mod tests {
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("brainstorm-HANDOFF.md"), "## handoff content").unwrap();
-        run.phases = vec![];  // phases not relevant for collect
+        run.phases = vec![]; // phases not relevant for collect
 
         let content = collect(&run, "brainstorm").unwrap();
         assert_eq!(content, "## handoff content");
@@ -1290,8 +1341,14 @@ mod tests {
             "pane_run command must carry a single-quoted DROVR_PHASE=<run>/<phase>: {run_call}"
         );
         // Auth secrets must never be inlined into the launch command.
-        assert!(!run_call.contains("ANTHROPIC_API_KEY"), "no secret in command: {run_call}");
-        assert!(!run_call.contains("CLAUDE_CONFIG_DIR"), "no secret in command: {run_call}");
+        assert!(
+            !run_call.contains("ANTHROPIC_API_KEY"),
+            "no secret in command: {run_call}"
+        );
+        assert!(
+            !run_call.contains("CLAUDE_CONFIG_DIR"),
+            "no secret in command: {run_call}"
+        );
     }
 
     // -- F1 (agy security): a phase/run name with shell metacharacters must be
@@ -1333,7 +1390,10 @@ mod tests {
         let mut run = make_run_with_workspace("launch-fail-test", "ws-9");
 
         let res = phase_start(&h, &mut run, "brainstorm", None);
-        assert!(res.is_err(), "phase_start must propagate the pane_run failure");
+        assert!(
+            res.is_err(),
+            "phase_start must propagate the pane_run failure"
+        );
         assert_eq!(
             run.root_pane.as_deref(),
             Some("ws-9:root"),
@@ -1390,10 +1450,22 @@ mod tests {
         let diag = diagnose_stuck_phase(&h, &run, "brainstorm")
             .expect("a parked prompt must yield a diagnostic");
         // Names the run + phase, quotes the pane, and points at `drovr attach`.
-        assert!(diag.contains("stuck-test"), "diag must name the run: {diag}");
-        assert!(diag.contains("brainstorm"), "diag must name the phase: {diag}");
-        assert!(diag.contains("Try the new fullscreen"), "diag must quote the pane: {diag}");
-        assert!(diag.contains("drovr attach stuck-test"), "diag must suggest attach: {diag}");
+        assert!(
+            diag.contains("stuck-test"),
+            "diag must name the run: {diag}"
+        );
+        assert!(
+            diag.contains("brainstorm"),
+            "diag must name the phase: {diag}"
+        );
+        assert!(
+            diag.contains("Try the new fullscreen"),
+            "diag must quote the pane: {diag}"
+        );
+        assert!(
+            diag.contains("drovr attach stuck-test"),
+            "diag must suggest attach: {diag}"
+        );
     }
 
     #[test]
@@ -1443,7 +1515,10 @@ mod tests {
         .unwrap();
 
         // Registered in review_phases, NOT the pipeline `phases` list.
-        assert!(run.phases.is_empty(), "reviewer must not touch pipeline phases");
+        assert!(
+            run.phases.is_empty(),
+            "reviewer must not touch pipeline phases"
+        );
         assert_eq!(run.review_phases.len(), 1);
         let p = &run.review_phases[0];
         assert_eq!(p.name, "review:task-1:1:correctness");
@@ -1484,7 +1559,10 @@ mod tests {
             .iter()
             .find(|c| c.contains("tab_create"))
             .expect("reviewer must create its own tab");
-        assert!(tab_call.contains("workspace=ws-rt"), "tab in the run workspace: {tab_call}");
+        assert!(
+            tab_call.contains("workspace=ws-rt"),
+            "tab in the run workspace: {tab_call}"
+        );
         // Root pane untouched — still available for the pipeline.
         assert_eq!(
             run.root_pane.as_deref(),
@@ -1492,7 +1570,10 @@ mod tests {
             "reviewer must not consume the pipeline root pane"
         );
         let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
-        assert_ne!(reviewer_pane, "ws-rt:root", "reviewer must not run in the root pane");
+        assert_ne!(
+            reviewer_pane, "ws-rt:root",
+            "reviewer must not run in the root pane"
+        );
     }
 
     #[test]
@@ -1599,11 +1680,23 @@ mod tests {
         .unwrap();
 
         let calls = h.calls();
-        let capture = calls.iter().position(|c| c.contains("focused_workspace")).unwrap();
+        let capture = calls
+            .iter()
+            .position(|c| c.contains("focused_workspace"))
+            .unwrap();
         let run_at = calls.iter().position(|c| c.contains("pane_run")).unwrap();
-        let restore = calls.iter().position(|c| c.contains("workspace_focus")).unwrap();
-        assert!(capture < run_at, "focus must be captured before pane_run: {calls:?}");
-        assert!(restore > run_at, "focus must be restored after pane_run: {calls:?}");
+        let restore = calls
+            .iter()
+            .position(|c| c.contains("workspace_focus"))
+            .unwrap();
+        assert!(
+            capture < run_at,
+            "focus must be captured before pane_run: {calls:?}"
+        );
+        assert!(
+            restore > run_at,
+            "focus must be restored after pane_run: {calls:?}"
+        );
     }
 
     #[test]
@@ -1616,7 +1709,10 @@ mod tests {
         let result = phase_start(&h, &mut run, "brainstorm", None);
         assert!(result.is_err(), "must error when project_dir is empty");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("project_dir"), "error should mention project_dir: {msg}");
+        assert!(
+            msg.contains("project_dir"),
+            "error should mention project_dir: {msg}"
+        );
     }
 
     #[test]
@@ -1627,8 +1723,14 @@ mod tests {
         run.project_dir = String::new();
 
         let result = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude");
-        assert!(result.is_err(), "reviewer must error when project_dir is empty");
+        assert!(
+            result.is_err(),
+            "reviewer must error when project_dir is empty"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("project_dir"), "error should mention project_dir: {msg}");
+        assert!(
+            msg.contains("project_dir"),
+            "error should mention project_dir: {msg}"
+        );
     }
 }

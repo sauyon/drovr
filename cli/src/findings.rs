@@ -215,11 +215,7 @@ mod tests {
             findings: vec![],
             impact: Some("low".into()),
         };
-        let merged = merge_reviews(vec![
-            ("x".into(), a),
-            ("y".into(), b),
-            ("z".into(), c),
-        ]);
+        let merged = merge_reviews(vec![("x".into(), a), ("y".into(), b), ("z".into(), c)]);
         assert_eq!(merged.impact.as_deref(), Some("medium"));
     }
 

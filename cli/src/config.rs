@@ -4,15 +4,8 @@
 //! baked-in defaults when the file is absent. Resolves a reviewer's launch command
 //! and its read-only flag.
 //!
-//! # Merge semantics (important)
-//!
-//! Each top-level field uses a `#[serde(default = "...")]` seed fn, so a field that is
-//! **entirely absent** from the TOML gets its built-in default, while a field that is
-//! **present** is taken verbatim. There is no per-key merge: a file with any `[agents.*]`
-//! table replaces the whole agent map (the built-in `claude` entry does NOT get merged
-//! back in), whereas a file with no `[agents]` table at all keeps the built-in `claude`
-//! entry. This keeps [`Config::reviewer_launch`] honest — it errors on a truly-missing
-//! agent rather than silently resurrecting the built-in default.
+//! User-defined agents override built-ins by key. Missing built-in agents and
+//! missing optional fields on a built-in agent are filled in for compatibility.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -24,6 +17,15 @@ pub struct AgentSpec {
     /// Read-only flag; absent → this agent cannot serve as a reviewer.
     #[serde(default)]
     pub readonly_flag: Option<String>,
+    /// Flag used to pin the agent to the run's project directory.
+    #[serde(default)]
+    pub workspace_flag: Option<String>,
+    /// Flag used to append the workspace-root guard prompt.
+    #[serde(default)]
+    pub system_prompt_flag: Option<String>,
+    /// Arguments for non-interactive compression; `{project_dir}` is replaced.
+    #[serde(default)]
+    pub print_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -60,9 +62,78 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
         AgentSpec {
             command: "claude".into(),
             readonly_flag: Some("--permission-mode plan".into()),
+            workspace_flag: Some("--add-dir".into()),
+            system_prompt_flag: Some("--append-system-prompt".into()),
+            print_args: Some(vec![
+                "-p".into(),
+                "--permission-mode".into(),
+                "plan".into(),
+                "--add-dir".into(),
+                "{project_dir}".into(),
+            ]),
+        },
+    );
+    m.insert(
+        "cursor".to_string(),
+        AgentSpec {
+            command: "agent".into(),
+            readonly_flag: Some("--mode plan".into()),
+            workspace_flag: Some("--workspace".into()),
+            system_prompt_flag: None,
+            print_args: Some(vec![
+                "--print".into(),
+                "--mode".into(),
+                "plan".into(),
+                "--workspace".into(),
+                "{project_dir}".into(),
+            ]),
+        },
+    );
+    m.insert(
+        "codex".to_string(),
+        AgentSpec {
+            command: "codex".into(),
+            readonly_flag: Some("--sandbox read-only".into()),
+            workspace_flag: Some("-C".into()),
+            system_prompt_flag: None,
+            print_args: Some(vec![
+                "exec".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+                "-C".into(),
+                "{project_dir}".into(),
+                "-".into(),
+            ]),
         },
     );
     m
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Detect the agent backend invoking drovr.
+///
+/// `DROVR_AGENT` is an explicit escape hatch for agents without a stable
+/// environment marker. Otherwise use markers exported by the major CLIs and
+/// fall back to the configured default when drovr is run from an ordinary shell.
+pub fn invoking_agent(config: &Config) -> String {
+    if let Ok(agent) = std::env::var("DROVR_AGENT")
+        && !agent.trim().is_empty()
+    {
+        return agent;
+    }
+    if std::env::var_os("CURSOR_AGENT").is_some() {
+        return "cursor".into();
+    }
+    if std::env::var_os("CLAUDECODE").is_some() {
+        return "claude".into();
+    }
+    if std::env::var_os("CODEX_THREAD_ID").is_some() {
+        return "codex".into();
+    }
+    config.default_agent.clone()
 }
 
 impl Default for Config {
@@ -96,18 +167,88 @@ pub fn load_config() -> io::Result<Config> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e),
     };
-    toml::from_str(&text).map_err(io::Error::other)
+    let mut config: Config = toml::from_str(&text).map_err(io::Error::other)?;
+    for (name, builtin) in default_agents() {
+        if let Some(spec) = config.agents.get_mut(&name) {
+            spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
+            spec.workspace_flag = spec.workspace_flag.take().or(builtin.workspace_flag);
+            spec.system_prompt_flag = spec
+                .system_prompt_flag
+                .take()
+                .or(builtin.system_prompt_flag);
+            spec.print_args = spec.print_args.take().or(builtin.print_args);
+        } else {
+            config.agents.insert(name, builtin);
+        }
+    }
+    Ok(config)
 }
 
 impl Config {
+    fn agent(&self, name: &str) -> io::Result<&AgentSpec> {
+        self.agents.get(name).ok_or_else(|| {
+            io::Error::other(format!("unknown agent '{name}': not in config agent map"))
+        })
+    }
+
+    /// Compose an agent launch command pinned to `project_dir`.
+    pub fn launch(&self, agent: &str, project_dir: &str, readonly: bool) -> io::Result<String> {
+        let spec = self.agent(agent)?;
+        let mut command = spec.command.clone();
+        if readonly {
+            let flag = spec.readonly_flag.as_ref().ok_or_else(|| {
+                io::Error::other(format!(
+                    "agent '{agent}' has no readonly_flag; cannot serve as reviewer"
+                ))
+            })?;
+            command.push(' ');
+            command.push_str(flag);
+        }
+        if let Some(flag) = &spec.workspace_flag {
+            command.push(' ');
+            command.push_str(flag);
+            command.push(' ');
+            command.push_str(&shell_single_quote(project_dir));
+        }
+        if let Some(flag) = &spec.system_prompt_flag {
+            let prompt = format!(
+                "Your project root is {project_dir}. Treat it as the absolute workspace \
+                 root: resolve every file path against it, and never read or edit files \
+                 outside it. If this checkout is a git worktree that shares its .git with \
+                 another checkout, ignore that outer checkout entirely — edits belong in \
+                 {project_dir}."
+            );
+            command.push(' ');
+            command.push_str(flag);
+            command.push(' ');
+            command.push_str(&shell_single_quote(&prompt));
+        }
+        Ok(command)
+    }
+
+    /// Resolve a non-interactive, read-only command for handoff compression.
+    pub fn compressor(&self, agent: &str, project_dir: &str) -> io::Result<(String, Vec<String>)> {
+        let spec = self.agent(agent)?;
+        let args = spec.print_args.as_ref().ok_or_else(|| {
+            io::Error::other(format!(
+                "agent '{agent}' has no print_args; cannot compress a handoff"
+            ))
+        })?;
+        Ok((
+            spec.command.clone(),
+            args.iter()
+                .map(|arg| arg.replace("{project_dir}", project_dir))
+                .collect(),
+        ))
+    }
+
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
     /// (defaults to `self.default_agent` when `agent` is `None`). Errors if the agent is
     /// unknown or has no `readonly_flag` ("cannot serve as reviewer").
+    #[cfg(test)]
     pub fn reviewer_launch(&self, agent: Option<&str>) -> io::Result<String> {
         let name = agent.unwrap_or(&self.default_agent);
-        let spec = self.agents.get(name).ok_or_else(|| {
-            io::Error::other(format!("unknown agent '{name}': not in config agent map"))
-        })?;
+        let spec = self.agent(name)?;
         let flag = spec.readonly_flag.as_ref().ok_or_else(|| {
             io::Error::other(format!(
                 "agent '{name}' has no readonly_flag; cannot serve as reviewer"
@@ -146,6 +287,40 @@ mod tests {
             cfg.reviewer_launch(None).unwrap(),
             "claude --permission-mode plan"
         );
+        assert!(cfg.agents.contains_key("cursor"));
+        assert_eq!(
+            cfg.launch("cursor", "/tmp/my worktree", false).unwrap(),
+            "agent --workspace '/tmp/my worktree'"
+        );
+        assert_eq!(
+            cfg.launch("cursor", "/tmp/my worktree", true).unwrap(),
+            "agent --mode plan --workspace '/tmp/my worktree'"
+        );
+    }
+
+    #[test]
+    fn detects_cursor_and_honors_explicit_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("DROVR_AGENT");
+            std::env::set_var("CURSOR_AGENT", "1");
+        }
+        assert_eq!(invoking_agent(&Config::default()), "cursor");
+        unsafe {
+            std::env::set_var("DROVR_AGENT", "custom");
+        }
+        assert_eq!(invoking_agent(&Config::default()), "custom");
+        unsafe {
+            std::env::remove_var("DROVR_AGENT");
+            std::env::remove_var("CURSOR_AGENT");
+            std::env::remove_var("CLAUDECODE");
+            std::env::set_var("CODEX_THREAD_ID", "thread");
+        }
+        assert_eq!(invoking_agent(&Config::default()), "codex");
+        assert!(Config::default().agents.contains_key("codex"));
+        unsafe {
+            std::env::remove_var("CODEX_THREAD_ID");
+        }
     }
 
     #[test]
@@ -202,7 +377,7 @@ readonly_flag = "--sandbox read-only"
     }
 
     #[test]
-    fn file_with_only_codex_does_not_resolve_claude() {
+    fn user_agent_map_keeps_missing_builtins_and_fields() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("drovr");
@@ -216,7 +391,12 @@ readonly_flag = "--sandbox read-only"
 
         let cfg = load_config().unwrap();
         assert!(cfg.reviewer_launch(Some("codex")).is_ok());
-        assert!(cfg.reviewer_launch(Some("claude")).is_err());
+        assert!(cfg.reviewer_launch(Some("claude")).is_ok());
+        assert!(cfg.reviewer_launch(Some("cursor")).is_ok());
+        assert_eq!(
+            cfg.launch("codex", "/tmp/project", false).unwrap(),
+            "codex -C '/tmp/project'"
+        );
     }
 
     #[test]
@@ -231,6 +411,9 @@ readonly_flag = "--sandbox read-only"
                     AgentSpec {
                         command: "noflag".into(),
                         readonly_flag: None,
+                        workspace_flag: None,
+                        system_prompt_flag: None,
+                        print_args: None,
                     },
                 );
                 m
@@ -252,6 +435,9 @@ readonly_flag = "--sandbox read-only"
                     AgentSpec {
                         command: "codex".into(),
                         readonly_flag: Some("--sandbox read-only".into()),
+                        workspace_flag: None,
+                        system_prompt_flag: None,
+                        print_args: None,
                     },
                 );
                 m
@@ -276,6 +462,9 @@ readonly_flag = "--sandbox read-only"
                     AgentSpec {
                         command: "noflag".into(),
                         readonly_flag: None,
+                        workspace_flag: None,
+                        system_prompt_flag: None,
+                        print_args: None,
                     },
                 );
                 m

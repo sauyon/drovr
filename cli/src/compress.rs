@@ -7,6 +7,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 
+use crate::config::Config;
 use crate::herdr::Herdr;
 use crate::run::{RunState, run_dir};
 
@@ -39,12 +40,10 @@ impl CmdRunner for SystemRunner {
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(io::Error::other(
-                format!(
-                    "{cmd} exited with status {}",
-                    output.status.code().unwrap_or(-1)
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "{cmd} exited with status {}",
+                output.status.code().unwrap_or(-1)
+            )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
@@ -99,8 +98,17 @@ impl CmdRunner for FakeRunner {
 
 /// Build the compressor prompt and run claude one-shot.
 /// Returns the trimmed handoff document.
-pub fn compress<R: CmdRunner>(
+#[cfg(test)]
+pub fn compress<R: CmdRunner>(r: &R, transcript: &str, objective: &str) -> io::Result<String> {
+    compress_for(r, &Config::default(), "claude", "", transcript, objective)
+}
+
+/// Build the compressor prompt and run the selected agent non-interactively.
+pub fn compress_for<R: CmdRunner>(
     r: &R,
+    config: &Config,
+    agent: &str,
+    project_dir: &str,
     transcript: &str,
     objective: &str,
 ) -> io::Result<String> {
@@ -108,7 +116,9 @@ pub fn compress<R: CmdRunner>(
         "{}\n\n## OBJECTIVE\n{}\n\n## RAW PHASE CONTEXT\n{}",
         COMPRESS_PROMPT, objective, transcript
     );
-    r.run("claude", &["-p", "--permission-mode", "plan"], &prompt)
+    let (command, args) = config.compressor(agent, project_dir)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    r.run(&command, &args, &prompt)
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +126,7 @@ pub fn compress<R: CmdRunner>(
 // ---------------------------------------------------------------------------
 
 /// Compress `transcript` into a 7-section HANDOFF and write it to `out`. Returns `out`.
+#[cfg(test)]
 pub fn handoff_self<R: CmdRunner>(
     r: &R,
     transcript: &str,
@@ -123,6 +134,25 @@ pub fn handoff_self<R: CmdRunner>(
     out: &std::path::Path,
 ) -> io::Result<std::path::PathBuf> {
     let doc = compress(r, transcript, objective)?;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, &doc)?;
+    Ok(out.to_path_buf())
+}
+
+pub fn handoff_self_for<R: CmdRunner>(
+    r: &R,
+    config: &Config,
+    agent: &str,
+    project_dir: &str,
+    transcript: &str,
+    objective: &str,
+    out: &std::path::Path,
+) -> io::Result<std::path::PathBuf> {
+    let doc = compress_for(r, config, agent, project_dir, transcript, objective)?;
     if let Some(parent) = out.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -159,7 +189,9 @@ pub fn phase_compress<H: Herdr, R: CmdRunner>(
 
     let transcript = h.agent_read(&pane_id)?;
     let objective = &run.task;
-    let handoff = compress(r, &transcript, objective)?;
+    let config = crate::config::load_config()?;
+    let agent = run.agent.as_deref().unwrap_or("claude");
+    let handoff = compress_for(r, &config, agent, &run.project_dir, &transcript, objective)?;
 
     let dir = run_dir(&run.name);
     std::fs::create_dir_all(&dir)?;
@@ -181,14 +213,12 @@ mod tests {
 
     fn make_run(name: &str) -> RunState {
         unsafe {
-            std::env::set_var(
-                "XDG_DATA_HOME",
-                format!("/tmp/drovr-compress-test-{name}"),
-            );
+            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-compress-test-{name}"));
         }
         RunState {
             name: name.to_owned(),
             task: "compress the brainstorm phase output".into(),
+            agent: Some("claude".into()),
             phases: vec![],
             review_phases: vec![],
             gate: "spec".into(),
@@ -213,7 +243,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let (cmd, args, stdin) = &calls[0];
         assert_eq!(cmd, "claude");
-        assert_eq!(args, &["-p", "--permission-mode", "plan"]);
+        assert_eq!(args, &["-p", "--permission-mode", "plan", "--add-dir", ""]);
         // stdin must contain the fixed COMPRESS_PROMPT prefix
         assert!(
             stdin.contains("You are drovr's handoff compressor"),
@@ -229,8 +259,14 @@ mod tests {
             "stdin missing ## RAW PHASE CONTEXT heading"
         );
         // stdin must contain the caller-supplied content
-        assert!(stdin.contains("do the objective"), "stdin missing objective text");
-        assert!(stdin.contains("the transcript text"), "stdin missing transcript");
+        assert!(
+            stdin.contains("do the objective"),
+            "stdin missing objective text"
+        );
+        assert!(
+            stdin.contains("the transcript text"),
+            "stdin missing transcript"
+        );
     }
 
     #[test]
@@ -286,6 +322,7 @@ mod tests {
         let runner = FakeRunner::new();
 
         let mut run = make_run("write-handoff");
+        run.agent = Some("cursor".into());
         run.phases.push(Phase {
             name: "brainstorm".into(),
             status: PhaseStatus::Done,
@@ -306,6 +343,18 @@ mod tests {
         // File must exist and match what the runner returned
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "## Objective\nHandoff content here.");
+        let calls = runner.calls();
+        assert_eq!(calls[0].0, "agent");
+        assert_eq!(
+            calls[0].1,
+            [
+                "--print",
+                "--mode",
+                "plan",
+                "--workspace",
+                "/tmp/drovr-proj-test"
+            ]
+        );
     }
 
     #[test]
@@ -355,7 +404,10 @@ mod tests {
         let result = phase_compress(&h, &runner, &run, "brainstorm");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("no pane_id"), "error should mention missing pane_id: {msg}");
+        assert!(
+            msg.contains("no pane_id"),
+            "error should mention missing pane_id: {msg}"
+        );
     }
 
     #[test]
@@ -398,15 +450,24 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let (cmd, args, stdin) = &calls[0];
         assert_eq!(cmd, "claude");
-        assert_eq!(args, &["-p", "--permission-mode", "plan"]);
+        assert_eq!(args, &["-p", "--permission-mode", "plan", "--add-dir", ""]);
         // The COMPRESS_PROMPT preamble is what proves handoff_self routed
         // through compress() rather than building its own prompt.
         assert!(
             stdin.contains("You are drovr's handoff compressor"),
             "stdin missing COMPRESS_PROMPT preamble — handoff_self did not route through compress()"
         );
-        assert!(stdin.contains("## OBJECTIVE"), "stdin missing ## OBJECTIVE heading");
-        assert!(stdin.contains("do the objective"), "stdin missing objective text");
-        assert!(stdin.contains("the transcript text"), "stdin missing transcript");
+        assert!(
+            stdin.contains("## OBJECTIVE"),
+            "stdin missing ## OBJECTIVE heading"
+        );
+        assert!(
+            stdin.contains("do the objective"),
+            "stdin missing objective text"
+        );
+        assert!(
+            stdin.contains("the transcript text"),
+            "stdin missing transcript"
+        );
     }
 }

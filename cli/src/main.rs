@@ -9,14 +9,13 @@ mod run;
 
 use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_run, head_sha};
-use compress::{SystemRunner, handoff_self, phase_compress};
+use compress::{SystemRunner, handoff_self_for, phase_compress};
 use herdr::{Herdr, SystemHerdr};
-use std::io::Read as _;
 use phase::{
     PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
     phase_wait, triage_blocked_phase,
 };
-use review::{review_summary, review_wait, serve, WaitOutcome};
+use review::{WaitOutcome, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
 use std::path::PathBuf;
@@ -86,10 +85,7 @@ enum Commands {
     },
 
     /// Plumbing: collect the handoff doc for a finished phase.
-    Collect {
-        run: String,
-        phase_name: String,
-    },
+    Collect { run: String, phase_name: String },
 
     /// Plumbing: review subcommands.
     Review {
@@ -130,15 +126,9 @@ enum PhaseCmd {
     },
     /// Mark a phase complete. Run by the phase AGENT itself as its final
     /// action — it drops the completion marker `drovr phase wait` polls for.
-    Done {
-        run: String,
-        phase_name: String,
-    },
+    Done { run: String, phase_name: String },
     /// Compress a finished phase into a handoff doc.
-    Compress {
-        run: String,
-        phase_name: String,
-    },
+    Compress { run: String, phase_name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,7 +226,11 @@ fn phase_status_str(status: &PhaseStatus) -> &'static str {
 
 /// Format the phase list as `N/M phases done | current: <name>` (for `list`).
 fn format_progress(run: &RunState) -> String {
-    let done = run.phases.iter().filter(|p| p.status == PhaseStatus::Done).count();
+    let done = run
+        .phases
+        .iter()
+        .filter(|p| p.status == PhaseStatus::Done)
+        .count();
     let total = run.phases.len();
     let current = run
         .first_incomplete()
@@ -253,9 +247,7 @@ fn format_progress(run: &RunState) -> String {
 fn cmd_list() {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share")
-        });
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
     let runs_dir = base.join("drovr").join("runs");
 
     let entries = match std::fs::read_dir(&runs_dir) {
@@ -292,8 +284,17 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
         eprintln!("drovr: {e}");
         process::exit(1);
     }
-    if !herdr.integration_present() {
-        eprintln!("prerequisite missing: run 'herdr integration install claude'");
+    let cfg = config::load_config().unwrap_or_else(|e| {
+        eprintln!("drovr: failed to load config: {e}");
+        process::exit(1);
+    });
+    let agent = config::invoking_agent(&cfg);
+    if !cfg.agents.contains_key(&agent) {
+        eprintln!("drovr: detected unknown agent '{agent}': add it to the config agent map");
+        process::exit(1);
+    }
+    if !herdr.integration_present(&agent) {
+        eprintln!("prerequisite missing: run 'herdr integration install {agent}'");
         process::exit(1);
     }
 
@@ -318,17 +319,19 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
 
     // Create the workspace in the project dir so its root shell pane (reused by
     // the first phase) and every later tab start already `cd`'d into the project.
-    let (workspace, root_pane) = match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
-        Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
-        Err(e) => {
-            eprintln!("drovr: warning: could not create herdr workspace: {e}");
-            (None, None)
-        }
-    };
+    let (workspace, root_pane) =
+        match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
+            Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
+            Err(e) => {
+                eprintln!("drovr: warning: could not create herdr workspace: {e}");
+                (None, None)
+            }
+        };
 
     let run = RunState {
         name: name.to_owned(),
         task: task_str,
+        agent: Some(agent),
         project_dir,
         phases: vec![
             run::Phase {
@@ -380,7 +383,11 @@ fn cmd_status(name: &str) {
     println!("run: {}", run.name);
     println!("task: {}", run.task);
     for (i, p) in run.phases.iter().enumerate() {
-        let marker = if run.first_incomplete() == Some(i) { " <-- resume" } else { "" };
+        let marker = if run.first_incomplete() == Some(i) {
+            " <-- resume"
+        } else {
+            ""
+        };
         println!(
             "  [{:2}] {:15} {}{}",
             i,
@@ -427,7 +434,9 @@ fn cmd_attach(name: &str) {
             }
         }
         None => {
-            eprintln!("drovr: no active pane for run '{name}'; try 'drovr phase start {name} <phase>'");
+            eprintln!(
+                "drovr: no active pane for run '{name}'; try 'drovr phase start {name} <phase>'"
+            );
             process::exit(1);
         }
     }
@@ -508,7 +517,11 @@ fn cmd_phase(sub: PhaseCmd) {
     let r = SystemRunner;
 
     match sub {
-        PhaseCmd::Start { run, phase_name, seed } => {
+        PhaseCmd::Start {
+            run,
+            phase_name,
+            seed,
+        } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
@@ -520,7 +533,11 @@ fn cmd_phase(sub: PhaseCmd) {
             }
             println!("started phase '{phase_name}' for run '{run}'");
         }
-        PhaseCmd::Send { run, phase_name, text } => {
+        PhaseCmd::Send {
+            run,
+            phase_name,
+            text,
+        } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
@@ -531,7 +548,11 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
         }
-        PhaseCmd::Wait { run, phase_name, timeout_ms } => {
+        PhaseCmd::Wait {
+            run,
+            phase_name,
+            timeout_ms,
+        } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
@@ -618,7 +639,10 @@ fn resolve_transcript<H: Herdr, R: io::Read>(
 ) -> io::Result<String> {
     if let Some(path) = transcript {
         std::fs::read_to_string(path).map_err(|e| {
-            io::Error::new(e.kind(), format!("cannot read transcript {}: {e}", path.display()))
+            io::Error::new(
+                e.kind(),
+                format!("cannot read transcript {}: {e}", path.display()),
+            )
         })
     } else if let Some(pane_id) = pane.or_else(|| std::env::var("HERDR_PANE_ID").ok()) {
         herdr
@@ -635,21 +659,43 @@ fn resolve_transcript<H: Herdr, R: io::Read>(
 
 fn cmd_handoff(sub: HandoffCmd, herdr: &SystemHerdr) {
     match sub {
-        HandoffCmd::Own { objective, transcript, pane, out } => {
+        HandoffCmd::Own {
+            objective,
+            transcript,
+            pane,
+            out,
+        } => {
             // Resolve transcript by precedence:
             //   --transcript file > --pane (or $HERDR_PANE_ID) > stdin
             let transcript_text =
-                resolve_transcript(transcript.as_deref(), pane, herdr, io::stdin())
-                    .unwrap_or_else(|e| {
+                resolve_transcript(transcript.as_deref(), pane, herdr, io::stdin()).unwrap_or_else(
+                    |e| {
                         eprintln!("drovr: {e}");
                         process::exit(1);
-                    });
+                    },
+                );
 
             let objective =
                 objective.unwrap_or_else(|| "(self-serve mid-task handoff)".to_string());
             let out = out.unwrap_or_else(|| PathBuf::from("./HANDOFF.md"));
 
-            match handoff_self(&SystemRunner, &transcript_text, &objective, &out) {
+            let cfg = config::load_config().unwrap_or_else(|e| {
+                eprintln!("drovr: failed to load config: {e}");
+                process::exit(1);
+            });
+            let agent = config::invoking_agent(&cfg);
+            let project_dir = std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match handoff_self_for(
+                &SystemRunner,
+                &cfg,
+                &agent,
+                &project_dir,
+                &transcript_text,
+                &objective,
+                &out,
+            ) {
                 Ok(path) => {
                     // Print an absolute resume pointer. canonicalize succeeds on
                     // the success path (the file was just written); fall back to
@@ -719,7 +765,9 @@ fn cmd_review(sub: ReviewCmd) {
                     process::exit(3);
                 }
                 Ok(WaitOutcome::Timeout) => {
-                    println!("review: no reviewer action for run '{run}' within timeout (re-run to resume)");
+                    println!(
+                        "review: no reviewer action for run '{run}' within timeout (re-run to resume)"
+                    );
                     process::exit(2);
                 }
                 Err(e) => {
@@ -767,9 +815,16 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                 eprintln!("drovr: cannot write {}: {e}", path.display());
                 process::exit(1);
             }
-            println!("recorded review base for '{task}' = {sha} ({})", path.display());
+            println!(
+                "recorded review base for '{task}' = {sha} ({})",
+                path.display()
+            );
         }
-        CodeReviewCmd::Run { run, task, timeout_ms } => {
+        CodeReviewCmd::Run {
+            run,
+            task,
+            timeout_ms,
+        } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
@@ -951,7 +1006,14 @@ mod tests {
     fn parse_phase_start() {
         let cli = parse(&["drovr", "phase", "start", "myrun", "brainstorm"]).unwrap();
         match cli.command {
-            Commands::Phase { sub: PhaseCmd::Start { run, phase_name, seed } } => {
+            Commands::Phase {
+                sub:
+                    PhaseCmd::Start {
+                        run,
+                        phase_name,
+                        seed,
+                    },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(phase_name, "brainstorm");
                 assert!(seed.is_none());
@@ -962,9 +1024,20 @@ mod tests {
 
     #[test]
     fn parse_phase_start_with_seed() {
-        let cli = parse(&["drovr", "phase", "start", "myrun", "brainstorm", "--seed", "/tmp/seed.md"]).unwrap();
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "brainstorm",
+            "--seed",
+            "/tmp/seed.md",
+        ])
+        .unwrap();
         match cli.command {
-            Commands::Phase { sub: PhaseCmd::Start { seed, .. } } => {
+            Commands::Phase {
+                sub: PhaseCmd::Start { seed, .. },
+            } => {
                 assert_eq!(seed.as_deref(), Some(std::path::Path::new("/tmp/seed.md")));
             }
             _ => panic!("wrong variant"),
@@ -975,7 +1048,14 @@ mod tests {
     fn parse_phase_send() {
         let cli = parse(&["drovr", "phase", "send", "myrun", "plan", "hello"]).unwrap();
         match cli.command {
-            Commands::Phase { sub: PhaseCmd::Send { run, phase_name, text } } => {
+            Commands::Phase {
+                sub:
+                    PhaseCmd::Send {
+                        run,
+                        phase_name,
+                        text,
+                    },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(phase_name, "plan");
                 assert_eq!(text, "hello");
@@ -988,7 +1068,9 @@ mod tests {
     fn parse_phase_wait_default_timeout() {
         let cli = parse(&["drovr", "phase", "wait", "myrun", "plan"]).unwrap();
         match cli.command {
-            Commands::Phase { sub: PhaseCmd::Wait { timeout_ms, .. } } => {
+            Commands::Phase {
+                sub: PhaseCmd::Wait { timeout_ms, .. },
+            } => {
                 assert_eq!(timeout_ms, 30_000);
             }
             _ => panic!("wrong variant"),
@@ -999,7 +1081,9 @@ mod tests {
     fn parse_phase_compress() {
         let cli = parse(&["drovr", "phase", "compress", "demo", "plan"]).unwrap();
         match cli.command {
-            Commands::Phase { sub: PhaseCmd::Compress { run, phase_name } } => {
+            Commands::Phase {
+                sub: PhaseCmd::Compress { run, phase_name },
+            } => {
                 assert_eq!(run, "demo");
                 assert_eq!(phase_name, "plan");
             }
@@ -1010,11 +1094,25 @@ mod tests {
     #[test]
     fn parse_handoff_self() {
         let cli = parse(&[
-            "drovr", "handoff", "self", "--objective", "o", "--out", "/tmp/h.md",
+            "drovr",
+            "handoff",
+            "self",
+            "--objective",
+            "o",
+            "--out",
+            "/tmp/h.md",
         ])
         .unwrap();
         match cli.command {
-            Commands::Handoff { sub: HandoffCmd::Own { objective, transcript, pane, out } } => {
+            Commands::Handoff {
+                sub:
+                    HandoffCmd::Own {
+                        objective,
+                        transcript,
+                        pane,
+                        out,
+                    },
+            } => {
                 assert_eq!(objective.as_deref(), Some("o"));
                 assert_eq!(out.as_deref(), Some(std::path::Path::new("/tmp/h.md")));
                 assert!(transcript.is_none());
@@ -1028,7 +1126,15 @@ mod tests {
     fn parse_handoff_self_all_none() {
         let cli = parse(&["drovr", "handoff", "self"]).unwrap();
         match cli.command {
-            Commands::Handoff { sub: HandoffCmd::Own { objective, transcript, pane, out } } => {
+            Commands::Handoff {
+                sub:
+                    HandoffCmd::Own {
+                        objective,
+                        transcript,
+                        pane,
+                        out,
+                    },
+            } => {
                 assert!(objective.is_none());
                 assert!(transcript.is_none());
                 assert!(pane.is_none());
@@ -1054,7 +1160,9 @@ mod tests {
     fn parse_review_summary() {
         let cli = parse(&["drovr", "review", "summary", "myrun", "the text"]).unwrap();
         match cli.command {
-            Commands::Review { sub: ReviewCmd::Summary { run, text } } => {
+            Commands::Review {
+                sub: ReviewCmd::Summary { run, text },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(text, "the text");
             }
@@ -1066,7 +1174,9 @@ mod tests {
     fn parse_review_wait_default_timeout() {
         let cli = parse(&["drovr", "review", "wait", "myrun"]).unwrap();
         match cli.command {
-            Commands::Review { sub: ReviewCmd::Wait { run, timeout_ms } } => {
+            Commands::Review {
+                sub: ReviewCmd::Wait { run, timeout_ms },
+            } => {
                 assert_eq!(run, "myrun");
                 // Generous default (30 min) — not a short silent cap.
                 assert_eq!(timeout_ms, 1_800_000);
@@ -1079,7 +1189,9 @@ mod tests {
     fn parse_review_wait_custom_timeout() {
         let cli = parse(&["drovr", "review", "wait", "myrun", "--timeout-ms", "5000"]).unwrap();
         match cli.command {
-            Commands::Review { sub: ReviewCmd::Wait { run, timeout_ms } } => {
+            Commands::Review {
+                sub: ReviewCmd::Wait { run, timeout_ms },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(timeout_ms, 5000);
             }
@@ -1091,7 +1203,9 @@ mod tests {
     fn parse_code_review_base() {
         let cli = parse(&["drovr", "code-review", "base", "myrun", "task-1"]).unwrap();
         match cli.command {
-            Commands::CodeReview { sub: CodeReviewCmd::Base { run, task } } => {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Base { run, task },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(task, "task-1");
             }
@@ -1103,7 +1217,14 @@ mod tests {
     fn parse_code_review_run_default_timeout() {
         let cli = parse(&["drovr", "code-review", "run", "myrun", "task-1"]).unwrap();
         match cli.command {
-            Commands::CodeReview { sub: CodeReviewCmd::Run { run, task, timeout_ms } } => {
+            Commands::CodeReview {
+                sub:
+                    CodeReviewCmd::Run {
+                        run,
+                        task,
+                        timeout_ms,
+                    },
+            } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(task, "task-1");
                 // Generous default (30 min), matching `review wait`.
@@ -1115,10 +1236,20 @@ mod tests {
 
     #[test]
     fn parse_code_review_run_custom_timeout() {
-        let cli =
-            parse(&["drovr", "code-review", "run", "myrun", "task-1", "--timeout-ms", "5000"]).unwrap();
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "run",
+            "myrun",
+            "task-1",
+            "--timeout-ms",
+            "5000",
+        ])
+        .unwrap();
         match cli.command {
-            Commands::CodeReview { sub: CodeReviewCmd::Run { timeout_ms, .. } } => {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Run { timeout_ms, .. },
+            } => {
                 assert_eq!(timeout_ms, 5000);
             }
             _ => panic!("wrong variant"),
@@ -1163,18 +1294,32 @@ mod tests {
         let run = RunState {
             name: "r".into(),
             task: "t".into(),
+            agent: None,
             phases: vec![
-                run::Phase { name: "brainstorm".into(), status: PhaseStatus::Pending,
-                    handoff_doc: None, herdr_session: None, pane_id: None },
-                run::Phase { name: "plan".into(), status: PhaseStatus::Pending,
-                    handoff_doc: None, herdr_session: None, pane_id: None },
+                run::Phase {
+                    name: "brainstorm".into(),
+                    status: PhaseStatus::Pending,
+                    handoff_doc: None,
+                    herdr_session: None,
+                    pane_id: None,
+                },
+                run::Phase {
+                    name: "plan".into(),
+                    status: PhaseStatus::Pending,
+                    handoff_doc: None,
+                    herdr_session: None,
+                    pane_id: None,
+                },
             ],
             // A populated review_phases list must not shift the "0/2" progress or
             // the "current" phase — format_progress walks `phases` only.
-            review_phases: vec![
-                run::Phase { name: "review:task-1:1:correctness".into(), status: PhaseStatus::Running,
-                    handoff_doc: None, herdr_session: None, pane_id: None },
-            ],
+            review_phases: vec![run::Phase {
+                name: "review:task-1:1:correctness".into(),
+                status: PhaseStatus::Running,
+                handoff_doc: None,
+                herdr_session: None,
+                pane_id: None,
+            }],
             gate: "spec".into(),
             cursor: 0,
             workspace: None,
@@ -1191,10 +1336,14 @@ mod tests {
         let run = RunState {
             name: "r".into(),
             task: "t".into(),
-            phases: vec![
-                run::Phase { name: "brainstorm".into(), status: PhaseStatus::Done,
-                    handoff_doc: None, herdr_session: None, pane_id: None },
-            ],
+            agent: None,
+            phases: vec![run::Phase {
+                name: "brainstorm".into(),
+                status: PhaseStatus::Done,
+                handoff_doc: None,
+                herdr_session: None,
+                pane_id: None,
+            }],
             review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,

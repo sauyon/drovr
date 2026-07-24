@@ -116,11 +116,7 @@ fn skill_files(dir: &Path) -> Vec<(String, PathBuf)> {
 fn all_skills_have_valid_frontmatter() {
     let dir = skills_dir();
     let files = skill_files(&dir);
-    assert!(
-        !files.is_empty(),
-        "no skills found under {}",
-        dir.display()
-    );
+    assert!(!files.is_empty(), "no skills found under {}", dir.display());
 
     for (dir_name, path) in &files {
         let contents = fs::read_to_string(path)
@@ -136,15 +132,12 @@ fn all_skills_have_valid_frontmatter() {
             .name
             .as_deref()
             .unwrap_or_else(|| panic!("{} missing `name:` in frontmatter", path.display()));
-        assert!(
-            !name.is_empty(),
-            "{} has an empty `name:`",
-            path.display()
-        );
+        assert!(!name.is_empty(), "{} has an empty `name:`", path.display());
 
-        let description = skill.description.as_deref().unwrap_or_else(|| {
-            panic!("{} missing `description:` in frontmatter", path.display())
-        });
+        let description = skill
+            .description
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} missing `description:` in frontmatter", path.display()));
         assert!(
             !description.is_empty(),
             "{} has an empty `description:`",

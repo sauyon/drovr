@@ -205,7 +205,12 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
 
     // GET / — serve embedded index.html
     if method == Method::Get && path == "/" {
-        respond_bytes(req, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec());
+        respond_bytes(
+            req,
+            200,
+            "text/html; charset=utf-8",
+            INDEX_HTML.as_bytes().to_vec(),
+        );
         return;
     }
 
@@ -218,7 +223,12 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         }
         match rel {
             "vendor/markdown-it.min.js" => {
-                respond_bytes(req, 200, "application/javascript; charset=utf-8", MARKDOWN_IT_JS.to_vec());
+                respond_bytes(
+                    req,
+                    200,
+                    "application/javascript; charset=utf-8",
+                    MARKDOWN_IT_JS.to_vec(),
+                );
             }
             other => {
                 let ct = content_type_for(other);
@@ -267,11 +277,7 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
     // GET /state — JSON {state, turn}
     if method == Method::Get && path == "/state" {
         let st = shared.lock().unwrap();
-        let body = format!(
-            r#"{{"state":"{}","turn":{}}}"#,
-            st.state.as_str(),
-            st.turn
-        );
+        let body = format!(r#"{{"state":"{}","turn":{}}}"#, st.state.as_str(), st.turn);
         drop(st);
         respond_str(req, 200, "application/json", body);
         return;
@@ -352,8 +358,14 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         let decision = parsed["decision"].as_str().unwrap_or("");
         let feedback = parsed["feedback"].as_str().unwrap_or("").to_string();
-        let answers = parsed.get("answers").cloned().unwrap_or(serde_json::json!({}));
-        let annotations = parsed.get("annotations").cloned().unwrap_or(serde_json::json!([]));
+        let answers = parsed
+            .get("answers")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let annotations = parsed
+            .get("annotations")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
 
         let mut st = shared.lock().unwrap();
 
@@ -361,7 +373,12 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
             let _ = fs::write(st.approved_path(), b"approved\n");
             st.state = LoopState::Approved;
             drop(st);
-            respond_str(req, 200, "application/json", r#"{"ok":true,"state":"approved"}"#.into());
+            respond_str(
+                req,
+                200,
+                "application/json",
+                r#"{"ok":true,"state":"approved"}"#.into(),
+            );
         } else {
             // Snapshot the submitted spec as BOTH prior.md and last_summarized.md.
             // The reviewer's next turn diffs from the version they just acted on, so
@@ -392,7 +409,12 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
             let _ = fs::write(st.feedback_path(), fb_json.to_string());
             st.state = LoopState::Waiting;
             drop(st);
-            respond_str(req, 200, "application/json", r#"{"ok":true,"state":"waiting"}"#.into());
+            respond_str(
+                req,
+                200,
+                "application/json",
+                r#"{"ok":true,"state":"waiting"}"#.into(),
+            );
         }
         return;
     }
@@ -429,7 +451,12 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         let _ = fs::write(st.summary_path(), body.as_bytes());
         st.state = LoopState::Ready;
         drop(st);
-        respond_str(req, 200, "application/json", r#"{"ok":true,"state":"ready"}"#.into());
+        respond_str(
+            req,
+            200,
+            "application/json",
+            r#"{"ok":true,"state":"ready"}"#.into(),
+        );
         return;
     }
 
@@ -457,8 +484,7 @@ pub fn serve(run: &str, host: &str, port: u16) -> io::Result<()> {
     let addr_file = workdir.join("review.addr");
 
     let addr = format!("{}:{}", host, port);
-    let server = Server::http(&addr)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let server = Server::http(&addr).map_err(|e| io::Error::other(e.to_string()))?;
 
     // Write the actual bound address (important when port=0 → OS-assigned).
     let bound_addr = server
@@ -496,7 +522,12 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     let addr = fs::read_to_string(&addr_file).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("review server address not found ({}); is `drovr serve` running for run {:?}? ({})", addr_file.display(), run, e),
+            format!(
+                "review server address not found ({}); is `drovr serve` running for run {:?}? ({})",
+                addr_file.display(),
+                run,
+                e
+            ),
         )
     })?;
     let addr = addr.trim();
@@ -508,8 +539,12 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
         body.len()
     );
 
-    let mut stream = TcpStream::connect(addr)
-        .map_err(|e| io::Error::new(e.kind(), format!("could not connect to review server at {addr}: {e}")))?;
+    let mut stream = TcpStream::connect(addr).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not connect to review server at {addr}: {e}"),
+        )
+    })?;
 
     stream.write_all(request.as_bytes())?;
     stream.write_all(body)?;
@@ -518,9 +553,10 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     if !response.starts_with("HTTP/1") || !response.contains(" 200 ") {
-        return Err(io::Error::other(
-            format!("unexpected response from review server: {}", response.lines().next().unwrap_or("")),
-        ));
+        return Err(io::Error::other(format!(
+            "unexpected response from review server: {}",
+            response.lines().next().unwrap_or("")
+        )));
     }
 
     Ok(())
@@ -540,7 +576,10 @@ pub enum WaitOutcome {
 /// GET `/state` from the live review server, returning the `state` string.
 fn fetch_state(addr: &str) -> io::Result<String> {
     let mut stream = TcpStream::connect(addr).map_err(|e| {
-        io::Error::new(e.kind(), format!("could not connect to review server at {addr}: {e}"))
+        io::Error::new(
+            e.kind(),
+            format!("could not connect to review server at {addr}: {e}"),
+        )
     })?;
     write!(stream, "GET /state HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
     let mut resp = String::new();
@@ -571,7 +610,12 @@ pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
     let addr = fs::read_to_string(&addr_file).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("review server address not found ({}); is `drovr serve` running for run {:?}? ({})", addr_file.display(), run, e),
+            format!(
+                "review server address not found ({}); is `drovr serve` running for run {:?}? ({})",
+                addr_file.display(),
+                run,
+                e
+            ),
         )
     })?;
     let addr = addr.trim().to_owned();
@@ -613,11 +657,7 @@ mod tests {
     /// Like `start_server` but with an explicit `project_dir` for `/review/diff`.
     fn start_server_pd(workdir: PathBuf, spec_path: PathBuf, project_dir: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
-        let bound = server
-            .server_addr()
-            .to_ip()
-            .expect("ip addr")
-            .to_string();
+        let bound = server.server_addr().to_ip().expect("ip addr").to_string();
 
         let shared = Arc::new(Mutex::new(AppState::new(spec_path, workdir, project_dir)));
         thread::spawn(move || {
@@ -735,7 +775,10 @@ mod tests {
         assert_eq!(s3, 200);
         let (ps3, body3) = http_get(&addr, "/prior");
         assert_eq!(ps3, 200);
-        assert_eq!(body3, "v2", "prior after v3 must advance to v2, not stay at v1");
+        assert_eq!(
+            body3, "v2",
+            "prior after v3 must advance to v2, not stay at v1"
+        );
     }
 
     // -- Fix 2 (issue 2): a reviewer submit re-anchors last_summarized.md too, so
@@ -755,10 +798,17 @@ mod tests {
         assert_eq!(http_post(&addr, "/summary", "text/plain", "v2").0, 200);
 
         // Reviewer requests changes on v2 → prior must be v2.
-        let payload = r#"{"decision":"request-changes","feedback":"x","answers":{},"annotations":[]}"#;
-        assert_eq!(http_post(&addr, "/submit", "application/json", payload).0, 200);
+        let payload =
+            r#"{"decision":"request-changes","feedback":"x","answers":{},"annotations":[]}"#;
+        assert_eq!(
+            http_post(&addr, "/submit", "application/json", payload).0,
+            200
+        );
         let prior_after_submit = fs::read(tmp.path().join("prior.md")).unwrap();
-        assert_eq!(prior_after_submit, b"v2", "submit must snapshot the submitted spec");
+        assert_eq!(
+            prior_after_submit, b"v2",
+            "submit must snapshot the submitted spec"
+        );
 
         // First revision after the submit: prior must ADVANCE to v2 (the submitted
         // version), not regress to a stale last_summarized.
@@ -766,7 +816,10 @@ mod tests {
         assert_eq!(http_post(&addr, "/summary", "text/plain", "v3").0, 200);
         let (ps, body) = http_get(&addr, "/prior");
         assert_eq!(ps, 200);
-        assert_eq!(body, "v2", "post-submit revision must diff against the submitted v2, not regress");
+        assert_eq!(
+            body, "v2",
+            "post-submit revision must diff against the submitted v2, not regress"
+        );
     }
 
     #[test]
@@ -874,7 +927,11 @@ mod tests {
 
         let (status, body) = http_get(&addr, "/");
         assert_eq!(status, 200);
-        assert!(body.contains("Drovr Review"), "body should contain title: {}", &body[..200.min(body.len())]);
+        assert!(
+            body.contains("Drovr Review"),
+            "body should contain title: {}",
+            &body[..200.min(body.len())]
+        );
     }
 
     #[test]
@@ -919,7 +976,9 @@ mod tests {
         // Write review.addr into the run dir so review_summary can find it.
         fs::write(fake_run_dir.join("review.addr"), addr.as_bytes()).unwrap();
 
-        unsafe { std::env::set_var("XDG_DATA_HOME", fake_base.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", fake_base.to_str().unwrap());
+        }
 
         review_summary(run_name, "Agent summary text.").expect("review_summary");
 
@@ -944,7 +1003,9 @@ mod tests {
 
         let addr = start_server(fake_run_dir.clone(), spec);
         fs::write(fake_run_dir.join("review.addr"), addr.as_bytes()).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", fake_base.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", fake_base.to_str().unwrap());
+        }
         (addr, run_name, tmp)
     }
 
@@ -952,7 +1013,9 @@ mod tests {
     fn wait_missing_addr_errors() {
         let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
         let tmp = make_workdir("wait-no-addr");
-        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
         // No review.addr written → unreachable server → error (exit 1 at CLI).
         let res = review_wait("does-not-exist", 100);
         assert!(res.is_err(), "missing review.addr must be an error");
@@ -979,7 +1042,10 @@ mod tests {
 
         // While the reviewer has not acted, the wait must not have returned.
         thread::sleep(Duration::from_millis(200));
-        assert!(!handle.is_finished(), "wait must block while state is `ready`");
+        assert!(
+            !handle.is_finished(),
+            "wait must block while state is `ready`"
+        );
 
         // Reviewer approves → wait wakes and exits with Approved.
         http_post(
@@ -1002,7 +1068,10 @@ mod tests {
         let handle = thread::spawn(move || review_wait(&run_for_thread, 10_000));
 
         thread::sleep(Duration::from_millis(200));
-        assert!(!handle.is_finished(), "wait must block while state is `ready`");
+        assert!(
+            !handle.is_finished(),
+            "wait must block while state is `ready`"
+        );
 
         // Reviewer requests changes → wait exits ChangesRequested (exit 3).
         http_post(
@@ -1017,7 +1086,10 @@ mod tests {
         // feedback.json holds this turn's feedback for the driver to forward.
         let run_dir = tmp.path().join("drovr/runs").join(&run_name);
         let fb = fs::read_to_string(run_dir.join("feedback.json")).expect("feedback.json");
-        assert!(fb.contains("needs work"), "feedback.json must hold the turn: {fb}");
+        assert!(
+            fb.contains("needs work"),
+            "feedback.json must hold the turn: {fb}"
+        );
     }
 
     // -- code-review surface (/review/findings, /review/diff) ----------------
@@ -1109,7 +1181,10 @@ mod tests {
         let addr = start_server_pd(workdir.clone(), spec, repo.clone());
         let (status, body) = http_get(&addr, "/review/diff?task=t");
         assert_eq!(status, 200, "body={body}");
-        assert!(body.contains("+two"), "diff body should show the added line: {body}");
+        assert!(
+            body.contains("+two"),
+            "diff body should show the added line: {body}"
+        );
     }
 
     #[test]
@@ -1137,7 +1212,12 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(&repo).args(args).output().expect("git")
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git")
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
