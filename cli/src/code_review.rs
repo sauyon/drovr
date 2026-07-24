@@ -281,8 +281,20 @@ pub fn code_review_run<H: Herdr>(
     };
 
     let cfg = load_config()?;
-    let agent = run.agent.as_deref().unwrap_or("claude");
-    let launch = cfg.launch(agent, &run.project_dir, true)?;
+    let auto_cursor_integrated = cfg.review_agent.is_none() && h.integration_present("cursor");
+    let review_agent = cfg.review_agent_for(run.agent.as_deref(), auto_cursor_integrated)?;
+    let review_agent_integrated = if review_agent == "cursor" && auto_cursor_integrated {
+        true
+    } else {
+        h.integration_present(&review_agent)
+    };
+    if !review_agent_integrated {
+        return Err(std::io::Error::other(format!(
+            "review agent '{review_agent}' has no herdr integration; run \
+             `herdr integration install {review_agent}`"
+        )));
+    }
+    let launch = cfg.launch(&review_agent, &run.project_dir, true)?;
     let iter = next_iter(run, task);
     std::fs::create_dir_all(&dir)?;
 
@@ -382,18 +394,24 @@ mod tests {
 
     /// A run whose `project_dir` is a fresh git repo with one commit (so `head_sha`
     /// resolves), and whose run dir is a clean, unique `XDG_DATA_HOME`. Caller holds
-    /// ENV_LOCK. Also points `XDG_CONFIG_HOME` at an empty dir so `load_config` yields
-    /// the built-in defaults (claude + the four angles), deterministically.
+    /// ENV_LOCK. Also writes a config that pins reviews to Claude so tests do not
+    /// depend on whether Cursor's `agent` executable is installed on the host.
     fn make_run(name: &str) -> (RunState, tempfile::TempDir) {
         let data = std::path::PathBuf::from(format!("/tmp/drovr-cr-test-{name}"));
         let _ = std::fs::remove_dir_all(&data);
         unsafe {
             std::env::set_var("XDG_DATA_HOME", &data);
         }
-        // Empty config home → defaults.
-        let cfg_home = tempfile::tempdir().unwrap();
+        // Pin the review backend; all other fields use built-in defaults.
+        let cfg_home = data.join("config-home");
+        std::fs::create_dir_all(cfg_home.join("drovr")).unwrap();
+        std::fs::write(
+            cfg_home.join("drovr/config.toml"),
+            "review_agent = \"claude\"\n",
+        )
+        .unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", cfg_home.path());
+            std::env::set_var("XDG_CONFIG_HOME", &cfg_home);
         }
 
         let repo = tempfile::tempdir().unwrap();
@@ -505,6 +523,12 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-readonly-done");
         run.agent = Some("cursor".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"cursor\"\n",
+        )
+        .unwrap();
         write_base(&run, "task-1");
         for _ in 0..4 {
             h.push_status(Some("done"));
@@ -520,9 +544,9 @@ mod tests {
         );
         let calls = h.calls();
         assert!(
-            calls
-                .iter()
-                .any(|call| call.contains("agent --mode plan --workspace"))
+            calls.iter().any(|call| {
+                call.contains("agent --mode plan --model 'composer-2.5' --workspace")
+            })
         );
     }
 

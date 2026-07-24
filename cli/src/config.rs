@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -23,6 +25,12 @@ pub struct AgentSpec {
     /// Flag used to append the workspace-root guard prompt.
     #[serde(default)]
     pub system_prompt_flag: Option<String>,
+    /// Flag used to select a model for read-only reviews.
+    #[serde(default)]
+    pub model_flag: Option<String>,
+    /// Model selected for read-only reviews. Absent means backend default.
+    #[serde(default)]
+    pub review_model: Option<String>,
     /// Arguments for non-interactive compression; `{project_dir}` is replaced.
     #[serde(default)]
     pub print_args: Option<Vec<String>>,
@@ -32,6 +40,10 @@ pub struct AgentSpec {
 pub struct Config {
     #[serde(default = "default_agent")]
     pub default_agent: String,
+    /// Backend used for automated review panels. When omitted, prefer Cursor's
+    /// `agent` backend if its command is available, then fall back to the run backend.
+    #[serde(default)]
+    pub review_agent: Option<String>,
     #[serde(default = "default_angles")]
     pub angles: Vec<String>,
     #[serde(default = "default_agents")]
@@ -64,6 +76,8 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             readonly_flag: Some("--permission-mode plan".into()),
             workspace_flag: Some("--add-dir".into()),
             system_prompt_flag: Some("--append-system-prompt".into()),
+            model_flag: Some("--model".into()),
+            review_model: None,
             print_args: Some(vec![
                 "-p".into(),
                 "--permission-mode".into(),
@@ -80,6 +94,8 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             readonly_flag: Some("--mode plan".into()),
             workspace_flag: Some("--workspace".into()),
             system_prompt_flag: None,
+            model_flag: Some("--model".into()),
+            review_model: Some("composer-2.5".into()),
             print_args: Some(vec![
                 "--print".into(),
                 "--mode".into(),
@@ -96,6 +112,8 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             readonly_flag: Some("--sandbox read-only".into()),
             workspace_flag: Some("-C".into()),
             system_prompt_flag: None,
+            model_flag: Some("-m".into()),
+            review_model: None,
             print_args: Some(vec![
                 "exec".into(),
                 "--sandbox".into(),
@@ -140,6 +158,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             default_agent: default_agent(),
+            review_agent: None,
             angles: default_angles(),
             agents: default_agents(),
         }
@@ -176,6 +195,8 @@ pub fn load_config() -> io::Result<Config> {
                 .system_prompt_flag
                 .take()
                 .or(builtin.system_prompt_flag);
+            spec.model_flag = spec.model_flag.take().or(builtin.model_flag);
+            spec.review_model = spec.review_model.take().or(builtin.review_model);
             spec.print_args = spec.print_args.take().or(builtin.print_args);
         } else {
             config.agents.insert(name, builtin);
@@ -191,6 +212,35 @@ impl Config {
         })
     }
 
+    /// Select the backend for an automated review panel.
+    ///
+    /// An explicit `review_agent` is always honored. Otherwise Cursor's `agent`
+    /// backend is preferred when its configured command is executable and its
+    /// herdr integration is available; otherwise use the backend captured by the
+    /// run (or `default_agent`).
+    pub fn review_agent_for(
+        &self,
+        run_agent: Option<&str>,
+        cursor_integration_available: bool,
+    ) -> io::Result<String> {
+        if let Some(name) = self.review_agent.as_deref() {
+            self.agent(name)?;
+            return Ok(name.to_owned());
+        }
+
+        if let Some(cursor) = self.agents.get("cursor")
+            && cursor.readonly_flag.is_some()
+            && command_available(&cursor.command)
+            && cursor_integration_available
+        {
+            return Ok("cursor".into());
+        }
+
+        let name = run_agent.unwrap_or(&self.default_agent);
+        self.agent(name)?;
+        Ok(name.to_owned())
+    }
+
     /// Compose an agent launch command pinned to `project_dir`.
     pub fn launch(&self, agent: &str, project_dir: &str, readonly: bool) -> io::Result<String> {
         let spec = self.agent(agent)?;
@@ -203,6 +253,17 @@ impl Config {
             })?;
             command.push(' ');
             command.push_str(flag);
+            if let Some(model) = &spec.review_model {
+                let model_flag = spec.model_flag.as_ref().ok_or_else(|| {
+                    io::Error::other(format!(
+                        "agent '{agent}' has a review_model but no model_flag"
+                    ))
+                })?;
+                command.push(' ');
+                command.push_str(model_flag);
+                command.push(' ');
+                command.push_str(&shell_single_quote(model));
+            }
         }
         if let Some(flag) = &spec.workspace_flag {
             command.push(' ');
@@ -258,6 +319,34 @@ impl Config {
     }
 }
 
+fn command_available(command: &str) -> bool {
+    let path = std::path::Path::new(command);
+    if path.components().count() > 1 {
+        return executable_file(path);
+    }
+
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| executable_file(&dir.join(command))))
+        .unwrap_or(false)
+}
+
+fn executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +368,7 @@ mod tests {
         let cfg = load_config().unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.default_agent, "claude");
+        assert_eq!(cfg.review_agent, None);
         assert_eq!(
             cfg.angles,
             vec!["correctness", "security", "error-handling", "type-design"]
@@ -294,7 +384,7 @@ mod tests {
         );
         assert_eq!(
             cfg.launch("cursor", "/tmp/my worktree", true).unwrap(),
-            "agent --mode plan --workspace '/tmp/my worktree'"
+            "agent --mode plan --model 'composer-2.5' --workspace '/tmp/my worktree'"
         );
     }
 
@@ -333,6 +423,7 @@ mod tests {
             dir.join("config.toml"),
             r#"
 default_agent = "claude"
+review_agent = "codex"
 angles = ["correctness", "security", "error-handling", "type-design"]
 
 [agents.claude]
@@ -348,6 +439,7 @@ readonly_flag = "--sandbox read-only"
         set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
+        assert_eq!(cfg.review_agent.as_deref(), Some("codex"));
         assert!(cfg.agents.contains_key("claude"));
         assert!(cfg.agents.contains_key("codex"));
         assert_eq!(
@@ -403,6 +495,7 @@ readonly_flag = "--sandbox read-only"
     fn reviewer_launch_errors_for_unknown_and_flagless_agents() {
         let cfg = Config {
             default_agent: "claude".into(),
+            review_agent: None,
             angles: default_angles(),
             agents: {
                 let mut m = BTreeMap::new();
@@ -413,6 +506,8 @@ readonly_flag = "--sandbox read-only"
                         readonly_flag: None,
                         workspace_flag: None,
                         system_prompt_flag: None,
+                        model_flag: None,
+                        review_model: None,
                         print_args: None,
                     },
                 );
@@ -427,6 +522,7 @@ readonly_flag = "--sandbox read-only"
     fn reviewer_launch_none_resolves_overridden_default_agent() {
         let cfg = Config {
             default_agent: "codex".into(),
+            review_agent: None,
             angles: default_angles(),
             agents: {
                 let mut m = BTreeMap::new();
@@ -437,6 +533,8 @@ readonly_flag = "--sandbox read-only"
                         readonly_flag: Some("--sandbox read-only".into()),
                         workspace_flag: None,
                         system_prompt_flag: None,
+                        model_flag: None,
+                        review_model: None,
                         print_args: None,
                     },
                 );
@@ -454,6 +552,7 @@ readonly_flag = "--sandbox read-only"
     fn reviewer_launch_none_errors_when_default_agent_lacks_flag() {
         let cfg = Config {
             default_agent: "noflag".into(),
+            review_agent: None,
             angles: default_angles(),
             agents: {
                 let mut m = BTreeMap::new();
@@ -464,6 +563,8 @@ readonly_flag = "--sandbox read-only"
                         readonly_flag: None,
                         workspace_flag: None,
                         system_prompt_flag: None,
+                        model_flag: None,
+                        review_model: None,
                         print_args: None,
                     },
                 );
@@ -483,5 +584,55 @@ readonly_flag = "--sandbox read-only"
         set_config_home(tmp.path());
 
         assert!(load_config().is_err());
+    }
+
+    #[test]
+    fn review_agent_prefers_available_cursor_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::write(&agent, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = std::fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&agent, permissions).unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.agents.get_mut("cursor").unwrap().command = agent.to_string_lossy().into_owned();
+        assert_eq!(
+            cfg.review_agent_for(Some("claude"), true).unwrap(),
+            "cursor",
+        );
+    }
+
+    #[test]
+    fn review_agent_falls_back_and_honors_override() {
+        let mut cfg = Config::default();
+        cfg.agents.get_mut("cursor").unwrap().command = "/definitely/not/a/real/drovr-agent".into();
+        assert_eq!(cfg.review_agent_for(Some("codex"), true).unwrap(), "codex",);
+
+        cfg.review_agent = Some("claude".into());
+        assert_eq!(cfg.review_agent_for(Some("codex"), true).unwrap(), "claude",);
+    }
+
+    #[test]
+    fn review_agent_requires_cursor_integration_for_auto_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::write(&agent, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = std::fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&agent, permissions).unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.agents.get_mut("cursor").unwrap().command = agent.to_string_lossy().into_owned();
+        assert_eq!(
+            cfg.review_agent_for(Some("claude"), false).unwrap(),
+            "claude",
+        );
     }
 }

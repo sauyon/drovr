@@ -35,6 +35,33 @@ cargo build
 Add `target/debug` to your `PATH` or copy the binary to a location on your
 `PATH`.
 
+## Configuration
+
+Drovr loads `${XDG_CONFIG_HOME:-~/.config}/drovr/config.toml`. Built-in
+definitions are provided for Claude, Cursor, and Codex; user definitions and
+flags override them.
+
+Automated review panels prefer Cursor's `agent` command when it is executable
+on `PATH` and its herdr integration is installed, then fall back to the backend
+that created the run. Pin a review backend independently when needed:
+
+```toml
+default_agent = "claude"
+review_agent = "codex"
+angles = ["correctness", "security", "error-handling", "type-design"]
+```
+
+An explicit `review_agent` is honored without availability-based fallback, so
+launch errors remain visible instead of silently selecting another backend.
+Cursor reviewers default to `composer-2.5` to give Cursor callers an
+independent model perspective. Override it in the agent map:
+
+```toml
+[agents.cursor]
+command = "agent"
+review_model = "gpt-5.6-terra-medium"
+```
+
 ## Commands
 
 ### Porcelain
