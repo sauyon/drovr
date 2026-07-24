@@ -27,6 +27,11 @@ a long one. Everything below serves that.
 investigation goes to read-only explorers (e.g. `explore-mcp`), never to parallel
 writers. This holds whether you stay inline or escalate to phases.
 
+**Always review.** Any change you write gets reviewed before you call it done —
+invoke **`drovr:code-review`** (read-only review subagents; they find, you fix).
+This is not optional and not gated on the change's size; it runs whether you
+worked inline or across phases.
+
 ## For the task in front of you, apply the right methodology skill
 
 Pick by what you are doing — invoke it via the `Skill` tool before you act:
@@ -34,8 +39,8 @@ Pick by what you are doing — invoke it via the `Skill` tool before you act:
 - Implementing a feature or bugfix → **`drovr:tdd`** (test-first, watch it fail).
 - Chasing a bug, test failure, or unexpected behavior → **`drovr:systematic-debugging`**.
 - About to claim something is done/fixed/passing → **`drovr:verification-before-completion`**.
-- An artifact (code, spec, plan) needs a check before it ships → **`drovr:code-review`**
-  (read-only review subagents; they find, you fix).
+- Reviewing an artifact (code, spec, plan) → **`drovr:code-review`**. Per the
+  *Always review* rule above, this runs on every change — not only before shipping.
 
 ## Escalation contract — inline first
 
