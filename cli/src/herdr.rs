@@ -1,6 +1,10 @@
 use std::io;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -52,51 +56,15 @@ pub trait Herdr {
 }
 
 // ---------------------------------------------------------------------------
-// SystemHerdr — shells the real `herdr` binary
+// SystemHerdr — talks to the real herdr daemon over its Unix-socket JSON-RPC API
 // ---------------------------------------------------------------------------
 
-/// Pause between writing a message and sending the primary submit CR. A CR sent
-/// immediately after a large `agent send` is swallowed by claude's
-/// bracketed-paste handling and never submits; a CR sent after the paste
-/// settles submits reliably (verified against the live claude TUI). Kept
-/// generous because the failure is timing-dependent (racy) and multi-KB pastes
-/// settle slowly.
-const PASTE_SETTLE: Duration = Duration::from_millis(250);
+/// Read timeout for a single JSON-RPC request/response round-trip on the socket.
+const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pause between the primary submit CR and the flush CR (see [`submit_handshake`]).
-/// The flush CR is a bare carriage return sent late enough that the paste has
-/// certainly settled, so it submits whatever the primary CR was absorbed into.
-/// A CR on an already-submitted (empty) buffer is a harmless no-op, so the flush
-/// is always safe. This bakes in the proven "second empty submit" workaround from
-/// docs/known-issues.md.
-const FLUSH_SETTLE: Duration = Duration::from_millis(900);
-
-/// Submit a just-written message by sending carriage returns as separately-timed
-/// keypresses. claude's TUI treats a large `agent send` as a bracketed paste; a
-/// CR in the same burst is absorbed into the paste and never submits. So we
-/// (1) wait `paste_settle` for the paste to land, then send a CR, and
-/// (2) wait `flush_settle`, then send a second, bare CR. The first CR submits
-/// when the paste settled in time; the second flushes any paste the first CR was
-/// swallowed into. This relies on one observed claude-TUI property: a bare CR on
-/// an already-submitted (empty) input box is a no-op, so the redundant flush never
-/// double-submits. If a future claude build instead submits an empty message on a
-/// bare CR, revisit this (poll the pane buffer before the single CR instead).
-///
-/// Durations are parameters so tests can drive it with `Duration::ZERO`.
-fn submit_handshake<F>(
-    mut send_cr: F,
-    paste_settle: Duration,
-    flush_settle: Duration,
-) -> io::Result<()>
-where
-    F: FnMut() -> io::Result<()>,
-{
-    std::thread::sleep(paste_settle);
-    send_cr()?;
-    std::thread::sleep(flush_settle);
-    send_cr()?;
-    Ok(())
-}
+/// Claude auth env vars propagated to spawned agents so they use the caller's
+/// authenticated profile rather than the default `~/.claude` dir.
+const AGENT_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"];
 
 pub struct SystemHerdr;
 
@@ -105,73 +73,121 @@ impl SystemHerdr {
         Self
     }
 
+    /// Shell out to the `herdr` binary (still used for `integration status` and
+    /// `session stop`, which are unchanged in 0.7.5).
     fn run(&self, args: &[&str]) -> io::Result<std::process::Output> {
         Command::new("herdr").args(args).output()
+    }
+
+    /// Perform one JSON-RPC call over the herdr Unix socket. Writes a single
+    /// request line and reads a single response line; returns the `result`
+    /// value on success, or an `io::Error` carrying the error message.
+    fn socket_call(&self, method: &str, params: Value) -> io::Result<Value> {
+        let path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| {
+            io::Error::other("HERDR_SOCKET_PATH is not set; cannot reach herdr socket")
+        })?;
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let mut stream = UnixStream::connect(&path)?;
+        stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
+
+        let request = json!({ "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&request)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response)?;
+        if response.trim().is_empty() {
+            return Err(io::Error::other(format!(
+                "herdr socket returned empty response for method {method}"
+            )));
+        }
+
+        let value: Value = serde_json::from_str(response.trim())?;
+        if let Some(err) = value.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown herdr error");
+            return Err(io::Error::other(msg.to_string()));
+        }
+        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Build the `env` object for `workspace.create` from the claude auth vars
+    /// currently set in this process's environment, plus the flicker-suppression
+    /// flag. Every pane later created in the workspace (root pane + each phase's
+    /// tab shell) inherits this env, so the spawned `claude` uses the caller's
+    /// authenticated profile (`CLAUDE_CONFIG_DIR`) instead of the default
+    /// `~/.claude`, and skips its first-run fullscreen-renderer upsell (which a
+    /// freshly-spawned interactive agent has no human to answer — see
+    /// `spawn_env_flags`).
+    fn agent_env(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        for var in AGENT_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                map.insert((*var).to_string(), Value::String(val));
+            }
+        }
+        // Always suppress the first-run renderer upsell (see spawn_env_flags).
+        map.insert(
+            "CLAUDE_CODE_NO_FLICKER".to_string(),
+            Value::String("1".to_string()),
+        );
+        Value::Object(map)
     }
 }
 
 impl Herdr for SystemHerdr {
     fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace> {
-        let mut args: Vec<String> = vec![
-            "workspace".into(),
-            "create".into(),
-            "--label".into(),
-            label.into(),
-            "--cwd".into(),
-            cwd.into(),
-            "--no-focus".into(),
-        ];
-        args.extend(spawn_env_flags());
-        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = self.run(&args_refs)?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!(
-                "herdr workspace create failed: {stderr}"
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let id = parse_workspace_id(&stdout).ok_or_else(|| {
+        // 0.7.5 socket API: create the workspace over the Unix socket rather than
+        // shelling `herdr workspace create`. `focus:false` mirrors the old
+        // `--no-focus` (never steal focus from the user); the auth env is set at
+        // the WORKSPACE level so every pane later created in it (the root shell
+        // pane and each phase's tab shell) inherits the caller's claude profile
+        // (`CLAUDE_CONFIG_DIR`) instead of the default ~/.claude.
+        let result = self.socket_call(
+            "workspace.create",
+            json!({ "label": label, "cwd": cwd, "focus": false, "env": self.agent_env() }),
+        )?;
+        let id = find_string_field(&result, "workspace_id").ok_or_else(|| {
             io::Error::other(format!(
-                "herdr workspace create: could not parse workspace_id from: {stdout}"
+                "workspace.create: could not find workspace_id in result: {result}"
             ))
         })?;
-        // The output's first `pane_id` is `result.root_pane.pane_id` — the shell
-        // pane the first phase will reuse.
-        let root_pane = parse_pane_id(&stdout).ok_or_else(|| {
+        // The result's `root_pane.pane_id` is the auto-created shell pane the
+        // first phase will reuse (found by walking the result for `pane_id`).
+        let root_pane = find_string_field(&result, "pane_id").ok_or_else(|| {
             io::Error::other(format!(
-                "herdr workspace create: could not parse root_pane pane_id from: {stdout}"
+                "workspace.create: could not find root_pane pane_id in result: {result}"
             ))
         })?;
         Ok(Workspace { id, root_pane })
     }
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
-        let out = self.run(&["workspace", "close", id])?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!(
-                "herdr workspace close failed: {stderr}"
-            )));
-        }
+        // 0.7.5 socket API: close over the socket rather than shelling
+        // `herdr workspace close`.
+        self.socket_call("workspace.close", json!({ "workspace_id": id }))?;
         Ok(())
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
-        let mut args: Vec<String> = vec![
-            "tab".into(),
-            "create".into(),
-            "--workspace".into(),
-            workspace.into(),
-            "--label".into(),
-            label.into(),
-            "--cwd".into(),
-            cwd.into(),
-            "--no-focus".into(),
+        // Kept as a `herdr` CLI shell-out: 0.7.5 still exposes `tab create`, and
+        // the new tab's shell pane inherits the workspace-level auth env set at
+        // `workspace.create` (so no per-tab `--env` is needed). Focus is never
+        // taken (`--no-focus`).
+        let args: Vec<&str> = vec![
+            "tab", "create", "--workspace", workspace, "--label", label, "--cwd", cwd,
+            "--no-focus",
         ];
-        args.extend(spawn_env_flags());
-        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = self.run(&args_refs)?;
+        let out = self.run(&args)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(format!(
@@ -180,9 +196,14 @@ impl Herdr for SystemHerdr {
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         // `tab create` returns `result.root_pane.pane_id` — the new tab's shell pane.
-        parse_pane_id(&stdout).ok_or_else(|| {
+        let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
             io::Error::other(format!(
-                "herdr tab create: could not parse pane_id from: {stdout}"
+                "herdr tab create: could not parse JSON output ({e}): {stdout}"
+            ))
+        })?;
+        find_string_field(&v, "pane_id").ok_or_else(|| {
+            io::Error::other(format!(
+                "herdr tab create: could not find pane_id in: {stdout}"
             ))
         })
     }
@@ -234,43 +255,28 @@ impl Herdr for SystemHerdr {
     }
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
-        let out = self.run(&["agent", "send", target, text])?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!(
-                "herdr agent send failed: {stderr}"
-            )));
-        }
-        // Submit the message. herdr writes the text into the pane's input box
-        // without pressing Enter, so a CR is required to dispatch it. The CR must
-        // be a separately-timed keypress, and we send two (see submit_handshake):
-        // a large paste can swallow the first CR, and the delayed flush CR then
-        // submits it reliably.
-        submit_handshake(
-            || {
-                let cr_out = self.run(&["agent", "send", target, "\r"])?;
-                if !cr_out.status.success() {
-                    let stderr = String::from_utf8_lossy(&cr_out.stderr);
-                    return Err(io::Error::other(format!(
-                        "herdr agent send (CR) failed: {stderr}"
-                    )));
-                }
-                Ok(())
-            },
-            PASTE_SETTLE,
-            FLUSH_SETTLE,
-        )
+        // 0.7.5 socket API: agent.prompt types AND submits the prompt natively,
+        // so the old PASTE_SETTLE/flush-CR handshake (0.7.3's `agent send`, which
+        // only wrote text into the input box) is gone.
+        self.socket_call(
+            "agent.prompt",
+            json!({ "target": target, "text": text }),
+        )?;
+        Ok(())
     }
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
-        let out = self.run(&["agent", "read", target, "--source", "recent"])?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!(
-                "herdr agent read failed: {stderr}"
-            )));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        // 0.7.5 socket API: agent.read returns the recent transcript in `text`.
+        let result = self.socket_call(
+            "agent.read",
+            json!({ "target": target, "source": "recent" }),
+        )?;
+        let text = result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(text)
     }
 
     fn agent_status(&self, pane_id: &str) -> Option<String> {
@@ -296,49 +302,33 @@ impl Herdr for SystemHerdr {
     }
 }
 
-/// `--env KEY=VALUE` flags applied to every phase-agent pane drovr creates
-/// (via `workspace create` / `tab create`). Two groups, both scoped to the
-/// phase's `claude`:
-///
-///   * the claude auth vars set in this process's environment, so the spawned
-///     `claude` inherits the caller's authenticated profile rather than the
-///     default `~/.claude`. Secrets travel as herdr's `--env` argv, never
-///     inlined into a `pane run` command string (which would echo into the
-///     terminal buffer);
-///   * `CLAUDE_CODE_NO_FLICKER=1`, which makes claude enable the fullscreen
-///     renderer directly and SKIP the first-run "Try the new fullscreen
-///     renderer?" upsell. A freshly-spawned interactive claude has no human to
-///     answer that prompt, so without this it blocks first-run until
-///     `phase wait` times out. (Verified: this flag preserves full transcript
-///     reads via `agent read --source recent`, so `phase compress` still works;
-///     `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` does NOT and must not be used.)
-fn spawn_env_flags() -> Vec<String> {
-    let mut flags = Vec::new();
-    for var in &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"] {
-        if let Ok(val) = std::env::var(var) {
-            flags.push("--env".into());
-            flags.push(format!("{var}={val}"));
+/// Recursively search a JSON value for a string field with the given key,
+/// returning its (non-empty) value. Defensive against nesting: the socket
+/// result shape may wrap the field in one or more objects/arrays.
+fn find_string_field(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get(key) {
+                if !s.is_empty() {
+                    return Some(s.clone());
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = find_string_field(v, key) {
+                    return Some(found);
+                }
+            }
+            None
         }
-    }
-    // Suppress claude's first-run renderer upsell so the spawned agent reaches
-    // its composer instead of parking on an unanswerable prompt.
-    flags.push("--env".into());
-    flags.push("CLAUDE_CODE_NO_FLICKER=1".into());
-    flags
-}
-
-/// Parse `pane_id` from herdr's JSON output.
-/// Looks for `"pane_id":"<value>"` defensively.
-fn parse_pane_id(json: &str) -> Option<String> {
-    // Simple substring search — avoids a serde dependency for one field.
-    let key = "\"pane_id\":\"";
-    let start = json.find(key)? + key.len();
-    let end = json[start..].find('"')? + start;
-    let id = &json[start..end];
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_owned())
+        Value::Array(items) => {
+            for v in items {
+                if let Some(found) = find_string_field(v, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -369,21 +359,6 @@ fn find_agent_status(v: &serde_json::Value) -> Option<String> {
         }
         serde_json::Value::Array(arr) => arr.iter().find_map(find_agent_status),
         _ => None,
-    }
-}
-
-/// Parse `workspace_id` from herdr's `workspace create` JSON output.
-/// Looks for `"workspace_id":"<value>"` inside the top-level `workspace` object.
-/// The output shape is: `{"result":{"workspace":{"workspace_id":"wN",...},...}}`.
-fn parse_workspace_id(json: &str) -> Option<String> {
-    let key = "\"workspace_id\":\"";
-    let start = json.find(key)? + key.len();
-    let end = json[start..].find('"')? + start;
-    let id = &json[start..end];
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_owned())
     }
 }
 
@@ -574,14 +549,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_id_extracts_correctly() {
-        let json = r#"{"id":"cli:agent:start","result":{"pane_id":"w1:pXY","tab_id":"w1:tXY"}}"#;
-        assert_eq!(parse_pane_id(json).as_deref(), Some("w1:pXY"));
+    fn find_string_field_extracts_top_level() {
+        let v: Value = serde_json::from_str(
+            r#"{"pane_id":"w1:pXY","tab_id":"w1:tXY"}"#,
+        )
+        .unwrap();
+        assert_eq!(find_string_field(&v, "pane_id").as_deref(), Some("w1:pXY"));
     }
 
     #[test]
-    fn parse_pane_id_missing_returns_none() {
-        assert!(parse_pane_id(r#"{"no":"pane"}"#).is_none());
+    fn find_string_field_extracts_nested() {
+        // workspace.create wraps the id inside a nested object.
+        let v: Value = serde_json::from_str(
+            r#"{"workspace":{"workspace_id":"w7","label":"drovr:demo"}}"#,
+        )
+        .unwrap();
+        assert_eq!(find_string_field(&v, "workspace_id").as_deref(), Some("w7"));
+    }
+
+    #[test]
+    fn find_string_field_missing_returns_none() {
+        let v: Value = serde_json::from_str(r#"{"no":"pane"}"#).unwrap();
+        assert!(find_string_field(&v, "pane_id").is_none());
+    }
+
+    #[test]
+    fn find_string_field_ignores_empty() {
+        let v: Value = serde_json::from_str(r#"{"pane_id":""}"#).unwrap();
+        assert!(find_string_field(&v, "pane_id").is_none());
     }
 
     #[test]
@@ -639,60 +634,6 @@ mod tests {
         );
     }
 
-    // -- Fix 1: the submit CR is sent as a separately-timed keypress, not
-    //    inline with the paste. The delay is what makes it a distinct keypress;
-    //    guard that it is never zeroed out.
-    #[test]
-    fn paste_settle_is_nonzero() {
-        assert!(
-            PASTE_SETTLE > Duration::ZERO,
-            "PASTE_SETTLE must be > 0 so the submit CR is a separate keypress, \
-             not swallowed by claude's bracketed paste"
-        );
-    }
-
-    // -- Fix 1 (issue 1): the submit handshake sends TWO carriage returns — a
-    //    primary CR and a delayed flush CR — so a paste that swallows the first
-    //    CR is still submitted by the second. FLUSH_SETTLE must be nonzero so the
-    //    flush is a distinct keypress after the paste has settled.
-    #[test]
-    fn flush_settle_is_nonzero() {
-        assert!(
-            FLUSH_SETTLE > Duration::ZERO,
-            "FLUSH_SETTLE must be > 0 so the flush CR is a distinct keypress"
-        );
-    }
-
-    #[test]
-    fn submit_handshake_sends_two_crs() {
-        let mut count = 0;
-        submit_handshake(
-            || {
-                count += 1;
-                Ok(())
-            },
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .unwrap();
-        assert_eq!(count, 2, "submit must send a primary CR and a flush CR");
-    }
-
-    #[test]
-    fn submit_handshake_short_circuits_on_error() {
-        let mut count = 0;
-        let r = submit_handshake(
-            || {
-                count += 1;
-                Err(io::Error::other("boom"))
-            },
-            Duration::ZERO,
-            Duration::ZERO,
-        );
-        assert!(r.is_err(), "an error on the primary CR must propagate");
-        assert_eq!(count, 1, "a failed primary CR must not attempt the flush");
-    }
-
     // workspace_create returns both the workspace id and its root shell pane id;
     // the first phase reuses the root pane rather than splitting a new one.
     #[test]
@@ -706,18 +647,15 @@ mod tests {
         assert!(call.contains("cwd=/proj"), "cwd must be threaded: {call}");
     }
 
-    // parse_pane_id extracts `result.root_pane.pane_id` from a real
-    // `workspace create` / `tab create` payload (root_pane is the first pane_id).
+    // -- agent_env: auth vars propagate via the socket `env`, never inlined -----
+    // Under 0.7.5 the caller's claude profile is passed as the `workspace.create`
+    // `env` object (inherited by every pane in the workspace) rather than the old
+    // 0.7.3 `--env` argv. Only vars that are actually set are forwarded, and the
+    // flicker-suppression flag is always present so a freshly-spawned interactive
+    // claude skips its first-run "Try the new fullscreen renderer?" upsell (which
+    // it would otherwise park on, hanging the phase until `phase wait` times out).
     #[test]
-    fn parse_pane_id_extracts_root_pane_from_create_output() {
-        let json = r#"{"result":{"root_pane":{"pane_id":"w9:p1","tab_id":"w9:t1","workspace_id":"w9"},"workspace":{"workspace_id":"w9"}}}"#;
-        assert_eq!(parse_pane_id(json).as_deref(), Some("w9:p1"));
-        assert_eq!(parse_workspace_id(json).as_deref(), Some("w9"));
-    }
-
-    // -- spawn_env_flags: secrets travel via herdr --env, never inlined --------
-    #[test]
-    fn spawn_env_flags_includes_set_vars_only() {
+    fn agent_env_includes_set_auth_vars_and_flicker() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -725,28 +663,40 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let joined = spawn_env_flags().join(" ");
+        let env = SystemHerdr::new().agent_env();
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
-        assert!(
-            joined.contains("--env CLAUDE_CONFIG_DIR=/home/user/.config/claude-work"),
-            "expected --env flag for set var: {joined}"
+        let map = env.as_object().expect("agent_env must be a JSON object");
+        assert_eq!(
+            map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str),
+            Some("/home/user/.config/claude-work"),
+            "set auth var must be forwarded: {env}"
         );
         assert!(
-            !joined.contains("ANTHROPIC_API_KEY"),
-            "unset key must not appear: {joined}"
+            !map.contains_key("ANTHROPIC_API_KEY"),
+            "unset key must not appear: {env}"
         );
         assert!(
-            !joined.contains("ANTHROPIC_MODEL"),
-            "unset model must not appear: {joined}"
+            !map.contains_key("ANTHROPIC_MODEL"),
+            "unset model must not appear: {env}"
+        );
+        // Flicker suppression is unconditional; the alternate-screen disable knob
+        // must NOT be used (it empties `agent read --source recent`, breaking
+        // `phase compress`).
+        assert_eq!(
+            map.get("CLAUDE_CODE_NO_FLICKER").and_then(Value::as_str),
+            Some("1"),
+            "flicker-suppression flag must always be present: {env}"
+        );
+        assert!(
+            !map.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "must not disable the alternate screen (breaks phase compress): {env}"
         );
     }
 
-    // Even with no auth vars set, the flicker-suppression flag is always emitted
-    // so the spawned claude skips its first-run renderer upsell.
     #[test]
-    fn spawn_env_flags_only_flicker_when_auth_unset() {
+    fn agent_env_flicker_only_when_auth_unset() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -754,55 +704,29 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        let joined = spawn_env_flags().join(" ");
-        assert!(
-            joined.contains("--env CLAUDE_CODE_NO_FLICKER=1"),
-            "flicker-suppression flag must always be present: {joined}"
+        let env = SystemHerdr::new().agent_env();
+        let map = env.as_object().expect("agent_env must be a JSON object");
+        assert_eq!(
+            map.get("CLAUDE_CODE_NO_FLICKER").and_then(Value::as_str),
+            Some("1"),
+            "flicker-suppression flag must always be present: {env}"
         );
         assert!(
-            !joined.contains("CLAUDE_CONFIG_DIR"),
-            "no auth flags expected when unset: {joined}"
+            !map.contains_key("CLAUDE_CONFIG_DIR"),
+            "no auth vars expected when unset: {env}"
         );
         assert!(
-            !joined.contains("ANTHROPIC_API_KEY"),
-            "no auth flags expected when unset: {joined}"
+            !map.contains_key("ANTHROPIC_API_KEY"),
+            "no auth vars expected when unset: {env}"
         );
         assert!(
-            !joined.contains("ANTHROPIC_MODEL"),
-            "no auth flags expected when unset: {joined}"
-        );
-    }
-
-    // The flicker flag must ride on every phase-agent pane. Without it a freshly
-    // spawned interactive claude parks on "Try the new fullscreen renderer?" with
-    // no human to answer, hanging the phase until `phase wait` times out.
-    #[test]
-    fn spawn_env_flags_always_suppresses_flicker_upsell() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-        }
-        let joined = spawn_env_flags().join(" ");
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        assert!(
-            joined.contains("--env CLAUDE_CODE_NO_FLICKER=1"),
-            "flicker-suppression flag must be present alongside auth flags: {joined}"
-        );
-        // We must NOT reach for the alternate-screen disable knob: it empties
-        // `agent read --source recent` and would break `phase compress`.
-        assert!(
-            !joined.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "must not disable the alternate screen (breaks phase compress): {joined}"
+            !map.contains_key("ANTHROPIC_MODEL"),
+            "no auth vars expected when unset: {env}"
         );
     }
 
     #[test]
-    fn spawn_env_flags_includes_all_set_vars() {
+    fn agent_env_includes_all_set_vars() {
         use crate::test_util::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -810,19 +734,29 @@ mod tests {
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
         }
-        let joined = spawn_env_flags().join(" ");
+        let env = SystemHerdr::new().agent_env();
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
         }
-        assert!(joined.contains("CLAUDE_CONFIG_DIR=/cfg"), "{joined}");
-        assert!(joined.contains("ANTHROPIC_API_KEY=sk-test"), "{joined}");
-        assert!(
-            joined.contains("ANTHROPIC_MODEL=claude-opus-4-5"),
-            "{joined}"
+        let map = env.as_object().expect("agent_env must be a JSON object");
+        assert_eq!(map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str), Some("/cfg"), "{env}");
+        assert_eq!(
+            map.get("ANTHROPIC_API_KEY").and_then(Value::as_str),
+            Some("sk-test"),
+            "{env}"
         );
-        assert!(joined.contains("CLAUDE_CODE_NO_FLICKER=1"), "{joined}");
+        assert_eq!(
+            map.get("ANTHROPIC_MODEL").and_then(Value::as_str),
+            Some("claude-opus-4-5"),
+            "{env}"
+        );
+        assert_eq!(
+            map.get("CLAUDE_CODE_NO_FLICKER").and_then(Value::as_str),
+            Some("1"),
+            "{env}"
+        );
     }
 
     // Fake focus capture/restore primitives are recorded so phase_start can be
