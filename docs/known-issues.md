@@ -250,3 +250,111 @@ After `phase send`, submit with `herdr agent send-keys <pane> Enter` (verify fir
 
 For large payloads, either send the submit key(s) separately after a short settle, or detect a
 still-populated composer post-send and re-issue the submit until the input clears.
+
+## Spawned agents park on the "New MCP server" approval prompt, undetected
+
+**Severity:** medium (every fresh agent in a project with an MCP server stalls at spawn until
+someone answers `1/2/3`; unattended pipelines wedge silently).
+**Found:** 2026-07-25, every `drovr phase start` / browser-launched session in this repo (has a
+`datadog` MCP server).
+
+### Symptom
+
+A freshly spawned `claude` sits on `New MCP server found: datadog … 1. Use  2. Use all  3.
+Continue without` — a numbered menu, cost `$0.00`, never starting. `agent_status` reports
+`idle`/none (not `blocked`), so `phase send` readiness and blocked-triage don't catch it.
+
+### Root cause (proven)
+
+herdr's prompt-detection manifest (`~/.local/state/herdr/agent-detection/remote/claude.toml`)
+has no rule matching this prompt's wording ("Use this MCP server" / "Enter to confirm"), so it
+resolves to not-blocked. herdr can *read* the text (`agent read --source detection`) but does
+not classify it or parse the options.
+
+### Workaround
+
+Clear it manually: `herdr agent send-keys <pane> 3` then `… enter`. (Blind — options aren't
+structured.)
+
+### Fix ideas
+
+Add a manifest rule so the prompt reports `blocked`; and give the browser mirror a "send keys"
+control (arrows/enter/number) so menus are answerable from the UI — today `/send` types text
+only.
+
+## `drovr review wait` fails (not "approved") if the server restarts mid-wait
+
+**Severity:** medium (a failed wait can be *misread* as approval and advance the pipeline past
+an unapproved gate).
+**Found:** 2026-07-24, gate wait for run `clean-content`.
+
+### Symptom
+
+A backgrounded `drovr review wait <run>` prints `could not connect to review server …
+Connection refused` and exits **1** while the reviewer has NOT acted. If the exit code is read
+loosely (e.g. a harness reporting the wrapper's 0), it looks like approval and the driver
+compresses/advances past a gate that is still `ready`.
+
+### Root cause
+
+`review wait` resolves the server addr once, then polls it; restarting the always-on server
+(e.g. to load new code) drops the socket, and the next poll's connect fails → `Err` → exit 1.
+
+### Workaround
+
+Never restart the always-on server while a `review wait` is in flight. Verify the *inner* exit
+code and the authoritative `GET /state` (`approved` vs `ready`) before advancing — do not trust
+a wrapper's exit alone. `phase wait` (filesystem markers) is unaffected by server restarts.
+
+### Fix idea
+
+Make `review wait` treat a transient connect failure as retryable (re-run `ensure_server` and
+resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
+exit.
+
+## Test suite flakes under parallel `cargo test`; needs `--test-threads=1`
+
+**Severity:** low (green when run serially; false failures otherwise).
+**Found:** 2026-07-24.
+
+### Symptom
+
+`cargo test` intermittently fails ~50+ tests across `config`, `herdr`, `run`, `phase` with
+unrelated assertion errors; the same tests pass in isolation and under `--test-threads=1`.
+
+### Root cause
+
+Those tests mutate **process-global** state (`XDG_DATA_HOME`, auth env vars) guarded by an
+`ENV_LOCK`, but the lock only serializes the tests that take it — other parallel tests read the
+polluted env between a mutation and its restore.
+
+### Workaround
+
+Run `cargo test -- --test-threads=1` (CI should pin this).
+
+### Fix idea
+
+Have env-mutating tests set state via a scoped guard that restores on drop and is held across
+every read, or move them behind a single serial test harness.
+
+## Session mirror shows raw terminal chrome, not clean conversation content
+
+**Severity:** low (cosmetic; the mirror is readable but noisy).
+**Found:** 2026-07-24.
+
+### Symptom
+
+`GET /api/runs/<run>/pane` (the Live-session mirror) returns herdr's raw terminal snapshot —
+status bar (`ctx:… | $… | …`), the `❯` input box, separators, box-drawing — not just the
+agent↔user conversation.
+
+### Root cause
+
+herdr's `agent read` mirrors the rendered TUI; there is no structured "just the conversation"
+source. (Claude's own session JSONL has clean turns, but reading it is claude-specific.)
+
+### Fix idea
+
+Add an agent-agnostic "clean" mode that strips the known chrome (status line, `❯` composer,
+separator rules) from the snapshot; keep raw as a toggle. Avoid a claude-only JSONL parser as
+the primary path.
