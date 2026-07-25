@@ -50,7 +50,19 @@ single writer of `spec.md`; you convey the reviewer's decisions.
    drovr serve <run> --host 127.0.0.1 --port 8791 &
    ```
    Use a Tailscale host instead of localhost only on a trusted tailnet — there is no auth.
-   Tell the human the URL.
+   The server must be up *before* the agent's first `drovr review summary`: that command
+   POSTs the summary to this server (via `review.addr`), so with nothing listening the post
+   fails. **But do NOT hand the human the URL yet** — the rendered page is EMPTY until the
+   first summary lands, and an empty page reads as "the tool is broken."
+
+1b. **Wait for the first summary before announcing the URL or starting `review wait`.** The
+   brainstorm agent writes `spec.md` then runs `drovr review summary`, flipping state
+   `idle → ready`. Only once `spec.md` exists **and** `GET /state` reports `ready` do you give
+   the human the URL and start `drovr review wait`. Until then there is nothing to review and
+   a `review wait` against a specless run just churns (or errors if the server isn't up yet).
+   If the agent stalls without producing a spec, inspect its pane (`drovr attach <run>`) — do
+   not point the human at an empty page. (Background a poll on `GET /state` for the `ready`
+   transition; don't busy-wait inline.)
 
 2. **Server state machine** (`GET /state` → `{state, turn}`; files in the run dir):
 
@@ -197,6 +209,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Mistake | Fix |
 |---|---|
 | Expecting `drovr new` to serve the gate | Start `drovr serve <run> &` yourself before the gate. |
+| Announcing the URL / starting `review wait` before the first summary | Wait for `spec.md` + `GET /state` = `ready`; an empty page reads as broken and a specless `review wait` churns. |
 | Agent edits `spec.md` but reviewer sees nothing | Agent must run `drovr review summary` after each edit. |
 | Busy-polling `GET /state` for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
