@@ -290,10 +290,57 @@ path** while `code-review run` used a bare `agent_send`.
 reviewer raises a `TimedOut` error that aborts the pass instead of erroring with "target not
 found". So the "agent target not found" symptom above should no longer occur.
 
-**Unverified as of 2026-07-25:** the *second* symptom — reviewer panes attach and get seeded but
+~~**Unverified as of 2026-07-25:** the *second* symptom — reviewer panes attach and get seeded but
 never reach `done`, so `code-review run` times out with no `<task>-review.json` — has not been
-re-run against current `main`. It is a distinct failure from the spawn race and nothing in the
-source rules it out. Keep the workaround until someone dogfoods the panel end-to-end again.
+re-run against current `main`.~~ **Verified 2026-07-25, see below.**
+
+### Dogfooded end-to-end 2026-07-25 (run `phase-reap`, task-1, branch `drovr/phase-reap`)
+
+Two full panel passes on a host where **cursor IS integrated** (so `review_agent_for` resolves to
+cursor). The panel failed **three distinct ways**, none of which is the spawn race:
+
+**Pass 1 — exit 2 (timeout), root cause is the unsubmitted paste.** All four reviewer panes
+(`wAF:p2`–`p5`) attached fine and sat at `agent_status: idle` with the seed visible in the composer
+as `→ [Pasted text #1 +46 lines]`. This is the *"`drovr phase send` still lands a large briefing
+unsubmitted"* bug below, reaching the **reviewer-spawn** path via `code_review.rs`'s `phase_send`
+call — the seed is never submitted, so the reviewer never starts and the panel burns its whole
+`timeout_ms`. `herdr agent send-keys <pane> enter` on each pane started all four immediately, and
+all four then produced valid verdicts.
+
+**Pass 2 — exit 1, findings emitted but not extractable.** With `enter` sent proactively, all four
+panes (`wAF:p7`–`pA`) ran to completion and reached `agent_status: done`. The panel still failed:
+
+```
+drovr: code-review run failed: reviewer 'review:task-1:2:correctness' produced no findings
+JSON (no file written and none found in its transcript)
+```
+
+`wAF:p7`'s transcript **did** contain a well-formed `{"verdict":"changes","findings":[…]}` block.
+`obtain_findings_json` could not see it because `agent_read` reads
+`source:"recent"` — a *viewport* snapshot, not the full scrollback. Cursor renders long tool output
+collapsed (`… NN output lines hidden · ctrl+o to expand`) and keeps scrolling, so by the time the
+panel reads the pane the emitted JSON has left the recent window. The file fallback never helps
+either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers deliberately write
+**no** `<task>-review-<angle>.json` file — the transcript is the only channel, and it is lossy.
+
+**Correction to an easy misdiagnosis:** cursor reviewers *do* reach `done`. In pass 1 they merely
+appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
+file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
+
+### Fix ideas (from the 2026-07-25 dogfood)
+
+1. **Make the findings channel durable, not a viewport.** Have the reviewer seed instruct writing
+   `<run_dir>/<task>-review-<angle>.json` *and* echoing it, then prefer the file. The file fallback
+   in `obtain_findings_json` already exists but is dead code today because nothing writes the file.
+2. If the transcript must stay the channel, read full scrollback rather than
+   `source:"recent"`, and fail with the captured transcript attached so the driver can hand-merge.
+3. Submit the seed reliably (see the entry below) — one fix removes failure mode 1 for the panel,
+   `phase send`, and the review gate at once.
+
+**Workaround used:** send `enter` to each reviewer pane after the panel spawns them, then read the
+four panes directly and hand-merge into `<run_dir>/<task>-review.json`. Both passes of task-1's
+review were merged this way, and both produced real, actionable findings — the reviewers work; only
+the plumbing around them fails.
 
 ## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
 
@@ -342,6 +389,34 @@ Confirmed live on the installed nix-profile binary with a 6586-byte / 124-line b
 So there are two failure modes on this path, not one: a silent *drop* and a silent
 *non-submit*. Any fix must cover both — verifying the composer is non-empty after the send is
 what distinguishes them.
+
+### Still reproducing 2026-07-25 (run `phase-reap`) — and it is not just the CLI path
+
+Reproduced on the installed nix-profile binary, on **three different callers**, which together
+show this is `phase::phase_send` itself (and therefore `agent_send` → socket `agent.prompt`),
+not anything specific to the `drovr phase send` CLI entry point:
+
+1. **Reviewer spawn (`code_review.rs:318`) — 8 for 8.** Both panel passes, all four angles each
+   (`wAF:p2`–`p5`, then `wAF:p7`–`pA`): every reviewer sat `idle` with
+   `→ [Pasted text #1 +46 lines]` unsubmitted. This is what makes the review panel time out; see
+   the panel entry above.
+2. **Driver re-entry into a live implement phase.** `drovr phase send phase-reap
+   implement-task-1 "<review findings>"` reported success; the payload landed in the claude
+   pane's composer as `❯ [Pasted text #3 +8 lines]` and was never submitted, so the re-entry
+   silently did nothing until nudged.
+3. Both **cursor** (reviewers) and **claude** (implementer) panes are affected, so it is not a
+   backend-specific quirk.
+
+**Payload size is not the trigger.** The previously-recorded repro used 6586 bytes / 124 lines;
+case 2 above was **8 lines**. Any fix predicated on "large bracketed paste" will miss this.
+
+**Impact is worse than "low" for unattended runs.** Case 1 costs the panel its entire
+`timeout_ms` (30 min here) per pass, and case 2 makes the implement↔review loop silently no-op —
+the driver believes it forwarded findings and then waits on an agent that was never told to do
+anything. Consider raising the severity.
+
+**Workaround (unchanged, still reliable):** `herdr agent send-keys <pane> enter` after every
+`phase send`. Verified 12/12 times across this run.
 
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
