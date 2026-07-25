@@ -835,6 +835,22 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
     }
 
     if decision == "approve" {
+        // Approve is terminal, but not answer-free: the reviewer may have
+        // answered the spec's open questions on the way to approving. Persist
+        // the same feedback.json the request-changes path writes, so the driver
+        // can read the selections instead of re-asking the human. The turn
+        // advances for the same reason it does there — a driver reading
+        // feedback.json must be able to tell this turn's answers from a stale
+        // previous turn's.
+        rs.turn += 1;
+        let fb_json = serde_json::json!({
+            "turn": rs.turn,
+            "decision": "approve",
+            "feedback": feedback,
+            "answers": answers,
+            "annotations": annotations,
+        });
+        let _ = fs::write(p.feedback(), fb_json.to_string());
         let _ = fs::write(p.approved(), b"approved\n");
         rs.state = LoopState::Approved;
         let _ = rs.save(&p.review_state());
@@ -1891,6 +1907,32 @@ mod tests {
 
         let (_, state_body) = http_get(&addr, "/api/runs/r/state");
         assert!(state_body.contains(r#""state":"approved""#));
+    }
+
+    #[test]
+    fn submit_approve_persists_question_answers() {
+        // Approving is the common path for a spec whose open questions the
+        // reviewer just answered. If the answers only survive `request-changes`,
+        // every approved run silently drops them and the next phase has to
+        // re-ask the human.
+        let tmp = make_root("approve-answers");
+        let dir = make_run(tmp.path(), "r", b"# Done");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let payload = r#"{"decision":"approve","feedback":"ship it",
+            "answers":{"q1":"redis","q2":"a custom typed answer"},
+            "annotations":[{"line":3,"note":"n"}]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(status, 200, "body={body}");
+
+        let fb = fs::read_to_string(dir.join("feedback.json")).expect("feedback.json on approve");
+        let v: serde_json::Value = serde_json::from_str(&fb).unwrap();
+        assert_eq!(v["decision"], "approve");
+        assert_eq!(v["feedback"], "ship it");
+        assert_eq!(v["answers"]["q1"], "redis");
+        assert_eq!(v["answers"]["q2"], "a custom typed answer");
+        assert_eq!(v["annotations"][0]["note"], "n");
+        assert_eq!(v["turn"], 1, "turn must advance so the driver sees a fresh turn");
     }
 
     #[test]
