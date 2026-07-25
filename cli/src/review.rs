@@ -36,6 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const MARKDOWN_IT_JS: &[u8] = include_bytes!("../web/vendor/markdown-it.min.js");
+const PIERRE_DIFFS_JS: &[u8] = include_bytes!("../web/vendor/pierre-diffs.js");
 
 // ---------------------------------------------------------------------------
 // State
@@ -134,6 +135,18 @@ fn respond_bytes(req: Request, status: u16, content_type: &str, body: Vec<u8>) {
     let _ = req.respond(resp);
 }
 
+/// Like `respond_bytes` but marks the body immutable/cacheable. Used for the
+/// embedded vendor assets (identical for the life of the binary) so the browser
+/// doesn't re-download them — notably `pierre-diffs.js` is multi-MB and
+/// `no-store` would re-fetch it on every page load.
+fn respond_bytes_cached(req: Request, content_type: &str, body: Vec<u8>) {
+    let resp = Response::from_data(body)
+        .with_status_code(StatusCode(200))
+        .with_header(header("Content-Type", content_type))
+        .with_header(header("Cache-Control", "public, max-age=31536000, immutable"));
+    let _ = req.respond(resp);
+}
+
 fn respond_404(req: Request) {
     respond_str(req, 404, "text/plain", "not found".into());
 }
@@ -223,11 +236,17 @@ fn handle(mut req: Request, shared: &Arc<Mutex<AppState>>) {
         }
         match rel {
             "vendor/markdown-it.min.js" => {
-                respond_bytes(
+                respond_bytes_cached(
                     req,
-                    200,
                     "application/javascript; charset=utf-8",
                     MARKDOWN_IT_JS.to_vec(),
+                );
+            }
+            "vendor/pierre-diffs.js" => {
+                respond_bytes_cached(
+                    req,
+                    "application/javascript; charset=utf-8",
+                    PIERRE_DIFFS_JS.to_vec(),
                 );
             }
             other => {
@@ -942,6 +961,10 @@ mod tests {
         let addr = start_server(tmp.path().to_path_buf(), spec);
 
         let (status, _) = http_get(&addr, "/web/vendor/markdown-it.min.js");
+        assert_eq!(status, 200);
+
+        // The pierre-diffs bundle (client-side diff renderer) is served too.
+        let (status, _) = http_get(&addr, "/web/vendor/pierre-diffs.js");
         assert_eq!(status, 200);
     }
 

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Drovr Review Loop</title>
 <script src="/web/vendor/markdown-it.min.js"></script>
+<script src="/web/vendor/pierre-diffs.js"></script>
 <style>
   /* ---- CSS reset + design tokens ---- */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -788,10 +789,28 @@ function renderFindings(findings) {
   }).join('');
 }
 
-// Render a unified `git diff` (base..HEAD) reusing the same green/red diff-line
-// styling as renderSourceDiff, and layer inline finding markers keyed by the
-// new-side file:line. Defensive: unknown lines render as context.
-function renderReviewDiff(diffText, locMap) {
+// Render a unified `git diff` (base..HEAD) as an AI-annotated, syntax-highlighted
+// diff via @pierre/diffs (client-side SSR). Falls back to the legacy line renderer
+// if the pierre bundle failed to load or errors. Async: preloadPatchDiff returns a
+// promise; callers await it.
+async function renderReviewDiff(diffText, locMap) {
+  var P = window.PierreDiffs;
+  if (P && P.preloadPatchDiff && diffText) {
+    try {
+      var res = await P.preloadPatchDiff({ patch: diffText });
+      if (res && res.prerenderedHTML) {
+        return '<div class="pierre-diff">' + res.prerenderedHTML + '</div>';
+      }
+    } catch (e) {
+      if (window.console) console.error('pierre render failed, using legacy renderer:', e);
+    }
+  }
+  return legacyRenderReviewDiff(diffText, locMap);
+}
+
+// Legacy hand-rolled unified-diff renderer (fallback). Reuses the green/red
+// diff-line styling and layers inline finding markers keyed by new-side file:line.
+function legacyRenderReviewDiff(diffText, locMap) {
   var lines = diffText.replace(/\n$/, '').split('\n');
   var rows = [];
   var curFile = '';
@@ -861,7 +880,7 @@ async function refreshReview() {
   var diffText = await fetchText('/review/diff' + q);
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
-    diffEl.innerHTML = renderReviewDiff(diffText, findingsByLoc(findings));
+    diffEl.innerHTML = await renderReviewDiff(diffText, findingsByLoc(findings));
   } else {
     diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
   }
