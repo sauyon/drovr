@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use crate::herdr::Herdr;
 use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
 
 /// How often [`review_wait`] polls the live server for a reviewer decision.
@@ -485,7 +486,71 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         // POST summary — agent posts a summary; flips state → ready.
         (Method::Post, "summary") => handle_post_summary(req, ctx, run, &p),
 
+        // GET pane — a snapshot of the run's live agent session (herdr read).
+        (Method::Get, "pane") => handle_get_pane(req, &p),
+
+        // POST send — type text into the run's live agent pane (herdr prompt).
+        (Method::Post, "send") => handle_post_send(req, &p),
+
         _ => respond_404(req),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live session mirror (herdr read / prompt)
+// ---------------------------------------------------------------------------
+
+/// The pane that is this run's live agent session: the first phase still
+/// `Running` (with a pane), else the workspace root pane. `None` when the run
+/// has no live pane to mirror.
+fn active_pane(run: &RunState) -> Option<String> {
+    run.phases
+        .iter()
+        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id.is_some())
+        .and_then(|ph| ph.pane_id.clone())
+        .or_else(|| run.root_pane.clone())
+}
+
+/// `GET /api/runs/<run>/pane` — the recent transcript of the run's live agent
+/// session, as plain text (204 when there is no live pane to read).
+fn handle_get_pane(req: Request, p: &RunPaths) {
+    let Some(run) = load_run_state(&p.dir) else {
+        respond_empty(req, 204);
+        return;
+    };
+    let Some(pane) = active_pane(&run) else {
+        respond_empty(req, 204);
+        return;
+    };
+    let h = crate::herdr::SystemHerdr::new();
+    match h.agent_read(&pane) {
+        Ok(text) => respond_str(req, 200, "text/plain; charset=utf-8", text),
+        Err(e) => {
+            eprintln!("drovr pane: read of {pane} failed: {e}");
+            respond_empty(req, 204);
+        }
+    }
+}
+
+/// `POST /api/runs/<run>/send` — type the request body into the run's live
+/// agent pane (herdr submits it). 409 when there is no live pane.
+fn handle_post_send(mut req: Request, p: &RunPaths) {
+    let text = read_body(&mut req);
+    let Some(run) = load_run_state(&p.dir) else {
+        respond_str(req, 409, "text/plain", "no run".into());
+        return;
+    };
+    let Some(pane) = active_pane(&run) else {
+        respond_str(req, 409, "text/plain", "no live pane for this run".into());
+        return;
+    };
+    let h = crate::herdr::SystemHerdr::new();
+    match h.agent_send(&pane, &text) {
+        Ok(()) => respond_str(req, 200, "application/json", r#"{"ok":true}"#.into()),
+        Err(e) => {
+            eprintln!("drovr send: to {pane} failed: {e}");
+            respond_str(req, 500, "text/plain", "send failed".into())
+        }
     }
 }
 
@@ -1024,6 +1089,42 @@ mod tests {
         assert!(names.contains(&"alpha"), "body={body}");
         assert!(names.contains(&"beta"), "body={body}");
         assert_eq!(v[0]["state"], "idle");
+    }
+
+    #[test]
+    fn active_pane_prefers_running_phase_then_root() {
+        let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
+            name: name.into(),
+            status,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: pane.map(|s| s.to_string()),
+        };
+        let mut run = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: Some("claude".into()),
+            phases: vec![
+                mkphase("brainstorm", crate::run::PhaseStatus::Done, Some("w:p1")),
+                mkphase("implement", crate::run::PhaseStatus::Running, Some("w:p2")),
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+        };
+        // Running phase wins.
+        assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
+        // No running phase → falls back to the workspace root pane.
+        run.phases[1].status = crate::run::PhaseStatus::Done;
+        assert_eq!(active_pane(&run).as_deref(), Some("w:root"));
+        // Neither → None.
+        run.root_pane = None;
+        assert_eq!(active_pane(&run), None);
     }
 
     #[test]

@@ -564,6 +564,30 @@
   .run-dot.state-waiting { background: #4098ff; }    /* awaiting agent */
   .run-dot.state-approved { background: #3ec46d; }   /* done */
   .run-dot.state-idle { background: #888; }
+
+  /* ---- Live session mirror ---- */
+  .session-view {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    max-height: 60vh;
+    overflow-y: auto;
+    margin-bottom: 12px;
+  }
+  .session-empty { color: var(--muted); font-style: italic; }
+  .session-input-row { display: flex; gap: 8px; align-items: flex-end; }
+  .session-input-row textarea {
+    flex: 1; min-height: 42px; max-height: 160px; resize: vertical;
+    padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); color: var(--text); font: inherit;
+  }
+  .session-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -586,6 +610,19 @@
   <div id="summary-banner" style="display:none" class="summary-banner">
     <strong>Agent change summary</strong>
     <span id="summary-text"></span>
+  </div>
+
+  <!-- Live session mirror: a snapshot of the run's real agent pane (herdr
+       read), with an input box that types back into it (herdr prompt). This is
+       the primary way to watch and drive a run from the browser. -->
+  <div id="session-panel" style="display:none" class="panel">
+    <div class="panel-title">Live session</div>
+    <div id="session-view" class="session-view"></div>
+    <div class="session-input-row">
+      <textarea id="session-text" placeholder="Type to the agent… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button class="primary" id="session-send" onclick="sendPane()">Send</button>
+    </div>
+    <div class="session-hint">Mirrors the current screen of the real agent pane. Drop to the terminal with <code>drovr attach &lt;run&gt;</code> for full scrollback.</div>
   </div>
 
   <!-- Code-review surface: merged findings + the reviewed base..HEAD diff.
@@ -1421,12 +1458,52 @@ async function renderRunList() {
   }
 }
 
+// ---- Live session mirror ----
+var paneTimer = null;
+
+async function pollPane(gen) {
+  if (gen !== routeGen) return;
+  try {
+    var r = await fetch(api('pane'));
+    var text = r.status === 200 ? await r.text() : '';
+    if (gen !== routeGen) return;
+    var view = document.getElementById('session-view');
+    // Only stick to the bottom if the user is already near it (don't yank the
+    // scroll while they're reading up-transcript).
+    var atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+    if (text) {
+      view.textContent = text;
+    } else {
+      view.innerHTML = '<span class="session-empty">No live pane for this run (it may not be running).</span>';
+    }
+    if (atBottom) view.scrollTop = view.scrollHeight;
+  } catch (e) { /* transient; keep polling */ }
+  if (gen === routeGen) paneTimer = setTimeout(function(){ pollPane(gen); }, 1000);
+}
+
+async function sendPane() {
+  var el = document.getElementById('session-text');
+  var text = el.value;
+  if (!text.trim()) return;
+  el.value = '';
+  try {
+    await fetch(api('send'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      body: text
+    });
+  } catch (e) { /* ignore; next poll reflects state */ }
+  // Reflect promptly.
+  setTimeout(function(){ pollPane(routeGen); }, 200);
+}
+
 // ---- Router ----
-var DETAIL_PANELS = ['summary-banner', 'review-panel', 'diff-panel',
+var DETAIL_PANELS = ['summary-banner', 'session-panel', 'review-panel', 'diff-panel',
   'doc-panel', 'waiting-overlay', 'approved-overlay', 'form-section'];
 
 async function route() {
   clearTimeout(pollTimer);
+  clearTimeout(paneTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   currentRun = h.run;
@@ -1446,10 +1523,17 @@ async function route() {
   hideEl('run-list');
   showEl('back-link');
   showEl('doc-panel');
+  // Live session mirror: primary surface, polled independently of the gate.
+  showEl('session-panel');
+  pollPane(routeGen);
   await refresh();
 }
 
 // ---- Init ----
+// Enter sends to the live pane; Shift+Enter inserts a newline.
+document.getElementById('session-text').addEventListener('keydown', function(e){
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPane(); }
+});
 window.addEventListener('hashchange', function(){ route().catch(console.error); });
 route().catch(console.error);
 </script>

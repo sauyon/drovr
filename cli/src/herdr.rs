@@ -260,17 +260,14 @@ impl Herdr for SystemHerdr {
     }
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
-        // 0.7.5 socket API: agent.read returns the recent transcript in `text`.
+        // 0.7.5 socket API: agent.read nests the transcript at
+        // `result.read.text` (result = {type:"pane_read", read:{…,text}}), so
+        // dig for it rather than reading `result.text` (which is always absent).
         let result = self.socket_call(
             "agent.read",
             json!({ "target": target, "source": "recent" }),
         )?;
-        let text = result
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Ok(text)
+        Ok(find_string_field(&result, "text").unwrap_or_default())
     }
 
     fn agent_status(&self, pane_id: &str) -> Option<String> {
