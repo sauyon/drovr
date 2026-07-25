@@ -7,8 +7,13 @@ use crate::config::load_config;
 use crate::herdr::Herdr;
 use crate::run::{Phase, PhaseStatus, RunState, run_dir};
 
-/// How often `phase_wait` polls the filesystem for the completion marker.
+/// How often `phase_wait` polls the filesystem for the completion marker, and
+/// how often `wait_agent_ready` polls the pane's agent status.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long `phase_send` waits for a freshly-spawned agent to reach its composer
+/// before delivering the prompt (see `wait_agent_ready`).
+const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Path of the completion marker a phase agent drops via `drovr phase done`.
 /// `pub(crate)` so the code-review orchestrator can compute reviewer marker paths
@@ -268,9 +273,104 @@ pub fn spawn_reviewer<H: Herdr>(
     Ok(())
 }
 
-/// Send `text` to the running phase pane.
+/// Whether `status` (a pane's herdr `agent_status`) means the agent has STARTED
+/// AND is at its composer, so a prompt sent now will land. `idle`, `working`, and
+/// `done` qualify; `None` (unreadable), `"unknown"`, and `"blocked"` do not.
+///
+/// Deliberately NOT limited to `idle`: a `working` agent has a composer too (the
+/// prompt just queues), so gating on `idle` alone would make `phase_send` block
+/// the full timeout on any follow-up send to a busy agent, which never returns to
+/// `idle` mid-task. We only need "has it started", not "is it free".
+///
+/// `blocked` is deliberately EXCLUDED even though it means the agent attached: a
+/// pane blocked on a first-run/trust/permission prompt is NOT sitting at its
+/// composer, so `agent.prompt` would type into that dialog — corrupting it and
+/// swallowing the seed (the original flake, wearing a new hat). Treating `blocked`
+/// as not-ready lets the gate wait it out; if it never clears, `phase_send` raises
+/// `TimedOut`, which the CLI surfaces via `diagnose_stuck_phase` so a human can
+/// answer the prompt.
+fn agent_has_started(status: Option<&str>) -> bool {
+    matches!(status, Some("idle") | Some("working") | Some("done"))
+}
+
+/// Poll until the agent in `pane_id` has STARTED, returning `true` once it has,
+/// or `false` if `timeout` elapses first. A freshly-spawned `claude` needs a
+/// moment to boot its TUI and attach its integration; `agent.prompt` types AND
+/// submits natively, so firing it into a still-booting pane drops or garbles the
+/// prompt — the "phase send is flaky" race. herdr reports a definite
+/// `agent_status` once the agent has attached (see `agent_has_started`), so poll
+/// for that. The query is the same read-only `pane get` `phase_wait` polls, so it
+/// never moves focus.
+///
+/// A `false` return is NOT ignored by the caller: `phase_send` treats "never
+/// became ready" as a failure to RAISE (the agent is likely parked on a first-run
+/// or permission prompt with no human at the pane), rather than blindly sending a
+/// prompt the agent can't receive.
+fn wait_agent_ready<H: Herdr>(
+    h: &H,
+    pane_id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if agent_has_started(h.agent_status(pane_id).as_deref()) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(poll_interval.min(deadline - now));
+    }
+}
+
+/// Send `text` to the running phase pane, first waiting for the agent to attach
+/// (see `wait_agent_ready`) so a prompt sent right after `phase_start` isn't lost
+/// to a still-booting agent.
+///
+/// If the agent does not become ready within [`SEND_READY_TIMEOUT`], this does NOT
+/// send — it returns a `TimedOut` error naming the run/phase and suggesting
+/// `drovr attach`. A never-ready agent is almost always parked on a first-run or
+/// permission prompt with no human at the pane; sending a prompt it can't receive
+/// would silently swallow the seed and leave the phase to hang until its `phase
+/// wait` times out. Raising instead surfaces the stuck agent to the driver (the
+/// CLI enriches this with a pane snapshot via `diagnose_stuck_phase`).
 pub fn phase_send<H: Herdr>(h: &H, run: &RunState, phase: &str, text: &str) -> io::Result<()> {
+    phase_send_with_timeout(h, run, phase, text, SEND_READY_TIMEOUT, POLL_INTERVAL)
+}
+
+/// [`phase_send`] with an injectable readiness timeout + poll interval (so tests
+/// can exercise the not-ready path, and the poll loop, without waiting out the
+/// full production timeout or real 500ms poll cadence).
+fn phase_send_with_timeout<H: Herdr>(
+    h: &H,
+    run: &RunState,
+    phase: &str,
+    text: &str,
+    ready_timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<()> {
     let pane_id = require_pane_id(run, phase)?;
+    if !wait_agent_ready(h, &pane_id, ready_timeout, poll_interval) {
+        // Render sub-second timeouts as ms so an injected test timeout doesn't
+        // print a misleading "within 0s"; production (30s) reads "within 30s".
+        let waited = if ready_timeout.as_secs() >= 1 {
+            format!("{}s", ready_timeout.as_secs())
+        } else {
+            format!("{}ms", ready_timeout.as_millis())
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "agent for phase '{phase}' of run '{run_name}' did not become ready \
+                 within {waited} — not sending. It is likely parked on a first-run or \
+                 permission prompt with no human at the pane. Attach to check: \
+                 drovr attach {run_name}",
+                run_name = run.name,
+            ),
+        ));
+    }
     h.agent_send(&pane_id, text)
 }
 
@@ -433,14 +533,16 @@ fn tail_snippet(pane: &str, n: usize) -> String {
 /// pane tail, suggesting `drovr attach`). Returns `None` when the pane is not
 /// recognizably stuck (it may just be mid-work) or has no pane_id yet.
 ///
+/// Resolves the pane via `find_phase` (both `phases` AND `review_phases`) so a
+/// `TimedOut` on `drovr phase send <run> review:...` still gets a pane snapshot,
+/// not just the bare error text.
+///
 /// Read-only and focus-safe: `agent_read` never moves focus, so no capture /
-/// restore is needed. Intended to be called ONCE on a `phase wait` timeout, not
-/// in a poll loop. A failed pane read is swallowed (returns `None`) — a
-/// best-effort diagnostic must never mask the underlying timeout with a new
-/// error.
+/// restore is needed. Intended to be called ONCE on a timeout, not in a poll
+/// loop. A failed pane read is swallowed (returns `None`) — a best-effort
+/// diagnostic must never mask the underlying timeout with a new error.
 pub fn diagnose_stuck_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Option<String> {
-    let idx = find_phase_idx(run, phase)?;
-    let pane_id = run.phases[idx].pane_id.clone()?;
+    let pane_id = run.find_phase(phase)?.pane_id.clone()?;
     let pane = h.agent_read(&pane_id).ok()?;
     let matched = detect_stuck_prompt(&pane)?;
     let snippet = tail_snippet(&pane, 6);
@@ -1196,6 +1298,8 @@ mod tests {
             herdr_session: None,
             pane_id: Some("review-pane-9".into()),
         });
+        // Report the pane ready so the readiness gate returns on the first poll.
+        h.push_status(Some("idle"));
         phase_send(&h, &run, "review:t:1:correctness", "seed text").unwrap();
         let calls = h.calls();
         let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
@@ -1213,6 +1317,8 @@ mod tests {
         let mut run = make_run("send-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
+        // Report the pane ready so the readiness gate returns on the first poll.
+        h.push_status(Some("idle"));
         phase_send(&h, &run, "code", "hello agent").unwrap();
 
         // Last call should be agent_send
@@ -1222,6 +1328,145 @@ mod tests {
         // Target should match the pane_id recorded
         let pane_id = run.phases[0].pane_id.as_ref().unwrap();
         assert!(send_call.contains(pane_id.as_str()));
+    }
+
+    // -- agent_has_started: which statuses mean "attached AND at the composer" -
+    #[test]
+    fn agent_has_started_recognizes_attached_states() {
+        // At the composer, safe to send.
+        assert!(agent_has_started(Some("idle")));
+        assert!(agent_has_started(Some("working")));
+        assert!(agent_has_started(Some("done")));
+        // Still-booting / unconfirmed: must keep waiting.
+        assert!(!agent_has_started(None));
+        assert!(!agent_has_started(Some("unknown")));
+        // `blocked` = attached but parked on a prompt, NOT at the composer — must
+        // NOT release the gate (sending would type into the dialog).
+        assert!(!agent_has_started(Some("blocked")));
+    }
+
+    // -- phase_send waits for the agent to attach before sending --------------
+    #[test]
+    fn send_waits_for_agent_ready_before_sending() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-ready-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        // The agent boots: unreadable, then `unknown` (pane seen, no agent yet),
+        // then `blocked` (attached but parked on a prompt — still NOT at the
+        // composer), then finally a composer-ready state. The send must NOT fire
+        // until that last state; in particular `blocked` must not release it.
+        h.push_status(None::<String>);
+        h.push_status(Some("unknown"));
+        h.push_status(Some("blocked"));
+        h.push_status(Some("idle"));
+
+        // Tiny poll interval so the three waited polls don't cost real wall-clock.
+        phase_send_with_timeout(
+            &h,
+            &run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        // Polled through all three un-ready states (incl. blocked) before the send,
+        // and every poll came before the send.
+        let first_send = calls.iter().position(|c| c.contains("agent_send")).unwrap();
+        let status_polls = calls
+            .iter()
+            .filter(|c| c.contains("agent_status"))
+            .count();
+        assert!(
+            status_polls >= 4,
+            "must poll through none/unknown/blocked until the composer is ready: {calls:?}"
+        );
+        assert!(
+            calls[..first_send]
+                .iter()
+                .filter(|c| c.contains("agent_status"))
+                .count()
+                == status_polls,
+            "all status polls must precede the send: {calls:?}"
+        );
+    }
+
+    // A follow-up send to an already-`working` agent must NOT block: `working` is
+    // a started state, so the gate releases on the first poll (regression guard
+    // for the "gate on idle only → 30s stall on busy agents" bug).
+    #[test]
+    fn send_to_working_agent_does_not_block() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-working-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("working"));
+
+        let start = Instant::now();
+        phase_send(&h, &run, "code", "follow-up").unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "send to a working agent must not wait out the readiness timeout"
+        );
+        // Exactly one status poll: the first `working` releases the gate.
+        let calls = h.calls();
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("agent_status")).count(),
+            1,
+            "a started agent must release the gate on the first poll: {calls:?}"
+        );
+    }
+
+    // When the agent never attaches within the readiness timeout, phase_send must
+    // RAISE (a `TimedOut` error naming the run/phase) and must NOT send — a prompt
+    // into a never-ready pane would be silently swallowed.
+    #[test]
+    fn send_raises_and_does_not_send_when_agent_never_ready() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-never-ready-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        // The pane keeps reporting an un-started state — it never attaches. (Enough
+        // entries to outlast every poll within the tiny timeout below; the default
+        // is `idle`, so the queue must not drain to it before the deadline.)
+        for _ in 0..8 {
+            h.push_status(Some("unknown"));
+        }
+
+        // Coarse poll interval (500ms) vs a 50ms timeout ⇒ at most 2 polls, so the
+        // 8 queued `unknown`s can never drain to the idle default before the
+        // deadline. Deterministic, ~50ms wall-clock.
+        let err = phase_send_with_timeout(
+            &h,
+            &run,
+            "code",
+            "seed text",
+            Duration::from_millis(50),
+            POLL_INTERVAL,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "must be a TimedOut error");
+        assert!(
+            err.to_string().contains("send-never-ready-test")
+                && err.to_string().contains("code"),
+            "error must name the run and phase: {err}"
+        );
+        assert!(
+            err.to_string().contains("drovr attach"),
+            "error must suggest attach: {err}"
+        );
+        // Crucially, no prompt was delivered.
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send")),
+            "must not send a prompt when the agent never became ready: {:?}",
+            h.calls()
+        );
     }
 
     #[test]
@@ -1339,6 +1584,13 @@ mod tests {
     #[test]
     fn phase_start_sets_drovr_phase() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // Hermetic: clear the config-dir/secret env so the command shape is
+        // deterministic regardless of the ambient environment this test runs in.
+        // (CLAUDE_CONFIG_DIR, when set, IS inlined — see the dedicated test below.)
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
         let h = FakeHerdr::new();
         let mut run = make_run("start-test");
 
@@ -1357,6 +1609,43 @@ mod tests {
         );
         assert!(
             !run_call.contains("CLAUDE_CONFIG_DIR"),
+            "config dir absent when unset: {run_call}"
+        );
+    }
+
+    // -- A1b: when CLAUDE_CONFIG_DIR is set, it IS inlined (single-quoted) into
+    //    the launch command so the spawned agent authenticates as the caller's
+    //    profile. It is a path, not a secret, so inlining is safe (see
+    //    `launch_in_pane`). This locks the behavior that made phase_start_sets_
+    //    drovr_phase environment-sensitive before it was made hermetic.
+    #[test]
+    fn phase_start_inlines_claude_config_dir_when_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        let h = FakeHerdr::new();
+        let mut run = make_run("cfg-dir-test");
+
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        // Restore the env immediately (before any fallible assertion) so no code
+        // path out of this test leaks the var to the next ENV_LOCK holder.
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(
+                r"DROVR_PHASE='cfg-dir-test/brainstorm' CLAUDE_CONFIG_DIR='/home/user/.config/claude-work' claude"
+            ),
+            "CLAUDE_CONFIG_DIR must be inlined single-quoted after DROVR_PHASE: {run_call}"
+        );
+        // A real secret still never rides the command line.
+        assert!(
+            !run_call.contains("ANTHROPIC_API_KEY"),
             "no secret in command: {run_call}"
         );
     }
@@ -1366,6 +1655,12 @@ mod tests {
     #[test]
     fn phase_start_shell_quotes_unsafe_phase_name() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // Hermetic: clear CLAUDE_CONFIG_DIR so `claude` follows DROVR_PHASE directly
+        // regardless of the ambient environment (an inlined config dir would sit
+        // between them — see phase_start_inlines_claude_config_dir_when_set).
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
         let h = FakeHerdr::new();
         let mut run = make_run("inject-test");
 
@@ -1659,6 +1954,8 @@ mod tests {
         );
 
         // phase_send routes to the reviewer pane registered in review_phases.
+        // Report the pane ready so the readiness gate returns on the first poll.
+        h.push_status(Some("idle"));
         phase_send(&h, &run, "review:t:1:correctness", "here is your brief").unwrap();
         let send_call = h
             .calls()

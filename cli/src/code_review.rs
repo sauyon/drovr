@@ -530,6 +530,12 @@ mod tests {
         )
         .unwrap();
         write_base(&run, "task-1");
+        // The seed path calls `phase_send`, whose readiness gate polls
+        // `agent_status` once per angle; feed it an `idle` per angle so those polls
+        // don't consume the `done` statuses the wait loop below relies on.
+        for _ in 0..4 {
+            h.push_status(Some("idle"));
+        }
         for _ in 0..4 {
             h.push_status(Some("done"));
             h.push_read(format!("```json\n{CLEAN}\n```"));

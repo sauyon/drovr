@@ -485,9 +485,16 @@ impl Herdr for FakeHerdr {
 
     fn agent_status(&self, pane_id: &str) -> Option<String> {
         self.record(format!("agent_status target={pane_id}"));
-        // An empty queue models a pane with no reportable status (yields None),
-        // so the default poll path (no scripted blocked status) keeps waiting.
-        self.status_queue.borrow_mut().pop_front().flatten()
+        // A scripted status (pushed via `push_status`) is consumed FIFO. When the
+        // queue is empty the fake models a booted, ready agent parked at its
+        // composer — `Some("idle")` — so a test that does not care about status
+        // (the common case) sails through `phase_send`'s readiness gate instead of
+        // waiting out its timeout. Tests that need a different status (blocked,
+        // done, or an unreadable `None`) push it explicitly.
+        match self.status_queue.borrow_mut().pop_front() {
+            Some(scripted) => scripted,
+            None => Some("idle".to_string()),
+        }
     }
 
     fn integration_present(&self, agent: &str) -> bool {
@@ -597,12 +604,16 @@ mod tests {
     #[test]
     fn fake_status_queue() {
         let h = FakeHerdr::new();
-        // Empty queue → None (default "keep waiting" path).
-        assert_eq!(h.agent_status("pane-1"), None);
+        // Empty queue → a ready, idle agent (so phase_send's readiness gate does
+        // not wait out its timeout when a test does not script status).
+        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
         h.push_status(Some("blocked"));
         h.push_status(None::<String>);
+        // Scripted values are consumed FIFO, including an explicit unreadable None.
         assert_eq!(h.agent_status("pane-1").as_deref(), Some("blocked"));
         assert_eq!(h.agent_status("pane-1"), None);
+        // Queue drained → back to the idle default.
+        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
         assert!(
             h.calls()
                 .iter()
