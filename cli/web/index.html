@@ -264,6 +264,25 @@
   }
   .diff-line.hunk { background: var(--bg); }
 
+  /* ---- Inline findings rendered into pierre's annotation slots ---- */
+  .pierre-diff [data-annotation-content] { padding: 0; }
+  .pierre-finding {
+    font-family: var(--font);
+    font-size: 0.82rem;
+    line-height: 1.45;
+    margin: 4px 6px 4px 2.4em;
+    padding: 6px 10px;
+    border-left: 3px solid var(--border);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    background: color-mix(in srgb, var(--surface) 60%, transparent);
+  }
+  .pierre-finding.critical { border-left-color: var(--danger); }
+  .pierre-finding.important { border-left-color: var(--warn-border); }
+  .pierre-finding.nit { border-left-color: var(--muted); }
+  .pierre-finding .sev-badge { margin-right: 6px; }
+  .pierre-finding .pf-summary { color: var(--text); }
+  .pierre-finding .pf-rationale { color: var(--muted); margin-top: 3px; font-size: 0.95em; }
+
   /* ---- Code-review findings ---- */
   .review-verdict {
     font-size: .82rem;
@@ -793,11 +812,13 @@ function renderFindings(findings) {
 // diff via @pierre/diffs (client-side SSR). Falls back to the legacy line renderer
 // if the pierre bundle failed to load or errors. Async: preloadPatchDiff returns a
 // promise; callers await it.
-async function renderReviewDiff(diffText, locMap) {
+async function renderReviewDiff(diffText, findings) {
   var P = window.PierreDiffs;
   if (P && P.preloadPatchDiff && diffText) {
     try {
-      var res = await P.preloadPatchDiff({ patch: diffText });
+      // Pass findings as annotations so pierre reserves an (empty) slot at each
+      // finding's line; fillFindingAnnotations() populates them after insertion.
+      var res = await P.preloadPatchDiff({ patch: diffText, annotations: findingsToAnnotations(findings) });
       if (res && res.prerenderedHTML) {
         return '<div class="pierre-diff">' + res.prerenderedHTML + '</div>';
       }
@@ -805,7 +826,65 @@ async function renderReviewDiff(diffText, locMap) {
       if (window.console) console.error('pierre render failed, using legacy renderer:', e);
     }
   }
-  return legacyRenderReviewDiff(diffText, locMap);
+  return legacyRenderReviewDiff(diffText, findingsByLoc(findings));
+}
+
+// Findings with a new-side line → pierre additions-side annotation stubs. SSR has
+// no renderAnnotation hook, so pierre emits an empty slot per annotation; we fill
+// it in fillFindingAnnotations().
+function findingsToAnnotations(findings) {
+  return (findings || [])
+    .filter(function(f) { return f.line != null; })
+    .map(function(f) { return { side: 'additions', lineNumber: f.line, metadata: {} }; });
+}
+
+// Recover the file order pierre indexes annotations by, from the +++ b/<path> lines.
+function diffFileOrder(diffText) {
+  var files = [];
+  (diffText || '').split('\n').forEach(function(l) {
+    if (l.indexOf('+++ ') === 0) files.push(l.slice(4).replace(/^b\//, ''));
+  });
+  return files;
+}
+
+// Populate pierre's empty annotation slots with finding content. pierre encodes
+// each slot as data-line-annotation="<fileIndex>,<fileLine-1>" (verified), so we
+// match slots to findings by (file, line).
+function fillFindingAnnotations(container, diffText, findings) {
+  if (!container || !findings || !findings.length) return;
+  var files = diffFileOrder(diffText);
+  var byKey = {};
+  findings.forEach(function(f) {
+    if (f.file && f.line != null) {
+      var k = f.file + ':' + f.line;
+      (byKey[k] = byKey[k] || []).push(f);
+    }
+  });
+  var seen = {};
+  container.querySelectorAll('[data-line-annotation]').forEach(function(wrap) {
+    var parts = (wrap.getAttribute('data-line-annotation') || '').split(',');
+    if (parts.length < 2) return;
+    var fileIdx = parseInt(parts[0], 10);
+    var line = parseInt(parts[parts.length - 1], 10) + 1;
+    var key = files[fileIdx] + ':' + line;
+    var hits = byKey[key];
+    if (!hits) return;
+    var slot = wrap.querySelector('[data-annotation-content]') || wrap;
+    // A split view renders the slot on both sides; only fill the first per key so
+    // the finding isn't duplicated across columns.
+    if (seen[key]) { slot.innerHTML = ''; return; }
+    seen[key] = true;
+    slot.innerHTML = hits.map(renderFindingInline).join('');
+  });
+}
+
+function renderFindingInline(f) {
+  var sev = (f.severity || 'nit').toLowerCase();
+  return '<div class="pierre-finding ' + escHtml(sev) + '">'
+    + '<span class="sev-badge ' + escHtml(sev) + '">' + escHtml(sev) + '</span>'
+    + '<span class="pf-summary">' + escHtml(f.summary || '') + '</span>'
+    + (f.rationale ? '<div class="pf-rationale">' + escHtml(f.rationale) + '</div>' : '')
+    + '</div>';
 }
 
 // Legacy hand-rolled unified-diff renderer (fallback). Reuses the green/red
@@ -880,7 +959,8 @@ async function refreshReview() {
   var diffText = await fetchText('/review/diff' + q);
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
-    diffEl.innerHTML = await renderReviewDiff(diffText, findingsByLoc(findings));
+    diffEl.innerHTML = await renderReviewDiff(diffText, findings);
+    fillFindingAnnotations(diffEl, diffText, findings);
   } else {
     diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
   }
