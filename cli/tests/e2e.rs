@@ -123,23 +123,11 @@ fn free_port() -> u16 {
 // ---------------------------------------------------------------------------
 
 fn drovr_binary() -> PathBuf {
-    // Prefer the binary produced by `cargo test` (same profile).
-    // CARGO_TARGET_DIR may be set; fall back to conventional location.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = manifest.join("target/debug/drovr");
-    if bin.exists() {
-        return bin;
-    }
-    // Workspace target dir (one level up from cli/)
-    let ws_bin = manifest
-        .parent()
-        .unwrap_or(&manifest)
-        .join("target/debug/drovr");
-    if ws_bin.exists() {
-        return ws_bin;
-    }
-    // Last resort: look for it relative to OUT_DIR (set during `cargo test`)
-    bin // will fail at runtime with a clear error if missing
+    // The binary cargo built for this test run, whatever the profile (debug,
+    // release, or a nix sandbox's release). `CARGO_BIN_EXE_<name>` is set by
+    // cargo for integration tests and always points at the real artifact —
+    // unlike a hardcoded `target/debug/drovr`, which is absent under `--release`.
+    PathBuf::from(env!("CARGO_BIN_EXE_drovr"))
 }
 
 // ---------------------------------------------------------------------------
