@@ -36,11 +36,6 @@ This is not optional and not gated on the change's size; it runs whether you
 worked inline or across phases.
 <!-- /reflex:section:always-review -->
 
-**Isolate when it helps.** To keep the invoking checkout clean while a run edits
-the repo, give the run its own git worktree — `drovr new --worktree`. See
-**`drovr:worktrees`** for when to isolate and how the branch is handed back (drovr
-never merges it for you).
-
 <!-- reflex:section:methodology -->
 ## For the task in front of you, apply the right methodology skill
 
