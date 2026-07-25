@@ -4,7 +4,7 @@
 //! dir. It presents a session-list landing view (`GET /api/runs`) and, per run,
 //! the interactive spec-review surface: read the spec, diff it against the
 //! prior version, answer MC questions, leave per-line annotations, and submit a
-//! decision (approve / request-changes). The same run-scoped surface also
+//! decision (approve / request-changes / cancel). The same run-scoped surface also
 //! serves the code-review panel (`/api/runs/<run>/review/{findings,diff}`).
 //!
 //! The agent counterpart calls [`review_summary`] to POST the summary text for
@@ -75,6 +75,9 @@ enum LoopState {
     Waiting,
     Ready,
     Approved,
+    /// The human abandoned the run at the gate. Terminal, like `Approved`, but
+    /// the opposite verdict — a driver must be able to tell them apart.
+    Cancelled,
 }
 
 impl LoopState {
@@ -84,6 +87,7 @@ impl LoopState {
             LoopState::Waiting => "waiting",
             LoopState::Ready => "ready",
             LoopState::Approved => "approved",
+            LoopState::Cancelled => "cancelled",
         }
     }
 
@@ -92,8 +96,18 @@ impl LoopState {
             "waiting" => LoopState::Waiting,
             "ready" => LoopState::Ready,
             "approved" => LoopState::Approved,
+            "cancelled" => LoopState::Cancelled,
             _ => LoopState::Idle,
         }
+    }
+
+    /// `Approved` and `Cancelled` are verdicts, not phases: once a human has
+    /// decided, neither the agent nor a stray client may move the run off one.
+    /// Without this a late `POST /summary` — very likely, since the agent is
+    /// usually still mid-revision when the human cancels — would flip
+    /// `cancelled` back to `ready` and silently erase the decision.
+    fn is_terminal(&self) -> bool {
+        matches!(self, LoopState::Approved | LoopState::Cancelled)
     }
 }
 
@@ -166,6 +180,9 @@ impl RunPaths {
     }
     fn approved(&self) -> PathBuf {
         self.dir.join("approved")
+    }
+    fn cancelled(&self) -> PathBuf {
+        self.dir.join("cancelled")
     }
     fn questions(&self) -> PathBuf {
         self.dir.join("questions.json")
@@ -680,7 +697,7 @@ fn handle_review_diff(req: Request, p: &RunPaths, url: &str) {
     }
 }
 
-/// `POST /api/runs/<run>/submit` — reviewer approve / request-changes.
+/// `POST /api/runs/<run>/submit` — reviewer approve / cancel / request-changes.
 ///
 /// Holds this run's OWN state lock across the handler so its read-modify-write
 /// of state + the prior.md snapshot are atomic w.r.t. a concurrent `POST
@@ -704,6 +721,18 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
     let cell = ctx.cell(run, p);
     let mut rs = cell.lock().unwrap_or_else(|e| e.into_inner());
 
+    if rs.state.is_terminal() {
+        let state = rs.state.as_str();
+        drop(rs);
+        respond_str(
+            req,
+            409,
+            "application/json",
+            format!(r#"{{"ok":false,"state":"{state}"}}"#),
+        );
+        return;
+    }
+
     if decision == "approve" {
         let _ = fs::write(p.approved(), b"approved\n");
         rs.state = LoopState::Approved;
@@ -714,6 +743,20 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
             200,
             "application/json",
             r#"{"ok":true,"state":"approved"}"#.into(),
+        );
+    } else if decision == "cancel" {
+        // Terminal like approve, but the opposite verdict: the human is
+        // abandoning the run. The marker mirrors `approved` so a driver (or a
+        // human poking at the run dir) can see the outcome without the server.
+        let _ = fs::write(p.cancelled(), b"cancelled\n");
+        rs.state = LoopState::Cancelled;
+        let _ = rs.save(&p.review_state());
+        drop(rs);
+        respond_str(
+            req,
+            200,
+            "application/json",
+            r#"{"ok":true,"state":"cancelled"}"#.into(),
         );
     } else {
         // Snapshot the submitted spec as BOTH prior.md and last_summarized.md.
@@ -758,6 +801,19 @@ fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths
 
     let cell = ctx.cell(run, p);
     let mut rs = cell.lock().unwrap_or_else(|e| e.into_inner());
+
+    // A decided run is closed: reject the summary rather than reviving it.
+    if rs.state.is_terminal() {
+        let state = rs.state.as_str();
+        drop(rs);
+        respond_str(
+            req,
+            409,
+            "application/json",
+            format!(r#"{{"ok":false,"state":"{state}"}}"#),
+        );
+        return;
+    }
 
     // Re-baseline the diff per revision. The reviewer's diff is (current spec)
     // vs prior.md; we want each revision to diff against the *previous*
@@ -1057,6 +1113,16 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
 
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
+    // 409 means the run already reached a terminal verdict. Name it, so the
+    // agent learns *why* its revision was refused instead of retrying blindly.
+    if response.contains(" 409 ") {
+        let body = response.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or_default();
+        let state = parsed["state"].as_str().unwrap_or("decided");
+        return Err(io::Error::other(format!(
+            "run '{run}' is already {state}; the review gate is closed — stop revising the spec"
+        )));
+    }
     if !response.starts_with("HTTP/1") || !response.contains(" 200 ") {
         return Err(io::Error::other(format!(
             "unexpected response from review server: {}",
@@ -1073,6 +1139,9 @@ pub enum WaitOutcome {
     Approved,
     /// Reviewer requested changes — `feedback.json` holds this turn's feedback.
     ChangesRequested,
+    /// Reviewer cancelled the run — the `cancelled` marker is present. Terminal:
+    /// the driver should tear the run down, not revise the spec.
+    Cancelled,
     /// No reviewer action within the timeout; the caller may re-run to resume.
     Timeout,
 }
@@ -1104,10 +1173,11 @@ fn fetch_state(addr: &str, run: &str) -> io::Result<String> {
 /// Ensures the server is up, then polls the authoritative `GET
 /// /api/runs/<run>/state` at [`POLL_INTERVAL`] until either the reviewer
 /// submits or `timeout_ms` elapses. Blocks while state is `idle`/`ready`;
-/// returns [`WaitOutcome::Approved`] once approved and
+/// returns [`WaitOutcome::Approved`] once approved,
 /// [`WaitOutcome::ChangesRequested`] once changes are requested
-/// (`feedback.json` holds the turn). On timeout returns [`WaitOutcome::Timeout`]
-/// — the wait is resumable, so a driver just re-runs it.
+/// (`feedback.json` holds the turn), and [`WaitOutcome::Cancelled`] once the
+/// reviewer cancels. On timeout returns [`WaitOutcome::Timeout`] — the wait is
+/// resumable, so a driver just re-runs it.
 pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
     let addr = ensure_server()?;
 
@@ -1115,6 +1185,7 @@ pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
     loop {
         match fetch_state(&addr, run)?.as_str() {
             "approved" => return Ok(WaitOutcome::Approved),
+            "cancelled" => return Ok(WaitOutcome::Cancelled),
             "waiting" => return Ok(WaitOutcome::ChangesRequested),
             // "idle" / "ready" — reviewer has not acted yet; keep blocking.
             _ => {}
@@ -1592,6 +1663,31 @@ mod tests {
     }
 
     #[test]
+    fn submit_cancel_writes_marker_and_flips_cancelled() {
+        let tmp = make_root("cancel");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let payload = r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains(r#""state":"cancelled""#), "body={body}");
+
+        let marker = fs::read(dir.join("cancelled")).expect("cancelled marker");
+        assert_eq!(marker, b"cancelled\n");
+
+        let (_, state_body) = http_get(&addr, "/api/runs/r/state");
+        assert!(
+            state_body.contains(r#""state":"cancelled""#),
+            "{state_body}"
+        );
+
+        // Persisted, so a restarted server still reports cancelled.
+        let persisted = fs::read_to_string(dir.join("review.state.json")).unwrap();
+        assert!(persisted.contains(r#""state":"cancelled""#), "{persisted}");
+    }
+
+    #[test]
     fn doc_graceful_when_spec_absent() {
         let tmp = make_root("no-spec");
         let dir = tmp.path().join("r");
@@ -1627,6 +1723,13 @@ mod tests {
         let (status, body) = http_get(&addr, "/");
         assert_eq!(status, 200);
         assert!(body.contains("Drovr Review"), "title missing");
+        // The cancel control and its terminal-state overlay must ship with the
+        // embedded page — without them the server-side signal is unreachable.
+        assert!(body.contains("cancel-btn"), "cancel control missing");
+        assert!(
+            body.contains("cancelled-overlay"),
+            "cancelled overlay missing"
+        );
     }
 
     #[test]
@@ -1772,6 +1875,130 @@ mod tests {
         let fb = fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("feedback.json"))
             .expect("feedback.json");
         assert!(fb.contains("needs work"), "feedback.json: {fb}");
+    }
+
+    #[test]
+    fn summary_on_a_cancelled_run_errors_clearly() {
+        // The agent's own exit path: it posts a summary, the run is already
+        // cancelled, and the message must name that — not "unexpected response".
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (addr, run, _tmp) = global_fixture("summary-cancelled");
+        http_post(
+            &addr,
+            &format!("/api/runs/{run}/submit"),
+            "application/json",
+            r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#,
+        );
+
+        let err = review_summary(&run, "late revision").expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("cancelled"), "message must name the state: {msg}");
+    }
+
+    #[test]
+    fn wait_returns_cancelled() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (addr, run, tmp) = global_fixture("cancel");
+        http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
+
+        let run_t = run.clone();
+        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        thread::sleep(Duration::from_millis(200));
+        assert!(!handle.is_finished(), "wait must block while `ready`");
+
+        http_post(
+            &addr,
+            &format!("/api/runs/{run}/submit"),
+            "application/json",
+            r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#,
+        );
+        assert_eq!(
+            handle.join().unwrap().expect("wait"),
+            WaitOutcome::Cancelled
+        );
+
+        assert!(
+            tmp.path()
+                .join("drovr/runs")
+                .join(&run)
+                .join("cancelled")
+                .exists(),
+            "cancelled marker must be on disk"
+        );
+    }
+
+    #[test]
+    fn cancelled_is_terminal_against_a_late_summary() {
+        // The realistic race: the human cancels while the agent is still
+        // mid-revision, then the agent (unaware) posts its summary. If that
+        // flipped the run back to `ready`, the cancelled signal would be lost
+        // and the driver would resume waiting — exactly the bug this fixes.
+        let tmp = make_root("cancel-terminal-summary");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let payload = r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#;
+        assert_eq!(
+            http_post(&addr, "/api/runs/r/submit", "application/json", payload).0,
+            200
+        );
+
+        let (status, _) = http_post(&addr, "/api/runs/r/summary", "text/plain", "late revision");
+        assert_eq!(status, 409, "a cancelled run must reject a late summary");
+
+        let (_, state_body) = http_get(&addr, "/api/runs/r/state");
+        assert!(state_body.contains(r#""state":"cancelled""#), "{state_body}");
+        let persisted = fs::read_to_string(dir.join("review.state.json")).unwrap();
+        assert!(persisted.contains(r#""state":"cancelled""#), "{persisted}");
+    }
+
+    #[test]
+    fn cancelled_is_terminal_against_a_late_submit() {
+        let tmp = make_root("cancel-terminal-submit");
+        make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let cancel = r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#;
+        assert_eq!(
+            http_post(&addr, "/api/runs/r/submit", "application/json", cancel).0,
+            200
+        );
+
+        // Any later decision — including an approve — must not un-cancel.
+        let approve = r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, _) = http_post(&addr, "/api/runs/r/submit", "application/json", approve);
+        assert_eq!(status, 409, "a cancelled run must reject a late submit");
+
+        let (_, state_body) = http_get(&addr, "/api/runs/r/state");
+        assert!(state_body.contains(r#""state":"cancelled""#), "{state_body}");
+    }
+
+    #[test]
+    fn approved_is_terminal_against_a_late_summary() {
+        // Same guarantee for the other terminal state: approval is a decision,
+        // not a phase the agent can walk back.
+        let tmp = make_root("approve-terminal");
+        make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let payload = r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#;
+        assert_eq!(
+            http_post(&addr, "/api/runs/r/submit", "application/json", payload).0,
+            200
+        );
+
+        let (status, _) = http_post(&addr, "/api/runs/r/summary", "text/plain", "late revision");
+        assert_eq!(status, 409, "an approved run must reject a late summary");
+
+        let (_, state_body) = http_get(&addr, "/api/runs/r/state");
+        assert!(state_body.contains(r#""state":"approved""#), "{state_body}");
+    }
+
+    #[test]
+    fn cancelled_state_round_trips() {
+        // The wire/persistence spelling the driver and the UI both key off.
+        assert_eq!(LoopState::Cancelled.as_str(), "cancelled");
+        assert_eq!(LoopState::from_str("cancelled"), LoopState::Cancelled);
     }
 
     // -- code-review surface (/review/findings, /review/diff) ----------------

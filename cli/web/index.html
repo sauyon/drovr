@@ -506,6 +506,23 @@
   button.primary:hover { background: var(--accent-hover); }
   button.primary:disabled { opacity: .5; cursor: default; }
 
+  /* Cancel is terminal and destructive: outlined-danger, and it sits apart from
+     Submit so it can't be hit by muscle memory. */
+  button.danger {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: var(--radius);
+    padding: 8px 20px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    margin-left: auto;
+  }
+  button.danger:hover { background: var(--danger); color: #fff; }
+  button.danger:disabled { opacity: .5; cursor: default; }
+  button.danger.armed { background: var(--danger); color: #fff; }
+
   /* ---- State overlays ---- */
   .state-overlay {
     text-align: center;
@@ -526,6 +543,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .approved-msg .icon { color: var(--success); }
+  .cancelled-msg .icon { color: var(--danger); }
   .error-msg { color: var(--danger); font-size: 0.88rem; margin-top: 8px; }
 
   /* doc-panel needs relative+overflow-visible so annotation triggers can peek left */
@@ -563,6 +581,7 @@
   .run-dot.state-ready { background: #f5a623; }      /* awaiting reviewer */
   .run-dot.state-waiting { background: #4098ff; }    /* awaiting agent */
   .run-dot.state-approved { background: #3ec46d; }   /* done */
+  .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
 
   /* ---- Live session mirror ---- */
@@ -712,6 +731,15 @@
     </div>
   </div>
 
+  <div id="cancelled-overlay" style="display:none" class="panel">
+    <div class="state-overlay cancelled-msg">
+      <span class="icon">&#10005;</span>
+      <strong>Cancelled</strong>
+      <p>This run was cancelled at the review gate. The driver has been told to
+         stop &mdash; nothing further will be built from this spec.</p>
+    </div>
+  </div>
+
   <div id="form-section" class="panel form-section">
     <div class="panel-title">Your decision</div>
     <div class="radio-group">
@@ -729,6 +757,8 @@
     <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes)…"></textarea>
     <div class="btn-row">
       <button class="primary" id="submit-btn" onclick="submitDecision()">Submit</button>
+      <button class="danger" id="cancel-btn" onclick="cancelRun()"
+              title="Abandon this run. The driver stops; nothing is built from this spec.">Cancel run</button>
     </div>
     <div id="form-error" class="error-msg" style="display:none"></div>
   </div>
@@ -1396,17 +1426,31 @@ async function refresh() {
   // questions
   renderQuestions(questionsData);
 
+  // Any re-render disarms Cancel: a half-armed button must never carry over a
+  // state change or a navigation to another run.
+  disarmCancel();
+
   // Show correct overlay / form
   if (state === 'approved') {
     hideEl('form-section');
     hideEl('waiting-overlay');
+    hideEl('cancelled-overlay');
     showEl('approved-overlay');
+    return;
+  }
+
+  if (state === 'cancelled') {
+    hideEl('form-section');
+    hideEl('waiting-overlay');
+    hideEl('approved-overlay');
+    showEl('cancelled-overlay');
     return;
   }
 
   if (state === 'waiting') {
     hideEl('form-section');
     hideEl('approved-overlay');
+    hideEl('cancelled-overlay');
     showEl('waiting-overlay');
     pollTimer = setTimeout(function(){ pollState(gen); }, 1000);
     return;
@@ -1415,7 +1459,9 @@ async function refresh() {
   // idle or ready: show form
   hideEl('waiting-overlay');
   hideEl('approved-overlay');
+  hideEl('cancelled-overlay');
   document.getElementById('submit-btn').disabled = false;
+  document.getElementById('cancel-btn').disabled = false;
   showEl('form-section');
 }
 
@@ -1425,7 +1471,7 @@ async function pollState(gen) {
     var r = await fetch(api('state'));
     var data = await r.json();
     if (gen !== routeGen) return;         // navigated away mid-fetch
-    if (data.state === 'ready' || data.state === 'approved') {
+    if (data.state === 'ready' || data.state === 'approved' || data.state === 'cancelled') {
       await refresh();
     } else {
       pollTimer = setTimeout(function(){ pollState(gen); }, 1000);
@@ -1436,14 +1482,20 @@ async function pollState(gen) {
   }
 }
 
-async function submitDecision() {
+// `forced` bypasses the radio group for out-of-band decisions (currently only
+// 'cancel', from the Cancel run button).
+async function submitDecision(forced) {
   var btn = document.getElementById('submit-btn');
+  var cancelBtn = document.getElementById('cancel-btn');
   var errEl = document.getElementById('form-error');
   errEl.style.display = 'none';
 
-  var decision = document.querySelector('input[name="decision"]:checked');
-  if (!decision) { showError('Select a decision.'); return; }
-  var decisionVal = decision.value;
+  var decisionVal = forced;
+  if (!decisionVal) {
+    var decision = document.querySelector('input[name="decision"]:checked');
+    if (!decision) { showError('Select a decision.'); return; }
+    decisionVal = decision.value;
+  }
   var feedbackVal = document.getElementById('feedback').value.trim();
 
   if (decisionVal === 'request-changes' && !feedbackVal) {
@@ -1452,6 +1504,7 @@ async function submitDecision() {
   }
 
   btn.disabled = true;
+  cancelBtn.disabled = true;
 
   var payload = {
     decision: decisionVal,
@@ -1467,13 +1520,40 @@ async function submitDecision() {
       body: JSON.stringify(payload)
     });
     var data = await r.json();
-    if (!data.ok) { showError('Submit failed.'); btn.disabled = false; return; }
+    if (!data.ok) {
+      showError('Submit failed.');
+      btn.disabled = false; cancelBtn.disabled = false; disarmCancel();
+      return;
+    }
     // State flipped; refresh to reflect
     await refresh();
   } catch(e) {
     showError('Network error: ' + e.message);
-    btn.disabled = false;
+    btn.disabled = false; cancelBtn.disabled = false; disarmCancel();
   }
+}
+
+// Cancel is terminal, so it takes two clicks: the first arms the button, the
+// second submits. An inline arm (rather than confirm()) keeps it non-modal.
+var cancelArmed = false;
+
+function disarmCancel() {
+  cancelArmed = false;
+  var btn = document.getElementById('cancel-btn');
+  btn.classList.remove('armed');
+  btn.textContent = 'Cancel run';
+}
+
+function cancelRun() {
+  var btn = document.getElementById('cancel-btn');
+  if (!cancelArmed) {
+    cancelArmed = true;
+    btn.classList.add('armed');
+    btn.textContent = 'Click again to cancel';
+    return;
+  }
+  disarmCancel();
+  submitDecision('cancel');
 }
 
 function showError(msg) {
@@ -1639,7 +1719,8 @@ async function sendPane() {
 
 // ---- Router ----
 var DETAIL_PANELS = ['summary-banner', 'agents-panel', 'session-panel', 'review-panel',
-  'diff-panel', 'doc-panel', 'waiting-overlay', 'approved-overlay', 'form-section'];
+  'diff-panel', 'doc-panel', 'waiting-overlay', 'approved-overlay', 'cancelled-overlay',
+  'form-section'];
 
 async function route() {
   clearTimeout(pollTimer);

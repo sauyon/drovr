@@ -81,7 +81,9 @@ together:** `drovr serve <run>` to present `spec.md`, **and** a backgrounded
 `drovr review wait <run>` — the *watch*. `serve` does not start the watch; without it you
 never learn the decision and fall back to hand-polling `GET /state` (the anti-pattern).
 `review wait` blocks on the gate and the harness wakes you when the reviewer acts
-(exit `0` approved · `2` request-changes + `feedback.json`). Revise loop: edit `spec.md` →
+(exit `0` approved · `3` request-changes + `feedback.json` · `5` cancelled — the human
+abandoned the run, stop · `2` timeout, re-run · `1` error, which is **never** an approval).
+Revise loop: edit `spec.md` →
 `drovr review summary <run> "<what changed>"` → re-background `review wait`. Full mechanics
 (state machine, diff baselining, gotchas) live in `drovr:pipeline` → "The spec gate".
 

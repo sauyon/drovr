@@ -67,8 +67,13 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    idle ──agent: drovr review summary──▶ ready ──reviewer "request changes"──▶ waiting
      ▲                                                                            │
      └──────────────── agent revises + drovr review summary ──────────────────────┘
-                          reviewer "approve"  ──▶  approved   (writes `approved` marker)
+                          reviewer "approve"  ──▶  approved    (writes `approved` marker)
+                          reviewer "cancel"   ──▶  cancelled   (writes `cancelled` marker)
    ```
+
+   `approved` and `cancelled` are **terminal**: the server rejects a later `summary` or
+   `submit` on such a run with HTTP 409, so a late revision from an agent that hasn't
+   noticed yet cannot silently revive a decided run.
 
 3. **The mandated discipline** (encoded in `brainstorm.md`): the agent writes/edits
    `spec.md` and, **after every edit, runs `drovr review summary <run> "<what changed>"`**.
@@ -90,8 +95,13 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    |---|---|---|
    | 0 | approved | Compress brainstorm; proceed to plan. |
    | 3 | changes requested | Forward `feedback.json` (step 5); wait again. |
+   | 5 | **cancelled** by the reviewer (`cancelled` marker in the run dir) | Stop. Do not revise, do not wait again — tell the human and tear the run down (`drovr cleanup <run>`). |
    | 2 | timeout | Re-run `drovr review wait <run>`. |
    | 1 | error (server unreachable / could not auto-start) | Check `drovr serve` can run; try `drovr serve &` manually. |
+
+   **Only exit 0 is approval.** A non-zero exit is never an approval — in particular exit 1
+   means the wait *failed* (e.g. connection refused), not that the reviewer said yes. If you
+   cannot read a clean 0, re-run the wait rather than proceeding.
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:

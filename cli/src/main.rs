@@ -180,7 +180,11 @@ enum ReviewCmd {
     /// Run in the background after posting a summary: the process exits when
     /// the reviewer acts (harness wakes the driver on exit) — no busy-poll.
     /// Exit codes: 0 = approved, 3 = changes requested (`feedback.json` holds
-    /// the turn), 2 = timeout (re-run to resume), 1 = error.
+    /// the turn), 5 = cancelled by the reviewer (terminal — tear the run down),
+    /// 2 = timeout (re-run to resume), 1 = error.
+    ///
+    /// Note 1 (error) is distinct from every outcome: a failed wait must never
+    /// be read as an approval.
     Wait {
         run: String,
         #[arg(long, default_value_t = 1_800_000)]
@@ -901,6 +905,12 @@ fn cmd_review(sub: ReviewCmd) {
                 Ok(WaitOutcome::ChangesRequested) => {
                     println!("review: changes requested for run '{run}' (see feedback.json)");
                     process::exit(3);
+                }
+                Ok(WaitOutcome::Cancelled) => {
+                    println!(
+                        "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
+                    );
+                    process::exit(5);
                 }
                 Ok(WaitOutcome::Timeout) => {
                     println!(
