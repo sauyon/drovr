@@ -49,6 +49,12 @@ pub struct Config {
     /// Default host/address `drovr serve` binds to when `--host` is omitted.
     #[serde(default = "default_serve_host")]
     pub serve_host: String,
+    /// When true, `drovr new` isolates each run in a git worktree
+    /// (`.drovr/wt/<run>` on branch `drovr/<run>`) unless `--no-worktree` is
+    /// passed. `--worktree` overrides this to on per-run. Bare `#[serde(default)]`
+    /// is correct here: `bool::default()` is `false`, the intended off-by-default.
+    #[serde(default)]
+    pub worktree: bool,
     #[serde(default = "default_agents")]
     pub agents: BTreeMap<String, AgentSpec>,
 }
@@ -170,6 +176,7 @@ impl Default for Config {
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
             agents: default_agents(),
         }
     }
@@ -518,6 +525,7 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -546,6 +554,7 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -577,6 +586,7 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(

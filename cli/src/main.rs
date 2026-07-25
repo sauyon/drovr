@@ -6,6 +6,7 @@ mod herdr;
 mod phase;
 mod review;
 mod run;
+mod worktree;
 
 use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_run, head_sha};
@@ -45,6 +46,13 @@ enum Commands {
         /// Project directory phases will run in (must exist; defaults to cwd).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Isolate the run in a git worktree (`.drovr/wt/<run>` on branch
+        /// `drovr/<run>`). Overrides the `worktree` config default. `--no-worktree`
+        /// forces it off. Requires the project dir to be a git repo.
+        #[arg(long, overrides_with = "no_worktree")]
+        worktree: bool,
+        #[arg(long = "no-worktree")]
+        no_worktree: bool,
     },
 
     /// Print each phase + status + resume point for a run.
@@ -283,7 +291,14 @@ fn cmd_list() {
     }
 }
 
-fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &SystemHerdr) {
+fn cmd_new(
+    name: &str,
+    task: Option<String>,
+    dir: Option<PathBuf>,
+    worktree_flag: bool,
+    no_worktree_flag: bool,
+    herdr: &SystemHerdr,
+) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
@@ -317,6 +332,31 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
             })
             .to_string_lossy()
             .into_owned(),
+    };
+
+    // Resolve worktree isolation: --no-worktree wins, then --worktree, else the
+    // config default. When on, redirect project_dir into a fresh worktree so the
+    // whole run (panes, code-review base, phase edits) lands there, never in the
+    // invoking checkout.
+    let use_worktree = if no_worktree_flag {
+        false
+    } else {
+        worktree_flag || cfg.worktree
+    };
+    let (project_dir, worktree_path, worktree_branch) = if use_worktree {
+        match worktree::create(std::path::Path::new(&project_dir), name) {
+            Ok((abs, branch)) => {
+                let p = abs.to_string_lossy().into_owned();
+                println!("drovr: worktree {p} on branch {branch}");
+                (p.clone(), Some(p), Some(branch))
+            }
+            Err(e) => {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        (project_dir, None, None)
     };
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
@@ -372,6 +412,8 @@ fn cmd_new(name: &str, task: Option<String>, dir: Option<PathBuf>, herdr: &Syste
         cursor: 0,
         workspace,
         root_pane,
+        worktree_path,
+        worktree_branch,
     };
 
     save_run(&run);
@@ -459,6 +501,67 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
         && let Err(e) = herdr.workspace_close(ws_id)
     {
         eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+    }
+
+    // Prune the run's worktree, if any. Without --purge we keep the branch (locked
+    // decision 1: drovr never merges — it hands back a reviewable branch) and let
+    // git refuse a dirty tree rather than discard uncommitted work. --purge force-
+    // removes and deletes the branch.
+    if let Some(wt) = &run.worktree_path {
+        let branch = run.worktree_branch.as_deref();
+        let wt_path = std::path::Path::new(wt);
+        if !wt_path.exists() {
+            // The worktree is already gone (manually removed, or a prior
+            // interrupted cleanup). Nothing to prune, and git ops from a missing
+            // dir would fail — so skip pruning rather than abort. This keeps a run
+            // recoverable/purge-able instead of wedged on a vanished worktree.
+            eprintln!("drovr: worktree {wt} no longer exists; skipping prune");
+            if !purge && let Some(b) = branch {
+                println!("drovr: kept branch {b} — merge it with: git merge {b}");
+            }
+        } else {
+            // Non-purge: land the run's accumulated work as one squash commit on
+            // the branch before pruning (locked decision 4a), so the branch is
+            // mergeable and the worktree removes cleanly. --purge discards.
+            if !purge {
+                let msg = format!("drovr({name}): {}", run.task);
+                match worktree::commit_all(wt_path, &msg) {
+                    Ok(true) => {
+                        println!(
+                            "drovr: committed run work to {}",
+                            branch.unwrap_or("branch")
+                        )
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("drovr: could not commit worktree {wt}: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
+            let delete_branch = if purge { branch } else { None };
+            match worktree::remove(wt_path, delete_branch, purge) {
+                Ok(()) => {
+                    if !purge && let Some(b) = branch {
+                        println!("drovr: kept branch {b} — merge it with: git merge {b}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("drovr: could not prune worktree {wt}: {e}");
+                    if purge {
+                        // --purge means "force it gone": warn but keep going so the
+                        // run dir is still removed and the run isn't left un-purgeable.
+                        eprintln!("drovr: continuing purge despite the prune failure");
+                    } else {
+                        eprintln!(
+                            "drovr: commit or discard the changes and re-run cleanup, \
+                             or use --purge to force-remove and delete the branch"
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+        }
     }
 
     if purge {
@@ -910,7 +1013,13 @@ fn main() {
 
     match cli.command {
         Commands::List => cmd_list(),
-        Commands::New { name, task, dir } => cmd_new(&name, task, dir, &herdr),
+        Commands::New {
+            name,
+            task,
+            dir,
+            worktree,
+            no_worktree,
+        } => cmd_new(&name, task, dir, worktree, no_worktree, &herdr),
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
@@ -1362,6 +1471,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         let s = format_progress(&run);
         assert!(s.contains("0/2"), "got: {s}");
@@ -1387,6 +1498,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");

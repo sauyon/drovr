@@ -446,6 +446,8 @@ mod tests {
             workspace: Some("ws-cr".into()),
             root_pane: Some("ws-cr:root".into()),
             project_dir: repo.path().to_string_lossy().into_owned(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         (run, repo)
     }
@@ -759,6 +761,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         assert_eq!(next_iter(&base, "task-1"), 1);
 

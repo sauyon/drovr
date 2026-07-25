@@ -52,6 +52,16 @@ pub struct RunState {
     /// Captured at `drovr new` time; defaults to empty string for old runs.
     #[serde(default)]
     pub project_dir: String,
+    /// Absolute path of the git worktree created for this run (`.drovr/wt/<run>`),
+    /// set by `drovr new --worktree`. When `Some`, `project_dir` points *into*
+    /// this worktree and `cmd_cleanup` prunes it. `None` for in-place runs and any
+    /// run created before worktree support existed → identical to today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    /// The branch (`drovr/<run>`) the worktree checks out. Kept on cleanup so the
+    /// human can merge it; deleted only under `--purge`. `None` when no worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
 }
 
 fn legacy_agent() -> Option<String> {
@@ -152,6 +162,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
@@ -184,6 +196,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_worktree_fields_default_to_none() {
+        // A state.json written before worktree support has no worktree_path /
+        // worktree_branch keys; #[serde(default)] must yield None, not an error —
+        // that None is exactly what makes old (in-place) runs behave as today.
+        let json = r#"{
+            "name":"old","task":"t",
+            "phases":[{"name":"plan","status":"Pending","handoff_doc":null,"herdr_session":null,"pane_id":null}],
+            "gate":"spec","cursor":0,"project_dir":"/tmp/proj"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        assert!(
+            loaded.worktree_path.is_none(),
+            "absent worktree_path → None"
+        );
+        assert!(
+            loaded.worktree_branch.is_none(),
+            "absent worktree_branch → None"
+        );
+    }
+
+    #[test]
+    fn worktree_fields_roundtrip() {
+        let json = r#"{
+            "name":"wt","task":"t",
+            "phases":[],"gate":"spec","cursor":0,"project_dir":"/repo/.drovr/wt/wt",
+            "worktree_path":"/repo/.drovr/wt/wt","worktree_branch":"drovr/wt"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.worktree_path.as_deref(), Some("/repo/.drovr/wt/wt"));
+        assert_eq!(loaded.worktree_branch.as_deref(), Some("drovr/wt"));
+        // Re-serialize and reload: the fields survive a full round-trip.
+        let reloaded: RunState =
+            serde_json::from_str(&serde_json::to_string(&loaded).unwrap()).unwrap();
+        assert_eq!(reloaded.worktree_branch.as_deref(), Some("drovr/wt"));
+    }
+
+    #[test]
     fn find_phase_searches_both_lists() {
         let mk = |name: &str| Phase {
             name: name.into(),
@@ -203,6 +252,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
         };
         assert_eq!(s.find_phase("plan").map(|p| p.name.as_str()), Some("plan"));
         assert_eq!(

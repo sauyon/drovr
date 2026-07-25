@@ -226,6 +226,8 @@ mod tests {
             workspace: None,
             root_pane: None,
             project_dir: "/tmp/drovr-proj-test".into(),
+            worktree_path: None,
+            worktree_branch: None,
         }
     }
 

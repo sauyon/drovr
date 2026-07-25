@@ -32,6 +32,11 @@ invoke **`drovr:code-review`** (read-only review subagents; they find, you fix).
 This is not optional and not gated on the change's size; it runs whether you
 worked inline or across phases.
 
+**Isolate when it helps.** To keep the invoking checkout clean while a run edits
+the repo, give the run its own git worktree — `drovr new --worktree`. See
+**`drovr:worktrees`** for when to isolate and how the branch is handed back (drovr
+never merges it for you).
+
 ## For the task in front of you, apply the right methodology skill
 
 Pick by what you are doing — invoke it via the `Skill` tool before you act:
