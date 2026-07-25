@@ -1347,7 +1347,11 @@ async function refreshReview() {
   if (gen !== routeGen) return;
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
-    diffEl.innerHTML = await renderReviewDiff(diffText, findings);
+    // renderReviewDiff() awaits internally (it preloads the patch renderer), so
+    // this is a third suspension point and needs the same guard as the two above.
+    var rendered = await renderReviewDiff(diffText, findings);
+    if (gen !== routeGen) return;
+    diffEl.innerHTML = rendered;
     fillFindingAnnotations(diffEl, diffText, findings);
   } else {
     diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
@@ -2200,33 +2204,43 @@ async function route() {
   // and its answers could be submitted against THIS run.
   clearQuestions();
   showEl('back-link');
-  // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
-  // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
-  // run with no spec never flashes the previously-viewed run's doc — and if
-  // refresh() throws mid-flight the stale spec is already gone rather than left
-  // on screen under this run's name. route() is not on a timer for the detail
-  // view (pollState re-arms that), so this runs on real navigation only.
-  hideEl('doc-panel');
-  document.getElementById('doc-content').innerHTML = '';
-  currentDocText = '';   // keep it in step with the DOM it describes
-  // Annotations must be dropped HERE, synchronously, not just in
-  // loadAnnotations(): that runs after refresh()'s awaits, so between this point
-  // and those fetches resolving, collectAnnotations() still returns the previous
-  // run's line comments while api('submit') already addresses THIS run — and if
-  // refresh() rejects, loadAnnotations() never runs at all and they stay
-  // submittable indefinitely. loadAnnotations() then restores this run's own
-  // in-progress comments from localStorage.
-  annotations = {};
-  // Same class again, and the worst instance of it: the decision radio and the
-  // feedback box are plain form fields that nothing ever reset, so prose typed for
-  // one run stayed in the box — and the radio stayed on whatever was picked —
-  // after navigating to another. Submitting there wrote one run's decision and
-  // feedback into the OTHER run's feedback.json, which an agent then acts on.
-  // Back to the markup default: request-changes selected, box empty.
-  var rcRadio = document.querySelector('input[name="decision"][value="request-changes"]');
-  if (rcRadio) rcRadio.checked = true;
-  document.getElementById('feedback').value = '';
-  hideEl('form-error');
+  // Everything below is a CROSS-RUN reset, so it is gated on the run actually
+  // changing. `#/runs/<run>?task=<t>` is a supported URL (see reviewTask() and the
+  // router comment above), so back/forward — or opening a task link while already
+  // on that run — re-enters route() with the same run; wiping the form there would
+  // destroy the reviewer's half-typed feedback, which is persisted nowhere.
+  if (h.run !== prevRun) {
+    // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
+    // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
+    // run with no spec never flashes the previously-viewed run's doc — and if
+    // refresh() throws mid-flight the stale spec is already gone rather than left
+    // on screen under this run's name.
+    hideEl('doc-panel');
+    document.getElementById('doc-content').innerHTML = '';
+    currentDocText = '';   // keep it in step with the DOM it describes
+    // The review panel is fetched by refreshReview() behind two awaits, so on a
+    // direct run-to-run jump it would otherwise keep painting the OLD task's
+    // findings and diff under the new run's name until those resolve.
+    hideEl('review-panel');
+    // Annotations must be dropped HERE, synchronously, not just in
+    // loadAnnotations(): that runs after refresh()'s awaits, so between this point
+    // and those fetches resolving, collectAnnotations() still returns the previous
+    // run's line comments while api('submit') already addresses THIS run — and if
+    // refresh() rejects, loadAnnotations() never runs at all and they stay
+    // submittable indefinitely. loadAnnotations() then restores this run's own
+    // in-progress comments from localStorage.
+    annotations = {};
+    // Same class again, and the worst instance of it: the decision radio and the
+    // feedback box are plain form fields that nothing ever reset, so prose typed
+    // for one run stayed in the box — and the radio stayed on whatever was picked
+    // — after navigating to another. Submitting there wrote one run's decision and
+    // feedback into the OTHER run's feedback.json, which an agent then acts on.
+    // Back to the markup default: request-changes selected, box empty.
+    var rcRadio = document.querySelector('input[name="decision"][value="request-changes"]');
+    if (rcRadio) rcRadio.checked = true;
+    document.getElementById('feedback').value = '';
+    hideEl('form-error');
+  }
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;

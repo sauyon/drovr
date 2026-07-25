@@ -573,6 +573,43 @@ check('the decision falls back to request-changes, not the previous pick',
     var r = document.querySelector('input[name="decision"]:checked');
     return r ? r.value : null;`), 'request-changes');
 
+console.log('\n== staying on the same run keeps the reviewer\'s work ==');
+// The cross-run resets above must fire on a RUN CHANGE, not on every route().
+// `#/runs/<run>?task=<t>` is a supported URL (reviewTask(), and the router
+// comment documents it), so browser back/forward — or opening a task link while
+// already on that run — re-enters route() with the SAME run. Feedback is never
+// persisted anywhere, so clearing it there destroys the reviewer's typed prose
+// with no warning and no way back.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'half-written feedback I am still editing';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  annotations = { 2: { quote: 'Content.', comments: [{ id: 9, text: 'in-progress note' }] } };
+  saveAnnotations();   // every real mutation site does this, so match real usage
+  return 1;`);
+const sameRunGen = await evaluate(`return routeGen;`);
+await evaluate(`location.hash = '#/runs/alpha-deploy?task=task-1'; return 1;`);
+await waitFor(hash, h => h === '#/runs/alpha-deploy?task=task-1', 4000, 'same-run task hash');
+// Wait on routeGen, NOT refreshSeq: refreshSeq is also bumped by the background
+// pollState->refresh() loop that runs for a `ready` run, so it can advance before
+// route() has touched the hashchange at all — which made these checks pass whether
+// or not the reset block ran. routeGen is incremented only by route(), on entry,
+// in the same synchronous task as the reset block below it.
+await waitFor(() => evaluate(`return routeGen;`), g => g > sameRunGen, 8000,
+  'route() to process the same-run navigation');
+check('typed feedback survives a same-run navigation',
+  await evaluate(`return document.getElementById('feedback').value;`),
+  'half-written feedback I am still editing');
+check('the decision pick survives too', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r ? r.value : null;`), 'approve');
+// Note this one holds via loadAnnotations() restoring from localStorage, not via
+// the run-change gate — it still passes with the gate removed. Kept because the
+// user-visible invariant is worth pinning (it would catch persistence breaking),
+// but it is not what proves the gate works: the two checks above are.
+check('and in-progress annotations survive',
+  await evaluate(`return collectAnnotations().length;`), 1);
+
 console.log('\n== a stale review panel cannot repaint over the session list ==');
 // refreshReview() is called fire-and-forget and awaits twice, so it outlives a
 // navigation. Without a routeGen guard its late resolution re-showed the panel —

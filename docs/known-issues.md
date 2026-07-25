@@ -178,6 +178,35 @@ reset synchronously in `route()` is a cross-run leak waiting to happen.**
    once on the way out. Strictly worse than the original symptom. Fixed with the standard
    guard after each await.
 
+### A regression the fix itself introduced, caught by the final review round
+
+Worth recording because it is the natural failure mode of this kind of fix: **the cure for a
+cross-run leak is a reset, and a reset in the wrong place destroys the reviewer's work.**
+
+The resets above were added to `route()` ungated. But `route()` fires on every `hashchange`,
+and `#/runs/<run>?task=<t>` is a supported URL (`reviewTask()`, `cli/web/index.html:1119`, and
+the router comment at the top of the file documents it) — so browser back/forward, or opening
+a task link while already on that run, re-enters `route()` with the *same* run. That silently
+cleared the feedback textarea and reset the decision radio mid-edit. Feedback is persisted
+nowhere, so it was simply gone, with no warning.
+
+Note the pre-existing `if (h.run !== prevRun)` guard higher in `route()` covers only the
+nav-cursor bits — it is not a general run-change gate, which is easy to misread. The resets
+now sit in their own `h.run !== prevRun` block.
+
+Two reviewers disagreed on this: one reported it Critical with a live repro, the other cleared
+the same code as "reset is gated on navigation, not on poll" — true but not the point, since a
+same-run navigation is still a navigation. The repro decided it.
+
+**Two test traps hit while pinning it**, both of which made the check pass against broken code:
+- Waiting on `refreshSeq` was wrong — the background `pollState` → `refresh()` loop bumps it
+  for a `ready` run, so it advances before `route()` has touched the hashchange. The checks
+  now wait on `routeGen`, which only `route()` increments, in the same synchronous task as the
+  reset block.
+- The "annotations survive" check passes with the gate removed, because `loadAnnotations()`
+  restores them from localStorage. It is labelled in-place as not being what proves the gate
+  works.
+
 ### Still open (follow-ups, not blocking)
 
 - `fetchText()` (`cli/web/index.html`) collapses 204, non-OK and a genuinely empty body all to
