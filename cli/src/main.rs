@@ -7,6 +7,10 @@ mod reflex;
 mod review;
 mod run;
 mod worktree;
+/// Dependency-free SHA-256, used only by build-time integrity tests that pin
+/// embedded third-party assets to known-good digests.
+#[cfg(test)]
+mod sha256;
 
 use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_run, head_sha};

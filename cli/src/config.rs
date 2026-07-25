@@ -228,6 +228,13 @@ pub fn load_config() -> io::Result<Config> {
     if config.serve_host.trim().is_empty() {
         return Err(io::Error::other("serve_host must not be empty"));
     }
+    // Reject relative-path commands before any of them can be spawned. A
+    // hostile repo under review (or tampered config) must not be able to point
+    // drovr at a CWD-relative binary.
+    for (name, spec) in &config.agents {
+        validate_command(&spec.command)
+            .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+    }
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
             spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
@@ -343,6 +350,35 @@ impl Config {
     }
 }
 
+/// Reject agent commands that would resolve against an untrusted working
+/// directory. drovr often runs with its CWD inside the repository under review;
+/// a relative-path command (`./git`, `../tool`, `bin/agent`) resolves against
+/// that CWD, so a hostile repo (or a tampered config) could drop a lookalike
+/// binary and have drovr execute it. A bare name (`claude`) is resolved via
+/// `$PATH` — a trusted, user-controlled search path — and an absolute path names
+/// exactly one file; both are allowed. Anything relative-but-pathful is not.
+fn validate_command(command: &str) -> io::Result<()> {
+    if command.trim().is_empty() {
+        return Err(io::Error::other("agent command must not be empty"));
+    }
+    // Validate exactly what gets spawned. Surrounding whitespace is never a
+    // valid command and would otherwise pass the path check below (a single
+    // component) only to fail later with a cryptic spawn error — reject it here.
+    if command != command.trim() {
+        return Err(io::Error::other(format!(
+            "agent command '{command}' has leading or trailing whitespace"
+        )));
+    }
+    let path = std::path::Path::new(command);
+    if path.components().count() > 1 && !path.is_absolute() {
+        return Err(io::Error::other(format!(
+            "agent command '{command}' is a relative path; use a bare name \
+             (resolved via $PATH) or an absolute path"
+        )));
+    }
+    Ok(())
+}
+
 fn command_available(command: &str) -> bool {
     let path = std::path::Path::new(command);
     if path.components().count() > 1 {
@@ -440,6 +476,53 @@ mod tests {
         unsafe {
             std::env::remove_var("CODEX_THREAD_ID");
         }
+    }
+
+    #[test]
+    fn validate_command_accepts_bare_and_absolute() {
+        assert!(validate_command("claude").is_ok());
+        assert!(validate_command("cursor-agent").is_ok());
+        assert!(validate_command("/usr/local/bin/claude").is_ok());
+    }
+
+    #[test]
+    fn validate_command_rejects_relative_and_empty() {
+        assert!(validate_command("./claude").is_err());
+        assert!(validate_command("../bin/claude").is_err());
+        assert!(validate_command("bin/agent").is_err());
+        assert!(validate_command("").is_err());
+        assert!(validate_command("   ").is_err());
+        // Surrounding whitespace: rejected clearly rather than passing here and
+        // failing later at spawn time.
+        assert!(validate_command(" claude").is_err());
+        assert!(validate_command("claude ").is_err());
+    }
+
+    #[test]
+    fn load_config_rejects_relative_command() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+default_agent = "evil"
+
+[agents.evil]
+command = "./git"
+"#,
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let err = load_config().expect_err("relative-path command must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("evil"), "error should name the agent: {msg}");
+        assert!(
+            msg.contains("relative path"),
+            "error should explain the reason: {msg}"
+        );
     }
 
     #[test]

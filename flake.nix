@@ -1,9 +1,15 @@
 {
   description = "drovr — CLI for driving multi-agent code review/handoff pipelines";
 
+  # Inputs are pinned to immutable commit revs rather than moving branch refs
+  # (`nixpkgs-unstable`, `master`) so a fresh `nix build` on a machine with a
+  # cold evaluation cache resolves to exactly the tree recorded in flake.lock —
+  # an upstream force-push or a re-pointed branch cannot silently change what we
+  # build. To update: bump the `rev` below to the desired commit, then run
+  # `nix flake update nixpkgs` (or `nix flake update flake-utils`).
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17";
+    flake-utils.url = "github:numtide/flake-utils/11707dc2f618dd54ca8739b309ec4fc024de578b";
   };
 
   outputs = { self, nixpkgs, flake-utils }:
@@ -14,7 +20,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "drovr";
-          version = "0.1.0";
+          version = "0.2.0";
 
           # The crate lives in cli/, but two integration tests reach OUT to
           # repo-root siblings during checkPhase: reflex_hook execs
@@ -63,11 +69,51 @@
           };
         };
 
+        # Supply-chain gate: enforce cli/deny.toml. Runs the deterministic,
+        # network-free subset (bans/licenses/sources) inside the sandbox so a
+        # dependency from an unexpected registry/git source, an unapproved
+        # license, or a wildcard version fails `nix flake check` reproducibly.
+        # The `advisories` check is intentionally NOT run here — it wants the
+        # live RustSec DB, so it belongs in CI/dev (`cargo deny check advisories`
+        # from the devShell), not pinned to a stale sandbox snapshot.
+        checks.cargo-deny =
+          let
+            vendorDir = pkgs.rustPlatform.importCargoLock {
+              lockFile = ./cli/Cargo.lock;
+            };
+          in
+          pkgs.runCommand "drovr-cargo-deny"
+            {
+              nativeBuildInputs = [ pkgs.cargo-deny pkgs.cargo ];
+            }
+            ''
+              cp -r ${./cli} src && chmod -R +w src
+              export CARGO_HOME=$PWD/cargo-home
+              mkdir -p $CARGO_HOME
+              cat > $CARGO_HOME/config.toml <<EOF
+              [source.crates-io]
+              replace-with = "vendored-sources"
+              [source.vendored-sources]
+              directory = "${vendorDir}"
+              EOF
+              # Point at deny.toml explicitly: relying on cargo-deny's implicit
+              # CWD discovery risks a future version silently falling back to its
+              # permissive default config and passing without enforcing anything.
+              # --config makes a missing config a hard error instead.
+              cd src
+              cargo-deny --offline --manifest-path Cargo.toml \
+                --config deny.toml \
+                check bans licenses sources
+              touch $out
+            '';
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
             rustc
             rust-analyzer
+            # `cargo deny check` — supply-chain audit (see cli/deny.toml).
+            cargo-deny
           ];
         };
       });
