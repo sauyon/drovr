@@ -2,6 +2,7 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -354,7 +355,17 @@ impl Herdr for SystemHerdr {
         let result = self
             .socket_call("pane.get", json!({ "pane_id": pane_id }))
             .ok()?;
-        parse_pane_info(&result)
+        let info = parse_pane_info(&result);
+        if info.is_none() {
+            // A closed/unknown pane comes back as a socket *error*, so it never
+            // reaches here — an unparseable success means herdr's response shape
+            // moved under us. That degrades silently and totally (every poll
+            // `None` → `phase_send` burns its readiness timeout on a healthy
+            // agent, `blocked` is never detected early), so say so once. Keys
+            // only: the payload carries cwds and terminal titles.
+            warn_once_on_pane_get_shape(&result);
+        }
+        info
     }
 
     fn tab_close(&self, tab_id: &str) -> io::Result<()> {
@@ -403,6 +414,29 @@ fn find_string_field(value: &Value, key: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Set once the first unreadable `pane.get` success has been reported, so a
+/// 500 ms poll loop warns once per process rather than twice a second.
+static PANE_GET_SHAPE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Report — once — that `pane.get` succeeded with a shape [`parse_pane_info`]
+/// does not recognise. Prints the result's top-level keys only, never its
+/// values: the payload carries cwds and terminal titles.
+fn warn_once_on_pane_get_shape(result: &Value) {
+    if PANE_GET_SHAPE_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let keys = match result.as_object() {
+        Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+        None => "<not an object>".to_string(),
+    };
+    eprintln!(
+        "drovr: herdr's pane.get returned a shape drovr cannot read \
+         (expected a `pane` object with a `tab_id`; got keys: {keys}). \
+         Agent status polling is degraded — phase sends will wait out their \
+         readiness timeout. Check the herdr version."
+    );
 }
 
 /// A non-empty string field of `value`, or `None`. herdr writes `""` for some
@@ -835,15 +869,41 @@ mod tests {
         assert!(session.agent.is_none(), "the `agent` key is optional");
     }
 
+    // `kind` and `value` are each independently required: a session missing
+    // either one is no session. Asserted separately because a struct literal
+    // short-circuits on the first `?`, so dropping both at once would only ever
+    // prove the FIRST field is required.
     #[test]
     fn parse_pane_info_ignores_a_session_missing_kind_or_value() {
-        let v = socket_result(
-            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"agent":"claude","source":"herdr:claude"}}}}"#,
-        );
-        let info = parse_pane_info(&v).unwrap();
+        let case = |session: &str| {
+            let v = socket_result(&format!(
+                r#"{{"result":{{"pane":{{"tab_id":"w1:t1","agent_session":{session}}}}}}}"#
+            ));
+            parse_pane_info(&v).expect("the pane itself is still readable")
+        };
+        // Neither field.
+        let info = case(r#"{"agent":"claude","source":"herdr:claude"}"#);
         assert_eq!(info.tab_id, "w1:t1");
         assert!(info.agent_session.is_none(), "an id-less session is no session");
         assert!(info.agent_status.is_none());
+        // `kind` only — an unusable session id must not be resumable-looking.
+        assert!(
+            case(r#"{"kind":"id","agent":"claude"}"#).agent_session.is_none(),
+            "a session with no value must not parse"
+        );
+        assert!(
+            case(r#"{"kind":"id","value":"","agent":"claude"}"#)
+                .agent_session
+                .is_none(),
+            "an empty value is as absent as a missing one"
+        );
+        // `value` only — a value drovr cannot classify must not be resumed.
+        assert!(
+            case(r#"{"value":"cca92f5b","agent":"claude"}"#)
+                .agent_session
+                .is_none(),
+            "a session with no kind must not parse"
+        );
     }
 
     // `agent_status` is now a provided trait method over the single `pane_info`
@@ -906,6 +966,15 @@ mod tests {
         h.fail_pane_info();
         assert!(h.pane_info("w1:p1").is_none());
         assert!(h.agent_status("w1:p1").is_none(), "a failed poll has no status");
+        // A failed poll is STILL a poll: it must be recorded, and its line must
+        // carry `agent_status` like every other, so "a poll happened but the
+        // pane was unreadable" stays distinguishable from "no poll happened".
+        let calls = h.calls();
+        assert_eq!(calls.len(), 2, "both polls recorded: {calls:?}");
+        for call in &calls {
+            assert!(call.starts_with("pane_info pane=w1:p1"), "call: {call}");
+            assert!(call.contains("agent_status=None"), "call: {call}");
+        }
 
         let h = FakeHerdr::new();
         h.fail_tab_close();
