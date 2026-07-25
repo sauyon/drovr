@@ -978,6 +978,17 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
             .as_ref()
             .map(|s| (s.task.clone(), s.gate.clone()))
             .unwrap_or_default();
+        // Pipeline progress, the axis the browser never had: `state` below is the
+        // *gate* state, which says nothing about how far the run got. Note the
+        // asymmetry — `approved` is set at the brainstorm gate, i.e. near the
+        // START of a run, so it must never be read as "finished".
+        let (done, total) = run_state.as_ref().map(|s| s.progress()).unwrap_or((0, 0));
+        // A run is finished when its phases are all Done, when `drovr cleanup`
+        // archived it, or when the human cancelled at the gate — the one terminal
+        // verdict that ends a run without completing it. An unreadable state.json
+        // is `None` here and stays visible rather than being hidden as complete.
+        let complete = run_state.as_ref().is_some_and(|s| s.is_complete())
+            || rs.state == LoopState::Cancelled;
         // Sort key: most-recently-touched review artifact (fall back to 0).
         let updated = fs::metadata(dir.join("review.state.json"))
             .or_else(|_| fs::metadata(dir.join("state.json")))
@@ -995,6 +1006,13 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
                 "state": rs.state.as_str(),
                 "turn": rs.turn,
                 "updated": updated,
+                "complete": complete,
+                "done": done,
+                "total": total,
+                // Lets the list say *why* a run is complete: "archived" (cleaned
+                // up with phases outstanding) reads very differently from a run
+                // that actually finished its pipeline.
+                "archived": run_state.as_ref().is_some_and(|s| s.archived),
             }),
         ));
     }
@@ -1382,6 +1400,129 @@ mod tests {
         dir
     }
 
+    /// Create a run dir whose `state.json` carries real phases, so completion is
+    /// computable. `statuses` is one `PhaseStatus` per pipeline phase.
+    fn make_run_with_phases(
+        root: &Path,
+        run: &str,
+        statuses: &[crate::run::PhaseStatus],
+        archived: bool,
+    ) -> PathBuf {
+        let dir = root.join(run);
+        fs::create_dir_all(&dir).unwrap();
+        let phases: Vec<crate::run::Phase> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::run::Phase {
+                name: format!("phase{i}"),
+                status: s.clone(),
+                handoff_doc: None,
+                herdr_session: None,
+                pane_id: None,
+            })
+            .collect();
+        let state = RunState {
+            name: run.into(),
+            task: "t".into(),
+            agent: None,
+            phases,
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived,
+        };
+        fs::write(
+            dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn row_for<'a>(rows: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+        rows.iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("run '{name}' missing from /api/runs"))
+    }
+
+    #[test]
+    fn list_runs_json_reports_completion_and_progress() {
+        use crate::run::PhaseStatus::{Done, Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-complete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        make_run_with_phases(&tmp, "finished", &[Done, Done, Done, Done], false);
+        make_run_with_phases(&tmp, "midflight", &[Done, Running, Pending, Pending], false);
+        // The `mcp-endpoint` shape: cleaned up mid-brainstorm, phases frozen.
+        make_run_with_phases(&tmp, "archived-early", &[Running, Pending], true);
+        // Unreadable state.json → must NOT be reported complete (see is_complete).
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone()));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx)).unwrap();
+
+        assert_eq!(row_for(&rows, "finished")["complete"], true);
+        assert_eq!(row_for(&rows, "finished")["done"], 4);
+        assert_eq!(row_for(&rows, "finished")["total"], 4);
+
+        assert_eq!(row_for(&rows, "midflight")["complete"], false);
+        assert_eq!(row_for(&rows, "midflight")["done"], 1);
+        assert_eq!(row_for(&rows, "midflight")["total"], 4);
+
+        assert_eq!(
+            row_for(&rows, "archived-early")["complete"],
+            true,
+            "a cleaned-up run is complete even with phases left Pending"
+        );
+        assert_eq!(row_for(&rows, "archived-early")["archived"], true);
+        assert_eq!(
+            row_for(&rows, "finished")["archived"],
+            false,
+            "a run that finished its phases was never archived"
+        );
+
+        assert_eq!(
+            row_for(&rows, "broken")["complete"],
+            false,
+            "a run whose state.json will not parse must stay visible, not be hidden as complete"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn list_runs_json_treats_a_cancelled_gate_as_complete() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-cancelled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let dir = make_run_with_phases(&tmp, "abandoned", &[Running, Pending], false);
+        fs::write(
+            dir.join("review.state.json"),
+            br#"{"state":"cancelled","turn":2}"#,
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone()));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx)).unwrap();
+        assert_eq!(
+            row_for(&rows, "abandoned")["complete"],
+            true,
+            "cancelled is a terminal human verdict — the run is over"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     fn http_get(addr: &str, path: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         write!(stream, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
@@ -1482,6 +1623,7 @@ mod tests {
             project_dir: "/tmp/p".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         // Running phase wins.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
@@ -1508,6 +1650,7 @@ mod tests {
             project_dir: "/tmp/p".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         }
     }
 

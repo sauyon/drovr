@@ -409,6 +409,7 @@ fn cmd_new(
         root_pane,
         worktree_path,
         worktree_branch,
+        archived: false,
     };
 
     save_run(&run);
@@ -483,7 +484,11 @@ fn cmd_attach(name: &str) {
     }
 }
 
-fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
+// Generic over `Herdr` (rather than taking `&SystemHerdr`) so the archived-marking
+// path can be driven with `FakeHerdr` in a test — it was untested while it was
+// the one thing standing between a torn-down run and a permanently live-looking
+// session row.
+fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
@@ -496,6 +501,29 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
         && let Err(e) = herdr.workspace_close(ws_id)
     {
         eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+    }
+
+    // Mark it archived HERE — immediately after the panes die, before any git
+    // work. `archived` means "the workspace is torn down", and that becomes true
+    // on the line above, so this is the moment it is honest.
+    //
+    // Not at the end of the function: the worktree prune below can `exit(1)` on a
+    // dirty tree or a failed squash-commit, and every one of those paths leaves a
+    // run whose panes are already gone. Marking archived last would let exactly
+    // those runs keep displaying as live sessions — the stale-status bug this
+    // field exists to kill. A run needing a second `drovr cleanup` is listed as
+    // finished-but-still-on-disk, which is what it is; the prune error and the
+    // kept-branch hint still print.
+    //
+    // Re-read rather than reusing the copy loaded above: `save()` rewrites the
+    // whole file, and a phase agent may have written its own status between that
+    // load and now. Re-reading shrinks the clobber window to this one call.
+    if !purge {
+        let mut latest = RunState::load(name).unwrap_or_else(|_| run.clone());
+        latest.archived = true;
+        if let Err(e) = latest.save() {
+            eprintln!("drovr: warning: could not mark run '{name}' archived: {e}");
+        }
     }
 
     // Prune the run's worktree, if any. Without --purge we keep the branch (locked
@@ -983,6 +1011,74 @@ mod tests {
         Cli::try_parse_from(args)
     }
 
+    // -- cleanup ----------------------------------------------------------------
+
+    /// `drovr cleanup` must leave the run marked archived. Without it the session
+    /// list has no way to tell a torn-down run from a live one: the phase statuses
+    /// stay frozen at their last write (`Running`, against a pane that no longer
+    /// exists) and the review gate keeps whatever verdict slot it was parked in,
+    /// so the row would advertise itself as an active session forever.
+    #[test]
+    fn cleanup_marks_the_run_archived() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("drovr-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+
+        // Cleaned up mid-brainstorm: the shape that used to strand a run on a
+        // live-looking status. No worktree, so the prune path is a no-op and the
+        // function runs to completion instead of exiting.
+        let run = RunState {
+            name: "cleanup-me".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![run::Phase {
+                name: "brainstorm".into(),
+                status: PhaseStatus::Running,
+                handoff_doc: None,
+                herdr_session: None,
+                pane_id: Some("wAC:p1".into()),
+            }],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("wAC".into()),
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+        };
+        run.save().expect("seed run");
+        assert!(!run.is_complete(), "precondition: not complete before cleanup");
+
+        let fake = FakeHerdr::new();
+        cmd_cleanup("cleanup-me", false, &fake);
+
+        assert!(
+            fake.calls().iter().any(|c| c.contains("workspace_close")),
+            "cleanup must close the workspace: {:?}",
+            fake.calls()
+        );
+        let after = RunState::load("cleanup-me").expect("run dir is kept without --purge");
+        assert!(after.archived, "cleanup must mark the run archived");
+        assert!(
+            after.is_complete(),
+            "an archived run reads as complete even with its phases frozen at Running"
+        );
+        // The phase statuses are deliberately left alone — `archived` is the flag
+        // that carries the meaning, and rewriting phase history would lose the
+        // record of how far the run actually got.
+        assert_eq!(after.phases[0].status, PhaseStatus::Running);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     // -- clap parse tests -------------------------------------------------------
 
     #[test]
@@ -1349,6 +1445,7 @@ mod tests {
             project_dir: "/tmp/proj".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         let s = format_progress(&run);
         assert!(s.contains("0/2"), "got: {s}");
@@ -1376,6 +1473,7 @@ mod tests {
             project_dir: "/tmp/proj".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");

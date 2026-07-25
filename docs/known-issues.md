@@ -555,6 +555,44 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## `drovr cleanup` can clobber a concurrent `state.json` write
+
+**Severity:** low (narrow window, and the panes it would race are already dead).
+**Found:** 2026-07-25, during review of the session-completion change.
+
+### Symptom
+
+`cmd_cleanup` (`cli/src/main.rs`) now writes `state.json` to set `archived: true`. `RunState::save`
+(`cli/src/run.rs`) is a whole-file `fs::write` with no locking, no read-modify-write and no
+version check, so a `drovr phase ...` running in a still-live pane can have its status write
+silently reverted.
+
+Before the archived flag existed the non-purge cleanup path never wrote `state.json` at all, so
+this window is new — it is a real (if small) regression introduced alongside the fix.
+
+### Why it is small
+
+The write was deliberately placed immediately after `herdr.workspace_close`, which kills every
+pane in the run, and it re-reads `state.json` from disk rather than saving the copy loaded at the
+top of the function. The race therefore needs a phase agent to write during the `workspace_close`
+call itself, after which it no longer exists.
+
+### Fix ideas
+
+1. Give `RunState::save` a compare-and-swap: re-read, compare against the copy that was loaded,
+   and refuse or retry on divergence.
+2. Or take a per-run lockfile in the run dir around load-modify-save, and have `phase_*` honour it.
+3. (1) is cheaper and fixes only this class of clobber; (2) is the general answer and would also
+   cover the server's own writers.
+
+### Not fixed here, on purpose
+
+`cmd_cleanup`'s `process::exit(1)` paths (dirty worktree, failed squash-commit) cannot be driven
+from a unit test, so the *ordering* guarantee — archived is written before any git work, so a
+failed prune still leaves the run correctly marked — is enforced by construction and comment
+rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
+run-to-completion path only.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**

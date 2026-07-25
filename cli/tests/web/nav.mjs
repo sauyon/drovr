@@ -128,8 +128,27 @@ async function typeText(s) {
 const cursorName = () => evaluate(`
   var el = document.querySelector('#run-list-items .run-row.nav-cursor');
   return el ? el.querySelector('.run-name').textContent : null;`);
+// VISIBLE rows only — rows inside a collapsed "Completed" group are off screen
+// and the keyboard cursor deliberately skips them. Inlined rather than reading
+// the page's RUN_ROW_SEL: probes run against a page that may still be parsing,
+// and a bare reference throws ReferenceError before the script defines it. The
+// two are pinned together by the drift check in the completed-sessions section.
+const RUN_ROW_SEL = "#run-list-items > .run-row, #run-list-items details[open] .run-row";
 const rowNames = () => evaluate(`
+  return Array.from(document.querySelectorAll(${JSON.stringify(RUN_ROW_SEL)})).map(function(e){return e.querySelector('.run-name').textContent;});`);
+// Every row in the DOM, collapsed or not.
+const allRowNames = () => evaluate(`
   return Array.from(document.querySelectorAll('#run-list-items .run-row .run-name')).map(function(e){return e.textContent;});`);
+const groupSummary = () => evaluate(`
+  var s = document.querySelector('.run-group > summary');
+  return s ? s.textContent : null;`);
+const groupOpen = () => evaluate(`
+  var g = document.querySelector('.run-group');
+  return g ? g.open : null;`);
+const metaFor = name => evaluate(`
+  var rows = Array.from(document.querySelectorAll('#run-list-items .run-row'));
+  var row = rows.find(function(r){ return r.querySelector('.run-name').textContent === ${JSON.stringify(name)}; });
+  return row ? row.querySelector('.run-state').textContent : null;`);
 const cursorQuestion = () => evaluate(`
   var el = document.querySelector('#questions-area .question-item.nav-cursor');
   return el ? el.querySelector('.question-prompt').textContent : null;`);
@@ -200,7 +219,87 @@ if ((await cursorName()) === names[2]) {
   console.log('  skip C-n — reserved by this browser for a new window (expected off macOS)'); skip++;
 }
 
+console.log('\n== session list: completed sessions ==');
+await goto('#/', LIST_READY);
+check('the probe selector still matches the page\'s own navRows selector',
+  await evaluate(`return RUN_ROW_SEL;`), RUN_ROW_SEL);
+check('completed runs are hidden from the active list',
+  (await rowNames()).filter(n => n === 'epsilon-done' || n === 'zeta-archived'), []);
+check('...but they are in the DOM, inside the group',
+  (await allRowNames()).filter(n => n === 'epsilon-done' || n === 'zeta-archived').sort(),
+  ['epsilon-done', 'zeta-archived']);
+check('the group is labelled with a count', await groupSummary(), 'Completed (2)');
+check('the group starts collapsed', await groupOpen(), false);
+check('a finished run reports phase progress, not its stale gate state',
+  await metaFor('epsilon-done'), 'complete · 4/4');
+check('an archived run says so rather than showing a live-looking "ready"',
+  await metaFor('zeta-archived'), 'archived · 0/4');
+
+// The whole point of collapsing: j/k must not walk into rows nobody can see.
+await press('G');
+check('G stops at the last ACTIVE row, not inside the collapsed group',
+  ['epsilon-done', 'zeta-archived'].indexOf(await cursorName()), -1);
+
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group expands');
+check('clicking the summary expands the group', await groupOpen(), true);
+await waitFor(rowNames, r => r.indexOf('epsilon-done') !== -1, 4000, 'completed rows reachable');
+check('expanded rows join the keyboard order', (await rowNames()).indexOf('epsilon-done') !== -1, true);
+await press('G');
+check('G now reaches a completed row',
+  ['epsilon-done', 'zeta-archived'].indexOf(await cursorName()) !== -1, true);
+
+// The list re-renders every 2s; the group must not slam shut under the reviewer.
+await new Promise(r => setTimeout(r, 2600));
+check('the expanded group survives the periodic re-render', await groupOpen(), true);
+
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapses');
+check('clicking again re-collapses it', await groupOpen(), false);
+
+// A filter force-opens the group so matches cannot hide inside it. That is a
+// render decision, not the reviewer's — it must not be mistaken for one and
+// written back as their persisted preference.
+const storedOpen = () => evaluate(`return localStorage.getItem('drovr.completedOpen');`);
+check('the collapsed preference is stored as collapsed', await storedOpen(), '0');
+await press('/');
+await typeText('zeta');
+await waitFor(groupOpen, o => o === true, 4000, 'filter force-opens the group');
+check('a completed-only match is force-shown', await groupOpen(), true);
+check('...but that does NOT overwrite the reviewer\'s collapsed preference',
+  await storedOpen(), '0');
+await press('Escape');
+await waitFor(groupOpen, o => o === false, 4000, 'group re-collapses after the filter clears');
+check('clearing the filter restores the collapsed group', await groupOpen(), false);
+
+// The 2s poll rebuilds the <details> from scratch; parsing `open` fires `toggle`
+// on its own. That echo must not be mistaken for a gesture either.
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(storedOpen, v => v === '1', 4000, 'expanded preference stored');
+await evaluate(`localStorage.setItem('drovr.completedOpen','sentinel'); return 1;`);
+await new Promise(r => setTimeout(r, 2600));
+check('a re-render while expanded does not rewrite localStorage',
+  await storedOpen(), 'sentinel');
+await evaluate(`localStorage.setItem('drovr.completedOpen','0'); return 1;`);
+
+console.log('\n== session list: the Completed disclosure owns its own keys ==');
+await goto('#/', LIST_READY);
+await evaluate(`document.querySelector('.run-group > summary').focus(); return 1;`);
+check('the summary can take DOM focus', await activeId(), 'summary');
+const hashBefore = await hash();
+await press('Enter');
+await new Promise(r => setTimeout(r, 300));
+check('Enter on the focused summary does not navigate to an unrelated run',
+  await hash(), hashBefore);
+check('Enter on the focused summary toggles the group instead', await groupOpen(), true);
+// Hand the next section a collapsed group. This has to go through a real toggle,
+// not just localStorage: `goto('#/')` only changes the hash, which does not
+// reload the document, so the in-memory completedOpen would otherwise survive.
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed for the next section');
+
 console.log('\n== session list: filter ==');
+await goto('#/', LIST_READY);
 await press('g');
 await press('/');
 check('/ opens the filter', await filterOpen(), true);

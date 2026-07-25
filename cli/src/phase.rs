@@ -810,6 +810,7 @@ mod tests {
             project_dir: "/tmp/drovr-proj-test".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         }
     }
 

@@ -448,6 +448,7 @@ mod tests {
             project_dir: repo.path().to_string_lossy().into_owned(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         (run, repo)
     }
@@ -763,6 +764,7 @@ mod tests {
             project_dir: String::new(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         assert_eq!(next_iter(&base, "task-1"), 1);
 

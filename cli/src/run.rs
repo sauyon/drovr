@@ -62,6 +62,15 @@ pub struct RunState {
     /// human can merge it; deleted only under `--purge`. `None` when no worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Set by `cmd_cleanup`: the human is done with this run, its workspace is
+    /// closed and its panes are gone. Needed because nothing else reconciles a
+    /// torn-down run — phase statuses are frozen at their last write and the
+    /// review gate keeps whatever verdict slot it was parked in, so a cleaned-up
+    /// run that never finished its phases would otherwise display as live
+    /// forever. `#[serde(default)]` + skip-if-false keeps pre-existing
+    /// `state.json` files loading (and re-serializing) unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 fn legacy_agent() -> Option<String> {
@@ -134,6 +143,27 @@ impl RunState {
             .iter()
             .position(|p| p.status != PhaseStatus::Done)
     }
+    /// Whether this run is finished and can be filed away: either every phase
+    /// reached `Done`, or the human archived it via `drovr cleanup`.
+    ///
+    /// The `phases` emptiness guard is load-bearing, not defensive noise. Callers
+    /// that recover from an unreadable `state.json` with a default `RunState` hold
+    /// zero phases, and `first_incomplete()` over zero phases is vacuously `None`
+    /// — so without this check the runs whose state we *failed to read* would be
+    /// the ones reported complete and hidden from view.
+    pub fn is_complete(&self) -> bool {
+        self.archived || (!self.phases.is_empty() && self.first_incomplete().is_none())
+    }
+    /// `(phases done, total phases)` — pipeline progress for display. Counts
+    /// `phases` only, never `review_phases` (see that field's note).
+    pub fn progress(&self) -> (usize, usize) {
+        let done = self
+            .phases
+            .iter()
+            .filter(|p| p.status == PhaseStatus::Done)
+            .count();
+        (done, self.phases.len())
+    }
     /// Look up a phase by name across BOTH `phases` and `review_phases`. Reviewer
     /// lookups (marker-drop, seed injection) need to resolve names living in
     /// `review_phases`; pipeline progress deliberately does NOT use this (it stays
@@ -151,6 +181,96 @@ impl RunState {
 mod tests {
     use super::*;
     use crate::test_util::ENV_LOCK;
+
+    // A RunState with the given phases; other fields inert. `archived` defaults
+    // off so each test opts in explicitly.
+    fn completion_run(phases: Vec<Phase>) -> RunState {
+        RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases,
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+        }
+    }
+
+    fn done(name: &str) -> Phase {
+        Phase {
+            name: name.into(),
+            status: PhaseStatus::Done,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: None,
+        }
+    }
+
+    fn running(name: &str) -> Phase {
+        Phase {
+            name: name.into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("w:p1".into()),
+        }
+    }
+
+    #[test]
+    fn is_complete_only_when_every_phase_is_done() {
+        let s = completion_run(vec![done("brainstorm"), done("plan")]);
+        assert!(s.is_complete(), "all phases Done → complete");
+
+        let s = completion_run(vec![done("brainstorm"), running("plan")]);
+        assert!(!s.is_complete(), "a Running phase means still in flight");
+    }
+
+    #[test]
+    fn is_complete_is_false_for_a_run_with_no_phases() {
+        // Guard against the `unwrap_or_default()` trap on the server's list path:
+        // a missing or garbled state.json yields an empty RunState, and
+        // `first_incomplete()` on zero phases is vacuously None. Reporting that as
+        // "complete" would hide precisely the runs whose state we failed to read.
+        let s = completion_run(vec![]);
+        assert!(!s.is_complete(), "no phases is unknown, not complete");
+    }
+
+    #[test]
+    fn archived_forces_complete_even_mid_flight() {
+        // `drovr cleanup` tore the workspace down; the phase statuses are frozen
+        // mid-run and no longer reflect anything live (see cmd_cleanup).
+        let mut s = completion_run(vec![done("brainstorm"), running("plan")]);
+        assert!(!s.is_complete());
+        s.archived = true;
+        assert!(s.is_complete(), "an archived run is done regardless of phases");
+    }
+
+    #[test]
+    fn archived_defaults_false_when_absent_from_state_json() {
+        // Every run written before this field existed must keep showing as active.
+        let json = r#"{
+            "name": "legacy", "task": "t", "phases": [], "gate": "spec",
+            "cursor": 0, "project_dir": "/tmp/p"
+        }"#;
+        let s: RunState = serde_json::from_str(json).expect("legacy state.json must load");
+        assert!(!s.archived, "legacy runs default to not-archived");
+    }
+
+    #[test]
+    fn archived_survives_a_save_load_round_trip() {
+        let mut s = completion_run(vec![done("brainstorm")]);
+        s.archived = true;
+        let round: RunState =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
+        assert!(round.archived);
+    }
+
     #[test]
     fn run_dir_uses_xdg() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -229,6 +349,7 @@ mod tests {
             project_dir: "/tmp/proj".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
@@ -319,6 +440,7 @@ mod tests {
             project_dir: "/tmp/proj".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
         };
         assert_eq!(s.find_phase("plan").map(|p| p.name.as_str()), Some("plan"));
         assert_eq!(

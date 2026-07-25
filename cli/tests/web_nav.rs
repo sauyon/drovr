@@ -93,6 +93,48 @@ fn seed_runs(runs_root: &PathBuf) {
         )
         .unwrap();
     }
+    // Two finished runs for the "Completed (N)" group. They carry real phases —
+    // the four runs above use `"phases":[]`, which is deliberately NOT complete
+    // (an empty phase list means "unknown"; see RunState::is_complete), so they
+    // stay in the active list and the motion checks are untouched by this.
+    let phases = |statuses: [&str; 4]| {
+        ["brainstorm", "plan", "implement", "review"]
+            .iter()
+            .zip(statuses)
+            .map(|(n, s)| {
+                format!(
+                    r#"{{"name":"{n}","status":"{s}","handoff_doc":null,"herdr_session":null,"pane_id":null}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // Ran its pipeline to the end.
+    let eps = runs_root.join("epsilon-done");
+    fs::create_dir_all(&eps).unwrap();
+    fs::write(
+        eps.join("state.json"),
+        format!(
+            r#"{{"name":"epsilon-done","task":"task for epsilon-done","phases":[{}],"gate":"spec","cursor":0,"project_dir":""}}"#,
+            phases(["Done", "Done", "Done", "Done"])
+        ),
+    )
+    .unwrap();
+    // Cleaned up mid-flight: phases frozen at `Running` against a pane that no
+    // longer exists, archived by `drovr cleanup`. This is the shape that used to
+    // display as a live `ready` session forever.
+    let zeta = runs_root.join("zeta-archived");
+    fs::create_dir_all(&zeta).unwrap();
+    fs::write(
+        zeta.join("state.json"),
+        format!(
+            r#"{{"name":"zeta-archived","task":"task for zeta-archived","phases":[{}],"gate":"spec","cursor":0,"project_dir":"","archived":true}}"#,
+            phases(["Running", "Pending", "Pending", "Pending"])
+        ),
+    )
+    .unwrap();
+    fs::write(zeta.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
+
     // alpha-deploy is the run the detail-view checks drive: put it in the state a
     // reviewer actually meets it in — `ready`, still on turn 0 (the counter only
     // moves when the reviewer submits), with the agent's summary posted.
