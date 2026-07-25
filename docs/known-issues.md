@@ -297,10 +297,18 @@ path** while `code-review run` used a bare `agent_send`.
 reviewer raises a `TimedOut` error that aborts the pass instead of erroring with "target not
 found". So the "agent target not found" symptom above should no longer occur.
 
-**Unverified as of 2026-07-25:** the *second* symptom — reviewer panes attach and get seeded but
-never reach `done`, so `code-review run` times out with no `<task>-review.json` — has not been
-re-run against current `main`. It is a distinct failure from the spawn race and nothing in the
-source rules it out. Keep the workaround until someone dogfoods the panel end-to-end again.
+**CONFIRMED 2026-07-25** (run `review-resume`, branch `drovr/review-resume`, dogfooding the panel
+on the code-review resume change): the *second* symptom reproduces, and it is **not** a distinct
+bug — it is the unsubmitted-paste failure documented in the next section. All four cursor
+reviewer panes launched, attached, and received their seed, but the brief sits in the composer as
+`→ [Pasted text #1 +46 lines]`, never submitted. The agents therefore never start, never reach
+`done`, and `code-review run` times out with no `<task>-review.json` — exactly as reported.
+
+Reading a reviewer pane (`herdr agent read <pane>`) shows the full seed rendered in the composer
+with the correct `base..head` scope, so seeding and scope selection are fine; only the submit
+keystroke is missing. Fixing "`phase send` lands a large briefing unsubmitted" (below) fixes the
+panel too — they are one bug, and the panel is simply its most visible victim. Keep the
+self-spawned-reviewer workaround above until that lands.
 
 ## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
 
