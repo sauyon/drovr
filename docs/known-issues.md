@@ -147,3 +147,106 @@ polling is the anti-pattern the skill already names, reached here by the routing
 3. `drovr serve` is a foreground process; if it is backgrounded in a slot tied to the session
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
+
+## `drovr phase compress` regurgitates the seed instead of the phase's artifact
+
+**Severity:** medium (the next phase is seeded from a handoff that describes the *previous*
+phase's state, not the work just done — so it must re-read the source artifact anyway, and a
+driver that trusts the handoff would seed the next phase with stale/wrong context).
+**Found:** 2026-07-24, run `gpu-deploy-view`. Hit on BOTH the brainstorm and the plan phase.
+
+### Symptom
+
+- **Plan phase:** the plan agent wrote a complete 538-line `plan.md` (8 tasks, verified
+  signatures). `drovr phase compress ... plan` produced a ~35–43-line handoff whose State
+  section says *"No implementation done… the source has NOT been read… all signatures
+  UNKNOWN"* — i.e. it summarized the **brainstorm-level seed**, not the plan. Re-running
+  compress produced the same wrong content.
+- **Brainstorm phase (first attempt):** compress emitted 2 lines of meta-garbage
+  ("Backend still down… write the plan to …splendid-nova.md… ExitPlanMode"). A retry produced
+  a correct 7-section handoff.
+
+### Root cause (suspected)
+
+`phase compress` runs a fresh `claude -p` that reads the pane transcript via `herdr agent
+read`. When the phase's real output lives in a **file** the agent wrote (`plan.md` via the
+Write tool), the pane transcript shows tool *calls*, not the file's content — while the
+injected briefing (which contained the prior phase's handoff) is fully present in the
+transcript. The compressor over-weights the visible briefing and summarizes *that*. The
+2-line garbage case looks like a transient API/tool error (the `502 classifier unreachable`
+blips seen this session) that the compressor surfaced instead of a handoff.
+
+### Workaround
+
+Don't trust the handoff as the sole seed. Seed the next phase from the **artifact file**
+(`spec.md` / `plan.md`) directly; use the handoff only as a supplement. For per-task interface
+fold-forward, read the task's own `task<N>-report.md` (written by the implement agent), not the
+compressed handoff.
+
+### Fix ideas
+
+1. Have `phase compress` also read the phase's declared output artifact(s) (`spec.md`,
+   `plan.md`, `task<N>-report.md`) from the run dir, not only the pane transcript.
+2. Detect and reject a degenerate handoff (e.g. < N lines, or missing the fixed sections, or
+   an obvious API-error body) and auto-retry before writing it.
+
+## `drovr code-review run` panel never completes (reviewer panes don't attach)
+
+**Severity:** medium (the automated review-until-clean panel is unusable; the driver must fall
+back to spawning its own read-only reviewer).
+**Found:** 2026-07-24, run `gpu-deploy-view`, tasks 1–2. Only `claude` has a herdr integration
+here (cursor not integrated).
+
+### Symptom
+
+- On the pre-update binary: `drovr code-review run <run> task-N` → `code-review run failed:
+  agent target w61:pX not found` (the reviewer pane is created but the agent isn't attached
+  when the panel tries to drive it — the same startup race as `phase send`).
+- On the updated binary (past the phase-send readiness fix): the panel writes its per-angle
+  seed files (`task-N-review-<angle>-seed.md` for correctness/error-handling/security/
+  type-design) but the reviewer panes never reach `done`; `code-review run` times out with no
+  `task-N-review.json` produced.
+
+### Workaround
+
+Drive the between-task review with a self-spawned read-only reviewer (Claude Code Agent tool,
+`general-purpose`, read-only) over `git diff <base>..HEAD` **plus** the working tree, and feed
+Critical/Important findings back to the implement agent. Same find-then-fix discipline, no
+herdr panel.
+
+### Fix idea
+
+Apply the `phase send` agent-readiness fix (poll `agent_status` until attached/at-composer) to
+the reviewer-spawn path in `code_review.rs`, and bound each reviewer with a liveness check so a
+never-attached pane fails fast instead of hanging the whole panel.
+
+## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
+
+**Severity:** low (recoverable, but every phase injection needs a manual nudge, so an
+unattended pipeline stalls silently at each phase start).
+**Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
+binary that carries the phase-send agent-readiness fix.
+
+### Symptom
+
+`drovr phase send <run> <phase> "<large briefing>"` returns success, and (post-fix) no longer
+errors with "agent target not found" — but the briefing sits in the agent's composer as a
+collapsed bracketed paste (`❯ [Pasted text #1 +NN lines]`, cost `$0.00`) and is **not
+submitted**. The agent never starts; `phase wait` would time out.
+
+### Root cause (suspected)
+
+The readiness fix (await attach/composer before sending) resolved the *race* that caused
+"target not found", but the submit itself — a large **bracketed paste** followed by a single
+CR — still leaves the paste uncommitted in the composer for big payloads; the trailing CR does
+not submit it.
+
+### Workaround
+
+After `phase send`, submit with `herdr agent send-keys <pane> Enter` (verify first with
+`herdr agent read <pane>`).
+
+### Fix idea
+
+For large payloads, either send the submit key(s) separately after a short settle, or detect a
+still-populated composer post-send and re-issue the submit until the input clears.
