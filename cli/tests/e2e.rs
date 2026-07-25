@@ -15,9 +15,9 @@
 //!
 //! Runnable assertions (no integration agent required):
 //!   • `drovr new`  → state.json exists with 4 seeded phases.
-//!   • `drovr serve` in background → `/state` returns `idle`.
-//!   • `POST /submit` (request-changes) → `/state` becomes `waiting`.
-//!   • `drovr review summary` → `/state` becomes `ready`.
+//!   • always-on `drovr serve` in background → `/api/runs/<run>/state` = `idle`.
+//!   • `POST /api/runs/<run>/submit` (request-changes) → state = `waiting`.
+//!   • `drovr review summary` (finds server via global addr) → state = `ready`.
 //!   • `drovr cleanup --purge` → run dir removed.
 
 use std::fs;
@@ -92,12 +92,12 @@ fn http_post(addr: &str, path: &str, content_type: &str, body: &str) -> (u16, St
     (status, rb)
 }
 
-/// Poll `GET /state` until `field "state"` equals `expected` or timeout.
-fn poll_state(addr: &str, expected: &str, timeout: Duration) -> bool {
+/// Poll `GET /api/runs/<run>/state` until `field "state"` equals `expected`.
+fn poll_state(addr: &str, run: &str, expected: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(mut stream) = TcpStream::connect(addr) {
-            let req = format!("GET /state HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+            let req = format!("GET /api/runs/{run}/state HTTP/1.0\r\nHost: {addr}\r\n\r\n");
             let _ = stream.write_all(req.as_bytes());
             let mut resp = String::new();
             let _ = stream.read_to_string(&mut resp);
@@ -244,52 +244,49 @@ fn e2e_smoke() {
         phases.len()
     );
 
-    // ---- Step 2: drovr serve + review cycle --------------------------------
+    // ---- Step 2: always-on serve + review cycle ----------------------------
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    // Start `drovr serve` in a background child process.
+    // Start the always-on `drovr serve` (no run arg — it serves every run) in a
+    // background child process on a test port.
     let serve_child = base_cmd()
-        .args([
-            "serve",
-            run_name,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
+        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("drovr serve");
     let _guard = KillOnDrop(serve_child);
 
-    // Poll until the server is reachable and reports `idle`.
+    // Poll until the server is reachable and reports `idle` for our run.
     assert!(
-        poll_state(&addr, "idle", Duration::from_secs(5)),
+        poll_state(&addr, run_name, "idle", Duration::from_secs(5)),
         "timed out waiting for serve to reach idle state at {addr}"
     );
     println!("e2e: drovr serve started — state=idle");
 
-    // POST /submit (request-changes + feedback) → state should become `waiting`
+    // POST submit (request-changes + feedback) → state should become `waiting`
     let submit_payload = r#"{"decision":"request-changes","feedback":"please revise","answers":{},"annotations":[]}"#;
-    let (status, body) = http_post(&addr, "/submit", "application/json", submit_payload);
-    assert_eq!(status, 200, "POST /submit failed: {body}");
+    let submit_path = format!("/api/runs/{run_name}/submit");
+    let (status, body) = http_post(&addr, &submit_path, "application/json", submit_payload);
+    assert_eq!(status, 200, "POST submit failed: {body}");
     assert!(
         body.contains(r#""state":"waiting""#),
         "expected waiting after submit, got: {body}"
     );
-    println!("e2e: POST /submit OK — state=waiting");
+    println!("e2e: POST submit OK — state=waiting");
 
-    // Verify GET /state agrees
-    let (_, state_body) = http_get(&addr, "/state");
+    // Verify GET state agrees
+    let state_path = format!("/api/runs/{run_name}/state");
+    let (_, state_body) = http_get(&addr, &state_path);
     assert!(
         state_body.contains(r#""state":"waiting""#),
-        "GET /state should be waiting: {state_body}"
+        "GET state should be waiting: {state_body}"
     );
 
-    // `drovr review summary` → state should become `ready`
+    // `drovr review summary` finds the always-on server via the global
+    // `server.addr` (no per-run address file) → state should become `ready`.
     let out = base_cmd()
         .args([
             "review",
@@ -305,10 +302,10 @@ fn e2e_smoke() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let (_, state_body) = http_get(&addr, "/state");
+    let (_, state_body) = http_get(&addr, &state_path);
     assert!(
         state_body.contains(r#""state":"ready""#),
-        "GET /state should be ready after summary: {state_body}"
+        "GET state should be ready after summary: {state_body}"
     );
     println!("e2e: drovr review summary OK — state=ready");
 

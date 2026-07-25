@@ -68,11 +68,51 @@ fn legacy_agent() -> Option<String> {
     Some("claude".into())
 }
 
-pub fn run_dir(name: &str) -> PathBuf {
+/// The drovr data root (`$XDG_DATA_HOME/drovr` or `~/.local/share/drovr`).
+///
+/// Home of the global always-on-server discovery files (`server.addr`,
+/// `server.pid`) and the `runs/` directory. [`run_dir`] resolves under it.
+pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
-    base.join("drovr").join("runs").join(name)
+    base.join("drovr")
+}
+
+pub fn run_dir(name: &str) -> PathBuf {
+    data_dir().join("runs").join(name)
+}
+
+/// The directory holding every run (`<data_dir>/runs`). May not exist yet.
+pub fn runs_dir() -> PathBuf {
+    data_dir().join("runs")
+}
+
+/// Enumerate run names: the immediate subdirectories of `root` that hold a
+/// `state.json`. Returned unsorted; callers sort as they see fit. A missing
+/// `root` yields an empty list (not an error) — a fresh install has no runs.
+/// The always-on server passes its configured runs root (injectable in tests);
+/// the global convenience is `list_runs_in(&runs_dir())`. Entries whose name is
+/// not valid UTF-8 are skipped.
+pub fn list_runs_in(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if entry.path().join("state.json").is_file() {
+            out.push(name);
+        }
+    }
+    out
 }
 
 impl RunState {
@@ -121,6 +161,31 @@ mod tests {
             run_dir("demo"),
             PathBuf::from("/tmp/drovr-xdg-test/drovr/runs/demo")
         );
+        assert_eq!(data_dir(), PathBuf::from("/tmp/drovr-xdg-test/drovr"));
+    }
+
+    #[test]
+    fn list_runs_finds_dirs_with_state_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        // Missing runs/ dir → empty, not an error.
+        assert!(list_runs_in(&runs_dir()).is_empty());
+
+        let runs = runs_dir();
+        // A real run: has state.json.
+        fs::create_dir_all(runs.join("alpha")).unwrap();
+        fs::write(runs.join("alpha").join("state.json"), b"{}").unwrap();
+        // A dir without state.json → skipped (e.g. a stray/half-created dir).
+        fs::create_dir_all(runs.join("bogus")).unwrap();
+        // A file (not a dir) at the top level → skipped.
+        fs::write(runs.join("afile"), b"x").unwrap();
+
+        let mut got = list_runs_in(&runs_dir());
+        got.sort();
+        assert_eq!(got, vec!["alpha".to_string()]);
     }
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {

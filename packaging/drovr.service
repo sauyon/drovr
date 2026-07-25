@@ -1,0 +1,29 @@
+# drovr always-on review server (systemd --user unit).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/drovr.service ~/.config/systemd/user/drovr.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now drovr
+#
+# The server binds 127.0.0.1:8791 and serves every run under the drovr data
+# dir. `drovr review …` also auto-spawns it on demand, so this unit is optional
+# — it just keeps the server up across logins/reboots and gives you a supervised
+# process with logs (`journalctl --user -u drovr`).
+[Unit]
+Description=drovr always-on review server
+After=default.target
+
+[Service]
+Type=simple
+# Discovery files + every run's spec/diff/feedback live under the data dir;
+# keep them owner-only.
+UMask=0077
+# Relies on `drovr` being on PATH for the user's systemd environment. If it is
+# not, replace with an absolute path (e.g. ExecStart=%h/.nix-profile/bin/drovr serve).
+ExecStart=drovr serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

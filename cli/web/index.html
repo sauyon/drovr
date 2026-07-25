@@ -533,16 +533,54 @@
     overflow: visible;
     padding-left: 40px;
   }
+
+  /* ---- Session list view ---- */
+  #back-link {
+    color: var(--accent, #4098ff);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  #back-link:hover { text-decoration: underline; }
+  .run-row {
+    display: grid;
+    grid-template-columns: 14px minmax(120px, 1fr) 160px 2fr;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    text-decoration: none;
+    color: inherit;
+  }
+  .run-row:last-child { border-bottom: none; }
+  .run-row:hover { background: var(--hover, rgba(127,127,127,0.08)); }
+  .run-name { font-weight: 600; }
+  .run-state { font-size: 12px; opacity: 0.8; }
+  .run-task {
+    font-size: 12px; opacity: 0.7;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .run-dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
+  .run-dot.state-ready { background: #f5a623; }      /* awaiting reviewer */
+  .run-dot.state-waiting { background: #4098ff; }    /* awaiting agent */
+  .run-dot.state-approved { background: #3ec46d; }   /* done */
+  .run-dot.state-idle { background: #888; }
 </style>
 </head>
 <body>
 <div class="shell">
   <div class="topbar">
     <div style="display:flex;align-items:center;gap:10px">
-      <h1>Drovr Review Loop</h1>
+      <a id="back-link" href="#/" style="display:none">&larr; All sessions</a>
+      <h1>Drovr Review</h1>
       <span class="turn-badge" id="turn-badge"></span>
     </div>
     <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+  </div>
+
+  <!-- Session list (landing view): every run under the drovr data dir. -->
+  <div id="run-list" style="display:none" class="panel">
+    <div class="panel-title">Sessions</div>
+    <div id="run-list-items"></div>
   </div>
 
   <div id="summary-banner" style="display:none" class="summary-banner">
@@ -648,6 +686,31 @@ function toggleDiff() {
   localStorage.setItem('rl-diff-hidden', diffHidden() ? '0' : '1');
   applyDiffVisibility();
 }
+
+// ---- Routing / current run ----
+// The always-on server serves every run; the URL hash picks the view:
+//   #/                    → session list
+//   #/runs/<run>          → that run's review detail
+//   #/runs/<run>?task=<t> → detail with the code-review panel for <t>
+var currentRun = '';
+function parseHash() {
+  var h = (location.hash || '').replace(/^#/, '');
+  var qIdx = h.indexOf('?');
+  var path = qIdx >= 0 ? h.slice(0, qIdx) : h;
+  var query = qIdx >= 0 ? h.slice(qIdx + 1) : '';
+  var m = path.match(/^\/runs\/([^\/?]+)/);
+  return {
+    run: m ? decodeURIComponent(m[1]) : '',
+    query: new URLSearchParams(query)
+  };
+}
+// Build a run-scoped API path for the current run.
+function api(sub) { return '/api/runs/' + encodeURIComponent(currentRun) + '/' + sub; }
+
+// Bumped on every route() so an in-flight fetch/poll from a previous view can
+// detect it's stale (navigation happened mid-await) and bail instead of
+// clobbering the new view or firing fetches at the wrong run.
+var routeGen = 0;
 
 // ---- markdown-it with source-line injection ----
 // Override the renderer so block-level elements get data-source-line="N"
@@ -769,7 +832,7 @@ function renderSourceDiff(oldText, newText) {
 // ---- Code-review surface (findings + reviewed diff) ----
 // Task label from the page URL (?task=<task>); absent → panel stays hidden.
 function reviewTask() {
-  try { return new URLSearchParams(window.location.search).get('task') || ''; }
+  try { return parseHash().query.get('task') || ''; }
   catch (e) { return ''; }
 }
 
@@ -942,7 +1005,7 @@ async function refreshReview() {
 
   var review = {};
   try {
-    var fr = await fetch('/review/findings' + q);
+    var fr = await fetch(api('review/findings') + q);
     if (fr.ok) review = await fr.json();
   } catch (e) { review = {}; }
   var findings = (review && review.findings) || [];
@@ -956,7 +1019,7 @@ async function refreshReview() {
 
   document.getElementById('review-findings').innerHTML = renderFindings(findings);
 
-  var diffText = await fetchText('/review/diff' + q);
+  var diffText = await fetchText(api('review/diff') + q);
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
     diffEl.innerHTML = await renderReviewDiff(diffText, findings);
@@ -977,24 +1040,25 @@ var currentTurn = 0;
 // Persist annotations across page refreshes (incl. the loop's own reload after
 // each turn). Keyed by turn: a manual refresh mid-turn restores in-progress
 // comments; a new turn starts clean (the prior turn's were already submitted).
-var ANNOT_KEY = 'rl-annotations';
+// Keyed by run AND turn: switching runs or advancing a turn starts clean.
+function annotKey() { return 'rl-annotations:' + currentRun; }
 function saveAnnotations() {
   try {
-    localStorage.setItem(ANNOT_KEY, JSON.stringify({
+    localStorage.setItem(annotKey(), JSON.stringify({
       turn: currentTurn, seq: _annotIdSeq, annotations: annotations
     }));
   } catch (e) {}
 }
 function loadAnnotations(turn) {
   try {
-    var raw = localStorage.getItem(ANNOT_KEY);
-    if (!raw) return;
+    var raw = localStorage.getItem(annotKey());
+    if (!raw) { annotations = {}; return; }
     var stored = JSON.parse(raw);
     if (stored && stored.turn === turn && stored.annotations) {
       annotations = stored.annotations;
       _annotIdSeq = stored.seq || _annotIdSeq;
     } else if (stored && stored.turn !== turn) {
-      localStorage.removeItem(ANNOT_KEY); // stale (new turn) — clear
+      localStorage.removeItem(annotKey()); // stale (new turn) — clear
       annotations = {};
     }
   } catch (e) {}
@@ -1191,14 +1255,18 @@ async function fetchText(url) {
 
 async function refresh() {
   clearTimeout(pollTimer);
+  var gen = routeGen;
 
   var [stateRes, docText, priorText, summaryText, questionsData] = await Promise.all([
-    fetch('/state').then(function(r){ return r.json(); }),
-    fetchText('/doc'),
-    fetchText('/prior'),
-    fetchText('/summary'),
-    fetch('/questions').then(function(r){ return r.json(); }).catch(function(){ return []; })
+    fetch(api('state')).then(function(r){ return r.json(); }),
+    fetchText(api('doc')),
+    fetchText(api('prior')),
+    fetchText(api('summary')),
+    fetch(api('questions')).then(function(r){ return r.json(); }).catch(function(){ return []; })
   ]);
+
+  // Navigated away while these fetches were in flight → drop this stale render.
+  if (gen !== routeGen) return;
 
   currentDocText = docText;
   var state = stateRes.state;
@@ -1255,7 +1323,7 @@ async function refresh() {
     hideEl('form-section');
     hideEl('approved-overlay');
     showEl('waiting-overlay');
-    pollTimer = setTimeout(pollState, 1000);
+    pollTimer = setTimeout(function(){ pollState(gen); }, 1000);
     return;
   }
 
@@ -1266,17 +1334,20 @@ async function refresh() {
   showEl('form-section');
 }
 
-async function pollState() {
+async function pollState(gen) {
+  if (gen !== routeGen) return;           // view changed before this fired
   try {
-    var r = await fetch('/state');
+    var r = await fetch(api('state'));
     var data = await r.json();
+    if (gen !== routeGen) return;         // navigated away mid-fetch
     if (data.state === 'ready' || data.state === 'approved') {
       await refresh();
     } else {
-      pollTimer = setTimeout(pollState, 1000);
+      pollTimer = setTimeout(function(){ pollState(gen); }, 1000);
     }
   } catch(e) {
-    pollTimer = setTimeout(pollState, 2000);
+    if (gen !== routeGen) return;
+    pollTimer = setTimeout(function(){ pollState(gen); }, 2000);
   }
 }
 
@@ -1305,7 +1376,7 @@ async function submitDecision() {
   };
 
   try {
-    var r = await fetch('/submit', {
+    var r = await fetch(api('submit'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -1326,8 +1397,61 @@ function showError(msg) {
   el.style.display = '';
 }
 
+// ---- Session list view ----
+async function renderRunList() {
+  var listEl = document.getElementById('run-list-items');
+  try {
+    var r = await fetch('/api/runs');
+    var runs = await r.json();
+    if (!runs.length) {
+      listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
+      return;
+    }
+    listEl.innerHTML = runs.map(function(run) {
+      var meta = escHtml(run.state) + (run.turn ? ' · turn ' + run.turn : '');
+      return '<a class="run-row" href="#/runs/' + encodeURIComponent(run.name) + '">' +
+        '<span class="run-dot state-' + escHtml(run.state) + '"></span>' +
+        '<span class="run-name">' + escHtml(run.name) + '</span>' +
+        '<span class="run-state">' + meta + '</span>' +
+        '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
+      '</a>';
+    }).join('');
+  } catch (e) {
+    listEl.innerHTML = '<div class="review-empty">Failed to load sessions.</div>';
+  }
+}
+
+// ---- Router ----
+var DETAIL_PANELS = ['summary-banner', 'review-panel', 'diff-panel',
+  'doc-panel', 'waiting-overlay', 'approved-overlay', 'form-section'];
+
+async function route() {
+  clearTimeout(pollTimer);
+  routeGen++;                 // invalidate any in-flight poll/refresh
+  var h = parseHash();
+  currentRun = h.run;
+
+  if (!currentRun) {
+    // Session list landing view.
+    DETAIL_PANELS.forEach(hideEl);
+    hideEl('back-link');
+    document.getElementById('turn-badge').textContent = '';
+    showEl('run-list');
+    await renderRunList();
+    pollTimer = setTimeout(route, 2000); // keep the list fresh
+    return;
+  }
+
+  // Run detail view.
+  hideEl('run-list');
+  showEl('back-link');
+  showEl('doc-panel');
+  await refresh();
+}
+
 // ---- Init ----
-refresh().catch(console.error);
+window.addEventListener('hashchange', function(){ route().catch(console.error); });
+route().catch(console.error);
 </script>
 </body>
 </html>

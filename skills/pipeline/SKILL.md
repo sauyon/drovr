@@ -42,29 +42,26 @@ transcript. `spec.md`, `plan.md`, reports, and `verdict.md` all live in the run 
 
 ## The spec gate (after brainstorm only)
 
-`drovr new` does **not** start the review server — you start it. The brainstorm agent is the
-single writer of `spec.md`; you convey the reviewer's decisions.
+The review server is **always on** — you do not start it per run. `drovr review summary`/
+`wait` auto-start it on demand (and reuse it if already up). The brainstorm agent is the
+single writer of `spec.md`; you convey the reviewer's decisions. The run's page lives at
+`http://127.0.0.1:8791/#/runs/<run>` (the root `/` is the session list of all runs).
 
-1. **Start the server** (it blocks, so background it):
-   ```
-   drovr serve <run> --host 127.0.0.1 --port 8791 &
-   ```
-   Use a Tailscale host instead of localhost only on a trusted tailnet — there is no auth.
-   The server must be up *before* the agent's first `drovr review summary`: that command
-   POSTs the summary to this server (via `review.addr`), so with nothing listening the post
-   fails. **But do NOT hand the human the URL yet** — the rendered page is EMPTY until the
-   first summary lands, and an empty page reads as "the tool is broken."
+1. **Nothing to start.** The agent's first `drovr review summary` brings the server up if it
+   isn't already. Use a Tailscale host instead of localhost only on a trusted tailnet — there
+   is no auth (`drovr serve --host <tailscale-host>` if you want to pre-bind it). **Do NOT
+   hand the human the run URL yet** — the page is EMPTY until the first summary lands, and an
+   empty page reads as "the tool is broken."
 
 1b. **Wait for the first summary before announcing the URL or starting `review wait`.** The
    brainstorm agent writes `spec.md` then runs `drovr review summary`, flipping state
-   `idle → ready`. Only once `spec.md` exists **and** `GET /state` reports `ready` do you give
-   the human the URL and start `drovr review wait`. Until then there is nothing to review and
-   a `review wait` against a specless run just churns (or errors if the server isn't up yet).
-   If the agent stalls without producing a spec, inspect its pane (`drovr attach <run>`) — do
-   not point the human at an empty page. (Background a poll on `GET /state` for the `ready`
-   transition; don't busy-wait inline.)
+   `idle → ready`. Only once `spec.md` exists **and** state reports `ready` do you give the
+   human the URL and start `drovr review wait`. Until then there is nothing to review and a
+   `review wait` against a specless run just churns. If the agent stalls without producing a
+   spec, inspect its pane (`drovr attach <run>`) — do not point the human at an empty page.
+   (Background a poll on the run's state for the `ready` transition; don't busy-wait inline.)
 
-2. **Server state machine** (`GET /state` → `{state, turn}`; files in the run dir):
+2. **Per-run state machine** (`/api/runs/<run>/state` → `{state, turn}`; files in the run dir):
 
    ```
    idle ──agent: drovr review summary──▶ ready ──reviewer "request changes"──▶ waiting
@@ -79,7 +76,7 @@ single writer of `spec.md`; you convey the reviewer's decisions.
    never sees the change. The agent edits the markdown; the server owns rendering and
    diffing (a real markdown parser — zero LLM drift).
 
-4. **Wait for the reviewer — do NOT busy-poll `GET /state`.** After the summary is posted,
+4. **Wait for the reviewer — do NOT busy-poll state.** After the summary is posted,
    block on:
    ```
    drovr review wait <run>   # background it; exits when the reviewer acts
@@ -94,7 +91,7 @@ single writer of `spec.md`; you convey the reviewer's decisions.
    | 0 | approved | Compress brainstorm; proceed to plan. |
    | 3 | changes requested | Forward `feedback.json` (step 5); wait again. |
    | 2 | timeout | Re-run `drovr review wait <run>`. |
-   | 1 | error (no `review.addr` / server down) | Ensure `drovr serve <run>` is running. |
+   | 1 | error (server unreachable / could not auto-start) | Check `drovr serve` can run; try `drovr serve &` manually. |
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
@@ -208,10 +205,10 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 
 | Mistake | Fix |
 |---|---|
-| Expecting `drovr new` to serve the gate | Start `drovr serve <run> &` yourself before the gate. |
-| Announcing the URL / starting `review wait` before the first summary | Wait for `spec.md` + `GET /state` = `ready`; an empty page reads as broken and a specless `review wait` churns. |
+| Manually babysitting a per-run server | The server is always on and auto-starts on demand; just run `drovr review summary`/`wait`. |
+| Announcing the URL / starting `review wait` before the first summary | Wait for `spec.md` + state = `ready`; an empty page reads as broken and a specless `review wait` churns. |
 | Agent edits `spec.md` but reviewer sees nothing | Agent must run `drovr review summary` after each edit. |
-| Busy-polling `GET /state` for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
+| Busy-polling state for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |

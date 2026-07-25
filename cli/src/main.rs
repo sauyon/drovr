@@ -72,14 +72,14 @@ enum Commands {
     /// Reload a stopped run and report the resume point.
     Resurrect { name: String },
 
-    /// Start the review HTTP server for a run.
+    /// Start the always-on review server (serves every run). Runs in the
+    /// foreground; normally auto-started on demand by `drovr review …`.
     Serve {
-        name: String,
         /// Host/address to bind. Overrides `serve_host` from config
         /// (which itself defaults to `127.0.0.1`).
         #[arg(long)]
         host: Option<String>,
-        #[arg(long, default_value_t = 8791)]
+        #[arg(long, default_value_t = review::DEFAULT_PORT)]
         port: u16,
     },
 
@@ -616,11 +616,8 @@ fn cmd_resurrect(name: &str) {
     }
 }
 
-fn cmd_serve(name: &str, host: Option<String>, port: u16) {
-    if let Err(e) = validate_run_name(name) {
-        eprintln!("drovr: {e}");
-        process::exit(1);
-    }
+fn cmd_serve(host: Option<String>, port: u16) {
+    // `--host` omitted → fall back to the `serve_host` config field.
     let host = host.unwrap_or_else(|| {
         config::load_config()
             .map(|cfg| cfg.serve_host)
@@ -629,7 +626,7 @@ fn cmd_serve(name: &str, host: Option<String>, port: u16) {
                 process::exit(1);
             })
     });
-    if let Err(e) = serve(name, &host, port) {
+    if let Err(e) = serve(&host, port) {
         eprintln!("drovr: serve failed: {e}");
         process::exit(1);
     }
@@ -1058,7 +1055,7 @@ fn main() {
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
         Commands::Resurrect { name } => cmd_resurrect(&name),
-        Commands::Serve { name, host, port } => cmd_serve(&name, host, port),
+        Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Handoff { sub } => cmd_handoff(sub, &herdr),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
@@ -1149,10 +1146,10 @@ mod tests {
 
     #[test]
     fn parse_serve_defaults() {
-        let cli = parse(&["drovr", "serve", "myrun"]).unwrap();
+        // No run arg anymore — the always-on server serves every run.
+        let cli = parse(&["drovr", "serve"]).unwrap();
         match cli.command {
-            Commands::Serve { name, host, port } => {
-                assert_eq!(name, "myrun");
+            Commands::Serve { host, port } => {
                 assert_eq!(host, None);
                 assert_eq!(port, 8791);
             }
@@ -1162,10 +1159,9 @@ mod tests {
 
     #[test]
     fn parse_serve_custom_port() {
-        let cli = parse(&["drovr", "serve", "demo", "--port", "9000"]).unwrap();
+        let cli = parse(&["drovr", "serve", "--port", "9000"]).unwrap();
         match cli.command {
-            Commands::Serve { name, port, .. } => {
-                assert_eq!(name, "demo");
+            Commands::Serve { port, .. } => {
                 assert_eq!(port, 9000);
             }
             _ => panic!("wrong variant"),
@@ -1176,7 +1172,7 @@ mod tests {
     fn parse_serve_explicit_host() {
         // An explicit `--host` parses to `Some(..)`, which `cmd_serve` uses
         // verbatim (bypassing the `serve_host` config fallback).
-        let cli = parse(&["drovr", "serve", "myrun", "--host", "0.0.0.0"]).unwrap();
+        let cli = parse(&["drovr", "serve", "--host", "0.0.0.0"]).unwrap();
         match cli.command {
             Commands::Serve { host, .. } => assert_eq!(host, Some("0.0.0.0".to_string())),
             _ => panic!("wrong variant"),

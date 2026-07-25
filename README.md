@@ -4,7 +4,8 @@
 orchestrates a fixed sequence of phases (brainstorm → plan → implement →
 review), routes each phase to a Claude agent pane via
 [herdr](https://github.com/sauyon/herdr), compresses finished phases into
-handoff docs, and runs a local HTTP server for the human review loop.
+handoff docs, and runs an always-on local HTTP server (with a browsable session
+list) for the human review loop.
 
 Drovr leans on all three context-engineering levers
 (anthropic.com/engineering/effective-context-engineering-for-ai-agents), not compaction alone:
@@ -103,7 +104,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr status <name>` | Print each phase, its status, and the resume point. |
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
-| `drovr serve <name> [--host H] [--port P]` | Start the review HTTP server (default `127.0.0.1:8791`). Blocks until killed. The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
+| `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
 | `drovr cleanup <name> [--purge]` | Stop herdr sessions. With `--purge`, remove the run directory. |
 
 ### Plumbing
@@ -115,7 +116,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr phase wait <run> <phase> [--timeout-ms N]` | Poll until the phase agent is done (default 30 s). |
 | `drovr phase compress <run> <phase>` | Read the phase transcript and write `<phase>-HANDOFF.md` via `claude -p`. |
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
-| `drovr review summary <run> <text>` | POST summary text to the running review server, flipping state to `ready`. |
+| `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
 
@@ -151,31 +152,44 @@ Written by `drovr phase compress`. A compressed summary of the phase's agent
 transcript (objective + key decisions + artifacts) suitable for seeding the
 next phase.
 
-### Review server files
+### Server discovery files
 
-The review server (`drovr serve`) reads and writes these files in the run dir:
+The always-on server writes two files in the drovr data dir (not per-run):
 
 | File | Written by | Purpose |
 |---|---|---|
-| `review.addr` | `drovr serve` | Bound `host:port`; read by `drovr review summary` and `drovr review wait`. |
-| `spec.md` | agent (implement phase) | The spec document shown in the browser UI. |
-| `prior.md` | server on each submit | Snapshot of the previous spec version for diffing. |
+| `server.addr` | `drovr serve` | Bound `host:port`; read by `drovr review summary`/`wait` and `ensure_server`. |
+| `server.pid` | `drovr serve` | Daemon pid (liveness). |
+
+### Per-run review files
+
+The server reads and writes these files in each run dir:
+
+| File | Written by | Purpose |
+|---|---|---|
+| `spec.md` | agent (brainstorm/spec gate) | The spec document shown in the browser UI. |
+| `prior.md` | server on submit / per revision | Snapshot of the previous spec version for diffing. |
+| `last_summarized.md` | server on POST summary | Rolling copy that re-baselines `prior.md` per revision. |
+| `review.state.json` | server on state change | Durable `{state, turn}` — makes the server restart-safe. |
 | `feedback.json` | server on submit | Human feedback JSON for the current turn. |
-| `summary.txt` | server on POST `/summary` | Agent summary text. |
+| `summary.txt` | server on POST summary | Agent summary text. |
 | `questions.json` | agent | MC questions for the reviewer (optional). |
 | `approved` | server on approve | Marker file written when the spec is approved. |
 
 ## Review loop flow
 
-```
-drovr serve <name>
-```
+The server is always on (auto-started on demand by `drovr review …`). Open
+`http://127.0.0.1:8791` to see the **session list**; every run appears with a
+state badge. Click one to browse its spec, diffs, and code-review findings —
+active gates are interactive, finished runs are browsable read-only. To keep it
+supervised across logins/reboots, install the `systemd --user` unit at
+`packaging/drovr.service` (`systemctl --user enable --now drovr`).
 
-1. Open `http://127.0.0.1:8791` in a browser. State starts as `idle`.
+1. In a run's detail view, state starts as `idle`.
 2. Read the spec, leave annotations, answer questions, and choose
    **Request changes** or **Approve**.
 3. The driver posts a summary, then **waits** for the reviewer instead of
-   busy-polling `GET /state`:
+   busy-polling state:
    ```
    drovr review summary <name> "<what changed>"
    drovr review wait <name>   # blocks; run in the background
