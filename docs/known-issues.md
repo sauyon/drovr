@@ -267,12 +267,19 @@ herdr panel.
 ### Fix idea
 
 ~~Apply the `phase send` agent-readiness fix (poll `agent_status` until attached/at-composer)
-to the reviewer-spawn path in `code_review.rs`~~ — **done**, see below. Still open: bound each
-reviewer with a liveness check so a never-attached (or attached-but-wedged) pane fails fast
-instead of hanging the whole panel. Today the only bound is the single panel-wide `timeout_ms`
-deadline in the marker poll loop (`cli/src/code_review.rs:330-359`); an individual reviewer is
+to the reviewer-spawn path in `code_review.rs`~~ — **done**, see below.
+
+~~Still open: bound each reviewer with a liveness check so a never-attached (or
+attached-but-wedged) pane fails fast instead of hanging the whole panel. Today the only bound is
+the single panel-wide `timeout_ms` deadline in the marker poll loop; an individual reviewer is
 never probed for liveness, and a timed-out pass just returns `ReviewOutcome::Timeout` with no
-`<task>-review.json`.
+`<task>-review.json`.~~ — **addressed** by the resume path (2026-07-25): a timeout is now a
+pause rather than a dead end. Each reviewer is harvested to `<task>-review-<angle>.json` the
+moment it finishes, and a plain re-run of `drovr code-review run` resumes the same iteration —
+waiting only on the stragglers and respawning any whose pane no longer exists (`Herdr::pane_exists`,
+which unlike `agent_status` distinguishes "pane gone" from "status unparseable"). A wedged
+reviewer still needs the human's `--fresh`; what is fixed is that it no longer costs the whole
+panel's work.
 
 ### Also seen (2026-07-25, run `harden-review`, `harden/supply-chain`) — root cause since fixed
 

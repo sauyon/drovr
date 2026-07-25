@@ -7,6 +7,18 @@
 //! (→ exit 0 / 3 / 2 / 1). It is BLOCKING; the pipeline driver — never a skill — calls
 //! it and reacts to the outcome.
 //!
+//! # Resuming a slow panel
+//!
+//! Reviewers can outlive `timeout_ms`. A timeout is therefore not a failure but a
+//! pause: the outstanding reviewers stay `Running`, every angle that *did* finish is
+//! already banked in `<task>-review-<angle>.json`, and a plain re-run RESUMES —
+//! re-attaching to the same panel and waiting only on the stragglers (respawning any
+//! whose pane died). Nothing is re-reviewed, so a slow panel costs one reviewer per
+//! angle no matter how many resumes it takes. A new panel is opened only when the
+//! caller passes `fresh`, when HEAD has moved since the pending reviewers were
+//! seeded (their diff no longer stands), or when the previous pass ran to completion
+//! (the fix loop asking for a genuinely new review). See [`resumable_iter`].
+//!
 //! # Read-only findings path
 //!
 //! Reviewers emit fenced findings JSON in their transcript and exit. Drovr
@@ -123,10 +135,53 @@ fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     Ok(std::fs::read_to_string(&p)?.trim().to_owned())
 }
 
+/// The newest iteration for `task`, and whether any of its reviewers is still
+/// `Running`. `None` when the task has no reviewer phases at all.
+fn newest_iter(run: &RunState, task: &str) -> Option<(u64, bool)> {
+    let prefix = format!("review:{task}:");
+    let newest = run
+        .review_phases
+        .iter()
+        .filter_map(|p| p.name.strip_prefix(&prefix))
+        .filter_map(|rest| rest.split_once(':').map(|(it, _angle)| it))
+        .filter_map(|it| it.parse::<u64>().ok())
+        .max()?;
+    let iter_prefix = format!("{prefix}{newest}:");
+    let running = run
+        .review_phases
+        .iter()
+        .filter(|p| p.name.starts_with(&iter_prefix))
+        .any(|p| p.status == PhaseStatus::Running);
+    Some((newest, running))
+}
+
+/// The iteration a re-run should RESUME, if any: the newest one, and only while it
+/// still has a `Running` reviewer.
+///
+/// Deliberately restricted to the *newest* iteration. An older iteration with
+/// `Running` leftovers is a superseded pass (a `--fresh` re-run abandoned it), and
+/// reviving those zombies would review a diff nobody asked about. A newest
+/// iteration that is fully `Done` has already produced `<task>-review.json`, so a
+/// re-run there is the fix loop asking for a genuinely new pass.
+fn resumable_iter(run: &RunState, task: &str) -> Option<u64> {
+    match newest_iter(run, task) {
+        Some((iter, true)) => Some(iter),
+        _ => None,
+    }
+}
+
+/// `<task>-review-<iter>.head` — the head SHA an iteration's reviewers were seeded
+/// against. A resume compares it with the current HEAD: if the implementer has
+/// committed since, those reviewers are reading a diff that no longer stands and
+/// resuming them would launder a stale review, so the pass starts fresh instead.
+fn iter_head_path(dir: &Path, task: &str, iter: u64) -> std::path::PathBuf {
+    dir.join(format!("{task}-review-{iter}.head"))
+}
+
 /// One greater than the max existing iteration among `run.review_phases` named
-/// `review:<task>:<iter>:<angle>`. First pass = 1. This is what makes a timed-out
-/// pass resumable: a re-run bumps the iter, so the new markers/phase names never
-/// collide with the previous (still-`Running`) reviewers.
+/// `review:<task>:<iter>:<angle>`. First pass = 1. Used for a brand-new panel
+/// (`--fresh`, a moved HEAD, or a previous pass that ran to completion) so its
+/// markers/phase names never collide with an earlier iteration's leftovers.
 fn next_iter(run: &RunState, task: &str) -> u64 {
     let prefix = format!("review:{task}:");
     run.review_phases
@@ -253,6 +308,7 @@ pub fn code_review_run<H: Herdr>(
     run: &mut RunState,
     task: &str,
     timeout_ms: u64,
+    fresh: bool,
 ) -> io::Result<ReviewOutcome> {
     let dir = run_dir(&run.name);
 
@@ -295,19 +351,85 @@ pub fn code_review_run<H: Herdr>(
         )));
     }
     let launch = cfg.launch(&review_agent, &run.project_dir, true)?;
-    let iter = next_iter(run, task);
     std::fs::create_dir_all(&dir)?;
 
-    // Seed + spawn one read-only reviewer per angle, then inject its brief. Every
-    // reviewer exits (drops its marker) before the implementer fixes anything, so the
-    // single-writer invariant holds — the panel never has a reviewer alive while a
-    // writer runs.
+    // Resume, or open a new panel? A plain re-run after a timeout re-attaches to the
+    // reviewers still in flight — spawning a second panel over the same diff would
+    // double the token spend and throw away every angle that had already finished.
+    let resumed = match if fresh {
+        None
+    } else {
+        resumable_iter(run, task)
+    } {
+        Some(prev) => {
+            let seeded = std::fs::read_to_string(iter_head_path(&dir, task, prev))
+                .ok()
+                .map(|s| s.trim().to_owned());
+            if seeded.as_deref() == Some(head.as_str()) {
+                Some(prev)
+            } else {
+                // The implementer committed while the panel was pending, so those
+                // reviewers are reading a diff that no longer stands.
+                println!(
+                    "code-review: HEAD moved since review iteration {prev} was seeded \
+                     — starting a fresh panel instead of resuming it"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+    let iter = resumed.unwrap_or_else(|| next_iter(run, task));
+    if resumed.is_none() {
+        std::fs::write(iter_head_path(&dir, task, iter), format!("{head}\n"))?;
+    }
+
+    // Split the angles: what is already banked from an earlier pass of this same
+    // iteration, versus what still needs a reviewer waited on (or respawned).
+    let mut banked: Vec<(String, Review)> = Vec::new();
+    let mut pending: Vec<(String, String)> = Vec::new();
     for angle in &cfg.angles {
+        let phase = format!("review:{task}:{iter}:{angle}");
+        if resumed.is_some() {
+            let done = run
+                .find_phase(&phase)
+                .is_some_and(|p| p.status == PhaseStatus::Done);
+            // A `Done` reviewer's findings were harvested to disk when it finished.
+            // If that file is unreadable we do NOT trust the status — fall through and
+            // wait on the reviewer again, which self-heals rather than hard-failing.
+            if done
+                && let Some(review) =
+                    std::fs::read_to_string(dir.join(format!("{task}-review-{angle}.json")))
+                        .ok()
+                        .and_then(|json| parse_review(&json).ok())
+            {
+                banked.push((angle.clone(), review));
+                continue;
+            }
+            // Registered and its pane is still there → keep waiting, no respawn.
+            let alive = run
+                .find_phase(&phase)
+                .and_then(|p| p.pane_id.as_deref())
+                .is_some_and(|pane| h.pane_exists(pane));
+            if alive {
+                pending.push((angle.clone(), phase));
+                continue;
+            }
+            // Pane is gone (crashed agent, closed tab) — or the angle was never
+            // spawned because the configured angles changed mid-run. Respawn it in
+            // place, same iteration, below. Drop the stale registration first so
+            // `find_phase` cannot resolve to the dead pane.
+            run.review_phases.retain(|p| p.name != phase);
+            println!("code-review: reviewer for angle '{angle}' is gone — respawning it");
+        }
+
+        // Seed + spawn one read-only reviewer, then inject its brief. Every reviewer
+        // exits (drops its marker) before the implementer fixes anything, so the
+        // single-writer invariant holds — the panel never has a reviewer alive while a
+        // writer runs.
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
         let seed_text = build_seed(&run.name, task, angle, &base, &head, &run.task, iter);
         std::fs::write(&seed_path, &seed_text)?;
-
-        let phase = format!("review:{task}:{iter}:{angle}");
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
@@ -316,54 +438,81 @@ pub fn code_review_run<H: Herdr>(
         // reclaimed by the single `workspace_close` at `drovr cleanup` — the codebase
         // invariant is "never close a pane mid-run" (mirrors `phase_start`).
         phase_send(h, run, &phase, &seed_text)?;
+        pending.push((angle.clone(), phase));
+    }
+    if let Some(prev) = resumed {
+        println!(
+            "code-review: resuming review iteration {prev} for '{task}' \
+             ({} of {} angles already in — waiting on {})",
+            banked.len(),
+            cfg.angles.len(),
+            pending
+                .iter()
+                .map(|(a, _)| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
-    // Private, `review_phases`-aware wait: poll every angle's marker until all present
-    // or the deadline passes. Each landed marker flips the reviewer's status directly.
-    let phases: Vec<String> = cfg
-        .angles
-        .iter()
-        .map(|a| format!("review:{task}:{iter}:{a}"))
-        .collect();
+    // Private, `review_phases`-aware wait: poll every pending angle until all have
+    // finished or the deadline passes. Each reviewer is harvested the moment it
+    // finishes — banking it on disk BEFORE the status flips to `Done`, so a later
+    // timeout can never leave a `Done` angle whose findings were never captured.
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut pending: Vec<String> = phases.clone();
+    let mut harvested: Vec<(String, Review)> = banked;
     loop {
-        pending.retain(|name| {
-            let finished = done_marker(&run.name, name).exists()
+        let mut still_pending: Vec<(String, String)> = Vec::new();
+        for (angle, phase) in std::mem::take(&mut pending) {
+            let finished = done_marker(&run.name, &phase).exists()
                 || run
-                    .find_phase(name)
-                    .and_then(|phase| phase.pane_id.as_deref())
+                    .find_phase(&phase)
+                    .and_then(|p| p.pane_id.as_deref())
                     .and_then(|pane| h.agent_status(pane))
                     .as_deref()
                     == Some("done");
-            if finished {
-                if let Some(i) = run.review_phases.iter().position(|p| &p.name == name) {
-                    run.review_phases[i].status = PhaseStatus::Done;
-                }
-                false
-            } else {
-                true
+            if !finished {
+                still_pending.push((angle, phase));
+                continue;
             }
-        });
+            let json = obtain_findings_json(h, run, &dir, task, &angle, &phase)?;
+            let review = parse_review(&json)?;
+            if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
+                run.review_phases[i].status = PhaseStatus::Done;
+            }
+            harvested.push((angle, review));
+        }
+        pending = still_pending;
         if pending.is_empty() {
             break;
         }
         let now = Instant::now();
         if now >= deadline {
-            // Leave the timed-out reviewers `Running`; a re-run bumps iter and waits on
-            // fresh markers, so this pass's leftovers never collide with the next.
+            // Leave the outstanding reviewers `Running` and their findings banked: a
+            // plain re-run resumes this same iteration and waits only on these.
             run.save()?;
+            println!(
+                "code-review: {} of {} angles finished; still waiting on {}",
+                harvested.len(),
+                cfg.angles.len(),
+                pending
+                    .iter()
+                    .map(|(a, _)| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             return Ok(ReviewOutcome::Timeout);
         }
         thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
     run.save()?;
 
-    // All markers present → collect, merge, write.
+    // Every angle in → merge in configured order (harvest order is completion order,
+    // which is nondeterministic) and write the merged review.
     let mut per_angle: Vec<(String, Review)> = Vec::with_capacity(cfg.angles.len());
-    for (angle, phase) in cfg.angles.iter().zip(phases.iter()) {
-        let json = obtain_findings_json(h, run, &dir, task, angle, phase)?;
-        per_angle.push((angle.clone(), parse_review(&json)?));
+    for angle in &cfg.angles {
+        if let Some(i) = harvested.iter().position(|(a, _)| a == angle) {
+            per_angle.push(harvested.remove(i));
+        }
     }
     let merged = merge_reviews(per_angle);
     let out_path = dir.join(format!("{task}-review.json"));
@@ -469,14 +618,351 @@ mod tests {
     /// them, then the very first wait poll sees the markers and completes).
     fn drop_markers(run: &RunState, task: &str, iter: u64) {
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            let name = format!("review:{task}:{iter}:{a}");
-            let m = done_marker(&run.name, &name);
-            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
-            std::fs::write(&m, b"").unwrap();
+            drop_marker(run, task, iter, a);
         }
     }
 
+    /// Drop the done marker for ONE angle — models a reviewer that finished while
+    /// its panel-mates are still working (the resume path's whole reason to exist).
+    fn drop_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
+        let name = format!("review:{task}:{iter}:{angle}");
+        let m = done_marker(&run.name, &name);
+        std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+        std::fs::write(&m, b"").unwrap();
+    }
+
+    /// Advance HEAD in the run's project dir, so a resume must notice the diff it
+    /// would be resuming into is no longer the one the reviewers were seeded with.
+    fn commit_more(run: &RunState) {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&run.project_dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::write(
+            std::path::Path::new(&run.project_dir).join("g.txt"),
+            "more work",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "more"]);
+    }
+
+    fn pane_of(run: &RunState, phase: &str) -> String {
+        run.find_phase(phase)
+            .and_then(|p| p.pane_id.clone())
+            .unwrap_or_else(|| panic!("phase {phase} has no pane"))
+    }
+
+    fn spawn_count(h: &FakeHerdr) -> usize {
+        h.calls().iter().filter(|c| c.contains("pane_run")).count()
+    }
+
     const CLEAN: &str = r#"{"verdict":"clean","findings":[]}"#;
+
+    #[test]
+    fn rerun_after_timeout_resumes_the_same_iter_without_respawning() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-same-iter");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(
+            spawn_count(&h),
+            4,
+            "first pass spawns one reviewer per angle"
+        );
+        let panes: Vec<String> = run
+            .review_phases
+            .iter()
+            .map(|p| p.pane_id.clone().unwrap())
+            .collect();
+
+        // A plain re-run must RESUME iter 1 — not open a second panel on the same diff.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(
+            run.review_phases.len(),
+            4,
+            "resume must not add phases: {:?}",
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .all(|p| p.name.starts_with("review:task-1:1:")),
+            "resume stays on iter 1"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            4,
+            "resume must not launch another reviewer while the live ones still exist"
+        );
+        let panes_after: Vec<String> = run
+            .review_phases
+            .iter()
+            .map(|p| p.pane_id.clone().unwrap())
+            .collect();
+        assert_eq!(panes, panes_after, "resume re-attaches to the same panes");
+    }
+
+    #[test]
+    fn resume_harvests_angles_that_already_finished() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-harvest");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Two of the four reviewers have since finished.
+        drop_marker(&run, "task-1", 1, "correctness");
+        drop_marker(&run, "task-1", 1, "security");
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+        h.push_read(format!(
+            "```json\n{{\"verdict\":\"changes\",\"findings\":[{{\"file\":\"a.rs\",\"severity\":\"important\",\"summary\":\"leak\"}}]}}\n```"
+        ));
+
+        // Still Timeout (two stragglers), but the finished work is banked on disk.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        let dir = run_dir(&run.name);
+        for angle in ["correctness", "security"] {
+            let p = dir.join(format!("task-1-review-{angle}.json"));
+            assert!(
+                p.exists(),
+                "a finished angle's findings must be harvested on resume, not re-run: {}",
+                p.display()
+            );
+        }
+        assert!(
+            parse_review(
+                &std::fs::read_to_string(dir.join("task-1-review-security.json")).unwrap()
+            )
+            .unwrap()
+            .findings
+            .len()
+                == 1,
+            "harvest must persist the actual findings, not an empty stub"
+        );
+        let status = |name: &str| run.find_phase(name).map(|p| p.status.clone());
+        assert_eq!(
+            status("review:task-1:1:correctness"),
+            Some(PhaseStatus::Done)
+        );
+        assert_eq!(status("review:task-1:1:security"), Some(PhaseStatus::Done));
+        assert_eq!(
+            status("review:task-1:1:type-design"),
+            Some(PhaseStatus::Running),
+            "a straggler stays Running so the next resume keeps waiting on it"
+        );
+    }
+
+    #[test]
+    fn resume_completing_the_last_stragglers_merges_every_angle() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-completes");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // First resume banks two angles, then times out on the other two.
+        drop_marker(&run, "task-1", 1, "correctness");
+        drop_marker(&run, "task-1", 1, "security");
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Second resume: the stragglers land. The merge must cover ALL FOUR angles,
+        // including the two harvested during the earlier resume.
+        drop_marker(&run, "task-1", 1, "error-handling");
+        drop_marker(&run, "task-1", 1, "type-design");
+        h.push_read(format!(
+            "```json\n{{\"verdict\":\"changes\",\"findings\":[{{\"file\":\"b.rs\",\"severity\":\"critical\",\"summary\":\"panic\"}}]}}\n```"
+        ));
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Findings
+        );
+
+        let merged = parse_review(
+            &std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged.verdict, "changes");
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(merged.findings[0].angle, "error-handling");
+        assert_eq!(spawn_count(&h), 4, "no angle was ever re-reviewed");
+    }
+
+    #[test]
+    fn resume_respawns_a_reviewer_whose_pane_died() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-respawn");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let dead = pane_of(&run, "review:task-1:1:type-design");
+        let survivor = pane_of(&run, "review:task-1:1:correctness");
+        h.kill_pane(dead.clone());
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert_eq!(
+            run.review_phases.len(),
+            4,
+            "a respawn replaces the dead reviewer in place — same iter, same angle"
+        );
+        let respawned = pane_of(&run, "review:task-1:1:type-design");
+        assert_ne!(
+            respawned, dead,
+            "the dead reviewer must be respawned into a fresh pane"
+        );
+        assert_eq!(
+            pane_of(&run, "review:task-1:1:correctness"),
+            survivor,
+            "live reviewers must not be disturbed"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            5,
+            "exactly one extra launch: only the dead angle is respawned"
+        );
+    }
+
+    #[test]
+    fn fresh_flag_starts_a_new_iteration() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-fresh-flag");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, true).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert_eq!(
+            run.review_phases.len(),
+            8,
+            "--fresh abandons the iter-1 leftovers and opens iter 2"
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
+            "--fresh must bump the iteration: {:?}",
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(spawn_count(&h), 8, "--fresh launches a whole new panel");
+    }
+
+    #[test]
+    fn head_moving_forces_a_fresh_iteration_instead_of_resuming() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-head-moved");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // The implementer committed while the panel was pending: the in-flight
+        // reviewers were seeded against the OLD head, so resuming them would review
+        // a diff that no longer exists.
+        commit_more(&run);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert!(
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
+            "a moved HEAD must start a new iteration, not resume the stale one: {:?}",
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_completed_iter_is_never_resumed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-after-complete");
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", a, CLEAN);
+        }
+        drop_markers(&run, "task-1", 1);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        // The fix loop re-reviews after the implementer acts on findings: iter 1 is
+        // fully Done, so there is nothing to resume — this must be a fresh panel.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
+            "a finished iteration must not be resumed: {:?}",
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn clean_pass_writes_merged_and_returns_clean() {
@@ -490,7 +976,7 @@ mod tests {
         // Simulate every reviewer having dropped its marker.
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
 
         // Merged file exists and is clean.
@@ -544,7 +1030,7 @@ mod tests {
             h.push_read(format!("```json\n{CLEAN}\n```"));
         }
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
         assert!(
             run.review_phases
@@ -576,7 +1062,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Findings);
 
         let merged = run_dir(&run.name).join("task-1-review.json");
@@ -604,7 +1090,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
             ReviewOutcome::Findings
         );
 
@@ -613,7 +1099,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 2);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
             ReviewOutcome::Clean
         );
         let merged = run_dir(&run.name).join("task-1-review.json");
@@ -631,21 +1117,21 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-nobase");
         // No base.sha written.
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Error);
         // Nothing spawned.
         assert!(run.review_phases.is_empty());
     }
 
     #[test]
-    fn timeout_leaves_running_and_next_call_bumps_iter() {
+    fn timeout_leaves_reviewers_running_for_a_resume() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-timeout");
         write_base(&run, "task-1");
 
         // No markers dropped → tiny timeout → Timeout.
-        let outcome = code_review_run(&h, &mut run, "task-1", 40).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Timeout);
         assert_eq!(run.review_phases.len(), 4);
         assert!(
@@ -661,23 +1147,17 @@ mod tests {
             "timed-out reviewers stay Running (resumable)"
         );
 
-        // Second call bumps to iter 2 and waits on the fresh markers.
-        let outcome = code_review_run(&h, &mut run, "task-1", 40).unwrap();
-        assert_eq!(outcome, ReviewOutcome::Timeout);
+        // What a re-run does with those leftovers is covered by
+        // `rerun_after_timeout_resumes_the_same_iter_without_respawning` (resume) and
+        // `fresh_flag_starts_a_new_iteration` (`--fresh`).
+        let head = head_sha(&run.project_dir).unwrap();
         assert_eq!(
-            run.review_phases.len(),
-            8,
-            "iter-1 leftovers remain + iter-2 added"
-        );
-        assert!(
-            run.review_phases
-                .iter()
-                .any(|p| p.name == "review:task-1:2:correctness"),
-            "second pass must produce iter-2 phase names: {:?}",
-            run.review_phases
-                .iter()
-                .map(|p| &p.name)
-                .collect::<Vec<_>>()
+            std::fs::read_to_string(run_dir(&run.name).join("task-1-review-1.head"))
+                .unwrap()
+                .trim(),
+            head,
+            "the pass must record the head it seeded reviewers against, so a resume \
+             can tell whether that diff still stands"
         );
     }
 
@@ -692,7 +1172,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
 
-        code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
 
         let calls = h.calls();
         let run_calls: Vec<&String> = calls.iter().filter(|c| c.contains("pane_run")).collect();
@@ -722,7 +1202,7 @@ mod tests {
         );
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
         // drovr wrote the missing per-angle file from the transcript.
         let recovered = run_dir(&run.name).join("task-1-review-type-design.json");
@@ -784,6 +1264,74 @@ mod tests {
         ];
         assert_eq!(next_iter(&run, "task-1"), 2);
         assert_eq!(next_iter(&run, "task-2"), 6);
+    }
+
+    #[test]
+    fn only_the_newest_running_iteration_is_resumable() {
+        let base = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+        };
+        let mk = |name: &str, status: PhaseStatus| Phase {
+            name: name.into(),
+            status,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: None,
+        };
+
+        assert_eq!(resumable_iter(&base, "task-1"), None, "nothing spawned yet");
+
+        // A pass still in flight is resumable.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Done),
+            mk("review:task-1:1:security", PhaseStatus::Running),
+        ];
+        assert_eq!(resumable_iter(&run, "task-1"), Some(1));
+
+        // A pass that ran to completion is not: a re-run there is the fix loop
+        // asking for a new review of newly-fixed code.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Done),
+            mk("review:task-1:1:security", PhaseStatus::Done),
+        ];
+        assert_eq!(resumable_iter(&run, "task-1"), None);
+
+        // Zombies from an abandoned (`--fresh`-superseded) iteration must never be
+        // revived, even though they are still `Running` — iter 2 is what matters,
+        // and it is done.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Running),
+            mk("review:task-1:2:correctness", PhaseStatus::Done),
+        ];
+        assert_eq!(
+            resumable_iter(&run, "task-1"),
+            None,
+            "an older iteration's leftovers are not a resumable pass"
+        );
+
+        // Tasks are independent.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Done),
+            mk("review:task-2:1:correctness", PhaseStatus::Running),
+        ];
+        assert_eq!(resumable_iter(&run, "task-1"), None);
+        assert_eq!(resumable_iter(&run, "task-2"), Some(1));
     }
 
     #[test]
