@@ -1732,6 +1732,38 @@ mod tests {
         );
     }
 
+    /// markdown-it 14.1.0, verified against jsDelivr + unpkg. Kept in lockstep
+    /// with cli/web/vendor/PROVENANCE.toml. See `vendor_integrity_*` tests below.
+    const MARKDOWN_IT_SHA256: &str =
+        "38c70a1e7ca91ab40e2d9e6e60129851a717ed1c7d4acbbdd41bf9503791cf68";
+
+    /// Supply-chain tamper detection: the bytes embedded into the binary must
+    /// match the pinned digest. A malicious or accidental edit to the vendored
+    /// file changes its hash and fails here before it can ship to a reviewer's
+    /// browser. If you intentionally update the asset, update the pin AND
+    /// PROVENANCE.toml together (see PROVENANCE.toml for the procedure).
+    #[test]
+    fn vendor_integrity_matches_pin() {
+        assert_eq!(
+            crate::sha256::hex(MARKDOWN_IT_JS),
+            MARKDOWN_IT_SHA256,
+            "embedded markdown-it.min.js does not match its pinned SHA-256 — \
+             the vendored file was modified without updating the pin"
+        );
+    }
+
+    /// The provenance record must not silently drift from the enforced pin:
+    /// PROVENANCE.toml is what a human audits, the pin is what the test enforces.
+    #[test]
+    fn vendor_integrity_provenance_in_sync() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/web/vendor/PROVENANCE.toml");
+        let text = fs::read_to_string(manifest).expect("read PROVENANCE.toml");
+        assert!(
+            text.contains(MARKDOWN_IT_SHA256),
+            "PROVENANCE.toml does not record the pinned markdown-it digest {MARKDOWN_IT_SHA256}"
+        );
+    }
+
     #[test]
     fn health_served() {
         let tmp = make_root("health");

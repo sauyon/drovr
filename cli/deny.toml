@@ -1,0 +1,45 @@
+# cargo-deny configuration — supply-chain gate for drovr's Rust dependencies.
+#
+# Enforced two ways:
+#   • `nix flake check` runs `cargo deny check bans licenses sources` fully
+#     offline (see the `cargo-deny` check in ../flake.nix).
+#   • `cargo deny check advisories` runs from the devShell / CI against the live
+#     RustSec advisory DB (fetched at audit time). This is intentionally NOT run
+#     in the sandboxed flake check: advisory scanning is only useful against the
+#     latest DB, so pinning it to a stale snapshot would defeat the purpose.
+#
+# Schema targets cargo-deny 0.18+ (0.20.x in nixpkgs at time of writing).
+
+[advisories]
+# Fail on any crate with an unpatched RustSec advisory or that has been yanked.
+yanked = "deny"
+# No advisories are currently ignored. Any addition here must carry a comment
+# justifying the exception and a tracking link.
+ignore = []
+
+[licenses]
+# Every dependency must resolve to one of these permissive licenses. A new dep
+# that pulls in a copyleft or unknown license fails the check and forces a
+# conscious decision rather than silently entering the tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unlicense",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Surface accidental dependency bloat / duplicate-version drift.
+multiple-versions = "warn"
+# A wildcard version requirement ("*") pins nothing and lets an upgrade pull in
+# arbitrary upstream code — reject it outright.
+wildcards = "deny"
+
+[sources]
+# Only crates.io is trusted. An unknown registry or a git dependency (a common
+# vector for pulling unaudited code) fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

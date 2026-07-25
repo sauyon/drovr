@@ -1,0 +1,27 @@
+# Provenance for third-party assets vendored into the drovr binary.
+#
+# Every file here is embedded via `include_bytes!`/`include_str!` and shipped
+# inside the compiled binary — a tampered copy would execute in the reviewer's
+# browser (rendered diffs are untrusted content) with nothing to catch it.
+#
+# Each entry pins the exact upstream release and its SHA-256. The digest is
+# enforced by `sha256_integrity` tests in the crate (see cli/src/review.rs), so
+# any edit to a vendored file fails the test suite until this record is updated
+# deliberately. To update a vendored asset:
+#   1. Download the new release from its documented `url`.
+#   2. Verify the download against the publisher (npm dist / release checksums).
+#   3. Replace the file, bump `version`/`url`/`retrieved`, and set `sha256` to
+#      the new digest (`sha256sum <file>`).
+#   4. Run `cargo test` — the integrity test must pass with the new digest.
+
+[[asset]]
+file = "markdown-it.min.js"
+name = "markdown-it"
+version = "14.1.0"
+license = "MIT"
+# Canonical build published to npm; identical bytes served by jsDelivr + unpkg.
+url = "https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"
+sha256 = "38c70a1e7ca91ab40e2d9e6e60129851a717ed1c7d4acbbdd41bf9503791cf68"
+bytes = 123618
+retrieved = "2026-07-24"
+# Verified: jsDelivr and unpkg both return this exact digest for 14.1.0.
