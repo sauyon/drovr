@@ -172,7 +172,9 @@ driver can tell this turn's answers from a stale previous turn's. Regression tes
 
 **Severity:** medium (multiple-choice answers on the spec gate are silently lost on approval, so the downstream plan phase never sees the reviewer's picks).
 **Found:** 2026-07-24, run `gpu-deploy-view` — reviewer answered 4 open questions and approved; no answers were persisted anywhere.
-**Re-verified against source 2026-07-25:** still live; line refs below updated.
+**Re-verified against source 2026-07-25:** still live at that point; fixed later the same day (see Status above).
+
+The Symptom and Root cause below describe the behaviour **before** the fix, kept for history.
 
 ### Symptom
 
@@ -188,15 +190,16 @@ In `handle_post_submit` (`POST /api/runs/<run>/submit`, `cli/src/review.rs:808`)
 `decision == "approve"` branch (`cli/src/review.rs:837`) writes only the `approved` marker
 and returns — even though `answers`/`annotations` were parsed off the request body
 (`cli/src/review.rs:813-821`). The branch that persists `feedback.json` — including
-`answers` and `annotations` — runs only for the **request-changes** path
-(`cli/src/review.rs:879-886`). So answers survive a "request changes" but are dropped on
-"approve".
+`answers` and `annotations` — ran only for the **request-changes** path (now
+`cli/src/review.rs:895-902`; the fix inserted the approve-side write above it). So answers
+survived a "request changes" but were dropped on "approve".
 
-### Fix idea
+### Fix
 
-On approve, also write `feedback.json` (or a dedicated `approved.json`) carrying
-`{decision:"approve", answers, annotations, turn}`, so `review wait` / the driver can read
-the reviewer's selections. Mirror the request-changes persistence.
+Mirrored the request-changes persistence: on approve, write `feedback.json` carrying
+`{turn, decision:"approve", feedback, answers, annotations}`. The consuming half was wired
+too — `drovr review wait` names `feedback.json` in its approval message, and the brainstorm
+phase prompt tells the agent to fold the answers into `spec.md` rather than re-ask.
 
 ## Serving a spec doesn't start a watcher — the reviewer's decision gets missed
 
