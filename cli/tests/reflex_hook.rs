@@ -29,22 +29,14 @@ fn hook_script() -> PathBuf {
     repo_root().join("hooks/session-start")
 }
 
-/// Locate the drovr binary built by `cargo test` (mirrors e2e.rs). Points
-/// `DROVR_BIN` at it so the hook execs the just-built CLI, not one on PATH.
+/// Locate the drovr binary built for this test. Points `DROVR_BIN` at it so the
+/// hook execs the just-built CLI, not one on PATH. Uses cargo's
+/// `CARGO_BIN_EXE_drovr` — the path to the built `drovr` bin, set for integration
+/// tests — so it is hermetic across debug/release and the nix checkPhase sandbox
+/// (where a hardcoded `target/debug/drovr` does not exist, so the hook execs a
+/// missing binary and fails with 127).
 fn drovr_binary() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = manifest.join("target/debug/drovr");
-    if bin.exists() {
-        return bin;
-    }
-    let ws_bin = manifest
-        .parent()
-        .unwrap_or(&manifest)
-        .join("target/debug/drovr");
-    if ws_bin.exists() {
-        return ws_bin;
-    }
-    bin // will fail with a clear error if missing
+    PathBuf::from(env!("CARGO_BIN_EXE_drovr"))
 }
 
 /// True if `bash` can be executed. Tests skip (pass) when it is absent.
