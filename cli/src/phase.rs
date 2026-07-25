@@ -55,17 +55,27 @@ fn launch_in_pane<H: Herdr>(
     // Capture focus so the pane operations below don't steal it from the user.
     let prev_focus = h.focused_workspace();
 
-    // DROVR_PHASE=<run>/<phase> tags the launch so the reflex hook detects a
-    // drovr-spawned phase and suppresses the human reflex. It is not a secret, so
-    // it rides inline on the command; auth secrets travel via herdr `--env` at
-    // pane creation, never in this string. The value is single-quoted so a
-    // run/phase name with a space or shell metacharacter stays one literal word
-    // and cannot break out of the command.
-    let full = format!(
-        "DROVR_PHASE={} {}",
-        shell_single_quote(&format!("{run_name}/{phase}")),
-        command
+    // Launch the agent through `env VAR=val …` rather than a bare `VAR=val cmd`
+    // prefix: herdr's pane-level env (set at workspace/tab creation) does NOT
+    // reach a `pane run` command — it only populates the pane's interactive
+    // shell, which the run command doesn't inherit — and a bare leading
+    // assignment isn't applied either. `env` sets the vars directly on the
+    // launched process.
+    //   * DROVR_PHASE tags the launch for the reflex hook (not a secret).
+    //   * CLAUDE_CONFIG_DIR selects the caller's claude profile so the agent
+    //     authenticates as the right account instead of falling back to
+    //     ~/.claude. It is a path, not a secret, so inlining it is safe; it is
+    //     propagated from drovr's own environment when set (e.g. under a
+    //     `claude-prof` profile). Real secrets (API keys) are never inlined.
+    // Values are single-quoted so spaces/metacharacters can't break out.
+    let mut env_prefix = format!(
+        "env DROVR_PHASE={}",
+        shell_single_quote(&format!("{run_name}/{phase}"))
     );
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        env_prefix.push_str(&format!(" CLAUDE_CONFIG_DIR={}", shell_single_quote(&dir)));
+    }
+    let full = format!("{env_prefix} {command}");
     h.pane_run(pane, &full)?;
     // Cosmetic pane label; best-effort (a rename failure must not fail the phase).
     let _ = h.pane_rename(pane, phase);

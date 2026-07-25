@@ -179,31 +179,25 @@ impl Herdr for SystemHerdr {
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
-        // Kept as a `herdr` CLI shell-out: 0.7.5 still exposes `tab create`, and
-        // the new tab's shell pane inherits the workspace-level auth env set at
-        // `workspace.create` (so no per-tab `--env` is needed). Focus is never
-        // taken (`--no-focus`).
-        let args: Vec<&str> = vec![
-            "tab", "create", "--workspace", workspace, "--label", label, "--cwd", cwd,
-            "--no-focus",
-        ];
-        let out = self.run(&args)?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!(
-                "herdr tab create failed: {stderr}"
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // `tab create` returns `result.root_pane.pane_id` — the new tab's shell pane.
-        let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        // Socket `tab.create`, carrying the auth env explicitly. A tab's shell
+        // pane does NOT inherit the workspace-level env set at `workspace.create`
+        // (verified empirically), so without this the spawned agent would miss
+        // `CLAUDE_CONFIG_DIR` and fall back to the default `~/.claude` profile.
+        // `focus:false` keeps the user's focus put. Returns the new tab's shell
+        // pane id (`result.root_pane.pane_id`).
+        let result = self.socket_call(
+            "tab.create",
+            json!({
+                "workspace_id": workspace,
+                "label": label,
+                "cwd": cwd,
+                "focus": false,
+                "env": self.agent_env(),
+            }),
+        )?;
+        find_string_field(&result, "pane_id").ok_or_else(|| {
             io::Error::other(format!(
-                "herdr tab create: could not parse JSON output ({e}): {stdout}"
-            ))
-        })?;
-        find_string_field(&v, "pane_id").ok_or_else(|| {
-            io::Error::other(format!(
-                "herdr tab create: could not find pane_id in: {stdout}"
+                "tab.create: could not find pane_id in result: {result}"
             ))
         })
     }
