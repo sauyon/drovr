@@ -111,3 +111,39 @@ answers survive a "request changes" but are dropped on "approve".
 On approve, also write `feedback.json` (or a dedicated `approved.json`) carrying
 `{decision:"approve", answers, annotations, turn}`, so `review wait` / the driver can read
 the reviewer's selections. Mirror the request-changes persistence.
+
+## Serving a spec doesn't start a watcher — the reviewer's decision gets missed
+
+**Severity:** medium (a driver that serves a spec for review but never runs `drovr review wait` is not notified when the human acts; it only learns the outcome if it happens to poll `/state`).
+**Found:** 2026-07-24, standalone spec review on run `compress-spec` — the spec was served via `drovr serve`, the human approved in the UI, and the driver kept manually curling `GET /state` instead of being woken. "Why didn't your watch fire" — because no watch was ever started.
+
+### Symptom
+
+The human approves (or requests changes) in the review UI, but the driver does not react.
+Nothing surfaces the decision until the driver next polls `/state` by hand. The approval is
+recorded correctly on disk (`approved` marker, state `approved`) — the gap is purely that
+**no process is watching the gate**, so there is no signal to act on.
+
+### Root cause
+
+`drovr serve` and `drovr review wait` are separate commands, and serving does not imply
+watching. The **`drovr:pipeline`** skill documents backgrounding `review wait` and explicitly
+warns against busy-polling `/state` (SKILL.md lines ~85, ~214) — but that guidance only fires
+inside a full pipeline's brainstorm gate. A **standalone** spec/design review (serving a
+`spec.md` for approval outside `drovr:pipeline`) has no skill routing the driver to the gate
+discipline at all, so it is easy to `serve` and then never `review wait`. Manual `/state`
+polling is the anti-pattern the skill already names, reached here by the routing gap.
+
+### Fix ideas
+
+1. **Route standalone reviews:** `drovr:using-drovr` should point *any* human-approval-on-a-spec
+   (not only a full pipeline) at the gate — `drovr serve` **plus** a backgrounded
+   `drovr review wait <run>` — cross-referencing `drovr:pipeline`'s "The spec gate" mechanics.
+   (Done in this change.)
+2. **Couple serve + watch in the CLI:** either have `drovr serve` print the exact
+   `drovr review wait <run>` invocation on startup, or add a combined `drovr review gate <run>`
+   that serves, blocks until the reviewer acts, and returns the decision (exit 0 approved / 2
+   request-changes) — so the watch cannot be forgotten.
+3. `drovr serve` is a foreground process; if it is backgrounded in a slot tied to the session
+   shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
+   Launch it detached (`setsid`/`nohup`) when it must outlive the turn.

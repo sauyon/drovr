@@ -63,6 +63,16 @@ When you must escalate, pick the smallest tool that fits:
 - **A full gated run → `drovr:pipeline`.** Brainstorm → plan → implement → review
   with a human approval gate on `spec.md` before any code is written.
 
+**Putting *any* spec/design in front of a human for approval — even a one-off, not a
+full pipeline — goes through the review gate, and the gate has two halves you must run
+together:** `drovr serve <run>` to present `spec.md`, **and** a backgrounded
+`drovr review wait <run>` — the *watch*. `serve` does not start the watch; without it you
+never learn the decision and fall back to hand-polling `GET /state` (the anti-pattern).
+`review wait` blocks on the gate and the harness wakes you when the reviewer acts
+(exit `0` approved · `2` request-changes + `feedback.json`). Revise loop: edit `spec.md` →
+`drovr review summary <run> "<what changed>"` → re-background `review wait`. Full mechanics
+(state machine, diff baselining, gotchas) live in `drovr:pipeline` → "The spec gate".
+
 **REQUIRED BACKGROUND:** the downstream skills assume this file's contracts —
 single-writer rule, the run dir at `~/.local/share/drovr/runs/<name>/`, and that
 `drovr phase start` spawns a plain `claude` and does **not** inject the seed
