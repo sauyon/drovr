@@ -2201,6 +2201,14 @@ async function route() {
   hideEl('doc-panel');
   document.getElementById('doc-content').innerHTML = '';
   currentDocText = '';   // keep it in step with the DOM it describes
+  // Annotations must be dropped HERE, synchronously, not just in
+  // loadAnnotations(): that runs after refresh()'s awaits, so between this point
+  // and those fetches resolving, collectAnnotations() still returns the previous
+  // run's line comments while api('submit') already addresses THIS run — and if
+  // refresh() rejects, loadAnnotations() never runs at all and they stay
+  // submittable indefinitely. loadAnnotations() then restores this run's own
+  // in-progress comments from localStorage.
+  annotations = {};
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;

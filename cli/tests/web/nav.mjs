@@ -505,10 +505,50 @@ await evaluate(`
   document.getElementById('doc-panel').style.display = '';
   return 1;`);
 check('the planted stale doc is really on screen', (await docText()).indexOf('STALE DOC') !== -1, true);
-await evaluate(`return refresh().then(function(){ return 1; });`);
+// Surface a rejection as a check failure rather than an uncaught exception that
+// kills the driver before it prints its summary.
+check('refresh() completed without throwing', await evaluate(`
+  return refresh().then(function(){ return ''; }, function(e){ return String((e && e.message) || e); });`), '');
 check('refresh() alone clears a doc it did not fetch', await docText(), '');
 check('refresh() alone hides the panel it did not fill',
   await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+console.log('\n== a refresh that never completes still leaves no stale doc ==');
+// route()'s own defensive clear is invisible on the happy path, because route()
+// awaits refresh() before any probe can sample the DOM — so the checks above pass
+// even with that clear reverted. What it actually defends is refresh() FAILING:
+// the reviewer navigates, the fetches reject, and nothing downstream ever runs.
+// Force that by rejecting every fetch, and require the old spec to be gone anyway.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec (again)",
+});
+// Plant a line comment on ALPHA first, so there is something real to leak: with
+// no annotations on the outgoing run this check would pass no matter what.
+await evaluate(`
+  annotations = { 1: { quote: 'Spec for alpha-deploy', comments: [{ id: 1, text: 'alpha-only comment' }] } };
+  return JSON.stringify(collectAnnotations()).indexOf('alpha-only') !== -1;`);
+check('the planted annotation is really submittable on alpha',
+  await evaluate(`return collectAnnotations().length;`), 1);
+await evaluate(`
+  window.__origFetch = window.fetch;
+  window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+  return 1;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('a failed refresh leaves no stale doc behind', await docText(), '');
+check('...and no panel claiming to show one',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+// The same window is what let the previous run's line comments stay submittable:
+// loadAnnotations() runs after refresh()'s awaits, so a rejected fetch skips it
+// entirely and alpha's comment would still be in the payload POSTed for epsilon.
+check('...and no stale annotations to submit under this run',
+  await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
+await evaluate(`window.fetch = window.__origFetch; return 1;`);
 
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();
