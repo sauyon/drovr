@@ -66,8 +66,10 @@ enum Commands {
     /// Start the review HTTP server for a run.
     Serve {
         name: String,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host/address to bind. Overrides `serve_host` from config
+        /// (which itself defaults to `127.0.0.1`).
+        #[arg(long)]
+        host: Option<String>,
         #[arg(long, default_value_t = 8791)]
         port: u16,
     },
@@ -109,7 +111,9 @@ enum PhaseCmd {
         #[arg(long)]
         seed: Option<PathBuf>,
     },
-    /// Send text to a running phase pane.
+    /// Send text to a running phase pane. Waits for the agent to attach first;
+    /// exit 2 = it never became ready within the readiness timeout (likely parked
+    /// on a first-run/permission prompt — see the diagnostic), 1 = io error.
     Send {
         run: String,
         phase_name: String,
@@ -497,12 +501,20 @@ fn cmd_resurrect(name: &str) {
     }
 }
 
-fn cmd_serve(name: &str, host: &str, port: u16) {
+fn cmd_serve(name: &str, host: Option<String>, port: u16) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
-    if let Err(e) = serve(name, host, port) {
+    let host = host.unwrap_or_else(|| {
+        config::load_config()
+            .map(|cfg| cfg.serve_host)
+            .unwrap_or_else(|e| {
+                eprintln!("drovr: failed to load config: {e}");
+                process::exit(1);
+            })
+    });
+    if let Err(e) = serve(name, &host, port) {
         eprintln!("drovr: serve failed: {e}");
         process::exit(1);
     }
@@ -544,6 +556,20 @@ fn cmd_phase(sub: PhaseCmd) {
             }
             let state = load_run(&run);
             if let Err(e) = phase_send(&h, &state, &phase_name, &text) {
+                // A readiness timeout (agent never attached) is not a plain send
+                // failure — the agent is almost certainly parked on a prompt with
+                // no human at the pane. Raise it to the driver with the same
+                // actionable, pane-quoting diagnostic the wait-timeout path uses,
+                // and a distinct exit code (2) so the driver can escalate rather
+                // than assume the seed landed.
+                if e.kind() == io::ErrorKind::TimedOut {
+                    if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
+                        eprintln!("drovr: {diag}");
+                    } else {
+                        eprintln!("drovr: {e}");
+                    }
+                    process::exit(2);
+                }
                 eprintln!("drovr: phase send failed: {e}");
                 process::exit(1);
             }
@@ -889,7 +915,7 @@ fn main() {
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
         Commands::Resurrect { name } => cmd_resurrect(&name),
-        Commands::Serve { name, host, port } => cmd_serve(&name, &host, port),
+        Commands::Serve { name, host, port } => cmd_serve(&name, host, port),
         Commands::Handoff { sub } => cmd_handoff(sub, &herdr),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
@@ -983,7 +1009,7 @@ mod tests {
         match cli.command {
             Commands::Serve { name, host, port } => {
                 assert_eq!(name, "myrun");
-                assert_eq!(host, "127.0.0.1");
+                assert_eq!(host, None);
                 assert_eq!(port, 8791);
             }
             _ => panic!("wrong variant"),

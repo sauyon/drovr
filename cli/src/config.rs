@@ -46,6 +46,9 @@ pub struct Config {
     pub review_agent: Option<String>,
     #[serde(default = "default_angles")]
     pub angles: Vec<String>,
+    /// Default host/address `drovr serve` binds to when `--host` is omitted.
+    #[serde(default = "default_serve_host")]
+    pub serve_host: String,
     #[serde(default = "default_agents")]
     pub agents: BTreeMap<String, AgentSpec>,
 }
@@ -56,6 +59,10 @@ pub struct Config {
 // Each default fn seeds the built-in value so an absent field falls back correctly.
 fn default_agent() -> String {
     "claude".into()
+}
+
+fn default_serve_host() -> String {
+    "127.0.0.1".into()
 }
 
 fn default_angles() -> Vec<String> {
@@ -160,6 +167,7 @@ impl Default for Config {
             default_agent: default_agent(),
             review_agent: None,
             angles: default_angles(),
+            serve_host: default_serve_host(),
             agents: default_agents(),
         }
     }
@@ -373,6 +381,7 @@ mod tests {
             cfg.angles,
             vec!["correctness", "security", "error-handling", "type-design"]
         );
+        assert_eq!(cfg.serve_host, "127.0.0.1");
         assert_eq!(
             cfg.reviewer_launch(None).unwrap(),
             "claude --permission-mode plan"
@@ -497,6 +506,7 @@ readonly_flag = "--sandbox read-only"
             default_agent: "claude".into(),
             review_agent: None,
             angles: default_angles(),
+            serve_host: default_serve_host(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -524,6 +534,7 @@ readonly_flag = "--sandbox read-only"
             default_agent: "codex".into(),
             review_agent: None,
             angles: default_angles(),
+            serve_host: default_serve_host(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -554,6 +565,7 @@ readonly_flag = "--sandbox read-only"
             default_agent: "noflag".into(),
             review_agent: None,
             angles: default_angles(),
+            serve_host: default_serve_host(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
