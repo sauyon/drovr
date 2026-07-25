@@ -54,10 +54,11 @@ task that fits. Escalate only when a single context cannot hold the work well.
 
 When you must escalate, pick the smallest tool that fits:
 
-- **Mid-flight escape hatch — `drovr handoff self`.** You are deep in a task and
-  this context is filling. Run it to compress the current transcript into a
-  HANDOFF doc and get a resume pointer, then continue in a fresh agent seeded
-  from it. This is the self-serve primitive you invoke on yourself.
+- **Mid-flight escape hatch — author a HANDOFF yourself.** You are deep in a task
+  and this context is filling. You have the whole session in context, so compress
+  it *yourself*: write a `HANDOFF.md` (the 7-section shape from `drovr:handoff`,
+  git pointers included), then continue in a fresh agent seeded from it. Nothing
+  compresses it for you — the finishing agent always authors its own handoff.
 - **A single planned boundary → `drovr:handoff`.** Hand finished work across one
   phase boundary to a fresh clean-context agent.
 - **A full gated run → `drovr:pipeline`.** Brainstorm → plan → implement → review

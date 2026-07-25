@@ -55,17 +55,22 @@ A review server renders `spec.md` in a browser for the reviewer. The loop:
 
 ## Done when
 
-`spec.md` is approved by the reviewer, and — as your FINAL action, once approved — you have
-run:
+`spec.md` is approved by the reviewer, and — once approved — your FINAL two actions, in order:
 
-```
-drovr phase done <run> brainstorm
-```
+a. **Author the handoff.** Compress your own context into the fixed 7-section handoff (see
+   `drovr:handoff` / the handoff template) and write it to
+   `~/.local/share/drovr/runs/<run>/brainstorm-HANDOFF.md`, **git pointers mandatory**. The
+   plan phase is seeded from this handoff plus `spec.md`; nothing compresses it for you.
 
-This marker is the ONLY signal the driver uses to detect that this phase finished; herdr
-"idle" does not count. Leave `spec.md` complete and current — the next phase (plan) is seeded
-from your compressed handoff plus this file. Reference source by path; do not paste large code
-blocks into the spec.
+b. **Signal completion:**
+   ```
+   drovr phase done <run> brainstorm
+   ```
+   This **refuses until the handoff in (a) exists**, and its marker is the ONLY signal the
+   driver uses to detect that this phase finished; herdr "idle" does not count.
+
+Leave `spec.md` complete and current. Reference source by path; do not paste large code blocks
+into the spec or handoff.
 
 ---
 TASK:

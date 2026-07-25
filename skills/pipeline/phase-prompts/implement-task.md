@@ -42,21 +42,28 @@ tasks; later tasks run as their own fresh phases.
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.
-7. **Signal completion — your FINAL action.** After the report is written, run:
-   ```
-   drovr phase done <run> implement-task-<N>
-   ```
-   This marker is the ONLY signal the driver uses to detect that this phase finished — herdr
-   "idle" does not count (it also fires while you are merely waiting on a subagent). Run it
-   last, once, after everything else; do not run it if you are stopping blocked.
+7. **Author your handoff, then signal completion — your FINAL actions, in order.**
+   a. **Author the handoff.** Compress your own context — you hold the whole session — into the
+      fixed 7-section handoff (see `drovr:handoff` / the handoff template) and write it to
+      `~/.local/share/drovr/runs/<run>/implement-task-<N>-HANDOFF.md`, **git pointers
+      mandatory**. This folds your real interfaces forward to the next task; nothing compresses
+      it for you. Record exact signatures; report your dead-ends honestly.
+   b. **Signal completion.** Run:
+      ```
+      drovr phase done <run> implement-task-<N>
+      ```
+      This **refuses until the handoff in (a) exists** — the handoff and this marker are one
+      atomic step. The marker is the ONLY signal the driver uses to detect that this phase
+      finished — herdr "idle" does not count (it also fires while you are merely waiting on a
+      subagent). Run it last, once, after everything else; do not run it if you are stopping
+      blocked.
 
 ## Done when
 
 The task's tests pass, you have run read-only review subagents (in the foreground) and
-addressed their Critical/Important findings, `task<N>-report.md` is written, and you have run
-`drovr phase done <run> implement-task-<N>` as your final action. Your compressed handoff folds
-your real interfaces forward to the next task, so record exact signatures. Reference source by
-path; do not paste large diffs into the report.
+addressed their Critical/Important findings, `task<N>-report.md` is written, you have authored
+`implement-task-<N>-HANDOFF.md`, and you have run `drovr phase done <run> implement-task-<N>` as
+your final action. Reference source by path; do not paste large diffs into the report or handoff.
 
 If you cannot complete the task (blocked, or the plan contradicts reality), STOP and say so
 plainly in the report — a failed task halts the loop rather than cascading a broken interface

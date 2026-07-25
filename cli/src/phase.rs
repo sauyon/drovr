@@ -765,7 +765,7 @@ pub fn triage_blocked_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Blo
     }
 }
 
-/// Read `HANDOFF.md` written by the compressor into the run directory.
+/// Read `<phase>-HANDOFF.md`, authored by the finishing phase agent, from the run directory.
 pub fn collect(run: &RunState, phase: &str) -> io::Result<String> {
     let path: PathBuf = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
     std::fs::read_to_string(&path).map_err(|e| {

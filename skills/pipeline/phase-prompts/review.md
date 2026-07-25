@@ -27,16 +27,24 @@ You did not write this code — review it as a skeptic, not its author.
 
 ## Done when
 
-`verdict.md` is written with a clear overall call and evidence-backed findings, and — as your
-FINAL action — you have run:
+`verdict.md` is written with a clear overall call and evidence-backed findings, and — your
+FINAL two actions, in order:
 
-```
-drovr phase done <run> review
-```
+a. **Author the handoff.** This is the terminal phase, so the handoff is short: write
+   `~/.local/share/drovr/runs/<run>/review-HANDOFF.md` — the 7-section shape, but its State/
+   Next-step point at `verdict.md` and its overall call, with **git references** for the
+   reviewed range. It exists so the run has a collectable summary and can be resumed; the real
+   deliverable is `verdict.md`.
 
-This marker is the ONLY signal the driver uses to detect that this phase finished; herdr
-"idle" does not count. Be specific and cite `file:line`; the driver surfaces this verdict as
-the run's result. Reference source by path; do not paste large code blocks.
+b. **Signal completion:**
+   ```
+   drovr phase done <run> review
+   ```
+   This **refuses until the handoff in (a) exists**, and its marker is the ONLY signal the
+   driver uses to detect that this phase finished; herdr "idle" does not count.
+
+Be specific and cite `file:line`; the driver surfaces `verdict.md` as the run's result.
+Reference source by path; do not paste large code blocks.
 
 ---
 IMPLEMENT REPORTS / HANDOFFS:

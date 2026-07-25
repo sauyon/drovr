@@ -1,9 +1,9 @@
 <!--
-  Contract for `<phase>-HANDOFF.md` — the doc `drovr phase compress` writes and
-  `drovr collect` reads. These seven sections and headings are fixed; they mirror the
-  compressor's own instructions (cli/assets/compress-prompt.md), so the compressed output
-  will already look like this. Use this file to understand what each section is FOR — when
-  reviewing a handoff, or when hand-writing one for a phase you ran without the compressor.
+  Contract for `<phase>-HANDOFF.md` — the doc the finishing phase agent authors (as its
+  final action, before `drovr phase done`) and `drovr collect` reads. These seven sections
+  and headings are fixed; they mirror the authoring instructions the phase agent is given
+  (cli/assets/compress-prompt.md). Use this file to understand what each section is FOR —
+  when authoring your handoff, or when reviewing one.
 
   Rule of thumb: never drop a decision or an interface to save space — drop narration
   instead. Pointers, not pasted content.

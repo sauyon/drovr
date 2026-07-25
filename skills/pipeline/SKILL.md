@@ -13,7 +13,8 @@ the reviewer must approve `spec.md` before any code is written. Everything after
 runs unattended unless a phase fails.
 
 **REQUIRED SUB-SKILL:** every boundary uses `drovr:handoff` (start → inject → wait →
-compress → collect). This skill does not repeat those mechanics — read it first. Injecting
+collect; the phase agent authors its own handoff before `phase done`). This skill does not
+repeat those mechanics — read it first. Injecting
 each phase's briefing is **your** job; the CLI spawns a plain `claude` and seeds nothing.
 
 You are the **driver** (single writer of the orchestration). The phase agents are the
@@ -105,8 +106,8 @@ single writer of `spec.md`; you convey the reviewer's decisions.
    The agent revises, calls `drovr review summary`, state → `ready`; re-run `drovr review wait`.
 
 6. **Gate passes** when `drovr review wait` exits **0** (state `approved`; the server has
-   written the `approved` marker file in the run dir). Only then compress brainstorm and
-   proceed to plan.
+   written the `approved` marker file in the run dir). Only then let brainstorm finish
+   (authoring brainstorm-HANDOFF.md as its final action) and proceed to plan.
 
 If a reviewer submits **before** the agent's first `drovr review summary`, the server goes
 straight `idle → waiting` — unusual but possible. It self-heals: the agent's next
@@ -124,7 +125,9 @@ for each task N in plan.md:
                                                  + task N brief
                                                  + accumulated interfaces so far"
     drovr phase wait  <run> implement-task-<N> --timeout-ms 900000
-    drovr phase compress <run> implement-task-<N>     # writes implement-task-<N>-HANDOFF.md
+    # No separate compress step: the task agent authored implement-task-<N>-HANDOFF.md
+    # itself as its final action (phase done refuses without it), so `wait` returning
+    # done means the handoff already exists.
 ```
 
 **Fold interfaces forward:** each task's handoff carries the interfaces it introduced;
@@ -134,14 +137,14 @@ on demand alongside the four seeded phases.
 
 ### Review each task until clean — driver-run panel
 
-After a task's `drovr phase compress`, and **before** starting the next task, the **driver**
-runs the automatic review panel (see `drovr:code-review`). The implementer records the base at
+After a task's `drovr phase wait` returns done (so the agent has already authored its
+handoff), and **before** starting the next task, the **driver** runs the automatic review
+panel (see `drovr:code-review`). The implementer records the base at
 task start — `implement-task.md` has it run `drovr code-review base <run> task-<N>` before
 writing any code, so `HEAD` is the pre-task SHA. Then the driver runs the blocking panel and
 branches on its exit code:
 
 ```
-drovr phase compress <run> implement-task-<N>
 drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle
 case $? in
   0)  # clean — proceed to task N+1
@@ -154,9 +157,8 @@ esac
 On **exit 3**, re-enter the implement phase for task N and forward the merged findings:
 
 ```
-drovr phase send <run> implement-task-<N> "Review found changes (see <run_dir>/task-<N>-review.json). Fix every Important AND every nit, then report."
+drovr phase send <run> implement-task-<N> "Review found changes (see <run_dir>/task-<N>-review.json). Fix every Important AND every nit, then re-author your handoff and report."
 drovr phase wait <run> implement-task-<N> --timeout-ms 900000
-drovr phase compress <run> implement-task-<N>
 drovr code-review run <run> task-<N>          # re-run the panel
 ```
 
@@ -188,7 +190,7 @@ finishing.
 
 Review subagents are **read-only**, so drovr's single-writer discipline holds — they find,
 the phase agent fixes. This is encoded in the phase-prompts (`implement-task.md`, `plan.md`);
-as the driver, do not compress a phase until its report shows the self-review happened. This
+as the driver, do not accept a phase as done until its report shows the self-review happened. This
 is IN ADDITION to the pipeline's final review phase (step 4): self-review catches defects one
 phase early, where they are cheap; the final review is the independent cross-check over the
 whole change.
@@ -197,8 +199,9 @@ whole change.
 
 - A phase `wait` exits `1` (failed) or never leaves `2` (timeout) → **STOP**, name the phase,
   surface `herdr agent read <pane>` diagnostics (or `drovr attach <run>` to inspect the pane
-  live). Do not compress or proceed.
-- `drovr phase compress`/`drovr collect` yields an empty or malformed handoff → **STOP**.
+  live). Do not proceed.
+- `drovr phase done` keeps refusing (agent never authored the handoff), or `drovr collect`
+  yields an empty or malformed handoff → **STOP**.
 - A failed implement task **halts the loop** naming that task — later tasks depend on its
   interfaces.
 
@@ -215,6 +218,6 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |
-| Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task's compress; loop on exit 3. |
+| Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task completes; loop on exit 3. |
 | Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
 | Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |
