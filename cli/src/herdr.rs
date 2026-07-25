@@ -308,13 +308,16 @@ impl Herdr for SystemHerdr {
     }
 
     fn pane_exists(&self, pane_id: &str) -> bool {
-        // `pane get` is read-only and does not move focus. Bias toward "alive":
-        // only a successfully-executed query that reports failure proves the pane
-        // is gone. If the herdr binary/daemon is unreachable we cannot tell, so we
-        // claim it exists rather than let a blip trigger a respawn.
+        // `pane get` is read-only and does not move focus. Bias toward "alive": a
+        // nonzero exit alone proves nothing (an unreachable daemon exits nonzero
+        // too), so only herdr's explicit `pane_not_found` counts as death — see
+        // `pane_get_proves_missing`. Anything else, including a failure to run the
+        // binary at all, reports alive so a blip never respawns live work.
         match self.run(&["pane", "get", pane_id]) {
-            Ok(out) => out.status.success(),
-            Err(_) => true,
+            Ok(out) if !out.status.success() => {
+                !pane_get_proves_missing(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => true,
         }
     }
 
@@ -371,6 +374,24 @@ fn parse_agent_status(json: &str) -> Option<String> {
     find_agent_status(&v)
 }
 
+/// Whether a failed `herdr pane get` proves the pane is GONE, as opposed to merely
+/// failing for some other reason.
+///
+/// `pane get` exits non-zero for a missing pane *and* for an unreachable daemon, a
+/// bad socket path, a permissions problem — every one of which would otherwise read
+/// as "pane is dead" and make [`Herdr::pane_exists`] tell callers to respawn a
+/// reviewer that is alive and working. Only herdr's explicit `pane_not_found` error
+/// code is treated as proof of death; anything else is "cannot tell", i.e. alive.
+fn pane_get_proves_missing(stdout: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(stdout) else {
+        return false;
+    };
+    v.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        == Some("pane_not_found")
+}
+
 /// Recursively search a JSON value for the first `"agent_status"` string.
 fn find_agent_status(v: &serde_json::Value) -> Option<String> {
     match v {
@@ -405,8 +426,15 @@ pub struct FakeHerdr {
     status_queue: RefCell<VecDeque<Option<String>>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
+    /// When true, every `agent_send` returns an error (models a pane that accepted a
+    /// launch but cannot be given its prompt).
+    fail_agent_send: RefCell<bool>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Per-pane `agent_read` queues, consulted before the global `read_queue`. Real
+    /// transcripts belong to a specific pane; a test that cares which pane it is
+    /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
+    read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
 }
 
 #[cfg(test)]
@@ -418,7 +446,9 @@ impl FakeHerdr {
             read_queue: RefCell::new(VecDeque::new()),
             status_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
+            fail_agent_send: RefCell::new(false),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
+            read_by_pane: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -426,6 +456,21 @@ impl FakeHerdr {
     /// `pane_exists` reports `false` for it.
     pub fn kill_pane(&self, pane_id: impl Into<String>) {
         self.dead_panes.borrow_mut().insert(pane_id.into());
+    }
+
+    /// Make every `agent_send` fail: the pane launched, but its prompt can never be
+    /// delivered. Cheaper than driving `phase_send`'s 30s readiness timeout.
+    pub fn fail_agent_send(&self) {
+        *self.fail_agent_send.borrow_mut() = true;
+    }
+
+    /// Queue a transcript for one specific pane, taking priority over `push_read`.
+    pub fn push_read_for(&self, pane_id: impl Into<String>, text: impl Into<String>) {
+        self.read_by_pane
+            .borrow_mut()
+            .entry(pane_id.into())
+            .or_default()
+            .push_back(text.into());
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -517,6 +562,9 @@ impl Herdr for FakeHerdr {
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
+        if *self.fail_agent_send.borrow() {
+            return Err(io::Error::other("scripted agent_send failure"));
+        }
         Ok(())
     }
 
@@ -527,6 +575,16 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
+        // A transcript queued for this exact pane wins; otherwise fall back to the
+        // pane-agnostic queue most tests use.
+        if let Some(text) = self
+            .read_by_pane
+            .borrow_mut()
+            .get_mut(target)
+            .and_then(|q| q.pop_front())
+        {
+            return Ok(text);
+        }
         let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
         Ok(text)
     }
@@ -627,6 +685,30 @@ mod tests {
     fn find_string_field_ignores_empty() {
         let v: Value = serde_json::from_str(r#"{"pane_id":""}"#).unwrap();
         assert!(find_string_field(&v, "pane_id").is_none());
+    }
+
+    #[test]
+    fn only_pane_not_found_proves_a_pane_is_missing() {
+        // The one answer that proves death.
+        assert!(pane_get_proves_missing(
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+        ));
+
+        // Every other nonzero exit must read as "cannot tell" → alive. Reporting a
+        // live reviewer dead makes `code-review` resume respawn work in progress.
+        assert!(
+            !pane_get_proves_missing(
+                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+            ),
+            "an unreachable daemon must never be read as a dead pane"
+        );
+        assert!(
+            !pane_get_proves_missing(
+                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+            ),
+            "a non-JSON failure (bad socket path) must not be read as a dead pane"
+        );
+        assert!(!pane_get_proves_missing(""), "empty output proves nothing");
     }
 
     #[test]

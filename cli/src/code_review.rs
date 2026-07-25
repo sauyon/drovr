@@ -12,12 +12,22 @@
 //! Reviewers can outlive `timeout_ms`. A timeout is therefore not a failure but a
 //! pause: the outstanding reviewers stay `Running`, every angle that *did* finish is
 //! already banked in `<task>-review-<angle>.json`, and a plain re-run RESUMES —
-//! re-attaching to the same panel and waiting only on the stragglers (respawning any
-//! whose pane died). Nothing is re-reviewed, so a slow panel costs one reviewer per
-//! angle no matter how many resumes it takes. A new panel is opened only when the
-//! caller passes `fresh`, when HEAD has moved since the pending reviewers were
-//! seeded (their diff no longer stands), or when the previous pass ran to completion
-//! (the fix loop asking for a genuinely new review). See [`resumable_iter`].
+//! re-attaching to the same panel and waiting only on the stragglers. Nothing is
+//! re-reviewed, so a slow panel costs one reviewer per angle no matter how many
+//! resumes it takes. A new panel is opened only when the caller passes `fresh`, when
+//! HEAD has moved since the pending reviewers were seeded (their diff no longer
+//! stands), or when the previous pass ran to completion (the fix loop asking for a
+//! genuinely new review). See [`resumable_iter`].
+//!
+//! Resume must never wait forever on a reviewer that can no longer deliver, so an
+//! angle is REPLACED rather than waited on when its pane is gone
+//! ([`Herdr::pane_exists`] — which, unlike `agent_status`, separates "pane gone" from
+//! "status unparseable") or when it is marked [`PhaseStatus::Failed`]. `Failed` is
+//! recorded for the two ways a reviewer ends up alive but useless: its brief could
+//! not be delivered (`phase_send` failed after the pane launched), or it finished
+//! having emitted output that cannot be parsed. Both would otherwise reproduce
+//! identically on every resume — the pre-resume code masked them by always spawning a
+//! new panel, and only `Failed` preserves that self-healing.
 //!
 //! # Read-only findings path
 //!
@@ -135,9 +145,20 @@ fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     Ok(std::fs::read_to_string(&p)?.trim().to_owned())
 }
 
-/// The newest iteration for `task`, and whether any of its reviewers is still
-/// `Running`. `None` when the task has no reviewer phases at all.
-fn newest_iter(run: &RunState, task: &str) -> Option<(u64, bool)> {
+/// The iteration a re-run should RESUME, if any: the newest one, and only while a
+/// reviewer for a **currently configured** angle is still `Running`.
+///
+/// Deliberately restricted to the *newest* iteration. An older iteration with
+/// `Running` leftovers is a superseded pass (a `--fresh` re-run abandoned it), and
+/// reviving those zombies would review a diff nobody asked about. A newest
+/// iteration that is fully `Done` has already produced `<task>-review.json`, so a
+/// re-run there is the fix loop asking for a genuinely new pass.
+///
+/// Restricted to configured `angles` for the same reason: an angle dropped from
+/// config mid-run leaves a reviewer nothing will ever wait on again (the pass only
+/// iterates configured angles), so counting it as "still running" would hold the
+/// iteration open forever and keep re-banking a finished pass's results.
+fn resumable_iter(run: &RunState, task: &str, angles: &[String]) -> Option<u64> {
     let prefix = format!("review:{task}:");
     let newest = run
         .review_phases
@@ -146,28 +167,12 @@ fn newest_iter(run: &RunState, task: &str) -> Option<(u64, bool)> {
         .filter_map(|rest| rest.split_once(':').map(|(it, _angle)| it))
         .filter_map(|it| it.parse::<u64>().ok())
         .max()?;
-    let iter_prefix = format!("{prefix}{newest}:");
-    let running = run
-        .review_phases
-        .iter()
-        .filter(|p| p.name.starts_with(&iter_prefix))
-        .any(|p| p.status == PhaseStatus::Running);
-    Some((newest, running))
-}
-
-/// The iteration a re-run should RESUME, if any: the newest one, and only while it
-/// still has a `Running` reviewer.
-///
-/// Deliberately restricted to the *newest* iteration. An older iteration with
-/// `Running` leftovers is a superseded pass (a `--fresh` re-run abandoned it), and
-/// reviving those zombies would review a diff nobody asked about. A newest
-/// iteration that is fully `Done` has already produced `<task>-review.json`, so a
-/// re-run there is the fix loop asking for a genuinely new pass.
-fn resumable_iter(run: &RunState, task: &str) -> Option<u64> {
-    match newest_iter(run, task) {
-        Some((iter, true)) => Some(iter),
-        _ => None,
-    }
+    let running = angles.iter().any(|angle| {
+        run.review_phases.iter().any(|p| {
+            p.name == format!("{prefix}{newest}:{angle}") && p.status == PhaseStatus::Running
+        })
+    });
+    running.then_some(newest)
 }
 
 /// `<task>-review-<iter>.head` — the head SHA an iteration's reviewers were seeded
@@ -359,7 +364,7 @@ pub fn code_review_run<H: Herdr>(
     let resumed = match if fresh {
         None
     } else {
-        resumable_iter(run, task)
+        resumable_iter(run, task, &cfg.angles)
     } {
         Some(prev) => {
             let seeded = std::fs::read_to_string(iter_head_path(&dir, task, prev))
@@ -406,21 +411,30 @@ pub fn code_review_run<H: Herdr>(
                 banked.push((angle.clone(), review));
                 continue;
             }
-            // Registered and its pane is still there → keep waiting, no respawn.
-            let alive = run
-                .find_phase(&phase)
+            // Keep waiting only on a reviewer that can still deliver: registered,
+            // pane present, and not already known to be unusable. A `Failed` angle
+            // has a reviewer that was never seeded or whose output could not be
+            // parsed — its pane may well still exist, but waiting on it again just
+            // reproduces the same failure, so it needs a REPLACEMENT, not patience.
+            let existing = run.find_phase(&phase);
+            let failed = existing.is_some_and(|p| p.status == PhaseStatus::Failed);
+            let alive = existing
                 .and_then(|p| p.pane_id.as_deref())
                 .is_some_and(|pane| h.pane_exists(pane));
-            if alive {
+            if alive && !failed {
                 pending.push((angle.clone(), phase));
                 continue;
             }
-            // Pane is gone (crashed agent, closed tab) — or the angle was never
-            // spawned because the configured angles changed mid-run. Respawn it in
-            // place, same iteration, below. Drop the stale registration first so
-            // `find_phase` cannot resolve to the dead pane.
+            // Respawn in place, same iteration, below. Drop the stale registration
+            // first so `find_phase` cannot resolve to the replaced pane — otherwise
+            // the harvest could read the old reviewer's transcript.
+            let reason = match (existing.is_some(), failed) {
+                (false, _) => "was never spawned this iteration",
+                (true, true) => "produced nothing usable",
+                (true, false) => "is gone",
+            };
             run.review_phases.retain(|p| p.name != phase);
-            println!("code-review: reviewer for angle '{angle}' is gone — respawning it");
+            println!("code-review: reviewer for angle '{angle}' {reason} — respawning it");
         }
 
         // Seed + spawn one read-only reviewer, then inject its brief. Every reviewer
@@ -437,7 +451,18 @@ pub fn code_review_run<H: Herdr>(
         // timeout. Any reviewer panes already spawned this pass are left running and
         // reclaimed by the single `workspace_close` at `drovr cleanup` — the codebase
         // invariant is "never close a pane mid-run" (mirrors `phase_start`).
-        phase_send(h, run, &phase, &seed_text)?;
+        //
+        // Mark it `Failed` first, though. `spawn_reviewer` has already registered the
+        // phase as `Running` with a live pane, and the caller saves state even on the
+        // error path — leaving it `Running` would make every later resume patiently
+        // wait on an agent that was never given a task. `Failed` makes the next
+        // resume replace it.
+        if let Err(e) = phase_send(h, run, &phase, &seed_text) {
+            if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
+                run.review_phases[i].status = PhaseStatus::Failed;
+            }
+            return Err(e);
+        }
         pending.push((angle.clone(), phase));
     }
     if let Some(prev) = resumed {
@@ -474,12 +499,24 @@ pub fn code_review_run<H: Herdr>(
                 still_pending.push((angle, phase));
                 continue;
             }
-            let json = obtain_findings_json(h, run, &dir, task, &angle, &phase)?;
-            let review = parse_review(&json)?;
+            // Harvest BEFORE flipping the status. A reviewer marked `Done` whose
+            // findings were never captured would be treated as banked by every later
+            // resume, silently dropping its angle from the merged review.
+            //
+            // If the harvest fails, the reviewer has finished but produced nothing we
+            // can use, and re-reading that same finished pane will fail identically
+            // forever. Record `Failed` so the next resume replaces the reviewer, then
+            // surface the error — an unreadable angle must not pass for a clean one.
+            let harvest = obtain_findings_json(h, run, &dir, task, &angle, &phase)
+                .and_then(|json| parse_review(&json));
+            let status = match &harvest {
+                Ok(_) => PhaseStatus::Done,
+                Err(_) => PhaseStatus::Failed,
+            };
             if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
-                run.review_phases[i].status = PhaseStatus::Done;
+                run.review_phases[i].status = status;
             }
-            harvested.push((angle, review));
+            harvested.push((angle, harvest?));
         }
         pending = still_pending;
         if pending.is_empty() {
@@ -735,9 +772,9 @@ mod tests {
         drop_marker(&run, "task-1", 1, "correctness");
         drop_marker(&run, "task-1", 1, "security");
         h.push_read(format!("```json\n{CLEAN}\n```"));
-        h.push_read(format!(
-            "```json\n{{\"verdict\":\"changes\",\"findings\":[{{\"file\":\"a.rs\",\"severity\":\"important\",\"summary\":\"leak\"}}]}}\n```"
-        ));
+        h.push_read(
+            "```json\n{\"verdict\":\"changes\",\"findings\":[{\"file\":\"a.rs\",\"severity\":\"important\",\"summary\":\"leak\"}]}\n```",
+        );
 
         // Still Timeout (two stragglers), but the finished work is banked on disk.
         assert_eq!(
@@ -803,9 +840,9 @@ mod tests {
         // including the two harvested during the earlier resume.
         drop_marker(&run, "task-1", 1, "error-handling");
         drop_marker(&run, "task-1", 1, "type-design");
-        h.push_read(format!(
-            "```json\n{{\"verdict\":\"changes\",\"findings\":[{{\"file\":\"b.rs\",\"severity\":\"critical\",\"summary\":\"panic\"}}]}}\n```"
-        ));
+        h.push_read(
+            "```json\n{\"verdict\":\"changes\",\"findings\":[{\"file\":\"b.rs\",\"severity\":\"critical\",\"summary\":\"panic\"}]}\n```",
+        );
         h.push_read(format!("```json\n{CLEAN}\n```"));
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
@@ -861,6 +898,266 @@ mod tests {
             spawn_count(&h),
             5,
             "exactly one extra launch: only the dead angle is respawned"
+        );
+    }
+
+    /// A reviewer that launched but could never be given its brief must not be left
+    /// `Running`: a `Running` phase with a live pane is exactly what resume waits on,
+    /// so it would wait on an agent that was never asked anything — forever.
+    #[test]
+    fn a_reviewer_that_could_not_be_seeded_is_marked_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-send-fails");
+        write_base(&run, "task-1");
+        h.fail_agent_send();
+
+        let err = code_review_run(&h, &mut run, "task-1", 40, false)
+            .expect_err("a reviewer that cannot be seeded must fail the pass loudly");
+        assert!(err.to_string().contains("agent_send"), "surfaced: {err}");
+
+        let phase = run
+            .find_phase("review:task-1:1:correctness")
+            .expect("the spawned reviewer stays registered so its pane is reclaimed");
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Failed,
+            "an unseeded reviewer must be Failed, never Running — otherwise resume \
+             waits on an agent that was never given a task"
+        );
+    }
+
+    /// Unusable output is not a transient condition: re-reading the same finished
+    /// pane's transcript fails identically every time. Such an angle must be marked
+    /// `Failed` so a resume replaces the reviewer instead of retrying it forever.
+    #[test]
+    fn an_unparseable_reviewer_result_marks_the_angle_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-bad-json");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // correctness finishes, but emits JSON that is not a Review.
+        drop_marker(&run, "task-1", 1, "correctness");
+        let pane = pane_of(&run, "review:task-1:1:correctness");
+        h.push_read_for(&pane, "```json\n{\"not\":\"a review\"}\n```");
+
+        let err = code_review_run(&h, &mut run, "task-1", 40, false)
+            .expect_err("unparseable findings must fail the pass loudly");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            run.find_phase("review:task-1:1:correctness")
+                .unwrap()
+                .status,
+            PhaseStatus::Failed,
+            "an angle whose output cannot be parsed must be Failed, so the next \
+             resume respawns it rather than re-reading the same dead transcript"
+        );
+    }
+
+    #[test]
+    fn resume_respawns_an_angle_whose_reviewer_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-resume-failed");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Model the wedged angle: its pane is alive, but it is marked Failed.
+        let wedged = pane_of(&run, "review:task-1:1:security");
+        let i = run
+            .review_phases
+            .iter()
+            .position(|p| p.name == "review:task-1:1:security")
+            .unwrap();
+        run.review_phases[i].status = PhaseStatus::Failed;
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert_eq!(
+            run.review_phases.len(),
+            4,
+            "the failed reviewer is replaced in place, not added alongside"
+        );
+        assert_ne!(
+            pane_of(&run, "review:task-1:1:security"),
+            wedged,
+            "a Failed angle must get a NEW reviewer even though its pane still exists"
+        );
+        assert_eq!(spawn_count(&h), 5, "only the failed angle is respawned");
+    }
+
+    /// The respawn must not merely happen — the replacement reviewer's findings must
+    /// be the ones harvested for that angle.
+    #[test]
+    fn a_respawned_reviewer_is_the_one_harvested() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-respawn-harvest");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        let dead = pane_of(&run, "review:task-1:1:correctness");
+        h.kill_pane(dead.clone());
+        // If the harvest ever reads the DEAD pane, it picks up this poison instead.
+        h.push_read_for(
+            &dead,
+            "```json\n{\"verdict\":\"changes\",\"findings\":[{\"file\":\"stale.rs\",\"severity\":\"critical\",\"summary\":\"from the dead pane\"}]}\n```",
+        );
+
+        // Resume: respawns correctness, then every angle finishes. The three
+        // survivors read from their own panes; the single pane-agnostic transcript is
+        // therefore consumable only by the newly-spawned correctness reviewer, whose
+        // pane id does not exist yet.
+        drop_markers(&run, "task-1", 1);
+        for angle in ["security", "error-handling", "type-design"] {
+            h.push_read_for(
+                pane_of(&run, &format!("review:task-1:1:{angle}")),
+                format!("```json\n{CLEAN}\n```"),
+            );
+        }
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+
+        let fresh_pane = pane_of(&run, "review:task-1:1:correctness");
+        assert_ne!(fresh_pane, dead);
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Clean,
+            "the replacement reviewer's (empty) transcript must be what counts; \
+             reading the dead pane would have produced a critical finding"
+        );
+        let merged = parse_review(
+            &std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !merged
+                .findings
+                .iter()
+                .any(|f| f.summary.contains("from the dead pane")),
+            "findings must never be attributed from a pane that was replaced: {:?}",
+            merged.findings
+        );
+    }
+
+    /// A leftover `Running` reviewer for an angle no longer in config must not make
+    /// a finished iteration look resumable forever.
+    #[test]
+    fn a_leftover_for_an_unconfigured_angle_does_not_make_an_iter_resumable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-unconfigured-leftover");
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", a, CLEAN);
+        }
+        drop_markers(&run, "task-1", 1);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        // An angle that was dropped from config mid-run, still Running from an
+        // earlier pass. The configured angles are all Done, so this pass is over.
+        run.review_phases.push(Phase {
+            name: "review:task-1:1:performance".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("pane-stale".into()),
+        });
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
+            "a completed pass must still start fresh; an unconfigured angle's \
+             leftover must not hold the iteration open: {:?}",
+            run.review_phases
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Self-heal: a `Done` angle whose banked JSON is unreadable must be waited on
+    /// again rather than trusted or hard-failed.
+    #[test]
+    fn resume_rewaits_an_angle_whose_banked_findings_are_unreadable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-banked-corrupt");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Mark one angle Done but corrupt its banked file.
+        let i = run
+            .review_phases
+            .iter()
+            .position(|p| p.name == "review:task-1:1:correctness")
+            .unwrap();
+        run.review_phases[i].status = PhaseStatus::Done;
+        seed_angle_file(&run, "task-1", "correctness", "{ this is not json");
+
+        // It must be waited on again (so: Timeout, still 4 phases, no respawn since
+        // its pane is alive) — not trusted, and not a hard error.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(run.review_phases.len(), 4);
+        assert_eq!(
+            spawn_count(&h),
+            4,
+            "a live pane is re-waited on, not respawned"
+        );
+    }
+
+    /// Without a recorded head we cannot prove the pending reviewers are reading the
+    /// current diff, so the safe move is a fresh panel.
+    #[test]
+    fn a_missing_iter_head_record_starts_a_fresh_panel() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-no-head-record");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        std::fs::remove_file(run_dir(&run.name).join("task-1-review-1.head")).unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .any(|p| p.name == "review:task-1:2:correctness"),
+            "an unverifiable scope must start fresh rather than resume blind"
         );
     }
 
@@ -1291,7 +1588,16 @@ mod tests {
             pane_id: None,
         };
 
-        assert_eq!(resumable_iter(&base, "task-1"), None, "nothing spawned yet");
+        let angles: Vec<String> = ["correctness", "security"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert_eq!(
+            resumable_iter(&base, "task-1", &angles),
+            None,
+            "nothing spawned yet"
+        );
 
         // A pass still in flight is resumable.
         let mut run = base.clone();
@@ -1299,7 +1605,7 @@ mod tests {
             mk("review:task-1:1:correctness", PhaseStatus::Done),
             mk("review:task-1:1:security", PhaseStatus::Running),
         ];
-        assert_eq!(resumable_iter(&run, "task-1"), Some(1));
+        assert_eq!(resumable_iter(&run, "task-1", &angles), Some(1));
 
         // A pass that ran to completion is not: a re-run there is the fix loop
         // asking for a new review of newly-fixed code.
@@ -1308,7 +1614,16 @@ mod tests {
             mk("review:task-1:1:correctness", PhaseStatus::Done),
             mk("review:task-1:1:security", PhaseStatus::Done),
         ];
-        assert_eq!(resumable_iter(&run, "task-1"), None);
+        assert_eq!(resumable_iter(&run, "task-1", &angles), None);
+
+        // Neither is one whose only unfinished reviewer `Failed` — that angle needs a
+        // replacement, which the fresh-panel path provides.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Done),
+            mk("review:task-1:1:security", PhaseStatus::Failed),
+        ];
+        assert_eq!(resumable_iter(&run, "task-1", &angles), None);
 
         // Zombies from an abandoned (`--fresh`-superseded) iteration must never be
         // revived, even though they are still `Running` — iter 2 is what matters,
@@ -1319,9 +1634,23 @@ mod tests {
             mk("review:task-1:2:correctness", PhaseStatus::Done),
         ];
         assert_eq!(
-            resumable_iter(&run, "task-1"),
+            resumable_iter(&run, "task-1", &angles),
             None,
             "an older iteration's leftovers are not a resumable pass"
+        );
+
+        // A `Running` reviewer for an angle no longer in config holds nothing open:
+        // the pass only ever waits on configured angles, so it would never finish.
+        let mut run = base.clone();
+        run.review_phases = vec![
+            mk("review:task-1:1:correctness", PhaseStatus::Done),
+            mk("review:task-1:1:security", PhaseStatus::Done),
+            mk("review:task-1:1:performance", PhaseStatus::Running),
+        ];
+        assert_eq!(
+            resumable_iter(&run, "task-1", &angles),
+            None,
+            "an unconfigured angle's leftover must not make the pass resumable"
         );
 
         // Tasks are independent.
@@ -1330,8 +1659,8 @@ mod tests {
             mk("review:task-1:1:correctness", PhaseStatus::Done),
             mk("review:task-2:1:correctness", PhaseStatus::Running),
         ];
-        assert_eq!(resumable_iter(&run, "task-1"), None);
-        assert_eq!(resumable_iter(&run, "task-2"), Some(1));
+        assert_eq!(resumable_iter(&run, "task-1", &angles), None);
+        assert_eq!(resumable_iter(&run, "task-2", &angles), Some(1));
     }
 
     #[test]
