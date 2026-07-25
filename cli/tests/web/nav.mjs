@@ -550,6 +550,61 @@ check('...and no stale annotations to submit under this run',
   await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
 await evaluate(`window.fetch = window.__origFetch; return 1;`);
 
+console.log('\n== the decision form does not carry across runs ==');
+// The decision radio and the feedback box are plain form fields, so nothing reset
+// them on navigation: prose typed for one run stayed in the box and the radio kept
+// its pick, and submitting on the next run wrote them into THAT run's
+// feedback.json — a decision the reviewer never made about a spec they never read.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'alpha-only feedback, must not follow me';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  return 1;`);
+check('the planted decision is really staged on alpha', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r.value + '|' + (document.getElementById('feedback').value.length > 0);`), 'approve|true');
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('the feedback box is empty on the next run',
+  await evaluate(`return document.getElementById('feedback').value;`), '');
+check('the decision falls back to request-changes, not the previous pick',
+  await evaluate(`
+    var r = document.querySelector('input[name="decision"]:checked');
+    return r ? r.value : null;`), 'request-changes');
+
+console.log('\n== a stale review panel cannot repaint over the session list ==');
+// refreshReview() is called fire-and-forget and awaits twice, so it outlives a
+// navigation. Without a routeGen guard its late resolution re-showed the panel —
+// on the session list, which had already hidden it once on the way out.
+await goto('#/runs/alpha-deploy?task=task-1', {
+  probe: () => evaluate(`return currentRun;`), ok: r => r === 'alpha-deploy', label: 'alpha detail',
+});
+// Hold the findings fetch open, navigate away, then release it: the resolution
+// lands with the reviewer already back on the list.
+await evaluate(`
+  window.__release = null;
+  window.__origFetch2 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('review/findings') !== -1) {
+      return new Promise(function(res) { window.__release = function() { res(window.__origFetch2(u)); }; });
+    }
+    return window.__origFetch2.apply(window, arguments);
+  };
+  refreshReview();
+  return 1;`);
+await waitFor(() => evaluate(`return !!window.__release;`), v => v === true, 4000, 'findings fetch parked');
+await evaluate(`location.hash = '#/'; return 1;`);
+await waitFor(rowNames, r => r.length > 0, 8000, 'back on the session list');
+await evaluate(`window.__release(); return 1;`);
+// Give the released promise a turn to resolve and (wrongly) paint.
+await waitFor(() => evaluate(`return 1;`), () => true, 500, 'tick');
+await sleep(300);
+check('the review panel stays hidden on the session list',
+  await evaluate(`return document.getElementById('review-panel').style.display;`), 'none');
+check('...and the session list is still what is on screen', (await rowNames()).length > 0, true);
+await evaluate(`window.fetch = window.__origFetch2; return 1;`);
+
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();
 clearTimeout(watchdog);

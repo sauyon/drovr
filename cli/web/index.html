@@ -1316,6 +1316,12 @@ function legacyRenderReviewDiff(diffText, locMap) {
 // Additive and defensive: absent endpoints render an empty panel; any error
 // leaves the panel hidden so the spec-review loop is unaffected.
 async function refreshReview() {
+  // Every other async flow in this file captures routeGen and bails if it moved;
+  // this one did not, and it is called fire-and-forget from refresh(). Its own two
+  // awaits below outlive a navigation, so without this the late resolution painted
+  // the previous task's findings and diff and then unconditionally re-showed the
+  // panel — over the session list, which only hid it once on the way out.
+  var gen = routeGen;
   var task = reviewTask();
   if (!task) { hideEl('review-panel'); return; }
   var q = '?task=' + encodeURIComponent(task);
@@ -1325,6 +1331,7 @@ async function refreshReview() {
     var fr = await fetch(api('review/findings') + q);
     if (fr.ok) review = await fr.json();
   } catch (e) { review = {}; }
+  if (gen !== routeGen) return;
   var findings = (review && review.findings) || [];
 
   document.getElementById('review-task').textContent = task;
@@ -1337,6 +1344,7 @@ async function refreshReview() {
   document.getElementById('review-findings').innerHTML = renderFindings(findings);
 
   var diffText = await fetchText(api('review/diff') + q);
+  if (gen !== routeGen) return;
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
     diffEl.innerHTML = await renderReviewDiff(diffText, findings);
@@ -2209,6 +2217,16 @@ async function route() {
   // submittable indefinitely. loadAnnotations() then restores this run's own
   // in-progress comments from localStorage.
   annotations = {};
+  // Same class again, and the worst instance of it: the decision radio and the
+  // feedback box are plain form fields that nothing ever reset, so prose typed for
+  // one run stayed in the box — and the radio stayed on whatever was picked —
+  // after navigating to another. Submitting there wrote one run's decision and
+  // feedback into the OTHER run's feedback.json, which an agent then acts on.
+  // Back to the markup default: request-changes selected, box empty.
+  var rcRadio = document.querySelector('input[name="decision"][value="request-changes"]');
+  if (rcRadio) rcRadio.checked = true;
+  document.getElementById('feedback').value = '';
+  hideEl('form-error');
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;

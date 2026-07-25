@@ -67,7 +67,8 @@ To accept the old completion as-is, re-signal it deliberately from the run dir:
 
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
 case.
-## Review UI shows the PREVIOUS run's spec for a run that has no spec — FIXED 2026-07-25
+
+## Review UI presents one run's state as another's (spec, feedback, annotations, findings) — FIXED 2026-07-25
 
 **Status:** fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
 panel in the empty case, and `route()` no longer shows it. Regression checks: "a run with no
@@ -146,6 +147,52 @@ in-progress comment is lost.
 3. `#doc-panel` now carries inline `style="display:none"` like every other refresh-owned
    panel, so it is not visible-and-empty on first paint.
 4. Reset `annotations` unconditionally in `loadAnnotations()` (above).
+
+### Three more instances of the same class, found by the review panel on the fix
+
+All pre-existing, all "run A's state presented or submitted as run B's", all fixed on the
+same branch. Listed because the pattern is the point: **any run-scoped state that is not
+reset synchronously in `route()` is a cross-run leak waiting to happen.**
+
+1. **The decision radio and feedback textarea were never reset** (`cli/web/index.html:908-915`).
+   The worst of the set, and worse than the doc panel: no race needed and completely silent.
+   Type feedback for run A, select a decision, navigate to run B (list, bookmark, or
+   back/forward), submit — and A's prose and A's decision are written into B's
+   `feedback.json`, which an autonomous agent then acts on. `submitDecision()` reads the live
+   DOM (`:1773`, `:1777`); nothing in `route()` or `refresh()` ever touched those values.
+   Fixed by resetting both to the markup default in `route()`'s synchronous block.
+
+2. **`annotations` was reset too late.** `loadAnnotations()` runs *after* `refresh()`'s
+   awaits, so between `route()`'s synchronous body and those fetches resolving,
+   `collectAnnotations()` still returned the outgoing run's line comments while
+   `api('submit')` already addressed the incoming one — and if `refresh()` rejects,
+   `loadAnnotations()` never runs at all and they stay submittable indefinitely with nothing
+   on screen to reveal them. Fixed by dropping them synchronously in `route()`;
+   `loadAnnotations()` still restores this run's own in-progress comments from localStorage.
+
+3. **`refreshReview()` had no `routeGen` guard** (`cli/web/index.html:1286-1317`). Every other
+   async flow in the file captures `routeGen` and bails if it moved; this one did not, and it
+   is called fire-and-forget from `refresh()`. Its two sequential awaits outlive a
+   navigation, so a late resolution painted the previous task's findings and diff and then
+   unconditionally re-showed the panel — **over the session list**, which had only hidden it
+   once on the way out. Strictly worse than the original symptom. Fixed with the standard
+   guard after each await.
+
+### Still open (follow-ups, not blocking)
+
+- `fetchText()` (`cli/web/index.html`) collapses 204, non-OK and a genuinely empty body all to
+  `''`, so a 500 on `/doc` is indistinguishable from "this run has no spec" and silently
+  renders as the latter. The reviewer is told "no spec yet" when the truth is "the server
+  broke".
+- `/doc` is the one maybe-absent-markdown endpoint that answers **200-with-empty-body**;
+  its siblings `/prior` (`cli/src/review.rs:472-478`) and `/review/diff` (`:791-797`) both
+  answer `204`, the latter with an explicit comment reading *"not a misleading empty 200."*
+  `/doc` should match. Given `fetchText`'s current collapsing this is a consistency fix, not
+  a behavioral one — but the conflation is the root design flaw behind this whole entry.
+- `agents-panel` / `session-panel` are shown by `route()` before their own poll lands. Their
+  catch blocks leave prior content untouched, so a persistently-failing endpoint leaves the
+  previous run's agent tree visible under the new run's header. Self-heals in ~1-2s on the
+  normal path.
 
 ### Testing note
 
