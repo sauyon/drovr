@@ -588,6 +588,37 @@
     background: var(--surface); color: var(--text); font: inherit;
   }
   .session-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .session-target { text-transform: none; letter-spacing: 0; color: var(--text); font-family: var(--mono); font-size: 0.9em; }
+
+  /* ---- Agent tree ---- */
+  .agents-tree { font-size: 13px; }
+  .agent-node {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 8px; border-radius: var(--radius); cursor: pointer;
+  }
+  .agent-node:hover { background: var(--hover, rgba(127,127,127,0.08)); }
+  .agent-node.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .agent-node.no-pane { cursor: default; opacity: 0.7; }
+  .agent-dot { width: 9px; height: 9px; border-radius: 50%; background: #888; flex: 0 0 auto; }
+  .agent-dot.st-Running { background: #f5a623; }
+  .agent-dot.st-Done { background: #3ec46d; }
+  .agent-dot.st-Failed { background: var(--danger); }
+  .agent-dot.st-Pending { background: #888; }
+  .agent-name { font-family: var(--mono); }
+  .agent-angle { color: var(--muted); font-size: 0.85em; }
+  .agent-children { margin-left: 18px; border-left: 1px solid var(--border); padding-left: 6px; }
+
+  /* ---- New session form ---- */
+  .new-session-form {
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 4px 0 14px; padding: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg);
+  }
+  .new-session-form input, .new-session-form textarea {
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); color: var(--text); font: inherit;
+  }
+  .new-session-form textarea { min-height: 56px; resize: vertical; }
 </style>
 </head>
 <body>
@@ -603,7 +634,17 @@
 
   <!-- Session list (landing view): every run under the drovr data dir. -->
   <div id="run-list" style="display:none" class="panel">
-    <div class="panel-title">Sessions</div>
+    <div class="panel-title with-action">Sessions
+      <button class="panel-action-btn" onclick="toggleNewSession()">+ New session</button>
+    </div>
+    <div id="new-session-form" class="new-session-form" style="display:none">
+      <input id="ns-name" placeholder="run name (e.g. my-dogfood)" autocomplete="off">
+      <textarea id="ns-task" placeholder="task for the agent (optional)"></textarea>
+      <div class="btn-row">
+        <button class="primary" id="ns-create" onclick="createSession()">Create &amp; start</button>
+        <span id="ns-error" class="error-msg" style="display:none"></span>
+      </div>
+    </div>
     <div id="run-list-items"></div>
   </div>
 
@@ -615,8 +656,15 @@
   <!-- Live session mirror: a snapshot of the run's real agent pane (herdr
        read), with an input box that types back into it (herdr prompt). This is
        the primary way to watch and drive a run from the browser. -->
+  <!-- Agent tree: the phases + nested review panels a run has spawned. Click a
+       node to inspect its live session in the panel below. -->
+  <div id="agents-panel" style="display:none" class="panel">
+    <div class="panel-title">Agents</div>
+    <div id="agents-tree" class="agents-tree"></div>
+  </div>
+
   <div id="session-panel" style="display:none" class="panel">
-    <div class="panel-title">Live session</div>
+    <div class="panel-title">Live session · <span id="session-target" class="session-target">active</span></div>
     <div id="session-view" class="session-view"></div>
     <div class="session-input-row">
       <textarea id="session-text" placeholder="Type to the agent… (Enter to send, Shift+Enter for newline)"></textarea>
@@ -1434,6 +1482,43 @@ function showError(msg) {
   el.style.display = '';
 }
 
+// ---- New session ----
+function toggleNewSession() {
+  var f = document.getElementById('new-session-form');
+  var show = f.style.display === 'none';
+  f.style.display = show ? '' : 'none';
+  if (show) document.getElementById('ns-name').focus();
+}
+
+async function createSession() {
+  var name = document.getElementById('ns-name').value.trim();
+  var task = document.getElementById('ns-task').value;
+  var err = document.getElementById('ns-error');
+  var btn = document.getElementById('ns-create');
+  err.style.display = 'none';
+  if (!name) { err.textContent = 'A run name is required.'; err.style.display = ''; return; }
+  btn.disabled = true;
+  try {
+    var r = await fetch('/api/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, task: task })
+    });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || !d.ok) {
+      err.textContent = (d && d.error) || 'Create failed.';
+      err.style.display = '';
+      btn.disabled = false;
+      return;
+    }
+    location.hash = '#/runs/' + encodeURIComponent(d.name);   // jump to the new session
+  } catch (e) {
+    err.textContent = 'Network error: ' + e.message;
+    err.style.display = '';
+    btn.disabled = false;
+  }
+}
+
 // ---- Session list view ----
 async function renderRunList() {
   var listEl = document.getElementById('run-list-items');
@@ -1458,13 +1543,68 @@ async function renderRunList() {
   }
 }
 
+// ---- Agent tree ----
+var agentsTimer = null;
+// The pane currently being inspected in the Live session panel; null = the
+// run's default active pane.
+var selectedPane = null;
+var selectedName = '';
+
+// `?pane=<id>` suffix for /pane and /send when a specific node is selected.
+function paneQuery() {
+  return selectedPane ? '?pane=' + encodeURIComponent(selectedPane) : '';
+}
+
+function selectPane(pane, name) {
+  selectedPane = pane;
+  selectedName = name || '';
+  document.getElementById('session-target').textContent = name || 'active';
+  // Re-render the tree's selection highlight and jump the mirror immediately.
+  document.querySelectorAll('.agent-node').forEach(function(n) {
+    n.classList.toggle('selected', n.getAttribute('data-pane') === pane);
+  });
+  pollPane(routeGen);
+}
+
+function agentNodeHtml(node) {
+  var pane = node.pane_id || '';
+  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (pane && pane === selectedPane ? ' selected' : '');
+  var angle = node.angle ? ' <span class="agent-angle">· ' + escHtml(node.angle) + '</span>' : '';
+  var kids = (node.children && node.children.length)
+    ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
+  return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
+    + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle
+    + '</div>' + kids;
+}
+
+async function pollAgents(gen) {
+  if (gen !== routeGen) return;
+  try {
+    var r = await fetch(api('agents'));
+    var tree = await r.json();
+    if (gen !== routeGen) return;
+    var el = document.getElementById('agents-tree');
+    var nodes = (tree && tree.nodes) || [];
+    el.innerHTML = nodes.length
+      ? nodes.map(agentNodeHtml).join('')
+      : '<div class="review-empty">No agents spawned yet.</div>';
+    // Clicking a node with a pane inspects it in the Live session panel.
+    el.querySelectorAll('.agent-node').forEach(function(n) {
+      var pane = n.getAttribute('data-pane');
+      if (pane) n.onclick = function() { selectPane(pane, n.querySelector('.agent-name').textContent); };
+    });
+  } catch (e) { /* transient; keep polling */ }
+  if (gen === routeGen) agentsTimer = setTimeout(function(){ pollAgents(gen); }, 2000);
+}
+
 // ---- Live session mirror ----
 var paneTimer = null;
 
 async function pollPane(gen) {
   if (gen !== routeGen) return;
   try {
-    var r = await fetch(api('pane'));
+    var r = await fetch(api('pane') + paneQuery());
     var text = r.status === 200 ? await r.text() : '';
     if (gen !== routeGen) return;
     var view = document.getElementById('session-view');
@@ -1474,7 +1614,7 @@ async function pollPane(gen) {
     if (text) {
       view.textContent = text;
     } else {
-      view.innerHTML = '<span class="session-empty">No live pane for this run (it may not be running).</span>';
+      view.innerHTML = '<span class="session-empty">No live pane (this agent may not be running).</span>';
     }
     if (atBottom) view.scrollTop = view.scrollHeight;
   } catch (e) { /* transient; keep polling */ }
@@ -1487,7 +1627,7 @@ async function sendPane() {
   if (!text.trim()) return;
   el.value = '';
   try {
-    await fetch(api('send'), {
+    await fetch(api('send') + paneQuery(), {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
       body: text
@@ -1498,12 +1638,13 @@ async function sendPane() {
 }
 
 // ---- Router ----
-var DETAIL_PANELS = ['summary-banner', 'session-panel', 'review-panel', 'diff-panel',
-  'doc-panel', 'waiting-overlay', 'approved-overlay', 'form-section'];
+var DETAIL_PANELS = ['summary-banner', 'agents-panel', 'session-panel', 'review-panel',
+  'diff-panel', 'doc-panel', 'waiting-overlay', 'approved-overlay', 'form-section'];
 
 async function route() {
   clearTimeout(pollTimer);
   clearTimeout(paneTimer);
+  clearTimeout(agentsTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   currentRun = h.run;
@@ -1523,8 +1664,14 @@ async function route() {
   hideEl('run-list');
   showEl('back-link');
   showEl('doc-panel');
-  // Live session mirror: primary surface, polled independently of the gate.
+  // Agent tree + live session mirror: primary surfaces, polled independently of
+  // the gate. Reset the inspected pane to the run's default on each navigation.
+  selectedPane = null;
+  selectedName = '';
+  document.getElementById('session-target').textContent = 'active';
+  showEl('agents-panel');
   showEl('session-panel');
+  pollAgents(routeGen);
   pollPane(routeGen);
   await refresh();
 }

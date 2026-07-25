@@ -410,6 +410,13 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
         return;
     }
 
+    // POST /api/runs — create a run and start its brainstorm agent (dogfood a
+    // fresh drovr session straight from the browser).
+    if method == Method::Post && path == "/api/runs" {
+        handle_post_new_run(req);
+        return;
+    }
+
     // Everything else is run-scoped: /api/runs/<run>/<sub>.
     if let Some((run, sub)) = parse_run_path(&path) {
         if !safe_component(run) {
@@ -486,11 +493,14 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         // POST summary — agent posts a summary; flips state → ready.
         (Method::Post, "summary") => handle_post_summary(req, ctx, run, &p),
 
-        // GET pane — a snapshot of the run's live agent session (herdr read).
-        (Method::Get, "pane") => handle_get_pane(req, &p),
+        // GET agents — the tree of agents (phases + nested review panels).
+        (Method::Get, "agents") => handle_get_agents(req, &p),
 
-        // POST send — type text into the run's live agent pane (herdr prompt).
-        (Method::Post, "send") => handle_post_send(req, &p),
+        // GET pane[?pane=<id>] — snapshot of a run agent's session (herdr read).
+        (Method::Get, "pane") => handle_get_pane(req, &p, url),
+
+        // POST send[?pane=<id>] — type text into a run agent's pane (herdr prompt).
+        (Method::Post, "send") => handle_post_send(req, &p, url),
 
         _ => respond_404(req),
     }
@@ -511,14 +521,36 @@ fn active_pane(run: &RunState) -> Option<String> {
         .or_else(|| run.root_pane.clone())
 }
 
-/// `GET /api/runs/<run>/pane` — the recent transcript of the run's live agent
-/// session, as plain text (204 when there is no live pane to read).
-fn handle_get_pane(req: Request, p: &RunPaths) {
-    let Some(run) = load_run_state(&p.dir) else {
-        respond_empty(req, 204);
-        return;
-    };
-    let Some(pane) = active_pane(&run) else {
+/// Every pane id that belongs to `run` (phases, review panels, root pane). The
+/// allow-list that gates `?pane=<id>` so a run-scoped endpoint can never be used
+/// to read or write an arbitrary herdr pane outside the run.
+fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for ph in run.phases.iter().chain(run.review_phases.iter()) {
+        if let Some(pane) = &ph.pane_id {
+            set.insert(pane.clone());
+        }
+    }
+    if let Some(root) = &run.root_pane {
+        set.insert(root.clone());
+    }
+    set
+}
+
+/// Resolve which pane a `/pane` or `/send` request targets. An explicit
+/// `?pane=<id>` is honored only when it belongs to `run` (else `None`); with no
+/// param, falls back to the run's [`active_pane`].
+fn resolve_pane(run: &RunState, url: &str) -> Option<String> {
+    match query_param(url, "pane") {
+        Some(requested) => run_pane_ids(run).take(&requested),
+        None => active_pane(run),
+    }
+}
+
+/// `GET /api/runs/<run>/pane[?pane=<id>]` — the recent transcript of a run
+/// agent's session, as plain text (204 when there is no such live pane).
+fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
         respond_empty(req, 204);
         return;
     };
@@ -532,15 +564,11 @@ fn handle_get_pane(req: Request, p: &RunPaths) {
     }
 }
 
-/// `POST /api/runs/<run>/send` — type the request body into the run's live
-/// agent pane (herdr submits it). 409 when there is no live pane.
-fn handle_post_send(mut req: Request, p: &RunPaths) {
+/// `POST /api/runs/<run>/send[?pane=<id>]` — type the request body into a run
+/// agent's pane (herdr submits it). 409 when there is no such live pane.
+fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
     let text = read_body(&mut req);
-    let Some(run) = load_run_state(&p.dir) else {
-        respond_str(req, 409, "text/plain", "no run".into());
-        return;
-    };
-    let Some(pane) = active_pane(&run) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -552,6 +580,61 @@ fn handle_post_send(mut req: Request, p: &RunPaths) {
             respond_str(req, 500, "text/plain", "send failed".into())
         }
     }
+}
+
+/// `GET /api/runs/<run>/agents` — the tree of spawned agents: each phase pane
+/// with its per-task review panels nested beneath it. Only agents that actually
+/// have a pane appear (unstarted placeholder phases are omitted).
+fn handle_get_agents(req: Request, p: &RunPaths) {
+    let tree = match load_run_state(&p.dir) {
+        Some(run) => build_agent_tree(&run),
+        None => serde_json::json!({ "workspace": serde_json::Value::Null, "nodes": [] }),
+    };
+    respond_str(req, 200, "application/json", tree.to_string());
+}
+
+/// A `PhaseStatus` as its serialized string (`"Running"`, `"Done"`, …).
+fn status_str(status: &crate::run::PhaseStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// Build the agent tree for `run`: phases (that have a pane) as top-level nodes,
+/// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
+/// `implement-<task>` phase. Reviews with no matching phase land in a trailing
+/// group node so nothing is dropped.
+fn build_agent_tree(run: &RunState) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for rp in &run.review_phases {
+        let Some(pane) = &rp.pane_id else { continue };
+        let parts: Vec<&str> = rp.name.split(':').collect();
+        let task = parts.get(1).copied().unwrap_or("").to_string();
+        let angle = parts.get(3).copied().unwrap_or("").to_string();
+        reviews_by_task.entry(task).or_default().push(serde_json::json!({
+            "name": rp.name, "kind": "review", "angle": angle,
+            "status": status_str(&rp.status), "pane_id": pane,
+        }));
+    }
+    let mut nodes = Vec::new();
+    for ph in &run.phases {
+        let Some(pane) = &ph.pane_id else { continue };
+        let task_key = ph.name.strip_prefix("implement-").unwrap_or("");
+        let children = reviews_by_task.remove(task_key).unwrap_or_default();
+        nodes.push(serde_json::json!({
+            "name": ph.name, "kind": "phase",
+            "status": status_str(&ph.status), "pane_id": pane, "children": children,
+        }));
+    }
+    for (task, revs) in reviews_by_task {
+        nodes.push(serde_json::json!({
+            "name": format!("reviews: {task}"), "kind": "group",
+            "status": "", "pane_id": serde_json::Value::Null, "children": revs,
+        }));
+    }
+    serde_json::json!({ "workspace": run.workspace, "nodes": nodes })
 }
 
 /// `GET /api/runs/<run>/review/diff?task=<task>`: unified `git diff
@@ -855,6 +938,79 @@ fn live_server_addr() -> Option<String> {
         .map(|_| addr)
 }
 
+/// `POST /api/runs` — create a run and start its brainstorm agent, so a fresh
+/// drovr session can be launched (and then watched/driven) from the browser.
+/// Body: `{ "name": "<run>", "task"?: "<text>", "dir"?: "<project dir>" }`.
+/// Runs `drovr new` then `drovr phase start <run> brainstorm` via this same
+/// binary, synchronously (both return quickly — `phase start` only spawns).
+fn handle_post_new_run(mut req: Request) {
+    let body = read_body(&mut req);
+    let incoming: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            respond_str(req, 400, "text/plain", "invalid JSON".into());
+            return;
+        }
+    };
+    let name = incoming["name"].as_str().unwrap_or("").trim().to_string();
+    if !safe_component(&name) {
+        respond_str(req, 400, "text/plain", "invalid or missing run name".into());
+        return;
+    }
+    let task = incoming["task"].as_str().unwrap_or("").to_string();
+    let dir = incoming["dir"].as_str().unwrap_or("").to_string();
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            respond_str(req, 500, "text/plain", format!("cannot resolve drovr binary: {e}"));
+            return;
+        }
+    };
+
+    let mut new_args = vec!["new".to_string(), name.clone()];
+    if !task.is_empty() {
+        new_args.push("--task".into());
+        new_args.push(task);
+    }
+    if !dir.is_empty() {
+        new_args.push("--dir".into());
+        new_args.push(dir);
+    }
+    match Command::new(&exe).args(&new_args).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": err }).to_string(),
+            );
+            return;
+        }
+        Err(e) => {
+            respond_str(req, 500, "text/plain", format!("failed to run drovr new: {e}"));
+            return;
+        }
+    }
+
+    // Best-effort: start the brainstorm agent so the run has a live session to
+    // inspect. A failure here still leaves a created run the caller can drive.
+    let started = Command::new(&exe)
+        .args(["phase", "start", &name, "brainstorm"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    respond_str(
+        req,
+        200,
+        "application/json",
+        serde_json::json!({ "ok": true, "name": name, "started": started }).to_string(),
+    );
+}
+
 /// Spawn `drovr serve` detached, so it outlives the invoking CLI process.
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
@@ -1125,6 +1281,99 @@ mod tests {
         // Neither → None.
         run.root_pane = None;
         assert_eq!(active_pane(&run), None);
+    }
+
+    // A RunState with the given phases / review phases; other fields are inert.
+    fn tree_run(phases: Vec<crate::run::Phase>, reviews: Vec<crate::run::Phase>) -> RunState {
+        RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: Some("claude".into()),
+            phases,
+            review_phases: reviews,
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+        }
+    }
+
+    fn ph(name: &str, status: crate::run::PhaseStatus, pane: Option<&str>) -> crate::run::Phase {
+        crate::run::Phase {
+            name: name.into(),
+            status,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: pane.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn agent_tree_nests_reviews_under_tasks() {
+        use crate::run::PhaseStatus::*;
+        let run = tree_run(
+            vec![
+                ph("brainstorm", Done, Some("w:p1")),
+                ph("implement", Pending, None), // unstarted placeholder → omitted
+                ph("implement-task-1", Running, Some("w:p3")),
+            ],
+            vec![
+                ph("review:task-1:1:correctness", Running, Some("w:p4")),
+                ph("review:task-1:1:security", Done, Some("w:p5")),
+            ],
+        );
+        let tree = build_agent_tree(&run);
+        assert_eq!(tree["workspace"], "w");
+        let nodes = tree["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "placeholder omitted: {tree}");
+        assert_eq!(nodes[0]["name"], "brainstorm");
+        assert_eq!(nodes[0]["children"].as_array().unwrap().len(), 0);
+        let task1 = &nodes[1];
+        assert_eq!(task1["name"], "implement-task-1");
+        assert_eq!(task1["pane_id"], "w:p3");
+        let reviews = task1["children"].as_array().unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0]["kind"], "review");
+        assert_eq!(reviews[0]["angle"], "correctness");
+        assert_eq!(reviews[0]["pane_id"], "w:p4");
+    }
+
+    #[test]
+    fn resolve_pane_gates_foreign_panes() {
+        use crate::run::PhaseStatus::Running;
+        let run = tree_run(
+            vec![ph("brainstorm", Running, Some("w:p1")), ph("implement-task-1", Running, Some("w:p3"))],
+            vec![],
+        );
+        // Explicit pane belonging to the run is honored.
+        assert_eq!(resolve_pane(&run, "/x?pane=w:p3").as_deref(), Some("w:p3"));
+        // The root pane is in the allow-list.
+        assert_eq!(resolve_pane(&run, "/x?pane=w:root").as_deref(), Some("w:root"));
+        // A pane outside the run is rejected (no silent fallback).
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99"), None);
+        // No param → active_pane (first Running phase).
+        assert_eq!(resolve_pane(&run, "/x").as_deref(), Some("w:p1"));
+    }
+
+    #[test]
+    fn post_new_run_rejects_bad_input() {
+        // The reject paths short-circuit before spawning `drovr new`, so they are
+        // safe to exercise in-process (the happy path shells out and is covered
+        // by manual/e2e testing).
+        let tmp = make_root("newrun");
+        let addr = start_server(tmp.path().to_path_buf());
+        // Missing name.
+        let (s, _) = http_post(&addr, "/api/runs", "application/json", r#"{"task":"x"}"#);
+        assert_eq!(s, 400);
+        // Path-traversal name.
+        let (s, _) = http_post(&addr, "/api/runs", "application/json", r#"{"name":"../evil"}"#);
+        assert_eq!(s, 400);
+        // Malformed JSON.
+        let (s, _) = http_post(&addr, "/api/runs", "application/json", "not json");
+        assert_eq!(s, 400);
     }
 
     #[test]
