@@ -619,7 +619,9 @@
   .run-row.is-complete .run-dot.state-cancelled { background: #7d4340; }
   .run-check { color: #3ec46d; font-weight: 700; }
 
-  .run-group { border-top: 1px solid var(--border, #2a2a2a); }
+  /* .run-group deliberately has no border-top: the last active row above still
+     carries its own border-bottom (it is not `:last-child` of #run-list-items —
+     this <details> is), and stacking both drew a doubled line. */
   .run-group > summary {
     list-style: none;
     cursor: pointer;
@@ -1951,8 +1953,20 @@ var completedOpen = (function() {
 // dot, and their meta reports phase progress rather than the gate state — for a
 // finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
 function runRow(run) {
+  // Archived AND still live: the server archives even when closing the workspace
+  // failed, so this row is filed away while its agent keeps running. Say so —
+  // otherwise it renders identically to a cleanly-closed run and the panes leak
+  // unnoticed. Declared here, before first use: `var` hoists the declaration but
+  // not the value.
+  var zombie = run.archived && run.live === true;
   var meta;
-  if (run.complete) {
+  if (zombie) {
+    // Checked before the complete/active split: archiving is allowed at any
+    // phase, so an archived-but-still-live run is just as likely to be
+    // incomplete — and that is the more alarming case, since an agent is
+    // actively running inside panes we believe we closed.
+    meta = 'archived · panes still live';
+  } else if (run.complete) {
     if (run.state === 'cancelled') meta = 'cancelled';
     else if (run.archived) meta = 'archived · ' + run.done + '/' + run.total;
     else meta = 'complete · ' + run.done + '/' + run.total;
@@ -1960,7 +1974,9 @@ function runRow(run) {
     meta = (run.state || '') + (run.turn ? ' · turn ' + run.turn : '');
     if (run.total) meta += ' · ' + run.done + '/' + run.total;
   }
-  var dot = run.complete && run.state !== 'cancelled'
+  var dot = zombie
+    ? '<span class="run-dot state-ready" title="archived, but its workspace is still open"></span>'
+    : run.complete && run.state !== 'cancelled'
     ? '<span class="run-check">✓</span>'
     : '<span class="run-dot state-' + escHtml(run.state) + '"></span>';
   // `live` is true / false / null, and null means "herdr could not be asked".
@@ -1969,7 +1985,7 @@ function runRow(run) {
   var maybeLive = run.live !== false;
   var label = run.archived ? 'Restore' : 'Archive';
   var title = run.archived
-    ? 'Clear the archived flag. Panes are not reopened — resume with drovr phase start.'
+    ? 'Move it back to the active list. Does NOT bring the agent back: the workspace is closed and drovr phase start cannot recreate it.'
     : (maybeLive
         ? (run.live === null
             ? 'Archive — could not reach herdr to check for live panes; will confirm first'

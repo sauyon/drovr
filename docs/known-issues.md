@@ -562,7 +562,14 @@ below also closes this case.
 
 ### Symptom
 
-`cmd_cleanup` (`cli/src/main.rs`) now writes `state.json` to set `archived: true`. `RunState::save`
+Two writers now do load-modify-save on `state.json` without locking. `cmd_cleanup`
+(`cli/src/main.rs`) sets `archived: true`; so does `handle_archive`
+(`cli/src/review.rs`), the review server's archive endpoint. The endpoint's window is the
+more reachable of the two: the server is multi-threaded and the endpoint is a button a human
+can press mid-phase, whereas `cleanup` is a one-shot command. Both re-read immediately before
+writing to narrow the window; neither closes it.
+
+`cmd_cleanup` (`cli/src/main.rs`) writes `state.json` to set `archived: true`. `RunState::save`
 (`cli/src/run.rs`) is a whole-file `fs::write` with no locking, no read-modify-write and no
 version check, so a `drovr phase ...` running in a still-live pane can have its status write
 silently reverted.
@@ -593,6 +600,30 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
+## Restoring an archived run does not make it runnable again
+
+**Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
+expectation.
+**Found:** 2026-07-25, re-reviewing the archive button.
+
+`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — clears the flag
+and moves the row back to the active list. It cannot bring the agent back: archiving closed
+the run's herdr workspace, and nothing recreates one. `phase_start` (`cli/src/phase.rs`) only
+reuses a recorded `pane_id`, then `root_pane`, then `tab_create` against the run's existing
+`workspace` id; all three are dead after a close, and the only code that creates a workspace
+is `cmd_new`. So `drovr phase start` on a restored run fails.
+
+The run's artifacts survive (spec, handoffs, branch), so the work is not lost — but continuing
+it means a new run seeded from the handoff, not a restore.
+
+### Fix ideas
+
+1. Have `phase_start` create a fresh workspace when the recorded one is gone, and write the new
+   id back to `state.json` — makes Restore mean what it looks like it means.
+2. Or rename the control to something that does not imply resumability, and have it clear
+   `workspace`/`root_pane`/`pane_id` so the failure is a clean "no workspace" error rather than
+   a herdr rejection.
+
 ## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
 
 **Severity:** low on loopback, medium once `serve_host` leaves it.
@@ -600,8 +631,10 @@ run-to-completion path only.
 
 ### What IS guarded
 
-`handle` refuses any `POST` whose `Origin` is cross-origin or opaque (`origin_allowed`,
-`cli/src/review.rs`). That closes the drive-by case: a page the user happens to visit can no
+`handle` refuses any `POST` whose `Host` is not an address this server actually bound, and
+then any whose `Origin` is cross-origin or opaque (`write_allowed`, `cli/src/review.rs`). The
+`Host` check is the load-bearing one: comparing `Origin` to `Host` alone is defeated by DNS
+rebinding, since a browser derives both from the same attacker-controlled URL. That closes the drive-by case: a page the user happens to visit can no
 longer make their browser POST `/api/runs/<run>/archive` and close a live herdr workspace,
 nor `/send` into a live pane, nor `/submit` a spec decision. Browsers always attach `Origin`
 on a cross-origin request and script cannot suppress it; curl and drovr's own CLI send none

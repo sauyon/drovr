@@ -201,14 +201,31 @@ impl RunPaths {
 struct Ctx {
     runs_root: PathBuf,
     cells: Mutex<HashMap<String, Arc<Mutex<ReviewState>>>>,
+    /// `host:port` values this server will answer state-changing requests for.
+    /// Empty means "reject every write" — fail closed, so a construction path
+    /// that forgets to populate it cannot silently disable the guard.
+    allowed_hosts: Vec<String>,
+    /// Set when bound to a wildcard address (`0.0.0.0`/`::`), where the reachable
+    /// addresses cannot be enumerated ahead of time. Then any `Host` that is an
+    /// IP *literal* on this port is accepted. That keeps a LAN/Tailscale reviewer
+    /// working while still defeating rebinding, which fundamentally needs a DNS
+    /// *name* — `evil.example:8791` is not an IP literal and stays refused.
+    wildcard_port: Option<u16>,
 }
 
 impl Ctx {
-    fn new(runs_root: PathBuf) -> Self {
+    fn new(runs_root: PathBuf, allowed_hosts: Vec<String>) -> Self {
         Ctx {
             runs_root,
             cells: Mutex::new(HashMap::new()),
+            allowed_hosts,
+            wildcard_port: None,
         }
+    }
+
+    fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
+        self.wildcard_port = port;
+        self
     }
 
     fn paths(&self, run: &str) -> RunPaths {
@@ -379,21 +396,81 @@ fn header_of(req: &Request, name: &'static str) -> Option<String> {
 
 /// Whether a state-changing request may proceed.
 ///
-/// No `Origin` → not a browser cross-origin request at all (curl, the drovr CLI,
-/// a same-origin form in older browsers): allowed. An `Origin` whose host:port
-/// matches `Host` is this page talking to its own server: allowed. Anything else
-/// — including the opaque `null` origin a sandboxed iframe or a `file://` page
-/// sends — is a cross-origin write and is refused.
-fn origin_allowed(req: &Request) -> bool {
-    let Some(origin) = header_of(req, "Origin") else {
-        return true;
-    };
-    // `null` is what a sandboxed/opaque context sends. It can never legitimately
-    // be this server, and treating it as absent would reopen the hole.
-    let Some(origin_host) = origin.split("://").nth(1) else {
+/// Two checks, and the FIRST is the load-bearing one:
+///
+/// 1. **`Host` must be an address this server actually serves.** Comparing
+///    `Origin` against `Host` alone is not enough, because a browser derives both
+///    from the same URL the page was loaded from — so they agree by construction
+///    even when that URL is the attacker's. That is DNS rebinding: a page served
+///    from `evil.example:8791` whose DNS is then re-pointed at `127.0.0.1` sends
+///    `Origin: http://evil.example:8791` and `Host: evil.example:8791`, matching
+///    each other perfectly while the connection lands here. Checking `Host`
+///    against the addresses we bound breaks that: the forged name is not one of
+///    them. This matters most for `/send` and `/keys`, which type into a live
+///    agent's pane — remote command injection, not a flag flip.
+/// 2. **A present `Origin` must be same-origin.** Catches the ordinary
+///    cross-origin POST. The opaque `null` (sandboxed iframe, `file://` page)
+///    fails this: it can never legitimately be this server.
+///
+/// A missing `Origin` is not a browser cross-origin write at all — curl and
+/// drovr's own CLI send none — so check 1 alone governs those.
+fn write_allowed(req: &Request, allowed_hosts: &[String], wildcard_port: Option<u16>) -> bool {
+    let Some(host) = header_of(req, "Host") else {
         return false;
     };
-    header_of(req, "Host").is_some_and(|host| host == origin_host)
+    let host = host.to_ascii_lowercase();
+    if !allowed_hosts.iter().any(|h| h == &host) && !wildcard_ip_host(&host, wildcard_port) {
+        return false;
+    }
+    match header_of(req, "Origin") {
+        None => true,
+        Some(origin) => origin.split("://").nth(1).is_some_and(|oh| oh == host),
+    }
+}
+
+/// Whether `host` is an IP literal on the wildcard bind's port.
+///
+/// Only reachable when the server bound `0.0.0.0`/`::`, where the set of
+/// addresses a reviewer might legitimately use is not knowable up front. An IP
+/// literal is safe to accept because DNS rebinding needs a *name*: the attacker
+/// controls `evil.example`'s resolution, not the literal `192.168.1.5`, and a
+/// page served from a bare IP has no rebinding lever at all.
+fn wildcard_ip_host(host: &str, wildcard_port: Option<u16>) -> bool {
+    let Some(port) = wildcard_port else {
+        return false;
+    };
+    let Some((h, p)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if p.parse::<u16>() != Ok(port) {
+        return false;
+    }
+    h.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// The `host:port` values a server bound to `host:port` legitimately answers to.
+/// Loopback aliases are included because the reviewer may reach the UI by any of
+/// them; a forged name is excluded precisely because it is not in this list.
+fn allowed_hosts_for(host: &str, port: u16) -> Vec<String> {
+    // Bracket a bare IPv6 literal: browsers send `Host: [::1]:8791`, never `::1:8791`.
+    let display = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut out = vec![format!("{display}:{port}").to_ascii_lowercase()];
+    if host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" || host == "localhost" {
+        for alias in ["127.0.0.1", "localhost", "[::1]"] {
+            let candidate = format!("{alias}:{port}").to_ascii_lowercase();
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 fn handle(req: Request, ctx: &Arc<Ctx>) {
@@ -412,9 +489,9 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
     // Checking `Origin` is enough and costs nothing: browsers always attach it to
     // a cross-origin request and cannot be talked out of it from script, while
     // curl and drovr's own CLI send no `Origin` at all and are unaffected.
-    if method == Method::Post && !origin_allowed(&req) {
-        eprintln!("drovr: refused a cross-origin POST to {path}");
-        respond_str(req, 403, "text/plain", "cross-origin write refused".into());
+    if method == Method::Post && !write_allowed(&req, &ctx.allowed_hosts, ctx.wildcard_port) {
+        eprintln!("drovr: refused an untrusted POST to {path}");
+        respond_str(req, 403, "text/plain", "untrusted write refused".into());
         return;
     }
 
@@ -682,6 +759,14 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// should do without a git-aware conversation. Panes and the flag are enough to
 /// get a dead run out of the way; `drovr cleanup --purge` remains the way to
 /// reclaim the worktree.
+///
+/// Restore is NOT an undo. It clears the flag and puts the row back in the
+/// active list, but the workspace is gone: `phase_start` only ever reuses a
+/// recorded `pane_id`/`root_pane` or calls `tab_create` against the run's
+/// existing `workspace` id, and nothing anywhere recreates a closed workspace
+/// (only `drovr new` makes one). So `drovr phase start` on a restored run errors
+/// out. Restore is for undoing a misclick before you rely on the run, not for
+/// resurrecting one. See docs/known-issues.md.
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
 /// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
@@ -1207,7 +1292,22 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     eprintln!("drovr review server listening on http://{bound_addr}");
     eprintln!("  runs: {root:?}");
 
-    let ctx = Arc::new(Ctx::new(root));
+    // Built from the BOUND port, never the requested one: `--port 0` asks the OS
+    // to pick, so `port` is still 0 here while every real request carries the
+    // assigned port. Using the requested value would put `host:0` in the
+    // allowlist and reject every write — locking the user out of their own UI.
+    let bound_port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(port);
+    // A wildcard bind cannot know which address a reviewer will actually use, so
+    // it falls back to "any IP literal on this port" (see `wildcard_ip_host`).
+    // Without this, binding 0.0.0.0 — the whole point of which is reaching the UI
+    // from another machine — serves a readable page whose every button 403s.
+    let wildcard = matches!(host, "0.0.0.0" | "::" | "[::]").then_some(bound_port);
+    let ctx =
+        Arc::new(Ctx::new(root, allowed_hosts_for(host, bound_port)).with_wildcard_port(wildcard));
     let server = Arc::new(server);
 
     let mut handles = Vec::with_capacity(WORKERS);
@@ -1521,7 +1621,8 @@ mod tests {
     fn start_server(runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
-        let ctx = Arc::new(Ctx::new(runs_root));
+        let bound_port = server.server_addr().to_ip().expect("ip addr").port();
+        let ctx = Arc::new(Ctx::new(runs_root, allowed_hosts_for("127.0.0.1", bound_port)));
         let server = Arc::new(server);
         for _ in 0..2 {
             let server = Arc::clone(&server);
@@ -1618,7 +1719,7 @@ mod tests {
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("state.json"), b"{ not json").unwrap();
 
-        let ctx = Arc::new(Ctx::new(tmp.clone()));
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
 
         assert_eq!(row_for(&rows, "finished")["complete"], true);
@@ -1688,6 +1789,34 @@ mod tests {
         assert_eq!(code, 403, "the opaque `null` origin must be refused");
         assert!(!archived());
 
+        // DNS REBINDING: the attacker's page is served from evil.example, whose
+        // DNS is then re-pointed at this server. The browser derives BOTH headers
+        // from that one URL, so Origin == Host and an Origin-vs-Host check waves
+        // it through. Only the Host allowlist stops this.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("http://evil.example"),
+            Some("evil.example"),
+        );
+        assert_eq!(
+            code, 403,
+            "a rebound Host must be refused even though Origin matches it"
+        );
+        assert!(!archived(), "a rebinding attempt must not archive the run");
+
+        // Same, with no Origin — the shape a plain cross-site <form> POST takes.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            None,
+            Some("evil.example"),
+        );
+        assert_eq!(code, 403, "an unknown Host is refused with or without Origin");
+        assert!(!archived());
+
         // drovr's own UI: Origin matches Host.
         let (code, _) = http_post_origin(
             &addr,
@@ -1709,6 +1838,37 @@ mod tests {
         assert!(!archived());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn allowed_hosts_cover_the_ways_a_reviewer_actually_reaches_the_ui() {
+        // Loopback: all three spellings work, because the reviewer may use any.
+        let lo = allowed_hosts_for("127.0.0.1", 8791);
+        for expected in ["127.0.0.1:8791", "localhost:8791", "[::1]:8791"] {
+            assert!(lo.contains(&expected.to_string()), "missing {expected} in {lo:?}");
+        }
+        // A bare IPv6 literal must be bracketed — browsers send `Host: [::1]:80`.
+        assert!(allowed_hosts_for("::1", 8791).contains(&"[::1]:8791".to_string()));
+        // A specific non-loopback bind allows exactly itself.
+        let tail = allowed_hosts_for("100.71.4.9", 8791);
+        assert_eq!(tail, vec!["100.71.4.9:8791".to_string()]);
+    }
+
+    #[test]
+    fn wildcard_bind_accepts_ip_literals_but_never_a_rebound_name() {
+        // Binding 0.0.0.0 exists to be reached from another machine, so the LAN or
+        // Tailscale address a reviewer types must work...
+        assert!(wildcard_ip_host("192.168.1.5:8791", Some(8791)));
+        assert!(wildcard_ip_host("100.71.4.9:8791", Some(8791)));
+        assert!(wildcard_ip_host("[fd7a::1]:8791", Some(8791)));
+        // ...while a DNS name never does. Rebinding needs a name it controls; an
+        // IP literal gives the attacker no lever, which is what makes this safe.
+        assert!(!wildcard_ip_host("evil.example:8791", Some(8791)));
+        assert!(!wildcard_ip_host("localhost:8791", Some(8791)));
+        // Wrong port, and the non-wildcard case, stay closed.
+        assert!(!wildcard_ip_host("192.168.1.5:9999", Some(8791)));
+        assert!(!wildcard_ip_host("192.168.1.5:8791", None));
+        assert!(!wildcard_ip_host("192.168.1.5", Some(8791)));
     }
 
     #[test]
@@ -1776,7 +1936,7 @@ mod tests {
         mk("dead", Some("wZZ"));
         mk("no-workspace", None);
 
-        let ctx = Arc::new(Ctx::new(tmp.clone()));
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let live = vec!["w1".to_string(), "wAG".to_string()];
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
@@ -1867,7 +2027,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = Arc::new(Ctx::new(tmp.clone()));
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
         assert_eq!(
             row_for(&rows, "abandoned")["complete"],
@@ -1901,11 +2061,25 @@ mod tests {
         body: &str,
         origin: Option<&str>,
     ) -> (u16, String) {
+        http_post_full(addr, path, body, origin, None)
+    }
+
+    /// POST with an overridable `Host` as well as `Origin`. Forging `Host` is how
+    /// a DNS-rebinding request actually looks on the wire, so the guard cannot be
+    /// tested honestly without it. `host: None` sends the real address.
+    fn http_post_full(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+        host: Option<&str>,
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
+        let host_hdr = host.unwrap_or(addr);
         let origin_line = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
         write!(
             stream,
-            "POST {path} HTTP/1.0\r\nHost: {addr}\r\n{origin_line}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.0\r\nHost: {host_hdr}\r\n{origin_line}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -1917,7 +2091,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let rb = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
         (status, rb)
     }
 
@@ -1937,7 +2111,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let rb = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
         (status, rb)
     }
 
