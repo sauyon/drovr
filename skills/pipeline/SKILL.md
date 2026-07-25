@@ -27,7 +27,7 @@ parallel writing agents.
 drovr new <run> --task "<goal>" [--dir <project>]     # cwd is the default project dir
 ```
 
-Then, for each phase, run the `drovr:handoff` five steps, injecting the matching template
+Then, for each phase, run the `drovr:handoff` four steps, injecting the matching template
 from `phase-prompts/` (combined with the prior phase's `drovr collect` output) at step 2.
 
 | # | Phase | Injected template | Output artifact | Gate |
@@ -37,9 +37,9 @@ from `phase-prompts/` (combined with the prior phase's `drovr collect` output) a
 | 3 | implement | `phase-prompts/implement-task.md` per task | `task<N>-report.md` | auto |
 | 4 | review | `phase-prompts/review.md` + reports + diff | `verdict.md` | auto |
 
-Compress after every phase so the next one is seeded from the briefing, not a raw
-transcript. `spec.md`, `plan.md`, reports, and `verdict.md` all live in the run dir
-`~/.local/share/drovr/runs/<run>/`.
+Each finishing phase agent authors its own handoff before `drovr phase done`, so the next
+phase is seeded from that briefing, not a raw transcript. `spec.md`, `plan.md`, reports, and
+`verdict.md` all live in the run dir `~/.local/share/drovr/runs/<run>/`.
 
 ## The spec gate (after brainstorm only)
 

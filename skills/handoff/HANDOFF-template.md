@@ -1,12 +1,9 @@
 <!--
   Contract for `<phase>-HANDOFF.md` — the doc the finishing phase agent authors (as its
   final action, before `drovr phase done`) and `drovr collect` reads. These seven sections
-  and headings are fixed; they mirror the authoring instructions the phase agent is given
-  (cli/assets/compress-prompt.md). Use this file to understand what each section is FOR —
-  when authoring your handoff, or when reviewing one.
-
-  Rule of thumb: never drop a decision or an interface to save space — drop narration
-  instead. Pointers, not pasted content.
+  and headings are fixed. This file IS the authoring contract: read it when authoring your
+  own handoff, or when reviewing one. Nothing compresses the handoff for you — you, the
+  finishing agent, hold the whole session and write it yourself.
 -->
 
 ## Objective
@@ -37,3 +34,16 @@ agent re-reads source on demand. This is what keeps each phase's context small. 
 MUST include git references — the branch and the commit range/SHAs that carry this phase's
 work — so the next agent reads `git log`/`git diff` to reconstruct state from history, not
 just trust this summary. Git is the durable cross-check against lossy compression.
+
+## Authoring rules
+
+- **Compress hard.** Drop process narration, tool logs, retries, restated instructions, and
+  anything the next agent can re-read from an artifact pointer.
+- **Never drop a decision or an interface** to save space — drop narration instead.
+- **Preserve exact identifiers** (function names, flags, file paths, config keys, versions).
+- **Report your own dead-ends honestly.** "Tried X, it failed because Y — don't retry" is
+  load-bearing for the next phase. You are summarizing your OWN work, so resist the pull to
+  launder your mistakes out; the git pointers make omissions catchable anyway.
+- **If the phase failed or is incomplete, say so plainly** in State and Next step.
+- **Do not invent facts** not present in your context. If something is unknown, say so.
+- **Pointers, not pasted content** — the successor re-reads source on demand.

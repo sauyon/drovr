@@ -400,7 +400,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
             .unwrap_or(false);
         if !non_empty {
             return Err(io::Error::new(
-                io::ErrorKind::NotFound,
+                io::ErrorKind::InvalidInput,
                 format!(
                     "phase '{phase}' cannot signal done: its handoff {} is missing or empty. \
                      As your final action, author {phase}-HANDOFF.md (the 7-section handoff, \
@@ -1378,6 +1378,10 @@ mod tests {
         assert!(
             phase_done(&run, "plan").is_err(),
             "an empty/whitespace handoff must be rejected"
+        );
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "no marker may be written when the handoff is empty"
         );
     }
 

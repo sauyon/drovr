@@ -131,4 +131,4 @@ briefing is worse than a stopped run.
 | Expecting a separate compress step | There isn't one. The finishing agent authors the handoff itself, as its final action, before `phase done`. |
 | `phase done` failing "handoff missing" | The agent must author `<phase>-HANDOFF.md` *before* running `phase done`; the marker won't drop without it. |
 | Pasting file contents into the handoff | Use artifact pointers (paths + git refs); the successor re-reads. |
-| Hardcoding `<phase>-HANDOFF.md` elsewhere | Read it via `drovr collect`. |
+| Hardcoding `<phase>-HANDOFF.md` elsewhere | Read it via `drovr collect`; the finishing agent writes it directly (no CLI command authors it). |
