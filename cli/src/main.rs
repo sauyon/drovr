@@ -4,6 +4,7 @@ mod config;
 mod findings;
 mod herdr;
 mod phase;
+mod reflex;
 mod review;
 mod run;
 mod worktree;
@@ -107,6 +108,17 @@ enum Commands {
     CodeReview {
         #[command(subcommand)]
         sub: CodeReviewCmd,
+    },
+
+    /// Emit the SessionStart reflex context as Claude Code hook JSON.
+    ///
+    /// Run by the `session-start` hook. Reads `--skill`, shapes it per the
+    /// `[reflex]` config (master switch, preamble override, section toggles),
+    /// and prints the hook JSON — or nothing when the reflex is disabled.
+    Reflex {
+        /// Path to the router skill markdown to inject.
+        #[arg(long)]
+        skill: PathBuf,
     },
 }
 
@@ -1003,6 +1015,28 @@ fn cmd_code_review(sub: CodeReviewCmd) {
     }
 }
 
+/// Emit the SessionStart reflex context, or nothing when the reflex is disabled.
+///
+/// The `DROVR_PHASE` phase-suppression lives in the bash hook (it gates before
+/// this runs). Here we honor the config master switch and, when enabled, read
+/// the skill file — failing loudly on a read error rather than injecting a
+/// poisoned or partial context.
+fn cmd_reflex(skill: &std::path::Path) {
+    let cfg = config::load_config().unwrap_or_else(|e| {
+        eprintln!("drovr: failed to load config: {e}");
+        process::exit(1);
+    });
+    let skill_md = std::fs::read_to_string(skill).unwrap_or_else(|e| {
+        eprintln!("drovr: cannot read reflex skill {}: {e}", skill.display());
+        process::exit(1);
+    });
+    // `reflex_json` is the single authority on the `enabled` switch: it returns
+    // `None` (emit nothing) when the reflex is disabled, `Some(json)` otherwise.
+    if let Some(json) = reflex::reflex_json(&skill_md, &cfg.reflex) {
+        println!("{json}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1030,6 +1064,7 @@ fn main() {
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
+        Commands::Reflex { skill } => cmd_reflex(&skill),
     }
 }
 
@@ -1400,6 +1435,23 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn parse_reflex() {
+        let cli = parse(&["drovr", "reflex", "--skill", "/p/SKILL.md"]).unwrap();
+        match cli.command {
+            Commands::Reflex { skill } => {
+                assert_eq!(skill, std::path::PathBuf::from("/p/SKILL.md"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_reflex_requires_skill() {
+        // `--skill` is mandatory: the hook must always name the source markdown.
+        assert!(parse(&["drovr", "reflex"]).is_err());
     }
 
     #[test]

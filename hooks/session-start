@@ -5,10 +5,16 @@
 # `drovr:using-drovr` router skill so the agent's default operating mode is
 # drovr's single-writer, clean-context discipline.
 #
+# This hook is deliberately thin: it resolves the skill path and delegates
+# rendering to `drovr reflex`, which shapes the reflex per the user's `[reflex]`
+# config (master switch, preamble override, per-section toggles) and emits the
+# SessionStart hook JSON. Keeping the config-driven logic in the CLI keeps it
+# unit-testable and unifies configuration with the rest of drovr's config.toml.
+#
 # Suppression contract: drovr spawns each phase agent with DROVR_PHASE set (see
 # `drovr phase start`). Inside such a phase the agent runs purely on its
 # injected handoff, so re-deriving the discipline would fight that contract —
-# when DROVR_PHASE is set and non-empty we no-op.
+# when DROVR_PHASE is set and non-empty we no-op before spawning anything.
 
 set -euo pipefail
 
@@ -26,29 +32,12 @@ else
   PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 
-# Read the router skill content. A failed read must fail loudly (set -e exits
-# non-zero) rather than inject a poisoned context — never fold cat's stderr into
-# the payload, and never substitute an error string that still looks like a skill.
 skill_path="${PLUGIN_ROOT}/skills/using-drovr/SKILL.md"
-using_drovr_content=$(cat "$skill_path")
 
-# Escape a string for JSON embedding using bash parameter substitution. Each
-# ${s//old/new} is a single C-level pass — far faster than a char-by-char loop.
-escape_for_json() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
-
-using_drovr_escaped=$(escape_for_json "$using_drovr_content")
-session_context="<EXTREMELY_IMPORTANT>\nYou are running drovr — a single-writer, clean-context working discipline. It is your default operating mode.\n\n**Below is the full content of your 'drovr:using-drovr' skill — the router that picks the right methodology for the task in front of you and tells you when to escalate into a fresh phase. For all other skills, use the 'Skill' tool:**\n\n${using_drovr_escaped}\n</EXTREMELY_IMPORTANT>"
-
-# Emit context injection as the JSON shape Claude Code consumes for SessionStart.
-# printf (not a heredoc) avoids the bash 5.3+ heredoc hang.
-printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
-
-exit 0
+# 3. Delegate to the drovr CLI. It reads the skill, applies `[reflex]` config,
+#    and prints the hook JSON (or nothing when the reflex is disabled). $DROVR_BIN
+#    overrides the binary — tests point it at the freshly built binary; in a real
+#    session `drovr` is on PATH. `exec` hands drovr's stdout and exit status to
+#    Claude Code directly, so a missing binary or an unreadable skill fails loudly
+#    (non-zero) rather than injecting a poisoned or partial context.
+exec "${DROVR_BIN:-drovr}" reflex --skill "$skill_path"
