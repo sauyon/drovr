@@ -38,7 +38,20 @@ A review server renders `spec.md` in a browser for the reviewer. The loop:
 - Repeat until the reviewer approves. You only edit the markdown — the server owns rendering
   and diffing, so write clean Markdown and let it render.
 - (Optional) To ask the reviewer multiple-choice questions, write
-  `~/.local/share/drovr/runs/<run>/questions.json`.
+  `~/.local/share/drovr/runs/<run>/questions.json`. It MUST be a **bare JSON array**
+  (not an object) of `{"id", "prompt", "options":[{"value","label","recommended"?}]}` —
+  `prompt` (not `question`), and each option an OBJECT (not a string). Example:
+  ```json
+  [
+    {"id": "q1", "prompt": "Which storage backend?",
+     "options": [
+       {"value": "s3",    "label": "S3 (recommended)", "recommended": true},
+       {"value": "local", "label": "Local disk"}
+     ]}
+  ]
+  ```
+  The wrong shape (object-wrapped, or string options) makes the review UI's Submit button
+  silently fail — don't guess the schema.
 
 ## Done when
 
