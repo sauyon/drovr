@@ -99,7 +99,7 @@ escalation    = true   # the phases / handoff escalation contract
 
 | Command | Description |
 |---|---|
-| `drovr new <name> [--task <text>]` | Create a new run with 4 seeded phases. Requires the herdr claude integration. |
+| `drovr new <name> [--task <text>]` | Create a new run with 4 seeded phases. Requires the herdr claude integration. Isolates the run in a git worktree (`.drovr/wt/<run>` on branch `drovr/<run>`) **by default** — pass `--no-worktree` to edit the launch checkout in place, or set `worktree = false` in config. |
 | `drovr list` | List all runs with phase progress and current phase. |
 | `drovr status <name>` | Print each phase, its status, and the resume point. |
 | `drovr attach <name>` | Attach to the current phase's agent pane. |

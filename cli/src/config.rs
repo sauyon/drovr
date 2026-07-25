@@ -81,9 +81,11 @@ pub struct Config {
     pub serve_host: String,
     /// When true, `drovr new` isolates each run in a git worktree
     /// (`.drovr/wt/<run>` on branch `drovr/<run>`) unless `--no-worktree` is
-    /// passed. `--worktree` overrides this to on per-run. Bare `#[serde(default)]`
-    /// is correct here: `bool::default()` is `false`, the intended off-by-default.
-    #[serde(default)]
+    /// passed. `--worktree` overrides this to on per-run. **On by default** —
+    /// isolation keeps a run's edits off the checkout you launched it from, so
+    /// `default_true` (not a bare `#[serde(default)]`, which would yield `false`
+    /// whenever a config file omits the key).
+    #[serde(default = "default_true")]
     pub worktree: bool,
     /// SessionStart reflex configuration (see [`ReflexConfig`]).
     #[serde(default)]
@@ -216,7 +218,7 @@ impl Default for Config {
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
-            worktree: false,
+            worktree: default_true(),
             reflex: ReflexConfig::default(),
             agents: default_agents(),
         }
@@ -538,6 +540,28 @@ readonly_flag = "--sandbox read-only"
             cfg.reviewer_launch(Some("claude")).unwrap(),
             "claude --permission-mode plan"
         );
+    }
+
+    #[test]
+    fn worktree_isolation_defaults_on() {
+        // On by default in both paths: no config file (Config::default) and a
+        // config file that omits the key (serde default).
+        assert!(Config::default().worktree, "Config::default should isolate");
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "default_agent = \"claude\"\n").unwrap();
+        set_config_home(tmp.path());
+        assert!(
+            load_config().unwrap().worktree,
+            "a config omitting `worktree` should still isolate"
+        );
+
+        // Explicit opt-out is honored.
+        std::fs::write(dir.join("config.toml"), "worktree = false\n").unwrap();
+        assert!(!load_config().unwrap().worktree, "worktree = false must win");
     }
 
     #[test]
