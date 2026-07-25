@@ -335,3 +335,167 @@ fn e2e_smoke() {
 
     println!("e2e: all assertions passed");
 }
+
+/// End-to-end worktree isolation lifecycle through the real CLI:
+/// `drovr new --worktree` in a git repo → worktree + branch created and recorded;
+/// non-purge `cleanup` commits the run's work to the branch and prunes the
+/// worktree while keeping the branch; `--purge` then deletes the branch.
+///
+/// Gated identically to `e2e_smoke` (herdr + claude + integration), since
+/// `drovr new` creates a herdr workspace.
+#[test]
+fn e2e_worktree_lifecycle() {
+    if !binary_on_path("herdr") {
+        println!("skipping e2e worktree: `herdr` not found on PATH");
+        return;
+    }
+    if !binary_on_path("claude") {
+        println!("skipping e2e worktree: `claude` not found on PATH");
+        return;
+    }
+    if !herdr_integration_installed() {
+        println!("skipping e2e worktree: herdr claude integration not installed");
+        return;
+    }
+
+    let tmp = tempfile::Builder::new()
+        .prefix("drovr-e2e-wt-")
+        .tempdir()
+        .expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    // Seed a git repo with one commit.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.t"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.join("f.txt"), "hi").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let drovr = drovr_binary();
+    let base_cmd = || {
+        let mut c = Command::new(&drovr);
+        c.env("XDG_DATA_HOME", &xdg);
+        c.env("DROVR_AGENT", "claude");
+        c
+    };
+
+    // Create a --worktree run and assert the worktree/branch/state are recorded.
+    // Returns the worktree dir and the run dir. Independent run names keep the two
+    // scenarios (keep-branch vs. --purge) from colliding on branch `drovr/<name>`.
+    let make_run = |name: &str| -> (PathBuf, PathBuf) {
+        let out = base_cmd()
+            .args(["new", name, "--task", "isolate me", "--worktree"])
+            .arg("--dir")
+            .arg(&repo)
+            .output()
+            .expect("drovr new --worktree");
+        assert!(
+            out.status.success(),
+            "drovr new --worktree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_dir = repo.join(".drovr/wt").join(name);
+        let run_dir = xdg.join("drovr/runs").join(name);
+        assert!(wt_dir.exists(), "worktree dir not created at {wt_dir:?}");
+        assert!(
+            wt_dir.join("f.txt").exists(),
+            "worktree must check out HEAD"
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["worktree_branch"], format!("drovr/{name}"));
+        // project_dir was redirected into the worktree.
+        assert_eq!(state["project_dir"], state["worktree_path"]);
+        let excl = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert!(
+            excl.lines().any(|l| l.trim() == ".drovr/wt/"),
+            "exclude: {excl}"
+        );
+        // Simulate phase output landing in the worktree.
+        fs::write(wt_dir.join("phase-output.txt"), "work from the run").unwrap();
+        (wt_dir, run_dir)
+    };
+
+    // ---- Scenario A: non-purge cleanup commits work, prunes wt, keeps branch
+    let (wt_a, run_a) = make_run("e2e-wt-keep");
+    let out = base_cmd()
+        .args(["cleanup", "e2e-wt-keep"])
+        .output()
+        .expect("cleanup");
+    assert!(
+        out.status.success(),
+        "drovr cleanup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt_a.exists(), "worktree must be pruned on cleanup");
+    let branches = git(&["branch", "--list", "drovr/e2e-wt-keep"]);
+    assert!(
+        branches.contains("drovr/e2e-wt-keep"),
+        "branch must survive cleanup"
+    );
+    let show = git(&["show", "--stat", "drovr/e2e-wt-keep"]);
+    assert!(
+        show.contains("phase-output.txt"),
+        "branch tip must carry the committed run work: {show}"
+    );
+    assert!(run_a.exists(), "non-purge cleanup keeps the run dir");
+    println!("e2e worktree: non-purge OK — work committed, worktree pruned, branch kept");
+
+    // ---- Scenario B: --purge removes worktree, branch, and run dir ---------
+    let (wt_b, run_b) = make_run("e2e-wt-purge");
+    let out = base_cmd()
+        .args(["cleanup", "e2e-wt-purge", "--purge"])
+        .output()
+        .expect("cleanup --purge");
+    assert!(
+        out.status.success(),
+        "drovr cleanup --purge failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt_b.exists(), "--purge must remove the worktree");
+    let branches = git(&["branch", "--list", "drovr/e2e-wt-purge"]);
+    assert!(
+        branches.is_empty(),
+        "--purge must delete the branch: {branches}"
+    );
+    assert!(!run_b.exists(), "--purge removes the run dir");
+    println!("e2e worktree: non-purge + purge scenarios OK");
+
+    // ---- Scenario C: worktree manually deleted → --purge still completes ----
+    // Regression for the review finding: a vanished worktree must not wedge the
+    // run. --purge should tolerate the missing worktree and still remove the run
+    // dir instead of aborting on a git error.
+    let (wt_c, run_c) = make_run("e2e-wt-gone");
+    std::fs::remove_dir_all(&wt_c).expect("simulate manual worktree deletion");
+    let out = base_cmd()
+        .args(["cleanup", "e2e-wt-gone", "--purge"])
+        .output()
+        .expect("cleanup --purge on vanished worktree");
+    assert!(
+        out.status.success(),
+        "cleanup --purge must tolerate a vanished worktree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !run_c.exists(),
+        "--purge removes the run dir even when worktree is gone"
+    );
+    println!("e2e worktree: all assertions passed");
+}

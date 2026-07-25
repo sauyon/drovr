@@ -36,6 +36,36 @@ pub struct AgentSpec {
     pub print_args: Option<Vec<String>>,
 }
 
+/// Controls the SessionStart reflex the `session-start` hook injects (see
+/// `drovr reflex`). All fields are optional; an absent `[reflex]` table yields
+/// the built-in reflex unchanged.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ReflexConfig {
+    /// Master switch. `false` suppresses the reflex entirely for human sessions
+    /// (the `DROVR_PHASE` phase-suppression is separate and always applies).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Overrides the framing text placed before the skill body inside the
+    /// `<EXTREMELY_IMPORTANT>` wrapper. Absent → the built-in framing.
+    #[serde(default)]
+    pub preamble: Option<String>,
+    /// Per-section overrides keyed by the section name tagged in the skill
+    /// markdown (`<!-- reflex:section:NAME -->`). A section absent from this map
+    /// defaults to enabled; `NAME = false` omits that section from the reflex.
+    #[serde(default)]
+    pub sections: BTreeMap<String, bool>,
+}
+
+impl Default for ReflexConfig {
+    fn default() -> Self {
+        ReflexConfig {
+            enabled: true,
+            preamble: None,
+            sections: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
     #[serde(default = "default_agent")]
@@ -49,6 +79,15 @@ pub struct Config {
     /// Default host/address `drovr serve` binds to when `--host` is omitted.
     #[serde(default = "default_serve_host")]
     pub serve_host: String,
+    /// When true, `drovr new` isolates each run in a git worktree
+    /// (`.drovr/wt/<run>` on branch `drovr/<run>`) unless `--no-worktree` is
+    /// passed. `--worktree` overrides this to on per-run. Bare `#[serde(default)]`
+    /// is correct here: `bool::default()` is `false`, the intended off-by-default.
+    #[serde(default)]
+    pub worktree: bool,
+    /// SessionStart reflex configuration (see [`ReflexConfig`]).
+    #[serde(default)]
+    pub reflex: ReflexConfig,
     #[serde(default = "default_agents")]
     pub agents: BTreeMap<String, AgentSpec>,
 }
@@ -65,6 +104,13 @@ fn default_agent() -> String {
 
 fn default_serve_host() -> String {
     "127.0.0.1".into()
+}
+
+// Named `true` default for `ReflexConfig::enabled`: a bare `#[serde(default)]`
+// on a bool yields `false`, which would silently disable the reflex whenever a
+// `[reflex]` table is present but omits `enabled`.
+fn default_true() -> bool {
+    true
 }
 
 fn default_angles() -> Vec<String> {
@@ -170,6 +216,8 @@ impl Default for Config {
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
+            reflex: ReflexConfig::default(),
             agents: default_agents(),
         }
     }
@@ -374,6 +422,10 @@ mod tests {
             vec!["correctness", "security", "error-handling", "type-design"]
         );
         assert_eq!(cfg.serve_host, "127.0.0.1");
+        // Reflex defaults: on, no preamble override, no section overrides.
+        assert!(cfg.reflex.enabled);
+        assert_eq!(cfg.reflex.preamble, None);
+        assert!(cfg.reflex.sections.is_empty());
         assert_eq!(
             cfg.reviewer_launch(None).unwrap(),
             "claude --permission-mode plan"
@@ -502,6 +554,8 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
+            reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -530,6 +584,8 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
+            reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -561,6 +617,8 @@ readonly_flag = "--sandbox read-only"
             review_agent: None,
             angles: default_angles(),
             serve_host: default_serve_host(),
+            worktree: false,
+            reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -579,6 +637,59 @@ readonly_flag = "--sandbox read-only"
             },
         };
         assert!(cfg.reviewer_launch(None).is_err());
+    }
+
+    #[test]
+    fn reflex_config_parses_full_table() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+[reflex]
+enabled = false
+preamble = "Custom framing text."
+
+[reflex.sections]
+always-review = false
+escalation = true
+"#,
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert!(!cfg.reflex.enabled);
+        assert_eq!(cfg.reflex.preamble.as_deref(), Some("Custom framing text."));
+        assert_eq!(cfg.reflex.sections.get("always-review"), Some(&false));
+        assert_eq!(cfg.reflex.sections.get("escalation"), Some(&true));
+        // An unlisted section has no override entry.
+        assert_eq!(cfg.reflex.sections.get("single-writer"), None);
+    }
+
+    #[test]
+    fn reflex_table_present_but_enabled_omitted_defaults_true() {
+        // The bare-`#[serde(default)]`-on-bool trap: an absent `enabled` under a
+        // present `[reflex]` table must fall back to `true`, not `bool::default()`.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[reflex]\npreamble = \"only a preamble here\"\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert!(cfg.reflex.enabled);
+        assert_eq!(
+            cfg.reflex.preamble.as_deref(),
+            Some("only a preamble here")
+        );
     }
 
     #[test]

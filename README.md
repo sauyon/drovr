@@ -66,6 +66,32 @@ command = "agent"
 review_model = "gpt-5.6-terra-medium"
 ```
 
+### Reflex
+
+The `session-start` hook injects the `drovr:using-drovr` router skill as the
+always-on reflex for human-facing sessions (it no-ops inside a drovr-spawned
+phase). The hook delegates rendering to `drovr reflex`, so the reflex is shaped
+by the `[reflex]` table — with no `[reflex]` table the built-in reflex is
+injected unchanged:
+
+```toml
+[reflex]
+# Master switch. false suppresses the reflex entirely for human sessions.
+enabled = true
+# Optional: replace the framing text before the skill body inside the
+# <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing.
+preamble = "You are running drovr. Apply the discipline below."
+
+# Per-discipline toggles, keyed by the section names tagged in the router skill
+# (skills/using-drovr/SKILL.md). A section omitted here stays enabled;
+# set one to false to drop it from the injected reflex.
+[reflex.sections]
+single-writer = true   # the single-writer / read-only-explorers principle
+always-review = true   # the "always review before done" rule
+methodology   = true   # routing to drovr:tdd / systematic-debugging / …
+escalation    = true   # the phases / handoff escalation contract
+```
+
 ## Commands
 
 ### Porcelain
@@ -91,6 +117,7 @@ review_model = "gpt-5.6-terra-medium"
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the running review server, flipping state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
+| `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
 
 ## Run directory and state contracts
 

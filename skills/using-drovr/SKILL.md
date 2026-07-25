@@ -23,15 +23,25 @@ a long one. Everything below serves that.
 
 ## The principle (always)
 
+<!-- reflex:section:single-writer -->
 **Single writer, read-only explorers.** One agent edits at a time. Fan-out
 investigation goes to read-only explorers (e.g. `explore-mcp`), never to parallel
 writers. This holds whether you stay inline or escalate to phases.
+<!-- /reflex:section:single-writer -->
 
+<!-- reflex:section:always-review -->
 **Always review.** Any change you write gets reviewed before you call it done —
 invoke **`drovr:code-review`** (read-only review subagents; they find, you fix).
 This is not optional and not gated on the change's size; it runs whether you
 worked inline or across phases.
+<!-- /reflex:section:always-review -->
 
+**Isolate when it helps.** To keep the invoking checkout clean while a run edits
+the repo, give the run its own git worktree — `drovr new --worktree`. See
+**`drovr:worktrees`** for when to isolate and how the branch is handed back (drovr
+never merges it for you).
+
+<!-- reflex:section:methodology -->
 ## For the task in front of you, apply the right methodology skill
 
 Pick by what you are doing — invoke it via the `Skill` tool before you act:
@@ -41,7 +51,9 @@ Pick by what you are doing — invoke it via the `Skill` tool before you act:
 - About to claim something is done/fixed/passing → **`drovr:verification-before-completion`**.
 - Reviewing an artifact (code, spec, plan) → **`drovr:code-review`**. Per the
   *Always review* rule above, this runs on every change — not only before shipping.
+<!-- /reflex:section:methodology -->
 
+<!-- reflex:section:escalation -->
 ## Escalation contract — inline first
 
 **Default: do the work inline in this session.** Do not reach for phases for a
@@ -78,3 +90,4 @@ never learn the decision and fall back to hand-polling `GET /state` (the anti-pa
 single-writer rule, the run dir at `~/.local/share/drovr/runs/<name>/`, and that
 `drovr phase start` spawns a plain `claude` and does **not** inject the seed
 (injecting the briefing is the skill's job, via `drovr phase send`).
+<!-- /reflex:section:escalation -->

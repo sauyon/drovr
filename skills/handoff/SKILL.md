@@ -66,6 +66,13 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    ```
    drovr phase wait <run> <phase> --timeout-ms 600000
    ```
+   **Block on this in the foreground — do NOT background it.** The phase agent is a separate
+   `claude` running in a herdr pane, invisible to your own harness's task tracking, so nothing
+   auto-blocks you on its work; `drovr phase wait` IS the synchronization primitive that makes
+   the pane agent's progress something you can wait on. Backgrounding the wait defeats its
+   entire purpose — it turns the one blocking call async and lets you wander off while the
+   phase is still running. Run it foreground and let it hold the turn until the phase finishes.
+
    This POLLS the filesystem for the marker the agent drops via `drovr phase done` (step 2's
    final action). It deliberately does NOT watch herdr's agent status: `idle` is not a
    completion signal — it also fires while the agent is parked awaiting its own subagent. Exit
@@ -130,5 +137,6 @@ briefing is worse than a stopped run.
 | Skipping step 2 ("start seeds it") | It doesn't. The fresh agent sits idle until you `phase send`. |
 | Expecting a separate compress step | There isn't one. The finishing agent authors the handoff itself, as its final action, before `phase done`. |
 | `phase done` failing "handoff missing" | The agent must author `<phase>-HANDOFF.md` *before* running `phase done`; the marker won't drop without it. |
+| Backgrounding `drovr phase wait` | Block on it in the foreground — it's the sync primitive; the pane agent's work is invisible to your harness, so nothing else blocks you on it. |
 | Pasting file contents into the handoff | Use artifact pointers (paths + git refs); the successor re-reads. |
 | Hardcoding `<phase>-HANDOFF.md` elsewhere | Read it via `drovr collect`; the finishing agent writes it directly (no CLI command authors it). |

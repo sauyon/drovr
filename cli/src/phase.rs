@@ -808,6 +808,8 @@ mod tests {
             workspace: Some("ws-mk".into()),
             root_pane: Some("root-mk".into()),
             project_dir: "/tmp/drovr-proj-test".into(),
+            worktree_path: None,
+            worktree_branch: None,
         }
     }
 
