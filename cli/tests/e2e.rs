@@ -496,3 +496,93 @@ fn e2e_worktree_lifecycle() {
     );
     println!("e2e worktree: all assertions passed");
 }
+
+// ---------------------------------------------------------------------------
+// The cancel gate, end to end through the real binary
+// ---------------------------------------------------------------------------
+
+/// The signal the driver actually reads: `drovr review wait` must exit **5**
+/// (not 0, and not 1) when the human cancels at the gate. Unlike `e2e_smoke`
+/// this needs no herdr/claude — the run dir is built by hand — so it always
+/// runs.
+#[test]
+fn e2e_cancel_gate_exits_5() {
+    let tmp = tempfile::Builder::new()
+        .prefix("drovr-e2e-cancel-")
+        .tempdir()
+        .expect("tempdir");
+    let xdg = tmp.path().to_path_buf();
+    let run_name = "e2e-cancel";
+    let run_dir = xdg.join("drovr/runs").join(run_name);
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(run_dir.join("spec.md"), b"# Spec").expect("spec");
+    fs::write(
+        run_dir.join("state.json"),
+        format!(
+            r#"{{"name":"{run_name}","task":"t","phases":[],"gate":"spec","cursor":0,"project_dir":""}}"#
+        ),
+    )
+    .expect("state.json");
+
+    let drovr = drovr_binary();
+    assert!(drovr.exists(), "drovr binary missing; run `cargo build`");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let serve_child = Command::new(&drovr)
+        .env("XDG_DATA_HOME", &xdg)
+        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("drovr serve");
+    let _guard = KillOnDrop(serve_child);
+    assert!(
+        poll_state(&addr, run_name, "idle", Duration::from_secs(5)),
+        "serve did not come up at {addr}"
+    );
+
+    // Driver blocks on the gate while the reviewer decides.
+    let mut wait_child = Command::new(&drovr)
+        .env("XDG_DATA_HOME", &xdg)
+        .args(["review", "wait", run_name, "--timeout-ms", "20000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("drovr review wait");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_child.try_wait().expect("try_wait").is_none(),
+        "review wait must still be blocking before any decision"
+    );
+
+    // The human hits Cancel in the browser.
+    let (status, _) = http_post(
+        &addr,
+        &format!("/api/runs/{run_name}/submit"),
+        "application/json",
+        r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#,
+    );
+    assert_eq!(status, 200, "cancel submit rejected");
+
+    let out = wait_child.wait_with_output().expect("wait for review wait");
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "review wait must exit 5 on cancel, got {:?}; stdout={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.to_lowercase().contains("cancel"),
+        "message must name the cancellation: {stdout}"
+    );
+
+    // The marker is on disk, so the outcome survives a server restart.
+    assert!(
+        run_dir.join("cancelled").exists(),
+        "cancelled marker missing from the run dir"
+    );
+    println!("e2e cancel: review wait exited 5 and the marker is on disk");
+}
