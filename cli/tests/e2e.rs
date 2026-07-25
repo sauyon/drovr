@@ -195,11 +195,19 @@ fn e2e_smoke() {
         drovr
     );
 
+    // Point drovr at a throwaway (never-created) herdr socket so `drovr new` /
+    // `drovr cleanup` exercise the graceful no-herdr path instead of creating and
+    // tearing down REAL workspaces on the developer's *live* herdr daemon. Left
+    // un-isolated, each test run churned the user's UI — `workspace.create` → root
+    // shell pane spawns → `workspace.close` → pane exits code 1 → `PaneDied` — which
+    // is exactly the "reader exits 1 in a throwaway workspace" churn we were chasing.
+    let iso_sock = xdg.join("isolated-herdr.sock");
     // Helper: run drovr with our XDG_DATA_HOME set
     let base_cmd = || {
         let mut c = Command::new(&drovr);
         c.env("XDG_DATA_HOME", &xdg);
         c.env("DROVR_AGENT", "claude");
+        c.env("HERDR_SOCKET_PATH", &iso_sock);
         c
     };
 
@@ -239,8 +247,17 @@ fn e2e_smoke() {
         "unexpected phase names: {:?}",
         phase_names
     );
+    // Isolation guard: with the throwaway socket, `drovr new` degrades gracefully and
+    // records NO workspace (the field is `skip_serializing_if = None`, so it is absent
+    // when workspace_create failed). If this ever contains an id, the test just created
+    // a real workspace on a live herdr and churned it — the bug this test now guards.
+    assert!(
+        state.get("workspace").is_none(),
+        "e2e must not create a real herdr workspace (would churn the dev's live herdr); got {:?}",
+        state.get("workspace")
+    );
     println!(
-        "e2e: drovr new OK — state.json exists with {} phases",
+        "e2e: drovr new OK — state.json exists with {} phases, no live workspace",
         phases.len()
     );
 
@@ -386,10 +403,14 @@ fn e2e_worktree_lifecycle() {
     git(&["commit", "-q", "-m", "init"]);
 
     let drovr = drovr_binary();
+    // Throwaway herdr socket — see the note in `e2e_smoke`. Keeps `drovr new
+    // --worktree` from creating/closing real workspaces on the developer's live herdr.
+    let iso_sock = xdg.join("isolated-herdr.sock");
     let base_cmd = || {
         let mut c = Command::new(&drovr);
         c.env("XDG_DATA_HOME", &xdg);
         c.env("DROVR_AGENT", "claude");
+        c.env("HERDR_SOCKET_PATH", &iso_sock);
         c
     };
 
@@ -420,6 +441,12 @@ fn e2e_worktree_lifecycle() {
         assert_eq!(state["worktree_branch"], format!("drovr/{name}"));
         // project_dir was redirected into the worktree.
         assert_eq!(state["project_dir"], state["worktree_path"]);
+        // Isolation guard: no real herdr workspace created (throwaway socket).
+        assert!(
+            state.get("workspace").is_none(),
+            "e2e worktree must not create a real herdr workspace: {:?}",
+            state.get("workspace")
+        );
         let excl = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert!(
             excl.lines().any(|l| l.trim() == ".drovr/wt/"),
