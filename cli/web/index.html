@@ -903,7 +903,7 @@
     <div id="diff-content" class="diff-content md-content"></div>
   </div>
 
-  <div id="doc-panel" class="panel">
+  <div id="doc-panel" style="display:none" class="panel">
     <div class="panel-title">Current spec</div>
     <div id="doc-content" class="md-content"></div>
   </div>
@@ -1367,16 +1367,22 @@ function saveAnnotations() {
   } catch (e) {}
 }
 function loadAnnotations(turn) {
+  // Reset FIRST, unconditionally: every mutation calls saveAnnotations(), so
+  // localStorage is authoritative and nothing in-progress is lost. Falling
+  // through any branch below with the previous run's map still in place let its
+  // line comments ride along in this run's submit (collectAnnotations feeds the
+  // payload) with nothing on screen to reveal them — the same cross-run
+  // misattribution as the stale doc panel, but data-losing rather than cosmetic.
+  annotations = {};
   try {
     var raw = localStorage.getItem(annotKey());
-    if (!raw) { annotations = {}; return; }
+    if (!raw) return;
     var stored = JSON.parse(raw);
     if (stored && stored.turn === turn && stored.annotations) {
       annotations = stored.annotations;
       _annotIdSeq = stored.seq || _annotIdSeq;
     } else if (stored && stored.turn !== turn) {
-      localStorage.removeItem(annotKey()); // stale (new turn) — clear
-      annotations = {};
+      localStorage.removeItem(annotKey()); // stale (new turn) — already cleared above
     }
   } catch (e) {}
 }
@@ -1636,6 +1642,11 @@ function blankCustomAnswer() {
 // ---- State ----
 var pollTimer = null;
 var currentDocText = '';
+// Bumped once per refresh() whose fetches landed for the run still on screen.
+// Monotonic on purpose: it is the only signal that distinguishes "this run has
+// been rendered" from "nothing has rendered yet", both of which look like an
+// empty currentDocText. cli/tests/web/nav.mjs waits on it.
+var refreshSeq = 0;
 
 function showEl(id) { document.getElementById(id).style.display = ''; }
 function hideEl(id) { document.getElementById(id).style.display = 'none'; }
@@ -1661,6 +1672,7 @@ async function refresh() {
 
   // Navigated away while these fetches were in flight → drop this stale render.
   if (gen !== routeGen) return;
+  refreshSeq++;
 
   currentDocText = docText;
   var state = stateRes.state;
@@ -1683,12 +1695,21 @@ async function refresh() {
     hideEl('summary-banner');
   }
 
-  // doc panel — render with source-line attributes then wire annotations
+  // doc panel — render with source-line attributes then wire annotations.
+  // The empty case MUST clear and hide, not just skip the write: a run has no
+  // spec.md until its gate is first opened, so /doc answers 200-with-no-body, and
+  // leaving the last render in place showed the PREVIOUS run's spec under this
+  // run's name. route() deliberately does not show this panel — visibility is
+  // owned here, so the stale doc is never briefly visible on the way in either.
+  var docContentEl = document.getElementById('doc-content');
   if (docText) {
-    var docContentEl = document.getElementById('doc-content');
     docContentEl.innerHTML = renderMd(docText);
     var sourceLines = docText.split('\n');
     wireAnnotations(docContentEl, sourceLines);
+    showEl('doc-panel');
+  } else {
+    docContentEl.innerHTML = '';
+    hideEl('doc-panel');
   }
 
   // diff panel — before→after diff of the raw markdown SOURCE (not rendered
@@ -2171,7 +2192,15 @@ async function route() {
   // and its answers could be submitted against THIS run.
   clearQuestions();
   showEl('back-link');
-  showEl('doc-panel');
+  // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
+  // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
+  // run with no spec never flashes the previously-viewed run's doc — and if
+  // refresh() throws mid-flight the stale spec is already gone rather than left
+  // on screen under this run's name. route() is not on a timer for the detail
+  // view (pollState re-arms that), so this runs on real navigation only.
+  hideEl('doc-panel');
+  document.getElementById('doc-content').innerHTML = '';
+  currentDocText = '';   // keep it in step with the DOM it describes
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;

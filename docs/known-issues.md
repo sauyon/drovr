@@ -67,6 +67,96 @@ To accept the old completion as-is, re-signal it deliberately from the run dir:
 
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
 case.
+## Review UI shows the PREVIOUS run's spec for a run that has no spec — FIXED 2026-07-25
+
+**Status:** fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
+panel in the empty case, and `route()` no longer shows it. Regression checks: "a run with no
+spec shows no doc at all" / "...and does not claim to be showing a spec" in
+`cli/tests/web/nav.mjs`, against a new `epsilon-nospec` fixture run seeded with `state.json`
+but no `spec.md`.
+
+**Severity:** high (silent misattribution — the reviewer reads one run's plan believing it is
+another's, and every other element on the page corroborates the wrong run).
+**Found:** 2026-07-25, while reviewing run `phase-reap` and being shown run
+`skill-stickiness`'s plan.
+
+### Symptom
+
+Navigate to a run whose gate has never been opened (no `spec.md`) after viewing a run that
+has one, and the previous run's rendered spec stays on screen under the new run's name. The
+turn badge, summary banner and questions panel all correctly update to the new run, so the
+page reads as a coherent review of it — only the document body is wrong.
+
+Verified on the live server (`100.71.58.39:8795`):
+
+| run | `GET /doc` | `GET /state` | `spec.md` on disk |
+|---|---|---|---|
+| `phase-reap` | 200, **0 bytes** | `{"state":"idle","turn":0}` | absent (only `plan.md`) |
+| `skill-stickiness` | 200, 24833 bytes | `{"state":"ready","turn":0}` | present, 24833 bytes |
+
+### Root cause
+
+Not server-side run leakage — the run is resolved per-request from the URL path
+(`cli/src/review.rs:364-370`, `452`) and `spec.md` is read fresh every time, so there is no
+shared "current run" anywhere in the stack. The fault is purely client-side.
+
+`refresh()` in `cli/web/index.html` wrote `#doc-content` only when the fetched doc was
+non-empty, with no `else`:
+
+```js
+if (docText) {
+  docContentEl.innerHTML = renderMd(docText);
+  wireAnnotations(docContentEl, docText.split('\n'));
+}
+```
+
+Meanwhile `route()` unconditionally did `showEl('doc-panel')` on entering any run detail
+view. A run has no `spec.md` until its first `drovr review summary`, at which point `/doc`
+answers 200-with-an-empty-body (`cli/src/review.rs:467-470` deliberately prefers an empty
+200 over a 404) — so `docText` is `''`, the write is skipped, and the panel is shown still
+holding the last run's markup.
+
+Second-order hazard: `currentDocText` **was** assigned unconditionally, so the visible text
+and the annotation source line array were desynced — annotations anchored against an empty
+document while the reviewer selected lines of the stale one.
+
+### The same bug class, one layer down: annotations could submit against the wrong run
+
+Found by the review pass on the fix, and worse than the visible symptom. `loadAnnotations()`
+had two fall-through paths that left the **previous run's** annotation map in `annotations`:
+a swallowed `JSON.parse` failure (`catch (e) {}`), and a `stored.turn === turn` record whose
+`annotations` field was missing. Previously those stale line comments at least rendered as
+chips on the (stale) doc and could be deleted; with the doc correctly cleared, nothing renders
+them — but `collectAnnotations()` still ships them in the submit payload and the server writes
+them verbatim into `feedback.json` (`cli/src/review.rs:817-820`, `846-853`, which gates submit
+on `is_terminal()` only, not on `state == ready`). Run A's line comments would land silently in
+run B's `feedback.json`, invisible to the reviewer.
+
+Fixed by resetting `annotations = {}` at the top of `loadAnnotations()`, unconditionally,
+before reading localStorage. Safe because every mutation site calls `saveAnnotations()`
+immediately (`cli/web/index.html:1451`, `1475`), so localStorage is authoritative and no
+in-progress comment is lost.
+
+### Fix
+
+1. Give the empty case an explicit branch that clears `#doc-content` and hides `doc-panel`.
+2. Move panel visibility out of `route()` into `refresh()`, and have `route()` defensively
+   clear + hide on navigation, so the stale doc is neither briefly visible on the way in nor
+   left on screen if `refresh()` throws mid-flight.
+3. `#doc-panel` now carries inline `style="display:none"` like every other refresh-owned
+   panel, so it is not visible-and-empty on first paint.
+4. Reset `annotations` unconditionally in `loadAnnotations()` (above).
+
+### Testing note
+
+The regression checks are deliberately split. "A run with no spec shows no doc" passes on
+`route()`'s defensive clear alone, so it does **not** pin the real invariant; the two
+`refresh() alone ...` checks plant a stale render and call `refresh()` directly, and those are
+the ones that fail if the `else` branch is removed. Both halves were verified to fail against
+the unfixed page before being kept. `refreshSeq` (`cli/web/index.html`) exists purely so the
+driver can tell "this run has rendered" from "nothing has rendered yet" — an empty
+`currentDocText` cannot distinguish the two, and waiting on it made the check vacuous under a
+real page reload.
 
 ## The agent's change summary is hidden on the first review — FIXED 2026-07-25
 

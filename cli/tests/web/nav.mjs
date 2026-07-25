@@ -158,6 +158,7 @@ const checkedIn = qi => evaluate(`
   var r = it.querySelector('input[type="radio"]:checked');
   return r ? r.value : null;`);
 const hash = () => evaluate(`return location.hash;`);
+const docText = () => evaluate(`return (document.getElementById('doc-content').textContent || '').trim();`);
 const filterOpen = () => evaluate(`return document.getElementById('nav-filter').style.display !== 'none';`);
 const helpOpen = () => evaluate(`return document.getElementById('key-help').classList.contains('open');`);
 const activeId = () => evaluate(`
@@ -326,7 +327,9 @@ console.log('\n== session list: cursor is anchored to its run, not its slot ==')
 // Explicitly not alpha-deploy: posting a summary overwrites the target's
 // summary.txt, and the detail-view checks below assert on alpha's seeded summary.
 // Picking "the last row" blind silently clobbered it whenever alpha sorted last.
-const bump = names.filter(n => n !== 'alpha-deploy').pop();
+// epsilon-nospec is out for the same reason: it is the fixture for "no spec yet",
+// and POSTing a summary would move it to `ready` under the stale-doc check below.
+const bump = names.filter(n => n !== 'alpha-deploy' && n !== 'epsilon-nospec').pop();
 await press('g'); await press('j');
 const anchored = await cursorName();
 check('cursor sits on a row the re-sort will move', anchored, names[1]);
@@ -458,6 +461,54 @@ console.log('\n== leaving a run ==');
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');
+
+console.log('\n== switching runs never leaves the previous run\'s spec on screen ==');
+// A run has no spec.md until its gate is first opened with `review summary`, so
+// /doc answers 200-with-an-empty-body. The doc panel was only ever WRITTEN when
+// the fetched doc was non-empty, so navigating from a run that has a spec to one
+// that does not left the old spec rendered under the new run's name — the
+// reviewer reads a stale document and believes it belongs to this run.
+// Gate on the panel being VISIBLE, not just on its text: leaving a run hides the
+// panel without emptying it, and textContent reads hidden nodes — so probing the
+// text alone is satisfied by the previous visit's leftovers and this goto() would
+// return before the navigation had happened at all.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec",
+});
+check('a run with a spec renders it', (await docText()).indexOf('Spec for alpha-deploy') !== -1, true);
+
+// In-page hash navigation, not a reload: a fresh page load would start with an
+// empty #doc-content and pass no matter what, proving nothing.
+const seqBefore = await evaluate(`return refreshSeq;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(hash, h => h === '#/runs/epsilon-nospec', 4000, 'nospec hash');
+// refreshSeq is monotonic and bumped only once a refresh's fetches have landed,
+// so "advanced past seqBefore" really does mean refresh() ran for THIS run.
+// currentDocText would not: it reads empty both after a spec-less refresh and
+// before anything has rendered at all, so a reload would satisfy it instantly.
+await waitFor(() => evaluate(`return currentRun + '|' + (refreshSeq > ${seqBefore});`),
+  v => v === 'epsilon-nospec|true', 8000, 'refresh for the spec-less run');
+check('a run with no spec shows no doc at all', await docText(), '');
+check('...and does not claim to be showing a spec',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+// The two checks above pass on route()'s defensive clear alone, so they do NOT
+// pin the invariant where it actually has to hold: refresh() re-runs on the poll
+// timer with no navigation, so IT must never leave a doc it did not fetch. Plant
+// a stale render, call refresh() directly, and require it to clean up.
+await evaluate(`
+  document.getElementById('doc-content').innerHTML = '<p>STALE DOC FROM ANOTHER RUN</p>';
+  document.getElementById('doc-panel').style.display = '';
+  return 1;`);
+check('the planted stale doc is really on screen', (await docText()).indexOf('STALE DOC') !== -1, true);
+await evaluate(`return refresh().then(function(){ return 1; });`);
+check('refresh() alone clears a doc it did not fetch', await docText(), '');
+check('refresh() alone hides the panel it did not fill',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
 
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();
