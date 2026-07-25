@@ -684,8 +684,8 @@ mod tests {
             "unset model must not appear: {env}"
         );
         // Flicker suppression is unconditional; the alternate-screen disable knob
-        // must NOT be used (it empties `agent read --source recent`, breaking
-        // `phase compress`).
+        // must NOT be used (it empties `agent read --source recent`, breaking the
+        // pane readers — `diagnose_stuck_phase` / `triage_blocked_phase`).
         assert_eq!(
             map.get("CLAUDE_CODE_NO_FLICKER").and_then(Value::as_str),
             Some("1"),
@@ -693,7 +693,7 @@ mod tests {
         );
         assert!(
             !map.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "must not disable the alternate screen (breaks phase compress): {env}"
+            "must not disable the alternate screen (empties `agent read`, breaks pane readers): {env}"
         );
     }
 

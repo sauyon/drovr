@@ -31,9 +31,6 @@ pub struct AgentSpec {
     /// Model selected for read-only reviews. Absent means backend default.
     #[serde(default)]
     pub review_model: Option<String>,
-    /// Arguments for non-interactive compression; `{project_dir}` is replaced.
-    #[serde(default)]
-    pub print_args: Option<Vec<String>>,
 }
 
 /// Controls the SessionStart reflex the `session-start` hook injects (see
@@ -135,13 +132,6 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: Some("--append-system-prompt".into()),
             model_flag: Some("--model".into()),
             review_model: None,
-            print_args: Some(vec![
-                "-p".into(),
-                "--permission-mode".into(),
-                "plan".into(),
-                "--add-dir".into(),
-                "{project_dir}".into(),
-            ]),
         },
     );
     m.insert(
@@ -153,13 +143,6 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
-            print_args: Some(vec![
-                "--print".into(),
-                "--mode".into(),
-                "plan".into(),
-                "--workspace".into(),
-                "{project_dir}".into(),
-            ]),
         },
     );
     m.insert(
@@ -171,14 +154,6 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("-m".into()),
             review_model: None,
-            print_args: Some(vec![
-                "exec".into(),
-                "--sandbox".into(),
-                "read-only".into(),
-                "-C".into(),
-                "{project_dir}".into(),
-                "-".into(),
-            ]),
         },
     );
     m
@@ -263,7 +238,6 @@ pub fn load_config() -> io::Result<Config> {
                 .or(builtin.system_prompt_flag);
             spec.model_flag = spec.model_flag.take().or(builtin.model_flag);
             spec.review_model = spec.review_model.take().or(builtin.review_model);
-            spec.print_args = spec.print_args.take().or(builtin.print_args);
         } else {
             config.agents.insert(name, builtin);
         }
@@ -351,22 +325,6 @@ impl Config {
             command.push_str(&shell_single_quote(&prompt));
         }
         Ok(command)
-    }
-
-    /// Resolve a non-interactive, read-only command for handoff compression.
-    pub fn compressor(&self, agent: &str, project_dir: &str) -> io::Result<(String, Vec<String>)> {
-        let spec = self.agent(agent)?;
-        let args = spec.print_args.as_ref().ok_or_else(|| {
-            io::Error::other(format!(
-                "agent '{agent}' has no print_args; cannot compress a handoff"
-            ))
-        })?;
-        Ok((
-            spec.command.clone(),
-            args.iter()
-                .map(|arg| arg.replace("{project_dir}", project_dir))
-                .collect(),
-        ))
     }
 
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
@@ -606,9 +564,7 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,
-                        print_args: None,
-                    },
+                        review_model: None,                    },
                 );
                 m
             },
@@ -636,9 +592,7 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,
-                        print_args: None,
-                    },
+                        review_model: None,                    },
                 );
                 m
             },
@@ -669,9 +623,7 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,
-                        print_args: None,
-                    },
+                        review_model: None,                    },
                 );
                 m
             },

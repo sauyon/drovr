@@ -387,6 +387,30 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     run.find_phase(phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
+
+    // Self-authored handoff contract: a PIPELINE phase (one in `run.phases`) must
+    // have authored a non-empty `<phase>-HANDOFF.md` before it may signal done —
+    // the handoff and the done marker are one atomic completion step, so a phase
+    // can never be marked done without the briefing the next phase inherits.
+    // Reviewer phases (only in `review_phases`) author no handoff and are exempt.
+    if run.phases.iter().any(|p| p.name == phase) {
+        let handoff = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
+        let non_empty = std::fs::read_to_string(&handoff)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !non_empty {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{phase}' cannot signal done: its handoff {} is missing or empty. \
+                     As your final action, author {phase}-HANDOFF.md (the 7-section handoff, \
+                     git pointers included) into the run dir, THEN run `drovr phase done`.",
+                    handoff.display()
+                ),
+            ));
+        }
+    }
+
     let marker = done_marker(&run.name, phase);
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
@@ -741,7 +765,7 @@ pub fn triage_blocked_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Blo
     }
 }
 
-/// Read `HANDOFF.md` written by the compressor into the run directory.
+/// Read `<phase>-HANDOFF.md`, authored by the finishing phase agent, from the run directory.
 pub fn collect(run: &RunState, phase: &str) -> io::Result<String> {
     let path: PathBuf = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
     std::fs::read_to_string(&path).map_err(|e| {
@@ -971,7 +995,12 @@ mod tests {
         let mut run = make_run("wait-done-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        // The phase agent signals completion by dropping the marker.
+        // The phase agent authors its handoff, then signals completion.
+        std::fs::write(
+            run_dir(&run.name).join("plan-HANDOFF.md"),
+            "## Objective\nself-authored handoff\n",
+        )
+        .unwrap();
         let marker = phase_done(&run, "plan").unwrap();
         assert!(
             marker.exists(),
@@ -1047,6 +1076,11 @@ mod tests {
         phase_start(&h, &mut run, "plan", None).unwrap();
         // Marker present AND a blocked status queued: the marker is checked first,
         // so the phase is Done and the status is never consulted.
+        std::fs::write(
+            run_dir(&run.name).join("plan-HANDOFF.md"),
+            "## Objective\nself-authored handoff\n",
+        )
+        .unwrap();
         phase_done(&run, "plan").unwrap();
         h.push_status(Some("blocked"));
 
@@ -1283,6 +1317,73 @@ mod tests {
             marker.exists(),
             "marker should exist at {}",
             marker.display()
+        );
+    }
+
+    // -- self-authored handoff: `phase done` enforces the handoff exists ----------
+
+    #[test]
+    fn done_requires_handoff_for_pipeline_phase() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("done-requires-handoff");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("p1".into()),
+        });
+        // The finishing agent authors <phase>-HANDOFF.md itself, in-context, BEFORE
+        // signalling done. With no handoff present, phase_done must refuse — the
+        // completion contract is atomic (no marker without a handoff).
+        let res = phase_done(&run, "plan");
+        assert!(
+            res.is_err(),
+            "phase done must refuse a pipeline phase with no handoff"
+        );
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("handoff"),
+            "error must name the missing handoff"
+        );
+        // The marker must NOT have been written on the refused call.
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "no marker may be written when the handoff is missing"
+        );
+        // Author a non-empty handoff → done succeeds and drops the marker.
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(&hp, "## Objective\nreal handoff\n").unwrap();
+        let marker = phase_done(&run, "plan").unwrap();
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn done_rejects_empty_handoff_for_pipeline_phase() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("done-empty-handoff");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            handoff_doc: None,
+            herdr_session: None,
+            pane_id: Some("p1".into()),
+        });
+        // A whitespace-only handoff is treated as absent (guards the degenerate
+        // 2-line-garbage case the old compressor produced).
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(&hp, "   \n\n").unwrap();
+        assert!(
+            phase_done(&run, "plan").is_err(),
+            "an empty/whitespace handoff must be rejected"
+        );
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "no marker may be written when the handoff is empty"
         );
     }
 

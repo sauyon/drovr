@@ -3,9 +3,9 @@
 `drovr` is a CLI tool for managing multi-phase AI agent workflows. It
 orchestrates a fixed sequence of phases (brainstorm → plan → implement →
 review), routes each phase to a Claude agent pane via
-[herdr](https://github.com/sauyon/herdr), compresses finished phases into
-handoff docs, and runs an always-on local HTTP server (with a browsable session
-list) for the human review loop.
+[herdr](https://github.com/sauyon/herdr), has each finishing phase agent compress
+its own work into a handoff doc, and runs an always-on local HTTP server (with a
+browsable session list) for the human review loop.
 
 Drovr leans on all three context-engineering levers
 (anthropic.com/engineering/effective-context-engineering-for-ai-agents), not compaction alone:
@@ -114,7 +114,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr phase start <run> <phase> [--seed <path>]` | Spawn a claude agent pane for the phase. |
 | `drovr phase send <run> <phase> <text>` | Send text to a running phase pane. |
 | `drovr phase wait <run> <phase> [--timeout-ms N]` | Poll until the phase agent is done (default 30 s). |
-| `drovr phase compress <run> <phase>` | Read the phase transcript and write `<phase>-HANDOFF.md` via `claude -p`. |
+| `drovr phase done <run> <phase>` | Run by the phase agent as its final action; refuses until the agent has authored `<phase>-HANDOFF.md`, then drops the completion marker. |
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
@@ -148,9 +148,10 @@ Phase `status` values: `Pending`, `Running`, `Done`, `Failed`.
 
 ### `<phase>-HANDOFF.md`
 
-Written by `drovr phase compress`. A compressed summary of the phase's agent
-transcript (objective + key decisions + artifacts) suitable for seeding the
-next phase.
+Authored by the finishing phase agent itself, in-context, as its final action
+(enforced by `drovr phase done`). A compressed summary of the phase's work
+(objective + key decisions + artifacts, with git pointers) suitable for seeding
+the next phase.
 
 ### Server discovery files
 
@@ -213,14 +214,14 @@ the intended interface for agents — the CLI is the mechanism, the skills are t
 | Skill | Use when |
 |---|---|
 | `drovr:using-drovr` | Orientation: prerequisites, the single-writer rule, and choosing handoff vs pipeline. |
-| `drovr:handoff` | Carry finished work across one phase boundary to a fresh agent (start → **inject seed** → wait → compress → collect). |
+| `drovr:handoff` | Carry finished work across one phase boundary to a fresh agent (start → **inject seed** → wait → collect; the phase agent authors its own handoff before `phase done`). |
 | `drovr:pipeline` | Run a whole change through brainstorm → plan → implement → review with a human spec gate. |
 
 **The load-bearing contract:** `drovr phase start` spawns a plain `claude` and only records
 the seed *path* — it does **not** inject the briefing. The skill injects it via
 `drovr phase send`. At the spec gate, the agent must run `drovr review summary <run> "<text>"`
-after **every** edit to `spec.md`, and `drovr phase compress` writes exactly
-`<phase>-HANDOFF.md` (the filename `drovr collect` reads).
+after **every** edit to `spec.md`, and the finishing phase agent authors exactly
+`<phase>-HANDOFF.md` (the filename `drovr collect` reads) before `drovr phase done`.
 
 ## Running tests
 
