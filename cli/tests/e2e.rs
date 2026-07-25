@@ -522,6 +522,28 @@ fn e2e_worktree_lifecycle() {
 /// runs.
 #[test]
 fn e2e_cancel_gate_exits_5() {
+    // ---- Prerequisite checks -----------------------------------------------
+    // This test does not spawn a herdr agent, but it MUST share the same
+    // herdr/claude-absent skip as the other e2e tests: that guard is the flake's
+    // hermeticity contract (see flake.nix) — it is what stops the test from
+    // binding a loopback server inside the Nix build sandbox, where it cannot
+    // come up (the assertion below would fail the whole build). herdr+claude are
+    // present locally, so the test still runs there.
+    if !binary_on_path("herdr") {
+        println!("skipping e2e: `herdr` not found on PATH");
+        return;
+    }
+    if !binary_on_path("claude") {
+        println!("skipping e2e: `claude` not found on PATH");
+        return;
+    }
+    if !herdr_integration_installed() {
+        println!(
+            "skipping e2e: herdr claude integration not installed (run `herdr integration install claude`)"
+        );
+        return;
+    }
+
     let tmp = tempfile::Builder::new()
         .prefix("drovr-e2e-cancel-")
         .tempdir()
