@@ -519,6 +519,10 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         // POST send[?pane=<id>] — type text into a run agent's pane (herdr prompt).
         (Method::Post, "send") => handle_post_send(req, &p, url),
 
+        // POST keys[?pane=<id>] — press keys in a run agent's pane, so the
+        // browser can answer numbered/arrow menus that `send` cannot drive.
+        (Method::Post, "keys") => handle_post_keys(req, &p, url),
+
         _ => respond_404(req),
     }
 }
@@ -559,9 +563,43 @@ fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
 /// param, falls back to the run's [`active_pane`].
 fn resolve_pane(run: &RunState, url: &str) -> Option<String> {
     match query_param(url, "pane") {
-        Some(requested) => run_pane_ids(run).take(&requested),
+        // Pane ids contain a `:` (`w16:p3`), which the browser's
+        // `encodeURIComponent` sends as `%3A` — decode before matching, or the
+        // allow-list never hits and every explicitly-selected pane 409s.
+        Some(requested) => run_pane_ids(run).take(&percent_decode(&requested)),
         None => active_pane(run),
     }
+}
+
+/// Minimal percent-decoder for a query-string value. `+` is left alone (these
+/// are path-ish ids, not form encoding); an invalid escape is passed through
+/// verbatim rather than dropped; and escapes that decode to non-UTF-8 bytes
+/// yield the *original* undecoded string. Every one of those paths just means
+/// the value fails the caller's allow-list — decoding widens nothing.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // `i + 2 < len` because the escape needs both bytes[i+1] and bytes[i+2];
+        // requiring ASCII hex digits keeps `from_str_radix` from accepting the
+        // sign it otherwise would (`%+3` must stay literal, not become 0x03).
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// `GET /api/runs/<run>/pane[?pane=<id>]` — the recent transcript of a run
@@ -595,6 +633,69 @@ fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
         Err(e) => {
             eprintln!("drovr send: to {pane} failed: {e}");
             respond_str(req, 500, "text/plain", "send failed".into())
+        }
+    }
+}
+
+/// Most keypresses one request may carry. A menu answer is 1–2 keys; a burst of
+/// arrow-scrolling is a handful. The cap bounds the argv handed to herdr.
+const MAX_KEYS: usize = 32;
+/// Longest herdr key *name* (`enter`, `pagedown`, `ctrl+shift+k`). Anything
+/// longer is free text, which belongs on `/send`.
+const MAX_KEY_LEN: usize = 16;
+
+/// Parse+validate a `POST /keys` body (`{"keys":["3","enter"]}`) into herdr key
+/// names. Each key must be a short `[A-Za-z0-9+_-]` token that does not start
+/// with `-`: these land in `herdr agent send-keys`'s argv, where a leading dash
+/// would be parsed as an option rather than a key.
+fn parse_keys(body: &str) -> Result<Vec<String>, &'static str> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid JSON")?;
+    let arr = v.get("keys").and_then(|k| k.as_array()).ok_or("missing keys array")?;
+    if arr.is_empty() {
+        return Err("keys must not be empty");
+    }
+    if arr.len() > MAX_KEYS {
+        return Err("too many keys");
+    }
+    let mut keys = Vec::with_capacity(arr.len());
+    for item in arr {
+        let k = item.as_str().ok_or("keys must be strings")?;
+        if k.is_empty() || k.len() > MAX_KEY_LEN {
+            return Err("invalid key name");
+        }
+        // Alphanumerics cover the names and digits; `+` joins a modifier chord
+        // (`ctrl+c`). `-` is tolerated inside a name but never leading.
+        if k.starts_with('-') || !k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-')) {
+            return Err("invalid key name");
+        }
+        keys.push(k.to_string());
+    }
+    Ok(keys)
+}
+
+/// `POST /api/runs/<run>/keys[?pane=<id>]` — press keys in a run agent's pane
+/// (`herdr agent send-keys`), the only way to answer the numbered/arrow menus
+/// (MCP-server approval, trust-dir prompt, model picker) that `/send`'s typed
+/// prompt cannot drive. 400 on a bad body, 409 when there is no such live pane.
+fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
+    let body = read_body(&mut req);
+    let keys = match parse_keys(&body) {
+        Ok(keys) => keys,
+        Err(msg) => {
+            respond_str(req, 400, "text/plain", msg.into());
+            return;
+        }
+    };
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+        respond_str(req, 409, "text/plain", "no live pane for this run".into());
+        return;
+    };
+    let h = crate::herdr::SystemHerdr::new();
+    match h.agent_send_keys(&pane, &keys) {
+        Ok(()) => respond_str(req, 200, "application/json", r#"{"ok":true}"#.into()),
+        Err(e) => {
+            eprintln!("drovr keys: to {pane} failed: {e}");
+            respond_str(req, 500, "text/plain", "send-keys failed".into())
         }
     }
 }
@@ -1427,6 +1528,114 @@ mod tests {
         assert_eq!(resolve_pane(&run, "/x?pane=w9:p99"), None);
         // No param → active_pane (first Running phase).
         assert_eq!(resolve_pane(&run, "/x").as_deref(), Some("w:p1"));
+    }
+
+    #[test]
+    fn resolve_pane_decodes_percent_encoded_ids() {
+        use crate::run::PhaseStatus::Running;
+        let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
+        // The browser sends encodeURIComponent("w:p3") = "w%3Ap3"; without
+        // decoding it misses the allow-list and every selected pane 409s.
+        assert_eq!(resolve_pane(&run, "/x?pane=w%3Ap3").as_deref(), Some("w:p3"));
+        // Decoding must not open a hole: a foreign pane is still rejected.
+        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99"), None);
+        // Malformed escapes are passed through verbatim (and so simply miss).
+        assert_eq!(resolve_pane(&run, "/x?pane=w%3"), None);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_junk() {
+        assert_eq!(percent_decode("w%3Ap3"), "w:p3");
+        assert_eq!(percent_decode("w%3ap3"), "w:p3"); // lowercase hex
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("a%zzb"), "a%zzb"); // not hex → literal
+        assert_eq!(percent_decode("trailing%"), "trailing%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%+3"), "%+3"); // from_str_radix must not eat the sign
+        // Escapes that decode to non-UTF-8 bytes fall back to the raw input;
+        // either way the value misses the pane allow-list.
+        assert_eq!(percent_decode("w%80p"), "w%80p");
+        // Double-encoding decodes exactly once: `%253A` → `%3A`, never `:`.
+        assert_eq!(percent_decode("w%253Ap3"), "w%3Ap3");
+    }
+
+    // -- send-keys -----------------------------------------------------------
+
+    #[test]
+    fn parse_keys_accepts_a_menu_answer() {
+        assert_eq!(
+            parse_keys(r#"{"keys":["3","enter"]}"#).unwrap(),
+            vec!["3".to_string(), "enter".to_string()]
+        );
+        // The arrow/escape names the UI sends.
+        assert_eq!(
+            parse_keys(r#"{"keys":["down","up","esc","ctrl+c"]}"#).unwrap(),
+            vec!["down", "up", "esc", "ctrl+c"]
+        );
+    }
+
+    #[test]
+    fn parse_keys_rejects_bad_bodies() {
+        // Not JSON at all.
+        assert!(parse_keys("enter").is_err());
+        // Right shape, no keys — nothing to press.
+        assert!(parse_keys(r#"{"keys":[]}"#).is_err());
+        // Missing / wrongly-typed field.
+        assert!(parse_keys(r#"{"text":"enter"}"#).is_err());
+        assert!(parse_keys(r#"{"keys":"enter"}"#).is_err());
+        assert!(parse_keys(r#"{"keys":[3]}"#).is_err());
+        // Oversized list.
+        let many = (0..MAX_KEYS + 1).map(|_| "\"a\"").collect::<Vec<_>>().join(",");
+        assert!(parse_keys(&format!(r#"{{"keys":[{many}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_keys_rejects_unsafe_key_names() {
+        // A key is a herdr key *name*, never free text and never an argv flag:
+        // `herdr agent send-keys` would otherwise parse a leading `-` as an option.
+        assert!(parse_keys(r#"{"keys":["--help"]}"#).is_err());
+        assert!(parse_keys(r#"{"keys":[""]}"#).is_err());
+        assert!(parse_keys(r#"{"keys":["rm -rf /"]}"#).is_err());
+        assert!(parse_keys(r#"{"keys":["ent;er"]}"#).is_err());
+        assert!(parse_keys(r#"{"keys":["ent_er"]}"#).is_err());
+        assert!(parse_keys(r#"{"keys":["a b"]}"#).is_err());
+        let long = "a".repeat(MAX_KEY_LEN + 1);
+        assert!(parse_keys(&format!(r#"{{"keys":["{long}"]}}"#)).is_err());
+    }
+
+    #[test]
+    fn post_keys_validates_before_touching_a_pane() {
+        // The run in `make_run` has no panes, so a *well-formed* request gets as
+        // far as pane resolution (409) while a malformed one is rejected at the
+        // body (400). That ordering is what makes the 400s observable without a
+        // live herdr.
+        let tmp = make_root("keys");
+        make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (s, _) = http_post(&addr, "/api/runs/r/keys", "application/json", r#"{"keys":["3","enter"]}"#);
+        assert_eq!(s, 409, "valid body, no live pane → 409");
+
+        for bad in [r#"{"keys":[]}"#, "not json", r#"{"keys":["--oops"]}"#, r#"{"keys":"enter"}"#] {
+            let (s, _) = http_post(&addr, "/api/runs/r/keys", "application/json", bad);
+            assert_eq!(s, 400, "body {bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn post_keys_honors_pane_gating() {
+        // `?pane=` outside the run must never reach herdr: same allow-list as
+        // /pane and /send (resolve_pane), so a foreign pane looks like no pane.
+        let tmp = make_root("keys-gate");
+        make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+        let (s, _) = http_post(
+            &addr,
+            "/api/runs/r/keys?pane=w9%3Ap99",
+            "application/json",
+            r#"{"keys":["enter"]}"#,
+        );
+        assert_eq!(s, 409);
     }
 
     #[test]

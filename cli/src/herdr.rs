@@ -46,6 +46,12 @@ pub trait Herdr {
     /// no `--no-focus` flag, so drovr captures focus before and restores it after.
     fn workspace_focus(&self, id: &str) -> io::Result<()>;
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
+    /// Press keys in an agent's pane (`herdr agent send-keys`). Unlike
+    /// [`Herdr::agent_send`], which types a prompt, this drives the agent's
+    /// *menus* — the "New MCP server" approval, the trust-dir prompt, the model
+    /// picker — which only answer to keypresses. `keys` are herdr key names
+    /// (`enter`, `esc`, `up`, `down`, digits like `3`).
+    fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
     /// The pane's `agent_status` (`idle|working|blocked|done|unknown`) as reported
     /// by herdr, or `None` if it cannot be read/parsed. READ-ONLY: it must never
@@ -256,6 +262,21 @@ impl Herdr for SystemHerdr {
             "agent.prompt",
             json!({ "target": target, "text": text }),
         )?;
+        Ok(())
+    }
+
+    fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
+        // No socket method for keypresses in 0.7.5 — shell the CLI, which takes
+        // the key names as trailing positionals: `agent send-keys <target> 3 enter`.
+        let mut args = vec!["agent", "send-keys", target];
+        args.extend(keys.iter().map(String::as_str));
+        let out = self.run(&args)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(format!(
+                "herdr agent send-keys failed: {stderr}"
+            )));
+        }
         Ok(())
     }
 
@@ -474,6 +495,11 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
+        self.record(format!("agent_send_keys target={target} keys={keys:?}"));
+        Ok(())
+    }
+
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
         let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
@@ -634,6 +660,24 @@ mod tests {
             "unexpected CR in fake call: {}",
             calls[0]
         );
+    }
+
+    // -- send-keys: the fake records the key *names*, never a text payload -----
+    // Menus (the New MCP server approval, trust-dir prompt, model picker) are
+    // answered by key presses, not by typing — so the recording must show the
+    // keys verbatim and must not look like an `agent_send`.
+    #[test]
+    fn fake_agent_send_keys_records_keys_not_text() {
+        let h = FakeHerdr::new();
+        h.agent_send_keys("pane-1", &["3".to_string(), "enter".to_string()])
+            .unwrap();
+        let calls = h.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("agent_send_keys"), "call: {}", calls[0]);
+        assert!(calls[0].contains("target=pane-1"), "call: {}", calls[0]);
+        assert!(calls[0].contains("keys=[\"3\", \"enter\"]"), "call: {}", calls[0]);
+        // Must be distinguishable from a text send.
+        assert!(!calls[0].contains("text="), "call: {}", calls[0]);
     }
 
     // workspace_create returns both the workspace id and its root shell pane id;

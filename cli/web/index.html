@@ -606,6 +606,20 @@
     padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius);
     background: var(--surface); color: var(--text); font: inherit;
   }
+  /* Key row: answers the agent's numbered/arrow menus (MCP-server approval,
+     trust-dir prompt, model picker), which typed text cannot drive. */
+  .session-keys { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+  .session-keys .keys-label { font-size: 11px; color: var(--muted); margin-right: 2px; }
+  .session-keys .keys-gap { width: 8px; }
+  button.key {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 3px 10px; min-width: 28px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    cursor: pointer; transition: background .15s, border-color .15s;
+  }
+  button.key:hover { border-color: var(--accent); background: var(--hover, rgba(127,127,127,0.08)); }
+  button.key:disabled { opacity: .5; cursor: default; }
   .session-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
   .session-target { text-transform: none; letter-spacing: 0; color: var(--text); font-family: var(--mono); font-size: 0.9em; }
 
@@ -688,6 +702,19 @@
     <div class="session-input-row">
       <textarea id="session-text" placeholder="Type to the agent… (Enter to send, Shift+Enter for newline)"></textarea>
       <button class="primary" id="session-send" onclick="sendPane()">Send</button>
+    </div>
+    <div class="session-keys" id="session-keys">
+      <span class="keys-label">Keys</span>
+      <button class="key" onclick="sendKeys(['enter'])" title="Enter">&#9166;</button>
+      <button class="key" onclick="sendKeys(['esc'])" title="Escape">Esc</button>
+      <button class="key" onclick="sendKeys(['up'])" title="Up">&uarr;</button>
+      <button class="key" onclick="sendKeys(['down'])" title="Down">&darr;</button>
+      <span class="keys-gap"></span>
+      <button class="key" onclick="sendKeys(['1'])" title="Choose 1">1</button>
+      <button class="key" onclick="sendKeys(['2'])" title="Choose 2">2</button>
+      <button class="key" onclick="sendKeys(['3'])" title="Choose 3">3</button>
+      <button class="key" onclick="sendKeys(['4'])" title="Choose 4">4</button>
+      <button class="key" onclick="sendKeys(['5'])" title="Choose 5">5</button>
     </div>
     <div class="session-hint">Mirrors the current screen of the real agent pane. Drop to the terminal with <code>drovr attach &lt;run&gt;</code> for full scrollback.</div>
   </div>
@@ -1714,6 +1741,28 @@ async function sendPane() {
     });
   } catch (e) { /* ignore; next poll reflects state */ }
   // Reflect promptly.
+  setTimeout(function(){ pollPane(routeGen); }, 200);
+}
+
+// Press keys in the inspected pane (herdr `agent send-keys`). This is the only
+// way to answer the agent's numbered/arrow menus — the MCP-server approval, the
+// trust-dir prompt, the model picker — which ignore a typed prompt.
+async function sendKeys(keys) {
+  var row = document.getElementById('session-keys');
+  var btns = row ? row.querySelectorAll('button.key') : [];
+  btns.forEach(function(b) { b.disabled = true; });
+  try {
+    await fetch(api('keys') + paneQuery(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: keys })
+    });
+  } catch (e) { /* ignore; next poll reflects state */ }
+  // Only re-enable the row we disabled — if route() rebuilt the panel mid-await
+  // these nodes are detached and the live ones are already enabled.
+  if (row && document.getElementById('session-keys') === row) {
+    btns.forEach(function(b) { b.disabled = false; });
+  }
   setTimeout(function(){ pollPane(routeGen); }, 200);
 }
 

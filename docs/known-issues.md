@@ -282,6 +282,17 @@ Add a manifest rule so the prompt reports `blocked`; and give the browser mirror
 control (arrows/enter/number) so menus are answerable from the UI — today `/send` types text
 only.
 
+### Status: half fixed (2026-07-25, `drovr/send-keys-mirror`)
+
+The **answering** half is done: `POST /api/runs/<run>/keys` (`{"keys":["3","enter"]}`) →
+`Herdr::agent_send_keys` → `herdr agent send-keys`, wired to an Enter/Esc/↑/↓/1–5 key row in the
+Live-session panel, so a parked agent can be cleared from the browser without attaching.
+
+The **detection** half is still open: herdr's manifest has no rule for this prompt, so
+`agent_status` still reports `idle` and an unattended pipeline still wedges silently — a human
+has to notice the mirror and press `3`. Fixing that needs the herdr-side manifest rule (or a
+drovr-side `agent explain --json` / `visible_blocker` poll to surface it in the UI).
+
 ## `drovr review wait` fails (not "approved") if the server restarts mid-wait
 
 **Severity:** medium (a failed wait can be *misread* as approval and advance the pipeline past
@@ -358,3 +369,9 @@ source. (Claude's own session JSONL has clean turns, but reading it is claude-sp
 Add an agent-agnostic "clean" mode that strips the known chrome (status line, `❯` composer,
 separator rules) from the snapshot; keep raw as a toggle. Avoid a claude-only JSONL parser as
 the primary path.
+
+### Status: still open, but less costly (2026-07-25, `drovr/send-keys-mirror`)
+
+The rendering is unchanged — the mirror is still raw chrome. What changed is that the chrome is
+no longer *inert*: the menus it renders (numbered prompts, pickers) are now answerable from the
+panel's key row via `POST /keys`, so noisy output no longer means an unactionable panel.
