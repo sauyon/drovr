@@ -1462,9 +1462,8 @@ mod tests {
         let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         };
         let mut run = RunState {
             name: "r".into(),
@@ -1515,9 +1514,8 @@ mod tests {
         crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         }
     }
 

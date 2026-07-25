@@ -373,34 +373,10 @@ fn cmd_new(
         agent: Some(agent),
         project_dir,
         phases: vec![
-            run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "plan".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "implement".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "review".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
+            run::Phase::new("brainstorm"),
+            run::Phase::new("plan"),
+            run::Phase::new("implement"),
+            run::Phase::new("review"),
         ],
         review_phases: vec![],
         gate: "spec".into(),
@@ -1317,30 +1293,13 @@ mod tests {
             name: "r".into(),
             task: "t".into(),
             agent: None,
-            phases: vec![
-                run::Phase {
-                    name: "brainstorm".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
-                run::Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
-            ],
+            phases: vec![run::Phase::new("brainstorm"), run::Phase::new("plan")],
             // A populated review_phases list must not shift the "0/2" progress or
             // the "current" phase — format_progress walks `phases` only.
             review_phases: vec![run::Phase {
                 name: "review:task-1:1:correctness".into(),
                 status: PhaseStatus::Running,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             }],
             gate: "spec".into(),
             cursor: 0,
@@ -1364,9 +1323,7 @@ mod tests {
             phases: vec![run::Phase {
                 name: "brainstorm".into(),
                 status: PhaseStatus::Done,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             }],
             review_phases: vec![],
             gate: "spec".into(),

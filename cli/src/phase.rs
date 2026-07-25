@@ -131,6 +131,18 @@ pub fn phase_start<H: Herdr>(
     }
     let cwd = run.project_dir.clone();
 
+    // Drop any completion marker left by a PREVIOUS pass over this phase, BEFORE
+    // the agent is launched. Nothing else sweeps `<phase>.done`, so a re-entered
+    // phase would otherwise have its very next `phase wait` return `Done`
+    // instantly off the stale marker and never await the agent just launched.
+    //
+    // Placed ahead of the launch on purpose: the previous pass's agent is still
+    // alive (panes are never closed mid-run), so it could drop its marker at any
+    // moment. Deleting first makes the losing window as small as the code allows.
+    // It does NOT close the race entirely — that needs `phase_wait` to CONSUME
+    // the marker it observes, which is a separate change.
+    let _ = std::fs::remove_file(done_marker(&run.name, phase));
+
     // Pick the pane this phase's `claude` will run in, WITHOUT splitting a new
     // pane beside an empty shell:
     //   * a restarting phase reuses its own recorded pane;
@@ -177,13 +189,7 @@ pub fn phase_start<H: Herdr>(
     let idx = match find_phase_idx(run, phase) {
         Some(i) => i,
         None => {
-            run.phases.push(Phase {
-                name: phase.to_owned(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            });
+            run.phases.push(Phase::new(phase));
             run.phases.len() - 1
         }
     };
@@ -266,8 +272,8 @@ pub fn spawn_reviewer<H: Herdr>(
         name: phase.to_owned(),
         status: PhaseStatus::Running,
         handoff_doc: seed_str,
-        herdr_session: None,
         pane_id: Some(pane),
+        ..Default::default()
     });
     run.save()?;
     Ok(())
@@ -1266,9 +1272,7 @@ mod tests {
         run.phases.push(Phase {
             name: "code".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         });
 
         let t = triage_blocked_phase(&h, &run, "code");
@@ -1292,9 +1296,7 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         });
         assert!(phase_done(&run, "nonexistent").is_err());
     }
@@ -1308,9 +1310,8 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: Some("rp1".into()),
+            ..Default::default()
         });
         let marker = phase_done(&run, "review:t:1:correctness").unwrap();
         assert!(
@@ -1329,9 +1330,8 @@ mod tests {
         run.phases.push(Phase {
             name: "plan".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: Some("p1".into()),
+            ..Default::default()
         });
         // The finishing agent authors <phase>-HANDOFF.md itself, in-context, BEFORE
         // signalling done. With no handoff present, phase_done must refuse — the
@@ -1368,9 +1368,8 @@ mod tests {
         run.phases.push(Phase {
             name: "plan".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: Some("p1".into()),
+            ..Default::default()
         });
         // A whitespace-only handoff is treated as absent (guards the degenerate
         // 2-line-garbage case the old compressor produced).
@@ -1397,9 +1396,8 @@ mod tests {
         run.review_phases.push(Phase {
             name: "review:t:1:correctness".into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: Some("review-pane-9".into()),
+            ..Default::default()
         });
         // Report the pane ready so the readiness gate returns on the first poll.
         h.push_status(Some("idle"));
@@ -1628,18 +1626,51 @@ mod tests {
         let mut run = make_run("reuse-test");
 
         // Pre-populate a Pending phase
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Pending,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
-        });
+        run.phases.push(Phase::new("plan"));
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // Still only one phase
         assert_eq!(run.phases.len(), 1);
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn phase_start_clears_stale_done_marker() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("stale-marker-test");
+
+        // Pass 1: the phase runs and signals done, leaving `<phase>.done` behind.
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(&hp, "## Objective\nreal handoff\n").unwrap();
+        let marker = phase_done(&run, "plan").unwrap();
+        assert!(marker.exists());
+
+        // Pass 2: the driver re-enters the phase. Nothing else sweeps the marker,
+        // so if `phase_start` leaves it the next `phase wait` returns `Done`
+        // instantly off the PREVIOUS pass's marker and the phase is never awaited.
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        assert!(
+            !marker.exists(),
+            "phase_start must delete the stale done marker at {}",
+            marker.display()
+        );
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+
+        // Pass 3, with the launch scripted to fail: the marker must STILL be gone.
+        // That pins the delete AHEAD of `launch_in_pane` — the previous pass's
+        // agent is still alive and can drop a marker at any moment, so deleting
+        // late leaves a wider window in which `phase wait` short-circuits on it.
+        std::fs::write(&marker, b"").unwrap();
+        let failing = FakeHerdr::new();
+        failing.fail_pane_run();
+        assert!(phase_start(&failing, &mut run, "plan", None).is_err());
+        assert!(
+            !marker.exists(),
+            "the stale marker must be cleared before the launch, not after it"
+        );
     }
 
     #[test]

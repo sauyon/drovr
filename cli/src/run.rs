@@ -2,21 +2,44 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io};
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Default)]
 pub enum PhaseStatus {
+    #[default]
     Pending,
     Running,
     Done,
     Failed,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// One phase of a run. Construct via [`Phase::new`] or
+/// `Phase { name: …, ..Default::default() }` — never by listing every field, so
+/// adding a field stays a one-line diff instead of touching ~25 literal sites.
+///
+/// The cost of that convenience, for whoever adds the next field:
+/// * The compiler no longer flags construction sites that ought to populate it.
+///   Grep the `..Default::default()` sites and decide each one deliberately.
+/// * No field here is `#[serde(default)]`, so deserialization REQUIRES all of
+///   them. A new field without `#[serde(default)]` makes every existing
+///   `state.json` fail to load → `load_run` exits 1 → the run STOPs. Mirror
+///   `RunState`'s `#[serde(default, skip_serializing_if = "Option::is_none")]`
+///   and add a back-compat test for it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Phase {
     pub name: String,
     pub status: PhaseStatus,
     pub handoff_doc: Option<String>,
     pub herdr_session: Option<String>,
     pub pane_id: Option<String>,
+}
+
+impl Phase {
+    /// A `Pending` phase named `name`, with every other field at its default.
+    pub fn new(name: &str) -> Phase {
+        Phase {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -120,13 +143,55 @@ impl RunState {
         let p = run_dir(name).join("state.json");
         serde_json::from_str(&fs::read_to_string(p)?).map_err(io::Error::other)
     }
+    /// Write `state.json` ATOMICALLY: serialize into a temp file in the same
+    /// directory, then `fs::rename` it over the target. A bare `fs::write`
+    /// truncates in place, so any concurrent READER (the always-on review server
+    /// reading run state, a second CLI invocation, a `phase wait` loop) can parse
+    /// a half-written file — and a failed `load_run` exits 1, which per the
+    /// pipeline skill STOPs the whole run. A same-directory rename is atomic on
+    /// POSIX: a reader sees either the old file or the new one, never a splice.
+    ///
+    /// The temp name carries pid + a process-local counter rather than being a
+    /// fixed `state.json.tmp`: two concurrent savers sharing one temp path would
+    /// interleave their writes into the same inode and rename that corruption
+    /// into place, which is precisely the failure this is meant to remove.
+    ///
+    /// Scope, precisely — this fixes torn READS and nothing else:
+    /// * NOT durability. The temp file is not `fsync`ed and neither is the
+    ///   directory, so a power loss can still leave a stale (or, on some
+    ///   filesystems, empty) `state.json`. Deliberate: `save` runs in poll loops
+    ///   and an fsync per save is not worth it for a workflow whose herdr
+    ///   workspace does not survive a crash either.
+    /// * NOT serialized updates. Every writer still does load→mutate→save on its
+    ///   own copy, so two concurrent CLI invocations cleanly clobber each other
+    ///   whole-file. Losing an update is the pre-existing behavior; this only
+    ///   guarantees the loser's file is never *corrupt*.
+    /// * A SIGKILL between the write and the rename orphans a
+    ///   `.state.json.tmp.<pid>.<n>`; nothing sweeps it. Cosmetic — every
+    ///   `read_dir` over a run root gates on a `state.json` child, and nothing
+    ///   enumerates inside a run dir.
     pub fn save(&self) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
         let dir = run_dir(&self.name);
         fs::create_dir_all(&dir)?;
-        fs::write(
-            dir.join("state.json"),
-            serde_json::to_string_pretty(self).map_err(io::Error::other)?,
-        )?;
+        let body = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        let tmp = dir.join(format!(
+            ".state.json.tmp.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Best-effort cleanup of the temp file on any failure, so a transient
+        // ENOSPC/EACCES can't litter the run dir with orphaned partials.
+        if let Err(e) = fs::write(&tmp, &body) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&tmp, dir.join("state.json")) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(())
     }
     pub fn first_incomplete(&self) -> Option<usize> {
@@ -201,26 +266,17 @@ mod tests {
                 Phase {
                     name: "brainstorm".into(),
                     status: PhaseStatus::Done,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
+                    ..Default::default()
                 },
-                Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
+                Phase::new("plan"),
             ],
             // A populated review_phases list must NOT influence pipeline progress:
             // it round-trips but `first_incomplete` (and `format_progress`) ignore it.
             review_phases: vec![Phase {
                 name: "review:task-1:1:correctness".into(),
                 status: PhaseStatus::Running,
-                handoff_doc: None,
-                herdr_session: None,
                 pane_id: Some("p1".into()),
+                ..Default::default()
             }],
             gate: "spec".into(),
             cursor: 1,
@@ -298,13 +354,181 @@ mod tests {
     }
 
     #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = fat_run("tmpclean", 3);
+        s.save().unwrap();
+        s.cursor = 1;
+        s.save().unwrap();
+
+        // The real invariant is "no temp file survives a save"; asserting the dir
+        // holds ONLY state.json would start failing for the wrong reason the day
+        // anything else legitimately lands in a run dir.
+        let leftovers: Vec<String> = fs::read_dir(run_dir("tmpclean"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "save must rename its temp file away, leaving only state.json; found {leftovers:?}"
+        );
+        assert_eq!(RunState::load("tmpclean").unwrap().cursor, 1);
+    }
+
+    #[test]
+    fn concurrent_saves_never_expose_a_partial_state_json() {
+        // A bare `fs::write` truncates in place, so a concurrent `load` parses a
+        // half-written file, `load_run` exits 1, and per the pipeline skill the
+        // whole run STOPs.
+        //
+        // Tuned for DETECTION, verified by mutation (revert `save` to a bare
+        // `fs::write` and this must fail, repeatedly):
+        //  * MANY saves, not one huge one. The vulnerable window is between
+        //    `File::create`'s O_TRUNC and the write completing, and it is roughly
+        //    fixed per save — so detection scales with the NUMBER of saves, not
+        //    the size of each. 4 writers x 400 saves = 1600 windows.
+        //  * a moderate phases vec: big enough to keep the window open, small
+        //    enough that the reader's parse is cheap and it samples often. Both
+        //    a much fatter and a much thinner vec detect worse.
+        //  * each writer builds its `RunState` ONCE, outside the loop, so its
+        //    time goes into `fs::write` rather than into `format!`.
+        //
+        // Structured so NOTHING panics inside a spawned thread: a panic there
+        // would surface at a join on the main thread, which is holding ENV_LOCK,
+        // poisoning it and cascade-failing every other test in the binary. Threads
+        // return Results; the main thread asserts. `thread::scope` guarantees all
+        // threads are joined even if the body unwinds, so no thread can outlive
+        // the lock guard or the TempDir and race the next test's `set_var`.
+        const PHASES: usize = 200;
+        const WRITERS: usize = 4;
+        const SAVES: usize = 400;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        // Seed the file so the reader always has something to open.
+        fat_run("race", PHASES).save().unwrap();
+
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        let finished = &finished;
+        // Without this handshake the writers can burn through every save before
+        // the reader thread is first scheduled; the reader then does one clean
+        // read of a quiescent file and the test passes even against a
+        // deliberately non-atomic `save`. Verified by mutation: reverting `save`
+        // to a bare `fs::write` must fail this test.
+        let reading = std::sync::atomic::AtomicBool::new(false);
+        let reading = &reading;
+        let (write_errs, read_result) = std::thread::scope(|s| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    s.spawn(move || {
+                        let mut st = fat_run("race", PHASES);
+                        while !reading.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                        let mut errs = Vec::new();
+                        for i in 0..SAVES {
+                            st.cursor = w * 1000 + i;
+                            if let Err(e) = st.save() {
+                                errs.push(e.to_string());
+                            }
+                        }
+                        finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        errs
+                    })
+                })
+                .collect();
+            let reader = s.spawn(move || {
+                // Deadline backstop: if a writer dies without incrementing
+                // `finished`, this must fail the test rather than spin forever
+                // (`cargo test` has no per-test timeout, so a hang is worse than
+                // a failure).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let mut reads = 0usize;
+                loop {
+                    // Released only once the reader is actually in its loop, so
+                    // every save below overlaps a live read.
+                    reading.store(true, std::sync::atomic::Ordering::SeqCst);
+                    match RunState::load("race") {
+                        Ok(l) if l.phases.len() == PHASES => reads += 1,
+                        Ok(l) => {
+                            return Err(format!(
+                                "torn read: state.json parsed but held {} phases, not {PHASES}",
+                                l.phases.len()
+                            ));
+                        }
+                        Err(e) => return Err(format!("torn read: state.json did not parse: {e}")),
+                    }
+                    // Checked AFTER a read, so `reads` is non-zero even if every
+                    // writer finishes before this thread is first scheduled.
+                    if finished.load(std::sync::atomic::Ordering::SeqCst) == WRITERS {
+                        return Ok(reads);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err("writers never finished within 60s".to_string());
+                    }
+                }
+            });
+            let errs: Vec<String> = writers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+            (errs, reader.join().unwrap())
+        });
+
+        assert!(write_errs.is_empty(), "save() failed: {write_errs:?}");
+        let reads = read_result.expect("load must never observe a partially-written state.json");
+        assert!(reads > 0, "the reader thread must have observed some loads");
+    }
+
+    /// A `RunState` with `n` phases, fat enough that a non-atomic `save` has a
+    /// wide window in which a concurrent `load` sees a truncated file.
+    fn fat_run(name: &str, n: usize) -> RunState {
+        RunState {
+            name: name.into(),
+            task: "t".repeat(200),
+            agent: Some("claude".into()),
+            phases: (0..n)
+                .map(|i| Phase {
+                    name: format!("phase-{i}-{}", "x".repeat(64)),
+                    handoff_doc: Some("h".repeat(128)),
+                    ..Default::default()
+                })
+                .collect(),
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
+        }
+    }
+
+    #[test]
+    fn phase_default_is_pending_with_empty_fields() {
+        let p = Phase::new("plan");
+        assert_eq!(p.name, "plan");
+        assert_eq!(p.status, PhaseStatus::Pending);
+        assert!(p.handoff_doc.is_none());
+        assert!(p.herdr_session.is_none());
+        assert!(p.pane_id.is_none());
+        assert_eq!(Phase::default().name, "");
+        assert_eq!(PhaseStatus::default(), PhaseStatus::Pending);
+    }
+
+    #[test]
     fn find_phase_searches_both_lists() {
         let mk = |name: &str| Phase {
             name: name.into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         };
         let s = RunState {
             name: "r".into(),

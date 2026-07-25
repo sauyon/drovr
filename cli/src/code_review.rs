@@ -770,9 +770,7 @@ mod tests {
         let mk = |name: &str| Phase {
             name: name.into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         };
         run.review_phases = vec![
             mk("review:task-1:1:correctness"),
