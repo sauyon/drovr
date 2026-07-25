@@ -624,8 +624,8 @@ fn cmd_phase(sub: PhaseCmd) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
-            let state = load_run(&run);
-            if let Err(e) = phase_send(&h, &state, &phase_name, &text) {
+            let mut state = load_run(&run);
+            if let Err(e) = phase_send(&h, &mut state, &phase_name, &text) {
                 // A readiness timeout (agent never attached) is not a plain send
                 // failure — the agent is almost certainly parked on a prompt with
                 // no human at the pane. Raise it to the driver with the same
@@ -852,7 +852,18 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // then fail (e.g. a mid-spawn `phase_send` error) with those phases
             // only in memory, so an unconditional save here keeps disk and memory
             // in sync on every path — including the `Err` early-exit below.
-            save_run(&state);
+            //
+            // Transplant ONLY `review_phases` onto a freshly-loaded state. A panel
+            // runs for many minutes and `state` is a snapshot from before it
+            // started; writing the whole thing back would resurrect every pipeline
+            // phase's status as of panel-start — including a `Done` that a
+            // `phase send` re-entry has since cleared, which makes the next
+            // `phase wait` report success for an agent that is mid-work.
+            // `code_review_run` only ever mutates `review_phases`, so nothing else
+            // in the snapshot is worth keeping.
+            let mut merged = load_run(&run);
+            merged.review_phases = state.review_phases.clone();
+            save_run(&merged);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
                 process::exit(1);

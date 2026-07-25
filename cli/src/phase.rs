@@ -22,6 +22,79 @@ pub(crate) fn done_marker(run: &str, phase: &str) -> PathBuf {
     run_dir(run).join(format!("{phase}.done"))
 }
 
+/// Environment variable carrying the current pass's token into the phase agent.
+/// Set by `launch_in_pane`, read back by [`phase_done`] when the agent signals
+/// completion. Not a secret — a nonce that only needs to differ between passes.
+const PASS_ENV: &str = "DROVR_PASS";
+
+/// Mint a token for one pass over a phase. Uniqueness is all that is required
+/// (it is compared for equality, never parsed), and it must differ between two
+/// passes in the same process, so: pid + nanos + a process-local counter. The
+/// alphabet is deliberately `[0-9a-f-]` so the value is inert in a shell command
+/// and in a marker file.
+fn new_pass_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{:x}-{:x}-{:x}",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Delete a phase's completion marker, treating "already gone" as success and
+/// propagating every other failure with context. Callers depend on the marker
+/// being ABSENT afterwards, so a swallowed error here is a silent false-complete.
+fn remove_stale_marker(run_name: &str, phase: &str) -> io::Result<()> {
+    let marker = done_marker(run_name, phase);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "phase '{phase}': cannot clear stale completion marker {}: {e}. \
+                 Refusing to start — the phase would appear complete the moment \
+                 it is next awaited.",
+                marker.display()
+            ),
+        )),
+    }
+}
+
+/// Reject a phase name that could not address a real phase, at the two sites that
+/// APPEND one (`phase_start`, `spawn_reviewer`).
+///
+/// * Empty/whitespace: `Phase::default()` is representable with `name: ""`, and
+///   refusing to create one keeps an unnamed phase unreachable through
+///   `find_phase` without fighting the `..Default::default()` pattern.
+/// * Path separators, `..`, and a leading `.`: the name is interpolated into
+///   `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`, so `../../x`
+///   would place a run's marker outside its own directory.
+fn require_phase_name(phase: &str) -> io::Result<()> {
+    let bad = phase.trim().is_empty()
+        || phase.starts_with('.')
+        || phase.contains('/')
+        || phase.contains('\\')
+        || phase.contains("..")
+        || phase.contains('\0');
+    if bad {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid phase name {phase:?}: must be non-empty and must not \
+                 contain a path separator, '..', or a leading '.'"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -56,6 +129,7 @@ fn launch_in_pane<H: Herdr>(
     phase: &str,
     pane: &str,
     command: &str,
+    pass: &str,
 ) -> io::Result<()> {
     // Capture focus so the pane operations below don't steal it from the user.
     let prev_focus = h.focused_workspace();
@@ -67,6 +141,10 @@ fn launch_in_pane<H: Herdr>(
     // assignment isn't applied either. `env` sets the vars directly on the
     // launched process.
     //   * DROVR_PHASE tags the launch for the reflex hook (not a secret).
+    //   * DROVR_PASS identifies THIS pass over the phase. It lives in the agent's
+    //     environment precisely because that is immutable for the life of the
+    //     agent: a previous pass's agent keeps ITS token no matter what later
+    //     writes to state.json, so the marker it drops is always attributable.
     //   * CLAUDE_CONFIG_DIR selects the caller's claude profile so the agent
     //     authenticates as the right account instead of falling back to
     //     ~/.claude. It is a path, not a secret, so inlining it is safe; it is
@@ -74,8 +152,9 @@ fn launch_in_pane<H: Herdr>(
     //     `claude-prof` profile). Real secrets (API keys) are never inlined.
     // Values are single-quoted so spaces/metacharacters can't break out.
     let mut env_prefix = format!(
-        "env DROVR_PHASE={}",
-        shell_single_quote(&format!("{run_name}/{phase}"))
+        "env DROVR_PHASE={} {PASS_ENV}={}",
+        shell_single_quote(&format!("{run_name}/{phase}")),
+        shell_single_quote(pass),
     );
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         env_prefix.push_str(&format!(" CLAUDE_CONFIG_DIR={}", shell_single_quote(&dir)));
@@ -119,6 +198,7 @@ pub fn phase_start<H: Herdr>(
     phase: &str,
     seed: Option<&Path>,
 ) -> io::Result<()> {
+    require_phase_name(phase)?;
     if run.project_dir.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -136,12 +216,34 @@ pub fn phase_start<H: Herdr>(
     // phase would otherwise have its very next `phase wait` return `Done`
     // instantly off the stale marker and never await the agent just launched.
     //
-    // Placed ahead of the launch on purpose: the previous pass's agent is still
-    // alive (panes are never closed mid-run), so it could drop its marker at any
-    // moment. Deleting first makes the losing window as small as the code allows.
-    // It does NOT close the race entirely — that needs `phase_wait` to CONSUME
-    // the marker it observes, which is a separate change.
-    let _ = std::fs::remove_file(done_marker(&run.name, phase));
+    // RAISES on any failure other than "already gone": the whole fix rests on this
+    // delete, and a swallowed PermissionDenied would launch the agent into a phase
+    // whose next `phase wait` still short-circuits on the old marker — the exact
+    // silent false-complete this exists to prevent.
+    //
+    // This sweep is the FIRST line of defense, not the only one. The previous
+    // pass's agent is still alive and can recreate the marker a moment later; the
+    // pass token minted below is what makes that recreated marker identifiable.
+    remove_stale_marker(&run.name, phase)?;
+
+    // Mint this pass's token before the launch — it has to go into the agent's
+    // environment, which is fixed at exec time.
+    let pass = new_pass_token();
+
+    // Commit the new pass to state BEFORE anything fallible below, so that EVERY
+    // failure path fails closed:
+    //   * a leftover `Done` would make `phase_wait` short-circuit and report
+    //     success for a phase with no agent running;
+    //   * a `pass` of `None` puts the phase in the legacy "accept any marker"
+    //     bucket, so the previous pass's still-live agent could complete it.
+    // Writing `Running` + the NEW token here means a failed launch leaves a phase
+    // whose token no agent holds: every marker is rejected and the driver gets an
+    // honest timeout instead of a false completion.
+    if let Some(i) = find_phase_idx(run, phase) {
+        run.phases[i].status = PhaseStatus::Running;
+        run.phases[i].pass = Some(pass.clone());
+        run.save()?;
+    }
 
     // Pick the pane this phase's `claude` will run in, WITHOUT splitting a new
     // pane beside an empty shell:
@@ -178,7 +280,7 @@ pub fn phase_start<H: Herdr>(
     let cfg = load_config()?;
     let agent = run.agent.as_deref().unwrap_or("claude");
     let command = cfg.launch(agent, &cwd, false)?;
-    launch_in_pane(h, &run.name, phase, &target_pane, &command)?;
+    launch_in_pane(h, &run.name, phase, &target_pane, &command, &pass)?;
     // The launch succeeded, so this phase has now claimed the root pane (if it
     // used it); clear it so later phases don't try to reuse the same pane.
     if used_root {
@@ -199,6 +301,7 @@ pub fn phase_start<H: Herdr>(
     // pane_id only — herdr_session is not used for cleanup (workspace_close handles that)
     run.phases[idx].herdr_session = None;
     run.phases[idx].pane_id = Some(target_pane);
+    run.phases[idx].pass = Some(pass);
     run.phases[idx].status = PhaseStatus::Running;
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
@@ -232,6 +335,7 @@ pub fn spawn_reviewer<H: Herdr>(
     seed: Option<&Path>,
     launch_command: &str,
 ) -> io::Result<()> {
+    require_phase_name(phase)?;
     // Same guard as phase_start: a run with no project_dir can't anchor the
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
@@ -262,8 +366,20 @@ pub fn spawn_reviewer<H: Herdr>(
     // A fresh tab (with its auto shell pane) in the run workspace — never the root
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
     // launch itself.
+    // NOTE: deliberately does NOT sweep a pre-existing marker for this name, the
+    // way `phase_start` does. Reviewer names embed an iteration counter
+    // (`next_iter` = max+1 over an append-only `review_phases`), so a fresh
+    // reviewer name never has a marker — and `code_review_run`'s own wait loop
+    // treats a pre-dropped marker as a legitimate "already finished" signal, which
+    // its tests rely on. Sweeping here is a sound hardening once that loop is
+    // token-aware; see the task-1 handoff's note for task 6.
     let pane = h.tab_create(&ws, phase, &run.project_dir)?;
-    launch_in_pane(h, &run.name, phase, &pane, launch_command)?;
+    // Reviewers get a pass token too. They never collide with a previous pass
+    // (their names embed `iter`, and `next_iter` takes max+1 over an append-only
+    // `review_phases`), so this is uniformity rather than a fix — but it means
+    // every marker in the run dir is attributable to the launch that produced it.
+    let pass = new_pass_token();
+    launch_in_pane(h, &run.name, phase, &pane, launch_command, &pass)?;
 
     // Register the reviewer in `review_phases` only. The seed path rides on
     // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
@@ -273,6 +389,7 @@ pub fn spawn_reviewer<H: Herdr>(
         status: PhaseStatus::Running,
         handoff_doc: seed_str,
         pane_id: Some(pane),
+        pass: Some(pass),
         ..Default::default()
     });
     run.save()?;
@@ -342,8 +459,48 @@ fn wait_agent_ready<H: Herdr>(
 /// would silently swallow the seed and leave the phase to hang until its `phase
 /// wait` times out. Raising instead surfaces the stuck agent to the driver (the
 /// CLI enriches this with a pane snapshot via `diagnose_stuck_phase`).
-pub fn phase_send<H: Herdr>(h: &H, run: &RunState, phase: &str, text: &str) -> io::Result<()> {
+///
+/// Takes `&mut RunState` because sending to a FINISHED phase re-opens it. This is
+/// the pipeline's documented re-entry path — `skills/pipeline/SKILL.md`: "Re-entry
+/// needs **no `drovr phase start`** … `drovr phase send` reaches it directly" —
+/// and it is how the implement↔review loop drives an exit-3 iteration. Without the
+/// re-open, the previous iteration's `Done` status and completion marker both
+/// survive, so the `phase wait` that follows the send returns `Done` in
+/// microseconds while the agent has not yet read the prompt, and the driver
+/// advances (and, once task 6 lands, reaps a pane it just messaged).
+pub fn phase_send<H: Herdr>(h: &H, run: &mut RunState, phase: &str, text: &str) -> io::Result<()> {
     phase_send_with_timeout(h, run, phase, text, SEND_READY_TIMEOUT, POLL_INTERVAL)
+}
+
+/// Mark a PIPELINE phase live again for work being requested NOW: drop any
+/// completion marker and set the status back to `Running`, so the `phase_wait`
+/// that follows the send waits for this request instead of reporting an earlier
+/// one's completion.
+///
+/// The agent is the SAME process across a send re-entry (same pane, same
+/// `DROVR_PASS`), so the pass token cannot distinguish the two passes here — only
+/// clearing the previous completion can.
+///
+/// Both the sweep and the status reset are UNCONDITIONAL, not gated on
+/// `status == Done`. A marker sits on disk with a matching token during the whole
+/// interval between "the agent wrote it" and "some `phase_wait` consumed it", and
+/// if no wait was running that interval is unbounded — the status is still
+/// `Running`. Gating on `Done` would skip the sweep in exactly that state and the
+/// next wait would complete instantly off a marker that predates the send. Any
+/// marker present at send time necessarily records work finished BEFORE the
+/// request being made now, so discarding it is always right.
+///
+/// Reviewer phases no-op here: they live in `review_phases`, `find_phase_idx`
+/// searches `phases` only, and `phase_wait` never runs on them.
+fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<()> {
+    let Some(i) = find_phase_idx(run, phase) else {
+        return Ok(());
+    };
+    remove_stale_marker(&run.name, phase)?;
+    if run.phases[i].status != PhaseStatus::Running {
+        run.phases[i].status = PhaseStatus::Running;
+    }
+    run.save()
 }
 
 /// [`phase_send`] with an injectable readiness timeout + poll interval (so tests
@@ -351,7 +508,7 @@ pub fn phase_send<H: Herdr>(h: &H, run: &RunState, phase: &str, text: &str) -> i
 /// full production timeout or real 500ms poll cadence).
 fn phase_send_with_timeout<H: Herdr>(
     h: &H,
-    run: &RunState,
+    run: &mut RunState,
     phase: &str,
     text: &str,
     ready_timeout: Duration,
@@ -377,6 +534,12 @@ fn phase_send_with_timeout<H: Herdr>(
             ),
         ));
     }
+    // Re-open ONLY now. The agent is at its composer and has not seen `text`, so
+    // any marker on disk is from earlier work and is safe to discard — while
+    // sweeping before the readiness gate would destroy the record of a genuine
+    // completion on every failed send (a phase parked on a permission prompt
+    // would lose its `Done` and its marker without any new work being requested).
+    reopen_for_re_entry(run, phase)?;
     h.agent_send(&pane_id, text)
 }
 
@@ -421,8 +584,67 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&marker, b"")?;
+    // Stamp the marker with the pass token this agent was launched under, so
+    // `phase_wait` can tell "the agent I am waiting on finished" from "some
+    // earlier agent for this phase, still alive in the reused pane, finished".
+    //
+    // Written ATOMICALLY (temp + rename), like `RunState::save`: a plain
+    // `fs::write` truncates in place, and `phase_wait` polls this file from
+    // another process every 500 ms. A poll landing in the truncate window would
+    // read an EMPTY token — which, before this was atomic, was treated as
+    // "untokenized, accept" and so completed the wrong pass.
+    //
+    // The surrounding single quotes are stripped defensively: the token reaches
+    // the agent through `herdr pane run`'s command string, and if herdr ever
+    // hands the argument to a shell that does NOT strip them, the value would
+    // arrive as `'abc-1'`. Our tokens never contain a quote, so this is free.
+    let token = std::env::var(PASS_ENV).unwrap_or_default();
+    let token = token.trim().trim_matches('\'');
+    // Unique per writer: the two agents this change exists to distinguish can
+    // both be running `phase done` for the same phase, and a shared temp path
+    // would have one rename the other's file out from under it.
+    let tmp = marker.with_extension(format!(
+        "done.tmp.{}.{}",
+        std::process::id(),
+        new_pass_token()
+    ));
+    if let Err(e) = std::fs::write(&tmp, token.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &marker) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(marker)
+}
+
+/// Does a `<phase>.done` marker holding `token` complete the pass identified by
+/// `expected`?
+///
+/// * No `expected` — a phase from a run created before pass tokens, whose live
+///   agent has no `DROVR_PASS` to stamp. Complete on existence alone, exactly as
+///   before, rather than hanging such a run forever. This is the ONLY fail-open
+///   path, and it closes for good the first time `phase_start` re-enters the
+///   phase and mints a token.
+/// * Otherwise the tokens must match EXACTLY — an empty or mismatched token does
+///   not complete the phase. This is the load-bearing case: the previous pass's
+///   agent holds ITS token in an environment fixed at exec time, so a marker it
+///   recreates after `phase_start`'s sweep is provably rejected.
+///
+/// Empty is deliberately NOT accepted for a tokened phase, even though that means
+/// `drovr phase done` run from outside the pane cannot complete one. Accepting it
+/// would reopen the race twice over: through `fs::write`'s truncate window (hence
+/// the atomic marker write in [`phase_done`]), and for an agent launched by a
+/// PREVIOUS BUILD of drovr, which carries no token at all — a run re-entered
+/// across an upgrade would falsely complete off its old agent. The documented
+/// flow has the agent run `phase done` from inside its own pane, where the token
+/// is always present.
+fn marker_completes_pass(token: &str, expected: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(want) => !token.is_empty() && token == want,
+    }
 }
 
 /// The outcome of `phase_wait`. Maps 1:1 to a `drovr phase wait` exit code (see
@@ -466,15 +688,77 @@ pub fn phase_wait<H: Herdr>(
     let idx = find_phase_idx(run, phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
+    // An already-Done phase completes instantly. This is what keeps `phase wait`
+    // idempotent now that the marker is CONSUMED below: re-waiting a finished
+    // phase must not block. A re-entered phase cannot reach this — `phase_start`
+    // always resets the status to `Running`.
+    if run.phases[idx].status == PhaseStatus::Done {
+        return Ok(PhaseWaitOutcome::Done);
+    }
     let pane_id = run.phases[idx].pane_id.clone();
+    let expected_pass = run.phases[idx].pass.clone();
     let marker = done_marker(&run.name, phase);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut mismatch_reported = false;
     loop {
-        if marker.exists() {
-            let idx = find_phase_idx(run, phase).unwrap();
-            run.phases[idx].status = PhaseStatus::Done;
-            run.save()?;
-            return Ok(PhaseWaitOutcome::Done);
+        if let Ok(token) = std::fs::read_to_string(&marker) {
+            let token = token.trim();
+            if marker_completes_pass(token, expected_pass.as_deref()) {
+                // Before committing, check this wait has not been SUPERSEDED.
+                // `expected_pass` was snapshotted at entry and a wait can run for
+                // an hour; if a `phase start` re-entered the phase meanwhile, this
+                // process is waiting on a pass that no longer exists, and the
+                // marker it just matched belongs to that dead pass. Completing
+                // here would both report a false `Done` for the live agent and
+                // write this process's stale whole-state snapshot back over the
+                // re-entry. Report a timeout instead — honest: this pass's
+                // completion was never observed by anyone who still cares.
+                if let Ok(fresh) = RunState::load(&run.name)
+                    && fresh.find_phase(phase).map(|p| p.pass.clone()) != Some(expected_pass.clone())
+                {
+                    eprintln!(
+                        "drovr: phase '{phase}' was re-entered while this wait was running —                          the completion it saw belongs to a superseded pass. Not marking done."
+                    );
+                    return Ok(PhaseWaitOutcome::TimedOut);
+                }
+                // Persist the completion BEFORE consuming the marker. The marker
+                // is the only durable record that the agent finished; if `save`
+                // failed after the unlink, the completion would be lost forever
+                // (the agent has already exited its `phase done` and will not
+                // signal again) and every later wait would time out.
+                let idx = find_phase_idx(run, phase).unwrap();
+                run.phases[idx].status = PhaseStatus::Done;
+                run.save()?;
+                // Now best-effort consume, so the marker cannot satisfy a LATER
+                // pass. Failure here is harmless — the status is already durably
+                // `Done`, and both re-entry paths sweep the marker anyway — so it
+                // must not turn a successful wait into exit 1.
+                let _ = remove_stale_marker(&run.name, phase);
+                return Ok(PhaseWaitOutcome::Done);
+            }
+            // A marker from a DIFFERENT pass: the previous pass's agent is still
+            // alive in the reused pane and signalled done again.
+            //
+            // IGNORE it — do NOT delete it. A `phase wait` left over from an
+            // earlier pass holds that pass's token in memory and never re-reads
+            // state.json; if mismatches were unlinked, that stale waiter would
+            // delete the CURRENT pass's marker the moment it landed, and the real
+            // waiter would then time out on a phase that actually completed. The
+            // current agent's own marker overwrites this path when it lands, and
+            // both re-entry paths sweep it, so ignoring is sufficient.
+            //
+            // Announce it once: a silently-rejected marker is indistinguishable
+            // from "the agent never finished", and this is the one signal that
+            // tells a human the token transport (or a stale agent) is the problem.
+            if !mismatch_reported {
+                mismatch_reported = true;
+                eprintln!(
+                    "drovr: phase '{phase}' has a completion marker from a different pass \
+                     (marker token {token:?}, awaiting {expected:?}) — ignoring it and \
+                     continuing to wait for this pass's agent.",
+                    expected = expected_pass.as_deref().unwrap_or("<none>"),
+                );
+            }
         }
         // Proactively catch a blocked pane so the driver is signalled immediately
         // instead of hanging until the wait's full timeout. Only `blocked` short-
@@ -801,6 +1085,11 @@ mod tests {
         // Start each test from a clean run dir so a stale `.done` marker or
         // state.json from a prior run can't leak across test invocations.
         let _ = std::fs::remove_dir_all(run_dir(name));
+        // `phase_done` stamps the pass token into the marker; a value left behind
+        // by another test would silently change what `phase_wait` accepts.
+        unsafe {
+            std::env::remove_var(PASS_ENV);
+        }
         RunState {
             name: name.to_owned(),
             task: "test task".into(),
@@ -1001,13 +1290,12 @@ mod tests {
         let mut run = make_run("wait-done-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        // The phase agent authors its handoff, then signals completion.
-        std::fs::write(
-            run_dir(&run.name).join("plan-HANDOFF.md"),
-            "## Objective\nself-authored handoff\n",
-        )
-        .unwrap();
-        let marker = phase_done(&run, "plan").unwrap();
+        // The phase agent authors its handoff, then signals completion — from
+        // inside its pane, so the marker carries this pass's token.
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
+        let marker = done_marker(&run.name, "plan");
         assert!(
             marker.exists(),
             "marker should exist at {}",
@@ -1082,12 +1370,9 @@ mod tests {
         phase_start(&h, &mut run, "plan", None).unwrap();
         // Marker present AND a blocked status queued: the marker is checked first,
         // so the phase is Done and the status is never consulted.
-        std::fs::write(
-            run_dir(&run.name).join("plan-HANDOFF.md"),
-            "## Objective\nself-authored handoff\n",
-        )
-        .unwrap();
-        phase_done(&run, "plan").unwrap();
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
         h.push_status(Some("blocked"));
 
         let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
@@ -1401,7 +1686,7 @@ mod tests {
         });
         // Report the pane ready so the readiness gate returns on the first poll.
         h.push_status(Some("idle"));
-        phase_send(&h, &run, "review:t:1:correctness", "seed text").unwrap();
+        phase_send(&h, &mut run, "review:t:1:correctness", "seed text").unwrap();
         let calls = h.calls();
         let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
         assert!(
@@ -1420,7 +1705,7 @@ mod tests {
         phase_start(&h, &mut run, "code", None).unwrap();
         // Report the pane ready so the readiness gate returns on the first poll.
         h.push_status(Some("idle"));
-        phase_send(&h, &run, "code", "hello agent").unwrap();
+        phase_send(&h, &mut run, "code", "hello agent").unwrap();
 
         // Last call should be agent_send
         let calls = h.calls();
@@ -1466,7 +1751,7 @@ mod tests {
         // Tiny poll interval so the three waited polls don't cost real wall-clock.
         phase_send_with_timeout(
             &h,
-            &run,
+            &mut run,
             "code",
             "hello agent",
             Duration::from_secs(5),
@@ -1509,7 +1794,7 @@ mod tests {
         h.push_status(Some("working"));
 
         let start = Instant::now();
-        phase_send(&h, &run, "code", "follow-up").unwrap();
+        phase_send(&h, &mut run, "code", "follow-up").unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "send to a working agent must not wait out the readiness timeout"
@@ -1545,7 +1830,7 @@ mod tests {
         // deadline. Deterministic, ~50ms wall-clock.
         let err = phase_send_with_timeout(
             &h,
-            &run,
+            &mut run,
             "code",
             "seed text",
             Duration::from_millis(50),
@@ -1642,9 +1927,8 @@ mod tests {
 
         // Pass 1: the phase runs and signals done, leaving `<phase>.done` behind.
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
-        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
-        std::fs::write(&hp, "## Objective\nreal handoff\n").unwrap();
+        let pass_1 = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
         let marker = phase_done(&run, "plan").unwrap();
         assert!(marker.exists());
 
@@ -1659,7 +1943,17 @@ mod tests {
         );
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
 
+        // Drive the phase to a genuine `Done` in state, so the pass-3 assertions
+        // below actually exercise the reset (nothing else writes `Done`).
+        agent_signals_done(&run, "plan", &run.phases[0].pass.clone().unwrap());
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+        assert_eq!(run.phases[0].status, PhaseStatus::Done);
+
         // Pass 3, with the launch scripted to fail: the marker must STILL be gone.
+        // (Also proves the delete is not skipped when the launch errors.)
         // That pins the delete AHEAD of `launch_in_pane` — the previous pass's
         // agent is still alive and can drop a marker at any moment, so deleting
         // late leaves a wider window in which `phase wait` short-circuits on it.
@@ -1670,6 +1964,403 @@ mod tests {
         assert!(
             !marker.exists(),
             "the stale marker must be cleared before the launch, not after it"
+        );
+        // ...and the phase must not be left reporting the PREVIOUS pass's
+        // completion. `phase_wait` short-circuits on a `Done` status, so a failed
+        // re-launch that left `Done` behind would report success for a phase with
+        // no agent running at all.
+        assert_ne!(
+            run.phases[0].status,
+            PhaseStatus::Done,
+            "a failed re-launch must not leave the previous pass's Done status"
+        );
+        // The reset persists the NEW token rather than clearing it: a phase whose
+        // token no agent holds rejects every marker (fail-closed). Clearing to
+        // `None` would drop it into the legacy "accept any marker" bucket while
+        // the previous pass's agent is still alive — fail-open, the wrong way.
+        let after = run.phases[0].pass.clone().expect("a started phase always has a token");
+        assert_ne!(
+            after, pass_1,
+            "a re-launch must not leave the PREVIOUS pass's token"
+        );
+    }
+
+    // -- pass tokens: a re-entered phase must not complete off the old pass ------
+    //
+    // The pre-launch marker delete only narrows the window. The PREVIOUS pass's
+    // agent is still alive in the reused pane (panes are never closed mid-run) and
+    // can run `drovr phase done` again at any moment, recreating the marker after
+    // the delete. Every test below drives that exact sequence.
+
+    /// Simulate the agent launched by pass `token` running `drovr phase done`:
+    /// the pane's environment carries `DROVR_PASS`, so the marker it writes is
+    /// stamped with that pass's token.
+    fn agent_signals_done(run: &RunState, phase: &str, token: &str) {
+        unsafe {
+            std::env::set_var(PASS_ENV, token);
+        }
+        phase_done(run, phase).unwrap();
+        unsafe {
+            std::env::remove_var(PASS_ENV);
+        }
+    }
+
+    fn write_handoff(run: &RunState, phase: &str) {
+        let hp = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(&hp, "## Objective\nreal handoff\n").unwrap();
+    }
+
+    #[test]
+    fn phase_wait_rejects_a_marker_recreated_by_the_previous_pass() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("stale-pass-test");
+
+        // Pass 1 runs to completion.
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass_a = run.phases[0].pass.clone().expect("pass 1 must mint a token");
+        write_handoff(&run, "plan");
+        agent_signals_done(&run, "plan", &pass_a);
+
+        // Pass 2 re-enters the phase: fresh token, stale marker swept.
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass_b = run.phases[0].pass.clone().expect("pass 2 must mint a token");
+        assert_ne!(pass_a, pass_b, "each pass must mint a distinct token");
+        assert!(!done_marker(&run.name, "plan").exists());
+
+        // THE RACE: pass 1's agent is still alive and signals done again. Its
+        // environment was fixed at ITS launch, so the marker carries pass 1's
+        // token — no state change can make it carry pass 2's.
+        agent_signals_done(&run, "plan", &pass_a);
+        assert!(done_marker(&run.name, "plan").exists());
+
+        // The driver must NOT be told pass 2 finished.
+        let out = phase_wait(&h, &mut run, "plan", 50).unwrap();
+        assert_eq!(
+            out,
+            PhaseWaitOutcome::TimedOut,
+            "a marker from a previous pass must never complete the current one"
+        );
+        assert_eq!(
+            run.phases[0].status,
+            PhaseStatus::Running,
+            "the phase must stay Running so the driver keeps awaiting the live agent"
+        );
+    }
+
+    #[test]
+    fn phase_wait_accepts_the_current_passs_marker_and_consumes_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("current-pass-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
+        agent_signals_done(&run, "plan", &pass);
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+        assert_eq!(run.phases[0].status, PhaseStatus::Done);
+        // Consumed: no marker is left to be mistaken for a later pass's.
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "phase_wait must consume the marker it accepts"
+        );
+        // ...but re-waiting a Done phase is still instant, off the recorded status.
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done,
+            "re-waiting an already-Done phase must stay idempotent"
+        );
+    }
+
+    #[test]
+    fn send_to_a_finished_phase_reopens_it_so_the_next_wait_actually_waits() {
+        // The pipeline's DOCUMENTED re-entry (skills/pipeline/SKILL.md): after an
+        // exit-3 review iteration the driver runs `phase send` — NOT `phase start`
+        // — into the still-live agent, then `phase wait`. If the send does not
+        // re-open the phase, the previous iteration's Done status and marker both
+        // survive and that wait returns Done in microseconds while the agent has
+        // not even read the prompt. The driver then advances (and, once reaping
+        // lands, tears down the pane it just messaged).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-reentry-test");
+
+        phase_start(&h, &mut run, "implement-task-1", None).unwrap();
+        let pass = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "implement-task-1");
+        agent_signals_done(&run, "implement-task-1", &pass);
+        assert_eq!(
+            phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+
+        // The still-live agent drops ANOTHER marker (it re-ran `phase done`, or
+        // simply finished again) after the wait consumed the first. Without this
+        // the sweep assertion below would hold vacuously — `phase_wait` had
+        // already removed the marker.
+        agent_signals_done(&run, "implement-task-1", &pass);
+        assert!(done_marker(&run.name, "implement-task-1").exists());
+
+        // Exit 3: forward the findings to the SAME live agent.
+        h.push_status(Some("idle"));
+        phase_send(&h, &mut run, "implement-task-1", "fix every finding").unwrap();
+        assert_eq!(
+            run.phases[0].status,
+            PhaseStatus::Running,
+            "sending to a finished phase must re-open it"
+        );
+        assert!(
+            !done_marker(&run.name, "implement-task-1").exists(),
+            "the previous iteration's marker must be swept on re-entry"
+        );
+
+        // The wait that follows must now actually wait.
+        assert_eq!(
+            phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "the wait after a send must not report the PREVIOUS iteration's completion"
+        );
+
+        // The same agent (same pane, same token) finishing the fix completes it.
+        agent_signals_done(&run, "implement-task-1", &pass);
+        assert_eq!(
+            phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+    }
+
+    #[test]
+    fn send_sweeps_a_marker_even_when_the_phase_is_still_running() {
+        // The gap a `status == Done` gate would leave open. A marker sits on disk
+        // with a MATCHING token for the whole interval between "the agent wrote
+        // it" and "some phase_wait consumed it" — and if no wait was running, that
+        // interval is unbounded, with the status still `Running`. A send that
+        // skipped the sweep in that state would be followed by a wait that
+        // completes instantly off work finished before the send was even issued.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-running-sweep-test");
+
+        phase_start(&h, &mut run, "implement-task-1", None).unwrap();
+        let pass = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "implement-task-1");
+        // The agent finishes, but NOBODY waits — status stays Running.
+        agent_signals_done(&run, "implement-task-1", &pass);
+        assert_eq!(run.phases[0].status, PhaseStatus::Running);
+        assert!(done_marker(&run.name, "implement-task-1").exists());
+
+        h.push_status(Some("idle"));
+        phase_send(&h, &mut run, "implement-task-1", "more work").unwrap();
+        assert!(
+            !done_marker(&run.name, "implement-task-1").exists(),
+            "a send must sweep the marker even when the phase is still Running"
+        );
+        assert_eq!(
+            phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "the wait after a send must not complete off work that predates it"
+        );
+    }
+
+    #[test]
+    fn failed_send_preserves_the_previous_completion() {
+        // The sweep is destructive, so it must happen only once the send is known
+        // deliverable. An agent parked on a permission prompt never becomes ready;
+        // sweeping before that gate would discard a genuine completion (marker AND
+        // Done status) without any new work having been requested.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("failed-send-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
+        agent_signals_done(&run, "plan", &pass);
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+        agent_signals_done(&run, "plan", &pass); // agent re-signals; nobody consumes
+
+        // The pane never attaches → the send fails. (Same idiom as
+        // `send_raises_and_does_not_send_when_agent_never_ready`: enough queued
+        // `unknown`s that the queue cannot drain to FakeHerdr's `idle` default
+        // within the tiny timeout.)
+        for _ in 0..8 {
+            h.push_status(Some("unknown"));
+        }
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            "text",
+            Duration::from_millis(50),
+            POLL_INTERVAL,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            run.phases[0].status,
+            PhaseStatus::Done,
+            "a failed send must not re-open the phase"
+        );
+        assert!(
+            done_marker(&run.name, "plan").exists(),
+            "a failed send must not destroy the previous completion marker"
+        );
+    }
+
+    #[test]
+    fn phase_wait_ignores_an_untokenized_marker_for_a_tokened_phase() {
+        // An EMPTY marker must not complete a phase that has a token. Accepting it
+        // would reopen the race twice: through `fs::write`'s truncate window, and
+        // for an agent launched by a PREVIOUS BUILD of drovr (no DROVR_PASS at
+        // all), whose marker would otherwise complete a pass it knows nothing
+        // about. The documented flow has the agent run `phase done` from inside
+        // its own pane, where the token is always present.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("untokenized-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        assert!(run.phases[0].pass.is_some());
+        write_handoff(&run, "plan");
+        phase_done(&run, "plan").unwrap(); // no DROVR_PASS in env → empty marker
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "an untokenized marker must not complete a tokened phase"
+        );
+        // Ignored, NOT deleted: unlinking another pass's marker lets a leftover
+        // waiter destroy the real completion signal.
+        assert!(
+            done_marker(&run.name, "plan").exists(),
+            "a rejected marker must be left alone, not unlinked"
+        );
+    }
+
+    #[test]
+    fn phase_wait_accepts_any_marker_for_a_phase_with_no_recorded_pass() {
+        // Back-compat: a run whose state.json predates pass tokens has
+        // `pass: None`. Such a phase must complete on marker existence alone,
+        // exactly as before, rather than hanging forever.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("legacy-pass-test");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p1".into()),
+            ..Default::default()
+        });
+        assert!(run.phases[0].pass.is_none());
+        write_handoff(&run, "plan");
+        agent_signals_done(&run, "plan", "some-token-from-anywhere");
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+    }
+
+    #[test]
+    fn phase_start_surfaces_a_stale_marker_it_cannot_remove() {
+        // The whole stale-marker fix rests on this delete succeeding. If it fails
+        // for any reason other than "already gone", phase_start must RAISE — a
+        // silent `let _ =` would launch the agent into a phase whose next
+        // `phase wait` still short-circuits on the old marker.
+        use std::os::unix::fs::PermissionsExt;
+        /// Restore the directory's permissions even if the test panics. Without
+        /// this a panic leaves the run dir at 0o555 with a marker inside, which
+        /// `make_run`'s `remove_dir_all` cannot clear — so EVERY later run of this
+        /// test fails, and its panic (under the held ENV_LOCK) poisons the mutex
+        /// and reds the whole suite.
+        struct RestorePerms(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("unremovable-marker-test");
+
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(done_marker(&run.name, "plan"), b"").unwrap();
+        let orig = std::fs::metadata(&dir).unwrap().permissions();
+        let _restore = RestorePerms(dir.clone(), orig);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Running as root ignores directory permissions — skip rather than assert
+        // something the environment cannot produce.
+        let root = std::fs::write(dir.join(".probe"), b"").is_ok();
+        let res = phase_start(&h, &mut run, "plan", None);
+
+        if root {
+            return;
+        }
+        let err = res.expect_err("an unremovable stale marker must fail phase_start");
+        assert!(
+            err.to_string().contains("stale completion marker"),
+            "the error must name what went wrong: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_run")),
+            "the agent must not be launched when the marker could not be cleared: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn phase_start_rejects_an_empty_phase_name() {
+        // `Phase::default()` is representable with `name: ""`; the only site that
+        // appends a phase must refuse to create one, so an unnamed phase is never
+        // addressable via find_phase.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("empty-name-test");
+        assert!(phase_start(&h, &mut run, "", None).is_err());
+        assert!(phase_start(&h, &mut run, "   ", None).is_err());
+        for bad in ["../../etc/x", "a/b", "a\\b", ".hidden", "a\0b", ".."] {
+            assert!(
+                phase_start(&h, &mut run, bad, None).is_err(),
+                "phase name {bad:?} must be rejected: it lands the marker and the \
+                 handoff outside the run dir"
+            );
+        }
+        assert!(run.phases.is_empty(), "no phase may be appended");
+        assert!(
+            spawn_reviewer(&h, &mut run, "", None, "claude").is_err(),
+            "spawn_reviewer must refuse an unnamed reviewer too"
+        );
+        assert!(run.review_phases.is_empty());
+    }
+
+    #[test]
+    fn launch_exports_the_pass_token_to_the_agent() {
+        // The token has to reach the agent's ENVIRONMENT (not just state.json):
+        // that is what makes it immutable for the life of that agent, and so what
+        // makes a marker attributable to the pass that wrote it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("pass-env-test");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        let pass = run.phases[0].pass.clone().unwrap();
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(&format!("DROVR_PASS='{pass}'")),
+            "pane_run must export the pass token, single-quoted: {run_call}"
         );
     }
 
@@ -1733,7 +2424,7 @@ mod tests {
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(
-            run_call.contains(r"DROVR_PHASE='start-test/brainstorm' claude"),
+            run_call.contains(r"DROVR_PHASE='start-test/brainstorm' DROVR_PASS="),
             "pane_run command must carry a single-quoted DROVR_PHASE=<run>/<phase>: {run_call}"
         );
         // Auth secrets must never be inlined into the launch command.
@@ -1773,9 +2464,9 @@ mod tests {
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(
             run_call.contains(
-                r"DROVR_PHASE='cfg-dir-test/brainstorm' CLAUDE_CONFIG_DIR='/home/user/.config/claude-work' claude"
-            ),
-            "CLAUDE_CONFIG_DIR must be inlined single-quoted after DROVR_PHASE: {run_call}"
+                r"CLAUDE_CONFIG_DIR='/home/user/.config/claude-work' claude"
+            ) && run_call.contains(r"DROVR_PHASE='cfg-dir-test/brainstorm'"),
+            "CLAUDE_CONFIG_DIR must be inlined single-quoted alongside DROVR_PHASE: {run_call}"
         );
         // A real secret still never rides the command line.
         assert!(
@@ -1805,7 +2496,7 @@ mod tests {
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         // The value is a single quoted word; the metacharacters are inert.
         assert!(
-            run_call.contains(r"DROVR_PHASE='inject-test/p; rm -rf ~' claude"),
+            run_call.contains(r"DROVR_PHASE='inject-test/p; rm -rf ~' DROVR_PASS="),
             "unsafe phase name must be single-quoted: {run_call}"
         );
     }
@@ -2090,7 +2781,7 @@ mod tests {
         // phase_send routes to the reviewer pane registered in review_phases.
         // Report the pane ready so the readiness gate returns on the first poll.
         h.push_status(Some("idle"));
-        phase_send(&h, &run, "review:t:1:correctness", "here is your brief").unwrap();
+        phase_send(&h, &mut run, "review:t:1:correctness", "here is your brief").unwrap();
         let send_call = h
             .calls()
             .into_iter()

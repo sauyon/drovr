@@ -30,6 +30,15 @@ pub struct Phase {
     pub handoff_doc: Option<String>,
     pub herdr_session: Option<String>,
     pub pane_id: Option<String>,
+    /// Token identifying the CURRENT pass over this phase, minted by each
+    /// `phase_start` and exported into the agent's environment as `DROVR_PASS`.
+    /// `drovr phase done` stamps it into `<phase>.done`, and `phase_wait` accepts
+    /// a marker only if its token matches this one — which is what stops the
+    /// previous pass's still-live agent from completing the current pass by
+    /// recreating the marker. `None` for runs created before pass tokens existed;
+    /// such phases fall back to completing on marker existence alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
 }
 
 impl Phase {
@@ -509,6 +518,31 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
         }
+    }
+
+    #[test]
+    fn missing_phase_pass_defaults_to_none() {
+        // The Phase-level back-compat guard. `Phase`'s fields are NOT
+        // `#[serde(default)]` as a group, so any field added without its own
+        // `#[serde(default)]` makes EVERY existing state.json fail to load →
+        // `load_run` exits 1 → the run STOPs. This pins that `pass` (and, by
+        // example, whatever task 3 adds next) is absent-tolerant.
+        let json = r#"{
+            "name":"old","task":"t",
+            "phases":[{"name":"plan","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w:p1"}],
+            "gate":"spec","cursor":0,"project_dir":"/tmp/proj"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        assert!(
+            loaded.phases[0].pass.is_none(),
+            "a Phase written before pass tokens must load with pass: None"
+        );
+        // And a phase with no pass must not start emitting one on re-save.
+        let out = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !out.contains("\"pass\""),
+            "pass: None must be skipped on serialize: {out}"
+        );
     }
 
     #[test]
