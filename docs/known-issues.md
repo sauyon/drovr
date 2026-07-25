@@ -220,6 +220,19 @@ Apply the `phase send` agent-readiness fix (poll `agent_status` until attached/a
 the reviewer-spawn path in `code_review.rs`, and bound each reviewer with a liveness check so a
 never-attached pane fails fast instead of hanging the whole panel.
 
+### Also seen (2026-07-25, run `harden-review`, `harden/supply-chain`)
+
+Reproduced dogfooding the panel on the supply-chain-hardening change, on a host where
+**`cursor` IS integrated** (so the review agent resolves to cursor, not claude). Here the
+panel fails at the *first* step — `code-review run failed: agent target <ws>:p2 not found` —
+on **both** the merged binary (`main`) **and** a fresh build of `fix/phase-send-await-agent-ready`
+(`a71d1a8`). Confirmed why: the readiness fix that branch name promises lives on the **`drovr
+phase send` CLI path** (`main.rs` `Send` awaits attach), but `code-review run` calls the
+**internal** `phase::phase_send` (`code_review.rs`), still a bare `agent_send` with no readiness
+poll (`launch_in_pane` fires `pane_run` and returns; the orchestrator sends immediately). So the
+fix idea above is the real gap — the reviewer-spawn path never got the wait, regardless of
+backend; the cursor spawn just loses the race faster than claude.
+
 ## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
 
 **Severity:** low (recoverable, but every phase injection needs a manual nudge, so an
