@@ -1029,6 +1029,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_explicit_host() {
+        // An explicit `--host` parses to `Some(..)`, which `cmd_serve` uses
+        // verbatim (bypassing the `serve_host` config fallback).
+        let cli = parse(&["drovr", "serve", "myrun", "--host", "0.0.0.0"]).unwrap();
+        match cli.command {
+            Commands::Serve { host, .. } => assert_eq!(host, Some("0.0.0.0".to_string())),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn parse_phase_start() {
         let cli = parse(&["drovr", "phase", "start", "myrun", "brainstorm"]).unwrap();
         match cli.command {

@@ -49,6 +49,10 @@ that created the run. Pin a review backend independently when needed:
 default_agent = "claude"
 review_agent = "codex"
 angles = ["correctness", "security", "error-handling", "type-design"]
+# Default host `drovr serve` binds to when `--host` is omitted. Override it to
+# reach the review UI from other devices — e.g. your Tailscale IP on a trusted
+# tailnet (the server has no authentication).
+serve_host = "127.0.0.1"
 ```
 
 An explicit `review_agent` is honored without availability-based fallback, so

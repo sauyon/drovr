@@ -56,6 +56,8 @@ pub struct Config {
 // Standalone default fns are REQUIRED (not `#[serde(default)]` bare): serde's bare default
 // calls `BTreeMap::default()` (EMPTY) when the TOML omits `[agents]`, which would make the
 // built-in claude entry vanish on any real config file and break `reviewer_launch("claude")`.
+// The same trap applies to non-empty String defaults like `serve_host`: bare `#[serde(default)]`
+// yields `String::default()` (`""`), not `"127.0.0.1"`, so it needs a named fn too.
 // Each default fn seeds the built-in value so an absent field falls back correctly.
 fn default_agent() -> String {
     "claude".into()
@@ -195,6 +197,12 @@ pub fn load_config() -> io::Result<Config> {
         Err(e) => return Err(e),
     };
     let mut config: Config = toml::from_str(&text).map_err(io::Error::other)?;
+    // An empty `serve_host` is a config mistake, not a request for the default
+    // (serde's default only fires for an *absent* key). Reject it here so the
+    // failure is a clear config error rather than an opaque bind error later.
+    if config.serve_host.trim().is_empty() {
+        return Err(io::Error::other("serve_host must not be empty"));
+    }
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
             spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
@@ -433,6 +441,7 @@ mod tests {
             r#"
 default_agent = "claude"
 review_agent = "codex"
+serve_host = "0.0.0.0"
 angles = ["correctness", "security", "error-handling", "type-design"]
 
 [agents.claude]
@@ -449,6 +458,8 @@ readonly_flag = "--sandbox read-only"
 
         let cfg = load_config().unwrap();
         assert_eq!(cfg.review_agent.as_deref(), Some("codex"));
+        // A file-set serve_host propagates through load_config (not just the default path).
+        assert_eq!(cfg.serve_host, "0.0.0.0");
         assert!(cfg.agents.contains_key("claude"));
         assert!(cfg.agents.contains_key("codex"));
         assert_eq!(
@@ -593,6 +604,19 @@ readonly_flag = "--sandbox read-only"
         let dir = tmp.path().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "this is = = not valid toml [[[").unwrap();
+        set_config_home(tmp.path());
+
+        assert!(load_config().is_err());
+    }
+
+    #[test]
+    fn empty_serve_host_errors() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Explicit empty string is a mistake, not a request for the default.
+        std::fs::write(dir.join("config.toml"), "serve_host = \"\"\n").unwrap();
         set_config_home(tmp.path());
 
         assert!(load_config().is_err());
