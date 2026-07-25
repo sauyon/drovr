@@ -182,7 +182,8 @@ drovr code-review run <run> task-<N>                             # re-run the pa
 Re-entry needs **no `drovr phase start`**: `drovr phase done` only writes a marker — it never
 closes the pane (panes live until `drovr cleanup`), so the task's agent is still alive and
 `drovr phase send` reaches it directly. The agent drops a fresh `drovr phase done` marker when
-it finishes the fix, which the following `phase wait` consumes.
+it finishes the fix, which the following `phase wait` sees. `phase send` clears the previous
+iteration's completion first, so that wait really does wait.
 
 Loop with **impact-scaled judgement** — no hardcoded floor or ceiling on iterations. Stop when
 the panel is clean *and* converged for the change's impact (a small change may need one pass; a

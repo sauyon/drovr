@@ -1,5 +1,40 @@
 # Known issues
 
+## `phase wait` times out on a phase completed by a PRE-pass-token drovr build
+
+Introduced by the pass-token change (task 1 of the phase-reap work).
+
+### Symptom
+
+`drovr phase wait <run> <phase>` exits 2 (timeout) for a phase whose `state.json` already says
+`"status": "Done"`, and the run dir has no `<phase>.done` marker.
+
+### Root cause
+
+The build before pass tokens CONSUMED the completion marker when a wait accepted it, and relied on
+a `status == Done` short-circuit to make a re-wait idempotent. That short-circuit is gone: a stale
+`Done` on disk is no longer accepted as evidence, because every "marker destroyed but state write
+did not land" failure produced exactly that state and would have been reported as a false
+completion. The verdict now derives solely from the marker plus its pass token.
+
+So a phase completed by the older binary has `Done` recorded but no marker left to prove it, and
+the new binary honestly reports that it has no evidence.
+
+### Working around it
+
+Only affects a phase that was already `Done` before the upgrade AND is waited on again. The normal
+flow self-heals: `drovr phase send <run> <phase> "<instructions>"` re-opens the phase (clearing the
+stale status), and the live agent's next `drovr phase done` completes it normally.
+
+To accept the old completion as-is, re-signal it deliberately from the run dir:
+
+```
+: > "$(drovr path <run>)/<phase>.done"      # or: touch <run_dir>/<phase>.done
+```
+
+An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
+case.
+
 ## The agent's change summary is hidden on the first review — FIXED 2026-07-25
 
 **Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;

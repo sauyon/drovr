@@ -11,6 +11,43 @@ pub enum PhaseStatus {
     Failed,
 }
 
+/// Identifies ONE launch of a phase's agent ("pass"). Minted by `phase_start`,
+/// carried to the agent in `$DROVR_PASS`, stamped into `<phase>.done`, and
+/// compared for equality by `phase_wait` — never parsed, ordered, or displayed as
+/// anything but itself.
+///
+/// A newtype rather than a bare `String` because every other string in this area
+/// (phase names, pane ids, marker paths, env var names) is also a `String`, and
+/// mixing them up would be a silent equality check that is always false — i.e. a
+/// phase that never completes. This makes that class of mistake a type error.
+///
+/// Serializes transparently as a JSON string, so `state.json` is unchanged.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default)]
+pub struct PassToken(String);
+
+impl PassToken {
+    pub fn new(value: String) -> PassToken {
+        PassToken(value)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// Whether a `<phase>.done` marker holding `token` was written by the agent
+    /// this pass launched. Empty never matches: an empty marker means the writer
+    /// had no `$DROVR_PASS` at all, which is either a pre-token build or a
+    /// `phase done` run from outside the pane — neither is evidence about *this*
+    /// pass.
+    pub fn matches_marker(&self, token: &str) -> bool {
+        !token.is_empty() && token == self.0
+    }
+}
+
+impl std::fmt::Display for PassToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One phase of a run. Construct via [`Phase::new`] or
 /// `Phase { name: …, ..Default::default() }` — never by listing every field, so
 /// adding a field stays a one-line diff instead of touching ~25 literal sites.
@@ -35,10 +72,13 @@ pub struct Phase {
     /// `drovr phase done` stamps it into `<phase>.done`, and `phase_wait` accepts
     /// a marker only if its token matches this one — which is what stops the
     /// previous pass's still-live agent from completing the current pass by
-    /// recreating the marker. `None` for runs created before pass tokens existed;
-    /// such phases fall back to completing on marker existence alone.
+    /// recreating the marker. `None` only for runs created before pass tokens
+    /// existed — `phase_start` persists a token before it launches anything, so no
+    /// phase this build has started is ever `None`. Such a legacy phase completes
+    /// on an UNTOKENIZED marker (its agent has no `$DROVR_PASS` to stamp either);
+    /// a tokened marker against it is an inconsistency and is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pass: Option<String>,
+    pub pass: Option<PassToken>,
 }
 
 impl Phase {
@@ -543,6 +583,25 @@ mod tests {
             !out.contains("\"pass\""),
             "pass: None must be skipped on serialize: {out}"
         );
+    }
+
+    #[test]
+    fn pass_token_only_matches_a_non_empty_equal_marker() {
+        let t = PassToken::new("abc-1".into());
+        assert!(t.matches_marker("abc-1"));
+        assert!(!t.matches_marker("abc-2"));
+        assert!(
+            !t.matches_marker(""),
+            "an empty marker is not evidence about any pass"
+        );
+        // Serializes transparently: state.json shape is unchanged by the newtype.
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"abc-1\"");
+        let p: Phase = serde_json::from_str(
+            r#"{"name":"plan","status":"Running","handoff_doc":null,
+                "herdr_session":null,"pane_id":null,"pass":"xyz-9"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.pass.unwrap().as_str(), "xyz-9");
     }
 
     #[test]
