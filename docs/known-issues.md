@@ -593,6 +593,38 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
+## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
+
+**Severity:** low on loopback, medium once `serve_host` leaves it.
+**Found:** 2026-07-25, reviewing the archive button.
+
+### What IS guarded
+
+`handle` refuses any `POST` whose `Origin` is cross-origin or opaque (`origin_allowed`,
+`cli/src/review.rs`). That closes the drive-by case: a page the user happens to visit can no
+longer make their browser POST `/api/runs/<run>/archive` and close a live herdr workspace,
+nor `/send` into a live pane, nor `/submit` a spec decision. Browsers always attach `Origin`
+on a cross-origin request and script cannot suppress it; curl and drovr's own CLI send none
+and are unaffected.
+
+### What is NOT guarded
+
+There is still no authentication of any kind. Anything that can open a TCP connection to the
+port can do everything — the `Origin` check constrains *browsers*, and a non-browser client
+simply omits the header. This matters because `serve_host` is documented as configurable
+beyond loopback (`cli/src/config.rs`; the Tailscale/LAN case is called out in `display_addr`).
+On a shared or untrusted network that is a full remote-control surface: close workspaces,
+type into live agent panes, approve or cancel specs.
+
+### Fix ideas
+
+1. A bearer token in the data dir, required on every write and handed to the page at load.
+   Cheap, and makes a non-loopback bind honest.
+2. Refuse to bind a non-loopback host unless such a token is configured — the bind guard
+   already sketched in the `mcp-endpoint` run's spec.
+3. (2) is the smaller change and prevents the dangerous configuration outright; (1) is what
+   would make serving across a tailnet actually usable.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**

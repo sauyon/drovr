@@ -58,7 +58,31 @@ pub trait Herdr {
     /// move focus (it shells `herdr pane get`, which does not focus), so
     /// `phase_wait` can poll it every iteration without disturbing the user.
     fn agent_status(&self, pane_id: &str) -> Option<String>;
+    /// Every live workspace id, or `None` if herdr could not be reached/parsed.
+    ///
+    /// One call answers "is this run still alive?" for EVERY run at once, which is
+    /// what makes it affordable on the session list's 2s poll — the per-run
+    /// alternative (`agent_status` on each recorded `pane_id`) is a herdr round
+    /// trip per row. `None` is deliberately distinct from `Some(vec![])`: "herdr
+    /// is down, we do not know" must not read as "nothing is running", or the UI
+    /// would offer to archive live runs without warning.
+    fn workspace_list(&self) -> Option<Vec<String>>;
     fn integration_present(&self, agent: &str) -> bool;
+}
+
+/// Pull `result.workspaces[].workspace_id` out of a `herdr workspace list`
+/// response. Split out from the trait impl so the shape can be pinned by tests
+/// without a live herdr.
+fn parse_workspace_ids(stdout: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let workspaces = v.get("result")?.get("workspaces")?.as_array()?;
+    Some(
+        workspaces
+            .iter()
+            .filter_map(|w| w.get("workspace_id").and_then(|i| i.as_str()))
+            .map(|s| s.to_owned())
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +267,14 @@ impl Herdr for SystemHerdr {
             .map(|s| s.to_owned())
     }
 
+    fn workspace_list(&self) -> Option<Vec<String>> {
+        let out = self.run(&["workspace", "list"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_workspace_ids(&String::from_utf8_lossy(&out.stdout))
+    }
+
     fn workspace_focus(&self, id: &str) -> io::Result<()> {
         let out = self.run(&["workspace", "focus", id])?;
         if !out.status.success() {
@@ -389,6 +421,12 @@ pub struct FakeHerdr {
     status_queue: RefCell<VecDeque<Option<String>>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
+    /// What `workspace_list` reports. `None` models an unreachable herdr, which
+    /// callers must treat as "unknown", not "nothing is live".
+    live_workspaces: RefCell<Option<Vec<String>>>,
+    /// When true, `workspace_close` errors (models closing an already-gone
+    /// workspace, the common case when a run's panes died long ago).
+    fail_workspace_close: RefCell<bool>,
 }
 
 #[cfg(test)]
@@ -400,7 +438,18 @@ impl FakeHerdr {
             read_queue: RefCell::new(VecDeque::new()),
             status_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
+            live_workspaces: RefCell::new(Some(Vec::new())),
+            fail_workspace_close: RefCell::new(false),
         }
+    }
+
+    /// Declare which workspace ids herdr should report as live.
+    pub fn set_live_workspaces(&self, ids: Option<Vec<String>>) {
+        *self.live_workspaces.borrow_mut() = ids;
+    }
+
+    pub fn set_fail_workspace_close(&self, fail: bool) {
+        *self.fail_workspace_close.borrow_mut() = fail;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -456,7 +505,15 @@ impl Herdr for FakeHerdr {
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
         self.record(format!("workspace_close id={id}"));
+        if *self.fail_workspace_close.borrow() {
+            return Err(io::Error::other("workspace not found"));
+        }
         Ok(())
+    }
+
+    fn workspace_list(&self) -> Option<Vec<String>> {
+        self.record("workspace_list".to_string());
+        self.live_workspaces.borrow().clone()
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
@@ -533,6 +590,40 @@ impl Herdr for FakeHerdr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_workspace_ids_from_a_real_herdr_response() {
+        // Trimmed from actual `herdr workspace list` output (herdr 0.7.5). Kept
+        // verbatim in shape so a field rename upstream fails here rather than
+        // silently reporting every run as dead — which would let the UI offer to
+        // archive a workspace that is very much alive.
+        let out = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+            {"active_tab_id":"w1:t31","agent_status":"idle","focused":false,"label":"modular","number":1,"pane_count":3,"tab_count":3,"workspace_id":"w1"},
+            {"active_tab_id":"wAG:t1","agent_status":"working","focused":false,"label":"drovr:skill-stickiness","number":5,"pane_count":1,"tab_count":1,"workspace_id":"wAG"}
+        ]}}"#;
+        assert_eq!(
+            parse_workspace_ids(out),
+            Some(vec!["w1".to_string(), "wAG".to_string()])
+        );
+    }
+
+    #[test]
+    fn workspace_id_parse_failures_are_unknown_not_empty() {
+        // The distinction matters: `Some(vec![])` means "herdr answered, nothing
+        // is running"; `None` means "we could not ask". Callers gate a
+        // destructive archive on it, so conflating the two would drop the guard.
+        assert_eq!(parse_workspace_ids("not json"), None);
+        assert_eq!(parse_workspace_ids(r#"{"result":{}}"#), None);
+        assert_eq!(
+            parse_workspace_ids(r#"{"result":{"workspaces":[]}}"#),
+            Some(vec![])
+        );
+        // A workspace entry missing its id is skipped, not fatal.
+        assert_eq!(
+            parse_workspace_ids(r#"{"result":{"workspaces":[{"label":"x"},{"workspace_id":"w2"}]}}"#),
+            Some(vec!["w2".to_string()])
+        );
+    }
 
     #[test]
     fn fake_records_and_returns() {

@@ -87,6 +87,7 @@ const KEYS = {
   k: { key: 'k', code: 'KeyK', vk: 75, text: 'k' },
   g: { key: 'g', code: 'KeyG', vk: 71, text: 'g' },
   G: { key: 'G', code: 'KeyG', vk: 71, text: 'G', mods: 8 },
+  a: { key: 'a', code: 'KeyA', vk: 65, text: 'a' },
   h: { key: 'h', code: 'KeyH', vk: 72, text: 'h' },
   i: { key: 'i', code: 'KeyI', vk: 73, text: 'i' },
   '/': { key: '/', code: 'Slash', vk: 191, text: '/' },
@@ -133,7 +134,8 @@ const cursorName = () => evaluate(`
 // the page's RUN_ROW_SEL: probes run against a page that may still be parsing,
 // and a bare reference throws ReferenceError before the script defines it. The
 // two are pinned together by the drift check in the completed-sessions section.
-const RUN_ROW_SEL = "#run-list-items > .run-row, #run-list-items details[open] .run-row";
+const RUN_ROW_SEL = "#run-list-items > .run-row-wrap > .run-row, " +
+                    "#run-list-items details[open] .run-row-wrap > .run-row";
 const rowNames = () => evaluate(`
   return Array.from(document.querySelectorAll(${JSON.stringify(RUN_ROW_SEL)})).map(function(e){return e.querySelector('.run-name').textContent;});`);
 // Every row in the DOM, collapsed or not.
@@ -335,6 +337,105 @@ const after = await waitFor(rowNames, r => r[0] === bump, 8000, 'list re-sort');
 check('the list really did re-sort', after[0], bump);
 check('and the anchored run really changed index', after.indexOf(anchored) !== names.indexOf(anchored), true);
 check('cursor stayed on its run across the re-sort', await cursorName(), anchored);
+
+console.log('\n== session list: archive button ==');
+await goto('#/', LIST_READY);
+// Deterministic whether or not a real herdr is reachable from this machine: with
+// herdr up the fixtures report live:false, without it live:null, and only the
+// latter prompts. Stub the prompt so both paths proceed.
+const stubConfirm = () => evaluate(`
+  window.__confirms = 0;
+  window.confirm = function(){ window.__confirms++; return true; };
+  window.__alerts = [];
+  window.alert = function(m){ window.__alerts.push(m); };
+  return 1;`);
+const btnFor = name => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(name)}; });
+  return b ? b.textContent : null;`);
+const clickArchive = name => evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(name)}; }).click();
+  return 1;`);
+
+await stubConfirm();
+check('every row carries an archive control',
+  await evaluate(`return document.querySelectorAll('.run-archive').length > 0;`), true);
+check('an active run offers Archive', await btnFor('beta-cache'), 'Archive');
+
+// The control is a sibling of the <a>, not a child — clicking must not navigate.
+const beforeHash = await hash();
+await clickArchive('beta-cache');
+await waitFor(rowNames, r => r.indexOf('beta-cache') === -1, 6000, 'beta-cache leaves the list');
+check('archiving does not navigate away from the list', await hash(), beforeHash);
+check('the archived run leaves the active list', (await rowNames()).indexOf('beta-cache'), -1);
+check('...and is still present, under Completed',
+  (await allRowNames()).indexOf('beta-cache') !== -1, true);
+check('it persisted server-side', await evaluate(`
+  return fetch('/api/runs').then(function(r){return r.json();}).then(function(rows){
+    var row = rows.find(function(x){ return x.name === 'beta-cache'; });
+    return !!(row && row.archived && row.complete);
+  });`), true);
+
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open for restore');
+check('an archived run offers Restore', await btnFor('beta-cache'), 'Restore');
+await clickArchive('beta-cache');
+await waitFor(rowNames, r => r.indexOf('beta-cache') !== -1, 6000, 'beta-cache returns');
+check('restoring puts it back in the active list',
+  (await rowNames()).indexOf('beta-cache') !== -1, true);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed again');
+
+// The safety property the whole feature turns on: archiving a run that MAY have
+// live panes must prompt first, because closing the workspace destroys the
+// agent's context. Driven client-side with fetch stubbed — the fixtures record
+// no workspace (so a reachable herdr reports live:false and the branch would
+// never run), and stubbing keeps this from mutating server state, which made an
+// earlier state-cycling version order-dependent and wrong.
+const gateProbe = (archived, live) => evaluate(`
+  window.__confirms = 0;
+  window.__posted = 0;
+  window.confirm = function(){ window.__confirms++; return true; };
+  var realFetch = window.fetch;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/archive') !== -1) {
+      window.__posted++;
+      return Promise.resolve({ok: true, json: function(){ return Promise.resolve({ok:true, workspace_closed:true}); }});
+    }
+    return realFetch(u, o);
+  };
+  return toggleArchive('probe-run', ${archived}, ${JSON.stringify(live)}).then(function(){
+    window.fetch = realFetch;
+    return {confirms: window.__confirms, posted: window.__posted};
+  });`);
+
+check('archiving a definitively-dead run does NOT prompt',
+  await gateProbe(false, '0'), {confirms: 0, posted: 1});
+check('archiving a LIVE run prompts first',
+  await gateProbe(false, '1'), {confirms: 1, posted: 1});
+check('archiving with UNKNOWN liveness also prompts',
+  await gateProbe(false, 'unknown'), {confirms: 1, posted: 1});
+check('restoring never prompts, whatever liveness says',
+  await gateProbe(true, '1'), {confirms: 0, posted: 1});
+
+// 'a' acts on the row under the nav cursor.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const aTarget = await cursorName();
+await press('a');
+await waitFor(rowNames, r => r.indexOf(aTarget) === -1, 6000, `'a' archives ${aTarget}`);
+check("'a' archives the row under the cursor", (await rowNames()).indexOf(aTarget), -1);
+check('...and the cursor did not strand on the now-hidden row',
+  (await cursorName()) !== aTarget && (await cursorName()) !== null, true);
+// Restore it so the sections below see the original fixture.
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open to restore');
+await clickArchive(aTarget);
+await waitFor(rowNames, r => r.indexOf(aTarget) !== -1, 6000, `${aTarget} restored`);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed after restore');
 
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);

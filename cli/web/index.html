@@ -583,12 +583,17 @@
     grid-template-columns: 14px minmax(120px, 1fr) 160px 2fr;
     align-items: center;
     gap: 12px;
-    padding: 12px 14px;
+    /* Right padding reserves the lane the absolutely-positioned archive button
+       occupies, so the task text ellipsises before it reaches the control
+       instead of sliding underneath it. */
+    padding: 12px 82px 12px 14px;
     border-bottom: 1px solid var(--border, #2a2a2a);
     text-decoration: none;
     color: inherit;
   }
-  .run-row:last-child { border-bottom: none; }
+  /* The row is wrapped now, so `.run-row:last-child` would never match — the
+     anchor is always the FIRST child of .run-row-wrap, the button the last. */
+  .run-row-wrap:last-child > .run-row { border-bottom: none; }
   .run-row:hover { background: var(--hover, rgba(127,127,127,0.08)); }
   .run-name { font-weight: 600; }
   .run-state { font-size: 12px; opacity: 0.8; }
@@ -634,6 +639,32 @@
     transition: transform 0.12s ease;
   }
   .run-group[open] > summary::before { transform: rotate(90deg); }
+
+  /* ---- Archive control ----
+     The row itself is an <a>, and interactive content may not nest inside one,
+     so the button is a SIBLING in a positioned wrapper, not a child of the link.
+     Keeping the anchor intact preserves middle-click, Cmd-click and the
+     browser's own link keyboard handling. */
+  .run-row-wrap { position: relative; }
+  .run-archive {
+    position: absolute;
+    right: 10px; top: 50%; transform: translateY(-50%);
+    font: inherit; font-size: 11px;
+    padding: 3px 9px;
+    border: 1px solid var(--border, #2a2a2a);
+    border-radius: 5px;
+    background: var(--bg, #161616);
+    color: var(--muted, #9a9a9a);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.1s ease;
+  }
+  /* Revealed on hover, and ALWAYS on focus — an opacity-0 control that never
+     appears for keyboard users is unreachable in practice. */
+  .run-row-wrap:hover .run-archive,
+  .run-archive:focus { opacity: 1; }
+  .run-archive:hover { color: var(--fg, #e8e8e8); border-color: var(--muted, #9a9a9a); }
+  .run-archive.is-live { border-color: #f5a623; color: #f5a623; }
 
   /* ---- Live session mirror ---- */
   .session-view {
@@ -830,6 +861,7 @@
         <tr><td>Enter &nbsp;o &nbsp;l &nbsp;&rarr;</td><td>open the session under the cursor</td></tr>
         <tr><td>1&ndash;9</td><td>pick that option on the question under the cursor</td></tr>
         <tr><td>i</td><td>type a custom answer on that question</td></tr>
+        <tr><td>a</td><td>archive / restore the session under the cursor</td></tr>
         <tr><td>/ &nbsp;C-s</td><td>filter sessions</td></tr>
       </table>
       <h2>Leave</h2>
@@ -1931,13 +1963,78 @@ function runRow(run) {
   var dot = run.complete && run.state !== 'cancelled'
     ? '<span class="run-check">✓</span>'
     : '<span class="run-dot state-' + escHtml(run.state) + '"></span>';
-  return '<a class="run-row' + (run.complete ? ' is-complete' : '') +
+  // `live` is true / false / null, and null means "herdr could not be asked".
+  // Unknown is treated exactly like live: archiving closes panes, so the warning
+  // must not be skipped just because we failed to look.
+  var maybeLive = run.live !== false;
+  var label = run.archived ? 'Restore' : 'Archive';
+  var title = run.archived
+    ? 'Clear the archived flag. Panes are not reopened — resume with drovr phase start.'
+    : (maybeLive
+        ? (run.live === null
+            ? 'Archive — could not reach herdr to check for live panes; will confirm first'
+            : 'Archive — this run still has live panes; will confirm first')
+        : 'Archive — files the run away; no live panes to close');
+  var btn = '<button class="run-archive' + (!run.archived && maybeLive ? ' is-live' : '') +
+    '" data-run="' + escHtml(run.name) + '" data-archived="' + (run.archived ? '1' : '0') +
+    '" data-live="' + (run.live === null ? 'unknown' : (run.live ? '1' : '0')) +
+    '" title="' + escHtml(title) + '" aria-label="' + escHtml(label + ' session ' + run.name) +
+    '">' + label + '</button>';
+  return '<div class="run-row-wrap">' +
+    '<a class="run-row' + (run.complete ? ' is-complete' : '') +
       '" href="#/runs/' + encodeURIComponent(run.name) + '">' +
-    dot +
-    '<span class="run-name">' + escHtml(run.name) + '</span>' +
-    '<span class="run-state">' + escHtml(meta) + '</span>' +
-    '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
-  '</a>';
+      dot +
+      '<span class="run-name">' + escHtml(run.name) + '</span>' +
+      '<span class="run-state">' + escHtml(meta) + '</span>' +
+      '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
+    '</a>' + btn +
+  '</div>';
+}
+
+/// Archive or restore `name`. Confirms first whenever archiving could close live
+/// panes — including the unknown case — because the agent's conversation context
+/// dies with the pane and is not recoverable by resuming the run.
+async function toggleArchive(name, archived, live) {
+  // Captured BEFORE the awaits below, like every other async flow here. The POST
+  // blocks on a herdr round-trip, and the reviewer can open a run meanwhile —
+  // re-rendering the list then would run applyNavCursor against the detail
+  // view's question rows (they share `navCursor`) and yank the cursor on a page
+  // that has nothing to do with this action.
+  var gen = routeGen;
+  if (!archived && live !== '0') {
+    var why = live === 'unknown'
+      ? 'Could not reach herdr to check whether "' + name + '" has live panes.'
+      : 'Session "' + name + '" still has live panes.';
+    if (!window.confirm(why + '\n\nArchiving closes its herdr workspace. The run itself ' +
+        'resumes with `drovr phase start`, but the running agent\'s context is lost — ' +
+        'anything it has not written to a HANDOFF doc goes with it.\n\nArchive anyway?')) {
+      return;
+    }
+  }
+  try {
+    var r = await fetch('/api/runs/' + encodeURIComponent(name) + '/archive', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({archived: !archived}),
+    });
+    if (!r.ok) { console.error('[drovr] archive failed', r.status); return; }
+    // The server archives even when the workspace could not be closed — refusing
+    // would leave a row nobody can clear. But if we thought panes were alive and
+    // the close did NOT happen, the run is now filed away while its agent keeps
+    // running. That must not pass silently: the only other record is the
+    // server's stderr, which nobody looking at this page can see.
+    var res = await r.json().catch(function() { return {}; });
+    if (!archived && live !== '0' && res.workspace_closed === false) {
+      window.alert('Archived "' + name + '", but its herdr workspace could not be closed.\n\n' +
+        'Its panes may still be running. Check with `herdr workspace list`, and close it ' +
+        'with `drovr cleanup ' + name + '` once herdr is reachable.');
+    }
+  } catch (e) {
+    console.error('[drovr] archive failed', e);
+    return;
+  }
+  if (gen !== routeGen) return;
+  renderRunList(gen);
 }
 
 async function renderRunList(gen) {
@@ -1977,6 +2074,21 @@ async function renderRunList(gen) {
       '</details>';
     }
     listEl.innerHTML = html;
+
+    // Delegated once on the container, which survives every innerHTML rebuild —
+    // per-button listeners would be re-attached on each 2s poll.
+    if (!listEl.dataset.archiveBound) {
+      listEl.dataset.archiveBound = '1';
+      listEl.addEventListener('click', function(e) {
+        var btn = e.target.closest ? e.target.closest('.run-archive') : null;
+        if (!btn) return;
+        // The button sits inside the row wrapper, beside the <a>. Stop the event
+        // before it can bubble into a navigation.
+        e.preventDefault();
+        e.stopPropagation();
+        toggleArchive(btn.dataset.run, btn.dataset.archived === '1', btn.dataset.live);
+      });
+    }
 
     var group = listEl.querySelector('.run-group');
     if (group) {
@@ -2208,7 +2320,8 @@ var QUESTION_ITEM_SEL = '#questions-area .question-item';
 // Rows inside a COLLAPSED "Completed" group are deliberately excluded: they are
 // not on screen, and j/k must never park the cursor somewhere invisible. The two
 // selectors are in document order, so active rows still precede completed ones.
-var RUN_ROW_SEL = '#run-list-items > .run-row, #run-list-items details[open] .run-row';
+var RUN_ROW_SEL = '#run-list-items > .run-row-wrap > .run-row, ' +
+                  '#run-list-items details[open] .run-row-wrap > .run-row';
 
 function navRows() {
   var sel = currentRun ? QUESTION_ITEM_SEL : RUN_ROW_SEL;
@@ -2509,6 +2622,16 @@ function initKeyNav() {
         // Back out of a run to the session list. On the list itself there is
         // nowhere further back, so this is a no-op rather than a history pop.
         if (currentRun) { e.preventDefault(); location.hash = '#/'; }
+        break;
+      case 'a':
+        // List view only — on a run's detail view 'a' has no row to act on.
+        if (!currentRun) {
+          e.preventDefault();
+          var row = navRows()[navCursor];
+          var ab = row && row.parentElement
+            ? row.parentElement.querySelector('.run-archive') : null;
+          if (ab) toggleArchive(ab.dataset.run, ab.dataset.archived === '1', ab.dataset.live);
+        }
         break;
       case 'i':                    e.preventDefault(); focusCustomAnswer(); break;
       case '/':                    e.preventDefault(); openFilter(); break;

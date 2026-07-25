@@ -130,8 +130,16 @@ impl RunState {
         serde_json::from_str(&fs::read_to_string(p)?).map_err(io::Error::other)
     }
     pub fn save(&self) -> io::Result<()> {
-        let dir = run_dir(&self.name);
-        fs::create_dir_all(&dir)?;
+        self.save_in(&run_dir(&self.name))
+    }
+    /// Save into an explicitly given run directory.
+    ///
+    /// The always-on server is parameterised on a `runs_root` (a temp dir under
+    /// test), so its writers must not go through [`RunState::save`]: that
+    /// resolves `run_dir()` from the ambient `XDG_DATA_HOME` and would write to
+    /// the developer's real data dir instead of the root the server was handed.
+    pub fn save_in(&self, dir: &std::path::Path) -> io::Result<()> {
+        fs::create_dir_all(dir)?;
         fs::write(
             dir.join("state.json"),
             serde_json::to_string_pretty(self).map_err(io::Error::other)?,
