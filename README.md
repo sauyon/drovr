@@ -107,6 +107,32 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
 | `drovr cleanup <name> [--purge]` | Stop herdr sessions. With `--purge`, remove the run directory. |
 
+### Review UI keyboard navigation
+
+The review server's pages are drivable without a mouse, vim- or emacs-style. A
+cursor moves over the session list on the landing page, and over the run's open
+questions on a run page. Press <kbd>?</kbd> in the UI for the same table.
+
+| Keys | Action |
+|---|---|
+| `j` `↓` `C-n`* · `k` `↑` `C-p` | next / previous row or question |
+| `g` `M-<` · `G` `M->` | first / last |
+| `C-v` `M-v` | page down / up |
+| `Enter` `o` `l` `→` | open the session under the cursor |
+| `1`–`9` | pick that option on the question under the cursor |
+| `i` | type a custom answer on that question |
+| `/` `C-s` | filter the session list |
+| `h` `←` | back to the session list |
+| `Esc` `C-g` | close the filter or help, or leave a text box |
+| `?` | key help |
+
+Keys never fire while you are typing in a text box — `Esc`/`C-g` steps out
+first. \* `C-n` only reaches the page on macOS, where the browser's own modifier
+is Cmd; Chrome and Firefox on Linux/Windows reserve `Ctrl+N` for a new window and
+a page cannot intercept it. The bind is always registered — on Linux/Windows the
+in-app help adds a footnote saying your browser will take it, and that footnote
+is hidden on macOS where it does not apply.
+
 ### Plumbing
 
 | Command | Description |

@@ -1,5 +1,73 @@
 # Known issues
 
+## The agent's change summary is hidden on the first review — FIXED 2026-07-25
+
+**Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;
+the `turn > 0` clause is gone. Regression check: "the agent change summary shows on the
+first review (turn 0)" in `cli/tests/web/nav.mjs`, whose fixture seeds a `ready` run at
+turn 0 with a posted summary.
+
+**Severity:** medium (on turn 0 the reviewer sees a spec with no statement of what the agent did or is asking — exactly the turn where that context is most needed).
+**Found:** 2026-07-25, QA'ing a full gate cycle on a throwaway run (`qa-cache`): `drovr review summary` succeeded, `GET /api/runs/<run>/summary` returned the text, and the banner still did not render.
+
+### Symptom
+
+The brainstorm agent posts a summary, the run flips to `ready`, and the reviewer opens the
+page — but the "Agent change summary" banner is not shown. It appears only from the second
+review turn onward (after one request-changes round trip).
+
+### Root cause
+
+`cli/web/index.html:1643` gates the banner on the turn counter:
+
+```js
+if (summaryText && turn > 0) { ... showEl('summary-banner'); }
+else { hideEl('summary-banner'); }
+```
+
+`turn` only increments when the reviewer submits, so it is `0` for the whole first review.
+The `turn > 0` test appears to be aimed at "only show a summary once there is a previous
+version to describe", but the summary is not a diff — `review summary` is the agent's own
+statement of what it wants reviewed, and it is equally meaningful on turn 0. Introduced in
+`8f98013` (interactive review server), unrelated to the questions/navigation work.
+
+### Fix
+
+Dropped the `turn > 0` clause and gated on `summaryText` alone. The empty-summary case is
+already covered by the same condition, so a run that never posted a summary still shows no
+banner.
+
+## Editing `cli/web/index.html` can silently test the OLD page
+
+**Severity:** low (no runtime bug — but it wastes debugging cycles and can make a real fix look broken).
+**Found:** 2026-07-25, while adding the review UI's keyboard navigation.
+
+### Symptom
+
+You edit `cli/web/index.html`, run `cargo build` (which reports `Compiling drovr`),
+restart `drovr serve` — and the browser still shows the previous markup. Checking the
+served HTML for a string you just added returns nothing.
+
+### Root cause
+
+`cli/src/review.rs` embeds the page with `include_str!("../web/index.html")`, so the HTML
+lives in the **binary**, not on disk at request time. `serve` never re-reads the file. Cargo
+does track `include_str!` inputs, but a rebuild triggered by an unrelated source change can
+finish without re-embedding the newer HTML, so the build "succeeds" while the binary keeps
+the old page.
+
+### Working around it
+
+`touch cli/web/index.html` before `cargo build` whenever the page changed, then confirm the
+binary actually carries the change before you debug anything:
+
+```
+grep -ac '<a-string-you-just-added>' cli/target/debug/drovr    # -a: it's a binary
+```
+
+`grep` without `-a` prints nothing useful here and reads as "not present" either way.
+`cli/tests/web_nav.rs` has the same exposure — it drives whatever HTML was compiled in.
+
 ## Review-server Submit button does nothing when `questions.json` is not a bare array
 
 **Severity:** high (the human spec gate is unusable — the reviewer's decision can never be recorded from the UI).
@@ -86,7 +154,13 @@ through `collectAnswers()` reproduces the uncaught `TypeError` before any fetch.
 4. Add a UI/integration test that feeds a malformed `questions.json` and asserts Submit
    still posts (or shows an error), locking in the fault tolerance.
 
-## `approve` discards the reviewer's question answers
+## `approve` discards the reviewer's question answers — FIXED 2026-07-25
+
+**Status:** fixed on `feat/questions-ui`. `handle_post_submit`'s approve branch now
+writes the same `feedback.json` the request-changes branch does
+(`{turn, decision:"approve", feedback, answers, annotations}`), with the turn advanced so a
+driver can tell this turn's answers from a stale previous turn's. Regression test:
+`review::tests::submit_approve_persists_question_answers`.
 
 **Severity:** medium (multiple-choice answers on the spec gate are silently lost on approval, so the downstream plan phase never sees the reviewer's picks).
 **Found:** 2026-07-24, run `gpu-deploy-view` — reviewer answered 4 open questions and approved; no answers were persisted anywhere.

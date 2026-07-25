@@ -99,7 +99,9 @@
   .shell {
     max-width: 900px;
     margin: 0 auto;
-    padding: 20px 16px 60px;
+    /* Bottom padding clears the fixed #keyhint bar (~27px) with room to spare, so
+       the last row stays readable at large browser zoom / font sizes. */
+    padding: 20px 16px 72px;
   }
 
   .topbar {
@@ -445,6 +447,23 @@
     font-size: 0.88rem;
     cursor: pointer;
   }
+  .question-other {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.88rem;
+  }
+  .question-other input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.86rem;
+  }
   .rec-badge {
     background: var(--accent);
     color: #fff;
@@ -652,6 +671,75 @@
     background: var(--surface); color: var(--text); font: inherit;
   }
   .new-session-form textarea { min-height: 56px; resize: vertical; }
+
+  /* ---- Keyboard navigation ---- */
+  /* The cursor is a rendered class, not DOM focus: the run list re-renders every
+     two seconds, which would blow away real focus. Left bar + tint so it stays
+     legible against .run-row:hover and the question panel's own background. */
+  .nav-cursor {
+    background: var(--hover, rgba(127,127,127,0.10));
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .question-item.nav-cursor { border-radius: 4px; }
+  /* Hidden via the inline style attribute, not here: showEl() clears
+     `style.display`, so a `display:none` in this rule would win and the box
+     would never open. */
+  #nav-filter {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }
+  #nav-filter input {
+    border: none; background: none; color: var(--text);
+    font: inherit; width: 90%; outline: none;
+  }
+  #keyhint {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 5px 14px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    white-space: nowrap;
+    overflow-x: auto;
+    z-index: 40;
+  }
+  #keyhint kbd {
+    font-family: inherit; color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 0 3px; margin: 0 1px;
+  }
+  /* The `?` hint is a real button so the help is reachable by mouse and by Tab,
+     not only by the key it documents. Styled to sit flush in the hint bar. */
+  #keyhint button {
+    background: none; border: none; padding: 0; margin: 0;
+    font: inherit; color: inherit; cursor: pointer;
+  }
+  #keyhint button:hover kbd, #keyhint button:focus-visible kbd { border-color: var(--accent); }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  #key-help {
+    position: fixed; inset: 0; z-index: 50;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45);
+  }
+  #key-help.open { display: flex; }
+  #key-help .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 22px;
+    max-height: 80vh; overflow-y: auto;
+    font-size: 0.85rem;
+  }
+  #key-help table { border-collapse: collapse; }
+  #key-help td { padding: 3px 14px 3px 0; vertical-align: top; }
+  #key-help td:first-child { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
+  #key-help h2 { font-size: 0.95rem; margin: 14px 0 6px; }
+  #key-help h2:first-child { margin-top: 0; }
 </style>
 </head>
 <body>
@@ -678,13 +766,59 @@
         <span id="ns-error" class="error-msg" style="display:none"></span>
       </div>
     </div>
+    <!-- Incremental filter, opened with `/` or C-s. Hidden until then so the
+         list reads clean; Esc / C-g closes it and restores the full list. -->
+    <div id="nav-filter" style="display:none">
+      /<input id="nav-filter-input" autocomplete="off" spellcheck="false"
+              aria-label="Filter sessions">
+    </div>
     <div id="run-list-items"></div>
+  </div>
+
+  <div id="key-help" onclick="closeKeyHelp()">
+    <div class="card" role="dialog" aria-modal="true" aria-labelledby="key-help-title"
+         tabindex="-1" onclick="event.stopPropagation()">
+      <h2 id="key-help-title">Move</h2>
+      <table>
+        <tr><td>j &nbsp;&darr; &nbsp;C-n<sup class="ctrl-n-note">&dagger;</sup></td><td>next row / question</td></tr>
+        <tr><td>k &nbsp;&uarr; &nbsp;C-p</td><td>previous row / question</td></tr>
+        <tr><td>g &nbsp;M-&lt;</td><td>first</td></tr>
+        <tr><td>G &nbsp;M-&gt;</td><td>last</td></tr>
+        <tr><td>C-v &nbsp;M-v</td><td>page down / up</td></tr>
+      </table>
+      <!-- C-n reaches the page on macOS (where the browser's own modifier is
+           Cmd), but Chrome and Firefox on Linux/Windows reserve Ctrl+N for "New
+           Window" and a page cannot preventDefault it. The bind is always
+           registered; only this caveat is platform-conditional. -->
+      <p class="ctrl-n-note" style="margin:6px 0 0;font-size:.78rem;color:var(--muted)">
+        &dagger; your browser reserves C-n for a new window &mdash; use <b>j</b> or &darr;
+      </p>
+      <h2>Act</h2>
+      <table>
+        <tr><td>Enter &nbsp;o &nbsp;l &nbsp;&rarr;</td><td>open the session under the cursor</td></tr>
+        <tr><td>1&ndash;9</td><td>pick that option on the question under the cursor</td></tr>
+        <tr><td>i</td><td>type a custom answer on that question</td></tr>
+        <tr><td>/ &nbsp;C-s</td><td>filter sessions</td></tr>
+      </table>
+      <h2>Leave</h2>
+      <table>
+        <tr><td>h &nbsp;&larr;</td><td>back to the session list</td></tr>
+        <tr><td>Esc &nbsp;C-g</td><td>close filter / help, or leave a text box</td></tr>
+        <tr><td>?</td><td>this help</td></tr>
+      </table>
+    </div>
   </div>
 
   <div id="summary-banner" style="display:none" class="summary-banner">
     <strong>Agent change summary</strong>
     <span id="summary-text"></span>
   </div>
+
+  <!-- Open questions (multiple choice) — populated dynamically. Sits at the TOP
+       of the page, above the spec and the session mirror: the agent is blocked on
+       these, so they are the first thing the reviewer should see. Answers are
+       submitted with the decision form at the bottom. -->
+  <div id="questions-area"></div>
 
   <!-- Live session mirror: a snapshot of the run's real agent pane (herdr
        read), with an input box that types back into it (herdr prompt). This is
@@ -778,9 +912,6 @@
       </label>
     </div>
 
-    <!-- Open questions (multiple choice) — populated dynamically -->
-    <div id="questions-area"></div>
-
     <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes)…"></textarea>
     <div class="btn-row">
       <button class="primary" id="submit-btn" onclick="submitDecision()">Submit</button>
@@ -790,6 +921,13 @@
     <div id="form-error" class="error-msg" style="display:none"></div>
   </div>
 </div>
+
+<!-- Cursor position for assistive tech. The cursor itself is a CSS class and
+     never moves DOM focus, so without this a screen reader would observe nothing
+     at all when j/k fire. Polite: it must not interrupt the reviewer mid-sentence. -->
+<div id="nav-live" aria-live="polite" aria-atomic="true" class="sr-only"></div>
+
+<div id="keyhint"></div>
 
 <script>
 // ---- Theme ----
@@ -881,8 +1019,13 @@ function renderMd(text) {
   return md.render(text);
 }
 
+// Escapes for BOTH text content and quoted attribute values, and tolerates
+// non-strings: agent-authored JSON (questions.json) reaches this with numeric or
+// missing fields, and a throw here would abort a whole render mid-refresh.
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ---- Source diff (before → after) ----
@@ -1347,6 +1490,10 @@ function collectAnnotations() {
 // ---- Open questions (multiple choice) ----
 var currentQuestions = [];
 
+// Value carried by the per-question "Other" radio. Not a real option value: it
+// is swapped for the typed text in collectAnswers, and never submitted as-is.
+var OTHER_SENTINEL = '__drovr_other__';
+
 function renderQuestions(questions) {
   currentQuestions = questions || [];
   var area = document.getElementById('questions-area');
@@ -1354,31 +1501,104 @@ function renderQuestions(questions) {
 
   var html = '<div class="questions-panel"><div class="panel-title">Open questions</div>';
   currentQuestions.forEach(function(q, qi) {
+    var group = 'q_' + escHtml(q.id);
+    var opts = q.options || [];
     html += '<div class="question-item">';
     html += '<div class="question-prompt">' + escHtml(q.prompt) + '</div>';
     html += '<div class="question-options">';
-    (q.options || []).forEach(function(opt, oi) {
+    opts.forEach(function(opt, oi) {
       var inputId = 'q_' + qi + '_' + oi;
       var checked = opt.recommended ? ' checked' : '';
       html += '<label for="' + inputId + '">';
-      html += '<input type="radio" id="' + inputId + '" name="q_' + escHtml(q.id) + '" value="' + escHtml(opt.value) + '"' + checked + '>';
+      html += '<input type="radio" id="' + inputId + '" name="' + group + '" value="' + escHtml(opt.value) + '"' + checked + '>';
       html += escHtml(opt.label);
       if (opt.recommended) html += ' <span class="rec-badge">recommended</span>';
       html += '</label>';
     });
+    // Free-text escape hatch: the offered options are never exhaustive, so every
+    // question also takes a custom answer. Typing selects the radio, so the text
+    // can't be silently ignored. A question with no options at all is just this
+    // row — a plain free-text ask. The radio is never pre-checked: an untouched
+    // question must read as unanswered, not as an empty custom answer.
+    var otherId = 'q_' + qi + '_other';
+    var textId = 'q_' + qi + '_othertext';
+    html += '<div class="question-other">';
+    html += '<input type="radio" id="' + otherId + '" name="' + group + '" value="' + OTHER_SENTINEL + '">';
+    html += '<label for="' + otherId + '">' + (opts.length ? 'Other' : 'Answer') + '</label>';
+    html += '<input type="text" id="' + textId + '" aria-label="Custom answer" ' +
+            'placeholder="type your own answer…" ' +
+            'oninput="document.getElementById(\'' + otherId + '\').checked = true">';
+    html += '</div>';
     html += '</div></div>';
   });
   html += '</div>';
   area.innerHTML = html;
+  applyNavCursor(false);
+}
+
+function clearQuestions() {
+  currentQuestions = [];
+  document.getElementById('questions-area').innerHTML = '';
+  applyNavCursor(false);
+}
+
+// The checked radio is found by walking the question's own rendered container,
+// not by `input[name="q_<id>"]` — an agent-authored id can carry characters that
+// make that selector throw (or, if two questions share an id, match the wrong
+// question's radio while reading this one's text box).
+function questionItemEl(qi) {
+  return document.querySelectorAll('#questions-area .question-item')[qi] || null;
+}
+
+function checkedRadio(qi) {
+  var item = questionItemEl(qi);
+  return item ? item.querySelector('input[type="radio"]:checked') : null;
 }
 
 function collectAnswers() {
   var answers = {};
-  currentQuestions.forEach(function(q) {
-    var checked = document.querySelector('input[name="q_' + q.id + '"]:checked');
-    if (checked) answers[q.id] = checked.value;
+  currentQuestions.forEach(function(q, qi) {
+    var checked = checkedRadio(qi);
+    if (!checked) return;
+    if (checked.value === OTHER_SENTINEL) {
+      var el = document.getElementById('q_' + qi + '_othertext');
+      var custom = el ? el.value.trim() : '';
+      if (custom) answers[q.id] = custom;
+    } else {
+      answers[q.id] = checked.value;
+    }
   });
   return answers;
+}
+
+// `answers` is keyed by question id, so two questions sharing an id cannot both
+// be represented — the second would overwrite the first and the reviewer would
+// never know one of their answers was dropped. The radios themselves are read
+// per-container (see `questionItemEl`), so this is purely about the submitted
+// shape. An agent authoring questions.json is the only thing that can cause it,
+// and silently losing an answer is worse than refusing to submit. Returns the
+// offending id, or null.
+function duplicateQuestionId() {
+  var seen = {};
+  for (var i = 0; i < currentQuestions.length; i++) {
+    var id = String(currentQuestions[i].id);
+    if (Object.prototype.hasOwnProperty.call(seen, id)) return id;
+    seen[id] = true;
+  }
+  return null;
+}
+
+// "Other" checked with an empty box is an explicit half-answer: the reviewer
+// meant to say something. Submitting would drop it silently, so block instead.
+// Returns the offending text input, or null.
+function blankCustomAnswer() {
+  for (var qi = 0; qi < currentQuestions.length; qi++) {
+    var checked = checkedRadio(qi);
+    if (!checked || checked.value !== OTHER_SENTINEL) continue;
+    var el = document.getElementById('q_' + qi + '_othertext');
+    if (el && !el.value.trim()) return el;
+  }
+  return null;
 }
 
 // ---- State ----
@@ -1419,8 +1639,12 @@ async function refresh() {
   // turn badge
   document.getElementById('turn-badge').textContent = 'turn ' + turn + ' · ' + state;
 
-  // summary banner
-  if (summaryText && turn > 0) {
+  // Summary banner. Gated on the text alone, NOT on the turn: the summary is the
+  // agent's statement of what it wants reviewed, not a diff against a previous
+  // version, so it is just as meaningful on the first review — and turn is 0 for
+  // the whole of that first review, which used to hide it exactly when the
+  // reviewer had no other context.
+  if (summaryText) {
     document.getElementById('summary-text').textContent = summaryText;
     showEl('summary-banner');
   } else {
@@ -1458,8 +1682,12 @@ async function refresh() {
   disarmCancel();
 
   // Show correct overlay / form
+  // The questions panel lives outside #form-section (it renders at the top of the
+  // page), so every branch that hides the form must clear it too — otherwise
+  // answerable radios linger with no way to submit them.
   if (state === 'approved') {
     hideEl('form-section');
+    clearQuestions();
     hideEl('waiting-overlay');
     hideEl('cancelled-overlay');
     showEl('approved-overlay');
@@ -1468,6 +1696,7 @@ async function refresh() {
 
   if (state === 'cancelled') {
     hideEl('form-section');
+    clearQuestions();
     hideEl('waiting-overlay');
     hideEl('approved-overlay');
     showEl('cancelled-overlay');
@@ -1476,6 +1705,7 @@ async function refresh() {
 
   if (state === 'waiting') {
     hideEl('form-section');
+    clearQuestions();
     hideEl('approved-overlay');
     hideEl('cancelled-overlay');
     showEl('waiting-overlay');
@@ -1528,6 +1758,22 @@ async function submitDecision(forced) {
   if (decisionVal === 'request-changes' && !feedbackVal) {
     showError('Feedback is required when requesting changes.');
     return;
+  }
+
+  // Cancel is terminal and discards the spec — don't hold it up over questions.
+  if (decisionVal !== 'cancel') {
+    var dupe = duplicateQuestionId();
+    if (dupe) {
+      showError('questions.json has two questions with id "' + dupe + '" — one answer ' +
+                'would be silently dropped. Ask the agent to give each question a unique id.');
+      return;
+    }
+    var blank = blankCustomAnswer();
+    if (blank) {
+      showError('An open question has "Other" selected with no answer typed.');
+      blank.focus();
+      return;
+    }
   }
 
   btn.disabled = true;
@@ -1627,14 +1873,31 @@ async function createSession() {
 }
 
 // ---- Session list view ----
-async function renderRunList() {
+// `gen` is the routeGen at call time, matching the other pollers: a list fetch in
+// flight when the reviewer navigates into a run must not paint its result over
+// the detail view (or drag the cursor with it).
+async function renderRunList(gen) {
   var listEl = document.getElementById('run-list-items');
   try {
     var r = await fetch('/api/runs');
     var runs = await r.json();
+    if (gen !== undefined && gen !== routeGen) return;
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
+      applyNavCursor(false);
       return;
+    }
+    // `/`-filter: substring over the fields the reviewer can actually see.
+    if (listFilter) {
+      runs = runs.filter(function(run) {
+        return (run.name + ' ' + (run.state || '') + ' ' + (run.task || ''))
+          .toLowerCase().indexOf(listFilter) !== -1;
+      });
+      if (!runs.length) {
+        listEl.innerHTML = '<div class="review-empty">No sessions match that filter.</div>';
+        applyNavCursor(false);
+        return;
+      }
     }
     listEl.innerHTML = runs.map(function(run) {
       var meta = escHtml(run.state) + (run.turn ? ' · turn ' + run.turn : '');
@@ -1645,8 +1908,12 @@ async function renderRunList() {
         '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
       '</a>';
     }).join('');
+    // Rows were just rebuilt — repaint the cursor onto the new elements. Not
+    // scrolled: this also runs on the 2s refresh, which must not yank the page.
+    applyNavCursor(false);
   } catch (e) {
     listEl.innerHTML = '<div class="review-empty">Failed to load sessions.</div>';
+    applyNavCursor(false);
   }
 }
 
@@ -1777,21 +2044,41 @@ async function route() {
   clearTimeout(agentsTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
+  // Only a real navigation resets the cursor. route() also re-runs every 2s to
+  // refresh the list, and resetting there would drag the cursor back to the top
+  // under the reviewer twice a second.
+  //
+  // currentRun is updated BEFORE the teardown below, not after: closeFilter()
+  // decides whether to rebuild the list by looking at currentRun, so leaving the
+  // old value in place here would make it rebuild the list view we are in the
+  // middle of navigating away from.
+  var prevRun = currentRun;
   currentRun = h.run;
+  if (h.run !== prevRun) {
+    navCursor = 0;
+    navCursorKey = '';
+    closeKeyHelp();
+    if (h.run) closeFilter(true);   // the filter is a list-view affordance
+  }
 
   if (!currentRun) {
     // Session list landing view.
     DETAIL_PANELS.forEach(hideEl);
+    clearQuestions();           // dynamic container, not in DETAIL_PANELS
     hideEl('back-link');
     document.getElementById('turn-badge').textContent = '';
     showEl('run-list');
-    await renderRunList();
+    await renderRunList(routeGen);
     pollTimer = setTimeout(route, 2000); // keep the list fresh
     return;
   }
 
   // Run detail view.
   hideEl('run-list');
+  // Drop the previous run's questions immediately: refresh() below re-renders
+  // them, but if it throws mid-flight the stale panel would otherwise stay live
+  // and its answers could be submitted against THIS run.
+  clearQuestions();
   showEl('back-link');
   showEl('doc-panel');
   // Agent tree + live session mirror: primary surfaces, polled independently of
@@ -1806,6 +2093,327 @@ async function route() {
   await refresh();
 }
 
+// ---- Keyboard navigation (vim + emacs) ----
+// The page is driven like a TUI: a cursor moves over the session list on the
+// landing view and over the open questions on a run's detail view. The cursor is
+// an index into the rendered rows plus a `.nav-cursor` class — deliberately NOT
+// DOM focus, because both lists re-render on a poll timer (the list every 2s)
+// and real focus would be destroyed on every tick.
+var navCursor = 0;
+var listFilter = '';
+// The run name the list cursor is anchored to. /api/runs sorts by most-recently-
+// touched, so any run's activity can reorder the list under a 2s refresh; an
+// index alone would leave the cursor sitting on whatever row slid into that slot,
+// and Enter would open a session the reviewer never pointed at. Empty on the
+// detail view, where questions have a fixed order.
+var navCursorKey = '';
+
+// Rows the cursor moves over, chosen by view. Detail view has no run rows, and
+// the list view has no questions, so one of these is always empty. On the detail
+// view this is the same node set `questionItemEl` indexes into — both go through
+// QUESTION_ITEM_SEL so the two can never disagree about what a question is.
+var QUESTION_ITEM_SEL = '#questions-area .question-item';
+
+function navRows() {
+  var sel = currentRun ? QUESTION_ITEM_SEL : '#run-list-items .run-row';
+  return Array.prototype.slice.call(document.querySelectorAll(sel));
+}
+
+// The run name a list row points at, used to re-find the cursor after a re-sort.
+function rowKey(el) {
+  var n = el.querySelector('.run-name');
+  return n ? n.textContent : '';
+}
+
+// Re-paints the cursor class. Called after every render that rebuilds the rows,
+// and after every move.
+//
+// On the list view the anchor (a run name) wins over the index, so a re-sorted
+// list keeps the cursor on the run the reviewer chose. The index is only the
+// fallback for when that run has left the list entirely (filtered out, deleted),
+// and is clamped because a shrinking list can leave it past the end.
+function applyNavCursor(scroll) {
+  var rows = navRows();
+  if (!rows.length) { navCursor = 0; navCursorKey = ''; renderKeyhint(); announceCursor(null); return; }
+  if (!currentRun && navCursorKey) {
+    var found = -1;
+    rows.forEach(function(el, i) { if (found < 0 && rowKey(el) === navCursorKey) found = i; });
+    if (found >= 0) navCursor = found;
+  }
+  if (navCursor >= rows.length) navCursor = rows.length - 1;
+  if (navCursor < 0) navCursor = 0;
+  if (!currentRun) navCursorKey = rowKey(rows[navCursor]);
+  rows.forEach(function(el, i) {
+    var on = i === navCursor;
+    el.classList.toggle('nav-cursor', on);
+    // aria-current is the cursor's only representation for assistive tech: the
+    // class is purely visual, and we deliberately do not move DOM focus here.
+    if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
+  });
+  if (scroll) rows[navCursor].scrollIntoView({ block: 'nearest' });
+  renderKeyhint();
+  announceCursor(rows[navCursor]);
+}
+
+// Mirrors the cursor into a polite live region. Without this the cursor is
+// invisible to a screen reader — nothing moves focus and nothing else changes in
+// the accessibility tree when j/k fire.
+function announceCursor(el) {
+  var live = document.getElementById('nav-live');
+  if (!live) return;
+  if (!el) { live.textContent = ''; return; }
+  var rows = navRows();
+  var what = currentRun
+    ? (el.querySelector('.question-prompt') || {}).textContent
+    : rowKey(el) + ', ' + ((el.querySelector('.run-state') || {}).textContent || '');
+  live.textContent = (what || '') + ' (' + (navCursor + 1) + ' of ' + rows.length + ')';
+}
+
+function moveCursor(delta) {
+  var rows = navRows();
+  if (!rows.length) return;
+  navCursor = Math.min(rows.length - 1, Math.max(0, navCursor + delta));
+  if (!currentRun) navCursorKey = rowKey(rows[navCursor]);
+  applyNavCursor(true);
+}
+
+function cursorTo(i) {
+  navCursor = i;
+  var rows = navRows();
+  if (!currentRun && rows[i]) navCursorKey = rowKey(rows[i]);
+  applyNavCursor(true);
+}
+
+// Enter / o / l — open the session under the cursor. List view only.
+function openCursorRow() {
+  var rows = navRows();
+  if (currentRun || !rows[navCursor]) return;
+  location.hash = rows[navCursor].getAttribute('href');
+}
+
+// 1-9 on the detail view select the nth option of the question under the cursor.
+// Radios inside the cursor's own container, so an agent-authored question id
+// that isn't a valid selector can't misroute the pick (same reason
+// `questionItemEl` walks containers).
+function pickOption(n) {
+  var item = questionItemEl(navCursor);
+  if (!currentRun || !item) return;
+  var radios = item.querySelectorAll('.question-options input[type="radio"]');
+  if (n < 1 || n > radios.length) return;
+  radios[n - 1].checked = true;
+  // Scripted .checked fires no event, so anything listening for a change (and
+  // assistive tech watching the group) would never learn of the pick.
+  radios[n - 1].dispatchEvent(new Event('change', { bubbles: true }));
+  var live = document.getElementById('nav-live');
+  if (live) live.textContent = 'selected: ' + radios[n - 1].parentNode.textContent.trim();
+  renderKeyhint();
+}
+
+// `i` — jump into the cursor question's free-text box, vim-insert style.
+function focusCustomAnswer() {
+  var item = questionItemEl(navCursor);
+  if (!currentRun || !item) return;
+  var box = item.querySelector('.question-other input[type="text"]');
+  if (box) { box.focus(); box.select(); }
+}
+
+// Clicking is the other way to point at a row. Without this the visual cursor
+// and the thing the reviewer just touched drift apart, and a following 1-9 would
+// answer a different question than the one they clicked on.
+function syncCursorToClick(e) {
+  var rows = navRows();
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].contains(e.target)) {
+      navCursor = i;
+      if (!currentRun) navCursorKey = rowKey(rows[i]);
+      applyNavCursor(false);
+      return;
+    }
+  }
+}
+
+// ---- Filter ----
+function openFilter() {
+  if (currentRun) return;
+  showEl('nav-filter');
+  var el = document.getElementById('nav-filter-input');
+  el.value = listFilter;
+  el.focus();
+  el.select();
+}
+
+function closeFilter(clear) {
+  var had = listFilter;
+  if (clear) { listFilter = ''; document.getElementById('nav-filter-input').value = ''; }
+  hideEl('nav-filter');
+  document.getElementById('nav-filter-input').blur();
+  // Re-render only if a filter was actually dropped AND the list is the visible
+  // view — route() also clears the filter on the way *into* a run, and rebuilding
+  // the list there would race the detail view's own render.
+  if (clear && had && !currentRun) {
+    // Re-check the generation inside the .then as well: renderRunList drops its
+    // own stale render, but the continuation would still run, and by then the
+    // reviewer may be inside a run — where applyNavCursor(true) would grab the
+    // question rows and scroll the detail page out from under them.
+    var gen = routeGen;
+    renderRunList(gen).then(function(){ if (gen === routeGen) applyNavCursor(true); });
+  }
+}
+
+// ---- Help overlay ----
+// Focus moves into the card on open and back to whatever opened it on close, so
+// Tab stays inside the visible dialog instead of wandering into the page behind
+// the scrim, and a screen reader is told the dialog appeared.
+var keyHelpOpener = null;
+function openKeyHelp() {
+  var el = document.getElementById('key-help');
+  if (el.classList.contains('open')) return;
+  keyHelpOpener = document.activeElement;
+  el.classList.add('open');
+  el.querySelector('.card').focus();
+}
+function closeKeyHelp() {
+  var el = document.getElementById('key-help');
+  if (!el.classList.contains('open')) return;
+  el.classList.remove('open');
+  if (keyHelpOpener && keyHelpOpener.focus) keyHelpOpener.focus();
+  keyHelpOpener = null;
+}
+function keyHelpOpen() { return document.getElementById('key-help').classList.contains('open'); }
+
+// ---- Hint bar ----
+// Context-sensitive: the keys shown are the ones that do something right now.
+function renderKeyhint() {
+  var n = navRows().length;
+  var parts = currentRun
+    ? ['<kbd>j</kbd>/<kbd>k</kbd> question', '<kbd>1</kbd>-<kbd>9</kbd> pick',
+       '<kbd>i</kbd> custom', '<kbd>h</kbd> back']
+    : ['<kbd>j</kbd>/<kbd>k</kbd> move', '<kbd>&crarr;</kbd> open', '<kbd>/</kbd> filter'];
+  if (currentRun && !n) parts = ['<kbd>h</kbd> back to sessions'];
+  parts.push('<button type="button" onclick="openKeyHelp()" aria-haspopup="dialog">' +
+             '<kbd>?</kbd> keys</button>');
+  document.getElementById('keyhint').innerHTML = parts.join(' &nbsp;·&nbsp; ');
+}
+
+// True when keystrokes belong to whatever the user is typing in, not to the
+// navigator. Without this, typing "j" into the feedback box would scroll the page.
+function inTextEntry(el) {
+  if (!el) return false;
+  var tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function initKeyNav() {
+  renderKeyhint();
+
+  // Hide the C-n caveat on macOS, where Ctrl+N is not a browser shortcut and the
+  // bind works as advertised.
+  var mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  if (mac) {
+    document.querySelectorAll('.ctrl-n-note').forEach(function(el) { el.style.display = 'none'; });
+  }
+
+  // Filter box: typing re-renders the list live. Handled here rather than in the
+  // global listener so the box keeps normal text editing.
+  var fin = document.getElementById('nav-filter-input');
+  fin.addEventListener('input', function() {
+    listFilter = fin.value.trim().toLowerCase();
+    // A new filter re-scopes the list, so the old anchor is meaningless — start
+    // at the top of whatever now matches.
+    navCursor = 0;
+    navCursorKey = '';
+    // Same generation re-check as closeFilter: a keystroke's fetch can still be
+    // in flight when the reviewer presses Enter to open the highlighted run.
+    var gen = routeGen;
+    renderRunList(gen).then(function(){ if (gen === routeGen) applyNavCursor(false); });
+  });
+  // Every branch here calls stopPropagation: they all blur the input, so without
+  // it the event still reaches the document listener, `inTextEntry` now reads
+  // false because focus is already gone, and the same key runs a second time.
+  fin.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' || (e.ctrlKey && e.key === 'g')) {
+      e.preventDefault(); e.stopPropagation(); closeFilter(true); return;
+    }
+    // Enter, and the move keys, act on the list without leaving the box — so a
+    // filter can be narrowed and its result opened without reaching for a mouse.
+    if (e.key === 'Enter') {
+      e.preventDefault(); e.stopPropagation(); closeFilter(false); openCursorRow(); return;
+    }
+    if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) {
+      e.preventDefault(); e.stopPropagation(); moveCursor(1); return;
+    }
+    if (e.key === 'ArrowUp'   || (e.ctrlKey && e.key === 'p')) {
+      e.preventDefault(); e.stopPropagation(); moveCursor(-1); return;
+    }
+  });
+
+  // Clicking a row or a question adopts it as the cursor.
+  document.addEventListener('click', syncCursorToClick, true);
+
+  document.addEventListener('keydown', function(e) {
+    // Never steal a browser/OS shortcut. Ctrl and Meta chords we claim are
+    // matched explicitly below; anything else with Meta is left alone.
+    if (e.metaKey && !e.altKey) return;
+
+    // Escape and C-g work from anywhere, including inside a text box — that is
+    // the whole point of them (leave what you are typing in).
+    if (e.key === 'Escape' || (e.ctrlKey && e.key === 'g')) {
+      if (keyHelpOpen()) { e.preventDefault(); closeKeyHelp(); return; }
+      if (inTextEntry(document.activeElement)) { e.preventDefault(); document.activeElement.blur(); return; }
+      e.preventDefault();
+      closeFilter(true);
+      return;
+    }
+
+    if (inTextEntry(document.activeElement)) return;
+
+    // Emacs paging: C-v / M-v. Kept above the plain-key switch because they
+    // apply in both views and while the help overlay is up.
+    if (e.ctrlKey && e.key === 'v') { e.preventDefault(); window.scrollBy(0, window.innerHeight * 0.9); return; }
+    if (e.altKey  && e.key === 'v') { e.preventDefault(); window.scrollBy(0, -window.innerHeight * 0.9); return; }
+
+    if (keyHelpOpen()) {
+      if (e.key === '?') { e.preventDefault(); closeKeyHelp(); return; }
+      // Trap Tab: the card holds no focusable children, so bounce focus back to
+      // it rather than let Tab walk into the page hidden behind the scrim.
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        document.getElementById('key-help').querySelector('.card').focus();
+      }
+      return;
+    }
+
+    // Emacs motion.
+    if (e.ctrlKey && e.key === 'n') { e.preventDefault(); moveCursor(1); return; }
+    if (e.ctrlKey && e.key === 'p') { e.preventDefault(); moveCursor(-1); return; }
+    if (e.ctrlKey && e.key === 's') { e.preventDefault(); openFilter(); return; }
+    if (e.altKey  && e.key === '<') { e.preventDefault(); cursorTo(0); return; }
+    if (e.altKey  && e.key === '>') { e.preventDefault(); cursorTo(navRows().length - 1); return; }
+    if (e.ctrlKey || e.altKey) return;   // any other chord belongs to the browser
+
+    switch (e.key) {
+      case 'j': case 'ArrowDown':  e.preventDefault(); moveCursor(1); break;
+      case 'k': case 'ArrowUp':    e.preventDefault(); moveCursor(-1); break;
+      case 'g':                    e.preventDefault(); cursorTo(0); break;
+      case 'G':                    e.preventDefault(); cursorTo(navRows().length - 1); break;
+      case 'Enter': case 'o': case 'l': case 'ArrowRight':
+        e.preventDefault(); openCursorRow(); break;
+      case 'h': case 'ArrowLeft':
+        // Back out of a run to the session list. On the list itself there is
+        // nowhere further back, so this is a no-op rather than a history pop.
+        if (currentRun) { e.preventDefault(); location.hash = '#/'; }
+        break;
+      case 'i':                    e.preventDefault(); focusCustomAnswer(); break;
+      case '/':                    e.preventDefault(); openFilter(); break;
+      case '?':                    e.preventDefault(); openKeyHelp(); break;
+      default:
+        if (currentRun && e.key >= '1' && e.key <= '9') {
+          e.preventDefault(); pickOption(parseInt(e.key, 10));
+        }
+    }
+  });
+}
+
 // ---- Init ----
 // Enter sends to the live pane; Shift+Enter inserts a newline.
 document.getElementById('session-text').addEventListener('keydown', function(e){
@@ -1813,6 +2421,8 @@ document.getElementById('session-text').addEventListener('keydown', function(e){
 });
 window.addEventListener('hashchange', function(){ route().catch(console.error); });
 route().catch(console.error);
+initKeyNav();
+
 </script>
 </body>
 </html>

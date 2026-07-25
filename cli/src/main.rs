@@ -767,7 +767,13 @@ fn cmd_review(sub: ReviewCmd) {
             }
             match review_wait(&run, timeout_ms) {
                 Ok(WaitOutcome::Approved) => {
-                    println!("review approved for run '{run}'");
+                    // Approval can carry answers: the reviewer may have answered
+                    // the spec's open questions on the way to approving, and
+                    // feedback.json is the only place those land. Say so, or the
+                    // agent moves on and re-asks the human what they just told us.
+                    println!(
+                        "review approved for run '{run}' (any answers to open questions are in feedback.json)"
+                    );
                 }
                 Ok(WaitOutcome::ChangesRequested) => {
                     println!("review: changes requested for run '{run}' (see feedback.json)");

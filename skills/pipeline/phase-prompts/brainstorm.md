@@ -53,9 +53,24 @@ A review server renders `spec.md` in a browser for the reviewer. The loop:
   The wrong shape (object-wrapped, or string options) makes the review UI's Submit button
   silently fail — don't guess the schema.
 
+  Questions render at the **top** of the review page, and the UI appends a free-text **Other**
+  row to every question — so never author an "Other"/"Something else" option yourself, and
+  expect `answers[<id>]` in `feedback.json` to be an arbitrary string, not necessarily one of
+  your `value`s. A question with `"options": []` is a plain free-text ask. `__drovr_other__`
+  is reserved as that row's internal value — never use it as an option `value`.
+
 ## Done when
 
-`spec.md` is approved by the reviewer, and — once approved — your FINAL two actions, in order:
+`spec.md` is approved by the reviewer.
+
+**On approval, read `feedback.json` before you do anything else.** Approving does not
+mean the questions went unanswered: the reviewer can answer them *and* approve in the same
+submission, and `answers[<id>]` is the only place those picks exist — `spec.md` still shows
+the questions as open. Fold the answers into `spec.md` (resolving each open question) so the
+plan phase inherits decisions rather than questions. `feedback.json` is written on approval
+and on request-changes alike; only `cancel` leaves it untouched.
+
+Once approved and folded in, your FINAL two actions, in order:
 
 a. **Author the handoff.** Compress your own context into the fixed 7-section handoff (see
    `drovr:handoff` / the handoff template) and write it to
