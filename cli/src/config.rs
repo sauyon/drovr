@@ -303,22 +303,6 @@ impl Config {
         Ok(command)
     }
 
-    /// Resolve a non-interactive, read-only command for handoff compression.
-    pub fn compressor(&self, agent: &str, project_dir: &str) -> io::Result<(String, Vec<String>)> {
-        let spec = self.agent(agent)?;
-        let args = spec.print_args.as_ref().ok_or_else(|| {
-            io::Error::other(format!(
-                "agent '{agent}' has no print_args; cannot compress a handoff"
-            ))
-        })?;
-        Ok((
-            spec.command.clone(),
-            args.iter()
-                .map(|arg| arg.replace("{project_dir}", project_dir))
-                .collect(),
-        ))
-    }
-
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
     /// (defaults to `self.default_agent` when `agent` is `None`). Errors if the agent is
     /// unknown or has no `readonly_flag` ("cannot serve as reviewer").
