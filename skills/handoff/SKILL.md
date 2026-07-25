@@ -62,22 +62,44 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    Also tell the agent that any review subagents it launches must run in the **foreground**
    (never `run_in_background`, never yield waiting on them), so step 3 can detect completion.
 
-3. **Wait for done.**
+3. **Wait for done — background the wait, then end your turn.**
    ```
-   drovr phase wait <run> <phase> --timeout-ms 600000
+   drovr phase wait <run> <phase> --timeout-ms 3600000     # Bash run_in_background: true
    ```
-   **Block on this in the foreground — do NOT background it.** The phase agent is a separate
-   `claude` running in a herdr pane, invisible to your own harness's task tracking, so nothing
-   auto-blocks you on its work; `drovr phase wait` IS the synchronization primitive that makes
-   the pane agent's progress something you can wait on. Backgrounding the wait defeats its
-   entire purpose — it turns the one blocking call async and lets you wander off while the
-   phase is still running. Run it foreground and let it hold the turn until the phase finishes.
+   Then **stop and end the turn immediately**: no other command, no edits, no scheduled
+   wakeup. The harness wakes you with the exit code when the process exits — that notification
+   *is* your synchronization signal. `drovr phase wait` is still the sync primitive; the only
+   change is that the harness, not the Bash call, holds the block.
+
+   **Why not foreground?** A foreground Bash call is hard-capped at **600 000 ms (10 min)** —
+   you cannot ask for more. Real phases routinely run longer, so a foreground wait does not
+   block until the phase finishes: it dies at the cap and reports exit `2` on a phase that is
+   still running healthily. You then re-run it, burning a turn and a fresh context read every
+   10 minutes. Backgrounding removes the cap — one wait, one wake-up, when the phase is
+   actually done. It is also the only way a `--timeout-ms` above 600 000 is reachable at all.
+
+   **The rule the old "always foreground" advice was protecting still holds**, and it is the
+   part that matters: *never do your own work while a phase agent is writing.* That is drovr's
+   single-writer rule, not a property of foreground-ness. Backgrounding is only dangerous if
+   you keep working — so background the wait and go idle.
 
    This POLLS the filesystem for the marker the agent drops via `drovr phase done` (step 2's
-   final action). It deliberately does NOT watch herdr's agent status: `idle` is not a
-   completion signal — it also fires while the agent is parked awaiting its own subagent. Exit
-   `0` = done · `2` = still running (timed out; wait again or investigate) · `1` = an I/O error.
-   Use a generous timeout — real phases take minutes.
+   final action). Completion is that marker, never herdr's `idle` status — `idle` also fires
+   while the agent is parked awaiting its own subagent. **Note the default `--timeout-ms` is
+   30 000 (30 s), which is far too short for a real phase; always pass an explicit value.**
+
+   Handle the exit code the wake-up hands you:
+
+   | Exit | Meaning | What to do |
+   |---|---|---|
+   | `0` | done — the handoff exists | Go to step 4. |
+   | `4` | **blocked** — the agent hit a safety/permission prompt; the diagnostic names the class | Answer the prompt (`herdr agent send-keys <pane> …`), then **re-arm**. Do not treat this as failure. |
+   | `2` | timed out; the phase may still be running healthily | **Re-arm**, or investigate if it has now timed out twice. |
+   | `1` | I/O error | STOP — see *Stop conditions*. |
+
+   **Re-arm** = run the exact same backgrounded `drovr phase wait` again and end the turn again.
+   The wait is stateless and resumable: it polls an on-disk marker, so nothing is lost by
+   re-issuing it and a phase that finished during the gap is detected immediately.
 
 4. **Collect + hand forward.**
    ```
@@ -92,7 +114,7 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 |---|---|---|
 | start | `drovr phase start <run> <phase> [--seed <path>]` | plain claude; records seed path only |
 | **inject** | `drovr phase send <run> <phase> "<text>"` | **you must do this — CLI won't**; end the text with the completion contract (author handoff → `phase done`) |
-| wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | polls for the `done` marker (not herdr idle); 0=done 2=timeout 1=io-error |
+| wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
 
@@ -137,6 +159,7 @@ briefing is worse than a stopped run.
 | Skipping step 2 ("start seeds it") | It doesn't. The fresh agent sits idle until you `phase send`. |
 | Expecting a separate compress step | There isn't one. The finishing agent authors the handoff itself, as its final action, before `phase done`. |
 | `phase done` failing "handoff missing" | The agent must author `<phase>-HANDOFF.md` *before* running `phase done`; the marker won't drop without it. |
-| Backgrounding `drovr phase wait` | Block on it in the foreground — it's the sync primitive; the pane agent's work is invisible to your harness, so nothing else blocks you on it. |
+| Foregrounding `drovr phase wait` | Background it and end the turn. Foreground Bash is capped at 600 000 ms, so a long healthy phase reports a false exit `2`. |
+| Backgrounding the wait and then working | Background the wait *and go idle*. The single-writer rule is what forbids working here, not foreground-ness. |
 | Pasting file contents into the handoff | Use artifact pointers (paths + git refs); the successor re-reads. |
 | Hardcoding `<phase>-HANDOFF.md` elsewhere | Read it via `drovr collect`; the finishing agent writes it directly (no CLI command authors it). |

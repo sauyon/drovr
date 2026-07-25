@@ -152,10 +152,13 @@ polling is the anti-pattern the skill already names, reached here by the routing
    (not only a full pipeline) at the gate — `drovr serve` **plus** a backgrounded
    `drovr review wait <run>` — cross-referencing `drovr:pipeline`'s "The spec gate" mechanics.
    (Done in this change.)
-2. **Couple serve + watch in the CLI:** either have `drovr serve` print the exact
-   `drovr review wait <run>` invocation on startup, or add a combined `drovr review gate <run>`
-   that serves, blocks until the reviewer acts, and returns the decision (exit 0 approved / 2
-   request-changes) — so the watch cannot be forgotten.
+2. **Couple serve + watch in the CLI.** *(Done — `drovr review summary` now prints the hint.)*
+   `drovr serve` turned out to be the wrong hook: it is global and takes no run argument, so it
+   cannot name the run to watch. The run-scoped moment the gate actually opens is
+   `drovr review summary <run>`, which previously printed nothing on success. It now prints the
+   reviewer's page URL and the exact `drovr review wait <run>` invocation, flagged to run
+   backgrounded. Still open if the reminder proves too weak: a combined `drovr review gate <run>`
+   (**sketch — no such subcommand exists**) that serves, blocks, and returns the decision.
 3. `drovr serve` is a foreground process; if it is backgrounded in a slot tied to the session
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.

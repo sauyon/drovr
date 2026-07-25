@@ -131,11 +131,19 @@ for each task N in plan.md:
     drovr phase send  <run> implement-task-<N>  "<phase-prompts/implement-task.md>
                                                  + task N brief
                                                  + accumulated interfaces so far"
-    drovr phase wait  <run> implement-task-<N> --timeout-ms 900000
+    drovr phase wait  <run> implement-task-<N> --timeout-ms 3600000   # BACKGROUND it, then
+                                                                      # end the turn
     # No separate compress step: the task agent authored implement-task-<N>-HANDOFF.md
     # itself as its final action (phase done refuses without it), so `wait` returning
     # done means the handoff already exists.
 ```
+
+**Every blocking wait in this loop runs backgrounded** (`drovr phase wait`, and
+`drovr code-review run` below) — see `drovr:handoff` step 3 for why. Foreground Bash is capped
+at 600 000 ms, so a foreground wait reports a false timeout on any phase that runs past 10
+minutes, and implement tasks routinely do. Background the call, end the turn, and let the
+harness wake you with the exit code. **Do no work of your own while it runs** — that is the
+single-writer rule, and it is the reason to go idle rather than the reason to foreground.
 
 **Fold interfaces forward:** each task's handoff carries the interfaces it introduced;
 include those in the next task's injected briefing so later tasks bind to real signatures.
@@ -152,7 +160,9 @@ writing any code, so `HEAD` is the pre-task SHA. Then the driver runs the blocki
 branches on its exit code:
 
 ```
-drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle
+drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle.
+                                              # BACKGROUND it and end the turn — the panel
+                                              # runs well past the 600 000 ms foreground cap.
 case $? in
   0)  # clean — proceed to task N+1
   3)  # findings — re-enter implement, forward the review, re-run the panel (loop)
@@ -165,8 +175,8 @@ On **exit 3**, re-enter the implement phase for task N and forward the merged fi
 
 ```
 drovr phase send <run> implement-task-<N> "Review found changes (see <run_dir>/task-<N>-review.json). Fix every Important AND every nit, then re-author your handoff and report."
-drovr phase wait <run> implement-task-<N> --timeout-ms 900000
-drovr code-review run <run> task-<N>          # re-run the panel
+drovr phase wait <run> implement-task-<N> --timeout-ms 3600000   # backgrounded, then end turn
+drovr code-review run <run> task-<N>                             # re-run the panel (same)
 ```
 
 Re-entry needs **no `drovr phase start`**: `drovr phase done` only writes a marker — it never
@@ -228,3 +238,4 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task completes; loop on exit 3. |
 | Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
 | Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |
+| Running `phase wait` / `code-review run` in the foreground | Background them and end the turn. Foreground Bash caps at 600 000 ms, so long healthy phases report a false exit `2`. |

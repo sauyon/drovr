@@ -1190,10 +1190,32 @@ fn spawn_daemon() -> io::Result<()> {
 // Public API — agent/driver coordination
 // ---------------------------------------------------------------------------
 
+/// Rewrite a wildcard bind address into one a human can actually click.
+///
+/// `serve --host 0.0.0.0` records `0.0.0.0:<port>` in `server.addr`. That is a
+/// valid thing to bind to but not a valid destination, so a URL built from it
+/// is useless in a browser. Any already-routable host — loopback, a LAN IP, the
+/// Tailscale IP a `serve_host` config produces — passes through untouched.
+pub fn display_addr(addr: &str) -> String {
+    for wildcard in ["0.0.0.0:", "[::]:"] {
+        if let Some(port) = addr.strip_prefix(wildcard) {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+    addr.to_string()
+}
+
 /// POST summary text to the running review server for `run` (`drovr review
 /// summary`). Ensures the server is up, then POSTs to
 /// `/api/runs/<run>/summary`, flipping that run's state to `ready`.
-pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
+///
+/// Returns the server address on success so the caller can print the reviewer's
+/// page URL and the matching `drovr review wait` invocation. This is the moment
+/// the gate actually opens, so it is the only place that can reliably remind a
+/// driver to start the watch — `drovr serve` is global and does not know which
+/// run is being reviewed. See `docs/known-issues.md`, "Serving a spec doesn't
+/// start a watcher".
+pub fn review_summary(run: &str, text: &str) -> io::Result<String> {
     let addr = ensure_server()?;
 
     let body = text.as_bytes();
@@ -1230,7 +1252,7 @@ pub fn review_summary(run: &str, text: &str) -> io::Result<()> {
             response.lines().next().unwrap_or("")
         )));
     }
-    Ok(())
+    Ok(addr)
 }
 
 /// Terminal outcome of a [`review_wait`] blocking wait.
@@ -2045,6 +2067,41 @@ mod tests {
             fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("summary.txt"))
                 .expect("summary.txt");
         assert_eq!(summary, "Agent summary text.");
+    }
+
+    /// The caller needs the bound address back so it can print the reviewer's
+    /// page URL and the matching `drovr review wait` command — opening the gate
+    /// is the only run-scoped moment that can remind a driver to start the
+    /// watch. Regression guard for "serving a spec doesn't start a watcher".
+    #[test]
+    fn review_summary_returns_server_addr_for_the_watch_hint() {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+        let (addr, run, _tmp) = global_fixture("rev-summary-addr");
+
+        let returned = review_summary(&run, "Agent summary text.").expect("review_summary");
+
+        assert_eq!(returned, addr, "must return the address it posted to");
+        // The CLI interpolates this into `http://{addr}/#/runs/{run}`, so it has
+        // to be a bare host:port — a returned URL would produce `http://http://…`.
+        assert!(
+            !returned.contains("://"),
+            "addr must be host:port, not a URL: {returned}"
+        );
+        assert!(
+            returned.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()),
+            "addr must end in a port: {returned}"
+        );
+    }
+
+    #[test]
+    fn display_addr_rewrites_wildcard_binds_only() {
+        // `serve --host 0.0.0.0` records a bind target, not a destination.
+        assert_eq!(display_addr("0.0.0.0:8791"), "127.0.0.1:8791");
+        assert_eq!(display_addr("[::]:8791"), "127.0.0.1:8791");
+        // Anything already routable passes through untouched — notably the
+        // Tailscale IP a `serve_host` config produces.
+        assert_eq!(display_addr("100.71.58.39:8795"), "100.71.58.39:8795");
+        assert_eq!(display_addr("127.0.0.1:8791"), "127.0.0.1:8791");
     }
 
     #[test]

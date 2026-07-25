@@ -19,7 +19,7 @@ use phase::{
     PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
     phase_wait, triage_blocked_phase,
 };
-use review::{WaitOutcome, review_summary, review_wait, serve};
+use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
 use std::io;
 use std::path::PathBuf;
@@ -755,9 +755,22 @@ fn cmd_review(sub: ReviewCmd) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
-            if let Err(e) = review_summary(&run, &text) {
-                eprintln!("drovr: review summary failed: {e}");
-                process::exit(1);
+            match review_summary(&run, &text) {
+                Ok(addr) => {
+                    // The gate is now open. Serving is global and run-agnostic,
+                    // so this is the only run-scoped moment that can hand the
+                    // driver both halves of the gate — the page to show the
+                    // human, and the watch that reports their decision.
+                    println!("review: run '{run}' is ready for the reviewer");
+                    println!("  page:  http://{}/#/runs/{run}", display_addr(&addr));
+                    println!(
+                        "  watch: drovr review wait {run}   # run this BACKGROUNDED, then end your turn"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("drovr: review summary failed: {e}");
+                    process::exit(1);
+                }
             }
         }
         ReviewCmd::Wait { run, timeout_ms } => {

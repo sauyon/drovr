@@ -73,9 +73,12 @@ When you must escalate, pick the smallest tool that fits:
 
 **Putting *any* spec/design in front of a human for approval — even a one-off, not a
 full pipeline — goes through the review gate, and the gate has two halves you must run
-together:** `drovr serve <run>` to present `spec.md`, **and** a backgrounded
-`drovr review wait <run>` — the *watch*. `serve` does not start the watch; without it you
-never learn the decision and fall back to hand-polling `GET /state` (the anti-pattern).
+together:** `drovr review summary <run> "<what changed>"` to present `spec.md`, **and** a
+backgrounded `drovr review wait <run>` — the *watch*. (The server itself is global and
+always-on: `drovr serve` takes **no** run argument and auto-starts on demand, so serving is not
+a step you perform per run.) `summary` opens the gate and prints the reviewer's page URL plus
+the exact watch command; it does **not** start the watch. Without the watch you never learn the
+decision and fall back to hand-polling `GET /state` (the anti-pattern).
 `review wait` blocks on the gate and the harness wakes you when the reviewer acts
 (exit `0` approved · `3` request-changes + `feedback.json` · `5` cancelled — the human
 abandoned the run, stop · `2` timeout, re-run · `1` error, which is **never** an approval).
