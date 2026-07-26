@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::load_config;
 use crate::findings::{Review, is_clean, merge_reviews, parse_review};
-use crate::herdr::Herdr;
+use crate::herdr::{AgentStatus, Herdr};
 use crate::phase::{done_marker, phase_send, spawn_reviewer};
 use crate::run::{PhaseStatus, RunState, run_dir};
 
@@ -334,8 +334,7 @@ pub fn code_review_run<H: Herdr>(
                     .find_phase(name)
                     .and_then(|phase| phase.pane_id.as_deref())
                     .and_then(|pane| h.agent_status(pane))
-                    .as_deref()
-                    == Some("done");
+                    == Some(AgentStatus::Done);
             if finished {
                 if let Some(i) = run.review_phases.iter().position(|p| &p.name == name) {
                     run.review_phases[i].status = PhaseStatus::Done;

@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::load_config;
-use crate::herdr::Herdr;
+use crate::herdr::{AgentStatus, Herdr};
 use crate::run::{PassToken, Phase, PhaseStatus, RunState, run_dir};
 
 /// How often `phase_wait` polls the filesystem for the completion marker, and
@@ -418,8 +418,15 @@ pub fn spawn_reviewer<H: Herdr>(
 /// as not-ready lets the gate wait it out; if it never clears, `phase_send` raises
 /// `TimedOut`, which the CLI surfaces via `diagnose_stuck_phase` so a human can
 /// answer the prompt.
-fn agent_has_started(status: Option<&str>) -> bool {
-    matches!(status, Some("idle") | Some("working") | Some("done"))
+///
+/// An `AgentStatus::Other` — a herdr state this drovr has never seen — is NOT
+/// treated as started: an unrecognised state is not evidence the composer is
+/// ready, and waiting it out is recoverable where typing into it is not.
+fn agent_has_started(status: Option<&AgentStatus>) -> bool {
+    matches!(
+        status,
+        Some(AgentStatus::Idle) | Some(AgentStatus::Working) | Some(AgentStatus::Done)
+    )
 }
 
 /// Poll until the agent in `pane_id` has STARTED, returning `true` once it has,
@@ -443,7 +450,7 @@ fn wait_agent_ready<H: Herdr>(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if agent_has_started(h.agent_status(pane_id).as_deref()) {
+        if agent_has_started(h.agent_status(pane_id).as_ref()) {
             return true;
         }
         let now = Instant::now();
@@ -881,7 +888,7 @@ pub fn phase_wait<H: Herdr>(
         // instead of hanging until the wait's full timeout. Only `blocked` short-
         // circuits; every other status keeps waiting for the marker.
         if let Some(pid) = pane_id.as_deref() {
-            if h.agent_status(pid).as_deref() == Some("blocked") {
+            if h.agent_status(pid) == Some(AgentStatus::Blocked) {
                 return Ok(PhaseWaitOutcome::Blocked);
             }
         }
@@ -1838,15 +1845,20 @@ mod tests {
     #[test]
     fn agent_has_started_recognizes_attached_states() {
         // At the composer, safe to send.
-        assert!(agent_has_started(Some("idle")));
-        assert!(agent_has_started(Some("working")));
-        assert!(agent_has_started(Some("done")));
+        assert!(agent_has_started(Some(&AgentStatus::Idle)));
+        assert!(agent_has_started(Some(&AgentStatus::Working)));
+        assert!(agent_has_started(Some(&AgentStatus::Done)));
         // Still-booting / unconfirmed: must keep waiting.
         assert!(!agent_has_started(None));
-        assert!(!agent_has_started(Some("unknown")));
+        assert!(!agent_has_started(Some(&AgentStatus::Unknown)));
         // `blocked` = attached but parked on a prompt, NOT at the composer — must
         // NOT release the gate (sending would type into the dialog).
-        assert!(!agent_has_started(Some("blocked")));
+        assert!(!agent_has_started(Some(&AgentStatus::Blocked)));
+        // A herdr state this drovr has never seen is not "started" either: an
+        // unrecognised status is not evidence of a composer.
+        assert!(!agent_has_started(Some(&AgentStatus::Other(
+            "compacting".to_string()
+        ))));
     }
 
     // -- phase_send waits for the agent to attach before sending --------------

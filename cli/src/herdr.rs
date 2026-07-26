@@ -24,21 +24,122 @@ pub struct Workspace {
     pub root_pane: String,
 }
 
-/// The agent session herdr records on a pane (`agent_session`). `kind` is
-/// herdr's discriminator: `"id"` for a resumable session id, `"path"` for a
-/// transcript path. Only `kind == "id"` may ever be interpolated into an
-/// agent's `--resume` argument — a path there would be read as a session name.
+/// The agent session herdr records on a pane (`agent_session`), keyed by herdr's
+/// own `kind` discriminator.
+///
+/// Only a `kind == "id"` session may ever be interpolated into an agent's
+/// `--resume` argument — a transcript path there would be read as a session
+/// name. That rule lives in the TYPE rather than in every caller: the value is
+/// reachable through [`AgentSession::resumable_id`], which yields `Some` for
+/// `Id` alone. Reading any other kind's value takes an explicit match on that
+/// variant, which is the point.
 ///
 /// herdr DROPS this whole key once the pane's agent process exits (verified
 /// against 0.7.5), so it must be captured while the agent is alive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentSession {
-    pub kind: String,
-    pub value: String,
-    /// The agent that owns the session (`claude`, `cursor`, …). Optional: it is
-    /// absent on some herdr versions, and a session id is only safe to resume
-    /// with the backend that created it.
-    pub agent: Option<String>,
+pub enum AgentSession {
+    /// A resumable session id.
+    Id {
+        value: String,
+        /// The agent that owns the session (`claude`, `cursor`, …). Optional —
+        /// absent on some herdr versions — and a session id is only safe to
+        /// resume with the backend that created it, so a caller that cannot
+        /// confirm the backend must not resume.
+        agent: Option<String>,
+    },
+    /// A transcript path. Never a resume operand.
+    Path { value: String },
+    /// A kind this drovr does not know. Preserved verbatim so it is visible in
+    /// diagnostics, and never resumable.
+    Other { kind: String, value: String },
+}
+
+// Capability only for now: nothing in drovr reads a session yet — capturing it
+// onto `Phase` is a later step, and resuming from it later still.
+#[allow(dead_code)]
+impl AgentSession {
+    /// The session id — and ONLY when this session is a resumable id. Every
+    /// other kind yields `None`. This is the single chokepoint for the "never
+    /// interpolate a path as a session id" rule.
+    pub fn resumable_id(&self) -> Option<&str> {
+        match self {
+            AgentSession::Id { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The agent that owns the session, when herdr reported one. Only an `Id`
+    /// session carries it, because it is only ever consulted to decide whether
+    /// a resume is safe.
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            AgentSession::Id { agent, .. } => agent.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// herdr's own `kind` string, for diagnostics and logging.
+    pub fn kind(&self) -> &str {
+        match self {
+            AgentSession::Id { .. } => "id",
+            AgentSession::Path { .. } => "path",
+            AgentSession::Other { kind, .. } => kind,
+        }
+    }
+}
+
+/// A pane's agent status, as reported by herdr.
+///
+/// The vocabulary is `idle|working|blocked|done|unknown`, but it is herdr's to
+/// extend, so anything else is preserved verbatim as [`AgentStatus::Other`]
+/// rather than collapsed onto a known state. That matters more than it looks:
+/// `Done` is the verdict that tears a pane down, and a future herdr state
+/// silently reading as `Done` would close a live agent's pane.
+///
+/// `Unknown` is herdr's own literal `"unknown"` — the status of a pane whose
+/// agent has exited — and is distinct from `Option::None`, which means herdr
+/// reported no status field at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+    Other(String),
+}
+
+impl AgentStatus {
+    /// Classify a raw herdr status. Total: an unrecognised value becomes
+    /// `Other`, never a known state.
+    pub fn from_herdr(status: &str) -> AgentStatus {
+        match status {
+            "idle" => AgentStatus::Idle,
+            "working" => AgentStatus::Working,
+            "blocked" => AgentStatus::Blocked,
+            "done" => AgentStatus::Done,
+            "unknown" => AgentStatus::Unknown,
+            other => AgentStatus::Other(other.to_string()),
+        }
+    }
+
+    /// The raw herdr string this status came from.
+    pub fn as_str(&self) -> &str {
+        match self {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Working => "working",
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Unknown => "unknown",
+            AgentStatus::Other(raw) => raw,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A snapshot of one pane, from herdr's `pane.get`. This is drovr's single poll
@@ -54,7 +155,7 @@ pub struct AgentSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneInfo {
     pub tab_id: String,
-    pub agent_status: Option<String>,
+    pub agent_status: Option<AgentStatus>,
     pub agent_session: Option<AgentSession>,
 }
 
@@ -110,7 +211,7 @@ pub trait Herdr {
     ///
     /// Provided, not implemented: there is exactly one poll primitive
     /// ([`Herdr::pane_info`]) and this is the status field of it.
-    fn agent_status(&self, pane_id: &str) -> Option<String> {
+    fn agent_status(&self, pane_id: &str) -> Option<AgentStatus> {
         self.pane_info(pane_id).and_then(|info| info.agent_status)
     }
     fn integration_present(&self, agent: &str) -> bool;
@@ -464,7 +565,8 @@ fn parse_pane_info(result: &Value) -> Option<PaneInfo> {
     let pane = result.get("pane")?;
     Some(PaneInfo {
         tab_id: non_empty_string(pane, "tab_id")?,
-        agent_status: non_empty_string(pane, "agent_status"),
+        agent_status: non_empty_string(pane, "agent_status")
+            .map(|raw| AgentStatus::from_herdr(&raw)),
         agent_session: pane.get("agent_session").and_then(parse_agent_session),
     })
 }
@@ -474,10 +576,20 @@ fn parse_pane_info(result: &Value) -> Option<PaneInfo> {
 /// optional. Note that a pane whose agent has exited has no `agent_session` key
 /// at all, which is exactly `None` here.
 fn parse_agent_session(value: &Value) -> Option<AgentSession> {
-    Some(AgentSession {
-        kind: non_empty_string(value, "kind")?,
-        value: non_empty_string(value, "value")?,
-        agent: non_empty_string(value, "agent"),
+    let kind = non_empty_string(value, "kind")?;
+    let session_value = non_empty_string(value, "value")?;
+    Some(match kind.as_str() {
+        "id" => AgentSession::Id {
+            value: session_value,
+            agent: non_empty_string(value, "agent"),
+        },
+        "path" => AgentSession::Path {
+            value: session_value,
+        },
+        _ => AgentSession::Other {
+            kind,
+            value: session_value,
+        },
     })
 }
 
@@ -541,6 +653,10 @@ impl FakeHerdr {
     /// Queue a status for the next `pane_info` poll (and so for the next
     /// `agent_status`). Pass `Some("blocked")` to model a blocked pane, or `None`
     /// to model a pane that cannot be read. Mirrors `push_read`.
+    ///
+    /// Takes the RAW herdr string, classified through [`AgentStatus::from_herdr`]
+    /// exactly as a real response would be — so `push_status(Some("compacting"))`
+    /// models a herdr state drovr has never seen.
     pub fn push_status(&self, status: Option<impl Into<String>>) {
         self.status_queue
             .borrow_mut()
@@ -671,7 +787,7 @@ impl Herdr for FakeHerdr {
             // A scripted `None` status means the pane could not be read at all.
             status.map(|status| PaneInfo {
                 tab_id: Self::tab_id_for(pane_id),
-                agent_status: Some(status),
+                agent_status: Some(AgentStatus::from_herdr(&status)),
                 agent_session: None,
             })
         };
@@ -805,11 +921,80 @@ mod tests {
     fn parse_pane_info_reads_live_pane_get() {
         let info = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
         assert_eq!(info.tab_id, "wAF:t1");
-        assert_eq!(info.agent_status.as_deref(), Some("working"));
+        assert_eq!(info.agent_status, Some(AgentStatus::Working));
         let session = info.agent_session.expect("live agent carries a session");
-        assert_eq!(session.kind, "id");
-        assert_eq!(session.value, "cca92f5b-3a8c-4008-a9f2-e2fa191395e5");
-        assert_eq!(session.agent.as_deref(), Some("claude"));
+        assert_eq!(session.kind(), "id");
+        assert_eq!(
+            session.resumable_id(),
+            Some("cca92f5b-3a8c-4008-a9f2-e2fa191395e5")
+        );
+        assert_eq!(session.agent(), Some("claude"));
+    }
+
+    #[test]
+    fn agent_status_parses_herdrs_vocabulary() {
+        for (raw, expected) in [
+            ("idle", AgentStatus::Idle),
+            ("working", AgentStatus::Working),
+            ("blocked", AgentStatus::Blocked),
+            ("done", AgentStatus::Done),
+            ("unknown", AgentStatus::Unknown),
+        ] {
+            assert_eq!(AgentStatus::from_herdr(raw), expected, "raw: {raw}");
+            assert_eq!(expected.as_str(), raw, "as_str must round-trip: {raw}");
+        }
+    }
+
+    // A herdr state this drovr has never heard of must be PRESERVED, never
+    // collapsed onto a known one. `Done` is what tears a pane down, so mistaking
+    // a new herdr state for it would reap a live agent.
+    #[test]
+    fn an_unrecognised_status_is_preserved_not_collapsed() {
+        let status = AgentStatus::from_herdr("compacting");
+        assert_eq!(status, AgentStatus::Other("compacting".to_string()));
+        assert_ne!(status, AgentStatus::Done);
+        assert_ne!(status, AgentStatus::Idle);
+        assert_ne!(status, AgentStatus::Unknown);
+        assert_eq!(status.as_str(), "compacting", "the raw value survives");
+        // And it reaches callers intact, straight off the wire.
+        let v = socket_result(
+            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_status":"compacting"}}}"#,
+        );
+        assert_eq!(
+            parse_pane_info(&v).unwrap().agent_status,
+            Some(AgentStatus::Other("compacting".to_string()))
+        );
+    }
+
+    // `kind == "id"` is the ONLY value that may ever be interpolated into an
+    // agent's `--resume`. The type carries that rule so no caller has to.
+    #[test]
+    fn only_an_id_session_is_resumable() {
+        let id = AgentSession::Id {
+            value: "cca92f5b".to_string(),
+            agent: Some("claude".to_string()),
+        };
+        assert_eq!(id.resumable_id(), Some("cca92f5b"));
+        assert_eq!(id.agent(), Some("claude"));
+        assert_eq!(id.kind(), "id");
+
+        let path = AgentSession::Path {
+            value: "/tmp/transcript.jsonl".to_string(),
+        };
+        assert_eq!(path.resumable_id(), None, "a path is never a session id");
+        assert_eq!(path.kind(), "path");
+        assert_eq!(path.agent(), None);
+
+        let other = AgentSession::Other {
+            kind: "handle".to_string(),
+            value: "abc".to_string(),
+        };
+        assert_eq!(
+            other.resumable_id(),
+            None,
+            "an unrecognised kind is not resumable either"
+        );
+        assert_eq!(other.kind(), "handle");
     }
 
     // An exited agent must still yield `Some(PaneInfo)` — with `agent_session:
@@ -821,7 +1006,7 @@ mod tests {
         let info = parse_pane_info(&socket_result(EXITED_PANE_GET))
             .expect("an exited agent still has a pane");
         assert_eq!(info.tab_id, "wAF:t2");
-        assert_eq!(info.agent_status.as_deref(), Some("unknown"));
+        assert_eq!(info.agent_status, Some(AgentStatus::Unknown));
         assert!(info.agent_session.is_none());
     }
 
@@ -864,9 +1049,20 @@ mod tests {
             r#"{"result":{"pane":{"pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"idle","agent_session":{"kind":"path","value":"/tmp/t.jsonl"}}}}"#,
         );
         let session = parse_pane_info(&v).unwrap().agent_session.unwrap();
-        assert_eq!(session.kind, "path");
-        assert_eq!(session.value, "/tmp/t.jsonl");
-        assert!(session.agent.is_none(), "the `agent` key is optional");
+        assert_eq!(
+            session,
+            AgentSession::Path {
+                value: "/tmp/t.jsonl".to_string()
+            }
+        );
+        assert_eq!(session.resumable_id(), None, "a path is not a session id");
+        // The `agent` key is optional, and an id session parses without it.
+        let v = socket_result(
+            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"kind":"id","value":"abc"}}}}"#,
+        );
+        let session = parse_pane_info(&v).unwrap().agent_session.unwrap();
+        assert_eq!(session.resumable_id(), Some("abc"));
+        assert_eq!(session.agent(), None);
     }
 
     // `kind` and `value` are each independently required: a session missing
@@ -914,10 +1110,10 @@ mod tests {
         let h = FakeHerdr::new();
         h.push_pane_info(Some(PaneInfo {
             tab_id: "w1:t1".into(),
-            agent_status: Some("blocked".into()),
+            agent_status: Some(AgentStatus::Blocked),
             agent_session: None,
         }));
-        assert_eq!(h.agent_status("w1:p1").as_deref(), Some("blocked"));
+        assert_eq!(h.agent_status("w1:p1"), Some(AgentStatus::Blocked));
         // A pane that cannot be read has no status.
         h.push_pane_info(None);
         assert_eq!(h.agent_status("w1:p1"), None);
@@ -952,7 +1148,7 @@ mod tests {
         h.push_status(Some("working"));
         h.pane_info("w1:p1");
         assert!(
-            h.calls()[0].contains("agent_status=Some(\"working\")"),
+            h.calls()[0].contains("agent_status=Some(Working)"),
             "call: {}",
             h.calls()[0]
         );
@@ -995,7 +1191,7 @@ mod tests {
         let h = FakeHerdr::new();
         let info = h.pane_info("pane-1").unwrap();
         assert_eq!(info.tab_id, FakeHerdr::tab_id_for("pane-1"));
-        assert_eq!(info.agent_status.as_deref(), Some("idle"));
+        assert_eq!(info.agent_status, Some(AgentStatus::Idle));
         assert!(info.agent_session.is_none());
     }
 
@@ -1004,14 +1200,14 @@ mod tests {
         let h = FakeHerdr::new();
         // Empty queue → a ready, idle agent (so phase_send's readiness gate does
         // not wait out its timeout when a test does not script status).
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
+        assert_eq!(h.agent_status("pane-1"), Some(AgentStatus::Idle));
         h.push_status(Some("blocked"));
         h.push_status(None::<String>);
         // Scripted values are consumed FIFO, including an explicit unreadable None.
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("blocked"));
+        assert_eq!(h.agent_status("pane-1"), Some(AgentStatus::Blocked));
         assert_eq!(h.agent_status("pane-1"), None);
         // Queue drained → back to the idle default.
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
+        assert_eq!(h.agent_status("pane-1"), Some(AgentStatus::Idle));
         assert!(
             h.calls()
                 .iter()
