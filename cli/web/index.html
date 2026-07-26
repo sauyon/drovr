@@ -2061,8 +2061,10 @@ async function toggleArchive(name, archived, live) {
 
 async function renderRunList(gen) {
   var listEl = document.getElementById('run-list-items');
+  // Claimed before the try so the catch can check it too — a superseded call
+  // must not report failure over a newer call's successful render.
+  var seq = ++listFetchSeq;
   try {
-    var seq = ++listFetchSeq;
     var r = await fetch('/api/runs');
     var runs = await r.json();
     if (gen !== undefined && gen !== routeGen) return;
@@ -2159,6 +2161,12 @@ async function renderRunList(gen) {
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
     applyNavCursor(false);
   } catch (e) {
+    // Same sequencing rule as the success path, and it matters just as much: a
+    // stale call whose fetch rejects AFTER a newer one already rendered would
+    // otherwise wipe a correct list to "Failed to load sessions". The reviewer
+    // sees a phantom failure — and if an archive was in flight, reads it as that
+    // action having failed.
+    if (seq !== listFetchSeq) return;
     listEl.innerHTML = '<div class="review-empty">Failed to load sessions.</div>';
     applyNavCursor(false);
   }
@@ -2393,15 +2401,25 @@ function rowKey(el) {
 // and is clamped because a shrinking list can leave it past the end.
 function applyNavCursor(scroll) {
   var rows = navRows();
-  // Zero rows does NOT mean the anchored run is gone. The commonest way to land
-  // here is a failed `/api/runs` fetch, which replaces the list with "Failed to
-  // load sessions" — a server hiccup, not a deletion. Clearing the key here
-  // discarded the selection before any of the hidden-vs-gone reasoning below
-  // could run, so the cursor never returned after a recovery poll. Keeping it
-  // costs nothing: the failure path leaves `knownRunNames` untouched, and a list
-  // that is genuinely empty still releases the anchor on the next render that
-  // has rows to compare against.
-  if (!rows.length) { navCursor = 0; renderKeyhint(); announceCursor(null); return; }
+  // Zero rows does NOT by itself mean the anchored run is gone. The commonest way
+  // to land here is a failed `/api/runs` fetch, which replaces the list with
+  // "Failed to load sessions" — a server hiccup, not a deletion. Clearing the key
+  // unconditionally discarded the selection before any hidden-vs-gone reasoning
+  // could run, so the cursor never returned after a recovery poll.
+  //
+  // The same `knownRunNames` question applies here as below, so ask it rather
+  // than assume: the failure path leaves that list untouched (so the anchor is
+  // held), while a successful fetch returning no runs at all empties it (so the
+  // anchor is released). Both branches then agree on what "gone" means.
+  if (!rows.length) {
+    navCursor = 0;
+    if (!currentRun && navCursorKey && knownRunNames.indexOf(navCursorKey) === -1) {
+      navCursorKey = '';
+    }
+    renderKeyhint();
+    announceCursor(null);
+    return;
+  }
   var anchorMissing = false;
   if (!currentRun && navCursorKey) {
     var found = -1;

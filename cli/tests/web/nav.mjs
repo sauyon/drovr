@@ -428,6 +428,35 @@ check('a stale list response cannot overwrite a newer one',
 // Leave the page on real data for the sections below.
 await evaluate(`return renderRunList(routeGen);`);
 
+// The mirror of the case above, and the one the suite could not previously
+// reach: the STALE call FAILS after the fresh one already rendered. Guarding
+// only the success path let its catch wipe a correct list to "Failed to load
+// sessions" — a phantom failure, easily read as the archive having failed.
+check('a stale FAILED fetch cannot wipe a newer successful render', await evaluate(`
+  var realFetch = window.fetch;
+  var call = 0;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      call++;
+      if (call === 1) {
+        // Older call: rejects, but only after the newer one has rendered.
+        return new Promise(function(_res, rej){ setTimeout(function(){ rej(new Error('boom')); }, 220); });
+      }
+      return realFetch(u, o);
+    }
+    return realFetch(u, o);
+  };
+  var stale = renderRunList(routeGen);
+  var fresh = renderRunList(routeGen);
+  return Promise.all([stale, fresh]).then(function(){
+    return new Promise(function(res){ setTimeout(res, 320); });
+  }).then(function(){
+    window.fetch = realFetch;
+    var failed = document.querySelector('#run-list-items .review-empty');
+    return failed ? 'wiped: ' + failed.textContent : 'rows:' + document.querySelectorAll('.run-row').length;
+  });`), 'rows:6');
+await evaluate(`return renderRunList(routeGen);`);
+
 console.log('\n== session list: filter ==');
 await goto('#/', LIST_READY);
 await press('g');
