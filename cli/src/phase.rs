@@ -713,8 +713,8 @@ fn marker_completes_pass(token: &str, expected: Option<&PassToken>) -> bool {
 }
 
 /// The outcome of `phase_wait`. Maps 1:1 to a `drovr phase wait` exit code (see
-/// `main.rs`): `Done` = 0, `TimedOut` = 2, `Blocked` = 4. (An io error is exit 1,
-/// surfaced via the `Err` arm, not this enum.)
+/// `main.rs`): `Done` = 0, `TimedOut` = 2, `Blocked` = 4, `Superseded` = 5. (An
+/// io error is exit 1, surfaced via the `Err` arm, not this enum.)
 #[derive(Debug, PartialEq, Eq)]
 pub enum PhaseWaitOutcome {
     /// The completion marker appeared — the phase agent ran `drovr phase done`.
@@ -724,13 +724,29 @@ pub enum PhaseWaitOutcome {
     /// herdr reported the phase pane's `agent_status` as `blocked` — the agent
     /// hit a Claude Code safety/permission prompt with no human at the pane.
     Blocked,
+    /// This wait was SUPERSEDED: while it ran, another pass re-entered the phase
+    /// (a `phase start`, minting a new token), so the completion this wait saw
+    /// belongs to a pass that no longer exists.
+    ///
+    /// Deliberately NOT `TimedOut`, which it used to be reported as. The two are
+    /// opposite verdicts about the same phase — "another pass took over, and it is
+    /// the one to follow now" versus "the agent I am waiting on is not
+    /// progressing" — and nothing but log scraping could tell them apart. Task 6
+    /// keys pane teardown off this enum, and the pane here belongs to the LIVE
+    /// re-entry: a caller must be able to see that without parsing prose.
+    ///
+    /// Like the `Done` path, this outcome adopts the freshly loaded run state
+    /// (`*run = fresh`), so a caller that saves after waiting writes the
+    /// re-entry's state rather than restoring the superseded pass.
+    Superseded,
 }
 
 /// Poll the filesystem for the phase's completion marker (dropped by the phase
 /// agent via `drovr phase done`) AND the phase pane's herdr `agent_status` until
 /// the marker appears, the pane goes `blocked`, or `timeout_ms` elapses. Marks
 /// the phase Done (and saves) when the marker is found; leaves it Running on
-/// timeout or block.
+/// timeout or block. A marker that belongs to a pass another `phase start` has
+/// since superseded returns [`PhaseWaitOutcome::Superseded`] and writes nothing.
 ///
 /// herdr status is consulted ONLY to catch `blocked` early — a proactive signal
 /// that the agent hit a safety/permission prompt and will otherwise hang until the
@@ -839,9 +855,18 @@ pub fn phase_wait<H: Herdr>(
                 if fresh.phases[i].pass != expected_pass {
                     eprintln!(
                         "drovr: phase '{phase}' was re-entered while this wait was running — \
-                         the completion it saw belongs to a superseded pass. Not marking done."
+                         the completion it saw belongs to a superseded pass. Not marking done. \
+                         The phase is now running a newer pass; wait on THAT one."
                     );
-                    return Ok(PhaseWaitOutcome::TimedOut);
+                    // Adopt the fresh state, exactly as the `Done` path below does
+                    // and for the same reason: a caller that saves after waiting
+                    // (task 6 records a reap that way) would otherwise write this
+                    // waiter's hour-old snapshot back, restoring the superseded
+                    // pass token and undoing the re-entry that superseded it.
+                    // Nothing is written HERE — the re-entry already persisted
+                    // everything, and this wait has no verdict of its own to record.
+                    *run = fresh;
+                    return Ok(PhaseWaitOutcome::Superseded);
                 }
                 // Commit onto the FRESHLY loaded state, not the snapshot taken at
                 // entry: writing an hour-old whole-state copy back would silently
@@ -2395,15 +2420,63 @@ mod tests {
         agent_signals_done(&run, "plan", &pass_a);
 
         // `run` is this waiter's hour-old snapshot, still expecting pass A.
+        // Supersession is its OWN outcome, never `TimedOut`: "another pass took
+        // over, all is well" and "the agent is stuck" are opposite verdicts, and
+        // task 6 tears panes down on this one.
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
-            PhaseWaitOutcome::TimedOut,
+            PhaseWaitOutcome::Superseded,
             "a superseded pass's completion must not be reported"
         );
         // ...and the re-entry must survive: not clobbered back to Done/pass A.
         let on_disk = RunState::load("superseded-test").unwrap();
         assert_eq!(on_disk.phases[0].status, PhaseStatus::Running);
         assert_eq!(on_disk.phases[0].pass, Some(pass_b));
+    }
+
+    #[test]
+    fn a_superseded_wait_leaves_the_caller_holding_the_re_entrys_state() {
+        // The clobber half of the same defect. `phase_wait`'s Done path adopts the
+        // freshly loaded state (`*run = fresh`) precisely so a caller that saves
+        // after waiting cannot write an hour-old snapshot back; task 6 records a
+        // reap exactly that way. The supersession path has the SAME hazard and a
+        // worse payload: the waiter's snapshot still carries the superseded pass
+        // token and its `Running`/`Done` status, so saving it would restore the
+        // dead pass and undo the very re-entry that superseded this wait.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("superseded-no-clobber-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass_a = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
+
+        let mut other = RunState::load("superseded-no-clobber-test").unwrap();
+        phase_start(&h, &mut other, "plan", None).unwrap();
+        let pass_b = other.phases[0].pass.clone().unwrap();
+        assert_ne!(pass_a, pass_b);
+
+        agent_signals_done(&run, "plan", &pass_a);
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Superseded
+        );
+        // The caller's snapshot must already BE the fresh state, so that the
+        // save-after-wait a reaping caller performs is a no-op, not a rollback.
+        assert_eq!(
+            run.phases[0].pass,
+            Some(pass_b.clone()),
+            "the waiter must adopt the fresh state, not keep the superseded snapshot"
+        );
+        run.save().unwrap();
+        let on_disk = RunState::load("superseded-no-clobber-test").unwrap();
+        assert_eq!(
+            on_disk.phases[0].pass,
+            Some(pass_b),
+            "a save after a superseded wait must not restore the dead pass"
+        );
+        assert_eq!(on_disk.phases[0].status, PhaseStatus::Running);
     }
 
     #[test]

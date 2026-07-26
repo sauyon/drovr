@@ -95,6 +95,7 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    | `0` | done — the handoff exists | Go to step 4. |
    | `4` | **blocked** — the agent hit a safety/permission prompt; the diagnostic names the class | Answer the prompt (`herdr agent send-keys <pane> …`), then **re-arm**. Do not treat this as failure. |
    | `2` | timed out; the phase may still be running healthily | **Re-arm**, or investigate if it has now timed out twice. |
+   | `5` | **superseded** — a newer `phase start` re-entered the phase while this wait ran, so it was watching a pass that no longer exists | Nothing is wrong with the phase. **Re-arm** to follow the live pass. Never triage this as a stuck agent. |
    | `1` | I/O error | STOP — see *Stop conditions*. |
 
    **Re-arm** = run the exact same backgrounded `drovr phase wait` again and end the turn again.
@@ -114,7 +115,7 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 |---|---|---|
 | start | `drovr phase start <run> <phase> [--seed <path>]` | plain claude; records seed path only |
 | **inject** | `drovr phase send <run> <phase> "<text>"` | **you must do this — CLI won't**; end the text with the completion contract (author handoff → `phase done`) |
-| wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
+| wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `5`=superseded by a newer pass → re-arm, not a stuck agent · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
 

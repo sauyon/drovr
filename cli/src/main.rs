@@ -672,6 +672,20 @@ fn cmd_phase(sub: PhaseCmd) {
                     }
                     process::exit(4);
                 }
+                Ok(PhaseWaitOutcome::Superseded) => {
+                    // NOT a timeout, and deliberately not exit 2. Another pass
+                    // re-entered this phase while the wait ran, so this wait is
+                    // obsolete and the agent it was watching is not the live one.
+                    // Re-arming the same wait is the RIGHT move (the new pass's
+                    // completion will satisfy it) — the wrong move is triaging a
+                    // stuck agent that does not exist, which exit 2 invites.
+                    eprintln!(
+                        "drovr: phase '{phase_name}' was superseded by a newer pass while this \
+                         wait was running — nothing is wrong with the phase, but this wait was \
+                         watching a pass that is gone. Re-run the wait to follow the live pass."
+                    );
+                    process::exit(5);
+                }
                 Ok(PhaseWaitOutcome::TimedOut) => {
                     // Liveness net: a timeout can mean the agent is genuinely
                     // still working, OR it parked on a first-run prompt with no
