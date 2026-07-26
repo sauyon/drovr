@@ -730,11 +730,14 @@ and task names remain unrestricted.)
 
 ### Scope — an EXISTING phase is not affected
 
-The strict alphabet gates creation only. `require_phase_name`, used by `phase done` / `phase wait` /
-`phase send` / `collect`, keeps the older path-safety rule, so a phase an earlier drovr created under
-a now-illegal name is still fully operable and its live agent can still signal done. Pinned by
-`a_phase_already_on_disk_under_an_old_name_is_still_reachable`. **Do not "align" the two rules** —
-doing so bricks every such phase with no migration path.
+The strict alphabet gates creation only — a name being INTRODUCED. `require_phase_name`, used by
+`phase done` / `phase wait` / `phase send` / `collect` **and by `phase start` when the phase already
+exists**, keeps the older path-safety rule. So a phase an earlier drovr created under a now-illegal
+name is still fully operable: its live agent can signal done, and it can still be RE-ENTERED, which
+matters because `drovr phase start <run> <phase>` is the recovery drovr itself prints for a lost pass
+token. Pinned by `a_phase_already_on_disk_under_an_old_name_is_still_reachable` and
+`an_old_named_phase_can_still_be_re_entered`. **Do not "align" the two rules, and do not hoist the
+strict check to the top of `phase_start`** — either bricks these phases with no migration path.
 
 ### Working around it
 

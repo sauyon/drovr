@@ -74,8 +74,9 @@ fn remove_stale_marker(run_name: &str, phase: &str) -> io::Result<()> {
 
 /// Reject a phase name that could not address a real phase. Called by every entry
 /// point that resolves a name into a filesystem path (`phase_done`, `phase_wait`,
-/// `phase_send`, `collect`) — which is what makes an unnamed or path-escaping
-/// phase unreachable even if one somehow exists in `state.json`.
+/// `phase_send`, `collect`, and `phase_start`'s re-entry branch) — which is what
+/// makes an unnamed or path-escaping phase unreachable even if one somehow exists
+/// in `state.json`.
 ///
 /// * Empty/whitespace: `Phase::default()` is representable with `name: ""`, and
 ///   refusing to address one keeps an unnamed phase unreachable through
@@ -112,9 +113,10 @@ fn require_phase_name(phase: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Reject a name drovr is about to CREATE a phase under (`phase_start`,
-/// `spawn_reviewer`). Everything [`require_phase_name`] rejects, plus an
-/// ALLOWLIST: `[A-Za-z0-9._:-]`.
+/// Reject a name drovr is about to CREATE a phase under — `spawn_reviewer` (which
+/// always appends), and `phase_start` ONLY when the name is not already in
+/// `run.phases` (`phase_start` doubles as the re-entry path). Everything
+/// [`require_phase_name`] rejects, plus an ALLOWLIST: `[A-Za-z0-9._:-]`.
 ///
 /// An allowlist rather than a metacharacter denylist because a phase name is
 /// interpolated into three different grammars and a denylist has to be right in
@@ -127,9 +129,9 @@ fn require_phase_name(phase: &str) -> io::Result<()> {
 ///   the user runs it themselves.
 ///
 /// Quoting at every emission site is still necessary and still present — run and
-/// task names are not restricted this way. What this buys is that no NEW phase
-/// name ever needs it: from here on, everything in `run.phases` is a name any
-/// command can mention literally.
+/// task names are not restricted this way. What this buys is that no NEWLY
+/// INTRODUCED phase name ever needs it: from here on, every name this build adds
+/// to `run.phases` is one any command can mention literally.
 ///
 /// The alphabet is everything drovr itself mints: pipeline names
 /// (`implement-task-1`), reviewer names (`review:<task>:<iter>:<angle>` — hence
@@ -275,7 +277,18 @@ pub fn phase_start<H: Herdr>(
     phase: &str,
     seed: Option<&Path>,
 ) -> io::Result<()> {
-    require_new_phase_name(phase)?;
+    // `phase_start` is BOTH the creation path and the documented RE-ENTRY path
+    // (`token_lost_message` prints `drovr phase start <run> <phase>` as the
+    // recovery for a vanished token, and `skills/pipeline` re-enters this way).
+    // The strict alphabet therefore applies to a name being INTRODUCED, not to
+    // one already in `state.json` — gating the whole function would brick exactly
+    // the legacy-named phases [`require_phase_name`]'s weaker rule exists to keep
+    // working, on the recovery drovr itself suggests.
+    if find_phase_idx(run, phase).is_none() {
+        require_new_phase_name(phase)?;
+    } else {
+        require_phase_name(phase)?;
+    }
     if run.project_dir.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4175,6 +4188,40 @@ mod tests {
         assert!(marker.exists());
         collect(&run, legacy).expect_err("no handoff file — but the NAME was accepted");
         phase_send(&h, &mut run, legacy, "text").expect("and can still be sent to");
+    }
+
+    #[test]
+    fn an_old_named_phase_can_still_be_re_entered() {
+        // `phase_start` is BOTH the creation path and the documented re-entry
+        // path — `token_lost_message` prints `drovr phase start <run> <phase>` as
+        // the recovery for a phase whose token vanished. Gating the whole function
+        // on the creation alphabet would break that recovery for exactly the
+        // legacy-named phases the create/resolve split exists to keep working.
+        // The strict rule applies to a name being INTRODUCED, not to one already
+        // in state.json.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("old-name-reentry-test");
+        let legacy = "my task 1";
+        run.phases.push(Phase {
+            name: legacy.into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p3".into()),
+            ..Default::default()
+        });
+        run.save().unwrap();
+
+        phase_start(&h, &mut run, legacy, None).expect("re-entry of an existing phase is allowed");
+        assert_eq!(run.phases.len(), 1, "re-entry reuses the entry, never appends");
+        assert!(
+            run.phases[0].pass.is_some(),
+            "and it really did mint a new pass"
+        );
+
+        // A name that does NOT already exist is still refused.
+        let err = phase_start(&h, &mut run, "brand new", None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run.phases.len(), 1, "and nothing was appended");
     }
 
     #[test]
