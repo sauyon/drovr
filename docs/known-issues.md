@@ -337,6 +337,17 @@ not submit it.
 After `phase send`, submit with `herdr agent send-keys <pane> Enter` (verify first with
 `herdr agent read <pane>`).
 
+**A follow-up empty `phase send` does not work** (confirmed 2026-07-25, run `skill-stickiness`):
+`drovr phase send <run> <phase> ""` is rejected by the CLI with
+`drovr: phase send failed: agent prompt must not be empty`. If you are carrying that as a
+remembered workaround, drop it — `herdr agent send-keys` above is the only one that submits.
+
+A more robust alternative that sidesteps the paste-size problem entirely: **write the briefing to a
+file in the run dir and send a short pointer** — e.g.
+`drovr phase send <run> <phase> "Read <run_dir>/<phase>-brief.md NOW, in full, before anything
+else."` The payload is then small enough to submit reliably, and the agent re-reads the file if its
+context compacts mid-task. Used for every injection in run `skill-stickiness`; no stuck composer.
+
 ### Fix idea
 
 For large payloads, either send the submit key(s) separately after a short settle, or detect a
@@ -607,6 +618,175 @@ from a unit test, so the *ordering* guarantee — archived is written before any
 failed prune still leaves the run correctly marked — is enforced by construction and comment
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
+
+## Piping a `wait` command destroys its exit-code contract — a timeout reads as approval
+
+**Severity:** high (the failure is silent and points the wrong way: a *timeout* is
+indistinguishable from an *approval*, so an unapproved spec can walk straight into the implement
+phase — the exact outcome the gate exists to prevent).
+**Found:** 2026-07-25, run `skill-stickiness`, brainstorm spec gate.
+
+### Symptom
+
+The driver backgrounded the gate watch as:
+
+```
+drovr review wait skill-stickiness 2>&1 | tail -5
+```
+
+The harness reported **exit code 0** — which `drovr:pipeline` defines as *approved*. The command's
+actual output was `review: no reviewer action for run 'skill-stickiness' within timeout (re-run to
+resume)`, i.e. a **timeout (exit 2)**. On-disk state confirmed no decision: `review.state.json`
+still `{"state":"ready"}`, no `approved` marker, no `feedback.json`.
+
+### Root cause
+
+A shell pipeline's exit status is the status of its **last** command. `tail` succeeds, so the
+pipeline exits 0 regardless of what `drovr review wait` returned. Both `drovr:pipeline` ("The spec
+gate" → exit-code table) and `drovr:handoff` (step 3 → exit-code table) define precise exit-code
+contracts for `review wait`, `phase wait`, and `code-review run`, and **neither warns that piping
+the command destroys the contract**. Adding `| tail`, `| head`, `| grep`, or `| jq` to trim output
+is a natural thing to do and silently voids every one of those tables.
+
+This is the inverse of the danger the skill already names. `drovr:pipeline` warns "Only exit 0 is
+approval. A non-zero exit is never an approval" — the observed failure is an **exit 0 that is not
+an approval**, which no existing guidance covers.
+
+### Workaround
+
+Never pipe a command whose exit code you depend on. Capture it explicitly:
+
+```
+drovr review wait <run>; rc=$?; echo "EXIT=$rc"; exit $rc
+```
+
+This preserves the real status for the harness *and* records it in the output. Independently,
+**verify against on-disk state before acting on an approval** — `approved`/`cancelled` markers and
+`review.state.json` are the source of truth; the exit code is a convenience.
+
+### Fix ideas
+
+1. Add a red-flag row to `drovr:pipeline` and `drovr:handoff`: *"Piping `wait`/`code-review run`
+   → the pipeline's exit status is the last command's; use `cmd; rc=$?` instead."* Cheapest fix,
+   and it belongs next to the exit-code tables that create the expectation.
+2. Have `review wait` / `phase wait` write their outcome to a marker file in the run dir as well as
+   returning it, so a lost exit code is recoverable rather than fatal.
+3. Consider making the approval path require the on-disk `approved` marker, so that no exit-code
+   mishap alone can advance a gated run.
+
+## `review.state.json` state is sticky — polling it detects a condition, not a transition
+
+**Severity:** medium (a driver that polls for `state == "ready"` fires immediately on a
+*previous* revision and reports a revision that has not happened).
+**Found:** 2026-07-25, run `skill-stickiness`, while watching the gate for a post-review revision.
+
+### Symptom
+
+The driver armed a watch that fired when `review.state.json` reported `state: "ready"`, intending
+"the agent posted a new revision". It fired at once and reported a revision that did not exist:
+`spec.md`'s mtime predated the feedback file the agent was supposed to be acting on, and the
+agent was still mid-work.
+
+### Root cause
+
+`ready` is a **resting state**, not an edge. It is set by `drovr review summary` and persists
+until the reviewer acts. After any earlier revision the run sits in `ready` indefinitely, so a
+predicate of the form `state == "ready"` is true continuously — it says *"a revision is available
+for review"*, never *"a new revision just arrived"*.
+
+A second bug in the same watch is worth recording because it fails silently in the dangerous
+direction: the turn threshold was hardcoded (`turn > 4`) while `feedback.json` was at turn 3, so
+the reviewer's *next* decision (turn 4) would never have matched and the watch would have waited
+forever while the human had already acted.
+
+### Workaround
+
+Watch **mtimes**, not state. Capture `stat -c %Y` for `summary.txt` and `spec.md` at arm time and
+fire when they increase; derive any turn threshold from `feedback.json` at arm time rather than
+hardcoding it. A useful extra alarm: if `summary.txt` is re-posted while `spec.md` is unchanged,
+the agent has claimed work it did not do.
+
+### Fix ideas
+
+1. Add a monotonically increasing `revision` counter (or a `last_summary_at` timestamp) to
+   `review.state.json`, so watchers have an edge to trigger on.
+2. Document in `drovr:pipeline` that `state` is a resting value and that `drovr review wait` — not
+   a hand-rolled state poll — is the sanctioned way to detect a decision.
+
+## The review server binds to the configured host, so the documented `127.0.0.1` URL can fail
+
+**Severity:** low (cosmetic for a human who can read the bind address, but it silently breaks any
+scripted `localhost` poll).
+**Found:** 2026-07-25, run `skill-stickiness`.
+
+### Symptom
+
+`drovr:pipeline` documents the run's page as `http://127.0.0.1:8791/#/runs/<run>` and the state
+endpoint as `/api/runs/<run>/state`. On this machine the server was listening on the Tailscale
+address (`100.71.58.39:8791`), so:
+
+- `curl 127.0.0.1:8791/...` returned **empty** — a scripted poll for `"ready"` never matched and
+  silently ran to timeout.
+- On the correct host, `/` and `/#/runs/<run>` returned **200**, but `/api/runs` and
+  `/api/runs/<run>/state` returned **404**.
+
+### Root cause
+
+Partly configuration (the server was bound to a Tailscale host rather than loopback, which the
+skill explicitly supports via `drovr serve --host <tailscale-host>`) — the skill just hardcodes
+`127.0.0.1` in the URL it tells the driver to hand the human.
+
+**The 404s are not diagnosed.** The correct API path was not determined; it may simply differ from
+what the skill documents, or the endpoint may be versioned differently. Do not treat "the API path
+is wrong" as established — that needs checking against `cli/src/` before anyone acts on it.
+
+### Workaround
+
+Read the actual bind address (`ss -ltnp | grep 8791`) rather than assuming loopback, and prefer the
+on-disk markers (`review.state.json`, `approved`, `cancelled`, `feedback.json`) over HTTP for any
+programmatic check. They are the source of truth and need no network.
+
+### Fix ideas
+
+1. Have `drovr review summary` print the URL using the address the server actually bound to (it
+   already prints the reviewer URL — it should be the *real* one).
+2. Confirm the correct `/api/...` path and fix either the server or the skill's documentation.
+
+## Upstream (not a drovr bug): context-percentage readouts are computed against 200k
+
+**Severity:** informational — recorded because it distorts drovr's primary escalation signal, not
+because drovr should change.
+**Found:** 2026-07-25, run `skill-stickiness`, on `claude-opus-5`.
+
+### Symptom
+
+The statusline reported `ctx:83%` when the session held 165,258 tokens. 165,258 / 200,000 = 82.6%
+— an exact match, so the denominator is 200k. On a model with a 1M context window the true
+fullness was 16.5%, i.e. readings are inflated roughly 5×.
+
+More consequential than the display: the harness's **auto-compaction trigger uses the same
+number**, so an agent is compacted at ~200k regardless of the model's real capacity. The
+practical ceiling therefore *is* ~200k in behaviour even though the displayed percentage is wrong.
+
+### Why it is recorded here
+
+`drovr:using-drovr`'s escalation contract names **context fullness as the primary signal** for
+escalating a task into its own phase. An inflated reading pushes drovr to escalate far earlier
+than warranted — chopping work that would fit comfortably in one context, which inverts the
+project's value. During this run it nearly triggered an unnecessary mid-flight handoff at a
+displayed 63% (true fullness ~13%).
+
+### Status — do not design around this
+
+This is an upstream harness bug that is expected to be fixed, and the maintainer's explicit
+instruction was **not to change any drovr skill because of it**. No drovr change is warranted.
+Recorded only so that a reading taken before the upstream fix is not mistaken for a drovr defect,
+and so the interaction with the escalation contract is on record.
+
+Until it is fixed: when a context reading would actually change a decision, read real token counts
+from the session transcript (`~/.claude/projects/<munged-cwd>/<session>.jsonl`, summing
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens` on the last `usage` entry)
+rather than trusting the percentage.
 
 ## Resolved
 
