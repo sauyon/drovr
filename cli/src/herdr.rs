@@ -662,10 +662,15 @@ impl Herdr for SystemHerdr {
 
     fn tab_close(&self, tab_id: &TabId) -> io::Result<()> {
         // Socket `tab.close` (params: `tab_id`) → `{"type":"ok"}`. The error is
-        // re-wrapped with the tab it names, matching `pane_info`'s diagnostics:
-        // reaping swallows this after logging it.
+        // re-wrapped with the tab it names, matching `pane_info`'s diagnostics,
+        // because reaping is meant to log a failed close and carry on — a log
+        // line that does not say which tab is close to useless. The original
+        // `ErrorKind` is preserved: a caller may yet want to tell "no such tab"
+        // (already gone, ignorable) from "socket down" (a real failure).
         self.socket_call("tab.close", json!({ "tab_id": tab_id.as_str() }))
-            .map_err(|err| io::Error::other(tab_close_error_message(tab_id, &err.to_string())))?;
+            .map_err(|err| {
+                io::Error::new(err.kind(), tab_close_error_message(tab_id, &err.to_string()))
+            })?;
         Ok(())
     }
 
@@ -721,12 +726,15 @@ static PANE_GET_ERROR_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new
 /// call with the same pane. Turns a 500 ms poll loop's diagnostic into one line
 /// per pane instead of two a second — and keys it PER PANE, because a reap loop
 /// polls many: one pane's transient failure must not silence a different pane's
-/// persistent one. A poisoned lock reports rather than swallows.
+/// persistent one.
+///
+/// A poisoned lock is recovered rather than treated as an error: the set holds
+/// nothing but pane ids, so a panicking thread cannot have left it inconsistent,
+/// and reporting `true` forever after would turn the diagnostic back into the
+/// once-a-poll spam this gate exists to prevent.
 fn first_time_for(seen: &Mutex<BTreeSet<String>>, pane_id: &str) -> bool {
-    match seen.lock() {
-        Ok(mut seen) => seen.insert(pane_id.to_string()),
-        Err(_) => true,
-    }
+    let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.insert(pane_id.to_string())
 }
 
 /// The diagnostic for a `pane.get` that succeeded with a shape
@@ -1024,8 +1032,9 @@ impl Herdr for FakeHerdr {
         // unreadable `None`) push it explicitly.
         //
         // FIDELITY: an attached agent ALWAYS carries an `agent_session` in real
-        // herdr (verified live against a working claude pane); only an exited
-        // agent — herdr status `unknown` — lacks one. The fake ties the two
+        // herdr — captured live on a `working` pane, and absent on a captured
+        // exited one; only an exited agent, whose status is herdr's own
+        // `unknown`, lacks a session. The fake ties the two
         // together the same way, because reaping classifies on the SESSION, and
         // a session-less "live" pane here would teach every later test the
         // opposite of what herdr does.
@@ -1675,10 +1684,12 @@ mod tests {
         let info = h.pane_info("pane-1").unwrap();
         assert_eq!(info.tab_id, FakeHerdr::tab_id_for("pane-1"));
         assert_eq!(info.agent_status, Some(AgentStatus::Idle));
-        // An attached agent ALWAYS carries a session in real herdr — verified
-        // live against a working claude pane. A fake that omitted it would teach
-        // every later test that a live agent looks session-less, and reaping
-        // keys off exactly that.
+        // An attached agent ALWAYS carries a session in real herdr: a live
+        // `working` pane was captured with one and an exited pane without (see
+        // LIVE_PANE_GET / EXITED_PANE_GET), and herdr 0.7.5's schema marks the
+        // field required whenever an agent is attached. A fake that omitted it
+        // would teach every later test that a live agent looks session-less, and
+        // reaping keys off exactly that.
         assert_eq!(info.state(), PaneState::AgentAttached);
         let session = info.agent_session.expect("an attached agent has a session");
         assert_eq!(
@@ -1703,8 +1714,10 @@ mod tests {
             "an exited agent still has a closable tab"
         );
 
-        // Every other status models an attached agent, session and all.
-        for status in ["idle", "working", "blocked", "done"] {
+        // Every other status models an attached agent, session and all —
+        // INCLUDING one drovr has never seen, so a refactor that enumerates the
+        // four known-live variants instead of "everything but unknown" is caught.
+        for status in ["idle", "working", "blocked", "done", "compacting"] {
             h.push_status(Some(status));
             let info = h.pane_info("pane-1").unwrap();
             assert_eq!(

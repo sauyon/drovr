@@ -2,6 +2,10 @@
 
 ## Reviewers judge an intermediate task against the WHOLE run's goal
 
+**Severity:** medium (every intermediate task of every multi-task run draws a spurious CRITICAL, and
+each one costs a review round to adjudicate).
+**Found:** 2026-07-25, run `phase-reap` task-2 iteration 5.
+
 ### Symptom
 
 On a multi-task run, `drovr code-review run <run> <task>` returns a CRITICAL finding of the form
