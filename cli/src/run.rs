@@ -21,13 +21,28 @@ pub enum PhaseStatus {
 /// mixing them up would be a silent equality check that is always false — i.e. a
 /// phase that never completes. This makes that class of mistake a type error.
 ///
+/// An empty token is NOT representable — neither through [`PassToken::new`] nor
+/// through `Deserialize`. "This phase has no token" is `Option::None` and means
+/// something specific (a run created before pass tokens, which completes on an
+/// UNTOKENIZED marker); a `PassToken("")` would be `Some` while matching no
+/// marker at all, i.e. a phase that can never complete under either rule. The
+/// two must not be the same value.
+///
 /// Serializes transparently as a JSON string, so `state.json` is unchanged.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+#[serde(try_from = "String")]
 pub struct PassToken(String);
 
 impl PassToken {
-    pub fn new(value: String) -> PassToken {
-        PassToken(value)
+    /// `None` for a value no marker could ever match. The only in-tree caller
+    /// (`phase::new_pass_token`) builds from `format!`ed pid/nanos/counter and so
+    /// can never hit it, but `new` is `pub` and this is the invariant the type
+    /// exists to carry.
+    pub fn new(value: String) -> Option<PassToken> {
+        if value.trim().is_empty() {
+            return None;
+        }
+        Some(PassToken(value))
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -39,6 +54,18 @@ impl PassToken {
     /// pass.
     pub fn matches_marker(&self, token: &str) -> bool {
         !token.is_empty() && token == self.0
+    }
+}
+
+/// The second constructor: `state.json` is a file, and anything that can write it
+/// can propose a token. It is held to exactly the rule [`PassToken::new`]
+/// enforces, so a deserialized token is as trustworthy as a minted one. A run
+/// whose state really does carry `"pass": ""` fails to load LOUDLY rather than
+/// running on with a phase that no `phase wait` could ever complete.
+impl TryFrom<String> for PassToken {
+    type Error = String;
+    fn try_from(value: String) -> Result<PassToken, String> {
+        PassToken::new(value).ok_or_else(|| "pass token must not be empty".to_string())
     }
 }
 
@@ -586,8 +613,31 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_pass_token_is_not_representable() {
+        // "no token" (a phase from a pre-token build, which completes on an EMPTY
+        // marker) and "a token that happens to be empty" are opposite statements
+        // about a phase, and `Option<PassToken>` already carries the first one.
+        // A `PassToken("")` would satisfy `pass.is_some()` while matching no
+        // marker at all — a phase that can never complete, by either rule.
+        assert!(PassToken::new(String::new()).is_none());
+        assert!(PassToken::new("   ".into()).is_none());
+        assert!(PassToken::new("abc-1".into()).is_some());
+
+        // `Deserialize` is a second constructor, reachable by anyone who can write
+        // state.json. It must enforce the same rule.
+        let r: Result<Phase, _> = serde_json::from_str(
+            r#"{"name":"plan","status":"Running","handoff_doc":null,
+                "herdr_session":null,"pane_id":null,"pass":""}"#,
+        );
+        assert!(
+            r.is_err(),
+            "an empty pass token on disk must not deserialize into Some(PassToken)"
+        );
+    }
+
+    #[test]
     fn pass_token_only_matches_a_non_empty_equal_marker() {
-        let t = PassToken::new("abc-1".into());
+        let t = PassToken::new("abc-1".into()).unwrap();
         assert!(t.matches_marker("abc-1"));
         assert!(!t.matches_marker("abc-2"));
         assert!(

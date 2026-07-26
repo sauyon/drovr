@@ -39,12 +39,16 @@ fn new_pass_token() -> PassToken {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Infallible by construction: `format!` of three integers is never empty.
+    // `PassToken::new` is fallible because an EMPTY token is not representable
+    // (see [`PassToken`]) — not because minting can fail.
     PassToken::new(format!(
         "{:x}-{:x}-{:x}",
         std::process::id(),
         nanos,
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
+    .expect("a minted pass token is never empty")
 }
 
 /// Delete a phase's completion marker, treating "already gone" as success and
@@ -2707,8 +2711,8 @@ mod tests {
 
     #[test]
     fn pass_drift_separates_a_newer_pass_from_a_lost_token() {
-        let a = PassToken::new("a".into());
-        let b = PassToken::new("b".into());
+        let a = PassToken::new("a".into()).unwrap();
+        let b = PassToken::new("b".into()).unwrap();
         // The same pass, tokened or legacy.
         assert_eq!(PassDrift::between(Some(&a), Some(&a)), PassDrift::Same);
         assert_eq!(PassDrift::between(None, None), PassDrift::Same);
