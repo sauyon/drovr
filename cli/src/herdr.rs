@@ -69,25 +69,15 @@ impl SessionId {
     }
 }
 
-/// A session that is safe to resume: a `kind == "id"` session whose owning agent
-/// herdr told us. Both halves of the resume rule travel together, so a caller
-/// cannot hold the id without also holding the backend to check it against —
-/// see [`AgentSession::resumable`], the only thing that builds one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResumableSession<'a> {
-    pub id: &'a SessionId,
-    pub agent: &'a str,
-}
-
 /// The agent session herdr records on a pane (`agent_session`), keyed by herdr's
 /// own `kind` discriminator.
 ///
 /// Only a `kind == "id"` session may ever be interpolated into an agent's
 /// `--resume` argument — a transcript path there would be read as a session
 /// name. That rule lives in the TYPE rather than in every caller: the id is
-/// reachable through [`AgentSession::resumable`], and only for an `Id` whose
-/// owning agent herdr reported; the value it hands back is a [`SessionId`] no
-/// other variant can produce. A `Path`'s value is still readable — diagnostics
+/// reachable through [`AgentSession::resumable_for`], and only for an `Id` that
+/// herdr attributes to the backend asking for it; the value it hands back is a
+/// [`SessionId`] no other variant can produce. A `Path`'s value is still readable — diagnostics
 /// need it — but only by naming `Path` explicitly, which is a deliberate,
 /// greppable act.
 ///
@@ -102,7 +92,7 @@ pub struct ResumableSession<'a> {
 /// variants, so with the id and the agent sitting directly on the variant any
 /// same-crate caller could write `if let AgentSession::Id { value, .. }` and
 /// walk off with the id having skipped the agent check entirely — reproducing
-/// the bug [`AgentSession::resumable`] exists to prevent. Behind this struct,
+/// the bug [`AgentSession::resumable_for`] exists to prevent. Behind this struct,
 /// destructuring the variant yields something you cannot read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdSession {
@@ -130,21 +120,33 @@ pub enum AgentSession {
 // onto `Phase` is a later step, and resuming from it later still.
 #[allow(dead_code)]
 impl AgentSession {
-    /// The session — and ONLY when it is an id whose owning agent is known.
-    /// A `kind:"path"` session, an unrecognised kind, and an id herdr did not
-    /// attribute to an agent all yield `None`.
+    /// The session id — and ONLY when this is an id session that herdr
+    /// attributes to `expected_backend`. A `kind:"path"` session, an
+    /// unrecognised kind, an id herdr did not attribute to any agent, and an id
+    /// belonging to a *different* backend all yield `None`, as does an empty
+    /// `expected_backend`: a caller that cannot name its own backend has nothing
+    /// to verify against.
     ///
-    /// This is the single chokepoint for the whole resume rule: never
-    /// interpolate a path as a session id, AND never resume an id without being
-    /// able to check it came from this run's backend. Without the agent that
-    /// check is impossible, and resuming a claude session under cursor is not a
-    /// recoverable mistake — so an agent-less id is not resumable at all.
-    pub fn resumable(&self) -> Option<ResumableSession<'_>> {
+    /// This is the single chokepoint for the whole resume rule, and it takes the
+    /// backend as an argument precisely so the check cannot be skipped — the id
+    /// is not obtainable until it has passed. Never interpolate a path as a
+    /// session id; never resume an id that came from another agent. Resuming a
+    /// claude session under cursor is not a recoverable mistake, so it is not
+    /// merely discouraged here, it is unreachable.
+    ///
+    /// Backend names compare case-insensitively after trimming: they come from
+    /// user config on one side and herdr on the other, and a casing difference
+    /// is not a mismatch.
+    pub fn resumable_for(&self, expected_backend: &str) -> Option<&SessionId> {
+        let expected = expected_backend.trim();
+        if expected.is_empty() {
+            return None;
+        }
         match self {
             AgentSession::Id(IdSession {
                 value,
                 agent: Some(agent),
-            }) => Some(ResumableSession { id: value, agent }),
+            }) if agent.trim().eq_ignore_ascii_case(expected) => Some(value),
             _ => None,
         }
     }
@@ -248,6 +250,76 @@ pub struct PaneInfo {
     pub tab_id: TabId,
     pub agent_status: Option<AgentStatus>,
     pub agent_session: Option<AgentSession>,
+}
+
+/// What one [`Herdr::pane_info`] poll established about a pane. Classifies the
+/// WHOLE poll result — its `None` included — so the outcomes cannot be confused
+/// by reconstructing them from two `Option`s at each call site.
+///
+/// Reaping and session capture both turn on this, in opposite directions:
+/// treating [`PaneState::Unreadable`] as [`PaneState::AgentExited`] tears down a
+/// pane whose agent is alive and working, while treating `AgentExited` as
+/// `Unreadable` means finished panes never get reaped at all.
+// Capability only for now: reaping and session capture are later steps, so
+// `Unreadable` is constructed by tests alone until one of them polls.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneState {
+    /// The poll FAILED — herdr unreachable, a socket error, or the pane is gone.
+    /// It says NOTHING about the agent: never reap on this, and never clear a
+    /// captured session on it. `pane_info` has already printed one diagnostic
+    /// per process explaining why.
+    Unreadable,
+    /// herdr answered and reports an agent session on the pane: an agent is
+    /// attached. Its `agent_status` says what that agent is *doing*, which is a
+    /// separate question — and may be absent, see [`PaneInfo::status_unreadable`].
+    AgentAttached,
+    /// herdr answered: the pane and its tab are still there, but there is no
+    /// agent session — the agent process has exited. herdr reports
+    /// `agent_status: "unknown"` here and DROPS the session, so a session id
+    /// captured earlier must be kept, not cleared.
+    AgentExited,
+}
+
+#[allow(dead_code)]
+impl PaneState {
+    /// Classify a whole `pane_info` result, `None` and all.
+    pub fn from_poll(poll: Option<&PaneInfo>) -> PaneState {
+        match poll {
+            None => PaneState::Unreadable,
+            Some(info) => info.state(),
+        }
+    }
+}
+
+// Capability only for now: reaping and session capture are later steps.
+#[allow(dead_code)]
+impl PaneInfo {
+    /// This pane's state. Never [`PaneState::Unreadable`] — holding a `PaneInfo`
+    /// is itself proof the poll succeeded. Use [`PaneState::from_poll`] to
+    /// classify a result that may be `None`.
+    pub fn state(&self) -> PaneState {
+        if self.agent_has_exited() {
+            PaneState::AgentExited
+        } else {
+            PaneState::AgentAttached
+        }
+    }
+
+    /// Whether the pane's agent process has exited. Keyed off the SESSION, not
+    /// the status: herdr drops `agent_session` when the agent exits, whereas a
+    /// status can be missing on a perfectly live pane.
+    pub fn agent_has_exited(&self) -> bool {
+        self.agent_session.is_none()
+    }
+
+    /// Whether herdr answered without an `agent_status` for this pane. Distinct
+    /// from [`PaneInfo::agent_has_exited`] — an exited agent has a status
+    /// (`unknown`), and a live agent may momentarily have none. Callers that
+    /// gate on a status should treat this as "not yet known", never as done.
+    pub fn status_unreadable(&self) -> bool {
+        self.agent_status.is_none()
+    }
 }
 
 pub trait Herdr {
@@ -1049,7 +1121,7 @@ mod tests {
         let session = info.agent_session.expect("live agent carries a session");
         assert_eq!(session.kind(), "id");
         assert_eq!(
-            session.resumable().map(|r| r.id.as_str()),
+            session.resumable_for("claude").map(SessionId::as_str),
             Some("cca92f5b-3a8c-4008-a9f2-e2fa191395e5")
         );
         assert_eq!(session.agent(), Some("claude"));
@@ -1091,6 +1163,61 @@ mod tests {
         assert!(first_time(&flag), "the first call reports");
         assert!(!first_time(&flag), "and every later one is silent");
         assert!(!first_time(&flag));
+    }
+
+    // Tasks 3 and 6 both hinge on telling these three outcomes apart, so the
+    // classification is a named type rather than something each consumer
+    // reconstructs from two Options.
+    #[test]
+    fn pane_state_distinguishes_the_three_poll_outcomes() {
+        // (A) the poll itself failed — herdr unreachable, or the pane is gone.
+        assert_eq!(PaneState::from_poll(None), PaneState::Unreadable);
+
+        // (B) herdr answered and an agent is attached.
+        let live = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
+        assert_eq!(live.state(), PaneState::AgentAttached);
+        assert_eq!(PaneState::from_poll(Some(&live)), PaneState::AgentAttached);
+        assert!(!live.agent_has_exited());
+
+        // (C) herdr answered; the pane and its tab are there, the agent exited.
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert_eq!(exited.state(), PaneState::AgentExited);
+        assert_eq!(PaneState::from_poll(Some(&exited)), PaneState::AgentExited);
+        assert!(exited.agent_has_exited());
+        assert_eq!(
+            exited.tab_id.as_str(),
+            "wAF:t2",
+            "an exited agent still has a closable tab"
+        );
+
+        // The three are pairwise distinct — a consumer that collapses any two of
+        // them either reaps a live agent or never reaps at all.
+        assert_ne!(PaneState::from_poll(None), exited.state());
+        assert_ne!(exited.state(), live.state());
+    }
+
+    // A missing `agent_status` field is NOT the agent exiting: herdr may answer
+    // without a status while a session is plainly attached. Reaping must key off
+    // the session, never the status field.
+    #[test]
+    fn a_missing_status_field_is_not_an_exited_agent() {
+        let statusless = PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: None,
+            agent_session: Some(AgentSession::Id(IdSession {
+                value: SessionId("abc".to_string()),
+                agent: Some("claude".to_string()),
+            })),
+        };
+        assert!(statusless.status_unreadable());
+        assert!(!statusless.agent_has_exited());
+        assert_eq!(statusless.state(), PaneState::AgentAttached);
+
+        // And the converse: an exited agent's status is readable — herdr's own
+        // `unknown` — so the two predicates are genuinely independent.
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert!(!exited.status_unreadable());
+        assert!(exited.agent_has_exited());
     }
 
     #[test]
@@ -1136,16 +1263,30 @@ mod tests {
             value: SessionId("cca92f5b".to_string()),
             agent: Some("claude".to_string()),
         });
-        let resumable = id.resumable().expect("an id session with a known agent");
-        assert_eq!(resumable.id, &SessionId("cca92f5b".to_string()));
+        let resumable = id
+            .resumable_for("claude")
+            .expect("an id session owned by the backend asking for it");
+        assert_eq!(resumable, &SessionId("cca92f5b".to_string()));
         assert_eq!(
-            resumable.id.as_str(),
+            resumable.as_str(),
             "cca92f5b",
             "the raw id is still reachable, but only through a SessionId"
         );
+        // A MIS-attributed id is as unusable as an unattributed one: resuming a
+        // claude session under cursor is not a recoverable mistake, so the id is
+        // not obtainable at all unless the backend matches.
+        assert!(
+            id.resumable_for("cursor").is_none(),
+            "another backend must not be able to reach this id"
+        );
+        assert!(
+            id.resumable_for("").is_none(),
+            "a caller that cannot name its backend must not resume"
+        );
         assert_eq!(
-            resumable.agent, "claude",
-            "the backend to check against comes WITH the id, not separately"
+            id.resumable_for("Claude").map(SessionId::as_str),
+            Some("cca92f5b"),
+            "backend names compare case-insensitively"
         );
         assert_eq!(id.agent(), Some("claude"));
         assert_eq!(id.kind(), "id");
@@ -1159,7 +1300,7 @@ mod tests {
             agent: None,
         });
         assert!(
-            agentless.resumable().is_none(),
+            agentless.resumable_for("claude").is_none(),
             "half of the rule is not enough"
         );
         assert_eq!(agentless.kind(), "id", "but it is still an id session");
@@ -1167,11 +1308,14 @@ mod tests {
         let path = AgentSession::Path {
             value: "/tmp/transcript.jsonl".to_string(),
         };
-        assert!(path.resumable().is_none(), "a path is never a session id");
+        assert!(
+            path.resumable_for("claude").is_none(),
+            "a path is never a session id"
+        );
         // …and a `Path`'s value cannot be passed off as one: only `Id` carries a
         // `SessionId`, so an or-pattern merging the two variants to lift out a
         // single `value` binding does not type-check.
-        assert!(path.resumable().is_none());
+        assert!(path.resumable_for("claude").is_none());
         assert_eq!(path.kind(), "path");
         assert_eq!(path.agent(), None);
 
@@ -1180,7 +1324,7 @@ mod tests {
             value: "abc".to_string(),
         };
         assert!(
-            other.resumable().is_none(),
+            other.resumable_for("claude").is_none(),
             "an unrecognised kind is not resumable either"
         );
         assert_eq!(other.kind(), "handle");
@@ -1247,7 +1391,10 @@ mod tests {
                 value: "/tmp/t.jsonl".to_string()
             }
         );
-        assert!(session.resumable().is_none(), "a path is not a session id");
+        assert!(
+            session.resumable_for("claude").is_none(),
+            "a path is not a session id"
+        );
         // The `agent` key is optional, and an id session parses without it.
         let v = socket_result(
             r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"kind":"id","value":"abc"}}}}"#,
@@ -1256,7 +1403,7 @@ mod tests {
         assert_eq!(session.kind(), "id", "it is still parsed faithfully");
         assert_eq!(session.agent(), None);
         assert!(
-            session.resumable().is_none(),
+            session.resumable_for("claude").is_none(),
             "an id herdr did not attribute to an agent is not safely resumable"
         );
     }
