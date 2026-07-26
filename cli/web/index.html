@@ -2062,12 +2062,20 @@ async function toggleArchive(name, archived, live) {
 async function renderRunList(gen) {
   var listEl = document.getElementById('run-list-items');
   try {
+    var seq = ++listFetchSeq;
     var r = await fetch('/api/runs');
     var runs = await r.json();
     if (gen !== undefined && gen !== routeGen) return;
-    // Recorded BEFORE filtering: this is "which runs exist", the question
-    // applyNavCursor asks to tell a hidden row from a deleted one. Filtering it
-    // first would make every filtered-out run look deleted.
+    // `routeGen` only changes when the VIEW does, so it cannot order two list
+    // fetches issued from the same view — and there are several: the 2s poll,
+    // toggleArchive's un-awaited re-render, and closeFilter's. If an older
+    // response lands after a newer one it would otherwise win, rebuilding the
+    // list from a stale snapshot and restoring names to `knownRunNames` that
+    // have since disappeared — which is enough to make a deleted run look merely
+    // hidden and bring the cursor drift back.
+    if (seq !== listFetchSeq) return;
+    // Recorded BEFORE filtering, so the list stays "which runs exist" rather
+    // than "which runs match the current filter".
     knownRunNames = runs.map(function(x) { return x.name; });
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
@@ -2350,6 +2358,8 @@ var navCursorKey = '';
 // separates "the anchored row is hidden" from "the anchored run is gone" — see
 // applyNavCursor, which needs the reason, not the duration.
 var knownRunNames = [];
+// Monotonic id for list fetches, so a slow response cannot overwrite a newer one.
+var listFetchSeq = 0;
 
 // Rows the cursor moves over, chosen by view. Detail view has no run rows, and
 // the list view has no questions, so one of these is always empty. On the detail
@@ -2383,7 +2393,15 @@ function rowKey(el) {
 // and is clamped because a shrinking list can leave it past the end.
 function applyNavCursor(scroll) {
   var rows = navRows();
-  if (!rows.length) { navCursor = 0; navCursorKey = ''; renderKeyhint(); announceCursor(null); return; }
+  // Zero rows does NOT mean the anchored run is gone. The commonest way to land
+  // here is a failed `/api/runs` fetch, which replaces the list with "Failed to
+  // load sessions" — a server hiccup, not a deletion. Clearing the key here
+  // discarded the selection before any of the hidden-vs-gone reasoning below
+  // could run, so the cursor never returned after a recovery poll. Keeping it
+  // costs nothing: the failure path leaves `knownRunNames` untouched, and a list
+  // that is genuinely empty still releases the anchor on the next render that
+  // has rows to compare against.
+  if (!rows.length) { navCursor = 0; renderKeyhint(); announceCursor(null); return; }
   var anchorMissing = false;
   if (!currentRun && navCursorKey) {
     var found = -1;

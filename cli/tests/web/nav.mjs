@@ -368,6 +368,66 @@ check('...and the cursor then stops drifting across rows',
   drift.every(k => k === released), true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
+console.log('\n== session list: the cursor survives a failed fetch ==');
+await goto('#/', LIST_READY);
+await press('g');
+await press('j');
+const held = await cursorName();
+// A failed /api/runs replaces the list with "Failed to load sessions" — zero
+// rows. That is a server hiccup, not a deletion, so the selection must survive
+// it; clearing the anchor there discarded it before any hidden-vs-gone reasoning
+// could run, and the cursor never came back on the recovery poll.
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) return Promise.reject(new Error('boom'));
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('a failed fetch empties the list', await evaluate(`
+  return document.querySelectorAll('.run-row').length;`), 0);
+check('...but does not discard the selection',
+  await evaluate(`return navCursorKey;`), held);
+await evaluate(`window.__restoreFetch(); return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('...so the cursor is back on its run once the server recovers',
+  await cursorName(), held);
+
+// A slow response must never overwrite a newer one: `routeGen` only changes when
+// the VIEW does, so it cannot order two fetches issued from the same view.
+const baselineRuns = await evaluate(`return knownRunNames.length;`);
+const afterRace = await evaluate(`
+  var realFetch = window.fetch;
+  var call = 0;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      call++;
+      var mine = call;
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        // Call 1 is the OLD snapshot (full list), delayed so it lands LAST.
+        // Call 2 is newer and drops one run.
+        var body = mine === 1 ? rows : rows.filter(function(x){ return x.name !== rows[0].name; });
+        var wait = mine === 1 ? 220 : 0;
+        return new Promise(function(res){
+          setTimeout(function(){ res({ok: true, json: function(){ return Promise.resolve(body); }}); }, wait);
+        });
+      });
+    }
+    return realFetch(u, o);
+  };
+  var stale = renderRunList(routeGen);
+  var fresh = renderRunList(routeGen);
+  return Promise.all([stale, fresh]).then(function(){
+    window.fetch = realFetch;
+    return knownRunNames.length;
+  });`);
+check('a stale list response cannot overwrite a newer one',
+  afterRace, baselineRuns - 1);
+// Leave the page on real data for the sections below.
+await evaluate(`return renderRunList(routeGen);`);
+
 console.log('\n== session list: filter ==');
 await goto('#/', LIST_READY);
 await press('g');
