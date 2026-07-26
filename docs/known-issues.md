@@ -299,112 +299,129 @@ found". So the "agent target not found" symptom above should no longer occur.
 
 **CONFIRMED 2026-07-25** (run `review-resume`, branch `drovr/review-resume`, dogfooding the panel
 on the code-review resume change): the *second* symptom reproduces, and it is **not** a distinct
-bug — it is the unsubmitted-paste failure documented in the next section. All four cursor
+bug — it is the unsubmitted-prompt failure documented in the next section. All four cursor
 reviewer panes launched, attached, and received their seed, but the brief sits in the composer as
 `→ [Pasted text #1 +46 lines]`, never submitted. The agents therefore never start, never reach
 `done`, and `code-review run` times out with no `<task>-review.json` — exactly as reported.
 
 Reading a reviewer pane (`herdr agent read <pane>`) shows the full seed rendered in the composer
 with the correct `base..head` scope, so seeding and scope selection are fine; only the submit
-keystroke is missing. Fixing "`phase send` lands a large briefing unsubmitted" (below) fixes the
-panel too — they are one bug, and the panel is simply its most visible victim. Keep the
-self-spawned-reviewer workaround above until that lands.
+keystroke is missing. Fixing "`drovr phase send` returns success with the prompt left
+unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
+visible victim. Keep the self-spawned-reviewer workaround above until that lands.
 
-## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
+## `drovr phase send` returns success with the prompt left unsubmitted
 
-**Severity:** low (recoverable, but every phase injection needs a manual nudge, so an
-unattended pipeline stalls silently at each phase start).
+**Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as
+`low` originally on the grounds that it is recoverable; that undersold it. Recovery requires a
+human noticing that nothing is happening, and the failure is indistinguishable from an agent
+that is simply working.)
 **Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
-binary that carries the phase-send agent-readiness fix.
-**Reproduced 2026-07-25** (run `mcp-endpoint`) — see "Still reproducing" below.
+binary carrying the phase-send agent-readiness fix.
+**Reproduced:** 2026-07-25 (`mcp-endpoint`), 2026-07-26 (`skill-stickiness`, three times). See
+"Occurrences".
 
 ### Symptom
 
-`drovr phase send <run> <phase> "<large briefing>"` returns success, and (post-fix) no longer
-errors with "agent target not found" — but the briefing sits in the agent's composer as a
-collapsed bracketed paste (`❯ [Pasted text #1 +NN lines]`, cost `$0.00`) and is **not
-submitted**. The agent never starts; `phase wait` would time out.
+`drovr phase send <run> <phase> "<text>"` exits `0` with no stderr. The text reaches the agent's
+composer but is **never submitted** — it sits at the `❯` prompt, cost `$0.00`. The agent is idle
+and unaware. `phase wait` runs to its full timeout, and any watch keyed on the work the message
+asked for stays correctly silent, because nothing happened.
 
-### Root cause (suspected)
+Two distinct renderings, depending on payload:
 
-The readiness fix (await attach/composer before sending) resolved the *race* that caused
-"target not found", but the submit itself — a large **bracketed paste** followed by a single
-CR — still leaves the paste uncommitted in the composer for big payloads; the trailing CR does
-not submit it.
+- large payloads appear as a collapsed bracketed paste — `❯ [Pasted text #1 +NN lines]`;
+- small payloads appear as ordinary inline wrapped text.
+
+Both fail the same way. There is also a rarer third mode where the send lands **nothing at all**
+and the composer stays empty (see Occurrences, `mcp-endpoint` case 1) — the payload is dropped
+outright while the command still reports success.
+
+### Root cause — not established
+
+Unknown. Two plausible-sounding explanations have been **ruled out** by evidence; do not fix
+against either.
+
+- **Not payload size, and not a bracketed-paste commit failure.** Three sends of a few hundred
+  bytes each failed on 2026-07-26, none rendering as a paste. Whatever fails, fails for inline
+  text too.
+- **Not a stale herdr-version assumption.** `cli/src/herdr.rs:265-271` issues the socket call
+  `agent.prompt`, documented to type *and* submit natively, which is why the 0.7.3 flush-CR
+  handshake was removed. herdr was 0.7.5 during the 2026-07-26 failures, so the version premise
+  held and the submit still did not happen.
+
+One unconfirmed contributor: in the first 2026-07-26 case the target had been failing tool calls
+against a degraded classifier and had parked itself, with the TUI showing a `new task? /clear to
+save …` hint. A readiness probe reporting "ready" for an agent parked mid-error would explain
+both the exit `0` and the swallowed submit. The other two cases had no such state, so it is at
+most partial.
 
 ### Workaround
 
-After `phase send`, submit with `herdr agent send-keys <pane> Enter` (verify first with
-`herdr agent read <pane>`).
+Treat exit `0` as "text reached the composer", never as "the agent received it". Follow **every**
+send — large or small, paste or inline — with an explicit submit, then verify:
 
-**A follow-up empty `phase send` does not work** (confirmed 2026-07-25, run `skill-stickiness`):
-`drovr phase send <run> <phase> ""` is rejected by the CLI with
-`drovr: phase send failed: agent prompt must not be empty`. If you are carrying that as a
-remembered workaround, drop it — `herdr agent send-keys` above is the only one that submits.
+```sh
+drovr phase send "$RUN" "$PHASE" "$TEXT"
+sleep 2
+herdr pane send-keys "$PANE" Enter                    # pane_id is in the run's state.json
+herdr pane read "$PANE" --source recent --lines 12    # confirm the composer cleared
+```
 
-A more robust alternative that sidesteps the paste-size problem entirely: **write the briefing to a
-file in the run dir and send a short pointer** — e.g.
-`drovr phase send <run> <phase> "Read <run_dir>/<phase>-brief.md NOW, in full, before anything
-else."` The payload is then small enough to submit reliably, and the agent re-reads the file if its
-context compacts mid-task. Used for every injection in run `skill-stickiness`; no stuck composer.
+A redundant `Enter` on an already-submitted message is harmless — it lands on an empty prompt.
 
-### Fix idea
+**A follow-up empty `phase send` does not work.** `drovr phase send <run> <phase> ""` is rejected
+with `drovr: phase send failed: agent prompt must not be empty`. If you are carrying that as a
+remembered workaround, drop it; `herdr pane send-keys` is the only thing that submits.
 
-For large payloads, either send the submit key(s) separately after a short settle, or detect a
-still-populated composer post-send and re-issue the submit until the input clears.
+**Sending a short pointer instead of a large briefing does not avoid this bug** — it was tried
+and failed (Occurrences, 2026-07-26 case 3). The write-to-a-file-and-send-a-pointer pattern is
+still worth using, but for an unrelated reason: the agent can re-read the file if its context
+compacts mid-task. It is not a mitigation for this issue and must still be followed by an
+explicit submit.
 
-### Still reproducing (2026-07-25, run `mcp-endpoint`, pane `wAC:p1`)
+**Never read a quiet watch as progress.** Silence is equally consistent with "working", "never
+started", and "dead". When a watch has been quiet longer than the work plausibly takes, read the
+pane — that is the only thing that distinguishes them. This bug is invisible from the outside;
+it was caught both times only by reading the pane directly.
 
-Confirmed live on the installed nix-profile binary with a 6586-byte / 124-line briefing:
+### Occurrences
 
-1. The **first** `drovr phase send` landed **nothing at all** — the composer stayed empty at
-   `$0.00`. That is the readiness race described in the entry above's addendum (
-   "`code-review run` panel never completes") reaching the `phase send` CLI path too, not just
-   the reviewer-spawn path: the command reports success while the payload is dropped.
-2. A **second, identical** send landed as the documented collapsed paste:
-   `❯ [Pasted text #1 +124 lines]`, `$0.00`, **unsubmitted**.
-3. `herdr agent send-keys wAC:p1 Enter` submitted it — the documented workaround still works.
+**2026-07-25, run `mcp-endpoint`, pane `wAC:p1`** — installed nix-profile binary, 6586-byte /
+124-line briefing:
 
-So there are two failure modes on this path, not one: a silent *drop* and a silent
-*non-submit*. Any fix must cover both — verifying the composer is non-empty after the send is
-what distinguishes them.
+1. The first `drovr phase send` landed **nothing at all** — composer empty at `$0.00`. That is
+   the readiness race described under "`drovr code-review run` panel never completes" reaching
+   the `phase send` CLI path, not just the reviewer-spawn path: success reported, payload
+   dropped.
+2. A second, identical send landed as a collapsed paste: `❯ [Pasted text #1 +124 lines]`,
+   `$0.00`, unsubmitted.
+3. `herdr agent send-keys wAC:p1 Enter` submitted it.
 
-### Payload size is NOT the cause (2026-07-26, run `skill-stickiness`, panes `wAG:p1`/`wAG:p2`)
+**2026-07-26, run `skill-stickiness`, panes `wAG:p1` / `wAG:p2`** — herdr 0.7.5. Three sends,
+all small, none rendering as a paste, all unsubmitted until an explicit `Enter`:
 
-The "large briefing" framing in this entry's title and its paste-size root-cause hypothesis are
-**wrong, or at least incomplete**. Three sends failed to submit in one session, and all three
-were *small, single-message payloads of a few hundred bytes* — well under any paste threshold:
+1. `wAG:p1`, ~300 bytes — "GATE APPROVED … Read `<path>` … then run `drovr phase done`".
+2. `wAG:p1`, ~430 bytes — a one-paragraph correction.
+3. `wAG:p2`, ~400 bytes — the plan phase's pointer injection, i.e. already using the
+   short-pointer pattern.
 
-1. `wAG:p1`, ~300 bytes ("GATE APPROVED … Read <path> … then run `drovr phase done`").
-2. `wAG:p1`, ~430 bytes (a one-paragraph correction).
-3. `wAG:p2`, ~400 bytes (the plan phase's pointer injection — already using the
-   write-to-file-and-send-a-pointer pattern this entry recommends).
+So the failure spans at least two orders of magnitude of payload size and both composer
+renderings.
 
-Critically, none of them rendered as `[Pasted text #1 +NN lines]`. They appeared as ordinary
-**inline wrapped text at the `❯` prompt** — so this is not a bracketed paste failing to commit.
-The text is typed into the composer and the submit simply does not happen. Case 3 matters most:
-the recommended workaround *reduces* the payload precisely to dodge the paste path, and it still
-did not submit. **Sending a pointer instead of a briefing does not avoid this bug.**
+### Fix ideas
 
-Note also that herdr was 0.7.5 here, whose `agent.prompt` is documented to type *and* submit
-natively — which is why `cli/src/herdr.rs:265-271` dropped the old 0.7.3 flush-CR handshake. That
-assumption does not hold in practice.
-
-One possible contributor, unconfirmed: in case 1 the target had been failing tool calls against a
-degraded classifier and had parked itself, with the TUI showing a `new task? /clear to save …`
-hint. A readiness probe reporting "ready" for an agent parked mid-error would explain both the
-exit `0` and the swallowed submit. Cases 2 and 3 had no such state, so it cannot be the whole
-explanation.
-
-**Practical rule:** treat `phase send`'s exit `0` as "text reached the composer", never as "the
-agent received it". Follow *every* send — large or small, paste or inline — with
-`herdr pane send-keys <pane> Enter`, then confirm the composer cleared with
-`herdr pane read <pane> --source recent --lines 12`. A redundant `Enter` on an already-submitted
-message is harmless: it lands on an empty prompt and does nothing.
-
-**And never read a quiet watch as progress.** Silence is equally consistent with "working",
-"never started" and "dead". When a watch has been quiet longer than the work plausibly takes,
-read the pane — that is the only thing that distinguishes them.
+1. **Verify submission rather than assuming it.** After `agent.prompt`, poll for a bounded
+   interval and confirm the composer cleared / the agent moved to `working`. Exit non-zero with a
+   distinct code if the text is still sitting there. This covers the drop mode too — checking
+   that the composer is non-empty *before* submitting is what distinguishes a drop from a
+   non-submit.
+2. **Re-issue the submit as a fallback** — not the unconditional 0.7.3 handshake, but a single
+   `Enter` sent only when step 1 detects the prompt was not consumed, retried until the input
+   clears.
+3. **Harden `wait_agent_ready`.** If an agent parked after an error reports ready, readiness is
+   measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
+   it gave up".
 
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
