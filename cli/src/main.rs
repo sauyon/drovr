@@ -6,6 +6,7 @@ mod phase;
 mod reflex;
 mod review;
 mod run;
+mod shell;
 mod worktree;
 /// Dependency-free SHA-256, used only by build-time integrity tests that pin
 /// embedded third-party assets to known-good digests.
@@ -21,6 +22,7 @@ use phase::{
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
+use shell::shell_single_quote;
 use std::io;
 use std::path::PathBuf;
 use std::process;
@@ -453,7 +455,8 @@ fn cmd_attach(name: &str) {
         }
         None => {
             eprintln!(
-                "drovr: no active pane for run '{name}'; try 'drovr phase start {name} <phase>'"
+                "drovr: no active pane for run '{name}'; try: drovr phase start {} <phase>",
+                shell_single_quote(name)
             );
             process::exit(1);
         }
@@ -566,8 +569,9 @@ fn cmd_resurrect(name: &str) {
             }
             println!();
             println!(
-                "To resume: drovr phase start {name} {}",
-                run.phases[idx].name
+                "To resume: drovr phase start {} {}",
+                shell_single_quote(name),
+                shell_single_quote(&run.phases[idx].name)
             );
         }
         None => {
@@ -758,7 +762,8 @@ fn cmd_review(sub: ReviewCmd) {
                     println!("review: run '{run}' is ready for the reviewer");
                     println!("  page:  http://{}/#/runs/{run}", display_addr(&addr));
                     println!(
-                        "  watch: drovr review wait {run}   # run this BACKGROUNDED, then end your turn"
+                        "  watch: drovr review wait {}   # run this BACKGROUNDED, then end your turn",
+                        shell_single_quote(&run)
                     );
                 }
                 Err(e) => {

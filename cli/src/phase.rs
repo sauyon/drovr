@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::config::load_config;
 use crate::herdr::{AgentStatus, Herdr};
 use crate::run::{PassToken, Phase, PhaseStatus, RunState, run_dir};
+use crate::shell::shell_single_quote;
 
 /// How often `phase_wait` polls the filesystem for the completion marker, and
 /// how often `wait_agent_ready` polls the pane's agent status.
@@ -77,25 +78,46 @@ fn remove_stale_marker(run_name: &str, phase: &str) -> io::Result<()> {
 /// `collect`) — the latter is what makes an unnamed or path-escaping phase
 /// unreachable even if one somehow exists in `state.json`.
 ///
-/// * Empty/whitespace: `Phase::default()` is representable with `name: ""`, and
-///   refusing to create one keeps an unnamed phase unreachable through
-///   `find_phase` without fighting the `..Default::default()` pattern.
-/// * Path separators, `..`, and a leading `.`: the name is interpolated into
-///   `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`, so `../../x`
-///   would place a run's marker outside its own directory.
+/// The rule is an ALLOWLIST — `[A-Za-z0-9._:-]`, non-empty, no leading `.` —
+/// because a phase name is interpolated into three different grammars and a
+/// denylist has to be right in all of them:
+///
+/// * a FILESYSTEM path, `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`
+///   — so `/`, `\`, `..` and a leading `.` would place a run's marker outside its
+///   own directory;
+/// * a SHELL command handed to herdr's `pane run` (`DROVR_PHASE=<run>/<phase>`);
+/// * a SHELL command drovr PRINTS for a human to paste (the `phase done` /
+///   `phase start` remediations). That last one is the live delivery mechanism:
+///   the user runs it themselves, so quoting at the emission site is necessary
+///   but is not where this belongs. Rejecting here means every emission site is
+///   safe by construction rather than by remembering.
+///
+/// Empty/whitespace is rejected separately from the alphabet: `Phase::default()`
+/// is representable with `name: ""`, and refusing to create one keeps an unnamed
+/// phase unreachable through `find_phase` without fighting the
+/// `..Default::default()` pattern.
+///
+/// The alphabet is everything drovr itself mints: pipeline names
+/// (`implement-task-1`), reviewer names (`review:<task>:<iter>:<angle>` — hence
+/// `:`), and version-ish suffixes. **A `<task>` with a space or a metacharacter
+/// now fails here** rather than silently becoming a phase name no command can
+/// safely mention — which is the point, since `<task>` reaches drovr from the
+/// review server's HTTP layer, where it is only checked for path safety.
 fn require_phase_name(phase: &str) -> io::Result<()> {
     let bad = phase.trim().is_empty()
         || phase.starts_with('.')
-        || phase.contains('/')
-        || phase.contains('\\')
         || phase.contains("..")
-        || phase.contains('\0');
+        || !phase
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
     if bad {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "invalid phase name {phase:?}: must be non-empty and must not \
-                 contain a path separator, '..', or a leading '.'"
+                "invalid phase name {phase:?}: must be non-empty, must not contain \
+                 '..' or a leading '.', and may use only letters, digits, '-', \
+                 '_', '.' and ':' (a phase name is interpolated into file paths \
+                 and into shell commands drovr suggests you run)"
             ),
         ));
     }
@@ -110,12 +132,27 @@ fn find_phase_idx(run: &RunState, phase: &str) -> Option<usize> {
     run.phases.iter().position(|p| p.name == phase)
 }
 
-/// POSIX single-quote `s` so it becomes exactly one literal shell word when
-/// interpolated into a `herdr pane run` command. Neutralizes spaces and shell
-/// metacharacters (`;`, `$()`, `&&`, …); the enclosing single quotes are stripped
-/// by the shell, so the resulting env value is unchanged.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// The `drovr attach` suggestion every "nobody is at the pane" diagnostic ends
+/// with. A helper, not a `format!` at each of the three sites, so the quoting
+/// cannot be right in two of them and forgotten in the third.
+fn attach_command(run_name: &str) -> String {
+    format!("drovr attach {}", shell_single_quote(run_name))
+}
+
+/// The `drovr phase done` suggestion [`phase_done`]'s refusal and
+/// [`phase_wait`]'s marker-mismatch diagnostic both print. `pass` is the token to
+/// supply, or `None` to DROP the one being held (`env -u`) — the two remedies
+/// differ, the quoting must not.
+fn phase_done_command(run_name: &str, phase: &str, pass: Option<&PassToken>) -> String {
+    let prefix = match pass {
+        Some(want) => format!("{PASS_ENV}={}", shell_single_quote(want.as_str())),
+        None => format!("env -u {PASS_ENV}"),
+    };
+    format!(
+        "{prefix} drovr phase done {} {}",
+        shell_single_quote(run_name),
+        shell_single_quote(phase)
+    )
 }
 
 /// Launch an agent invocation inside an already-chosen `pane`, tagged with
@@ -563,9 +600,9 @@ fn phase_send_with_timeout<H: Herdr>(
             format!(
                 "agent for phase '{phase}' of run '{run_name}' did not become ready \
                  within {waited} — not sending. It is likely parked on a first-run or \
-                 permission prompt with no human at the pane. Attach to check: \
-                 drovr attach {run_name}",
+                 permission prompt with no human at the pane. Attach to check: {attach}",
                 run_name = run.name,
+                attach = attach_command(&run.name),
             ),
         ));
     }
@@ -659,27 +696,18 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
         // for a tokened phase the way out is to SUPPLY the right token; for an
         // untokened one it is to DROP the one being held (no token exists to
         // supply, and inventing one would just fail the read side differently).
-        let (held, remedy) = match expected {
-            Some(want) if token.is_empty() => (
-                format!("${PASS_ENV} is not set"),
-                format!("{PASS_ENV}={want} drovr phase done {} {phase}", run.name),
-            ),
-            Some(want) => (
-                format!("${PASS_ENV} is '{token}', but this phase is now running pass '{want}'"),
-                format!("{PASS_ENV}={want} drovr phase done {} {phase}", run.name),
-            ),
-            None => (
-                format!(
-                    "${PASS_ENV} is '{token}', but this phase has no pass token at all — it was \
-                     started by a drovr build that does not mint them, so a tokened marker \
-                     against it is an inconsistency `phase wait` refuses"
-                ),
-                format!(
-                    "env -u {PASS_ENV} drovr phase done {} {phase}",
-                    run.name
-                ),
+        let held = match expected {
+            Some(_) if token.is_empty() => format!("${PASS_ENV} is not set"),
+            Some(want) => {
+                format!("${PASS_ENV} is '{token}', but this phase is now running pass '{want}'")
+            }
+            None => format!(
+                "${PASS_ENV} is '{token}', but this phase has no pass token at all — it was \
+                 started by a drovr build that does not mint them, so a tokened marker \
+                 against it is an inconsistency `phase wait` refuses"
             ),
         };
+        let remedy = phase_done_command(&run.name, phase, expected);
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -971,13 +999,13 @@ pub fn phase_wait<H: Herdr>(
                 if !mismatch_reported {
                     mismatch_reported = true;
                     eprintln!(
-                        "drovr: phase '{phase}' has a completion marker from a different pass \
-                         (marker token {token:?}, awaiting {expected:?}) — ignoring it and \
-                         continuing to wait for this pass's agent. If the phase really did \
-                         finish and you want to accept this, re-signal it deliberately: \
-                         {PASS_ENV}={expected} drovr phase done {run_name} {phase}",
-                        expected = expected_pass.as_ref().map_or("<none>", |p| p.as_str()),
-                        run_name = run.name,
+                        "{}",
+                        marker_mismatch_message(
+                            phase,
+                            &run.name,
+                            token,
+                            expected_pass.as_ref()
+                        )
                     );
                 }
             }
@@ -1048,6 +1076,26 @@ impl PassDrift {
     }
 }
 
+/// The diagnostic for a `<phase>.done` whose token belongs to a different pass.
+/// A function rather than an inline `eprintln!` so the command it suggests can be
+/// tested: this suite captures no output (see the handoff), and this string is
+/// the one that carries a run name and a token into something a human pastes.
+fn marker_mismatch_message(
+    phase: &str,
+    run_name: &str,
+    marker_token: &str,
+    expected: Option<&PassToken>,
+) -> String {
+    let awaiting = expected.map_or("<none>", |p| p.as_str());
+    format!(
+        "drovr: phase '{phase}' has a completion marker from a different pass \
+         (marker token {marker_token:?}, awaiting {awaiting:?}) — ignoring it and \
+         continuing to wait for this pass's agent. If the phase really did \
+         finish and you want to accept this, re-signal it deliberately: {}",
+        phase_done_command(run_name, phase, expected)
+    )
+}
+
 /// The diagnostic for [`PassDrift::TokenLost`]. Names the recovery, because this
 /// state does not heal on its own: every later wait sees the same thing.
 fn token_lost_message(phase: &str, run_name: &str) -> String {
@@ -1056,7 +1104,9 @@ fn token_lost_message(phase: &str, run_name: &str) -> String {
          wait was running — the phase now records NO token, but its agent still holds one, so no \
          marker it writes can be accepted. This is not a re-entry (a re-entry mints a token, it \
          does not remove one); the usual cause is an older drovr binary re-saving the run. \
-         Recover by re-entering the phase deliberately: drovr phase start {run_name} {phase}"
+         Recover by re-entering the phase deliberately: drovr phase start {} {}",
+        shell_single_quote(run_name),
+        shell_single_quote(phase)
     )
 }
 
@@ -1214,8 +1264,9 @@ pub fn diagnose_stuck_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Opt
          (matched \"{matched}\") rather than working — it will never signal `drovr phase done`, \
          so `phase wait` timed out.\n\
          Pane {pane_id}:\n{snippet}\n\
-         Attach to answer the prompt: drovr attach {run_name}",
+         Attach to answer the prompt: {attach}",
         run_name = run.name,
+        attach = attach_command(&run.name),
     ))
 }
 
@@ -1336,8 +1387,9 @@ pub fn triage_blocked_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Blo
         diagnostic: format!(
             "phase '{phase}' of run '{run_name}' is BLOCKED on a Claude Code \
              safety/permission prompt with no human at the pane.\n{body}\n\
-             Attach to answer it: drovr attach {run_name}",
+             Attach to answer it: {attach}",
             run_name = run.name,
+            attach = attach_command(&run.name),
         ),
         auto_answered: false,
     };
@@ -1828,7 +1880,7 @@ mod tests {
         );
         assert!(
             t.diagnostic
-                .contains("drovr attach triage-destructive-test"),
+                .contains("drovr attach 'triage-destructive-test'"),
             "suggests attach: {}",
             t.diagnostic
         );
@@ -3362,40 +3414,14 @@ mod tests {
         );
     }
 
-    // -- F1 (agy security): a phase/run name with shell metacharacters must be
-    //    quoted into one literal word, not break out of the pane_run command.
-    #[test]
-    fn phase_start_shell_quotes_unsafe_phase_name() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        // Hermetic: clear CLAUDE_CONFIG_DIR so `claude` follows DROVR_PHASE directly
-        // regardless of the ambient environment (an inlined config dir would sit
-        // between them — see phase_start_inlines_claude_config_dir_when_set).
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        let h = FakeHerdr::new();
-        let mut run = make_run("inject-test");
-
-        // A phase name carrying a shell injection attempt.
-        phase_start(&h, &mut run, "p; rm -rf ~", None).unwrap();
-
-        let calls = h.calls();
-        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
-        // The value is a single quoted word; the metacharacters are inert.
-        assert!(
-            run_call.contains(r"DROVR_PHASE='inject-test/p; rm -rf ~' DROVR_PASS="),
-            "unsafe phase name must be single-quoted: {run_call}"
-        );
-    }
-
-    #[test]
-    fn shell_single_quote_neutralizes_metacharacters() {
-        assert_eq!(shell_single_quote("a/b"), "'a/b'");
-        assert_eq!(shell_single_quote("a; rm -rf ~"), "'a; rm -rf ~'");
-        assert_eq!(shell_single_quote("$(id)"), "'$(id)'");
-        // An embedded single quote is escaped, not terminated.
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
-    }
+    // -- F1 (agy security): originally `phase_start_shell_quotes_unsafe_phase_name`
+    //    — a phase name with shell metacharacters had to survive as one quoted
+    //    word. It is now REJECTED at the boundary instead (see
+    //    `require_phase_name`), so the quoting proof moved to
+    //    `launch_in_pane_quotes_every_value_it_interpolates`, which uses a RUN
+    //    name — still unrestricted — to exercise the same code path. See
+    //    `phase_start_rejects_a_shell_metacharacter_phase_name` for the boundary.
+    //    `shell_single_quote` itself is unit-tested in `crate::shell`.
 
     // -- F2 (agy correctness): a failed launch must NOT consume the root pane, so
     //    a retry can still reuse it rather than forfeiting it to a fresh tab.
@@ -3480,7 +3506,7 @@ mod tests {
             "diag must quote the pane: {diag}"
         );
         assert!(
-            diag.contains("drovr attach stuck-test"),
+            diag.contains("drovr attach 'stuck-test'"),
             "diag must suggest attach: {diag}"
         );
     }
@@ -3594,15 +3620,21 @@ mod tests {
     }
 
     #[test]
-    fn spawn_reviewer_shell_quotes_unsafe_phase_name() {
+    fn spawn_reviewer_shell_quotes_an_unsafe_run_name() {
+        // Was `spawn_reviewer_shell_quotes_unsafe_phase_name`: an unsafe PHASE
+        // name is now rejected outright (see
+        // `spawn_reviewer_rejects_a_shell_metacharacter_phase_name`), so the
+        // quoting half of the pair moved onto the run name — which is checked
+        // for path safety only and so still reaches the command with
+        // metacharacters intact.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-inject-test", "ws-ri");
+        let mut run = make_run_with_workspace("rev-inject-test; id", "ws-ri");
 
         spawn_reviewer(
             &h,
             &mut run,
-            "review:t:1:p; rm -rf ~",
+            "review:t:1:correctness",
             None,
             "claude --permission-mode plan",
         )
@@ -3611,8 +3643,8 @@ mod tests {
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(
-            run_call.contains(r"DROVR_PHASE='rev-inject-test/review:t:1:p; rm -rf ~'"),
-            "unsafe phase name must be single-quoted: {run_call}"
+            run_call.contains(r"DROVR_PHASE='rev-inject-test; id/review:t:1:correctness'"),
+            "an unsafe run name must be single-quoted: {run_call}"
         );
     }
 
@@ -3750,6 +3782,189 @@ mod tests {
         assert!(
             msg.contains("project_dir"),
             "error should mention project_dir: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shell-injection surface: a phase name reaches drovr from argv AND from the
+    // review server's HTTP layer (`review:<task>:…`, where `<task>` is only
+    // checked for path safety), and drovr PRINTS copy-pasteable remediation
+    // commands with run/phase/token values in them. The delivery mechanism is a
+    // human pasting drovr's own suggestion into a shell. Two independent rules:
+    // the validation boundary rejects a name that could not be a phase name, and
+    // every emission site quotes whatever it interpolates.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn require_phase_name_rejects_shell_metacharacters() {
+        for bad in [
+            "p; rm -rf ~",
+            "p && id",
+            "p | tee /tmp/x",
+            "p`id`",
+            "p$(id)",
+            "p$HOME",
+            "p > out",
+            "p<in",
+            "p&",
+            "p\nid",
+            "p 'q'",
+            "p\"q\"",
+            "p*",
+            "p?",
+            "p~",
+            "p!",
+            "p#c",
+            "p{a,b}",
+            "p[a]",
+            "p(a)",
+            "p q",
+            "p\ta",
+        ] {
+            assert!(
+                require_phase_name(bad).is_err(),
+                "a phase name a shell would not read as one literal word must be \
+                 rejected at the boundary: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_phase_name_accepts_the_names_drovr_actually_uses() {
+        for ok in [
+            "brainstorm",
+            "implement-task-1-fixes-2",
+            "review:task-1:1:correctness",
+            "review:task-1:12:type-design",
+            "a_b",
+            "v1.2",
+            "PHASE9",
+        ] {
+            assert!(
+                require_phase_name(ok).is_ok(),
+                "the hardening must not reject a name drovr itself mints: {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_start_rejects_a_shell_metacharacter_phase_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("inject-reject-test");
+
+        let err = phase_start(&h, &mut run, "p; rm -rf ~", None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_run")),
+            "a rejected name must never reach a launch: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn spawn_reviewer_rejects_a_shell_metacharacter_phase_name() {
+        // The HTTP-reachable half: `review:<task>:<iter>:<angle>` is built from a
+        // task string the review server only checks for path safety.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("inject-reviewer-test", "ws-i");
+
+        let err =
+            spawn_reviewer(&h, &mut run, "review:t$(id):1:correctness", None, "claude").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_run")),
+            "a rejected reviewer name must never reach a launch: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn launch_in_pane_quotes_every_value_it_interpolates() {
+        // Defence in depth behind `require_phase_name`: run names and pass tokens
+        // are NOT restricted the way phase names are, and this is the one command
+        // string drovr hands to a shell rather than to a human.
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        let h = FakeHerdr::new();
+
+        launch_in_pane(
+            &h,
+            "r; rm -rf ~",
+            "plan",
+            "p1",
+            "claude",
+            &PassToken::new("t'k".into()).unwrap(),
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(r"DROVR_PHASE='r; rm -rf ~/plan'"),
+            "the run name is quoted into one literal word: {run_call}"
+        );
+        // The fake records the command with `{:?}`, so the backslash of the
+        // `'\''` escape appears doubled here; the command itself carries one.
+        assert!(
+            run_call.contains(r"DROVR_PASS='t'\\''k'"),
+            "an embedded quote is escaped, not terminated: {run_call}"
+        );
+    }
+
+    #[test]
+    fn phase_done_remediation_commands_are_quoted() {
+        // The refusal prints a command the agent's human is meant to paste. A run
+        // name is validated for path safety only, so it can carry metacharacters.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("done-quote-test; id");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        write_handoff(&run, "plan");
+        let want = run.phases[0].pass.clone().unwrap();
+
+        // Case 1: a tokened phase with no $DROVR_PASS — remedy SUPPLIES the token.
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "DROVR_PASS='{want}' drovr phase done 'done-quote-test; id' 'plan'"
+            )),
+            "every value in the suggested command must be single-quoted: {err}"
+        );
+
+        // Case 2: an untokened phase holding a token — remedy DROPS it.
+        let mut legacy = make_run("done-quote-legacy; id");
+        legacy.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p1".into()),
+            ..Default::default()
+        });
+        legacy.save().unwrap();
+        write_handoff(&legacy, "plan");
+        unsafe {
+            std::env::set_var(PASS_ENV, "t-from-elsewhere");
+        }
+        let err = phase_done(&legacy, "plan").unwrap_err().to_string();
+        unsafe {
+            std::env::remove_var(PASS_ENV);
+        }
+        assert!(
+            err.contains("env -u DROVR_PASS drovr phase done 'done-quote-legacy; id' 'plan'"),
+            "the drop-the-token remedy must be quoted too: {err}"
+        );
+    }
+
+    #[test]
+    fn token_lost_message_quotes_its_suggested_command() {
+        let msg = token_lost_message("plan", "r; rm -rf ~");
+        assert!(
+            msg.contains("drovr phase start 'r; rm -rf ~' 'plan'"),
+            "the recovery command must be pasteable, not executable-by-accident: {msg}"
         );
     }
 }

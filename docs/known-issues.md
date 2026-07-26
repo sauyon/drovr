@@ -698,6 +698,32 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## A `<task>` with a space or a shell metacharacter no longer produces a reviewer phase
+
+Introduced by the phase-name hardening (task 1's second fixes round of the phase-reap work).
+
+### Symptom
+
+`drovr code-review run <run> "my task"` (or any `<task>` containing a space, `;`, `$`, quotes, …)
+fails with `invalid phase name "review:my task:1:correctness": … may use only letters, digits,
+'-', '_', '.' and ':'`. It used to work.
+
+### Root cause
+
+`require_phase_name` (`cli/src/phase.rs`) is now an ALLOWLIST — `[A-Za-z0-9._:-]` — not a
+path-traversal denylist. A reviewer phase name is `review:<task>:<iter>:<angle>`, so the `<task>`
+inherits the rule. `<task>` reaches drovr from argv AND from the review server's HTTP layer, where
+`safe_component` (`cli/src/review.rs`) checks it for path safety only; a phase name is interpolated
+into file paths, into the `herdr pane run` command, and into the remediation commands drovr PRINTS
+for a human to paste. Rejecting at the boundary is what makes every emission site safe by
+construction. (The emission sites quote independently — see `cli/src/shell.rs` — but a name that
+cannot be a phase name should not become one.)
+
+### Working around it
+
+Name the task in the same alphabet drovr itself mints: `task-1`, `implement-task-2`,
+`fix-login-bug`. Hyphens instead of spaces. There is no way to opt out, by design.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**
