@@ -300,61 +300,72 @@ check('Enter on the focused summary toggles the group instead', await groupOpen(
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === false, 4000, 'group collapsed for the next section');
 
-console.log('\n== session list: the cursor when a row vanishes ==');
+console.log('\n== session list: the cursor when a row leaves the view ==');
 await goto('#/', LIST_READY);
-// Two failure modes, opposite directions, both reproduced in earlier rounds:
-//   * re-anchor immediately -> a run that folds out of view for ONE poll hands
-//     the cursor to whatever slid into its index, permanently.
-//   * never re-anchor -> a run that is genuinely gone leaves the key pointing at
-//     nothing while the numeric index repaints the cursor onto a different row
-//     after every re-sort, so the highlight wanders on its own.
-// Driven by stubbing /api/runs so the row really disappears from the DATA across
-// several real render passes — removing a DOM node and re-rendering unchanged
-// data (an earlier version of this test) proved neither behaviour.
-const hideRunForPolls = (name, polls) => evaluate(`
+// Two opposite failure modes, both reproduced in earlier rounds. What separates
+// them is WHY the row left, not how long it has been gone:
+//   * merely HIDDEN (collapsed into Completed, folded by a liveness flap) — the
+//     run still exists, so the selection must survive and come back.
+//   * actually GONE from the server's list (archived then purged, deleted) — the
+//     key names nothing, so it must be released at once or the numeric index
+//     repaints the cursor onto a different row after every re-sort.
+
+// --- hidden: collapse the Completed group with the cursor inside it ---
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open');
+await press('G');                       // last visible row = inside the group
+const insideGroup = await cursorName();
+check('cursor can be parked on a completed row',
+  ['epsilon-done', 'zeta-archived'].indexOf(insideGroup) !== -1, true);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed');
+check('collapsing the group does not steal the selection',
+  await evaluate(`return navCursorKey;`), insideGroup);
+// Survive several real render passes — the previous timeout-based rule released
+// the anchor after a few of these and permanently reassigned it.
+for (let i = 0; i < 5; i++) await evaluate(`return renderRunList(routeGen);`);
+check('...and it still is not stolen after repeated polls',
+  await evaluate(`return navCursorKey;`), insideGroup);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group reopened');
+check('...so reopening the group restores the cursor to it',
+  await cursorName(), insideGroup);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed again');
+
+// --- gone: the run leaves /api/runs entirely ---
+await goto('#/', LIST_READY);
+await press('g');
+await press('j');
+const parked = await cursorName();
+// Stub /api/runs so the run really leaves the DATA, not just the DOM.
+await evaluate(`
   var realFetch = window.fetch;
-  var left = ${polls};
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
   window.fetch = function(u, o) {
-    if (String(u).indexOf('/api/runs') !== -1 && left > 0) {
-      left--;
+    if (String(u).indexOf('/api/runs') !== -1) {
       return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
-        var kept = rows.filter(function(x){ return x.name !== ${JSON.stringify(name)}; });
-        return {ok: true, json: function(){ return Promise.resolve(kept); }};
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.filter(function(x){ return x.name !== ${JSON.stringify(parked)}; }));
+        }};
       });
     }
     return realFetch(u, o);
   };
-  window.__restoreFetch = function(){ window.fetch = realFetch; };
   return 1;`);
-
-await press('g');
-await press('j');
-const parked = await cursorName();
-check('cursor is parked on a run', typeof parked, 'string');
-
-// One poll missing: the anchor must be held, so the cursor returns to it.
-await hideRunForPolls(parked, 1);
 await evaluate(`return renderRunList(routeGen);`);
-check('a one-poll absence does not re-anchor the cursor',
-  await evaluate(`return navCursorKey;`), parked);
-await evaluate(`return renderRunList(routeGen);`);
-check('...and the cursor returns to its run when it comes back',
-  await cursorName(), parked);
-
-// Gone for good: the anchor must be released, and then STOP moving.
-await hideRunForPolls(parked, 12);
-for (let i = 0; i < 6; i++) await evaluate(`return renderRunList(routeGen);`);
-const settled = await evaluate(`return navCursorKey;`);
-check('a durably-missing run releases the anchor', settled !== parked, true);
-check('...and the released anchor names a row that actually exists',
-  (await rowNames()).indexOf(settled) !== -1, true);
+const released = await evaluate(`return navCursorKey;`);
+check('a run gone from the server list releases the anchor immediately',
+  released !== parked, true);
+check('...onto a row that actually exists',
+  (await rowNames()).indexOf(released) !== -1, true);
 const drift = [];
 for (let i = 0; i < 4; i++) {
   await evaluate(`return renderRunList(routeGen);`);
   drift.push(await evaluate(`return navCursorKey;`));
 }
 check('...and the cursor then stops drifting across rows',
-  drift.every(k => k === settled), true);
+  drift.every(k => k === released), true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== session list: filter ==');

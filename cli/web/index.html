@@ -2065,6 +2065,10 @@ async function renderRunList(gen) {
     var r = await fetch('/api/runs');
     var runs = await r.json();
     if (gen !== undefined && gen !== routeGen) return;
+    // Recorded BEFORE filtering: this is "which runs exist", the question
+    // applyNavCursor asks to tell a hidden row from a deleted one. Filtering it
+    // first would make every filtered-out run look deleted.
+    knownRunNames = runs.map(function(x) { return x.name; });
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       applyNavCursor(false);
@@ -2342,14 +2346,10 @@ var listFilter = '';
 // and Enter would open a session the reviewer never pointed at. Empty on the
 // detail view, where questions have a fixed order.
 var navCursorKey = '';
-// Consecutive `applyNavCursor` passes in which the anchored run was not among the
-// visible rows. Bounded by NAV_ANCHOR_GRACE so a transient absence is ridden out
-// but a permanent one is not held forever — see the reasoning in applyNavCursor.
-var navAnchorMisses = 0;
-// ~3 passes. The list polls every 2s, so this rides out a few seconds of a run
-// being folded away or a herdr blip, without letting a deleted run hold the
-// anchor hostage while the highlight drifts across other rows.
-var NAV_ANCHOR_GRACE = 3;
+// Every run name the last list fetch returned, before filtering. This is what
+// separates "the anchored row is hidden" from "the anchored run is gone" — see
+// applyNavCursor, which needs the reason, not the duration.
+var knownRunNames = [];
 
 // Rows the cursor moves over, chosen by view. Detail view has no run rows, and
 // the list view has no questions, so one of these is always empty. On the detail
@@ -2388,29 +2388,31 @@ function applyNavCursor(scroll) {
   if (!currentRun && navCursorKey) {
     var found = -1;
     rows.forEach(function(el, i) { if (found < 0 && rowKey(el) === navCursorKey) found = i; });
-    if (found >= 0) { navCursor = found; navAnchorMisses = 0; }
-    else { anchorMissing = true; navAnchorMisses++; }
+    if (found >= 0) navCursor = found;
+    else anchorMissing = true;
   }
   if (navCursor >= rows.length) navCursor = rows.length - 1;
   if (navCursor < 0) navCursor = 0;
-  // Re-anchoring is deferred while the anchored run is missing — but only for a
-  // few passes, because both extremes are wrong:
+  // When the anchored row is not on screen, what matters is WHY — not how long
+  // it has been away. Both of the obvious rules are wrong, in opposite ways:
   //
-  // * Overwrite immediately, and a run that merely folded out of view for one
-  //   poll (a liveness flap) hands the cursor to whatever slid into its index,
-  //   permanently. A later `a`/Enter then acts on a session nobody selected.
-  // * Never overwrite, and a run that is genuinely gone (archived then purged,
-  //   deleted on disk) leaves the key pointing at nothing forever while the
-  //   numeric index keeps painting the cursor onto whichever row now occupies
-  //   that slot — so the highlight wanders by itself after every re-sort.
+  // * Re-anchor immediately, and a row that is merely hidden (collapsed into the
+  //   Completed group, folded away by a liveness flap) hands the cursor to
+  //   whatever slid into its index, permanently — a later `a`/Enter acts on a
+  //   session nobody selected.
+  // * Never re-anchor, and a run that is genuinely gone leaves the key naming
+  //   nothing while the numeric index repaints the cursor onto whichever row now
+  //   occupies that slot, so the highlight wanders on its own after every
+  //   re-sort.
   //
-  // So: hold the anchor across a brief absence, then accept it is gone and
-  // re-anchor to wherever the cursor actually sits.
-  var giveUp = navAnchorMisses > NAV_ANCHOR_GRACE;
-  if (!currentRun && (!anchorMissing || giveUp)) {
-    navCursorKey = rowKey(rows[navCursor]);
-    navAnchorMisses = 0;
-  }
+  // A timeout split the difference and got both halves wrong: it is not a
+  // duration question. `knownRunNames` answers it directly — still in the
+  // server's list means hidden, so hold the anchor and restore the selection
+  // when the row returns; absent from it means gone, so re-anchor at once and
+  // never drift. It also cannot be skewed by how many times this runs per poll,
+  // which the previous counter very much was.
+  var gone = anchorMissing && knownRunNames.indexOf(navCursorKey) === -1;
+  if (!currentRun && (!anchorMissing || gone)) navCursorKey = rowKey(rows[navCursor]);
   rows.forEach(function(el, i) {
     var on = i === navCursor;
     el.classList.toggle('nav-cursor', on);
