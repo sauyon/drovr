@@ -1253,15 +1253,32 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
             (Some(_), None) => Some(false),
             (Some(ids), Some(ws)) => Some(ids.iter().any(|i| i == ws)),
         };
-        // ...but NOT while its workspace is demonstrably still open. Archiving
-        // sets the flag even when closing the workspace failed, and `archived`
-        // alone forces `is_complete()`, which would file that run into the
-        // collapsed "Completed" group — hiding the one row that needs attention
-        // behind a fold, with an agent still running in panes we believe we shut.
-        // A run with something alive in it stays in the active list.
+        // Liveness gates the ARCHIVED case only, and nothing else.
+        //
+        // Archiving sets the flag even when closing the workspace failed, so an
+        // archived run with an open workspace is a zombie: filed away while an
+        // agent still runs in panes we believe we shut. That one stays in the
+        // active list, because a fold is exactly where it must not go.
+        //
+        // Finishing every phase is different. Nothing closes a workspace on
+        // completion — only `cleanup` and this endpoint ever call
+        // `workspace_close` — so a normally-finished run keeps its workspace open
+        // indefinitely. Gating on liveness there stranded EVERY finished run in
+        // the active list, which is the clutter this feature exists to remove.
+        let archived = run_state.as_ref().is_some_and(|s| s.archived);
+        // A zombie is specifically an ARCHIVED run whose workspace is still open:
+        // the human asked to close it, the close failed, and nothing else reports
+        // that. Surfaced regardless of phase progress — the anomaly is that an
+        // explicit request did not take effect, which is worth seeing whether or
+        // not the pipeline happened to finish.
+        //
+        // Going through `is_complete()` rather than recomputing keeps its
+        // empty-phases guard: a run whose state.json will not parse stays visible
+        // instead of being hidden as finished.
+        let zombie = archived && live == Some(true);
         let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
             || rs.state == LoopState::Cancelled)
-            && live != Some(true);
+            && !zombie;
         // Sort key: most-recently-touched review artifact (fall back to 0).
         let updated = fs::metadata(dir.join("review.state.json"))
             .or_else(|_| fs::metadata(dir.join("state.json")))
@@ -1285,7 +1302,7 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
                 // Lets the list say *why* a run is complete: "archived" (cleaned
                 // up with phases outstanding) reads very differently from a run
                 // that actually finished its pipeline.
-                "archived": run_state.as_ref().is_some_and(|s| s.archived),
+                "archived": archived,
                 // Whether the run's herdr workspace is still open. `null` when
                 // herdr could not be asked — never coerced to `false`, because
                 // archiving closes panes and "unknown" must not read as "safe".
@@ -1934,9 +1951,51 @@ mod tests {
         assert!(ws.contains(&"localhost:8791".to_string()), "{ws:?}");
     }
 
+    /// Give an existing fixture run a workspace id, so liveness is computable.
+    /// The default fixture leaves `workspace: None`, which pins `live` to
+    /// `Some(false)` and makes the live combinations untestable — the gap that
+    /// let a regression stranding every finished run reach a green suite.
+    fn set_workspace(dir: &Path, ws: &str) {
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some(ws.to_string());
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_is_complete_even_though_its_workspace_is_still_open() {
+        use crate::run::PhaseStatus::Done;
+        let tmp = std::env::temp_dir().join(format!("drovr-fin-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // The ordinary end of a pipeline: all four phases Done, nobody has run
+        // `cleanup` yet — so the herdr workspace is still open. Nothing closes it
+        // on completion, so this is the COMMON state of a finished run, not an
+        // edge case, and it must still collapse into "Completed".
+        let dir = make_run_with_phases(&tmp, "finished", &[Done, Done, Done, Done], false);
+        set_workspace(&dir, "wAG");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        let row = row_for(&rows, "finished");
+        assert_eq!(row["live"], true, "precondition: the workspace really is open");
+        assert_eq!(row["archived"], false);
+        assert_eq!(
+            row["complete"], true,
+            "a run that finished every phase belongs in Completed even with its \
+             workspace open — gating this on liveness strands every finished run \
+             in the active list, which is the clutter the group exists to remove"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn a_run_whose_panes_are_still_live_is_never_filed_as_complete() {
-        use crate::run::PhaseStatus::{Pending, Running};
+        use crate::run::PhaseStatus::{Done, Pending, Running};
         let tmp = std::env::temp_dir().join(format!("drovr-zombie-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
@@ -1965,6 +2024,19 @@ mod tests {
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
         assert_eq!(row_for(&rows, "zombie")["complete"], true);
+
+        // Finishing every phase does NOT excuse a failed close. The anomaly is
+        // that an explicit archive request didn't take effect, which is worth
+        // surfacing whether or not the pipeline happened to finish.
+        let dir = make_run_with_phases(&tmp, "done-zombie", &[Done, Done], true);
+        set_workspace(&dir, "wAG");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        assert_eq!(
+            row_for(&rows, "done-zombie")["complete"],
+            false,
+            "an archived run with an open workspace stays visible even with all phases Done"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

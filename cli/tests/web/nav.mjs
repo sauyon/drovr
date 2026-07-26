@@ -359,6 +359,26 @@ const clickArchive = name => evaluate(`
   return 1;`);
 
 await stubConfirm();
+// End-to-end pin: the server's `live` must actually reach the button's dataset,
+// which is what gates the confirm. The gateProbe checks below call toggleArchive
+// with synthetic arguments, so they prove the gating logic but NOT this wiring —
+// a break here (field renamed, dataset mis-spelled) would leave every live run
+// silently archivable with no prompt. Environment-independent: it asserts the
+// row agrees with whatever /api/runs actually reported, live herdr or not.
+check('every row\'s data-live matches what the server reported', await evaluate(`
+  return fetch('/api/runs').then(function(r){return r.json();}).then(function(rows){
+    var bad = [];
+    rows.forEach(function(row) {
+      var b = Array.from(document.querySelectorAll('.run-archive'))
+        .find(function(x){ return x.dataset.run === row.name; });
+      if (!b) { bad.push(row.name + ':missing-button'); return; }
+      var want = row.live === null ? 'unknown' : (row.live ? '1' : '0');
+      if (b.dataset.live !== want) bad.push(row.name + ':' + b.dataset.live + '!=' + want);
+      if (b.dataset.archived !== (row.archived ? '1' : '0')) bad.push(row.name + ':archived-mismatch');
+    });
+    return bad;
+  });`), []);
+
 check('every row carries an archive control',
   await evaluate(`return document.querySelectorAll('.run-archive').length > 0;`), true);
 check('an active run offers Archive', await btnFor('beta-cache'), 'Archive');
