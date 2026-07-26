@@ -236,7 +236,9 @@ pub fn phase_start<H: Herdr>(
     //     old marker, which are consistent with each other and describe a pass
     //     that genuinely did finish. `phase_start` returns Err (exit 1).
     //   * sweep fails → the phase already holds the NEW token while the marker
-    //     still holds the OLD one, so `phase_wait` rejects it and times out.
+    //     still holds the OLD one, so `phase_wait` rejects the marker either way:
+    //     a fresh wait times out, and a wait that was already running on the old
+    //     token reports `Superseded` (this re-entry is exactly what superseded it).
     // The reverse order has a hole: sweep succeeds, save fails, and the phase is
     // left `Done` from the previous pass with no agent running.
     //
