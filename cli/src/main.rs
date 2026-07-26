@@ -137,7 +137,8 @@ enum PhaseCmd {
     },
     /// Wait for a phase to complete (polls for the `done` marker and the pane's
     /// herdr status). Exit 0 = done, 2 = timeout, 4 = blocked (agent hit a
-    /// safety/permission prompt — see the triage diagnostic), 1 = io error.
+    /// safety/permission prompt — see the triage diagnostic), 5 = superseded (a
+    /// newer pass re-entered the phase; re-run the wait), 1 = io error.
     Wait {
         run: String,
         phase_name: String,
@@ -679,10 +680,13 @@ fn cmd_phase(sub: PhaseCmd) {
                     // Re-arming the same wait is the RIGHT move (the new pass's
                     // completion will satisfy it) — the wrong move is triaging a
                     // stuck agent that does not exist, which exit 2 invites.
-                    eprintln!(
-                        "drovr: phase '{phase_name}' was superseded by a newer pass while this \
-                         wait was running — nothing is wrong with the phase, but this wait was \
-                         watching a pass that is gone. Re-run the wait to follow the live pass."
+                    //
+                    // stdout, like the benign timeout line above it: nothing is
+                    // wrong with the PHASE. `phase_wait` has already explained on
+                    // stderr which pass went away, so this line stays the action.
+                    println!(
+                        "phase '{phase_name}' was superseded by a newer pass — re-run the wait \
+                         to follow the live one"
                     );
                     process::exit(5);
                 }

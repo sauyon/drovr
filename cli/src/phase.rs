@@ -752,8 +752,17 @@ pub enum PhaseWaitOutcome {
     /// hit a Claude Code safety/permission prompt with no human at the pane.
     Blocked,
     /// This wait was SUPERSEDED: while it ran, another pass re-entered the phase
-    /// (a `phase start`, minting a new token), so the completion this wait saw
-    /// belongs to a pass that no longer exists.
+    /// (a `phase start`, minting a new token), so the pass this wait was watching
+    /// no longer exists.
+    ///
+    /// Detected at exactly two points, both by comparing the entry snapshot's pass
+    /// against a freshly loaded one: when a marker matching the OLD pass lands
+    /// (the rare ordering — the superseded agent signalled done), and when the
+    /// wait runs out of time (the common one — it signalled nothing). What is
+    /// deliberately NOT detected is a re-entry via `phase send`, which leaves the
+    /// token unchanged and is therefore structurally invisible to a token
+    /// comparison; task 1's handoff §5.1 routes that to task 6, together with the
+    /// monotonic re-entry counter it needs.
     ///
     /// Deliberately NOT `TimedOut`, which it used to be reported as. The two are
     /// opposite verdicts about the same phase — "another pass took over, and it is
@@ -772,8 +781,10 @@ pub enum PhaseWaitOutcome {
 /// agent via `drovr phase done`) AND the phase pane's herdr `agent_status` until
 /// the marker appears, the pane goes `blocked`, or `timeout_ms` elapses. Marks
 /// the phase Done (and saves) when the marker is found; leaves it Running on
-/// timeout or block. A marker that belongs to a pass another `phase start` has
-/// since superseded returns [`PhaseWaitOutcome::Superseded`] and writes nothing.
+/// timeout or block. A wait whose pass another `phase start` has superseded
+/// meanwhile returns [`PhaseWaitOutcome::Superseded`] and writes nothing — checked
+/// both when a matching marker lands and when the wait runs out of time, so a
+/// re-entry does not have to produce a marker to be reported as one.
 ///
 /// herdr status is consulted ONLY to catch `blocked` early — a proactive signal
 /// that the agent hit a safety/permission prompt and will otherwise hang until the
@@ -949,10 +960,64 @@ pub fn phase_wait<H: Herdr>(
         }
         let now = Instant::now();
         if now >= deadline {
-            return Ok(PhaseWaitOutcome::TimedOut);
+            // Before reporting "the agent I am waiting on is not progressing",
+            // ask whether that agent is still the one this phase is running.
+            // Supersession is only visible through the marker when the dead pass
+            // happens to signal done — which is the RARE ordering. The common one
+            // is the driver's: a `phase start` re-entered the phase and the
+            // superseded agent never signalled anything, so this waiter simply
+            // sits there and used to report a plain timeout for a phase that is
+            // healthy under a newer pass. One state read, once, at the end.
+            return Ok(timed_out_or_superseded(run, phase, expected_pass.as_ref()));
         }
         thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
+}
+
+/// Classify a wait that ran out of time: did it time out, or was it SUPERSEDED
+/// while it ran?
+///
+/// Unlike the marker path's guard, this one fails OPEN — to `TimedOut`. There the
+/// question is "may I report a completion I cannot verify" and the answer must be
+/// no; here the conservative answer already IS `TimedOut` ("keep waiting / go
+/// look"), so a state file that cannot be read must not be turned into an error
+/// that aborts an otherwise honest timeout.
+///
+/// Adopts the fresh state on the superseded path for the same reason the `Done`
+/// path does: the caller may save after waiting, and this waiter's snapshot still
+/// names the pass that no longer exists.
+fn timed_out_or_superseded(
+    run: &mut RunState,
+    phase: &str,
+    expected: Option<&PassToken>,
+) -> PhaseWaitOutcome {
+    let fresh = match RunState::load(&run.name) {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            eprintln!(
+                "drovr: phase '{phase}' timed out, and its run state could not be re-read to \
+                 check whether this wait had been superseded ({e}). Reporting the timeout."
+            );
+            return PhaseWaitOutcome::TimedOut;
+        }
+    };
+    // `phases` only, like every other resolution in this function: a
+    // `review_phases` entry must never answer for a pipeline phase. A phase that
+    // has VANISHED is not evidence of a re-entry, so it stays a timeout — the
+    // marker path errors on that case because it is about to report a completion,
+    // and this one is not.
+    let Some(i) = fresh.phases.iter().position(|p| p.name == phase) else {
+        return PhaseWaitOutcome::TimedOut;
+    };
+    if fresh.phases[i].pass.as_ref() == expected {
+        return PhaseWaitOutcome::TimedOut;
+    }
+    eprintln!(
+        "drovr: phase '{phase}' was re-entered while this wait was running — the pass it was \
+         waiting on no longer exists. This is not a stuck agent."
+    );
+    *run = fresh;
+    PhaseWaitOutcome::Superseded
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,6 +2569,56 @@ mod tests {
             "a save after a superseded wait must not restore the dead pass"
         );
         assert_eq!(on_disk.phases[0].status, PhaseStatus::Running);
+    }
+
+    #[test]
+    fn a_superseded_wait_says_so_even_when_no_marker_ever_lands() {
+        // The COMMON supersession shape, and the one the driver actually hit: a
+        // `phase start` re-enters the phase, the superseded agent never signals
+        // anything, and this waiter just sits there. Detecting supersession only
+        // when a stale marker happens to land would leave that case reporting
+        // `TimedOut` — "the agent is stuck" — for a phase that is perfectly
+        // healthy under a newer pass. The whole point of the distinct outcome is
+        // that a caller never has to guess which of the two it is got.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("superseded-no-marker-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass_a = run.phases[0].pass.clone().unwrap();
+
+        let mut other = RunState::load("superseded-no-marker-test").unwrap();
+        phase_start(&h, &mut other, "plan", None).unwrap();
+        let pass_b = other.phases[0].pass.clone().unwrap();
+        assert_ne!(pass_a, pass_b);
+
+        // No marker on disk at all: nothing has completed, and this waiter's pass
+        // no longer exists.
+        assert!(!done_marker(&run.name, "plan").exists());
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Superseded,
+            "a wait that outlived its own pass is superseded, not stuck"
+        );
+        // Same no-clobber requirement as the marker path.
+        assert_eq!(run.phases[0].pass, Some(pass_b));
+    }
+
+    #[test]
+    fn a_timeout_on_the_current_pass_is_still_a_timeout() {
+        // The other side of the same check: supersession must not become a
+        // catch-all for "the wait ended without a marker". A phase still running
+        // the pass this waiter expects has to keep reporting `TimedOut`, or the
+        // driver stops triaging genuinely stuck agents.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("timeout-still-timeout-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut
+        );
     }
 
     #[test]
