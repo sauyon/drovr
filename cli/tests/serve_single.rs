@@ -8,15 +8,14 @@
 //! pin the refusal: a duplicate exits non-zero, says where the live one is, and
 //! binds nothing.
 //!
-//! A stale `server.addr` (server died without cleaning up) must NOT be mistaken
-//! for a live one, so the last check starts a server on top of a dead pointer.
+//! The lock is the whole test — `server.addr` is not consulted — so a stale or
+//! squatted-on address must never block a start; the last check pins that.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -179,57 +178,6 @@ fn try_serve(xdg: &Path, port: u16) -> (Option<i32>, String) {
     }
 }
 
-/// A minimal HTTP server that answers every request with `200 <body>`, used to
-/// stand in for whatever else may hold a dead server's recorded address. Stops
-/// when dropped.
-struct Responder {
-    addr: String,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl Responder {
-    fn spawn(body: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("responder listener");
-        let addr = listener.local_addr().unwrap().to_string();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = Arc::clone(&stop);
-        let thread = thread::spawn(move || {
-            for conn in listener.incoming() {
-                if stop_thread.load(Ordering::Relaxed) {
-                    return;
-                }
-                let Ok(mut conn) = conn else { return };
-                let mut buf = [0u8; 512];
-                let _ = conn.read(&mut buf);
-                let _ = conn.write_all(
-                    format!(
-                        "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                );
-            }
-        });
-        Responder {
-            addr,
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Responder {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // The thread is parked in `accept`: one connection wakes it to see the flag.
-        let _ = TcpStream::connect(&self.addr);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
 /// The lock/discovery file for a test's data dir.
 fn server_pid_file(xdg: &Path) -> PathBuf {
     xdg.join("drovr").join("server.pid")
@@ -298,39 +246,6 @@ fn second_serve_on_same_port_is_refused() {
         "stderr must name the conflict, got: {err}"
     );
     let mut first = first;
-    assert_serving(
-        &mut first,
-        first_port,
-        "the original server must still serve",
-    );
-    drop(first);
-}
-
-/// The state a real data dir was found in: a live server, but a `server.pid`
-/// that no longer describes it (deleted by hand, or written by an older drovr
-/// that has since died). The address must still be enough to refuse — otherwise
-/// the duplicate starts and takes `server.addr` off the server that is serving.
-#[test]
-fn live_server_without_a_lock_file_is_still_refused() {
-    let tmp = tmp_xdg("drovr-serve-nolock-");
-    let xdg = tmp.path().join("xdg");
-    let (mut first, first_port) = start_server(&xdg);
-
-    fs::remove_file(xdg.join("drovr").join("server.pid")).expect("drop the lock file");
-
-    let (code, err) = try_serve(&xdg, free_port());
-    assert_eq!(code, Some(1), "duplicate serve must fail; stderr={err}");
-    assert!(
-        err.contains("already running") && err.contains(&first_port.to_string()),
-        "stderr must point at the live server, got: {err}"
-    );
-    // This server is unmistakably drovr, so the message must NOT offer the
-    // delete-`server.addr` way out: with the lock file already gone, following that
-    // advice is what would let a second server start.
-    assert!(
-        !err.contains("delete"),
-        "a certain drovr server must not be offered as deletable, got: {err}"
-    );
     assert_serving(
         &mut first,
         first_port,
@@ -427,54 +342,6 @@ fn killing_a_server_frees_the_lock_immediately() {
     drop(second);
 }
 
-/// A stale `server.addr` pointing at an unrelated service that answers 200 on
-/// every path must not read as a live drovr server: the `/health` body has to be
-/// drovr's, or the start is blocked by whatever else is on that port.
-#[test]
-fn an_unrelated_200_responder_does_not_block_startup() {
-    let tmp = tmp_xdg("drovr-serve-200-");
-    let xdg = tmp.path().join("xdg");
-    let data = xdg.join("drovr");
-    fs::create_dir_all(&data).expect("data dir");
-
-    let responder = Responder::spawn("hello");
-    fs::write(data.join("server.addr"), &responder.addr).expect("stale addr");
-
-    let (mut server, port) = start_server(&xdg);
-    assert_serving(
-        &mut server,
-        port,
-        "an unrelated 200 on the stale address must not block a real start",
-    );
-    drop(server);
-}
-
-/// The unavoidable false positive: a service answering the bare `"ok"` that
-/// pre-guard drovr servers answer *is* taken for a server, because a real one of
-/// those holds no lock to be found by. The refusal must then say which file to
-/// delete — a verdict drawn from a stale address cannot be a dead end.
-#[test]
-fn a_legacy_ok_responder_refuses_but_names_the_way_out() {
-    let tmp = tmp_xdg("drovr-serve-legacy-");
-    let xdg = tmp.path().join("xdg");
-    let data = xdg.join("drovr");
-    fs::create_dir_all(&data).expect("data dir");
-
-    let responder = Responder::spawn("ok");
-    fs::write(data.join("server.addr"), &responder.addr).expect("stale addr");
-
-    let (code, err) = try_serve(&xdg, free_port());
-    assert_eq!(code, Some(1), "must refuse; stderr={err}");
-    assert!(
-        err.contains("already running") && err.contains(&responder.addr),
-        "stderr must name what it found, got: {err}"
-    );
-    assert!(
-        err.contains("delete") && err.contains("server.addr"),
-        "stderr must name the way out of a wrong verdict, got: {err}"
-    );
-}
-
 /// The other way a start can fail: no drovr server anywhere, but something
 /// foreign holds the requested port. That is a bind failure, not a duplicate — it
 /// must say so, and must not leave the lock held behind it.
@@ -503,12 +370,13 @@ fn a_foreign_process_on_the_requested_port_fails_to_bind() {
     drop(start_server(&xdg).0);
 }
 
-/// A foreign process squatting on a dead server's recorded address must not be
-/// mistaken for a live drovr server: the pid file is the authority, and its
-/// holder is gone, so a fresh start is allowed.
+/// Neither discovery file is part of the decision — the lock is. A `server.addr`
+/// left by a dead server must not wedge later starts, and that holds even when
+/// something foreign is listening there: the address is only ever a URL for the
+/// refusal message, and a `server.pid` naming a dead pid is just a file.
 #[test]
-fn foreign_listener_on_stale_addr_does_not_block_startup() {
-    let tmp = tmp_xdg("drovr-serve-foreign-");
+fn stale_discovery_files_do_not_block_startup() {
+    let tmp = tmp_xdg("drovr-serve-stale-");
     let xdg = tmp.path().join("xdg");
     let data = xdg.join("drovr");
     fs::create_dir_all(&data).expect("data dir");
@@ -517,41 +385,15 @@ fn foreign_listener_on_stale_addr_does_not_block_startup() {
     let squatter = TcpListener::bind("127.0.0.1:0").expect("squatter listener");
     let squatted = squatter.local_addr().unwrap().to_string();
     fs::write(data.join("server.addr"), &squatted).expect("stale addr");
-    // A pid that cannot be running: pid 0 is never a live process.
-    fs::write(data.join("server.pid"), "0").expect("stale pid");
-
-    let (mut server, port) = start_server(&xdg);
-    assert_serving(
-        &mut server,
-        port,
-        "serve must come up despite a foreign listener on the stale address",
-    );
-    drop(server);
-    drop(squatter);
-}
-
-/// A `server.addr` left behind by a dead server must not block a fresh start —
-/// otherwise a crashed daemon wedges every later `drovr serve` for good.
-#[test]
-fn stale_addr_file_does_not_block_startup() {
-    let tmp = tmp_xdg("drovr-serve-stale-");
-    let xdg = tmp.path().join("xdg");
-    let data = xdg.join("drovr");
-    fs::create_dir_all(&data).expect("data dir");
-    // Nothing listens here: the port was free at the moment we asked for it and
-    // we never bound it.
-    fs::write(
-        data.join("server.addr"),
-        format!("127.0.0.1:{}", free_port()),
-    )
-    .expect("stale addr");
+    // A pid that cannot be running, in a file nobody holds a lock on.
     fs::write(data.join("server.pid"), "999999").expect("stale pid");
 
     let (mut server, port) = start_server(&xdg);
     assert_serving(
         &mut server,
         port,
-        "serve must come up over a stale server.addr",
+        "serve must come up over stale discovery files",
     );
     drop(server);
+    drop(squatter);
 }
