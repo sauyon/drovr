@@ -492,7 +492,10 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
             // recoverable/purge-able instead of wedged on a vanished worktree.
             eprintln!("drovr: worktree {wt} no longer exists; skipping prune");
             if !purge && let Some(b) = branch {
-                println!("drovr: kept branch {b} — merge it with: git merge {b}");
+                println!(
+                    "drovr: kept branch {b} — merge it with: git merge {}",
+                    shell_single_quote(b)
+                );
             }
         } else {
             // Non-purge: land the run's accumulated work as one squash commit on
@@ -518,7 +521,10 @@ fn cmd_cleanup(name: &str, purge: bool, herdr: &SystemHerdr) {
             match worktree::remove(wt_path, delete_branch, purge) {
                 Ok(()) => {
                     if !purge && let Some(b) = branch {
-                        println!("drovr: kept branch {b} — merge it with: git merge {b}");
+                        println!(
+                            "drovr: kept branch {b} — merge it with: git merge {}",
+                            shell_single_quote(b)
+                        );
                     }
                 }
                 Err(e) => {

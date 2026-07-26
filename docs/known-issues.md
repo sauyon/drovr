@@ -698,31 +698,51 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
-## A `<task>` with a space or a shell metacharacter no longer produces a reviewer phase
+## A `<task>` or a review `angle` with a space or a shell metacharacter no longer produces a phase
 
 Introduced by the phase-name hardening (task 1's second fixes round of the phase-reap work).
 
 ### Symptom
 
-`drovr code-review run <run> "my task"` (or any `<task>` containing a space, `;`, `$`, quotes, …)
-fails with `invalid phase name "review:my task:1:correctness": … may use only letters, digits,
-'-', '_', '.' and ':'`. It used to work.
+`drovr code-review run <run> "my task"` — or any run whose config sets
+`angles = ["type design", "api & contracts"]` — fails with
+
+```
+invalid phase name "review:my task:1:correctness": may use only letters, digits,
+'-', '_', '.' and ':' …
+```
+
+It used to work. Both halves of the name are affected: `<task>` comes from argv or from the review
+server's HTTP layer, and `<angle>` comes from `${XDG_CONFIG_HOME}/drovr/config.toml`, which is
+free-form and validated nowhere else.
 
 ### Root cause
 
-`require_phase_name` (`cli/src/phase.rs`) is now an ALLOWLIST — `[A-Za-z0-9._:-]` — not a
-path-traversal denylist. A reviewer phase name is `review:<task>:<iter>:<angle>`, so the `<task>`
-inherits the rule. `<task>` reaches drovr from argv AND from the review server's HTTP layer, where
-`safe_component` (`cli/src/review.rs`) checks it for path safety only; a phase name is interpolated
-into file paths, into the `herdr pane run` command, and into the remediation commands drovr PRINTS
-for a human to paste. Rejecting at the boundary is what makes every emission site safe by
-construction. (The emission sites quote independently — see `cli/src/shell.rs` — but a name that
-cannot be a phase name should not become one.)
+`require_new_phase_name` (`cli/src/phase.rs`) is an ALLOWLIST — `[A-Za-z0-9._:-]` — applied wherever
+drovr CREATES a phase (`phase_start`, `spawn_reviewer`). A reviewer phase is
+`review:<task>:<iter>:<angle>`, so both interpolated parts inherit the rule.
+
+A phase name is interpolated into file paths, into the `herdr pane run` command, and into the
+remediation commands drovr PRINTS for a human to paste — three grammars, so a denylist would have to
+be right in all of them forever. Rejecting at creation means no phase drovr mints from here on needs
+quoting to be safe to mention. (Emission sites quote independently — `cli/src/shell.rs` — because run
+and task names remain unrestricted.)
+
+### Scope — an EXISTING phase is not affected
+
+The strict alphabet gates creation only. `require_phase_name`, used by `phase done` / `phase wait` /
+`phase send` / `collect`, keeps the older path-safety rule, so a phase an earlier drovr created under
+a now-illegal name is still fully operable and its live agent can still signal done. Pinned by
+`a_phase_already_on_disk_under_an_old_name_is_still_reachable`. **Do not "align" the two rules** —
+doing so bricks every such phase with no migration path.
 
 ### Working around it
 
-Name the task in the same alphabet drovr itself mints: `task-1`, `implement-task-2`,
-`fix-login-bug`. Hyphens instead of spaces. There is no way to opt out, by design.
+Name tasks and angles in the same alphabet drovr itself mints: `task-1`, `fix-login-bug`,
+`type-design`, `api-contracts`. Hyphens instead of spaces. There is no opt-out, by design.
+
+There is no validation at config load, so a bad `angle` is reported only when a panel is spawned —
+the error names the whole phase name, which is where the offending angle is visible.
 
 ## Resolved
 

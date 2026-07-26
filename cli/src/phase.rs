@@ -73,51 +73,84 @@ fn remove_stale_marker(run_name: &str, phase: &str) -> io::Result<()> {
 }
 
 /// Reject a phase name that could not address a real phase. Called by every entry
-/// point that appends a phase (`phase_start`, `spawn_reviewer`) or that resolves a
-/// name into a filesystem path (`phase_done`, `phase_wait`, `phase_send`,
-/// `collect`) — the latter is what makes an unnamed or path-escaping phase
-/// unreachable even if one somehow exists in `state.json`.
+/// point that resolves a name into a filesystem path (`phase_done`, `phase_wait`,
+/// `phase_send`, `collect`) — which is what makes an unnamed or path-escaping
+/// phase unreachable even if one somehow exists in `state.json`.
 ///
-/// The rule is an ALLOWLIST — `[A-Za-z0-9._:-]`, non-empty, no leading `.` —
-/// because a phase name is interpolated into three different grammars and a
-/// denylist has to be right in all of them:
+/// * Empty/whitespace: `Phase::default()` is representable with `name: ""`, and
+///   refusing to address one keeps an unnamed phase unreachable through
+///   `find_phase` without fighting the `..Default::default()` pattern.
+/// * Path separators, `..`, and a leading `.`: the name is interpolated into
+///   `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`, so `../../x`
+///   would place a run's marker outside its own directory.
 ///
-/// * a FILESYSTEM path, `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`
-///   — so `/`, `\`, `..` and a leading `.` would place a run's marker outside its
-///   own directory;
-/// * a SHELL command handed to herdr's `pane run` (`DROVR_PHASE=<run>/<phase>`);
-/// * a SHELL command drovr PRINTS for a human to paste (the `phase done` /
-///   `phase start` remediations). That last one is the live delivery mechanism:
-///   the user runs it themselves, so quoting at the emission site is necessary
-///   but is not where this belongs. Rejecting here means every emission site is
-///   safe by construction rather than by remembering.
-///
-/// Empty/whitespace is rejected separately from the alphabet: `Phase::default()`
-/// is representable with `name: ""`, and refusing to create one keeps an unnamed
-/// phase unreachable through `find_phase` without fighting the
-/// `..Default::default()` pattern.
-///
-/// The alphabet is everything drovr itself mints: pipeline names
-/// (`implement-task-1`), reviewer names (`review:<task>:<iter>:<angle>` — hence
-/// `:`), and version-ish suffixes. **A `<task>` with a space or a metacharacter
-/// now fails here** rather than silently becoming a phase name no command can
-/// safely mention — which is the point, since `<task>` reaches drovr from the
-/// review server's HTTP layer, where it is only checked for path safety.
+/// **This is deliberately WEAKER than [`require_new_phase_name`], and the
+/// asymmetry is the whole design.** A phase reaching this function ALREADY EXISTS
+/// — it has a pane, a pass token and a live agent. Applying the creation alphabet
+/// here would brick every phase an older drovr created under a name that was legal
+/// then (an `angles` entry or a `<task>` containing a space): `phase done`,
+/// `phase wait`, `phase send` and `collect` would all refuse the name the running
+/// agent was launched under, with no migration path. Shell safety on this path is
+/// carried by quoting at the emission sites — which it must be anyway, since run
+/// names are unrestricted too.
 fn require_phase_name(phase: &str) -> io::Result<()> {
     let bad = phase.trim().is_empty()
         || phase.starts_with('.')
+        || phase.contains('/')
+        || phase.contains('\\')
         || phase.contains("..")
-        || !phase
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+        || phase.contains('\0');
     if bad {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "invalid phase name {phase:?}: must be non-empty, must not contain \
-                 '..' or a leading '.', and may use only letters, digits, '-', \
-                 '_', '.' and ':' (a phase name is interpolated into file paths \
-                 and into shell commands drovr suggests you run)"
+                "invalid phase name {phase:?}: must be non-empty and must not \
+                 contain a path separator, '..', or a leading '.'"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a name drovr is about to CREATE a phase under (`phase_start`,
+/// `spawn_reviewer`). Everything [`require_phase_name`] rejects, plus an
+/// ALLOWLIST: `[A-Za-z0-9._:-]`.
+///
+/// An allowlist rather than a metacharacter denylist because a phase name is
+/// interpolated into three different grammars and a denylist has to be right in
+/// all of them, forever:
+///
+/// * a FILESYSTEM path, `<run_dir>/<phase>.done` and `<run_dir>/<phase>-HANDOFF.md`;
+/// * a SHELL command handed to herdr's `pane run` (`DROVR_PHASE=<run>/<phase>`);
+/// * a SHELL command drovr PRINTS for a human to paste (the `phase done` /
+///   `phase start` remediations). That last one is the live delivery mechanism:
+///   the user runs it themselves.
+///
+/// Quoting at every emission site is still necessary and still present — run and
+/// task names are not restricted this way. What this buys is that no NEW phase
+/// name ever needs it: from here on, everything in `run.phases` is a name any
+/// command can mention literally.
+///
+/// The alphabet is everything drovr itself mints: pipeline names
+/// (`implement-task-1`), reviewer names (`review:<task>:<iter>:<angle>` — hence
+/// `:`), and version-ish suffixes. **A `<task>` or a configured `angle` with a
+/// space or a metacharacter now fails here**, which is the point: `<task>` reaches
+/// drovr from the review server's HTTP layer, where it is only checked for path
+/// safety. See `docs/known-issues.md`.
+fn require_new_phase_name(phase: &str) -> io::Result<()> {
+    require_phase_name(phase)?;
+    if !phase
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid phase name {phase:?}: may use only letters, digits, '-', \
+                 '_', '.' and ':' — a phase name is interpolated into file paths \
+                 and into shell commands drovr suggests you run. (If this came from \
+                 a `<task>` argument or a configured review `angle`, rename it: \
+                 hyphens instead of spaces.)"
             ),
         ));
     }
@@ -242,7 +275,7 @@ pub fn phase_start<H: Herdr>(
     phase: &str,
     seed: Option<&Path>,
 ) -> io::Result<()> {
-    require_phase_name(phase)?;
+    require_new_phase_name(phase)?;
     if run.project_dir.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -384,7 +417,7 @@ pub fn spawn_reviewer<H: Herdr>(
     seed: Option<&Path>,
     launch_command: &str,
 ) -> io::Result<()> {
-    require_phase_name(phase)?;
+    require_new_phase_name(phase)?;
     // Same guard as phase_start: a run with no project_dir can't anchor the
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
@@ -3833,7 +3866,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn require_phase_name_rejects_shell_metacharacters() {
+    fn require_new_phase_name_rejects_shell_metacharacters() {
         for bad in [
             "p; rm -rf ~",
             "p && id",
@@ -3859,7 +3892,7 @@ mod tests {
             "p\ta",
         ] {
             assert!(
-                require_phase_name(bad).is_err(),
+                require_new_phase_name(bad).is_err(),
                 "a phase name a shell would not read as one literal word must not \
                  be CREATED: {bad:?}"
             );
@@ -3867,7 +3900,7 @@ mod tests {
     }
 
     #[test]
-    fn require_phase_name_accepts_the_names_drovr_actually_uses() {
+    fn require_new_phase_name_accepts_the_names_drovr_actually_uses() {
         for ok in [
             "brainstorm",
             "implement-task-1-fixes-2",
@@ -3878,9 +3911,22 @@ mod tests {
             "PHASE9",
         ] {
             assert!(
-                require_phase_name(ok).is_ok(),
+                require_new_phase_name(ok).is_ok(),
                 "the hardening must not reject a name drovr itself mints: {ok:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_resolve_rule_stays_weaker_than_the_creation_rule() {
+        // The asymmetry is load-bearing, not an oversight — see
+        // `a_phase_already_on_disk_under_an_old_name_is_still_reachable`. Both
+        // still reject what would escape the run dir.
+        assert!(require_new_phase_name("a b").is_err());
+        assert!(require_phase_name("a b").is_ok());
+        for escaping in ["../x", "a/b", "a\\b", "..", ".hidden", "", "  "] {
+            assert!(require_phase_name(escaping).is_err(), "{escaping:?}");
+            assert!(require_new_phase_name(escaping).is_err(), "{escaping:?}");
         }
     }
 
@@ -4093,6 +4139,42 @@ mod tests {
         );
         // The evidence half is unchanged: both tokens are still named.
         assert!(msg.contains("tok-from-elsewhere") && msg.contains("<none>"));
+    }
+
+    #[test]
+    fn a_phase_already_on_disk_under_an_old_name_is_still_reachable() {
+        // VERSION SKEW. Before the allowlist, a phase name with a space was legal:
+        // an `angles` entry or a `<task>` carrying one produced a real phase, with
+        // a pane and a pass token, recorded in state.json. Applying the CREATION
+        // rule to every later operation would brick exactly those phases —
+        // `phase done`, `phase wait`, `phase send` and `collect` would all refuse
+        // the name the live agent was launched under, with no migration path.
+        //
+        // So the strict alphabet gates CREATION only. The resolve path keeps the
+        // path-safety rule, and the emitted commands are quoted (they always must
+        // be: run names are unrestricted too).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("old-name-test");
+        let legacy = "review:t:1:api & contracts";
+        run.review_phases.push(Phase {
+            name: legacy.into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p7".into()),
+            ..Default::default()
+        });
+        run.save().unwrap();
+
+        // The name may no longer be CREATED …
+        assert!(
+            spawn_reviewer(&h, &mut run, legacy, None, "claude").is_err(),
+            "the creation boundary still rejects it"
+        );
+        // … but the phase that already exists under it still works end to end.
+        let marker = phase_done(&run, legacy).expect("an existing phase can still signal done");
+        assert!(marker.exists());
+        collect(&run, legacy).expect_err("no handoff file — but the NAME was accepted");
+        phase_send(&h, &mut run, legacy, "text").expect("and can still be sent to");
     }
 
     #[test]
