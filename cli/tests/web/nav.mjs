@@ -300,32 +300,62 @@ check('Enter on the focused summary toggles the group instead', await groupOpen(
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === false, 4000, 'group collapsed for the next section');
 
-console.log('\n== session list: the cursor survives a row vanishing ==');
+console.log('\n== session list: the cursor when a row vanishes ==');
 await goto('#/', LIST_READY);
-// A row can leave the visible list with no user action: a liveness flap folds an
-// archived run into the collapsed group on a 2s poll. The cursor must not
-// silently re-anchor onto whatever slid into that index — that displacement was
-// permanent, so a later `a`/Enter acted on an unrelated run.
+// Two failure modes, opposite directions, both reproduced in earlier rounds:
+//   * re-anchor immediately -> a run that folds out of view for ONE poll hands
+//     the cursor to whatever slid into its index, permanently.
+//   * never re-anchor -> a run that is genuinely gone leaves the key pointing at
+//     nothing while the numeric index repaints the cursor onto a different row
+//     after every re-sort, so the highlight wanders on its own.
+// Driven by stubbing /api/runs so the row really disappears from the DATA across
+// several real render passes — removing a DOM node and re-rendering unchanged
+// data (an earlier version of this test) proved neither behaviour.
+const hideRunForPolls = (name, polls) => evaluate(`
+  var realFetch = window.fetch;
+  var left = ${polls};
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1 && left > 0) {
+      left--;
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        var kept = rows.filter(function(x){ return x.name !== ${JSON.stringify(name)}; });
+        return {ok: true, json: function(){ return Promise.resolve(kept); }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  return 1;`);
+
 await press('g');
 await press('j');
 const parked = await cursorName();
 check('cursor is parked on a run', typeof parked, 'string');
-const kept = await evaluate(`
-  window.__savedKey = navCursorKey;
-  var wraps = Array.from(document.querySelectorAll('#run-list-items > .run-row-wrap'));
-  var target = wraps.find(function(w){
-    return w.querySelector('.run-name').textContent === navCursorKey;
-  });
-  if (!target) return 'anchored row not found';
-  target.remove();               // exactly what a fold does to the visible set
-  applyNavCursor(false);
-  return navCursorKey === window.__savedKey ? 'kept' : 'overwritten:' + navCursorKey;`);
-check('the anchor is kept when its row vanishes, not overwritten', kept, 'kept');
-check('...so the cursor finds it again once the row is back', await evaluate(`
-  return renderRunList(routeGen).then(function(){
-    var el = document.querySelector('#run-list-items .run-row.nav-cursor');
-    return el && el.querySelector('.run-name').textContent === window.__savedKey;
-  });`), true);
+
+// One poll missing: the anchor must be held, so the cursor returns to it.
+await hideRunForPolls(parked, 1);
+await evaluate(`return renderRunList(routeGen);`);
+check('a one-poll absence does not re-anchor the cursor',
+  await evaluate(`return navCursorKey;`), parked);
+await evaluate(`return renderRunList(routeGen);`);
+check('...and the cursor returns to its run when it comes back',
+  await cursorName(), parked);
+
+// Gone for good: the anchor must be released, and then STOP moving.
+await hideRunForPolls(parked, 12);
+for (let i = 0; i < 6; i++) await evaluate(`return renderRunList(routeGen);`);
+const settled = await evaluate(`return navCursorKey;`);
+check('a durably-missing run releases the anchor', settled !== parked, true);
+check('...and the released anchor names a row that actually exists',
+  (await rowNames()).indexOf(settled) !== -1, true);
+const drift = [];
+for (let i = 0; i < 4; i++) {
+  await evaluate(`return renderRunList(routeGen);`);
+  drift.push(await evaluate(`return navCursorKey;`));
+}
+check('...and the cursor then stops drifting across rows',
+  drift.every(k => k === settled), true);
+await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== session list: filter ==');
 await goto('#/', LIST_READY);

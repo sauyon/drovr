@@ -2342,6 +2342,14 @@ var listFilter = '';
 // and Enter would open a session the reviewer never pointed at. Empty on the
 // detail view, where questions have a fixed order.
 var navCursorKey = '';
+// Consecutive `applyNavCursor` passes in which the anchored run was not among the
+// visible rows. Bounded by NAV_ANCHOR_GRACE so a transient absence is ridden out
+// but a permanent one is not held forever — see the reasoning in applyNavCursor.
+var navAnchorMisses = 0;
+// ~3 passes. The list polls every 2s, so this rides out a few seconds of a run
+// being folded away or a herdr blip, without letting a deleted run hold the
+// anchor hostage while the highlight drifts across other rows.
+var NAV_ANCHOR_GRACE = 3;
 
 // Rows the cursor moves over, chosen by view. Detail view has no run rows, and
 // the list view has no questions, so one of these is always empty. On the detail
@@ -2380,18 +2388,29 @@ function applyNavCursor(scroll) {
   if (!currentRun && navCursorKey) {
     var found = -1;
     rows.forEach(function(el, i) { if (found < 0 && rowKey(el) === navCursorKey) found = i; });
-    if (found >= 0) navCursor = found;
-    else anchorMissing = true;
+    if (found >= 0) { navCursor = found; navAnchorMisses = 0; }
+    else { anchorMissing = true; navAnchorMisses++; }
   }
   if (navCursor >= rows.length) navCursor = rows.length - 1;
   if (navCursor < 0) navCursor = 0;
-  // Re-anchor ONLY when the cursor is where the reviewer left it. If the anchored
-  // run just vanished from the visible rows — folded into the collapsed group by
-  // a liveness flap, filtered out — the index fallback is already pointing at an
-  // unrelated run, and overwriting the key with that run's name would make the
-  // displacement permanent: the original would never be recovered when it comes
-  // back. Keeping the key lets the next render re-find it.
-  if (!currentRun && !anchorMissing) navCursorKey = rowKey(rows[navCursor]);
+  // Re-anchoring is deferred while the anchored run is missing — but only for a
+  // few passes, because both extremes are wrong:
+  //
+  // * Overwrite immediately, and a run that merely folded out of view for one
+  //   poll (a liveness flap) hands the cursor to whatever slid into its index,
+  //   permanently. A later `a`/Enter then acts on a session nobody selected.
+  // * Never overwrite, and a run that is genuinely gone (archived then purged,
+  //   deleted on disk) leaves the key pointing at nothing forever while the
+  //   numeric index keeps painting the cursor onto whichever row now occupies
+  //   that slot — so the highlight wanders by itself after every re-sort.
+  //
+  // So: hold the anchor across a brief absence, then accept it is gone and
+  // re-anchor to wherever the cursor actually sits.
+  var giveUp = navAnchorMisses > NAV_ANCHOR_GRACE;
+  if (!currentRun && (!anchorMissing || giveUp)) {
+    navCursorKey = rowKey(rows[navCursor]);
+    navAnchorMisses = 0;
+  }
   rows.forEach(function(el, i) {
     var on = i === navCursor;
     el.classList.toggle('nav-cursor', on);
