@@ -257,9 +257,10 @@ pub struct PaneInfo {
 /// by reconstructing them from two `Option`s at each call site.
 ///
 /// Reaping and session capture both turn on this, in opposite directions:
-/// treating [`PaneState::Unreadable`] as [`PaneState::AgentExited`] tears down a
-/// pane whose agent is alive and working, while treating `AgentExited` as
-/// `Unreadable` means finished panes never get reaped at all.
+/// treating [`PaneState::Unreadable`] as [`PaneState::NoAgentSession`] tears
+/// down a pane whose agent is alive and working, while treating
+/// `NoAgentSession` as `Unreadable` means finished panes never get reaped at
+/// all.
 // Capability only for now: reaping and session capture are later steps, so
 // `Unreadable` is constructed by tests alone until one of them polls.
 #[allow(dead_code)]
@@ -274,11 +275,24 @@ pub enum PaneState {
     /// attached. Its `agent_status` says what that agent is *doing*, which is a
     /// separate question — and may be absent, see [`PaneInfo::status_unreadable`].
     AgentAttached,
-    /// herdr answered: the pane and its tab are still there, but there is no
-    /// agent session — the agent process has exited. herdr reports
-    /// `agent_status: "unknown"` here and DROPS the session, so a session id
-    /// captured earlier must be kept, not cleared.
-    AgentExited,
+    /// herdr answered: the pane and its tab are still there, but NO agent
+    /// session is attached.
+    ///
+    /// **This covers two situations herdr does not let drovr tell apart:** an
+    /// agent that ran and has since exited (herdr reports `agent_status:
+    /// "unknown"` and DROPS the session), and a pane that never ran an agent at
+    /// all — a bare shell, which is exactly what a run's root pane is.
+    /// `pane.get` carries neither an `agent` nor an `agent_session` key in
+    /// either case, so this variant is named for what it can actually prove.
+    ///
+    /// Consequences for the two consumers:
+    /// - a session id captured earlier must be KEPT here, not cleared — herdr
+    ///   dropping it is not the agent disowning it;
+    /// - **this is NOT a licence to close the tab.** Whether a session-less pane
+    ///   is one of the run's finished phases or its root shell is a property of
+    ///   the RUN, and the caller must decide it from run state — the same
+    ///   boundary that keeps the root-tab guard out of this module.
+    NoAgentSession,
 }
 
 #[allow(dead_code)]
@@ -299,22 +313,24 @@ impl PaneInfo {
     /// is itself proof the poll succeeded. Use [`PaneState::from_poll`] to
     /// classify a result that may be `None`.
     pub fn state(&self) -> PaneState {
-        if self.agent_has_exited() {
-            PaneState::AgentExited
-        } else {
+        if self.has_agent_session() {
             PaneState::AgentAttached
+        } else {
+            PaneState::NoAgentSession
         }
     }
 
-    /// Whether the pane's agent process has exited. Keyed off the SESSION, not
-    /// the status: herdr drops `agent_session` when the agent exits, whereas a
-    /// status can be missing on a perfectly live pane.
-    pub fn agent_has_exited(&self) -> bool {
-        self.agent_session.is_none()
+    /// Whether herdr reports an agent session on this pane. This is THE signal
+    /// for "is an agent attached" — keyed off the session, never off the
+    /// status: herdr drops `agent_session` when an agent exits, whereas a
+    /// status can be missing on a perfectly live pane, and a stale `working`
+    /// can outlive the session it described.
+    pub fn has_agent_session(&self) -> bool {
+        self.agent_session.is_some()
     }
 
     /// Whether herdr answered without an `agent_status` for this pane. Distinct
-    /// from [`PaneInfo::agent_has_exited`] — an exited agent has a status
+    /// from [`PaneInfo::has_agent_session`] — an exited agent has a status
     /// (`unknown`), and a live agent may momentarily have none. Callers that
     /// gate on a status should treat this as "not yet known", never as done.
     pub fn status_unreadable(&self) -> bool {
@@ -1177,13 +1193,13 @@ mod tests {
         let live = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
         assert_eq!(live.state(), PaneState::AgentAttached);
         assert_eq!(PaneState::from_poll(Some(&live)), PaneState::AgentAttached);
-        assert!(!live.agent_has_exited());
+        assert!(live.has_agent_session());
 
-        // (C) herdr answered; the pane and its tab are there, the agent exited.
+        // (C) herdr answered; the pane and its tab are there, no agent session.
         let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
-        assert_eq!(exited.state(), PaneState::AgentExited);
-        assert_eq!(PaneState::from_poll(Some(&exited)), PaneState::AgentExited);
-        assert!(exited.agent_has_exited());
+        assert_eq!(exited.state(), PaneState::NoAgentSession);
+        assert_eq!(PaneState::from_poll(Some(&exited)), PaneState::NoAgentSession);
+        assert!(!exited.has_agent_session());
         assert_eq!(
             exited.tab_id.as_str(),
             "wAF:t2",
@@ -1210,14 +1226,51 @@ mod tests {
             })),
         };
         assert!(statusless.status_unreadable());
-        assert!(!statusless.agent_has_exited());
+        assert!(statusless.has_agent_session());
         assert_eq!(statusless.state(), PaneState::AgentAttached);
 
         // And the converse: an exited agent's status is readable — herdr's own
         // `unknown` — so the two predicates are genuinely independent.
         let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
         assert!(!exited.status_unreadable());
-        assert!(exited.agent_has_exited());
+        assert!(!exited.has_agent_session());
+    }
+
+    // The state is keyed off the SESSION, never off the status. A pane that
+    // reports `working` with no session is still session-less — a status-keyed
+    // implementation (`agent_status == Some(Unknown)`) would call this attached
+    // and hide a finished pane from reaping forever.
+    #[test]
+    fn pane_state_is_keyed_off_the_session_not_the_status() {
+        let working_but_session_less = PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: Some(AgentStatus::Working),
+            agent_session: None,
+        };
+        assert!(!working_but_session_less.has_agent_session());
+        assert_eq!(working_but_session_less.state(), PaneState::NoAgentSession);
+        assert!(!working_but_session_less.status_unreadable());
+    }
+
+    // A pane that NEVER ran an agent — a bare shell, which is what drovr's own
+    // root pane is — is indistinguishable from one whose agent exited: herdr's
+    // `pane.get` reports neither an `agent` nor an `agent_session` for either.
+    // `NoAgentSession` is named for what it can actually prove. Deciding whether
+    // a session-less pane is safe to close needs the RUN, not this type.
+    #[test]
+    fn a_pane_that_never_had_an_agent_is_not_distinguishable_from_an_exited_one() {
+        let shell = parse_pane_info(&socket_result(
+            r#"{"result":{"pane":{"pane_id":"w1:p0","tab_id":"w1:t0","cwd":"/proj","focused":false}}}"#,
+        ))
+        .expect("a bare shell pane is still a readable pane");
+        assert_eq!(shell.state(), PaneState::NoAgentSession);
+        assert!(shell.status_unreadable(), "a shell has no agent_status at all");
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert_eq!(
+            shell.state(),
+            exited.state(),
+            "same state — the difference is knowable only from the run"
+        );
     }
 
     #[test]
