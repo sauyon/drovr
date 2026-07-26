@@ -6,11 +6,11 @@ mod phase;
 mod reflex;
 mod review;
 mod run;
-mod worktree;
 /// Dependency-free SHA-256, used only by build-time integrity tests that pin
 /// embedded third-party assets to known-good digests.
 #[cfg(test)]
 mod sha256;
+mod worktree;
 
 use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_run, head_sha};
@@ -177,11 +177,20 @@ enum CodeReviewCmd {
     /// task start, before any code is written, so HEAD is the pre-task SHA).
     Base { run: String, task: String },
     /// Spawn one review panel for `task`, wait, merge, exit 0/3/2/1.
+    ///
+    /// Re-running after a timeout (exit 2) RESUMES: it re-attaches to the panel
+    /// still in flight, banks the angles that finished, and keeps waiting on the
+    /// stragglers. Pass `--fresh` to abandon them and open a new panel instead.
     Run {
         run: String,
         task: String,
         #[arg(long, default_value_t = 1_800_000)]
         timeout_ms: u64,
+        /// Always start a new review iteration, even if a previous one is still
+        /// in flight. Use when the pending reviewers are wedged or reviewing a
+        /// diff you no longer care about.
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -886,6 +895,7 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             run,
             task,
             timeout_ms,
+            fresh,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
@@ -897,7 +907,7 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             }
             let h = SystemHerdr::new();
             let mut state = load_run(&run);
-            let outcome = code_review_run(&h, &mut state, &task, timeout_ms);
+            let outcome = code_review_run(&h, &mut state, &task, timeout_ms, fresh);
             // Persist the review_phases progress the panel recorded (spawned
             // reviewers, done/running status) BEFORE handling the result:
             // `code_review_run` appends reviewer phases as it spawns them and can
@@ -1055,7 +1065,10 @@ mod tests {
             archived: false,
         };
         run.save().expect("seed run");
-        assert!(!run.is_complete(), "precondition: not complete before cleanup");
+        assert!(
+            !run.is_complete(),
+            "precondition: not complete before cleanup"
+        );
 
         let fake = FakeHerdr::new();
         cmd_cleanup("cleanup-me", false, &fake);
@@ -1324,13 +1337,29 @@ mod tests {
                         run,
                         task,
                         timeout_ms,
+                        fresh,
                     },
             } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(task, "task-1");
                 // Generous default (30 min), matching `review wait`.
                 assert_eq!(timeout_ms, 1_800_000);
+                assert!(
+                    !fresh,
+                    "a plain re-run must default to resuming an in-flight panel"
+                );
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_code_review_run_fresh() {
+        let cli = parse(&["drovr", "code-review", "run", "myrun", "task-1", "--fresh"]).unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Run { fresh, .. },
+            } => assert!(fresh),
             _ => panic!("wrong variant"),
         }
     }
@@ -1479,5 +1508,4 @@ mod tests {
         assert!(s.contains("1/1"), "got: {s}");
         assert!(s.contains("all done"), "got: {s}");
     }
-
 }

@@ -267,12 +267,19 @@ herdr panel.
 ### Fix idea
 
 ~~Apply the `phase send` agent-readiness fix (poll `agent_status` until attached/at-composer)
-to the reviewer-spawn path in `code_review.rs`~~ — **done**, see below. Still open: bound each
-reviewer with a liveness check so a never-attached (or attached-but-wedged) pane fails fast
-instead of hanging the whole panel. Today the only bound is the single panel-wide `timeout_ms`
-deadline in the marker poll loop (`cli/src/code_review.rs:330-359`); an individual reviewer is
+to the reviewer-spawn path in `code_review.rs`~~ — **done**, see below.
+
+~~Still open: bound each reviewer with a liveness check so a never-attached (or
+attached-but-wedged) pane fails fast instead of hanging the whole panel. Today the only bound is
+the single panel-wide `timeout_ms` deadline in the marker poll loop; an individual reviewer is
 never probed for liveness, and a timed-out pass just returns `ReviewOutcome::Timeout` with no
-`<task>-review.json`.
+`<task>-review.json`.~~ — **addressed** by the resume path (2026-07-25): a timeout is now a
+pause rather than a dead end. Each reviewer is harvested to `<task>-review-<angle>.json` the
+moment it finishes, and a plain re-run of `drovr code-review run` resumes the same iteration —
+waiting only on the stragglers and respawning any whose pane no longer exists (`Herdr::pane_exists`,
+which unlike `agent_status` distinguishes "pane gone" from "status unparseable"). A wedged
+reviewer still needs the human's `--fresh`; what is fixed is that it no longer costs the whole
+panel's work.
 
 ### Also seen (2026-07-25, run `harden-review`, `harden/supply-chain`) — root cause since fixed
 
@@ -290,10 +297,18 @@ path** while `code-review run` used a bare `agent_send`.
 reviewer raises a `TimedOut` error that aborts the pass instead of erroring with "target not
 found". So the "agent target not found" symptom above should no longer occur.
 
-**Unverified as of 2026-07-25:** the *second* symptom — reviewer panes attach and get seeded but
-never reach `done`, so `code-review run` times out with no `<task>-review.json` — has not been
-re-run against current `main`. It is a distinct failure from the spawn race and nothing in the
-source rules it out. Keep the workaround until someone dogfoods the panel end-to-end again.
+**CONFIRMED 2026-07-25** (run `review-resume`, branch `drovr/review-resume`, dogfooding the panel
+on the code-review resume change): the *second* symptom reproduces, and it is **not** a distinct
+bug — it is the unsubmitted-paste failure documented in the next section. All four cursor
+reviewer panes launched, attached, and received their seed, but the brief sits in the composer as
+`→ [Pasted text #1 +46 lines]`, never submitted. The agents therefore never start, never reach
+`done`, and `code-review run` times out with no `<task>-review.json` — exactly as reported.
+
+Reading a reviewer pane (`herdr agent read <pane>`) shows the full seed rendered in the composer
+with the correct `base..head` scope, so seeding and scope selection are fine; only the submit
+keystroke is missing. Fixing "`phase send` lands a large briefing unsubmitted" (below) fixes the
+panel too — they are one bug, and the panel is simply its most visible victim. Keep the
+self-spawned-reviewer workaround above until that lands.
 
 ## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
 

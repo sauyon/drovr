@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -67,6 +67,14 @@ pub trait Herdr {
     /// is down, we do not know" must not read as "nothing is running", or the UI
     /// would offer to archive live runs without warning.
     fn workspace_list(&self) -> Option<Vec<String>>;
+    /// Whether `pane_id` still exists. Distinct from [`Herdr::agent_status`],
+    /// which returns `None` both for a pane that is gone *and* for one whose
+    /// status merely failed to parse — too ambiguous to act on. Callers use this
+    /// to decide a pane is genuinely dead (e.g. `code-review` resume respawning a
+    /// reviewer), so it is deliberately biased toward `true`: only a definitive
+    /// "no such pane" answer returns `false`; an unreachable daemon reports `true`
+    /// (unknown → assume alive) so a transient blip never kills live work.
+    fn pane_exists(&self, pane_id: &str) -> bool;
     fn integration_present(&self, agent: &str) -> bool;
 }
 
@@ -290,10 +298,7 @@ impl Herdr for SystemHerdr {
         // 0.7.5 socket API: agent.prompt types AND submits the prompt natively,
         // so the old PASTE_SETTLE/flush-CR handshake (0.7.3's `agent send`, which
         // only wrote text into the input box) is gone.
-        self.socket_call(
-            "agent.prompt",
-            json!({ "target": target, "text": text }),
-        )?;
+        self.socket_call("agent.prompt", json!({ "target": target, "text": text }))?;
         Ok(())
     }
 
@@ -332,6 +337,20 @@ impl Herdr for SystemHerdr {
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         parse_agent_status(&stdout)
+    }
+
+    fn pane_exists(&self, pane_id: &str) -> bool {
+        // `pane get` is read-only and does not move focus. Bias toward "alive": a
+        // nonzero exit alone proves nothing (an unreachable daemon exits nonzero
+        // too), so only herdr's explicit `pane_not_found` counts as death — see
+        // `pane_get_proves_missing`. Anything else, including a failure to run the
+        // binary at all, reports alive so a blip never respawns live work.
+        match self.run(&["pane", "get", pane_id]) {
+            Ok(out) if !out.status.success() => {
+                !pane_get_proves_missing(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => true,
+        }
     }
 
     fn integration_present(&self, agent: &str) -> bool {
@@ -387,6 +406,24 @@ fn parse_agent_status(json: &str) -> Option<String> {
     find_agent_status(&v)
 }
 
+/// Whether a failed `herdr pane get` proves the pane is GONE, as opposed to merely
+/// failing for some other reason.
+///
+/// `pane get` exits non-zero for a missing pane *and* for an unreachable daemon, a
+/// bad socket path, a permissions problem — every one of which would otherwise read
+/// as "pane is dead" and make [`Herdr::pane_exists`] tell callers to respawn a
+/// reviewer that is alive and working. Only herdr's explicit `pane_not_found` error
+/// code is treated as proof of death; anything else is "cannot tell", i.e. alive.
+fn pane_get_proves_missing(stdout: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(stdout) else {
+        return false;
+    };
+    v.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        == Some("pane_not_found")
+}
+
 /// Recursively search a JSON value for the first `"agent_status"` string.
 fn find_agent_status(v: &serde_json::Value) -> Option<String> {
     match v {
@@ -427,6 +464,15 @@ pub struct FakeHerdr {
     /// When true, `workspace_close` errors (models closing an already-gone
     /// workspace, the common case when a run's panes died long ago).
     fail_workspace_close: RefCell<bool>,
+    /// When true, every `agent_send` returns an error (models a pane that accepted a
+    /// launch but cannot be given its prompt).
+    fail_agent_send: RefCell<bool>,
+    /// Pane ids that `pane_exists` reports as gone; every other pane exists.
+    dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Per-pane `agent_read` queues, consulted before the global `read_queue`. Real
+    /// transcripts belong to a specific pane; a test that cares which pane it is
+    /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
+    read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
 }
 
 #[cfg(test)]
@@ -440,7 +486,31 @@ impl FakeHerdr {
             fail_pane_run: RefCell::new(false),
             live_workspaces: RefCell::new(Some(Vec::new())),
             fail_workspace_close: RefCell::new(false),
+            fail_agent_send: RefCell::new(false),
+            dead_panes: RefCell::new(std::collections::HashSet::new()),
+            read_by_pane: RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Model `pane_id` having disappeared (crashed agent, closed tab): from now on
+    /// `pane_exists` reports `false` for it.
+    pub fn kill_pane(&self, pane_id: impl Into<String>) {
+        self.dead_panes.borrow_mut().insert(pane_id.into());
+    }
+
+    /// Make every `agent_send` fail: the pane launched, but its prompt can never be
+    /// delivered. Cheaper than driving `phase_send`'s 30s readiness timeout.
+    pub fn fail_agent_send(&self) {
+        *self.fail_agent_send.borrow_mut() = true;
+    }
+
+    /// Queue a transcript for one specific pane, taking priority over `push_read`.
+    pub fn push_read_for(&self, pane_id: impl Into<String>, text: impl Into<String>) {
+        self.read_by_pane
+            .borrow_mut()
+            .entry(pane_id.into())
+            .or_default()
+            .push_back(text.into());
     }
 
     /// Declare which workspace ids herdr should report as live.
@@ -549,6 +619,9 @@ impl Herdr for FakeHerdr {
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
+        if *self.fail_agent_send.borrow() {
+            return Err(io::Error::other("scripted agent_send failure"));
+        }
         Ok(())
     }
 
@@ -559,6 +632,16 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
+        // A transcript queued for this exact pane wins; otherwise fall back to the
+        // pane-agnostic queue most tests use.
+        if let Some(text) = self
+            .read_by_pane
+            .borrow_mut()
+            .get_mut(target)
+            .and_then(|q| q.pop_front())
+        {
+            return Ok(text);
+        }
         let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
         Ok(text)
     }
@@ -575,6 +658,11 @@ impl Herdr for FakeHerdr {
             Some(scripted) => scripted,
             None => Some("idle".to_string()),
         }
+    }
+
+    fn pane_exists(&self, pane_id: &str) -> bool {
+        self.record(format!("pane_exists target={pane_id}"));
+        !self.dead_panes.borrow().contains(pane_id)
     }
 
     fn integration_present(&self, agent: &str) -> bool {
@@ -665,20 +753,16 @@ mod tests {
 
     #[test]
     fn find_string_field_extracts_top_level() {
-        let v: Value = serde_json::from_str(
-            r#"{"pane_id":"w1:pXY","tab_id":"w1:tXY"}"#,
-        )
-        .unwrap();
+        let v: Value = serde_json::from_str(r#"{"pane_id":"w1:pXY","tab_id":"w1:tXY"}"#).unwrap();
         assert_eq!(find_string_field(&v, "pane_id").as_deref(), Some("w1:pXY"));
     }
 
     #[test]
     fn find_string_field_extracts_nested() {
         // workspace.create wraps the id inside a nested object.
-        let v: Value = serde_json::from_str(
-            r#"{"workspace":{"workspace_id":"w7","label":"drovr:demo"}}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"workspace":{"workspace_id":"w7","label":"drovr:demo"}}"#)
+                .unwrap();
         assert_eq!(find_string_field(&v, "workspace_id").as_deref(), Some("w7"));
     }
 
@@ -692,6 +776,30 @@ mod tests {
     fn find_string_field_ignores_empty() {
         let v: Value = serde_json::from_str(r#"{"pane_id":""}"#).unwrap();
         assert!(find_string_field(&v, "pane_id").is_none());
+    }
+
+    #[test]
+    fn only_pane_not_found_proves_a_pane_is_missing() {
+        // The one answer that proves death.
+        assert!(pane_get_proves_missing(
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+        ));
+
+        // Every other nonzero exit must read as "cannot tell" → alive. Reporting a
+        // live reviewer dead makes `code-review` resume respawn work in progress.
+        assert!(
+            !pane_get_proves_missing(
+                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+            ),
+            "an unreachable daemon must never be read as a dead pane"
+        );
+        assert!(
+            !pane_get_proves_missing(
+                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+            ),
+            "a non-JSON failure (bad socket path) must not be read as a dead pane"
+        );
+        assert!(!pane_get_proves_missing(""), "empty output proves nothing");
     }
 
     #[test]
@@ -766,7 +874,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("agent_send_keys"), "call: {}", calls[0]);
         assert!(calls[0].contains("target=pane-1"), "call: {}", calls[0]);
-        assert!(calls[0].contains("keys=[\"3\", \"enter\"]"), "call: {}", calls[0]);
+        assert!(
+            calls[0].contains("keys=[\"3\", \"enter\"]"),
+            "call: {}",
+            calls[0]
+        );
         // Must be distinguishable from a text send.
         assert!(!calls[0].contains("text="), "call: {}", calls[0]);
     }
@@ -878,7 +990,11 @@ mod tests {
             std::env::remove_var("ANTHROPIC_MODEL");
         }
         let map = env.as_object().expect("agent_env must be a JSON object");
-        assert_eq!(map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str), Some("/cfg"), "{env}");
+        assert_eq!(
+            map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str),
+            Some("/cfg"),
+            "{env}"
+        );
         assert_eq!(
             map.get("ANTHROPIC_API_KEY").and_then(Value::as_str),
             Some("sk-test"),
