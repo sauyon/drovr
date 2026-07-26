@@ -249,8 +249,15 @@ pub trait Herdr {
     /// its agent is gone (see [`PaneInfo`] for that distinction).
     ///
     /// READ-ONLY: `pane.get` is a query and does not move focus, so this is safe
-    /// to poll every iteration without disturbing the user. It is drovr's only
-    /// poll primitive; [`Herdr::agent_status`] is a projection of it.
+    /// to poll every iteration without disturbing the user.
+    ///
+    /// It is drovr's ONLY poll. There is deliberately no `agent_status`
+    /// projection beside it: such a helper returned `None` both when the poll
+    /// failed and when herdr answered that the agent had exited, and reaping
+    /// turns on telling those apart. Callers narrow this themselves —
+    /// `pane_info(id).and_then(|info| info.agent_status)` where only the status
+    /// matters — so a collapse is always written out loud at the site that wants
+    /// it. **Do not re-add a status-only method to this trait.**
     fn pane_info(&self, pane_id: &str) -> Option<PaneInfo>;
     /// Close a tab and every pane in it (socket `tab.close`). The only pane
     /// teardown besides `workspace_close`, and it must never be aimed at the tab
