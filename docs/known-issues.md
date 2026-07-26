@@ -369,6 +369,43 @@ So there are two failure modes on this path, not one: a silent *drop* and a sile
 *non-submit*. Any fix must cover both — verifying the composer is non-empty after the send is
 what distinguishes them.
 
+### Payload size is NOT the cause (2026-07-26, run `skill-stickiness`, panes `wAG:p1`/`wAG:p2`)
+
+The "large briefing" framing in this entry's title and its paste-size root-cause hypothesis are
+**wrong, or at least incomplete**. Three sends failed to submit in one session, and all three
+were *small, single-message payloads of a few hundred bytes* — well under any paste threshold:
+
+1. `wAG:p1`, ~300 bytes ("GATE APPROVED … Read <path> … then run `drovr phase done`").
+2. `wAG:p1`, ~430 bytes (a one-paragraph correction).
+3. `wAG:p2`, ~400 bytes (the plan phase's pointer injection — already using the
+   write-to-file-and-send-a-pointer pattern this entry recommends).
+
+Critically, none of them rendered as `[Pasted text #1 +NN lines]`. They appeared as ordinary
+**inline wrapped text at the `❯` prompt** — so this is not a bracketed paste failing to commit.
+The text is typed into the composer and the submit simply does not happen. Case 3 matters most:
+the recommended workaround *reduces* the payload precisely to dodge the paste path, and it still
+did not submit. **Sending a pointer instead of a briefing does not avoid this bug.**
+
+Note also that herdr was 0.7.5 here, whose `agent.prompt` is documented to type *and* submit
+natively — which is why `cli/src/herdr.rs:265-271` dropped the old 0.7.3 flush-CR handshake. That
+assumption does not hold in practice.
+
+One possible contributor, unconfirmed: in case 1 the target had been failing tool calls against a
+degraded classifier and had parked itself, with the TUI showing a `new task? /clear to save …`
+hint. A readiness probe reporting "ready" for an agent parked mid-error would explain both the
+exit `0` and the swallowed submit. Cases 2 and 3 had no such state, so it cannot be the whole
+explanation.
+
+**Practical rule:** treat `phase send`'s exit `0` as "text reached the composer", never as "the
+agent received it". Follow *every* send — large or small, paste or inline — with
+`herdr pane send-keys <pane> Enter`, then confirm the composer cleared with
+`herdr pane read <pane> --source recent --lines 12`. A redundant `Enter` on an already-submitted
+message is harmless: it lands on an empty prompt and does nothing.
+
+**And never read a quiet watch as progress.** Silence is equally consistent with "working",
+"never started" and "dead". When a watch has been quiet longer than the work plausibly takes,
+read the pane — that is the only thing that distinguishes them.
+
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
 **Severity:** medium (every fresh agent in a project with an MCP server stalls at spawn until
@@ -864,68 +901,6 @@ failure: discovery succeeds, and the UI shows no runs.
    global one. A `serve` on a non-default port is almost by definition not the one to advertise.
 4. **Clear `server.pid`/`server.addr` on clean shutdown**, and treat a dead `server.pid` as
    grounds to ignore `server.addr` without waiting for the TCP timeout.
-
-## `drovr phase send` exits 0 with the prompt left unsubmitted in the agent's input box
-
-**Severity:** high — the orchestrator believes it has driven the phase forward and waits forever
-on an agent that never saw the message.
-**Found:** 2026-07-26, run `skill-stickiness`, herdr 0.7.5.
-
-### Symptom
-
-`drovr phase send <run> <phase> '<text>'` returns exit `0`. The text is visibly present in the
-agent pane — but sitting *in the input box* at the `❯` prompt, never submitted. The agent is idle
-and unaware. Any watch keyed on the work the message asked for waits indefinitely, and correctly
-reports nothing, because nothing happened.
-
-This is silent: exit `0`, no stderr, and a pane that looks like the message arrived. It was caught
-here only by reading the pane directly after a monitor stayed quiet longer than it should have.
-
-### Root cause — partially diagnosed
-
-`phase_send` (`cli/src/phase.rs:339-375`) gates on `wait_agent_ready`, then calls
-`Herdr::agent_send`, which issues the herdr socket call `agent.prompt`
-(`cli/src/herdr.rs:265-271`). That method is documented to type **and submit** natively —
-`herdr agent prompt` is literally "Submit a prompt to an agent" — and the old 0.7.3
-type-then-flush-CR handshake was removed on that basis.
-
-In this incident the type half happened and the submit half did not. What is *confirmed*: herdr
-was 0.7.5, so the version assumption in that comment held. What is **not** established is why
-submission was dropped. The most likely contributor is agent state: the target had been failing
-tool calls against a degraded classifier and had parked itself, with the Claude Code TUI showing a
-`new task? /clear to save …` hint. A readiness probe reporting "ready" for an agent that is
-actually parked mid-error would explain both the exit `0` and the swallowed submit. **This is a
-hypothesis, not a diagnosis** — do not fix against it without reproducing.
-
-### Workaround
-
-Treat `phase send`'s exit `0` as "text delivered to the pane", never as "agent received it".
-Follow every send with an explicit submit, then verify:
-
-```sh
-drovr phase send "$RUN" "$PHASE" "$TEXT"
-sleep 2
-herdr pane send-keys "$PANE" Enter        # pane_id is in the run's state.json
-herdr pane read "$PANE" --source recent --lines 20   # confirm it left the input box
-```
-
-A bare extra `Enter` is safe when the message *did* submit — it lands on an empty prompt and does
-nothing.
-
-The stronger habit, and the one that would have caught this immediately: **never treat a quiet
-monitor as evidence of progress.** Silence is consistent with "working", "never started", and
-"dead". When a watch has been quiet longer than the work plausibly takes, read the pane.
-
-### Fix ideas
-
-1. **Verify submission instead of assuming it.** After `agent.prompt`, poll `agent_status` (or
-   re-read the pane) for a bounded interval and confirm the input box is empty / the agent moved
-   to `working`. Return a distinct non-zero exit if the prompt is still sitting there.
-2. **Restore a flush keystroke as a fallback** — not the unconditional 0.7.3 handshake, but a
-   single `Enter` sent only when step 1 detects the prompt was not consumed.
-3. **Harden `wait_agent_ready`.** If a parked-after-error agent reports ready, readiness is
-   measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
-   it gave up".
 
 ## A finished phase reports `running` forever unless the driver happens to run `phase wait`
 
