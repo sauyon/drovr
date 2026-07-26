@@ -68,16 +68,31 @@ impl SessionId {
     }
 }
 
+/// A session that is safe to resume: a `kind == "id"` session whose owning agent
+/// herdr told us. Both halves of the resume rule travel together, so a caller
+/// cannot hold the id without also holding the backend to check it against —
+/// see [`AgentSession::resumable`], the only thing that builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumableSession<'a> {
+    pub id: &'a SessionId,
+    pub agent: &'a str,
+}
+
 /// The agent session herdr records on a pane (`agent_session`), keyed by herdr's
 /// own `kind` discriminator.
 ///
 /// Only a `kind == "id"` session may ever be interpolated into an agent's
 /// `--resume` argument — a transcript path there would be read as a session
 /// name. That rule lives in the TYPE rather than in every caller: the id is
-/// reachable through [`AgentSession::resumable_id`], which yields `Some` for
-/// `Id` alone, and the value it hands back is a [`SessionId`] no other variant
-/// can produce. A `Path`'s value is still readable — diagnostics need it — but
-/// only by naming `Path` explicitly, which is a deliberate, greppable act.
+/// reachable through [`AgentSession::resumable`], and only for an `Id` whose
+/// owning agent herdr reported; the value it hands back is a [`SessionId`] no
+/// other variant can produce. A `Path`'s value is still readable — diagnostics
+/// need it — but only by naming `Path` explicitly, which is a deliberate,
+/// greppable act.
+///
+/// Parsing stays FAITHFUL: an id session with no `agent` key is still parsed as
+/// `Id { agent: None }`, because that is what herdr said. It is `resumable` that
+/// refuses it — the safety judgement is a method, not a lie about the wire.
 ///
 /// herdr DROPS this whole key once the pane's agent process exits (verified
 /// against 0.7.5), so it must be captured while the agent is alive.
@@ -103,12 +118,21 @@ pub enum AgentSession {
 // onto `Phase` is a later step, and resuming from it later still.
 #[allow(dead_code)]
 impl AgentSession {
-    /// The session id — and ONLY when this session is a resumable id. Every
-    /// other kind yields `None`. This is the single chokepoint for the "never
-    /// interpolate a path as a session id" rule.
-    pub fn resumable_id(&self) -> Option<&SessionId> {
+    /// The session — and ONLY when it is an id whose owning agent is known.
+    /// A `kind:"path"` session, an unrecognised kind, and an id herdr did not
+    /// attribute to an agent all yield `None`.
+    ///
+    /// This is the single chokepoint for the whole resume rule: never
+    /// interpolate a path as a session id, AND never resume an id without being
+    /// able to check it came from this run's backend. Without the agent that
+    /// check is impossible, and resuming a claude session under cursor is not a
+    /// recoverable mistake — so an agent-less id is not resumable at all.
+    pub fn resumable(&self) -> Option<ResumableSession<'_>> {
         match self {
-            AgentSession::Id { value, .. } => Some(value),
+            AgentSession::Id {
+                value,
+                agent: Some(agent),
+            } => Some(ResumableSession { id: value, agent }),
             _ => None,
         }
     }
@@ -508,19 +532,29 @@ impl Herdr for SystemHerdr {
         // move focus, so this is safe to poll from `phase_wait` on every
         // iteration. Every failure — herdr unreachable, pane gone, unexpected
         // shape — collapses to `None`: a best-effort read must never break a
-        // poll loop.
-        let result = self
-            .socket_call("pane.get", json!({ "pane_id": pane_id }))
-            .ok()?;
+        // poll loop. But it must not collapse SILENTLY: both failures present
+        // downstream as an unexplained readiness or wait timeout, so each is
+        // reported once per process.
+        let result = match self.socket_call("pane.get", json!({ "pane_id": pane_id })) {
+            Ok(result) => result,
+            Err(err) => {
+                // Connection refused, read timeout, or a JSON-RPC error such as
+                // an unknown pane — herdr's own message is the only clue, and
+                // `.ok()?` used to drop it on the floor.
+                if first_time(&PANE_GET_ERROR_WARNED) {
+                    eprintln!("{}", pane_get_error_message(pane_id, &err.to_string()));
+                }
+                return None;
+            }
+        };
         let info = parse_pane_info(&result);
-        if info.is_none() {
-            // A closed/unknown pane comes back as a socket *error*, so it never
-            // reaches here — an unparseable success means herdr's response shape
+        if info.is_none() && first_time(&PANE_GET_SHAPE_WARNED) {
+            // A closed/unknown pane comes back as a socket *error* handled
+            // above, so an unparseable SUCCESS means herdr's response shape
             // moved under us. That degrades silently and totally (every poll
             // `None` → `phase_send` burns its readiness timeout on a healthy
-            // agent, `blocked` is never detected early), so say so once. Keys
-            // only: the payload carries cwds and terminal titles.
-            warn_once_on_pane_get_shape(&result);
+            // agent, `blocked` is never detected early).
+            eprintln!("{}", pane_get_shape_message(&result));
         }
         info
     }
@@ -577,23 +611,40 @@ fn find_string_field(value: &Value, key: &str) -> Option<String> {
 /// 500 ms poll loop warns once per process rather than twice a second.
 static PANE_GET_SHAPE_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Report — once — that `pane.get` succeeded with a shape [`parse_pane_info`]
-/// does not recognise. Prints the result's top-level keys only, never its
-/// values: the payload carries cwds and terminal titles.
-fn warn_once_on_pane_get_shape(result: &Value) {
-    if PANE_GET_SHAPE_WARNED.swap(true, Ordering::Relaxed) {
-        return;
-    }
+/// Set once the first socket-layer `pane.get` failure has been reported.
+static PANE_GET_ERROR_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// `true` the first time it is called for `flag`, `false` forever after. Turns
+/// a 500 ms poll loop's diagnostic into one line per process instead of two a
+/// second.
+fn first_time(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
+/// The diagnostic for a `pane.get` that succeeded with a shape
+/// [`parse_pane_info`] does not recognise. Names the result's top-level keys
+/// only, never their values: the payload carries cwds and terminal titles.
+fn pane_get_shape_message(result: &Value) -> String {
     let keys = match result.as_object() {
         Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
         None => "<not an object>".to_string(),
     };
-    eprintln!(
+    format!(
         "drovr: herdr's pane.get returned a shape drovr cannot read \
          (expected a `pane` object with a `tab_id`; got keys: {keys}). \
          Agent status polling is degraded — phase sends will wait out their \
          readiness timeout. Check the herdr version."
-    );
+    )
+}
+
+/// The diagnostic for a `pane.get` that failed at the socket layer.
+fn pane_get_error_message(pane_id: &str, err: &str) -> String {
+    format!(
+        "drovr: herdr's pane.get failed for pane {pane_id}: {err}. \
+         Agent status polling is degraded — phase sends and waits will run to \
+         their timeouts with no other explanation. (A pane that has been closed \
+         reports this too.)"
+    )
 }
 
 /// A non-empty string field of `value`, or `None`. herdr writes `""` for some
@@ -983,10 +1034,48 @@ mod tests {
         let session = info.agent_session.expect("live agent carries a session");
         assert_eq!(session.kind(), "id");
         assert_eq!(
-            session.resumable_id().map(SessionId::as_str),
+            session.resumable().map(|r| r.id.as_str()),
             Some("cca92f5b-3a8c-4008-a9f2-e2fa191395e5")
         );
         assert_eq!(session.agent(), Some("claude"));
+    }
+
+    // A poll that fails at the SOCKET layer (connection refused, read timeout,
+    // JSON-RPC "unknown pane") is invisible downstream — it presents as an
+    // unexplained readiness or wait timeout. Say so once, naming the pane and
+    // herdr's own message.
+    #[test]
+    fn pane_get_error_message_names_the_pane_and_the_cause() {
+        let msg = pane_get_error_message("wAF:p1", "connection refused");
+        assert!(msg.contains("wAF:p1"), "msg: {msg}");
+        assert!(msg.contains("connection refused"), "msg: {msg}");
+        assert!(msg.contains("pane.get"), "msg: {msg}");
+    }
+
+    // The shape diagnostic names the KEYS it got, never their values: the
+    // payload carries cwds and terminal titles.
+    #[test]
+    fn pane_get_shape_message_lists_keys_not_values() {
+        let msg = pane_get_shape_message(&socket_result(
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/home/someone/secret-project"}]}}"#,
+        ));
+        assert!(msg.contains("panes"), "msg: {msg}");
+        assert!(
+            !msg.contains("secret-project"),
+            "values must never be printed: {msg}"
+        );
+        // A non-object result is reported, not swallowed.
+        assert!(pane_get_shape_message(&Value::Null).contains("not an object"));
+    }
+
+    // Both diagnostics are gated so a 500 ms poll loop reports once per process
+    // rather than twice a second.
+    #[test]
+    fn first_time_is_true_exactly_once() {
+        let flag = AtomicBool::new(false);
+        assert!(first_time(&flag), "the first call reports");
+        assert!(!first_time(&flag), "and every later one is silent");
+        assert!(!first_time(&flag));
     }
 
     #[test]
@@ -1032,26 +1121,42 @@ mod tests {
             value: SessionId("cca92f5b".to_string()),
             agent: Some("claude".to_string()),
         };
-        assert_eq!(id.resumable_id(), Some(&SessionId("cca92f5b".to_string())));
+        let resumable = id.resumable().expect("an id session with a known agent");
+        assert_eq!(resumable.id, &SessionId("cca92f5b".to_string()));
         assert_eq!(
-            id.resumable_id().map(SessionId::as_str),
-            Some("cca92f5b"),
+            resumable.id.as_str(),
+            "cca92f5b",
             "the raw id is still reachable, but only through a SessionId"
+        );
+        assert_eq!(
+            resumable.agent, "claude",
+            "the backend to check against comes WITH the id, not separately"
         );
         assert_eq!(id.agent(), Some("claude"));
         assert_eq!(id.kind(), "id");
 
+        // An id whose owning agent herdr did not report is NOT resumable: with
+        // no backend to compare against we cannot know the id belongs to this
+        // run's agent, and resuming a claude session under cursor is not a
+        // recoverable mistake.
+        let agentless = AgentSession::Id {
+            value: SessionId("cca92f5b".to_string()),
+            agent: None,
+        };
+        assert!(
+            agentless.resumable().is_none(),
+            "half of the rule is not enough"
+        );
+        assert_eq!(agentless.kind(), "id", "but it is still an id session");
+
         let path = AgentSession::Path {
             value: "/tmp/transcript.jsonl".to_string(),
         };
-        assert_eq!(path.resumable_id(), None, "a path is never a session id");
+        assert!(path.resumable().is_none(), "a path is never a session id");
         // …and a `Path`'s value cannot be passed off as one: only `Id` carries a
         // `SessionId`, so an or-pattern merging the two variants to lift out a
         // single `value` binding does not type-check.
-        assert_ne!(
-            Some(&SessionId("/tmp/transcript.jsonl".to_string())),
-            path.resumable_id()
-        );
+        assert!(path.resumable().is_none());
         assert_eq!(path.kind(), "path");
         assert_eq!(path.agent(), None);
 
@@ -1059,9 +1164,8 @@ mod tests {
             kind: "handle".to_string(),
             value: "abc".to_string(),
         };
-        assert_eq!(
-            other.resumable_id(),
-            None,
+        assert!(
+            other.resumable().is_none(),
             "an unrecognised kind is not resumable either"
         );
         assert_eq!(other.kind(), "handle");
@@ -1128,14 +1232,18 @@ mod tests {
                 value: "/tmp/t.jsonl".to_string()
             }
         );
-        assert_eq!(session.resumable_id(), None, "a path is not a session id");
+        assert!(session.resumable().is_none(), "a path is not a session id");
         // The `agent` key is optional, and an id session parses without it.
         let v = socket_result(
             r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"kind":"id","value":"abc"}}}}"#,
         );
         let session = parse_pane_info(&v).unwrap().agent_session.unwrap();
-        assert_eq!(session.resumable_id().map(SessionId::as_str), Some("abc"));
+        assert_eq!(session.kind(), "id", "it is still parsed faithfully");
         assert_eq!(session.agent(), None);
+        assert!(
+            session.resumable().is_none(),
+            "an id herdr did not attribute to an agent is not safely resumable"
+        );
     }
 
     // `kind` and `value` are each independently required: a session missing
