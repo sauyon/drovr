@@ -647,7 +647,13 @@ fn cmd_serve(host: Option<String>, port: u16) {
             })
     });
     if let Err(e) = serve(&host, port) {
-        eprintln!("drovr: serve failed: {e}");
+        // A refused duplicate already reads as a full sentence naming the live
+        // server; "serve failed:" in front of it only buries the point.
+        if e.kind() == io::ErrorKind::AddrInUse {
+            eprintln!("drovr: {e}");
+        } else {
+            eprintln!("drovr: serve failed: {e}");
+        }
         process::exit(1);
     }
 }

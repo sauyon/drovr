@@ -16,7 +16,15 @@
 //! The server binds a fixed port (default 8791) and writes two global files in
 //! the drovr data dir:
 //!   * `server.addr` — the bound `host:port`
-//!   * `server.pid`  — the daemon pid
+//!   * `server.pid`  — the daemon pid, and the file the single-server lock is on
+//!
+//! Exactly one server may serve a data dir: [`serve`] takes an exclusive lock on
+//! `server.pid` for its lifetime ([`acquire_pid_lock`]) and a second invocation
+//! refuses instead of starting, since two servers would fight over these two files
+//! and each hold half the drivers. Before the lock it also asks `server.addr`
+//! whether a drovr server answers there ([`live_drovr_addr`]), which is what
+//! catches a server holding no lock at all — one from an older build, or one whose
+//! lock file was deleted underneath it.
 //!
 //! [`ensure_server`] reads `server.addr`; if it is missing or nothing is
 //! listening, it spawns `drovr serve` as a detached background daemon and waits
@@ -31,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -51,6 +60,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default port for the always-on server. (The default *host* lives in config
 /// as `serve_host`, resolved by `main::cmd_serve`.)
 pub const DEFAULT_PORT: u16 = 8791;
+
+/// How long one `/health` probe waits for an answer. Bounded so a wedged server
+/// cannot hang a start; [`HEALTH_ATTEMPTS`] is what covers a merely busy one.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many `/health` probes [`live_drovr_addr`] makes before calling the address
+/// dead. A server whose four workers are all mid-`git diff` can miss one.
+const HEALTH_ATTEMPTS: u32 = 3;
+
+/// What `GET /health` answers, and what a probe requires to believe the address
+/// belongs to drovr rather than to some other service on a recycled port.
+const HEALTH_BODY: &str = "drovr ok";
 
 /// Worker threads sharing the listening socket. `/review/diff` shells out to
 /// git, so a single thread would head-of-line-block browsing; a small pool
@@ -385,9 +406,12 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
         return;
     }
 
-    // GET /health — liveness probe for `ensure_server`.
+    // GET /health — liveness probe for `ensure_server`. The body names drovr so a
+    // probe can tell this server from any other service that answers 200 on a
+    // recycled address; `serve`'s duplicate check turns on exactly that (see
+    // [`live_drovr_addr`]).
     if method == Method::Get && path == "/health" {
-        respond_str(req, 200, "text/plain", "ok".into());
+        respond_str(req, 200, "text/plain", HEALTH_BODY.into());
         return;
     }
 
@@ -1026,8 +1050,16 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Start the always-on review server, serving every run under the drovr data
-/// dir. Writes `server.addr` and `server.pid` immediately after the socket
-/// opens, then blocks serving requests until the process exits.
+/// dir. Takes the `server.pid` lock, writes `server.addr` once the socket opens,
+/// then blocks serving requests until the process exits.
+///
+/// Refuses to start a *second* server for the same data dir: one server owns
+/// `server.addr` / `server.pid`, which is how every driver finds it, so a
+/// duplicate would silently steal discovery from the live one and leave two
+/// servers holding split in-memory run state. The lock (see [`acquire_pid_lock`])
+/// is the authority — it is held by the kernel and covers a duplicate on *any*
+/// port — with the health-checked address as a second line for a server that
+/// predates the lock.
 pub fn serve(host: &str, port: u16) -> io::Result<()> {
     let root = runs_dir();
     fs::create_dir_all(&root)?;
@@ -1041,8 +1073,25 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         let _ = fs::set_permissions(data_dir(), fs::Permissions::from_mode(0o700));
     }
 
+    // A server whose lock went missing is still a server — an older one that
+    // predates the lock, or a `server.pid` deleted by hand — so the address is
+    // checked too, and `/health` is what makes it trustworthy: an unrelated
+    // process squatting on a dead server's recorded address cannot answer it.
+    if let Some(found) = live_drovr_addr() {
+        return Err(duplicate_server_error(Some(found), lock_holder()));
+    }
+
+    // Single-writer for the discovery files: take the lock before touching the
+    // socket or rewriting `server.addr`, so a live server keeps serving untouched.
+    // Held until this function returns, which for a serving process means until it
+    // exits; the kernel drops it either way.
+    let _lock = acquire_pid_lock()?;
+
     let addr = format!("{host}:{port}");
-    let server = Server::http(&addr).map_err(|e| io::Error::other(e.to_string()))?;
+    // Losing the bind means something foreign holds the port (a duplicate drovr
+    // server was already turned away above); the error names which.
+    let server =
+        Server::http(&addr).map_err(|e| io::Error::other(format!("cannot bind {addr}: {e}")))?;
 
     let bound_addr = server
         .server_addr()
@@ -1050,7 +1099,6 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         .map(|a| a.to_string())
         .unwrap_or_else(|| addr.clone());
     fs::write(server_addr_file(), bound_addr.as_bytes())?;
-    fs::write(server_pid_file(), std::process::id().to_string().as_bytes())?;
 
     eprintln!("drovr review server listening on http://{bound_addr}");
     eprintln!("  runs: {root:?}");
@@ -1078,6 +1126,8 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     for h in handles {
         let _ = h.join();
     }
+    // `_lock` drops here (and on every error path above), so the next
+    // `drovr serve` can take it the moment this one stops serving.
     Ok(())
 }
 
@@ -1108,6 +1158,165 @@ pub fn ensure_server() -> io::Result<String> {
             ));
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Take the single-server lock, held for as long as the returned file lives.
+///
+/// The lock is an advisory exclusive lock on `server.pid`, not the pid inside it:
+/// the kernel holds it for this process and drops it however the process dies, so
+/// a crashed server never leaves a claim anyone has to judge stale, and nothing
+/// has to guess whether some pid is still a server. It is also the only check that
+/// catches a duplicate on an *arbitrary* port, where the OS bind would not
+/// serialize two starts at all.
+///
+/// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
+/// refusal message — never for the decision.
+fn acquire_pid_lock() -> io::Result<File> {
+    match try_take_lock(&server_pid_file())? {
+        Some(lock) => Ok(lock),
+        // Someone holds it: they are serving (or about to), so stand down. They may
+        // still be binding, so only quote an address a drovr server answers on.
+        None => Err(duplicate_server_error(live_drovr_addr(), lock_holder())),
+    }
+}
+
+/// Lock `path` and stamp this process's pid into it, or `Ok(None)` if another
+/// process holds it. Takes the path so it is testable without the data dir (and
+/// so without the process-global `XDG_DATA_HOME` other tests mutate).
+///
+/// The pid is written *after* the lock is taken, so for the moment between the two
+/// the file still names the previous holder — which is why the pid only ever
+/// informs the message, never a decision.
+fn try_take_lock(path: &Path) -> io::Result<Option<File>> {
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(e)) => return Err(e),
+    }
+
+    lock.set_len(0)?;
+    lock.write_all(std::process::id().to_string().as_bytes())?;
+    lock.flush()?;
+    Ok(Some(lock))
+}
+
+/// The pid recorded in `server.pid`, if it holds a readable one.
+fn lock_holder() -> Option<u32> {
+    fs::read_to_string(server_pid_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// How sure a `/health` answer makes us that the address belongs to drovr.
+#[derive(PartialEq)]
+enum Health {
+    /// The reply carried [`HEALTH_BODY`] — it is a drovr server, no question.
+    Drovr,
+    /// The reply was the bare `"ok"` a pre-lock drovr server answers, which other
+    /// services also say. Enough to refuse, not enough to be certain.
+    MaybeDrovr,
+}
+
+/// The refusal a second `drovr serve` exits with, naming the live server as
+/// precisely as it can be named.
+///
+/// Every part is conditional on what is actually known: a start that lost the lock
+/// race by microseconds sees a holder that has not bound yet (pid, no address), and
+/// a server predating the lock has an address with no trustworthy pid. A stale
+/// address is never quoted — it would send the human to the wrong page.
+///
+/// The way out is offered only for a [`Health::MaybeDrovr`] address with no pid —
+/// the one verdict that can be wrong about there being a server at all. Suggesting
+/// `server.addr` be deleted in any other case would be advice that *creates* the
+/// second server: a current server holding the lock through a deleted `server.pid`
+/// is caught by nothing else.
+fn duplicate_server_error(found: Option<(String, Health)>, pid: Option<u32>) -> io::Error {
+    let where_ = match &found {
+        Some((addr, _)) => format!(" on http://{}", display_addr(addr)),
+        None => String::new(),
+    };
+    let how = match (&found, pid) {
+        (_, Some(pid)) => format!(", or stop it with: kill {pid}"),
+        (Some((_, Health::MaybeDrovr)), None) => format!(
+            ". That address answers a bare `ok`, which a pre-lock drovr server and \
+             other services both do: if the page is not a drovr review server, delete \
+             {:?} and start again",
+            server_addr_file()
+        ),
+        _ => String::new(),
+    };
+    let who = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "a drovr review server is already running{where_}{who} — the server is global \
+             and serves every run, so use that one{how}"
+        ),
+    )
+}
+
+/// The address of a *drovr* server that is up right now, if there is one.
+///
+/// Stricter than [`live_server_addr`] in both directions: the reply must be a 200
+/// *and* carry a drovr `/health` body, so neither a foreign process holding the
+/// address of a long-dead server nor some unrelated service that answers 200 on
+/// every path reads as a live drovr server. Probed a few times, because the server
+/// this is looking for may be a busy one whose workers are mid-`git diff`.
+///
+/// The returned [`Health`] records which body answered, because the legacy one is
+/// ambiguous and only an ambiguous verdict may be offered a way out (see
+/// [`duplicate_server_error`]).
+fn live_drovr_addr() -> Option<(String, Health)> {
+    let addr = live_server_addr()?;
+    for attempt in 0..HEALTH_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(HEALTH_TIMEOUT / 2);
+        }
+        if let Some(health) = health_says_drovr(&addr) {
+            return Some((addr, health));
+        }
+    }
+    None
+}
+
+/// One `GET /health` against `addr`: is a drovr server answering there, and how
+/// certainly?
+///
+/// Both halves are bounded by [`HEALTH_TIMEOUT`]: `server.addr` can name a host
+/// that has gone away rather than gone down (a dropped tailnet peer), where an
+/// unbounded connect would hang the start for the OS's own TCP timeout.
+fn health_says_drovr(addr: &str) -> Option<Health> {
+    use std::net::ToSocketAddrs;
+    let sockaddr = addr.to_socket_addrs().ok().and_then(|mut a| a.next())?;
+    let mut stream = TcpStream::connect_timeout(&sockaddr, HEALTH_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(HEALTH_TIMEOUT)).ok()?;
+    stream
+        .write_all(format!("GET /health HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .ok()?;
+    let mut resp = String::new();
+    // A read timeout is a short read, not a failure: judge whatever arrived.
+    let _ = stream.read_to_string(&mut resp);
+    if !resp.lines().next().is_some_and(|l| l.contains(" 200")) {
+        return None;
+    }
+    match resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").trim() {
+        HEALTH_BODY => Some(Health::Drovr),
+        // `"ok"` is what a server built before `HEALTH_BODY` answers. Such a server
+        // holds no lock either, so this is the *only* thing that keeps it from being
+        // duplicated while the two builds coexist — worth the weaker signal.
+        "ok" => Some(Health::MaybeDrovr),
+        _ => None,
     }
 }
 
@@ -2180,13 +2389,63 @@ mod tests {
         );
     }
 
+    // -- the single-server lock ------------------------------------------------
+
+    /// Exclusivity *between processes* is what matters, and it is pinned by
+    /// `tests/serve_single.rs` (a second `drovr serve` is refused, and six racing
+    /// starts leave one server). Taking the same lock twice inside one process is
+    /// explicitly unspecified in std, so this covers the rest of the contract: the
+    /// pid lands in the file for humans, and dropping releases the claim.
+    ///
+    /// Deliberately path-based rather than data-dir based: nothing here touches
+    /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
+    /// that do — see "Test suite flakes under parallel `cargo test`" in
+    /// `docs/known-issues.md`.
+    #[test]
+    fn lock_records_our_pid_and_releases_on_drop() {
+        let tmp = make_root("lock-claim");
+        let path = tmp.path().join("server.pid");
+
+        let held = try_take_lock(&path).expect("claim").expect("uncontended");
+        assert_eq!(
+            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "the holder records its pid for humans to kill"
+        );
+
+        // Nothing has to prove the holder died for the lock to be free again.
+        drop(held);
+        let _held = try_take_lock(&path)
+            .expect("claim after release")
+            .expect("released lock must be free");
+    }
+
+    /// A server that was killed leaves the file behind with its pid in it. The
+    /// kernel released the lock when it died, so the file must not wedge a start.
+    #[test]
+    fn lock_ignores_a_stale_pid_in_the_file() {
+        let tmp = make_root("lock-stale");
+        let path = tmp.path().join("server.pid");
+        fs::write(&path, b"999999").expect("stale pid file");
+
+        let _held = try_take_lock(&path)
+            .expect("claim")
+            .expect("an unlocked file must be claimable");
+        assert_eq!(
+            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "claiming replaces the dead server's pid with ours"
+        );
+    }
+
     #[test]
     fn health_served() {
         let tmp = make_root("health");
         let addr = start_server(tmp.path().to_path_buf());
         let (status, body) = http_get(&addr, "/health");
         assert_eq!(status, 200);
-        assert_eq!(body.trim(), "ok");
+        // A probe uses this body to tell drovr from any other 200 on the address.
+        assert_eq!(body.trim(), HEALTH_BODY);
     }
 
     #[test]

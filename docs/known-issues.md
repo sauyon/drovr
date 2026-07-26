@@ -1030,3 +1030,47 @@ drovr phase wait <run> <phase> --timeout-ms 5000
   `skills/handoff/SKILL.md:55-56, 138`). Nothing compresses a transcript, so the
   over-weight-the-visible-briefing failure mode cannot recur. Do not re-file this against the
   handoff flow — a bad *self-authored* handoff is a different bug with a different cause.
+
+## Two `drovr serve` daemons can still slip past the single-server guard, in three narrow cases
+
+**Severity:** low (each case needs an unusual precondition; the ordinary duplicate — a second
+`drovr serve` on any port, or several racing at once — is refused, see
+`cli/tests/serve_single.rs`).
+**Found:** 2026-07-26, while adding the guard on `drovr/single-server`. The prompting incident:
+`~/.local/share/drovr/server.pid` named a **dead** pid (1662301) while a live server was serving
+on `100.71.58.39:8791` as pid 1289722 — i.e. two servers had run, and one had died, leaving
+discovery pointing at neither.
+
+### How the guard works
+
+`drovr serve` refuses to start when either signal says a server is already there
+(`cli/src/review.rs`):
+
+1. `server.addr` answers `GET /health` with drovr's own body — or with the legacy `"ok"` a
+   pre-guard server answers, which other services also say (`live_drovr_addr`, probed up to
+   3× because a busy server can miss one). When *this* is what refused a start, the error
+   names `server.addr` so a human who disagrees can delete it; or
+2. `server.pid` is locked (`acquire_pid_lock` → `File::try_lock`, i.e. `flock`). The kernel
+   holds that lock for the server's lifetime and releases it however the process dies, so a
+   crashed server never leaves a claim anyone has to judge stale.
+
+### The gaps
+
+- **The lock file is deleted while a server holds it.** `flock` is on the inode, not the path:
+  a later start creates a *new* inode at `server.pid` and locks that one happily. Only signal 1
+  then stands between it and a second server — so `rm server.pid` plus a server too busy to
+  answer `/health` three times = two servers. (The refusal message will not walk you into this:
+  it offers the delete-`server.addr` remedy only for an *ambiguous* address — one answering the
+  legacy `"ok"` — never for a server that identified itself as drovr.)
+- **A data dir on a filesystem where `flock` is not enforced** (some NFS mounts / `nolock`).
+  Signal 2 silently becomes advice; signal 1 still holds. drovr assumes a local data dir.
+- **The upgrade window.** A server built before this guard holds no lock at all and is caught
+  only by signal 1, which accepts its older `/health` body (`"ok"`) for exactly that reason.
+  Once every server is a new build, the lock is the authority.
+
+### Fix ideas
+
+- Re-check after taking the lock that the file we hold is still the one at the path (compare
+  inode) and refuse if it is not — closes the delete-while-held case in one direction.
+- Have `/health` answer from a per-server nonce that also appears in a discovery file, so a
+  probe can tell *which* server answered, not just that one did.
