@@ -755,10 +755,11 @@ pub enum PhaseWaitOutcome {
     /// (a `phase start`, minting a new token), so the pass this wait was watching
     /// no longer exists.
     ///
-    /// Detected at exactly two points, both by comparing the entry snapshot's pass
-    /// against a freshly loaded one: when a marker matching the OLD pass lands
-    /// (the rare ordering — the superseded agent signalled done), and when the
-    /// wait runs out of time (the common one — it signalled nothing). What is
+    /// Detected at exactly two points, both by classifying the entry snapshot's
+    /// pass against a freshly loaded one with [`PassDrift`] (a token that VANISHED
+    /// is not a re-entry and never lands here): when a marker matching the OLD pass
+    /// lands (the rare ordering — the superseded agent signalled done), and when
+    /// the wait runs out of time (the common one — it signalled nothing). What is
     /// deliberately NOT detected is a re-entry via `phase send`, which leaves the
     /// token unchanged and is therefore structurally invisible to a token
     /// comparison; task 1's handoff §5.1 routes that to task 6, together with the
@@ -832,6 +833,9 @@ pub fn phase_wait<H: Herdr>(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut mismatch_reported = false;
     let mut read_error_reported = false;
+    // Gated like the other two: the marker keeps matching, so this branch is
+    // re-entered on every poll until the deadline.
+    let mut token_lost_reported = false;
     loop {
         match std::fs::read_to_string(&marker) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
@@ -890,37 +894,59 @@ pub fn phase_wait<H: Herdr>(
                         ),
                     ));
                 };
-                if fresh.phases[i].pass != expected_pass {
-                    eprintln!(
-                        "drovr: phase '{phase}' was re-entered while this wait was running — \
-                         the completion it saw belongs to a superseded pass. Not marking done. \
-                         The phase is now running a newer pass; wait on THAT one."
-                    );
-                    // Adopt the fresh state, exactly as the `Done` path below does
-                    // and for the same reason: a caller that saves after waiting
-                    // (task 6 records a reap that way) would otherwise write this
-                    // waiter's hour-old snapshot back, restoring the superseded
-                    // pass token and undoing the re-entry that superseded it.
-                    // Nothing is written HERE — the re-entry already persisted
-                    // everything, and this wait has no verdict of its own to record.
-                    *run = fresh;
-                    return Ok(PhaseWaitOutcome::Superseded);
+                match PassDrift::between(fresh.phases[i].pass.as_ref(), expected_pass.as_ref()) {
+                    PassDrift::Superseded => {
+                        eprintln!(
+                            "drovr: phase '{phase}' was re-entered while this wait was running \
+                             (it was waiting on pass {was}, the phase is now on pass {now}) — the \
+                             completion it saw belongs to the superseded pass. Not marking done.",
+                            was = expected_pass.as_ref().map_or("<none>", |p| p.as_str()),
+                            now = fresh.phases[i].pass.as_ref().map_or("<none>", |p| p.as_str()),
+                        );
+                        // Adopt the fresh state, exactly as the `Done` path below
+                        // does and for the same reason: a caller that saves after
+                        // waiting (task 6 records a reap that way) would otherwise
+                        // write this waiter's hour-old snapshot back, restoring the
+                        // superseded pass token and undoing the re-entry that
+                        // superseded it. Nothing is written HERE — the re-entry
+                        // already persisted everything, and this wait has no verdict
+                        // of its own to record.
+                        *run = fresh;
+                        return Ok(PhaseWaitOutcome::Superseded);
+                    }
+                    // The token this waiter (and its live agent) hold has vanished
+                    // from disk. NOT a completion — the fresh state cannot account
+                    // for the token the marker carries — and NOT a supersession
+                    // either, so it must not be reported as one. Keep waiting: the
+                    // caller's snapshot still holds the token, which is what makes
+                    // the documented recovery possible.
+                    PassDrift::TokenLost => {
+                        if !token_lost_reported {
+                            token_lost_reported = true;
+                            eprintln!("{}", token_lost_message(phase, &run.name));
+                        }
+                    }
+                    PassDrift::Same => {
+                        // Commit onto the FRESHLY loaded state, not the snapshot
+                        // taken at entry: writing an hour-old whole-state copy back
+                        // would silently undo everything else that happened to the
+                        // run meanwhile.
+                        fresh.phases[i].status = PhaseStatus::Done;
+                        fresh.save()?;
+                        // Adopt the fresh state wholesale rather than patching one
+                        // field into the caller's stale snapshot. A caller that
+                        // saves after waiting (task 6 records the reap this way)
+                        // would otherwise write that snapshot back and undo exactly
+                        // what this block prevents.
+                        *run = fresh;
+                        // The marker is NOT removed. It is the durable evidence
+                        // that this pass finished, it makes a repeated wait
+                        // idempotent with no status short-circuit, and a later pass
+                        // cannot be fooled by it — that pass has a different token,
+                        // and both re-entry paths sweep it.
+                        return Ok(PhaseWaitOutcome::Done);
+                    }
                 }
-                // Commit onto the FRESHLY loaded state, not the snapshot taken at
-                // entry: writing an hour-old whole-state copy back would silently
-                // undo everything else that happened to the run meanwhile.
-                fresh.phases[i].status = PhaseStatus::Done;
-                fresh.save()?;
-                // Adopt the fresh state wholesale rather than patching one field
-                // into the caller's stale snapshot. A caller that saves after
-                // waiting (task 6 records the reap this way) would otherwise write
-                // that snapshot back and undo exactly what this block prevents.
-                *run = fresh;
-                // The marker is NOT removed. It is the durable evidence that this
-                // pass finished, it makes a repeated wait idempotent with no status
-                // short-circuit, and a later pass cannot be fooled by it — that pass
-                // has a different token, and both re-entry paths sweep it.
-                return Ok(PhaseWaitOutcome::Done);
             }
             // A marker from a DIFFERENT pass: the previous pass's agent is still
             // alive in the reused pane and signalled done again.
@@ -974,6 +1000,54 @@ pub fn phase_wait<H: Herdr>(
     }
 }
 
+/// What happened to a phase's pass token while a wait was running, compared
+/// against the token that wait snapshotted at entry.
+///
+/// The distinction that matters is between "a NEWER pass exists" and "the token
+/// went away". A bare `!=` conflates them, and the conflation is not theoretical:
+/// task 1's handoff §5.6 records that an older `drovr` on `PATH` drops the `pass`
+/// field on any save (serde omits what its struct does not know), taking a phase
+/// from `Some(x)` to `None` with no re-entry whatsoever. Reporting that as
+/// supersession tells the driver "nothing is wrong, re-run the wait" about a phase
+/// that will now hang forever — an untokened phase only accepts an EMPTY marker,
+/// and its live agent still stamps the token it was launched with. A misleading
+/// verdict is worse than the honest timeout it replaced.
+#[derive(Debug, PartialEq, Eq)]
+enum PassDrift {
+    /// Same pass. The wait is still watching the pass it started on.
+    Same,
+    /// A NEWER pass exists: either a different token, or a token where this wait
+    /// snapshotted none (`phase_start` always mints `Some`, so a legacy phase
+    /// acquiring a token is a genuine re-entry by a token-minting build).
+    Superseded,
+    /// The token this wait holds has VANISHED from disk. Not a re-entry —
+    /// corruption or a lossy writer. Stays a timeout, loudly.
+    TokenLost,
+}
+
+impl PassDrift {
+    fn between(fresh: Option<&PassToken>, expected: Option<&PassToken>) -> PassDrift {
+        match (fresh, expected) {
+            (None, Some(_)) => PassDrift::TokenLost,
+            (Some(now), Some(was)) if now != was => PassDrift::Superseded,
+            (Some(_), None) => PassDrift::Superseded,
+            _ => PassDrift::Same,
+        }
+    }
+}
+
+/// The diagnostic for [`PassDrift::TokenLost`]. Names the recovery, because this
+/// state does not heal on its own: every later wait sees the same thing.
+fn token_lost_message(phase: &str, run_name: &str) -> String {
+    format!(
+        "drovr: phase '{phase}' has lost its pass token from {run_name}'s state.json while this \
+         wait was running — the phase now records NO token, but its agent still holds one, so no \
+         marker it writes can be accepted. This is not a re-entry (a re-entry mints a token, it \
+         does not remove one); the usual cause is an older drovr binary re-saving the run. \
+         Recover by re-entering the phase deliberately: drovr phase start {run_name} {phase}"
+    )
+}
+
 /// Classify a wait that ran out of time: did it time out, or was it SUPERSEDED
 /// while it ran?
 ///
@@ -1009,15 +1083,27 @@ fn timed_out_or_superseded(
     let Some(i) = fresh.phases.iter().position(|p| p.name == phase) else {
         return PhaseWaitOutcome::TimedOut;
     };
-    if fresh.phases[i].pass.as_ref() == expected {
-        return PhaseWaitOutcome::TimedOut;
+    match PassDrift::between(fresh.phases[i].pass.as_ref(), expected) {
+        PassDrift::Same => PhaseWaitOutcome::TimedOut,
+        // A vanished token is not a re-entry, so it must not be reported as one —
+        // see [`PassDrift`]. Reported here because a timeout is otherwise the one
+        // outcome that explains nothing, and this state repeats on every wait.
+        PassDrift::TokenLost => {
+            eprintln!("{}", token_lost_message(phase, &run.name));
+            PhaseWaitOutcome::TimedOut
+        }
+        PassDrift::Superseded => {
+            eprintln!(
+                "drovr: phase '{phase}' was re-entered while this wait was running (it was \
+                 waiting on pass {was}, the phase is now on pass {now}) — the pass it was \
+                 watching is gone.",
+                was = expected.map_or("<none>", |p| p.as_str()),
+                now = fresh.phases[i].pass.as_ref().map_or("<none>", |p| p.as_str()),
+            );
+            *run = fresh;
+            PhaseWaitOutcome::Superseded
+        }
     }
-    eprintln!(
-        "drovr: phase '{phase}' was re-entered while this wait was running — the pass it was \
-         waiting on no longer exists. This is not a stuck agent."
-    );
-    *run = fresh;
-    PhaseWaitOutcome::Superseded
 }
 
 // ---------------------------------------------------------------------------
@@ -2602,6 +2688,111 @@ mod tests {
         );
         // Same no-clobber requirement as the marker path.
         assert_eq!(run.phases[0].pass, Some(pass_b));
+    }
+
+    #[test]
+    fn pass_drift_separates_a_newer_pass_from_a_lost_token() {
+        let a = PassToken::new("a".into());
+        let b = PassToken::new("b".into());
+        // The same pass, tokened or legacy.
+        assert_eq!(PassDrift::between(Some(&a), Some(&a)), PassDrift::Same);
+        assert_eq!(PassDrift::between(None, None), PassDrift::Same);
+        // A different token is a re-entry.
+        assert_eq!(PassDrift::between(Some(&b), Some(&a)), PassDrift::Superseded);
+        // A LEGACY phase that has since acquired a token: `phase_start` is the only
+        // thing that mints one, so this is a re-entry by a token-minting build —
+        // the mixed-era case, and the reason this arm is not folded into `Same`.
+        assert_eq!(PassDrift::between(Some(&a), None), PassDrift::Superseded);
+        // The one direction that is NOT a re-entry: nothing mints `None`.
+        assert_eq!(PassDrift::between(None, Some(&a)), PassDrift::TokenLost);
+    }
+
+    #[test]
+    fn a_dropped_pass_token_is_not_a_supersession() {
+        // The false positive a self-review caught. Task 1's handoff §5.6: an OLDER
+        // drovr on `PATH` does not know the `pass` field, so any save it performs
+        // silently drops it — `Some(x)` → `None` on disk with NO re-entry. A bare
+        // `!=` reads that as supersession and tells the driver "nothing is wrong,
+        // re-run the wait", which then hangs forever (an untokened phase only
+        // accepts an EMPTY marker, and the live agent still stamps its token).
+        //
+        // Supersession means a NEWER pass exists. `phase_start` always mints
+        // `Some`, so a token that VANISHED is corruption, not a re-entry, and it
+        // must stay a timeout — the loud, diagnosable outcome — never "all is well".
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("dropped-token-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass_a = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
+
+        // An older binary re-saves the run, dropping the field it cannot see.
+        let mut older = RunState::load("dropped-token-test").unwrap();
+        older.phases[0].pass = None;
+        older.save().unwrap();
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "a token that vanished is corruption, not another pass taking over"
+        );
+        // And the caller must NOT adopt the corrupted state: its snapshot still
+        // holds the token, which is what makes recovery possible at all.
+        assert_eq!(run.phases[0].pass, Some(pass_a.clone()));
+
+        // Same on the marker path: the live agent's own marker lands, matching the
+        // token this waiter holds, while the phase on disk has lost it. Not Done
+        // (the fresh state cannot account for the token), and not Superseded.
+        agent_signals_done(&run, "plan", &pass_a);
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "a matching marker against a phase whose token vanished is not a completion"
+        );
+    }
+
+    #[test]
+    fn a_timeout_that_cannot_re_read_state_stays_a_timeout() {
+        // The deadline check fails OPEN, the opposite of the marker path's guard,
+        // and that asymmetry is deliberate: there the question is "may I report a
+        // completion I cannot verify" (no), here the conservative answer already IS
+        // `TimedOut`. If someone later "aligns" this with the fail-closed guard,
+        // an unreadable state file turns an honest timeout into exit 1 — which the
+        // handoff skill documents as STOP — and breaks the re-arm loop.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("timeout-unreadable-state-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        std::fs::write(run_dir(&run.name).join("state.json"), b"{ not json").unwrap();
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "an unverifiable timeout is still a timeout, never an error"
+        );
+    }
+
+    #[test]
+    fn a_timeout_whose_phase_vanished_stays_a_timeout() {
+        // Mirror image of `phase_wait_fails_closed_when_the_phase_vanishes_from
+        // _fresh_state`, with the opposite (open) failure mode for the same reason:
+        // a vanished phase is not evidence of a re-entry, and nothing is being
+        // reported complete here.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("timeout-vanished-phase-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let mut clobbered = RunState::load("timeout-vanished-phase-test").unwrap();
+        clobbered.phases.clear();
+        clobbered.save().unwrap();
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::TimedOut
+        );
     }
 
     #[test]
