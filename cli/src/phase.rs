@@ -551,9 +551,15 @@ pub fn phase_send<H: Herdr>(h: &H, run: &mut RunState, phase: &str, text: &str) 
 ///
 /// Reviewer phases no-op here: they live in `review_phases`, `find_phase_idx`
 /// searches `phases` only, and `phase_wait` never runs on them.
-fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<()> {
+///
+/// Returns whether it ACTED. `false` is the reviewer no-op above, and the caller
+/// needs it: `phase_send` reports what a failed delivery left behind, and a
+/// reviewer phase was left exactly as it was — marker intact, status untouched.
+/// Claiming otherwise would tell a human their completed reviewer had been
+/// reset.
+fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<bool> {
     let Some(i) = find_phase_idx(run, phase) else {
-        return Ok(());
+        return Ok(false);
     };
     // ORDER MATTERS, and it is the OPPOSITE of `phase_start`'s — because here the
     // token does NOT change. The same agent serves both passes, so the marker is
@@ -571,7 +577,8 @@ fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<()> {
     if run.phases[i].status != PhaseStatus::Running {
         run.phases[i].status = PhaseStatus::Running;
     }
-    run.save()
+    run.save()?;
+    Ok(true)
 }
 
 /// [`phase_send`] with an injectable readiness timeout + poll interval (so tests
@@ -611,22 +618,34 @@ fn phase_send_with_timeout<H: Herdr>(
     // sweeping before the readiness gate would destroy the record of a genuine
     // completion on every failed send (a phase parked on a permission prompt
     // would lose its `Done` and its marker without any new work being requested).
-    reopen_for_re_entry(run, phase)?;
-    // The re-open already happened, so a send failure is NOT "nothing happened":
-    // the previous pass's completion marker has been deleted and the status is
-    // back to `Running`. A caller told only "agent_send failed" will read that
-    // phase as work in progress forever — the phantom-incomplete-phase state.
-    // Say what was left behind, and name the way out (re-send; the re-open is
-    // idempotent).
+    let reopened = reopen_for_re_entry(run, phase)?;
+    // When the re-open ACTED, a send failure is NOT "nothing happened": the
+    // previous pass's completion marker has been deleted and the status is back
+    // to `Running`. A caller told only "agent_send failed" will read that phase
+    // as work in progress forever — the phantom-incomplete-phase state. Say what
+    // was left behind, and name the way out (re-send; the re-open is idempotent).
+    //
+    // When it did NOT act — a reviewer phase, which lives in `review_phases` —
+    // nothing was touched and the message must not say otherwise. A reviewer that
+    // has finished and exited is precisely the pane whose `agent_send` fails, and
+    // its marker is intact: telling its human that it had been reset would be a
+    // false report about a phase that is correctly complete.
     h.agent_send(&pane_id, text).map_err(|e| {
+        let aftermath = if reopened {
+            "but this phase had ALREADY been re-opened for it — its completion marker is \
+             deleted and its status is back to Running, so it now looks like work in progress \
+             that nobody was asked to do. Re-send once the pane is reachable (re-opening again \
+             is harmless), or mark the phase failed."
+        } else {
+            "nothing was changed — this phase is not one `phase send` re-opens, so its status \
+             and any completion it already recorded are untouched. Re-send once the pane is \
+             reachable."
+        };
         io::Error::new(
             e.kind(),
             format!(
                 "phase '{phase}' of run '{run_name}': the prompt could not be delivered ({e}), \
-                 but this phase had ALREADY been re-opened for it — its completion marker is \
-                 deleted and its status is back to Running, so it now looks like work in \
-                 progress that nobody was asked to do. Re-send once the pane is reachable \
-                 (re-opening again is harmless), or mark the phase failed.",
+                 {aftermath}",
                 run_name = run.name,
             ),
         )
@@ -3841,8 +3860,8 @@ mod tests {
         ] {
             assert!(
                 require_phase_name(bad).is_err(),
-                "a phase name a shell would not read as one literal word must be \
-                 rejected at the boundary: {bad:?}"
+                "a phase name a shell would not read as one literal word must not \
+                 be CREATED: {bad:?}"
             );
         }
     }
@@ -4011,6 +4030,69 @@ mod tests {
             err.contains("plan") && err.contains("send-fail-test"),
             "and name the phase it applies to: {err}"
         );
+    }
+
+    #[test]
+    fn a_failed_send_to_a_reviewer_phase_claims_no_re_open() {
+        // `reopen_for_re_entry` searches `phases` only, so it NO-OPS for a phase
+        // that lives in `review_phases` — while `require_pane_id` resolves both,
+        // so `phase_send` reaches a reviewer pane happily. A reviewer that has
+        // finished and exited is exactly the pane whose `agent_send` fails, and
+        // its `.done` marker is intact. Claiming "your marker is deleted and the
+        // status is back to Running" there is a false diagnostic about a phase
+        // that is genuinely, correctly complete.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-fail-reviewer-test");
+        run.review_phases.push(Phase {
+            name: "review:t:1:correctness".into(),
+            status: PhaseStatus::Done,
+            pane_id: Some("p9".into()),
+            ..Default::default()
+        });
+        run.save().unwrap();
+        // A reviewer's marker, written by the reviewer itself before it exited.
+        let marker = done_marker(&run.name, "review:t:1:correctness");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+
+        h.fail_agent_send();
+        let err = phase_send(&h, &mut run, "review:t:1:correctness", "next")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            marker.exists(),
+            "precondition: a reviewer phase is not re-opened, so its marker survives"
+        );
+        assert!(
+            !err.contains("completion marker"),
+            "the message must not claim a re-open that did not happen: {err}"
+        );
+        assert!(
+            err.contains("review:t:1:correctness"),
+            "it must still name the phase and the transport failure: {err}"
+        );
+    }
+
+    #[test]
+    fn a_marker_mismatch_on_an_untokened_phase_says_to_drop_the_token() {
+        // The `expected: None` arm. Before `phase_done_command` existed, this
+        // path emitted the literal `DROVR_PASS=<none> drovr phase done …` — a
+        // command that sets the variable to the string "<none>" and fails the
+        // same way again. The remedy for a phase with no token is to DROP the one
+        // being held, never to supply a fabricated one.
+        let msg = marker_mismatch_message("plan", "r; id", "tok-from-elsewhere", None);
+        assert!(
+            msg.contains("env -u DROVR_PASS drovr phase done 'r; id' 'plan'"),
+            "an untokened phase's remedy drops the token: {msg}"
+        );
+        assert!(
+            !msg.contains("DROVR_PASS=<none>"),
+            "never suggest setting the token to a placeholder: {msg}"
+        );
+        // The evidence half is unchanged: both tokens are still named.
+        assert!(msg.contains("tok-from-elsewhere") && msg.contains("<none>"));
     }
 
     #[test]
