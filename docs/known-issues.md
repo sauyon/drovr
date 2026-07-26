@@ -927,6 +927,105 @@ monitor as evidence of progress.** Silence is consistent with "working", "never 
    measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
    it gave up".
 
+## A finished phase reports `running` forever unless the driver happens to run `phase wait`
+
+**Severity:** high — every read-only view of the run lies about its state, and `drovr status`
+actively instructs you to resume a phase that already finished.
+**Found:** 2026-07-26, run `skill-stickiness`.
+
+### Symptom
+
+The phase agent ran `drovr phase done <run> brainstorm` successfully. The marker
+`~/.local/share/drovr/runs/<run>/brainstorm.done` exists. And yet:
+
+```
+$ drovr status skill-stickiness
+  [ 0] brainstorm      running <-- resume
+  [ 1] plan            pending
+resume at phase 0: brainstorm
+```
+
+The phase had been complete for some time. `drovr list` and the review web UI agree with
+`status`, because they read the same field. There is no indication anywhere that the run is
+ready to advance — and the one line that looks like guidance (`resume at phase 0`) is wrong.
+
+### Root cause
+
+`phase done` deliberately writes only a marker file and never mutates `state.json` — by design,
+so the orchestrator stays the sole writer of run state (`cli/src/phase.rs:377-382`). The
+reconciliation from marker to `PhaseStatus::Done` happens in exactly **one** place:
+
+```rust
+// cli/src/phase.rs:466-471  — inside phase_wait's poll loop
+if marker.exists() {
+    run.phases[idx].status = PhaseStatus::Done;
+    run.save()?;
+    return Ok(PhaseWaitOutcome::Done);
+}
+```
+
+So `state.json` only catches up **if the driver runs `drovr phase wait` for that phase**. Any
+path that skips it strands the run:
+
+- the driver drove the phase by hand (as here — the spec gate was managed directly, and the
+  brainstorm phase never got a `phase wait`);
+- the driver's context was compacted or its session ended, and the resumed driver did not know
+  a wait was owed;
+- the wait was run, returned `Blocked` or `TimedOut`, and was never re-run.
+
+Everything downstream reads the stale field: `cmd_status` (`cli/src/main.rs:436-454`) prints
+`p.status` verbatim and derives `<-- resume` from `first_incomplete()` (`cli/src/run.rs:144`),
+which is itself `status`-based. `review.rs:715`'s `status_str` feeds the web UI the same value.
+None of them consult the marker that is sitting right next to `state.json` in the same
+directory.
+
+The failure is silent and stable: nothing times out, nothing errors, and the run simply never
+advances.
+
+### Consequence for orchestration
+
+**Do not write a watch keyed on `state.json` phase status.** It is a field only the driver can
+change, so a driver waiting on it is waiting on itself — the watch can never fire. This cost a
+long stall in the run where it was found: a monitor polled `phases[0].status` while the phase
+had already dropped its marker.
+
+The completion signal is the marker file, and only the marker file:
+
+```sh
+ls ~/.local/share/drovr/runs/<run>/<phase>.done
+```
+
+### Workaround
+
+Check the markers, not the status, whenever you need ground truth:
+
+```sh
+ls ~/.local/share/drovr/runs/<run>/*.done
+```
+
+To repair a stranded `state.json`, run the wait that was skipped — it reconciles immediately
+and returns, because the marker is already there:
+
+```sh
+drovr phase wait <run> <phase> --timeout-ms 5000
+```
+
+### Fix ideas
+
+1. **Make the read-only views marker-aware.** `cmd_status`, `drovr list` and `status_str`
+   should treat "marker present" as done regardless of `state.json`, so a stranded run is at
+   worst a cosmetic lag and never a wrong instruction. This is the cheap fix and it removes the
+   misleading `<-- resume`.
+2. **Reconcile on load.** Have `load_run` (or `RunState::first_incomplete`) sweep for `.done`
+   markers and promote statuses, so any command touching the run heals it. Keeps the
+   sole-writer intent — the reconciliation still happens in drovr, not in the agent.
+3. **Surface the discrepancy loudly** if 1 and 2 are both rejected: `drovr status` should print
+   something like `marker present, state not reconciled — run: drovr phase wait <run> <phase>`
+   rather than silently reporting `running`.
+4. **Document the invariant** in `drovr:pipeline`: every phase needs its `phase wait`, including
+   ones whose completion the driver observed by other means. The skill's flow implies this but
+   never says that skipping the wait corrupts run state.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**
