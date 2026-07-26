@@ -947,22 +947,22 @@ pub fn phase_wait<H: Herdr>(
                         return Ok(PhaseWaitOutcome::Done);
                     }
                 }
-            }
-            // A marker from a DIFFERENT pass: the previous pass's agent is still
-            // alive in the reused pane and signalled done again.
-            //
-            // IGNORE it — do NOT delete it. A `phase wait` left over from an
-            // earlier pass holds that pass's token in memory and never re-reads
-            // state.json; if mismatches were unlinked, that stale waiter would
-            // delete the CURRENT pass's marker the moment it landed, and the real
-            // waiter would then time out on a phase that actually completed. The
-            // current agent's own marker overwrites this path when it lands, and
-            // both re-entry paths sweep it, so ignoring is sufficient.
-            //
-            // Announce it once: a silently-rejected marker is indistinguishable
-            // from "the agent never finished", and this is the one signal that
-            // tells a human the token transport (or a stale agent) is the problem.
-            if !mismatch_reported {
+            } else {
+                // A marker from a DIFFERENT pass: the previous pass's agent is still
+                // alive in the reused pane and signalled done again.
+                //
+                // IGNORE it — do NOT delete it. A `phase wait` left over from an
+                // earlier pass holds that pass's token in memory and never re-reads
+                // state.json; if mismatches were unlinked, that stale waiter would
+                // delete the CURRENT pass's marker the moment it landed, and the real
+                // waiter would then time out on a phase that actually completed. The
+                // current agent's own marker overwrites this path when it lands, and
+                // both re-entry paths sweep it, so ignoring is sufficient.
+                //
+                // Announce it once: a silently-rejected marker is indistinguishable
+                // from "the agent never finished", and this is the one signal that
+                // tells a human the token transport (or a stale agent) is the problem.
+                if !mismatch_reported {
                     mismatch_reported = true;
                     eprintln!(
                         "drovr: phase '{phase}' has a completion marker from a different pass \
@@ -974,6 +974,7 @@ pub fn phase_wait<H: Herdr>(
                         run_name = run.name,
                     );
                 }
+            }
             }
         }
         // Proactively catch a blocked pane so the driver is signalled immediately
