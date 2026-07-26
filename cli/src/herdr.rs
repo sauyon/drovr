@@ -454,11 +454,22 @@ impl SystemHerdr {
 
         let value: Value = serde_json::from_str(response.trim())?;
         if let Some(err) = value.get("error") {
+            // A JSON-RPC error body carries a machine-readable `code` next to the
+            // human `message` (both `required` per `herdr api schema --json`).
+            // Classify on the code rather than returning `Other` for every
+            // application-level failure: the transport kinds (connection refused,
+            // read timeout) already propagate from `?` above, and a caller that
+            // cannot tell "no such tab" from "socket down" has to match on prose.
+            // Reaping is best-effort and needs exactly that distinction.
             let msg = err
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown herdr error");
-            return Err(io::Error::other(msg.to_string()));
+            let code = err.get("code").and_then(Value::as_str);
+            return Err(io::Error::new(
+                herdr_error_kind(code, msg),
+                herdr_error_message(code, msg),
+            ));
         }
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -764,6 +775,59 @@ fn pane_get_error_message(pane_id: &str, err: &str) -> String {
          their timeouts with no other explanation. (A pane that has been closed \
          reports this too.)"
     )
+}
+
+/// Classify a herdr JSON-RPC error body into an [`io::ErrorKind`] a caller can
+/// `match` on.
+///
+/// The kind, not the message, is the interface: reaping is best-effort and wants
+/// to IGNORE a tab that is already gone (`NotFound`) while still reporting a
+/// socket that is down, and `tab_close` preserves this kind through its own
+/// `map_err` for exactly that reason. Without it every application-level failure
+/// arrives as `ErrorKind::Other` and the only way to discriminate is parsing
+/// herdr's prose — an invariant living in string literals instead of the type.
+///
+/// * `*_not_found` → `NotFound`. Matched by SUFFIX (`pane_not_found`,
+///   `tab_not_found`, and any `workspace_not_found`/`agent_not_found` a later
+///   herdr grows) so the mapping does not need a drovr release per code.
+/// * `invalid_request` → `InvalidInput`. That is drovr calling herdr wrongly — a
+///   bad params key or an unknown method — never a transient condition.
+/// * anything else → `Other`. Deliberately NOT guessed at from the message: an
+///   unmapped code is an unknown condition, and claiming a kind for it would let a
+///   caller silently swallow a failure it has never seen. The code is preserved in
+///   the message (see [`herdr_error_message`]) so a human can still act on it.
+///
+/// The message is consulted ONLY when the code is absent or empty — defence
+/// against a future herdr that stops sending it, since the alternative is the call
+/// sites string-matching instead.
+fn herdr_error_kind(code: Option<&str>, message: &str) -> io::ErrorKind {
+    match code.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) if code.ends_with("not_found") => io::ErrorKind::NotFound,
+        Some("invalid_request") => io::ErrorKind::InvalidInput,
+        Some(_) => io::ErrorKind::Other,
+        None => {
+            let msg = message.to_ascii_lowercase();
+            if msg.contains("not found") || msg.contains("no such") {
+                io::ErrorKind::NotFound
+            } else {
+                io::ErrorKind::Other
+            }
+        }
+    }
+}
+
+/// herdr's own error text, with its machine code appended when there is one.
+///
+/// The message stays FIRST and verbatim: `pane_get_error_message` and
+/// `tab_close_error_message` embed it, and it is what a human reads. The code is
+/// appended rather than substituted because [`herdr_error_kind`] deliberately
+/// leaves unmapped codes as `Other` — the code in the text is then the only clue
+/// to what herdr actually refused.
+fn herdr_error_message(code: Option<&str>, message: &str) -> String {
+    match code.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) => format!("{message} (herdr error code: {code})"),
+        None => message.to_string(),
+    }
 }
 
 /// The error a failed `tab.close` carries. Reaping treats a close as
@@ -1251,6 +1315,76 @@ mod tests {
         assert!(msg.contains("wAF:t1"), "msg: {msg}");
         assert!(msg.contains("no such tab"), "msg: {msg}");
         assert!(msg.contains("tab.close"), "msg: {msg}");
+    }
+
+    // herdr's JSON-RPC error body carries a machine-readable `code` alongside the
+    // human `message` (both `required` in `herdr api schema --json`). Flattening
+    // every application-level failure to `ErrorKind::Other` throws that away and
+    // leaves callers matching on prose — which is exactly what task 6 must not do:
+    // reaping is best-effort and specifically wants to IGNORE a tab that is
+    // already gone while still reporting a socket that is down.
+    #[test]
+    fn a_not_found_code_becomes_a_matchable_error_kind() {
+        // Probed against the live 0.7.5 daemon, not guessed: `tab.close` on an
+        // unknown tab answers `{"code":"tab_not_found", …}` and `pane.get` on an
+        // unknown pane answers `{"code":"pane_not_found", …}`.
+        assert_eq!(
+            herdr_error_kind(Some("tab_not_found"), "tab wAF:t9 not found"),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            herdr_error_kind(Some("pane_not_found"), "pane wAF:p9 not found"),
+            io::ErrorKind::NotFound
+        );
+        // Matched by SUFFIX, so a herdr that grows `workspace_not_found` or
+        // `agent_not_found` classifies without a drovr release.
+        assert_eq!(
+            herdr_error_kind(Some("workspace_not_found"), "workspace wAF not found"),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn a_malformed_call_is_invalid_input_and_anything_else_stays_other() {
+        // `invalid_request` is drovr's own bug (a bad params key, an unknown
+        // method) — never a transient condition to retry or ignore.
+        assert_eq!(
+            herdr_error_kind(Some("invalid_request"), "invalid request: missing field `tab_id`"),
+            io::ErrorKind::InvalidInput
+        );
+        // An unmapped code must NOT be guessed at from its message: `Other` is the
+        // honest answer, and the message still carries the code for a human.
+        assert_eq!(
+            herdr_error_kind(Some("agent_busy"), "agent is busy"),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn a_code_less_error_falls_back_to_the_message() {
+        // Defence against a herdr that stops sending `code` (it is `required`
+        // today): a "not found" phrasing is still worth classifying, because the
+        // alternative is task 6 string-matching it at the call site instead.
+        assert_eq!(
+            herdr_error_kind(None, "tab wAF:t9 not found"),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            herdr_error_kind(None, "connection reset"),
+            io::ErrorKind::Other
+        );
+        assert_eq!(herdr_error_kind(Some(""), "no such pane"), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_error_message_keeps_herdrs_own_text_and_names_the_code() {
+        // `pane_get_error_message` / `tab_close_error_message` echo this verbatim,
+        // and it is the only clue a human gets for an unmapped code.
+        let msg = herdr_error_message(Some("tab_not_found"), "tab wAF:t9 not found");
+        assert!(msg.starts_with("tab wAF:t9 not found"), "msg: {msg}");
+        assert!(msg.contains("tab_not_found"), "msg: {msg}");
+        // No code, nothing to append.
+        assert_eq!(herdr_error_message(None, "connection reset"), "connection reset");
     }
 
     #[test]
