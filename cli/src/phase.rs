@@ -995,7 +995,12 @@ pub fn phase_wait<H: Herdr>(
             // superseded agent never signalled anything, so this waiter simply
             // sits there and used to report a plain timeout for a phase that is
             // healthy under a newer pass. One state read, once, at the end.
-            return Ok(timed_out_or_superseded(run, phase, expected_pass.as_ref()));
+            return Ok(timed_out_or_superseded(
+                run,
+                phase,
+                expected_pass.as_ref(),
+                token_lost_reported,
+            ));
         }
         thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
@@ -1061,10 +1066,15 @@ fn token_lost_message(phase: &str, run_name: &str) -> String {
 /// Adopts the fresh state on the superseded path for the same reason the `Done`
 /// path does: the caller may save after waiting, and this waiter's snapshot still
 /// names the pass that no longer exists.
+///
+/// `token_lost_reported` carries the loop's gate in, so a wait that already
+/// explained a vanished token mid-poll does not repeat itself at the deadline:
+/// one message per event, like every other diagnostic here.
 fn timed_out_or_superseded(
     run: &mut RunState,
     phase: &str,
     expected: Option<&PassToken>,
+    token_lost_reported: bool,
 ) -> PhaseWaitOutcome {
     let fresh = match RunState::load(&run.name) {
         Ok(fresh) => fresh,
@@ -1090,7 +1100,9 @@ fn timed_out_or_superseded(
         // see [`PassDrift`]. Reported here because a timeout is otherwise the one
         // outcome that explains nothing, and this state repeats on every wait.
         PassDrift::TokenLost => {
-            eprintln!("{}", token_lost_message(phase, &run.name));
+            if !token_lost_reported {
+                eprintln!("{}", token_lost_message(phase, &run.name));
+            }
             PhaseWaitOutcome::TimedOut
         }
         PassDrift::Superseded => {
