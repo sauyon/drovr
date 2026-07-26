@@ -632,18 +632,47 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     let token = token.trim().trim_matches('\'');
     // A marker this process cannot have matched to the running pass must not be
     // written with an exit 0: that tells the AGENT it finished while the driver
-    // silently waits out a full timeout. Two cases, same remedy —
-    //   * no $DROVR_PASS at all (run from outside the pane, or a pre-token build);
-    //   * a token that is not the one currently recorded, which is the routine
-    //     case this whole mechanism exists for: `phase_start` re-entered the phase
-    //     while THIS agent, holding the old token, was still alive.
-    if let Some(want) = run.find_phase(phase).and_then(|p| p.pass.as_ref())
-        && !want.matches_marker(token)
-    {
-        let held = if token.is_empty() {
-            format!("${PASS_ENV} is not set")
-        } else {
-            format!("${PASS_ENV} is '{token}', but this phase is now running pass '{want}'")
+    // silently waits out a full timeout. The check is exactly the rule
+    // [`marker_completes_pass`] enforces on READ, applied to the token about to be
+    // written — write-side and read-side must not be able to drift apart, because
+    // any gap between them is a marker on disk that no wait will ever accept.
+    // Three cases:
+    //   * a tokened phase, no $DROVR_PASS at all (run from outside the pane, or a
+    //     pre-token build);
+    //   * a tokened phase, a token that is not the one currently recorded — the
+    //     routine case this whole mechanism exists for: `phase_start` re-entered
+    //     the phase while THIS agent, holding the old token, was still alive;
+    //   * an UNTOKENED phase and a token in hand. The mixed-era case: the phase was
+    //     started by a build that mints no tokens, while this shell exports a
+    //     $DROVR_PASS from somewhere else. A tokened marker against an untokened
+    //     phase is an inconsistency the read side rejects outright, so writing one
+    //     is a guaranteed hang.
+    let expected = run.find_phase(phase).and_then(|p| p.pass.as_ref());
+    if !marker_completes_pass(token, expected) {
+        // The remedy differs per case, and it is the whole value of the message:
+        // for a tokened phase the way out is to SUPPLY the right token; for an
+        // untokened one it is to DROP the one being held (no token exists to
+        // supply, and inventing one would just fail the read side differently).
+        let (held, remedy) = match expected {
+            Some(want) if token.is_empty() => (
+                format!("${PASS_ENV} is not set"),
+                format!("{PASS_ENV}={want} drovr phase done {} {phase}", run.name),
+            ),
+            Some(want) => (
+                format!("${PASS_ENV} is '{token}', but this phase is now running pass '{want}'"),
+                format!("{PASS_ENV}={want} drovr phase done {} {phase}", run.name),
+            ),
+            None => (
+                format!(
+                    "${PASS_ENV} is '{token}', but this phase has no pass token at all — it was \
+                     started by a drovr build that does not mint them, so a tokened marker \
+                     against it is an inconsistency `phase wait` refuses"
+                ),
+                format!(
+                    "env -u {PASS_ENV} drovr phase done {} {phase}",
+                    run.name
+                ),
+            ),
         };
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -652,9 +681,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                  matched to the running pass. `drovr phase done` is meant to be run BY the \
                  phase agent, from inside its own pane. If this phase was restarted, the \
                  agent that should signal it is the one started most recently. To complete \
-                 it deliberately, pass the pass token explicitly:\n    \
-                 {PASS_ENV}={want} drovr phase done {run_name} {phase}",
-                run_name = run.name,
+                 it deliberately:\n    {remedy}",
             ),
         ));
     }
@@ -2721,6 +2748,51 @@ mod tests {
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
         );
+    }
+
+    #[test]
+    fn phase_done_refuses_to_stamp_a_token_onto_an_untokened_phase() {
+        // The write-side mirror of `legacy_phase_completes_only_on_an_untokenized_
+        // marker`. That rule is enforced on READ; without the same check on WRITE,
+        // `phase done` exits 0 having created disk state `phase_wait` will never
+        // accept, and the driver waits out a full timeout on a phase whose agent
+        // was told it finished.
+        //
+        // This is the live mixed-era case, not a hypothetical: the installed drovr
+        // mints no tokens (every phase records `pass: None`) while a rebuilt binary
+        // in the same shell exports $DROVR_PASS — so an agent can hold a token its
+        // phase does not have.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("untokened-write-test");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p1".into()),
+            ..Default::default()
+        });
+        assert!(run.phases[0].pass.is_none());
+        run.save().unwrap();
+        write_handoff(&run, "plan");
+
+        unsafe {
+            std::env::set_var(PASS_ENV, "token-from-a-newer-binary");
+        }
+        let err = phase_done(&run, "plan").unwrap_err();
+        unsafe {
+            std::env::remove_var(PASS_ENV);
+        }
+        assert!(
+            err.to_string().contains("env -u DROVR_PASS"),
+            "the refusal must name the way out — dropping the token, not supplying one: {err}"
+        );
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "a marker phase_wait can never accept must not be written at all"
+        );
+
+        // ...and the token-less agent this phase really belongs to still completes.
+        let marker = phase_done(&run, "plan").unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "");
     }
 
     #[test]
