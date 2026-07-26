@@ -647,6 +647,12 @@
      so the button is a SIBLING in a positioned wrapper, not a child of the link.
      Keeping the anchor intact preserves middle-click, Cmd-click and the
      browser's own link keyboard handling. */
+  .live-unknown {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: #f5a623;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
   .run-row-wrap { position: relative; }
   .run-archive {
     position: absolute;
@@ -2079,7 +2085,17 @@ async function renderRunList(gen) {
     var active = runs.filter(function(r) { return !r.complete; });
     var complete = runs.filter(function(r) { return r.complete; });
 
-    var html = active.map(runRow).join('');
+    // Liveness is unknown (herdr unreachable) for at least one run. Say so: the
+    // grouping silently assumes not-live in that case, so without this the
+    // reviewer would read "Completed" as verified when nothing verified it — and
+    // an archived run whose workspace never actually closed folds away unseen.
+    var unknownLive = runs.some(function(r) { return r.live === null; });
+    var banner = unknownLive
+      ? '<div class="live-unknown">Could not reach herdr &mdash; whether any session still ' +
+        'has live panes is unknown. Grouping below assumes not.</div>'
+      : '';
+
+    var html = banner + active.map(runRow).join('');
     if (complete.length) {
       // A filter is an explicit search — honour it over the collapsed default,
       // or matches would hide inside a closed group with no hint they exist.
@@ -2360,14 +2376,22 @@ function rowKey(el) {
 function applyNavCursor(scroll) {
   var rows = navRows();
   if (!rows.length) { navCursor = 0; navCursorKey = ''; renderKeyhint(); announceCursor(null); return; }
+  var anchorMissing = false;
   if (!currentRun && navCursorKey) {
     var found = -1;
     rows.forEach(function(el, i) { if (found < 0 && rowKey(el) === navCursorKey) found = i; });
     if (found >= 0) navCursor = found;
+    else anchorMissing = true;
   }
   if (navCursor >= rows.length) navCursor = rows.length - 1;
   if (navCursor < 0) navCursor = 0;
-  if (!currentRun) navCursorKey = rowKey(rows[navCursor]);
+  // Re-anchor ONLY when the cursor is where the reviewer left it. If the anchored
+  // run just vanished from the visible rows — folded into the collapsed group by
+  // a liveness flap, filtered out — the index fallback is already pointing at an
+  // unrelated run, and overwriting the key with that run's name would make the
+  // displacement permanent: the original would never be recovered when it comes
+  // back. Keeping the key lets the next render re-find it.
+  if (!currentRun && !anchorMissing) navCursorKey = rowKey(rows[navCursor]);
   rows.forEach(function(el, i) {
     var on = i === navCursor;
     el.classList.toggle('nav-cursor', on);

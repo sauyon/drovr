@@ -1275,6 +1275,21 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
         // Going through `is_complete()` rather than recomputing keeps its
         // empty-phases guard: a run whose state.json will not parse stays visible
         // instead of being hidden as finished.
+        //
+        // `Some(true)` deliberately, NOT `!= Some(false)`. The asymmetry with the
+        // archive confirm — which DOES treat unknown as live — is the point:
+        //
+        // * The confirm gates a destructive act. Unknown must warn, because being
+        //   wrong there means killing a live agent.
+        // * This decides whether to assert "panes still live" on a row. Unknown
+        //   asserting it would stamp that warning on EVERY archived run whenever
+        //   `herdr workspace list` blips — false alarms on a claim we cannot
+        //   support, which is exactly how a warning stops being read.
+        //
+        // The cost is that a genuine zombie collapses while herdr is unreachable.
+        // That is transient and self-healing — the next successful poll surfaces
+        // it again — and `live: null` on the row lets the UI tell the reviewer
+        // liveness is unknown rather than let them read the grouping as fact.
         let zombie = archived && live == Some(true);
         let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
             || rs.state == LoopState::Cancelled)
@@ -2024,6 +2039,22 @@ mod tests {
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
         assert_eq!(row_for(&rows, "zombie")["complete"], true);
+
+        // Herdr unreachable: liveness is unknown, and the row does NOT claim
+        // "panes still live". A deliberate asymmetry with the archive confirm,
+        // which treats unknown as live because it gates a destructive act —
+        // asserting it here would stamp the warning on every archived run on any
+        // herdr blip. `live: null` is what tells the UI to say liveness is
+        // unknown instead of presenting the grouping as verified.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+        let row = row_for(&rows, "zombie");
+        assert!(row["live"].is_null(), "herdr unreachable is unknown, not false");
+        assert_eq!(
+            row["complete"], true,
+            "with liveness unknown the row collapses rather than asserting a \
+             claim we cannot support; transient and self-healing on the next poll"
+        );
 
         // Finishing every phase does NOT excuse a failed close. The anomaly is
         // that an explicit archive request didn't take effect, which is worth

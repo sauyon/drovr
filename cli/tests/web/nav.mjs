@@ -300,6 +300,33 @@ check('Enter on the focused summary toggles the group instead', await groupOpen(
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === false, 4000, 'group collapsed for the next section');
 
+console.log('\n== session list: the cursor survives a row vanishing ==');
+await goto('#/', LIST_READY);
+// A row can leave the visible list with no user action: a liveness flap folds an
+// archived run into the collapsed group on a 2s poll. The cursor must not
+// silently re-anchor onto whatever slid into that index — that displacement was
+// permanent, so a later `a`/Enter acted on an unrelated run.
+await press('g');
+await press('j');
+const parked = await cursorName();
+check('cursor is parked on a run', typeof parked, 'string');
+const kept = await evaluate(`
+  window.__savedKey = navCursorKey;
+  var wraps = Array.from(document.querySelectorAll('#run-list-items > .run-row-wrap'));
+  var target = wraps.find(function(w){
+    return w.querySelector('.run-name').textContent === navCursorKey;
+  });
+  if (!target) return 'anchored row not found';
+  target.remove();               // exactly what a fold does to the visible set
+  applyNavCursor(false);
+  return navCursorKey === window.__savedKey ? 'kept' : 'overwritten:' + navCursorKey;`);
+check('the anchor is kept when its row vanishes, not overwritten', kept, 'kept');
+check('...so the cursor finds it again once the row is back', await evaluate(`
+  return renderRunList(routeGen).then(function(){
+    var el = document.querySelector('#run-list-items .run-row.nav-cursor');
+    return el && el.querySelector('.run-name').textContent === window.__savedKey;
+  });`), true);
+
 console.log('\n== session list: filter ==');
 await goto('#/', LIST_READY);
 await press('g');

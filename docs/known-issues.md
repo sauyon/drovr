@@ -600,6 +600,38 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
+## Zombie detection goes quiet while herdr is unreachable
+
+**Severity:** low (transient and self-healing), but it is a deliberate trade rather than a fix.
+**Found:** 2026-07-25, round-six review of the archive button.
+
+An archived run whose `workspace_close` failed is a *zombie*: filed away while an agent may
+still be running in panes we believe we shut. `list_runs_json` (`cli/src/review.rs`) keeps such
+a row out of the collapsed "Completed" group so it stays visible.
+
+That detection is `archived && live == Some(true)`. When `herdr workspace list` fails, `live`
+is `None` for every row, no run is judged a zombie, and a genuine one collapses into the group
+with no warning.
+
+### Why it is not `live != Some(false)`
+
+Treating unknown as live would stamp "panes still live" on **every** archived run on any herdr
+blip — false alarms on a claim we cannot support, which is how a warning stops being read.
+The archive *confirm* does treat unknown as live (`cli/web/index.html`), and that asymmetry is
+intentional: the confirm gates a destructive act, where being wrong means killing a live agent.
+
+The residual is bounded: the next successful poll surfaces the zombie again, and the list
+header shows a "could not reach herdr — liveness unknown" banner so the grouping is not read
+as verified.
+
+### Fix ideas
+
+1. Cache the last known-good `workspace_list` result and fall back to it, so a blip does not
+   erase liveness at all — with an age limit, since stale liveness is its own lie.
+2. Or have `handle_archive` record `workspace_closed: false` durably in `state.json`, making a
+   zombie a fact about the run rather than something re-derived from herdr on every poll.
+   (2) is the stronger fix: it survives herdr being down entirely.
+
 ## Restoring an archived run does not make it runnable again
 
 **Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
