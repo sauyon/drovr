@@ -743,10 +743,31 @@ static PANE_GET_ERROR_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new
 /// nothing but pane ids, so a panicking thread cannot have left it inconsistent,
 /// and reporting `true` forever after would turn the diagnostic back into the
 /// once-a-poll spam this gate exists to prevent.
+///
+/// BOUNDED at [`WARNED_PANES_CAP`]. These sets are `static` — they live for the
+/// whole process, and the always-on review server is the one drovr process that
+/// never restarts and polls the most panes. Remembering every id it ever saw is
+/// a slow leak in exactly the wrong place.
 fn first_time_for(seen: &Mutex<BTreeSet<String>>, pane_id: &str) -> bool {
     let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Clear rather than evict one entry: the set is a de-duplication gate, not a
+    // cache, so there is no entry that is more worth keeping than another, and
+    // wholesale clearing gives a bound with no bookkeeping. The cost of forgetting
+    // is one repeated diagnostic per still-failing pane per CAP distinct panes —
+    // which is the same order as the once-per-pane guarantee it protects, and far
+    // better than the twice-a-second spam the gate exists to stop.
+    if seen.len() >= WARNED_PANES_CAP && !seen.contains(pane_id) {
+        seen.clear();
+    }
     seen.insert(pane_id.to_string())
 }
+
+/// How many pane ids a warn-once set remembers before forgetting all of them.
+/// Comfortably above the panes any single run has (a phase each, plus a root
+/// shell), so a normal `drovr` invocation never reaches it and the once-per-pane
+/// guarantee is exact; a long-lived server crosses it only after having polled
+/// that many DISTINCT panes.
+const WARNED_PANES_CAP: usize = 512;
 
 /// The diagnostic for a `pane.get` that succeeded with a shape
 /// [`parse_pane_info`] does not recognise. Names the result's top-level keys
@@ -1397,6 +1418,26 @@ mod tests {
             "a different pane reports on its own"
         );
         assert!(!first_time_for(&seen, "w1:p2"));
+    }
+
+    #[test]
+    fn the_warned_pane_set_is_bounded() {
+        // These sets are `static`: they live for the whole process, and the
+        // always-on review server is the one drovr process that never restarts.
+        // Remembering every pane id it ever polled is a slow leak.
+        let seen = Mutex::new(BTreeSet::new());
+        for i in 0..10_000 {
+            first_time_for(&seen, &format!("w1:p{i}"));
+        }
+        let len = seen.lock().unwrap().len();
+        assert!(
+            len < 10_000,
+            "the warned-pane set must not grow with every pane ever polled: {len}"
+        );
+        // Whatever the eviction rule, the gate it exists for still holds for a
+        // pane seen right now.
+        assert!(first_time_for(&seen, "w1:fresh"));
+        assert!(!first_time_for(&seen, "w1:fresh"));
     }
 
     // Tasks 3 and 6 both hinge on telling these three outcomes apart, so the
