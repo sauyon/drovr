@@ -788,6 +788,145 @@ from the session transcript (`~/.claude/projects/<munged-cwd>/<session>.jsonl`, 
 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` on the last `usage` entry)
 rather than trusting the percentage.
 
+## A stale `server.addr` plus an occupied port deadlocks server discovery permanently
+
+**Severity:** high — `drovr review summary` / `review wait` fail with no path to recovery, so a
+run's gate cannot be opened at all.
+**Found:** 2026-07-26, run `skill-stickiness`.
+
+### Symptom
+
+Every `drovr review summary` fails with `timed out waiting for `drovr serve` to start`, while a
+perfectly healthy review server is running and reachable the whole time. Opening the URL a
+previous `summary` printed gives a connection refused — the human reads this as "the server isn't
+live" when in fact a server *is* live, just not the one drovr is looking for.
+
+Observed state during the incident:
+
+```
+~/.local/share/drovr/server.addr  ->  127.0.0.1:18732   (written 2026-07-25 20:37:46)
+~/.local/share/drovr/server.pid   ->  1662301           (process DEAD)
+actual live server                ->  100.71.58.39:8791 (pid 1289722, serving every run fine)
+```
+
+### Root cause
+
+Three mechanisms compose into a trap. Each is individually reasonable.
+
+1. **`server.addr` is a single global last-writer-wins pointer.** `serve()`
+   (`cli/src/review.rs:1052-1053`) writes `server.addr`/`server.pid` unconditionally right after
+   binding. Every drovr binary on the machine shares one `~/.local/share/drovr/`, so **dev builds
+   from other worktrees overwrite the pointer for everyone.** This repo routinely has 10+
+   worktrees live, several running their own `serve` on their own port — so the pointer churns.
+2. **A writer that exits leaves the pointer dangling.** Nothing clears `server.addr` on shutdown.
+   The last binary to start wins the pointer, and when it dies the pointer survives it, now naming
+   a dead port.
+3. **The recovery path cannot recover, because it has no port fallback.** `ensure_server()`
+   (`:1090-1112`) correctly detects the dead pointer — `live_server_addr()` connect-tests it and
+   returns `None` — and calls `spawn_daemon()`. But `spawn_daemon()` (`:1206-1221`) shells a bare
+   `drovr serve` with **no `--port`**, so the child always tries the default `8791` on the config
+   `serve_host`. That address is already held by the live server. The child dies instantly,
+   `server.addr` is never updated, and `ensure_server` polls a dead pointer for 5s and errors.
+
+The deadlock is stable: it recurs on every invocation and cannot self-heal, because the very
+condition that makes discovery fail (a live server on the port) is also what makes the fix
+attempt fail. Note the healthy-looking failure — the server is *up*, the runs are *fine*, and the
+error message points at startup, which is the one thing that is not the problem.
+
+### Workaround
+
+Point the file at the server that is actually running:
+
+```sh
+# find the live server and its bound address
+pgrep -af 'drovr serve'
+# then, with its real host:port
+printf '%s' '100.71.58.39:8791' > ~/.local/share/drovr/server.addr
+```
+
+Do **not** kill the dev-build servers to "clean up" — they belong to other worktrees and other
+people's sessions. Repointing the file is sufficient and non-destructive.
+
+To confirm before and after: `curl -s -m2 http://$(cat ~/.local/share/drovr/server.addr)/api/runs`
+should return a JSON array of runs. An empty `[]` means you have found a server pointed at a
+*different data dir* (another worktree's dev build) — that is a different, equally misleading
+failure: discovery succeeds, and the UI shows no runs.
+
+### Fix ideas
+
+1. **Give `spawn_daemon` a port fallback.** If the configured port is occupied, bind `:0`, let the
+   OS choose, and record the real bound address. This alone breaks the deadlock.
+2. **Validate before trusting, and self-heal.** `live_server_addr()` already connect-tests. Extend
+   it to also confirm the responder is a drovr server *for this data dir* (a `/api/health`
+   returning the runs root) — that catches the empty-`[]` cross-worktree case too.
+3. **Do not let dev builds clobber the shared pointer.** Namespace the discovery files by data dir,
+   or have non-default `--port`/`--host` invocations write a per-instance file instead of the
+   global one. A `serve` on a non-default port is almost by definition not the one to advertise.
+4. **Clear `server.pid`/`server.addr` on clean shutdown**, and treat a dead `server.pid` as
+   grounds to ignore `server.addr` without waiting for the TCP timeout.
+
+## `drovr phase send` exits 0 with the prompt left unsubmitted in the agent's input box
+
+**Severity:** high — the orchestrator believes it has driven the phase forward and waits forever
+on an agent that never saw the message.
+**Found:** 2026-07-26, run `skill-stickiness`, herdr 0.7.5.
+
+### Symptom
+
+`drovr phase send <run> <phase> '<text>'` returns exit `0`. The text is visibly present in the
+agent pane — but sitting *in the input box* at the `❯` prompt, never submitted. The agent is idle
+and unaware. Any watch keyed on the work the message asked for waits indefinitely, and correctly
+reports nothing, because nothing happened.
+
+This is silent: exit `0`, no stderr, and a pane that looks like the message arrived. It was caught
+here only by reading the pane directly after a monitor stayed quiet longer than it should have.
+
+### Root cause — partially diagnosed
+
+`phase_send` (`cli/src/phase.rs:339-375`) gates on `wait_agent_ready`, then calls
+`Herdr::agent_send`, which issues the herdr socket call `agent.prompt`
+(`cli/src/herdr.rs:265-271`). That method is documented to type **and submit** natively —
+`herdr agent prompt` is literally "Submit a prompt to an agent" — and the old 0.7.3
+type-then-flush-CR handshake was removed on that basis.
+
+In this incident the type half happened and the submit half did not. What is *confirmed*: herdr
+was 0.7.5, so the version assumption in that comment held. What is **not** established is why
+submission was dropped. The most likely contributor is agent state: the target had been failing
+tool calls against a degraded classifier and had parked itself, with the Claude Code TUI showing a
+`new task? /clear to save …` hint. A readiness probe reporting "ready" for an agent that is
+actually parked mid-error would explain both the exit `0` and the swallowed submit. **This is a
+hypothesis, not a diagnosis** — do not fix against it without reproducing.
+
+### Workaround
+
+Treat `phase send`'s exit `0` as "text delivered to the pane", never as "agent received it".
+Follow every send with an explicit submit, then verify:
+
+```sh
+drovr phase send "$RUN" "$PHASE" "$TEXT"
+sleep 2
+herdr pane send-keys "$PANE" Enter        # pane_id is in the run's state.json
+herdr pane read "$PANE" --source recent --lines 20   # confirm it left the input box
+```
+
+A bare extra `Enter` is safe when the message *did* submit — it lands on an empty prompt and does
+nothing.
+
+The stronger habit, and the one that would have caught this immediately: **never treat a quiet
+monitor as evidence of progress.** Silence is consistent with "working", "never started", and
+"dead". When a watch has been quiet longer than the work plausibly takes, read the pane.
+
+### Fix ideas
+
+1. **Verify submission instead of assuming it.** After `agent.prompt`, poll `agent_status` (or
+   re-read the pane) for a bounded interval and confirm the input box is empty / the agent moved
+   to `working`. Return a distinct non-zero exit if the prompt is still sitting there.
+2. **Restore a flush keystroke as a fallback** — not the unconditional 0.7.3 handshake, but a
+   single `Enter` sent only when step 1 detects the prompt was not consumed.
+3. **Harden `wait_agent_ready`.** If a parked-after-error agent reports ready, readiness is
+   measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
+   it gave up".
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**
