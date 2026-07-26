@@ -55,7 +55,8 @@ impl TabId {
 /// variant holding a bare `String` a caller could merge them in one pattern —
 /// `Id { value, .. } | Path { value } => value` — and walk off with a transcript
 /// path where a session id was expected. Giving `Id` a payload type of its own
-/// makes that or-pattern fail to type-check.
+/// makes that or-pattern fail to type-check, and [`IdSession`] keeps the id out
+/// of reach of a direct destructure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionId(String);
 
@@ -96,17 +97,28 @@ pub struct ResumableSession<'a> {
 ///
 /// herdr DROPS this whole key once the pane's agent process exits (verified
 /// against 0.7.5), so it must be captured while the agent is alive.
+/// The payload of an [`AgentSession::Id`]. Its fields are PRIVATE to this
+/// module, which is the whole point: Rust has no field-level privacy on enum
+/// variants, so with the id and the agent sitting directly on the variant any
+/// same-crate caller could write `if let AgentSession::Id { value, .. }` and
+/// walk off with the id having skipped the agent check entirely — reproducing
+/// the bug [`AgentSession::resumable`] exists to prevent. Behind this struct,
+/// destructuring the variant yields something you cannot read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdSession {
+    value: SessionId,
+    /// The agent that owns the session (`claude`, `cursor`, …). herdr 0.7.5's
+    /// schema marks it required, so `None` is defence against a future version
+    /// dropping it rather than a case seen in the wild — and a session id is
+    /// only safe to resume with the backend that created it, so a caller that
+    /// cannot confirm the backend must not resume at all.
+    agent: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSession {
-    /// A resumable session id.
-    Id {
-        value: SessionId,
-        /// The agent that owns the session (`claude`, `cursor`, …). Optional —
-        /// absent on some herdr versions — and a session id is only safe to
-        /// resume with the backend that created it, so a caller that cannot
-        /// confirm the backend must not resume.
-        agent: Option<String>,
-    },
+    /// A resumable session id, behind an opaque payload.
+    Id(IdSession),
     /// A transcript path. Never a resume operand.
     Path { value: String },
     /// A kind this drovr does not know. Preserved verbatim so it is visible in
@@ -129,10 +141,10 @@ impl AgentSession {
     /// recoverable mistake — so an agent-less id is not resumable at all.
     pub fn resumable(&self) -> Option<ResumableSession<'_>> {
         match self {
-            AgentSession::Id {
+            AgentSession::Id(IdSession {
                 value,
                 agent: Some(agent),
-            } => Some(ResumableSession { id: value, agent }),
+            }) => Some(ResumableSession { id: value, agent }),
             _ => None,
         }
     }
@@ -142,7 +154,7 @@ impl AgentSession {
     /// a resume is safe.
     pub fn agent(&self) -> Option<&str> {
         match self {
-            AgentSession::Id { agent, .. } => agent.as_deref(),
+            AgentSession::Id(id) => id.agent.as_deref(),
             _ => None,
         }
     }
@@ -150,7 +162,7 @@ impl AgentSession {
     /// herdr's own `kind` string, for diagnostics and logging.
     pub fn kind(&self) -> &str {
         match self {
-            AgentSession::Id { .. } => "id",
+            AgentSession::Id(_) => "id",
             AgentSession::Path { .. } => "path",
             AgentSession::Other { kind, .. } => kind,
         }
@@ -637,7 +649,10 @@ fn pane_get_shape_message(result: &Value) -> String {
     )
 }
 
-/// The diagnostic for a `pane.get` that failed at the socket layer.
+/// The diagnostic for a `pane.get` that failed at the socket layer. Unlike
+/// [`pane_get_shape_message`], which prints keys and never values, this echoes
+/// herdr's message verbatim — `socket_call` only ever surfaces a JSON-RPC
+/// `error.message` or an OS error string, neither of which carries a payload.
 fn pane_get_error_message(pane_id: &str, err: &str) -> String {
     format!(
         "drovr: herdr's pane.get failed for pane {pane_id}: {err}. \
@@ -686,10 +701,10 @@ fn parse_agent_session(value: &Value) -> Option<AgentSession> {
     let kind = non_empty_string(value, "kind")?;
     let session_value = non_empty_string(value, "value")?;
     Some(match kind.as_str() {
-        "id" => AgentSession::Id {
+        "id" => AgentSession::Id(IdSession {
             value: SessionId(session_value),
             agent: non_empty_string(value, "agent"),
-        },
+        }),
         "path" => AgentSession::Path {
             value: session_value,
         },
@@ -1117,10 +1132,10 @@ mod tests {
     // agent's `--resume`. The type carries that rule so no caller has to.
     #[test]
     fn only_an_id_session_is_resumable() {
-        let id = AgentSession::Id {
+        let id = AgentSession::Id(IdSession {
             value: SessionId("cca92f5b".to_string()),
             agent: Some("claude".to_string()),
-        };
+        });
         let resumable = id.resumable().expect("an id session with a known agent");
         assert_eq!(resumable.id, &SessionId("cca92f5b".to_string()));
         assert_eq!(
@@ -1139,10 +1154,10 @@ mod tests {
         // no backend to compare against we cannot know the id belongs to this
         // run's agent, and resuming a claude session under cursor is not a
         // recoverable mistake.
-        let agentless = AgentSession::Id {
+        let agentless = AgentSession::Id(IdSession {
             value: SessionId("cca92f5b".to_string()),
             agent: None,
-        };
+        });
         assert!(
             agentless.resumable().is_none(),
             "half of the rule is not enough"
