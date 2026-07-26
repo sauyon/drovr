@@ -24,15 +24,35 @@ pub struct Workspace {
     pub root_pane: String,
 }
 
+/// A resumable session id, carrying its own proof: the inner string is private
+/// to this module, so one can only be built here — by parsing a `kind == "id"`
+/// session.
+///
+/// It exists to make [`AgentSession`]'s guarantee structural rather than
+/// conventional. An enum's variants are as public as the enum, so with every
+/// variant holding a bare `String` a caller could merge them in one pattern —
+/// `Id { value, .. } | Path { value } => value` — and walk off with a transcript
+/// path where a session id was expected. Giving `Id` a payload type of its own
+/// makes that or-pattern fail to type-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The agent session herdr records on a pane (`agent_session`), keyed by herdr's
 /// own `kind` discriminator.
 ///
 /// Only a `kind == "id"` session may ever be interpolated into an agent's
 /// `--resume` argument — a transcript path there would be read as a session
-/// name. That rule lives in the TYPE rather than in every caller: the value is
+/// name. That rule lives in the TYPE rather than in every caller: the id is
 /// reachable through [`AgentSession::resumable_id`], which yields `Some` for
-/// `Id` alone. Reading any other kind's value takes an explicit match on that
-/// variant, which is the point.
+/// `Id` alone, and the value it hands back is a [`SessionId`] no other variant
+/// can produce. A `Path`'s value is still readable — diagnostics need it — but
+/// only by naming `Path` explicitly, which is a deliberate, greppable act.
 ///
 /// herdr DROPS this whole key once the pane's agent process exits (verified
 /// against 0.7.5), so it must be captured while the agent is alive.
@@ -40,7 +60,7 @@ pub struct Workspace {
 pub enum AgentSession {
     /// A resumable session id.
     Id {
-        value: String,
+        value: SessionId,
         /// The agent that owns the session (`claude`, `cursor`, …). Optional —
         /// absent on some herdr versions — and a session id is only safe to
         /// resume with the backend that created it, so a caller that cannot
@@ -63,7 +83,7 @@ impl AgentSession {
     /// interpolate a path as a session id" rule.
     pub fn resumable_id(&self) -> Option<&str> {
         match self {
-            AgentSession::Id { value, .. } => Some(value),
+            AgentSession::Id { value, .. } => Some(value.as_str()),
             _ => None,
         }
     }
@@ -580,7 +600,7 @@ fn parse_agent_session(value: &Value) -> Option<AgentSession> {
     let session_value = non_empty_string(value, "value")?;
     Some(match kind.as_str() {
         "id" => AgentSession::Id {
-            value: session_value,
+            value: SessionId(session_value),
             agent: non_empty_string(value, "agent"),
         },
         "path" => AgentSession::Path {
@@ -971,7 +991,7 @@ mod tests {
     #[test]
     fn only_an_id_session_is_resumable() {
         let id = AgentSession::Id {
-            value: "cca92f5b".to_string(),
+            value: SessionId("cca92f5b".to_string()),
             agent: Some("claude".to_string()),
         };
         assert_eq!(id.resumable_id(), Some("cca92f5b"));
@@ -982,6 +1002,13 @@ mod tests {
             value: "/tmp/transcript.jsonl".to_string(),
         };
         assert_eq!(path.resumable_id(), None, "a path is never a session id");
+        // …and a `Path`'s value cannot be passed off as one: only `Id` carries a
+        // `SessionId`, so an or-pattern merging the two variants to lift out a
+        // single `value` binding does not type-check.
+        assert_ne!(
+            SessionId("/tmp/transcript.jsonl".to_string()).as_str(),
+            path.resumable_id().unwrap_or_default()
+        );
         assert_eq!(path.kind(), "path");
         assert_eq!(path.agent(), None);
 
