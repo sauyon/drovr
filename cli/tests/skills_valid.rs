@@ -1,7 +1,7 @@
 //! Validates every `skills/*/SKILL.md` in the repo and enforces a body-size
 //! budget on the four `drovr:*` methodology skills.
 //!
-//! Two assertions:
+//! Three assertions:
 //!   1. **All** skills have valid frontmatter: a leading `---` block containing
 //!      non-empty `name:` and `description:`, and `name:` equals the directory
 //!      name.
@@ -9,9 +9,15 @@
 //!      verification-before-completion, code-review) each have a
 //!      post-frontmatter body of at most 2200 bytes. The pre-existing skills
 //!      (using-drovr, handoff, pipeline) are NOT size-checked.
+//!   3. The arm A snapshots under `docs/skill-evidence/arms/A/` still hash to
+//!      the values `arms/MANIFEST.md` records. Arm A is the pre-fix baseline the
+//!      whole measurement is compared against, and it is unrecoverable without a
+//!      checkout once fix 1 rewrites the live `description:` lines — so this is a
+//!      tripwire, not a formality.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Body-size budget (bytes) for the methodology skills.
 const BODY_BUDGET: usize = 2200;
@@ -27,6 +33,23 @@ const METHODOLOGY_SKILLS: &[&str] = &[
 fn skills_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../skills"))
 }
+
+/// Root of the per-arm skill snapshots (`docs/skill-evidence/arms/`).
+fn arms_dir() -> PathBuf {
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/skill-evidence/arms"
+    ))
+}
+
+/// The five skills snapshotted into every measurement arm.
+const ARM_SNAPSHOT_SKILLS: &[&str] = &[
+    "tdd",
+    "systematic-debugging",
+    "verification-before-completion",
+    "code-review",
+    "using-drovr",
+];
 
 /// A parsed SKILL.md: the frontmatter `name`/`description` and the body after
 /// the closing `---`.
@@ -110,6 +133,146 @@ fn skill_files(dir: &Path) -> Vec<(String, PathBuf)> {
     }
     out.sort();
     out
+}
+
+/// Is `git` resolvable? The arm-snapshot hashes are `git hash-object` blob SHAs,
+/// so the check is skipped rather than failed where git is absent — same shape as
+/// `reflex_hook.rs::bash_available`.
+fn git_available() -> bool {
+    // `output()`, not `status()`, so git's version banner does not leak into the
+    // test harness's own output.
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `git hash-object <path>` — the blob SHA `MANIFEST.md` records.
+///
+/// `cli/` has no `[lib]` target, so `cli/src/sha256.rs` is private to the binary
+/// crate and unreachable from an integration test; shelling out is the bridge.
+fn git_hash_object(path: &Path) -> String {
+    let out = Command::new("git")
+        .arg("hash-object")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run `git hash-object {}`: {e}", path.display()));
+    assert!(
+        out.status.success(),
+        "`git hash-object {}` failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap_or_else(|e| {
+            panic!(
+                "`git hash-object {}` output is not utf-8: {e}",
+                path.display()
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+/// One data row of `arms/MANIFEST.md`'s table.
+struct ManifestRow {
+    arm: String,
+    skill: String,
+    hash: String,
+}
+
+/// Parse `arms/MANIFEST.md`'s markdown table.
+///
+/// The manifest is append-only and gains a row per arm per skill as later tasks
+/// snapshot A′/B/B-r<i>/voice, so rows are matched on their `arm` and `skill`
+/// cells rather than by position. Header and `---` separator rows are skipped,
+/// and cells are trimmed of the backticks the table uses to typeset paths and
+/// hashes.
+fn parse_manifest(contents: &str) -> Vec<ManifestRow> {
+    let mut rows = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some(inner) = line.strip_prefix('|') else {
+            continue;
+        };
+        let cells: Vec<String> = inner
+            .strip_suffix('|')
+            .unwrap_or(inner)
+            .split('|')
+            .map(|c| c.trim().trim_matches('`').trim().to_string())
+            .collect();
+        if cells.len() < 4 {
+            continue;
+        }
+        // Separator row (`|---|---|…`), possibly with alignment colons.
+        if cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        // Header row.
+        if cells[0].eq_ignore_ascii_case("arm") {
+            continue;
+        }
+        rows.push(ManifestRow {
+            arm: cells[0].clone(),
+            skill: cells[1].clone(),
+            hash: cells[3].clone(),
+        });
+    }
+
+    rows
+}
+
+/// Arm A is the pre-fix baseline every later arm is measured against. It lives
+/// only in `docs/skill-evidence/arms/A/` — the live `skills/*/SKILL.md` files
+/// move out from under it as the fixes land, so this test deliberately compares
+/// the snapshots against `MANIFEST.md`, never against `skills/`.
+#[test]
+fn arm_a_snapshots_match_manifest() {
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    let arms = arms_dir();
+    let manifest_path = arms.join("MANIFEST.md");
+    let contents = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
+    let rows = parse_manifest(&contents);
+
+    for skill in ARM_SNAPSHOT_SKILLS {
+        let matches: Vec<&ManifestRow> = rows
+            .iter()
+            .filter(|r| r.arm == "A" && r.skill == *skill)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{}: expected exactly one arm A row for `{skill}`, found {}",
+            manifest_path.display(),
+            matches.len()
+        );
+
+        let snapshot = arms.join("A").join(format!("{skill}.md"));
+        assert!(
+            snapshot.is_file(),
+            "missing arm A snapshot {}",
+            snapshot.display()
+        );
+
+        let actual = git_hash_object(&snapshot);
+        assert_eq!(
+            actual,
+            matches[0].hash,
+            "{} has drifted: `git hash-object` is {actual}, MANIFEST.md records {}",
+            snapshot.display(),
+            matches[0].hash
+        );
+    }
 }
 
 #[test]
