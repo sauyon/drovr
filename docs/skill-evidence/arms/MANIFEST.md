@@ -9,10 +9,19 @@ checkable.
 
 A snapshot is the **whole file including frontmatter**: the `description:` line is itself under test.
 
-**This table is append-only.** Each snapshotting task adds its rows and rewrites nothing. The hash
-column is a `git hash-object` blob SHA (`git hash-object <path>`), not a raw SHA-256.
+**This table is append-only.** Each snapshotting task adds its rows and rewrites nothing.
+
+The hash column is a `git hash-object` blob SHA, not a raw SHA-256. **Compute it with
+`git hash-object --no-filters <path>`.** Without `--no-filters` the value also depends on the
+invoking user's `core.autocrlf` and on any `.gitattributes` in scope, so the same bytes can hash
+differently on another machine — which would read as arm corruption when nothing had changed. There
+is no `.gitattributes` in this repo today, so the two forms agree on every value below; the flag is
+what keeps them agreeing.
+
 `cli/tests/skills_valid.rs::arm_a_snapshots_match_manifest` re-checks the arm A rows on every test
-run; later tasks re-check their own arm before using its text.
+run; later tasks re-check their own arm before using its text. Rows are matched on their `arm` and
+`skill` cells (exact string equality — `A-prime` is not `A`), so **no cell may contain a literal
+`|`**, and only lines after the header row count as data.
 
 | arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
 |---|---|---|---|---|---|

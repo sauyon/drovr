@@ -136,8 +136,10 @@ fn skill_files(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Is `git` resolvable? The arm-snapshot hashes are `git hash-object` blob SHAs,
-/// so the check is skipped rather than failed where git is absent — same shape as
-/// `reflex_hook.rs::bash_available`.
+/// so this is a precondition of the check below.
+///
+/// Unlike `reflex_hook.rs::bash_available`, absence here is a **hard failure**,
+/// not a skip — see `arm_a_snapshots_match_manifest`.
 fn git_available() -> bool {
     // `output()`, not `status()`, so git's version banner does not leak into the
     // test harness's own output.
@@ -148,19 +150,32 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// `git hash-object <path>` — the blob SHA `MANIFEST.md` records.
+/// `git hash-object --no-filters <path>` — the blob SHA `MANIFEST.md` records.
 ///
 /// `cli/` has no `[lib]` target, so `cli/src/sha256.rs` is private to the binary
 /// crate and unreachable from an integration test; shelling out is the bridge.
+///
+/// `--no-filters` matters: without it the hash is a function of the invoking
+/// user's `core.autocrlf` and of any `.gitattributes` in scope, not of the file's
+/// bytes — so the same on-disk content can hash differently on another machine.
+/// `MANIFEST.md` claims to make "byte-exact" checkable across a whole multi-task
+/// run, and this flag is what makes that claim true. There is no `.gitattributes`
+/// in this repo today, so the recorded values are unchanged by it.
 fn git_hash_object(path: &Path) -> String {
     let out = Command::new("git")
         .arg("hash-object")
+        .arg("--no-filters")
         .arg(path)
         .output()
-        .unwrap_or_else(|e| panic!("cannot run `git hash-object {}`: {e}", path.display()));
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot run `git hash-object --no-filters {}`: {e}",
+                path.display()
+            )
+        });
     assert!(
         out.status.success(),
-        "`git hash-object {}` failed: {}",
+        "`git hash-object --no-filters {}` failed: {}",
         path.display(),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -189,8 +204,12 @@ struct ManifestRow {
 /// cells rather than by position. Header and `---` separator rows are skipped,
 /// and cells are trimmed of the backticks the table uses to typeset paths and
 /// hashes.
+///
+/// Only lines *after* the `| arm | …` header count as data, so prose in the
+/// preamble can never be mistaken for a row no matter what punctuation it grows.
 fn parse_manifest(contents: &str) -> Vec<ManifestRow> {
     let mut rows = Vec::new();
+    let mut in_table = false;
 
     for line in contents.lines() {
         let line = line.trim();
@@ -213,8 +232,12 @@ fn parse_manifest(contents: &str) -> Vec<ManifestRow> {
         {
             continue;
         }
-        // Header row.
+        // Header row — everything before it is preamble.
         if cells[0].eq_ignore_ascii_case("arm") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
             continue;
         }
         rows.push(ManifestRow {
@@ -233,17 +256,15 @@ fn parse_manifest(contents: &str) -> Vec<ManifestRow> {
 /// the snapshots against `MANIFEST.md`, never against `skills/`.
 #[test]
 fn arm_a_snapshots_match_manifest() {
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
-
     let arms = arms_dir();
     let manifest_path = arms.join("MANIFEST.md");
     let contents = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
     let rows = parse_manifest(&contents);
 
+    // Everything that does not need git runs first, so a git-less environment
+    // still reports a corrupt manifest rather than only "git is missing".
+    let mut to_verify = Vec::new();
     for skill in ARM_SNAPSHOT_SKILLS {
         let matches: Vec<&ManifestRow> = rows
             .iter()
@@ -257,6 +278,15 @@ fn arm_a_snapshots_match_manifest() {
             matches.len()
         );
 
+        // A blank or malformed hash cell would otherwise only surface as a
+        // confusing mismatch against a real SHA.
+        let expected = matches[0].hash.clone();
+        assert!(
+            expected.len() == 40 && expected.chars().all(|c| c.is_ascii_hexdigit()),
+            "{}: arm A row for `{skill}` records `{expected}`, which is not a 40-character hex blob SHA",
+            manifest_path.display()
+        );
+
         let snapshot = arms.join("A").join(format!("{skill}.md"));
         assert!(
             snapshot.is_file(),
@@ -264,13 +294,30 @@ fn arm_a_snapshots_match_manifest() {
             snapshot.display()
         );
 
+        to_verify.push((snapshot, expected));
+    }
+
+    // Only the hash comparison needs git, and its absence FAILS rather than
+    // skips. A skip would be invisible under plain `cargo test` (an `eprintln!`
+    // is captured unless `--nocapture` is passed), so a git-less environment
+    // would silently defuse this tripwire for the rest of the run while still
+    // printing `ok`. Nothing is lost by failing: `tests/e2e.rs` already runs
+    // `git init`/`add`/`commit` unconditionally, so the suite cannot pass
+    // without git either way.
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so the arm A snapshot hashes cannot be verified. \
+         This check guards a baseline that is unrecoverable without a checkout, so it \
+         fails loudly rather than skipping."
+    );
+
+    for (snapshot, expected) in to_verify {
         let actual = git_hash_object(&snapshot);
         assert_eq!(
             actual,
-            matches[0].hash,
-            "{} has drifted: `git hash-object` is {actual}, MANIFEST.md records {}",
+            expected,
+            "{} has drifted: `git hash-object --no-filters` is {actual}, MANIFEST.md records {expected}",
             snapshot.display(),
-            matches[0].hash
         );
     }
 }
