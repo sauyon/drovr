@@ -600,6 +600,32 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
+## The session list rebuilds via `innerHTML` every 2s, which is what makes rows "vanish"
+
+**Severity:** low as shipped (the symptoms are fixed), but it is the root of a whole bug class.
+**Found:** 2026-07-25, design review after the archive button.
+
+`renderRunList` (`cli/web/index.html`) replaces `#run-list-items` wholesale on every 2s poll.
+Every row element is therefore destroyed and recreated constantly, so anything the user has
+"on" a row — the keyboard cursor, DOM focus — has to be re-derived from scratch each time.
+
+That is why the cursor needs `navCursorKey`, `knownRunNames` and `listFetchSeq` to tell "this
+row is hidden" from "this run is gone", and why five review rounds went into that one
+function. The archive button did not introduce the fragility; it made it reachable, by being
+the first thing that removes a row out from under the poll while the reviewer is looking at
+it (archive/restore, and liveness flapping a row into and out of the collapsed group).
+
+It is also why real Tab focus on a row control is destroyed on the next tick — pre-existing,
+and now slightly worse with a second focusable control per row.
+
+### Fix idea
+
+Diff and patch rows instead of rebuilding: keyed by run name, update in place, add/remove only
+what changed. The cursor's element then simply persists and the entire hidden-vs-gone question
+disappears, along with the state that answers it. This is a rewrite of `renderRunList` — it has
+to preserve `<details>` open state, filter state and the delegated button listener — so it
+wants to be done deliberately, not folded into a feature branch.
+
 ## Zombie detection goes quiet while herdr is unreachable
 
 **Severity:** low (transient and self-healing), but it is a deliberate trade rather than a fix.
