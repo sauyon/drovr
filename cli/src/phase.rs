@@ -450,7 +450,10 @@ fn wait_agent_ready<H: Herdr>(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if agent_has_started(h.agent_status(pane_id).as_ref()) {
+        // `pane_info` is the only poll; narrow it here rather than through a
+        // helper, so "the poll failed" cannot be confused with a status.
+        let status = h.pane_info(pane_id).and_then(|info| info.agent_status);
+        if agent_has_started(status.as_ref()) {
             return true;
         }
         let now = Instant::now();
@@ -888,7 +891,7 @@ pub fn phase_wait<H: Herdr>(
         // instead of hanging until the wait's full timeout. Only `blocked` short-
         // circuits; every other status keeps waiting for the marker.
         if let Some(pid) = pane_id.as_deref() {
-            if h.agent_status(pid) == Some(AgentStatus::Blocked) {
+            if h.pane_info(pid).and_then(|info| info.agent_status) == Some(AgentStatus::Blocked) {
                 return Ok(PhaseWaitOutcome::Blocked);
             }
         }

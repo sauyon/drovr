@@ -333,7 +333,8 @@ pub fn code_review_run<H: Herdr>(
                 || run
                     .find_phase(name)
                     .and_then(|phase| phase.pane_id.as_deref())
-                    .and_then(|pane| h.agent_status(pane))
+                    .and_then(|pane| h.pane_info(pane))
+                    .and_then(|info| info.agent_status)
                     == Some(AgentStatus::Done);
             if finished {
                 if let Some(i) = run.review_phases.iter().position(|p| &p.name == name) {
