@@ -231,6 +231,15 @@ fn save_run(run: &RunState) {
     });
 }
 
+/// [`save_run`] for writers holding a long-stale copy — see
+/// [`RunState::save_preserving_archived`].
+fn save_run_preserving_archived(run: &mut RunState) {
+    run.save_preserving_archived().unwrap_or_else(|e| {
+        eprintln!("drovr: failed to save run '{}': {e}", run.name);
+        process::exit(1);
+    });
+}
+
 fn phase_status_str(status: &PhaseStatus) -> &'static str {
     match status {
         PhaseStatus::Pending => "pending",
@@ -914,7 +923,11 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // then fail (e.g. a mid-spawn `phase_send` error) with those phases
             // only in memory, so an unconditional save here keeps disk and memory
             // in sync on every path — including the `Err` early-exit below.
-            save_run(&state);
+            //
+            // `state` was loaded before a review pass that can block for the full
+            // timeout; the human may have archived the run in that window, so this
+            // write must not carry a stale `archived: false` back over it.
+            save_run_preserving_archived(&mut state);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
                 process::exit(1);

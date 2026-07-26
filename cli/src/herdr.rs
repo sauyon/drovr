@@ -679,6 +679,150 @@ impl Herdr for FakeHerdr {
 mod tests {
     use super::*;
 
+    /// Run `f` against a real [`SystemHerdr`] with a stub `herdr` first on `PATH`
+    /// that prints `stdout` and exits `code`.
+    ///
+    /// `FakeHerdr` cannot cover this: it *is* the stand-in, so it can never show
+    /// that `SystemHerdr` — the only impl that talks to the daemon — honours the
+    /// unknown-vs-empty and biased-toward-alive contracts. `PATH` is prepended
+    /// rather than replaced so the `git` other tests shell out to still resolves.
+    #[cfg(unix)]
+    fn with_stub_herdr<T>(stdout: &str, code: i32, f: impl FnOnce(&SystemHerdr) -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            !stdout.contains('\''),
+            "stub stdout is single-quoted for the shell; a quote in it would not survive"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("herdr");
+        // `echo` is a shell BUILTIN, deliberately: an external `cat` would have to be
+        // found on the very PATH this helper is rewriting, so the stub would break
+        // whenever it ran alongside `with_no_herdr_on_path`.
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{stdout}'\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        with_herdr_path(tmp.path(), true, f)
+    }
+
+    /// Run `f` with NO `herdr` anywhere on `PATH`, so `Command::output` fails to
+    /// launch it at all — a branch distinct from "ran and exited nonzero", and the
+    /// only way to reach `pane_exists`'s catch-all arm.
+    ///
+    /// `PATH` is REPLACED, not prepended. An earlier version of this helper instead
+    /// put a non-executable stub first on `PATH`, which does not work: `execvp`
+    /// skips a `PATH` entry it cannot execute and keeps searching, so it silently
+    /// fell through to the developer's real herdr binary and the test passed
+    /// against a live daemon rather than against a missing one.
+    #[cfg(unix)]
+    fn with_no_herdr_on_path<T>(f: impl FnOnce(&SystemHerdr) -> T) -> T {
+        let tmp = tempfile::tempdir().unwrap();
+        with_herdr_path(tmp.path(), false, f)
+    }
+
+    /// Point `PATH` at `dir` — prepended to the existing `PATH` when `prepend`,
+    /// otherwise replacing it outright — run `f` against a real [`SystemHerdr`],
+    /// then restore `PATH`.
+    ///
+    /// The new `PATH` is composed *under the lock*. Reading the old one outside it
+    /// races with the helper that replaces `PATH` wholesale: a stub could end up
+    /// prepended to an empty `PATH` and lose access to everything it needs.
+    #[cfg(unix)]
+    fn with_herdr_path<T>(
+        dir: &std::path::Path,
+        prepend: bool,
+        f: impl FnOnce(&SystemHerdr) -> T,
+    ) -> T {
+        // `into_inner` on poison: one unrelated panicking test must not cascade
+        // into every test that touches the env.
+        let _lock = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let saved = std::env::var_os("PATH");
+        let path = match (prepend, &saved) {
+            (true, Some(p)) => format!("{}:{}", dir.display(), p.to_string_lossy()),
+            _ => dir.display().to_string(),
+        };
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+        // Call under the modified PATH, assert *outside* it: a panic here would
+        // leave PATH clobbered for every later test in this process.
+        let out = f(&SystemHerdr::new());
+        unsafe {
+            match saved {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreachable_herdr_reports_unknown_liveness_and_assumes_panes_alive() {
+        // Daemon down: nonzero exit, nothing parseable on stdout.
+        let (live, alive) = with_stub_herdr("", 1, |h| (h.workspace_list(), h.pane_exists("w1:p1")));
+
+        assert_eq!(
+            live, None,
+            "an unreachable herdr must report unknown, never `Some(vec![])` — \
+             'nothing is live' would let the UI archive running work with no warning"
+        );
+        assert!(
+            alive,
+            "a nonzero exit alone must not count as a dead pane, or a transient blip \
+             would let code-review respawn reviewers over live ones"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_herdr_that_cannot_be_launched_is_unknown_and_assumes_panes_alive() {
+        // No herdr on PATH at all: `Command::output` fails to launch. A DIFFERENT
+        // branch from "ran and exited nonzero" — `pane_exists`'s catch-all
+        // `_ => true` is only reachable this way.
+        let (live, alive) = with_no_herdr_on_path(|h| (h.workspace_list(), h.pane_exists("w1:p1")));
+
+        assert_eq!(
+            live, None,
+            "failing to launch herdr at all is still unknown, never 'nothing is live'"
+        );
+        assert!(
+            alive,
+            "failing to launch herdr at all must still report the pane alive"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_an_explicit_pane_not_found_proves_a_pane_is_gone() {
+        let alive = with_stub_herdr(r#"{"error":{"code":"pane_not_found"}}"#, 1, |h| {
+            h.pane_exists("w1:p1")
+        });
+        assert!(
+            !alive,
+            "herdr's explicit `pane_not_found` is the one answer that proves death"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reachable_herdr_reporting_no_workspaces_is_empty_not_unknown() {
+        // The other half of the distinction: herdr answered, and the answer is
+        // genuinely "nothing is running".
+        let live = with_stub_herdr(
+            r#"{"id":"x","result":{"type":"workspace_list","workspaces":[]}}"#,
+            0,
+            |h| h.workspace_list(),
+        );
+        assert_eq!(
+            live,
+            Some(vec![]),
+            "a successful empty answer must stay distinguishable from unreachable"
+        );
+    }
+
     #[test]
     fn parses_workspace_ids_from_a_real_herdr_response() {
         // Trimmed from actual `herdr workspace list` output (herdr 0.7.5). Kept

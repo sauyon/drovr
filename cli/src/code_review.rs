@@ -317,6 +317,19 @@ pub fn code_review_run<H: Herdr>(
 ) -> io::Result<ReviewOutcome> {
     let dir = run_dir(&run.name);
 
+    // Archived means the human filed this run away and `workspace_close` destroyed
+    // its panes. Refuse before anything is spawned: a *cleanly* archived run would
+    // fail later anyway (`tab_create` against a closed workspace), but one whose
+    // close failed still has live panes, and there we would happily resume, harvest
+    // findings and flip phases to Done on a run the UI shows as archived.
+    if run.archived {
+        eprintln!(
+            "code-review: run '{}' is archived — restore it before reviewing",
+            run.name
+        );
+        return Ok(ReviewOutcome::Error);
+    }
+
     // Scope first: without a recorded base or a readable HEAD there is nothing to
     // review. Base is read before HEAD so "base not recorded" is reported precisely.
     let base = match base_sha(&dir, task) {
@@ -526,7 +539,7 @@ pub fn code_review_run<H: Herdr>(
         if now >= deadline {
             // Leave the outstanding reviewers `Running` and their findings banked: a
             // plain re-run resumes this same iteration and waits only on these.
-            run.save()?;
+            run.save_preserving_archived()?;
             println!(
                 "code-review: {} of {} angles finished; still waiting on {}",
                 harvested.len(),
@@ -541,7 +554,7 @@ pub fn code_review_run<H: Herdr>(
         }
         thread::sleep(POLL_INTERVAL.min(deadline - now));
     }
-    run.save()?;
+    run.save_preserving_archived()?;
 
     // Every angle in → merge in configured order (harvest order is completion order,
     // which is nondeterministic) and write the merged review.
@@ -700,6 +713,32 @@ mod tests {
     }
 
     const CLEAN: &str = r#"{"verdict":"clean","findings":[]}"#;
+
+    #[test]
+    fn an_archived_run_is_refused_before_any_reviewer_is_spawned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-archived");
+        write_base(&run, "task-1");
+        // The human filed this run away: `workspace_close` already destroyed its
+        // workspace, and nothing recreates a closed one.
+        run.archived = true;
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Error,
+            "an archived run's workspace is gone; a review must not start against it"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned into an archived run"
+        );
+        assert!(
+            run.review_phases.is_empty(),
+            "a refused review must not record phases either"
+        );
+    }
 
     #[test]
     fn rerun_after_timeout_resumes_the_same_iter_without_respawning() {

@@ -146,6 +146,33 @@ impl RunState {
         )?;
         Ok(())
     }
+    /// Save, but never resurrect a run the human archived while we were working.
+    ///
+    /// Long-running commands hold a `RunState` loaded minutes ago — `code-review
+    /// run` blocks for up to its timeout (30 min by default) before writing back.
+    /// Archiving from the web UI or `drovr cleanup` flips `archived` on disk
+    /// inside that window and destroys the run's workspace. A plain [`save`] would
+    /// then write our stale `archived: false` over it, leaving a run that looks
+    /// active and un-zombied (its panes really are gone, so nothing flags it) but
+    /// can never run again: nothing recreates a closed workspace.
+    ///
+    /// Only `archived` is rescued, because it is the one field a *different*
+    /// process sets while we hold our copy. Callers that mean to change it — the
+    /// Archive/Restore endpoint, `cleanup` — re-read immediately beforehand and
+    /// use [`save`]/[`save_in`] directly, so Restore can still clear it.
+    ///
+    /// This narrows the race; it does not close it. A concurrent write landing
+    /// between the re-read and the write is still lost (see docs/known-issues.md
+    /// — `state.json` has no locking or compare-and-swap).
+    ///
+    /// [`save`]: RunState::save
+    /// [`save_in`]: RunState::save_in
+    pub fn save_preserving_archived(&mut self) -> io::Result<()> {
+        if let Ok(disk) = RunState::load(&self.name) {
+            self.archived |= disk.archived;
+        }
+        self.save()
+    }
     pub fn first_incomplete(&self) -> Option<usize> {
         self.phases
             .iter()
@@ -277,6 +304,65 @@ mod tests {
         let round: RunState =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
         assert!(round.archived);
+    }
+
+    #[test]
+    fn a_stale_save_never_resurrects_an_archived_run() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+
+        // A long-running command (`code-review run` blocks for up to its timeout)
+        // loads the run while it is still active...
+        let mut stale = completion_run(vec![running("implement")]);
+        stale.save().unwrap();
+
+        // ...the human archives it from the web UI meanwhile, which closes the
+        // workspace and destroys every pane...
+        let mut archiver = RunState::load("r").unwrap();
+        archiver.archived = true;
+        archiver.save().unwrap();
+
+        // ...and only then does the long-running command write its copy back.
+        stale.phases[0].status = PhaseStatus::Done;
+        stale.save_preserving_archived().unwrap();
+
+        let on_disk = RunState::load("r").unwrap();
+        assert!(
+            on_disk.archived,
+            "a save carrying a stale `archived: false` must not un-archive a run \
+             whose workspace has already been destroyed"
+        );
+        assert_eq!(
+            on_disk.phases[0].status,
+            PhaseStatus::Done,
+            "the writer's own progress must still land — only `archived` is rescued"
+        );
+    }
+
+    #[test]
+    fn restore_can_still_clear_the_archived_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![done("implement")]);
+        s.archived = true;
+        s.save().unwrap();
+
+        // Restore deliberately clears the flag and uses a plain `save`, which must
+        // NOT rescue the on-disk `true` — otherwise archiving would be one-way.
+        let mut restore = RunState::load("r").unwrap();
+        restore.archived = false;
+        restore.save().unwrap();
+
+        assert!(
+            !RunState::load("r").unwrap().archived,
+            "Restore must still be able to un-archive a run"
+        );
     }
 
     #[test]
