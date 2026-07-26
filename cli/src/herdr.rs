@@ -2,7 +2,8 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -641,27 +642,30 @@ impl Herdr for SystemHerdr {
                 // Connection refused, read timeout, or a JSON-RPC error such as
                 // an unknown pane — herdr's own message is the only clue, and
                 // `.ok()?` used to drop it on the floor.
-                if first_time(&PANE_GET_ERROR_WARNED) {
+                if first_time_for(&PANE_GET_ERROR_WARNED, pane_id) {
                     eprintln!("{}", pane_get_error_message(pane_id, &err.to_string()));
                 }
                 return None;
             }
         };
         let info = parse_pane_info(&result);
-        if info.is_none() && first_time(&PANE_GET_SHAPE_WARNED) {
+        if info.is_none() && first_time_for(&PANE_GET_SHAPE_WARNED, pane_id) {
             // A closed/unknown pane comes back as a socket *error* handled
             // above, so an unparseable SUCCESS means herdr's response shape
             // moved under us. That degrades silently and totally (every poll
             // `None` → `phase_send` burns its readiness timeout on a healthy
             // agent, `blocked` is never detected early).
-            eprintln!("{}", pane_get_shape_message(&result));
+            eprintln!("{}", pane_get_shape_message(pane_id, &result));
         }
         info
     }
 
     fn tab_close(&self, tab_id: &TabId) -> io::Result<()> {
-        // Socket `tab.close` (params: `tab_id`) → `{"type":"ok"}`.
-        self.socket_call("tab.close", json!({ "tab_id": tab_id.as_str() }))?;
+        // Socket `tab.close` (params: `tab_id`) → `{"type":"ok"}`. The error is
+        // re-wrapped with the tab it names, matching `pane_info`'s diagnostics:
+        // reaping swallows this after logging it.
+        self.socket_call("tab.close", json!({ "tab_id": tab_id.as_str() }))
+            .map_err(|err| io::Error::other(tab_close_error_message(tab_id, &err.to_string())))?;
         Ok(())
     }
 
@@ -707,31 +711,35 @@ fn find_string_field(value: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// Set once the first unreadable `pane.get` success has been reported, so a
-/// 500 ms poll loop warns once per process rather than twice a second.
-static PANE_GET_SHAPE_WARNED: AtomicBool = AtomicBool::new(false);
+/// Panes whose unreadable `pane.get` success has been reported.
+static PANE_GET_SHAPE_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// Set once the first socket-layer `pane.get` failure has been reported.
-static PANE_GET_ERROR_WARNED: AtomicBool = AtomicBool::new(false);
+/// Panes whose socket-layer `pane.get` failure has been reported.
+static PANE_GET_ERROR_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// `true` the first time it is called for `flag`, `false` forever after. Turns
-/// a 500 ms poll loop's diagnostic into one line per process instead of two a
-/// second.
-fn first_time(flag: &AtomicBool) -> bool {
-    !flag.swap(true, Ordering::Relaxed)
+/// `true` the first time `pane_id` is seen in `seen`, `false` for every later
+/// call with the same pane. Turns a 500 ms poll loop's diagnostic into one line
+/// per pane instead of two a second — and keys it PER PANE, because a reap loop
+/// polls many: one pane's transient failure must not silence a different pane's
+/// persistent one. A poisoned lock reports rather than swallows.
+fn first_time_for(seen: &Mutex<BTreeSet<String>>, pane_id: &str) -> bool {
+    match seen.lock() {
+        Ok(mut seen) => seen.insert(pane_id.to_string()),
+        Err(_) => true,
+    }
 }
 
 /// The diagnostic for a `pane.get` that succeeded with a shape
 /// [`parse_pane_info`] does not recognise. Names the result's top-level keys
 /// only, never their values: the payload carries cwds and terminal titles.
-fn pane_get_shape_message(result: &Value) -> String {
+fn pane_get_shape_message(pane_id: &str, result: &Value) -> String {
     let keys = match result.as_object() {
         Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
         None => "<not an object>".to_string(),
     };
     format!(
-        "drovr: herdr's pane.get returned a shape drovr cannot read \
-         (expected a `pane` object with a `tab_id`; got keys: {keys}). \
+        "drovr: herdr's pane.get returned a shape drovr cannot read for pane \
+         {pane_id} (expected a `pane` object with a `tab_id`; got keys: {keys}). \
          Agent status polling is degraded — phase sends will wait out their \
          readiness timeout. Check the herdr version."
     )
@@ -748,6 +756,13 @@ fn pane_get_error_message(pane_id: &str, err: &str) -> String {
          their timeouts with no other explanation. (A pane that has been closed \
          reports this too.)"
     )
+}
+
+/// The error a failed `tab.close` carries. Reaping treats a close as
+/// best-effort — it logs the failure and moves on — so the message has to name
+/// the tab it was aiming at, or the log says nothing usable.
+fn tab_close_error_message(tab_id: &TabId, err: &str) -> String {
+    format!("herdr tab.close failed for tab {}: {err}", tab_id.as_str())
 }
 
 /// A non-empty string field of `value`, or `None`. herdr writes `""` for some
@@ -851,6 +866,23 @@ impl FakeHerdr {
         TabId(format!("tab-of-{pane_id}"))
     }
 
+    /// The raw session-id value the fake reports for an agent attached to
+    /// `pane_id`. Exposed so a test can assert on a captured/persisted id
+    /// without hard-coding the derivation.
+    pub fn session_value_for(pane_id: &str) -> String {
+        format!("session-of-{pane_id}")
+    }
+
+    /// The session the fake reports for an agent attached to `pane_id`, owned by
+    /// `claude` — the default backend. A test needing another backend scripts a
+    /// whole `PaneInfo` with [`FakeHerdr::push_pane_info`].
+    fn session_for(pane_id: &str) -> AgentSession {
+        AgentSession::Id(IdSession {
+            value: SessionId(Self::session_value_for(pane_id)),
+            agent: Some("claude".to_string()),
+        })
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
@@ -860,13 +892,18 @@ impl FakeHerdr {
         self.read_queue.borrow_mut().push_back(text.into());
     }
 
-    /// Queue a status for the next `pane_info` poll (and so for the next
-    /// `agent_status`). Pass `Some("blocked")` to model a blocked pane, or `None`
-    /// to model a pane that cannot be read. Mirrors `push_read`.
+    /// Queue a status for the next `pane_info` poll. Pass `Some("blocked")` to
+    /// model a blocked pane, or `None` to model a pane that cannot be read at
+    /// all. Mirrors `push_read`.
     ///
     /// Takes the RAW herdr string, classified through [`AgentStatus::from_herdr`]
     /// exactly as a real response would be — so `push_status(Some("compacting"))`
     /// models a herdr state drovr has never seen.
+    ///
+    /// The session follows the status the way herdr's does: `"unknown"` is the
+    /// status of a pane whose agent has EXITED, so it comes back with no
+    /// session; every other status models an attached agent, which always
+    /// carries one.
     pub fn push_status(&self, status: Option<impl Into<String>>) {
         self.status_queue
             .borrow_mut()
@@ -985,6 +1022,13 @@ impl Herdr for FakeHerdr {
         // through `phase_send`'s readiness gate instead of waiting out its
         // timeout. Tests that need a different status (blocked, done, or an
         // unreadable `None`) push it explicitly.
+        //
+        // FIDELITY: an attached agent ALWAYS carries an `agent_session` in real
+        // herdr (verified live against a working claude pane); only an exited
+        // agent — herdr status `unknown` — lacks one. The fake ties the two
+        // together the same way, because reaping classifies on the SESSION, and
+        // a session-less "live" pane here would teach every later test the
+        // opposite of what herdr does.
         let info = if *self.fail_pane_info.borrow() {
             None
         } else if let Some(scripted) = self.pane_info_queue.borrow_mut().pop_front() {
@@ -995,10 +1039,17 @@ impl Herdr for FakeHerdr {
                 None => Some("idle".to_string()),
             };
             // A scripted `None` status means the pane could not be read at all.
-            status.map(|status| PaneInfo {
-                tab_id: Self::tab_id_for(pane_id),
-                agent_status: Some(AgentStatus::from_herdr(&status)),
-                agent_session: None,
+            status.map(|status| {
+                let status = AgentStatus::from_herdr(&status);
+                let agent_session = match status {
+                    AgentStatus::Unknown => None,
+                    _ => Some(Self::session_for(pane_id)),
+                };
+                PaneInfo {
+                    tab_id: Self::tab_id_for(pane_id),
+                    agent_status: Some(status),
+                    agent_session,
+                }
             })
         };
         // `pane_info` IS the status poll, so the recorded line names the status:
@@ -1159,26 +1210,50 @@ mod tests {
     // payload carries cwds and terminal titles.
     #[test]
     fn pane_get_shape_message_lists_keys_not_values() {
-        let msg = pane_get_shape_message(&socket_result(
-            r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/home/someone/secret-project"}]}}"#,
-        ));
+        let msg = pane_get_shape_message(
+            "wAF:p7",
+            &socket_result(
+                r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/home/someone/secret-project"}]}}"#,
+            ),
+        );
         assert!(msg.contains("panes"), "msg: {msg}");
+        assert!(
+            msg.contains("wAF:p7"),
+            "the degraded pane must be nameable: {msg}"
+        );
         assert!(
             !msg.contains("secret-project"),
             "values must never be printed: {msg}"
         );
         // A non-object result is reported, not swallowed.
-        assert!(pane_get_shape_message(&Value::Null).contains("not an object"));
+        assert!(pane_get_shape_message("wAF:p7", &Value::Null).contains("not an object"));
     }
 
     // Both diagnostics are gated so a 500 ms poll loop reports once per process
     // rather than twice a second.
+    // Gated PER PANE, not per process: task 6 reaps across many panes, and one
+    // pane's transient failure must not silence every other pane's persistent
+    // one — that is precisely when the log is needed.
+    // Task 6 treats a close as best-effort and swallows the error after logging
+    // it, so an error that does not name the tab is close to useless.
     #[test]
-    fn first_time_is_true_exactly_once() {
-        let flag = AtomicBool::new(false);
-        assert!(first_time(&flag), "the first call reports");
-        assert!(!first_time(&flag), "and every later one is silent");
-        assert!(!first_time(&flag));
+    fn tab_close_error_message_names_the_tab_and_the_cause() {
+        let msg = tab_close_error_message(&TabId("wAF:t1".to_string()), "no such tab");
+        assert!(msg.contains("wAF:t1"), "msg: {msg}");
+        assert!(msg.contains("no such tab"), "msg: {msg}");
+        assert!(msg.contains("tab.close"), "msg: {msg}");
+    }
+
+    #[test]
+    fn first_time_is_true_once_per_pane() {
+        let seen = Mutex::new(BTreeSet::new());
+        assert!(first_time_for(&seen, "w1:p1"), "the first call reports");
+        assert!(!first_time_for(&seen, "w1:p1"), "and every later one is silent");
+        assert!(
+            first_time_for(&seen, "w1:p2"),
+            "a different pane reports on its own"
+        );
+        assert!(!first_time_for(&seen, "w1:p2"));
     }
 
     // Tasks 3 and 6 both hinge on telling these three outcomes apart, so the
@@ -1600,7 +1675,44 @@ mod tests {
         let info = h.pane_info("pane-1").unwrap();
         assert_eq!(info.tab_id, FakeHerdr::tab_id_for("pane-1"));
         assert_eq!(info.agent_status, Some(AgentStatus::Idle));
-        assert!(info.agent_session.is_none());
+        // An attached agent ALWAYS carries a session in real herdr — verified
+        // live against a working claude pane. A fake that omitted it would teach
+        // every later test that a live agent looks session-less, and reaping
+        // keys off exactly that.
+        assert_eq!(info.state(), PaneState::AgentAttached);
+        let session = info.agent_session.expect("an attached agent has a session");
+        assert_eq!(
+            session.resumable_for("claude").map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str())
+        );
+    }
+
+    // Only an EXITED agent lacks a session, and herdr signals that with its own
+    // `unknown` status — so the fake ties the two together the way herdr does.
+    #[test]
+    fn fake_pane_info_drops_the_session_only_for_an_exited_agent() {
+        let h = FakeHerdr::new();
+        h.push_status(Some("unknown"));
+        let exited = h.pane_info("pane-1").unwrap();
+        assert_eq!(exited.agent_status, Some(AgentStatus::Unknown));
+        assert!(!exited.has_agent_session());
+        assert_eq!(exited.state(), PaneState::NoAgentSession);
+        assert_eq!(
+            exited.tab_id,
+            FakeHerdr::tab_id_for("pane-1"),
+            "an exited agent still has a closable tab"
+        );
+
+        // Every other status models an attached agent, session and all.
+        for status in ["idle", "working", "blocked", "done"] {
+            h.push_status(Some(status));
+            let info = h.pane_info("pane-1").unwrap();
+            assert_eq!(
+                info.state(),
+                PaneState::AgentAttached,
+                "{status} is a live agent"
+            );
+        }
     }
 
     #[test]

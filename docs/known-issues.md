@@ -1,5 +1,34 @@
 # Known issues
 
+## Reviewers judge an intermediate task against the WHOLE run's goal
+
+### Symptom
+
+On a multi-task run, `drovr code-review run <run> <task>` returns a CRITICAL finding of the form
+"task behavior is not implemented" for work the plan deliberately schedules in a *later* task.
+
+Observed on run `phase-reap`, `task-2`, iteration 5: task 2 adds herdr capability only — the plan
+says "Nothing is ever closed until task 6" — and the correctness reviewer reported the absence of
+reaping and of `--resume` rehydration as a critical defect of that diff.
+
+### Root cause
+
+`build_seed` (`cli/src/code_review.rs`) seeds every reviewer with `run.task`, the run's overall goal
+("Reap finished phase panes, with rehydrate-in-the-UI"). The reviewer never sees the per-task brief
+that bounds the diff, so it measures an intermediate diff against the finished feature and correctly
+observes that most of the feature is missing.
+
+### Impact
+
+It fires on every intermediate task of every multi-task run, and it is expensive: a spurious CRITICAL
+costs a review round to adjudicate, and the driver must recognise it as a scope artifact rather than
+route it as a fix. It also crowds out real findings in the same angle.
+
+### Fix idea
+
+Seed the reviewer with the per-task brief instead of `run.task` — or pass both, and state explicitly
+which one bounds the diff's scope.
+
 ## `phase wait` times out on a phase completed by a PRE-pass-token drovr build
 
 Introduced by the pass-token change (task 1 of the phase-reap work).
