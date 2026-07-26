@@ -935,6 +935,9 @@ pub struct FakeHerdr {
     /// When true, every `tab_close` returns an error — reaping is best-effort,
     /// so callers must survive it.
     fail_tab_close: RefCell<bool>,
+    /// When true, every `agent_send` returns an error (tests what a caller
+    /// reports about the state a failed send leaves behind).
+    fail_agent_send: RefCell<bool>,
 }
 
 #[cfg(test)]
@@ -949,6 +952,7 @@ impl FakeHerdr {
             fail_pane_run: RefCell::new(false),
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
+            fail_agent_send: RefCell::new(false),
         }
     }
 
@@ -1026,6 +1030,12 @@ impl FakeHerdr {
         *self.fail_tab_close.borrow_mut() = true;
     }
 
+    /// Make every `agent_send` fail. `phase_send` re-opens the phase BEFORE it
+    /// sends, so this is how a test reaches the state a failed delivery leaves.
+    pub fn fail_agent_send(&self) {
+        *self.fail_agent_send.borrow_mut() = true;
+    }
+
     fn record(&self, call: String) {
         self.calls.borrow_mut().push(call);
     }
@@ -1092,6 +1102,9 @@ impl Herdr for FakeHerdr {
 
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
+        if *self.fail_agent_send.borrow() {
+            return Err(io::Error::other("fake agent_send failure"));
+        }
         Ok(())
     }
 

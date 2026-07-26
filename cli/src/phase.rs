@@ -612,7 +612,25 @@ fn phase_send_with_timeout<H: Herdr>(
     // completion on every failed send (a phase parked on a permission prompt
     // would lose its `Done` and its marker without any new work being requested).
     reopen_for_re_entry(run, phase)?;
-    h.agent_send(&pane_id, text)
+    // The re-open already happened, so a send failure is NOT "nothing happened":
+    // the previous pass's completion marker has been deleted and the status is
+    // back to `Running`. A caller told only "agent_send failed" will read that
+    // phase as work in progress forever — the phantom-incomplete-phase state.
+    // Say what was left behind, and name the way out (re-send; the re-open is
+    // idempotent).
+    h.agent_send(&pane_id, text).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "phase '{phase}' of run '{run_name}': the prompt could not be delivered ({e}), \
+                 but this phase had ALREADY been re-opened for it — its completion marker is \
+                 deleted and its status is back to Running, so it now looks like work in \
+                 progress that nobody was asked to do. Re-send once the pane is reachable \
+                 (re-opening again is harmless), or mark the phase failed.",
+                run_name = run.name,
+            ),
+        )
+    })
 }
 
 /// Mark a phase complete by dropping its completion marker. Run BY the phase
@@ -3956,6 +3974,42 @@ mod tests {
         assert!(
             err.contains("env -u DROVR_PASS drovr phase done 'done-quote-legacy; id' 'plan'"),
             "the drop-the-token remedy must be quoted too: {err}"
+        );
+    }
+
+    #[test]
+    fn a_send_that_fails_after_the_re_open_says_the_completion_is_gone() {
+        // `reopen_for_re_entry` runs BEFORE `agent_send`, so a send that fails
+        // leaves the phase Running with its completion marker already deleted —
+        // exactly the state that later reads as a phantom incomplete phase. The
+        // bare transport error says nothing about it, and the caller is left
+        // believing nothing happened.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-fail-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
+        run.phases[0].status = PhaseStatus::Done;
+        run.save().unwrap();
+
+        h.fail_agent_send();
+        let err = phase_send(&h, &mut run, "plan", "next").unwrap_err().to_string();
+
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "precondition: the re-open really did clear the marker"
+        );
+        assert!(
+            err.contains("completion marker"),
+            "the failure must report the state it left behind, not only the \
+             transport error: {err}"
+        );
+        assert!(
+            err.contains("plan") && err.contains("send-fail-test"),
+            "and name the phase it applies to: {err}"
         );
     }
 
