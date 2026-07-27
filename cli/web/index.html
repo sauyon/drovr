@@ -2088,6 +2088,41 @@ async function toggleArchive(name, archived, live) {
   renderRunList(gen);
 }
 
+// Answer any archive hand-offs this render is fresh enough to settle. Must be
+// called only AFTER the rows for `seq` are in the DOM: it asks what is on screen.
+//
+// Not called from the catch path on purpose — a failed fetch leaves the previous
+// list painted, which cannot say whether the row left, so entries wait for a
+// render that can answer.
+function resolvePendingAdvances(seq) {
+  if (!pendingAdvances.length) return;
+  pendingAdvances = pendingAdvances.filter(function(p) {
+    // This render's list was fetched before that archive committed, so it cannot
+    // say whether the row left. Keep waiting.
+    if (seq <= p.afterSeq) return true;
+    // Deliberately NOT `p.gen === routeGen`: `route()` bumps routeGen on every 2s
+    // poll, so any archive whose herdr round-trip outlasted one tick looked like
+    // a view change, and its hand-off was dropped without ever moving the cursor
+    // — stranding it. What actually matters is being on the list at all, since
+    // inside a run the cursor belongs to question rows.
+    if (!currentRun && navCursorKey === p.name && !isRowVisible(p.name)) {
+      // The neighbour was captured before the POST and may itself be gone by now
+      // — archiving the last two rows makes them each other's neighbour, so
+      // following it blindly put the cursor on the other archived row. Re-check
+      // against what is actually on screen, and fall back to the top of the list.
+      navCursorKey = isRowVisible(p.neighbour) ? p.neighbour : firstVisibleKey();
+    }
+    // Survived as a zombie, or the reviewer moved on: either way, answered.
+    return false;
+  });
+}
+
+// The key of the first selectable row, or '' when the list is empty.
+function firstVisibleKey() {
+  var rows = navRows();
+  return rows.length ? rowKey(rows[0]) : '';
+}
+
 // The row adjacent to `run` in the visible list, or '' if there is none. Called
 // BEFORE an action that may remove `run`, since afterwards its neighbours can no
 // longer be identified from it.
@@ -2139,6 +2174,7 @@ async function renderRunList(gen, resetAnchor) {
     knownRunNames = runs.map(function(x) { return x.name; });
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
+      resolvePendingAdvances(seq);
       applyNavCursor(false);
       return;
     }
@@ -2150,6 +2186,7 @@ async function renderRunList(gen, resetAnchor) {
       });
       if (!runs.length) {
         listEl.innerHTML = '<div class="review-empty">No sessions match that filter.</div>';
+        resolvePendingAdvances(seq);
         applyNavCursor(false);
         return;
       }
@@ -2223,22 +2260,7 @@ async function renderRunList(gen, resetAnchor) {
     // Resolve a pending archive hand-off, now that rows reflect a list fetched
     // after the archive committed. Whichever render gets here first answers it —
     // this one, the 2s poll, or a filter change — so no ordering can lose it.
-    if (pendingAdvances.length) {
-      pendingAdvances = pendingAdvances.filter(function(p) {
-        // This render's list was fetched before that archive committed, so it
-        // cannot say whether the row left. Keep waiting.
-        if (seq <= p.afterSeq) return true;
-        if (p.gen === routeGen && navCursorKey === p.name && !isRowVisible(p.name)) {
-          // It really left: hand the cursor to the neighbour captured while the
-          // row was still on screen. Left to `applyNavCursor`, a run that is
-          // archived but still listed reads as merely hidden, and the cursor
-          // parks on a row that is never coming back.
-          navCursorKey = p.neighbour;
-        }
-        // Survived as a zombie, or the reviewer moved on: either way, answered.
-        return false;
-      });
-    }
+    resolvePendingAdvances(seq);
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
     applyNavCursor(false);

@@ -997,6 +997,123 @@ check('...and the cursor is on a visible row, not parked',
   (await cursorName()) !== null && (await rowNames()).indexOf(await cursorName()) !== -1, true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
+// (5) An archive slower than one poll tick. `route()` bumps routeGen every 2s,
+// so gating the hand-off on `gen === routeGen` meant any archive whose herdr
+// round-trip outlasted a tick was dropped un-applied and the cursor stranded.
+// No double click, no adversarial timing — just a slow workspace close.
+await reload(LIST_READY);
+await stubConfirm();
+await press('g');
+const slowRow = await cursorName();
+await evaluate(`
+  window.__sDone = false;
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__sDone = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === ${JSON.stringify(slowRow)} && window.__sDone
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('a');
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the archive to dispatch its render');
+// Let the real 2s poll tick at least once while the archive is still in flight,
+// which is what used to invalidate the hand-off's generation.
+const genBefore = await evaluate(`return routeGen;`);
+await waitFor(() => evaluate(`return routeGen;`), g => g > genBefore, 8000,
+  'the poll to advance routeGen');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(cursorName, n => n !== null && n !== slowRow, 8000,
+  'the cursor to advance after a slow archive');
+check('an archive slower than a poll tick still hands the cursor on',
+  (await cursorName()) !== null && (await cursorName()) !== slowRow, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (6) The LAST two rows archived before either repaints. `neighbourKey` falls
+// back to the previous row when there is no next one, so those two name each
+// other — following a captured neighbour blindly put the cursor on the other
+// archived row. The neighbour has to be re-checked against what is on screen.
+await reload(LIST_READY);
+await stubConfirm();
+const allRows = await rowNames();
+const lastRow = allRows[allRows.length - 1];
+const secondLast = allRows[allRows.length - 2];
+await evaluate(`
+  window.__done2 = {};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    var m = s.match(/\\/api\\/runs\\/([^/]+)\\/archive/);
+    if (m) {
+      window.__done2[decodeURIComponent(m[1])] = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return window.__done2[x.name]
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`
+  navCursorKey = ${JSON.stringify(secondLast)};
+  applyNavCursor(false);
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(secondLast)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the first of the two archives');
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(lastRow)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the second of the two archives');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(rowNames, r => r.indexOf(secondLast) === -1 && r.indexOf(lastRow) === -1,
+  8000, 'both rows to leave');
+const survivor = await cursorName();
+check('archiving the last two rows leaves the cursor on a surviving row',
+  survivor !== null && survivor !== secondLast && survivor !== lastRow, true);
+check('...and that row is actually visible',
+  (await rowNames()).indexOf(survivor) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);
 await press('/');
