@@ -310,12 +310,63 @@ fn extract_findings_json(transcript: &str) -> Option<String> {
             break;
         };
         let block = body[..close].trim();
-        if block.starts_with('{') {
+        // Must PARSE, not merely start with `{`: the seed echoes the schema inside a
+        // fence (`"verdict": "clean" | "changes"`), which is not JSON. Accepting it would
+        // let that echo shadow the reviewer's real findings.
+        if block.starts_with('{') && parse_review(block).is_ok() {
             result = Some(block.to_string());
         }
         rest = &body[close + 3..];
     }
-    result
+    // Fenceless fallback. Reviewers routinely print `Review complete. Findings below.`
+    // and then a bare top-level object; a fence-only extractor threw those away and
+    // reported "produced no findings JSON" with valid findings on screen.
+    result.or_else(|| last_review_object(transcript))
+}
+
+/// The LAST balanced top-level `{...}` in `text` that parses as a [`Review`].
+///
+/// Scans for `{`, then walks forward tracking brace depth while ignoring braces inside
+/// JSON strings (and escapes within them), so a `summary` containing `{` cannot end the
+/// object early. Every candidate is validated by `parse_review`, so prose that merely
+/// contains braces is skipped rather than mistaken for findings.
+fn last_review_object(text: &str) -> Option<String> {
+    let mut found = None;
+    for (start, _) in text.char_indices().filter(|(_, c)| *c == '{') {
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (offset, c) in text[start..].char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = start + offset;
+                        if let Some(slice) = text.get(start..=end)
+                            && parse_review(slice).is_ok()
+                        {
+                            found = Some(slice.to_string());
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 /// Obtain one reviewer's findings JSON: read the file it wrote (primary), else fall
@@ -1754,6 +1805,34 @@ mod tests {
         assert_eq!(resumable_iter(&run, "task-2", &angles), Some(1));
     }
 
+    /// Cursor reviewers print `Review complete. Findings below.` and then a BARE
+    /// top-level JSON object — no fence. The only fenced block in such a transcript is
+    /// the schema echoed from the seed, so a fence-only extractor recovers nothing while
+    /// valid findings sit on screen. That cost a whole panel round (see
+    /// docs/known-issues.md).
+    #[test]
+    fn extract_findings_json_recovers_unfenced_output() {
+        let t = "Review complete. Findings below.\n\n\
+                 {\n  \"verdict\": \"changes\",\n  \"findings\": [\n    \
+                 {\"file\": \"a.rs\", \"severity\": \"important\", \"summary\": \"boom\"}\n  ]\n}\n\n\
+                 → Add a follow-up\n";
+        let got = extract_findings_json(t).expect("unfenced findings must be recovered");
+        let review = parse_review(&got).expect("and must parse as a Review");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.verdict, "changes");
+    }
+
+    /// The seed echoes the SCHEMA inside a fence, and that schema is not valid JSON
+    /// (`"clean" | "changes"`). A fenced block that does not parse must never shadow real
+    /// findings that appear later unfenced.
+    #[test]
+    fn a_fenced_schema_echo_does_not_shadow_real_unfenced_findings() {
+        let t = "## Output\n```json\n{\n  \"verdict\": \"clean\" | \"changes\"\n}\n```\n\
+                 Review complete.\n{\"verdict\":\"clean\",\"findings\":[]}\n";
+        let got = extract_findings_json(t).expect("real findings must win over the schema echo");
+        assert!(parse_review(&got).is_ok(), "recovered: {got}");
+    }
+
     #[test]
     fn extract_findings_json_picks_last_json_fence() {
         let t = "prose\n```\nnot json\n```\nmore\n```json\n{\"verdict\":\"clean\"}\n```\ntail";
@@ -1868,7 +1947,15 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false, Some("watch the retry loop")).unwrap(),
+            code_review_run(
+                &h,
+                &mut run,
+                "task-1",
+                40,
+                false,
+                Some("watch the retry loop")
+            )
+            .unwrap(),
             ReviewOutcome::Timeout
         );
         let dir = run_dir(&run.name);
@@ -1886,8 +1973,7 @@ mod tests {
             code_review_run(&h, &mut run, "task-1", 40, true, None).unwrap(),
             ReviewOutcome::Timeout
         );
-        let seed =
-            std::fs::read_to_string(dir.join("task-1-review-correctness-seed.md")).unwrap();
+        let seed = std::fs::read_to_string(dir.join("task-1-review-correctness-seed.md")).unwrap();
         assert!(
             seed.contains("watch the retry loop"),
             "a later pass must reuse the recorded context: {seed}"
