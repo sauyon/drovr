@@ -648,7 +648,7 @@ angle looks like a reviewer that simply produced nothing.
   a config passed on the command line), and registers it under `--permission-mode plan`.
 - The server itself is correct end-to-end: a hand-driven stdio JSON-RPC session
   (`initialize` → `tools/list` → `tools/call`) returns the tool and writes
-  `<task>-review-<angle>.json` exactly where the panel reads it.
+  `<task>-review-<iter>-<angle>.json` exactly where the panel reads it.
 
 ### Mitigations
 
@@ -688,7 +688,7 @@ regression; the behaviour predates the MCP findings channel.
 ### Symptom
 
 A reviewer that finishes without delivering anything — it never called `submit_findings`, so
-`<task>-review-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
+`<task>-review-<iter>-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
 CLI maps to **exit 1** ("setup failure: STOP and diagnose"). The other three angles' findings
 are already banked on disk and no merged `<task>-review.json` is written.
 

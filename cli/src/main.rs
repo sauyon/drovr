@@ -133,6 +133,9 @@ enum Commands {
         run: String,
         /// Task under review, e.g. `task-3`.
         task: String,
+        /// Review iteration this panel is serving. Scopes the findings file, so one
+        /// pass can never harvest another's verdicts.
+        iter: u64,
     },
 }
 
@@ -1119,7 +1122,17 @@ fn main() {
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
-        Commands::McpFindings { run, task } => {
+        Commands::McpFindings { run, task, iter } => {
+            // Both reach the filesystem as path components. The panel always supplies
+            // names it has already validated, but this is a write-capable entrypoint
+            // and nothing stops it being invoked directly — so it validates its own
+            // inputs rather than trusting its only intended caller.
+            for (kind, value) in [("run name", &run), ("task", &task)] {
+                if let Err(e) = validate_label(kind, value) {
+                    eprintln!("drovr: mcp-findings: {e}");
+                    process::exit(1);
+                }
+            }
             let angles = match config::load_config() {
                 Ok(c) => c.angles,
                 Err(e) => {
@@ -1127,7 +1140,7 @@ fn main() {
                     process::exit(1);
                 }
             };
-            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, &angles) {
+            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, iter, &angles) {
                 eprintln!("drovr: mcp-findings failed: {e}");
                 process::exit(1);
             }
@@ -1808,6 +1821,31 @@ mod tests {
         assert!(validate_label("task", "a/b").is_err());
         assert!(validate_label("task", "a\\b").is_err());
         assert!(validate_label("task", "").is_err());
+    }
+
+    /// `mcp-findings` turns `run` and `task` into path components, and it is the one
+    /// write-capable entrypoint drovr exposes. It is spawned by the panel with names
+    /// already validated, but nothing stops it being invoked directly, so it must
+    /// enforce the same rule rather than inherit it from its intended caller.
+    #[test]
+    fn mcp_findings_run_and_task_are_the_labels_the_dispatch_validates() {
+        let cmd = Cli::parse_from(["drovr", "mcp-findings", "../escape", "task-1", "2"]);
+        let Commands::McpFindings { run, task, iter } = cmd.command else {
+            panic!("expected McpFindings");
+        };
+        assert_eq!(iter, 2, "the iteration scopes the findings file");
+        // Exactly the checks the dispatch arm applies before serving.
+        assert!(
+            validate_label("run name", &run).is_err(),
+            "a traversing run name must be refused"
+        );
+        assert!(validate_label("task", &task).is_ok());
+        for bad in ["../escape", "a/b", ".."] {
+            assert!(
+                validate_label("task", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
     }
 
     // -- format_progress helper -------------------------------------------------

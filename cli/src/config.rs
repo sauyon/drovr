@@ -228,6 +228,14 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             review_model: Some("composer-2.5".into()),
             // No per-launch scoping exists: servers come from the project's
             // `.cursor/mcp.json`, so drovr writes that file instead.
+            //
+            // `--approve-mcps` approves EVERY server in that file — there is no
+            // per-server form. That is only safe because
+            // `code_review::write_mcp_config` makes drovr's findings server the sole
+            // entry, backing up anything it displaces. Preserving other servers here
+            // would auto-approve them for a read-only reviewer, and `.cursor/mcp.json`
+            // is a path the repository under review can simply commit. If that write
+            // is ever made to merge again, this flag has to go with it.
             mcp: Some(McpDelivery::ProjectFile {
                 path: ".cursor/mcp.json".into(),
                 extra_flags: vec!["--approve-mcps".into()],

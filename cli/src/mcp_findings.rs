@@ -11,10 +11,12 @@
 //!
 //! # Why the path is not a parameter
 //!
-//! `dir`/`task`/`angle` come from argv, chosen by drovr when it spawns the reviewer.
-//! The tool takes only the findings themselves. A reviewer cannot name the file it
-//! writes, so a confused or hostile one cannot use its single write to clobber another
-//! angle's verdict, a run's `state.json`, or anything else on disk.
+//! `dir`/`task`/`iter` come from argv, chosen by drovr when it spawns the reviewer,
+//! and `angle` is validated against the panel's configured set. The tool takes only
+//! the findings themselves. A reviewer cannot name the file it writes, so a confused
+//! or hostile one cannot use its single write to reach a run's `state.json`, the
+//! project, or anything else on disk. (It *can* name a panel-mate's angle — see the
+//! note at the angle check in [`handle`]; that is a reviewed, deliberate tradeoff.)
 //!
 //! # Why validation happens here
 //!
@@ -26,7 +28,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::findings::parse_review;
+use crate::findings::{Impact, Severity, Verdict, parse_review};
 
 /// JSON-RPC + MCP wire constants.
 const JSONRPC: &str = "2.0";
@@ -47,10 +49,52 @@ pub(crate) fn qualified_tool_name() -> String {
     format!("mcp__{SERVER_NAME}__{TOOL_NAME}")
 }
 
-/// The tool's JSON Schema. Mirrors `findings::Review` — `verdict` is required (its
-/// absence is what makes an arbitrary object fail `parse_review`), `findings` defaults
-/// to empty so a clean review is one short call.
+/// The JSON Schema for a `Review` body — everything `submit_findings` takes EXCEPT
+/// `angle`, which is drovr's routing argument rather than part of a review.
+///
+/// **This is the single source of truth for the findings shape.** It is what the MCP
+/// tool advertises AND what `code_review::build_seed` renders into the reviewer's
+/// brief, and its closed `enum`s are built from `findings::{Verdict, Impact,
+/// Severity}::WIRE` — the same values `parse_review` accepts. Three copies of this
+/// shape used to exist (tool schema, seed schema, Rust types) and could drift
+/// independently; a drift there tells a reviewer to send something validation then
+/// rejects, which reads exactly like a lazy reviewer.
+pub(crate) fn review_schema() -> serde_json::Value {
+    serde_json::json!({
+        "verdict": {
+            "type": "string",
+            "enum": Verdict::WIRE,
+            "description": "\"changes\" if you found any critical or important issue, else \"clean\"."
+        },
+        "findings": {
+            "type": "array",
+            "description": "One entry per issue. Empty for a clean review.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "severity": {"type": "string", "enum": Severity::WIRE},
+                    "summary": {"type": "string", "description": "one line: what is wrong"},
+                    "rationale": {"type": "string", "description": "why it matters"}
+                },
+                "required": ["file", "severity", "summary"]
+            }
+        },
+        "impact": {"type": "string", "enum": Impact::WIRE}
+    })
+}
+
+/// The tool's JSON Schema: [`review_schema`] plus the `angle` drovr routes on.
+/// `verdict` is required (its absence is what makes an arbitrary object fail
+/// `parse_review`); `findings` defaults to empty so a clean review is one short call.
 fn tool_def(angles: &[String]) -> serde_json::Value {
+    let mut properties = review_schema();
+    properties["angle"] = serde_json::json!({
+        "type": "string",
+        "enum": angles,
+        "description": "The angle YOU were assigned. Submitting under another reviewer's angle overwrites their verdict."
+    });
     serde_json::json!({
         "name": TOOL_NAME,
         "description":
@@ -59,42 +103,23 @@ fn tool_def(angles: &[String]) -> serde_json::Value {
              complete. A clean review is verdict \"clean\" with an empty findings list.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "angle": {
-                    "type": "string",
-                    "enum": angles,
-                    "description": "The angle YOU were assigned. Submitting under another reviewer's angle overwrites their verdict."
-                },
-                "verdict": {
-                    "type": "string",
-                    "enum": ["clean", "changes"],
-                    "description": "\"changes\" if you found any critical or important issue, else \"clean\"."
-                },
-                "findings": {
-                    "type": "array",
-                    "description": "One entry per issue. Empty for a clean review.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string", "enum": ["critical", "important", "nit"]},
-                            "summary": {"type": "string", "description": "one line: what is wrong"},
-                            "rationale": {"type": "string", "description": "why it matters"}
-                        },
-                        "required": ["file", "severity", "summary"]
-                    }
-                },
-                "impact": {"type": "string", "enum": ["low", "medium", "high"]}
-            },
+            "properties": properties,
             "required": ["angle", "verdict"]
         }
     })
 }
 
 /// Where this server's single write lands.
-pub(crate) fn findings_path(dir: &Path, task: &str, angle: &str) -> PathBuf {
-    dir.join(format!("{task}-review-{angle}.json"))
+///
+/// The **iteration** is part of the name, not decoration. Each review pass reviews a
+/// different diff, so a verdict is only meaningful for the iteration that produced it.
+/// With one shared name per angle, a reviewer that finished without ever calling this
+/// tool would be credited with whatever the previous pass concluded — and a straggler
+/// from a superseded iteration, submitting late, would land on top of a live panel.
+/// Naming the iteration makes both impossible by construction rather than by
+/// remembering to delete the file at every point a new panel can open.
+pub(crate) fn findings_path(dir: &Path, task: &str, iter: u64, angle: &str) -> PathBuf {
+    dir.join(format!("{task}-review-{iter}-{angle}.json"))
 }
 
 /// Outcome of handling one request: an optional reply (notifications get none).
@@ -120,7 +145,13 @@ fn tool_error(id: serde_json::Value, message: &str) -> Reply {
 
 /// Handle one decoded JSON-RPC request. Split from the IO loop so the protocol and the
 /// write are unit-testable without spawning a process.
-pub(crate) fn handle(req: &serde_json::Value, dir: &Path, task: &str, angles: &[String]) -> Reply {
+pub(crate) fn handle(
+    req: &serde_json::Value,
+    dir: &Path,
+    task: &str,
+    iter: u64,
+    angles: &[String],
+) -> Reply {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // A request without `id` is a notification: act, never reply.
     let id = match req.get("id") {
@@ -165,6 +196,25 @@ pub(crate) fn handle(req: &serde_json::Value, dir: &Path, task: &str, angles: &[
             // panel's configured angles — never used as a raw path component. An
             // unrecognised angle cannot create a file, and `..` or a separator can
             // never match a configured angle, so the path stays inside the run dir.
+            //
+            // # Why a reviewer CAN submit under a panel-mate's angle
+            //
+            // Deliberate, and reviewed: this is not an oversight to be hardened.
+            // Nothing here binds a call to the reviewer that made it, so a confused
+            // or hostile reviewer can name a sibling's angle and overwrite its
+            // verdict. Binding per process is not achievable on the backend the panel
+            // actually runs: cursor has no per-launch MCP scoping — no config flag
+            // (servers come from one shared `.cursor/mcp.json`) and no environment
+            // inheritance (probed with `DROVR_REVIEW_ANGLE`; it came back absent) —
+            // and all four reviewers of a task share one worktree, so argv cannot
+            // distinguish them either. The angle therefore HAS to be a tool argument.
+            //
+            // That leaves a bug-class risk inside drovr's own trust domain, not a
+            // security boundary. The boundary is unaffected and still holds: the
+            // reviewer names no path, so its one write cannot leave the run dir; it
+            // cannot touch the project, `state.json`, or another run; and every
+            // payload is validated before anything is written. The blast radius is
+            // one angle's verdict within one task's own panel.
             let angle = match args.get("angle").and_then(|a| a.as_str()) {
                 Some(a) if angles.iter().any(|c| c == a) => a.to_string(),
                 Some(a) => {
@@ -196,22 +246,34 @@ pub(crate) fn handle(req: &serde_json::Value, dir: &Path, task: &str, angles: &[
 
             // Validate BEFORE writing, and report failure to the model rather than the
             // transport, so the reviewer can correct itself while it is still running.
-            let body = match serde_json::to_string_pretty(&args) {
+            let raw = match serde_json::to_string(&args) {
                 Ok(b) => b,
                 Err(e) => return tool_error(id, &format!("could not serialize arguments: {e}")),
             };
-            if let Err(e) = parse_review(&body) {
-                return tool_error(
-                    id,
-                    &format!(
-                        "findings rejected ({e}). Required: verdict \"clean\"|\"changes\"; \
-                         each finding needs file, severity (critical|important|nit) and \
-                         summary. Fix the arguments and call submit_findings again."
-                    ),
-                );
-            }
+            let review = match parse_review(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        &format!(
+                            "findings rejected ({e}). Required: verdict \"clean\"|\"changes\"; \
+                             each finding needs file, severity (critical|important|nit) and \
+                             summary. Fix the arguments and call submit_findings again."
+                        ),
+                    );
+                }
+            };
+            // Persist the PARSED review, not the raw arguments. Serde ignores unknown
+            // top-level keys when validating, so writing `args` back would let anything
+            // a reviewer happened to pass — a stray `path`, a hallucinated field —
+            // into the canonical artifact the merge and the web UI read. Round-tripping
+            // through `Review` makes the file match the typed contract exactly.
+            let body = match serde_json::to_string_pretty(&review) {
+                Ok(b) => b,
+                Err(e) => return tool_error(id, &format!("could not serialize review: {e}")),
+            };
 
-            let path = findings_path(dir, task, &angle);
+            let path = findings_path(dir, task, iter, &angle);
             if let Some(parent) = path.parent()
                 && let Err(e) = std::fs::create_dir_all(parent)
             {
@@ -237,8 +299,18 @@ pub(crate) fn handle(req: &serde_json::Value, dir: &Path, task: &str, angles: &[
     }
 }
 
+/// JSON-RPC "Parse error". Answered with `id: null`, per the spec: a line that did not
+/// parse has no id to echo.
+fn parse_error(detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": JSONRPC,
+        "id": serde_json::Value::Null,
+        "error": {"code": -32700, "message": format!("Parse error: {detail}")},
+    })
+}
+
 /// Serve the tool on stdio until EOF. One line in, at most one line out.
-pub fn serve(dir: &Path, task: &str, angles: &[String]) -> io::Result<()> {
+pub fn serve(dir: &Path, task: &str, iter: u64, angles: &[String]) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
@@ -246,12 +318,16 @@ pub fn serve(dir: &Path, task: &str, angles: &[String]) -> io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        // A malformed line is skipped rather than fatal: killing the server would strand
-        // the reviewer with no way to deliver its findings at all.
-        let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+        // A malformed line is ANSWERED, not silently dropped, and never fatal. Dropping
+        // it leaves the client with a request it will never see a response to, so it
+        // waits out its own timeout — which looks to the panel exactly like a reviewer
+        // that went quiet. Killing the server would be worse still: it strands the
+        // reviewer with no way to deliver its findings at all.
+        let reply = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(req) => handle(&req, dir, task, iter, angles),
+            Err(e) => Some(parse_error(&e.to_string())),
         };
-        if let Some(reply) = handle(&req, dir, task, angles) {
+        if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
             stdout.flush()?;
         }
@@ -289,7 +365,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05"}
         });
-        let r = handle(&req, d.path(), "task-1", &angles()).unwrap();
+        let r = handle(&req, d.path(), "task-1", 1, &angles()).unwrap();
         assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
         assert!(r["result"]["capabilities"]["tools"].is_object());
     }
@@ -298,7 +374,7 @@ mod tests {
     fn tools_list_offers_exactly_one_tool() {
         let d = tempfile::tempdir().unwrap();
         let req = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-        let r = handle(&req, d.path(), "task-1", &angles()).unwrap();
+        let r = handle(&req, d.path(), "task-1", 1, &angles()).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
@@ -312,7 +388,7 @@ mod tests {
     fn a_notification_gets_no_reply() {
         let d = tempfile::tempdir().unwrap();
         let req = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        assert!(handle(&req, d.path(), "task-1", &angles()).is_none());
+        assert!(handle(&req, d.path(), "task-1", 1, &angles()).is_none());
     }
 
     #[test]
@@ -322,14 +398,15 @@ mod tests {
             &call(serde_json::json!({"angle": "security", "verdict": "clean", "findings": []})),
             d.path(),
             "task-1",
+            1,
             &angles(),
         )
         .unwrap();
         assert!(!is_error(&r), "{r}");
         let written =
-            std::fs::read_to_string(findings_path(d.path(), "task-1", "security")).unwrap();
+            std::fs::read_to_string(findings_path(d.path(), "task-1", 1, "security")).unwrap();
         let review = parse_review(&written).unwrap();
-        assert_eq!(review.verdict, "clean");
+        assert_eq!(review.verdict, Verdict::Clean);
         assert!(review.findings.is_empty());
     }
 
@@ -347,17 +424,182 @@ mod tests {
             })),
             d.path(),
             "task-1",
+            1,
             &angles(),
         )
         .unwrap();
         assert!(!is_error(&r), "{r}");
         assert!(
-            findings_path(d.path(), "task-1", "correctness").exists(),
+            findings_path(d.path(), "task-1", 1, "correctness").exists(),
             "the write must land at the drovr-chosen path"
         );
         assert!(
             !d.path().join("etc").exists(),
             "no agent-supplied path may influence the write"
+        );
+        // …and the stray arguments do not survive into the artifact either.
+        let body =
+            std::fs::read_to_string(findings_path(d.path(), "task-1", 1, "correctness")).unwrap();
+        assert!(
+            !body.contains("passwd") && !body.contains("shadow"),
+            "only the parsed Review may be persisted, not the raw arguments: {body}"
+        );
+    }
+
+    /// Serde ignores unknown keys when validating, so writing the raw arguments back
+    /// would let anything a reviewer passed into the canonical artifact that the merge
+    /// and the web UI read. Only the parsed `Review` is persisted.
+    #[test]
+    fn only_the_typed_review_is_persisted_not_the_raw_arguments() {
+        let d = tempfile::tempdir().unwrap();
+        let r = handle(
+            &call(serde_json::json!({
+                "angle": "security",
+                "verdict": "changes",
+                "findings": [{
+                    "file": "a.rs", "severity": "nit", "summary": "s",
+                    "invented_per_finding": "junk"
+                }],
+                "hallucinated": {"deeply": ["nested", "junk"]},
+                "notes": "prose the reviewer felt like adding"
+            })),
+            d.path(),
+            "task-1",
+            1,
+            &angles(),
+        )
+        .unwrap();
+        assert!(!is_error(&r), "{r}");
+        let body =
+            std::fs::read_to_string(findings_path(d.path(), "task-1", 1, "security")).unwrap();
+        for junk in ["hallucinated", "notes", "invented_per_finding"] {
+            assert!(
+                !body.contains(junk),
+                "'{junk}' must not reach the file: {body}"
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut keys: Vec<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["findings", "verdict"],
+            "exactly the Review fields: {body}"
+        );
+        assert_eq!(parse_review(&body).unwrap().findings.len(), 1);
+    }
+
+    /// Each iteration reviews a different diff, so its verdicts live in their own file.
+    /// Two iterations must never collide — that collision is what let a pass inherit
+    /// the previous pass's conclusions.
+    #[test]
+    fn each_iteration_writes_its_own_file() {
+        let d = tempfile::tempdir().unwrap();
+        for (iter, verdict) in [(1u64, "changes"), (2, "clean")] {
+            let r = handle(
+                &call(serde_json::json!({
+                    "angle": "correctness",
+                    "verdict": verdict,
+                    "findings": if verdict == "changes" {
+                        serde_json::json!([{"file": "a.rs", "severity": "critical", "summary": "boom"}])
+                    } else {
+                        serde_json::json!([])
+                    }
+                })),
+                d.path(),
+                "task-1",
+                iter,
+                &angles(),
+            )
+            .unwrap();
+            assert!(!is_error(&r), "{r}");
+        }
+        let one = findings_path(d.path(), "task-1", 1, "correctness");
+        let two = findings_path(d.path(), "task-1", 2, "correctness");
+        assert_ne!(one, two, "iterations must not share a filename");
+        assert_eq!(
+            parse_review(&std::fs::read_to_string(&one).unwrap())
+                .unwrap()
+                .findings
+                .len(),
+            1,
+            "iteration 1's verdict must survive iteration 2 being written"
+        );
+        assert!(
+            parse_review(&std::fs::read_to_string(&two).unwrap())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    /// A verdict outside the advertised enum is a tool error the reviewer can act on,
+    /// not a value that silently reaches the merge.
+    #[test]
+    fn a_verdict_outside_the_advertised_enum_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let r = handle(
+            &call(serde_json::json!({"angle": "security", "verdict": "looks-fine"})),
+            d.path(),
+            "task-1",
+            1,
+            &angles(),
+        )
+        .unwrap();
+        assert!(is_error(&r), "{r}");
+        assert!(!findings_path(d.path(), "task-1", 1, "security").exists());
+    }
+
+    /// The tool schema and the seed's schema are rendered from one definition, so a
+    /// reviewer is never told to send a shape validation will then reject.
+    #[test]
+    fn the_tool_schema_and_the_review_schema_are_one_definition() {
+        let tool = tool_def(&angles());
+        let props = &tool["inputSchema"]["properties"];
+        let mut keys: Vec<&str> = props
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["angle", "findings", "impact", "verdict"],
+            "the tool is the review schema plus drovr's routing argument"
+        );
+        for (k, v) in review_schema().as_object().unwrap() {
+            assert_eq!(&props[k], v, "'{k}' must come from review_schema()");
+        }
+        // The closed enums are the values `parse_review` accepts, not a second copy.
+        assert_eq!(props["verdict"]["enum"], serde_json::json!(Verdict::WIRE));
+        assert_eq!(props["impact"]["enum"], serde_json::json!(Impact::WIRE));
+        assert_eq!(
+            props["findings"]["items"]["properties"]["severity"]["enum"],
+            serde_json::json!(Severity::WIRE)
+        );
+    }
+
+    /// A line that does not parse must still get a response. Dropping it leaves the
+    /// client waiting out its own timeout on a request it will never see answered —
+    /// which looks, from the panel, exactly like a reviewer that went quiet.
+    #[test]
+    fn a_malformed_line_is_answered_with_a_json_rpc_parse_error() {
+        let reply = parse_error("expected value at line 1 column 1");
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert!(reply["id"].is_null(), "a line that did not parse has no id");
+        assert_eq!(reply["error"]["code"], -32700);
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Parse error"),
+            "{reply}"
         );
     }
 
@@ -370,6 +612,7 @@ mod tests {
             &call(serde_json::json!({"angle": "type-design", "summary": "I forgot the verdict"})),
             d.path(),
             "task-1",
+            1,
             &angles(),
         )
         .unwrap();
@@ -383,7 +626,7 @@ mod tests {
             "the error must tell the reviewer how to recover: {msg}"
         );
         assert!(
-            !findings_path(d.path(), "task-1", "type-design").exists(),
+            !findings_path(d.path(), "task-1", 1, "type-design").exists(),
             "nothing may be written when validation fails"
         );
     }
@@ -403,6 +646,7 @@ mod tests {
                 &call(serde_json::json!({"angle": bad, "verdict": "clean"})),
                 d.path(),
                 "task-1",
+                1,
                 &angles(),
             )
             .unwrap();
@@ -423,6 +667,7 @@ mod tests {
             &call(serde_json::json!({"verdict": "clean"})),
             d.path(),
             "task-1",
+            1,
             &angles(),
         )
         .unwrap();
@@ -440,17 +685,58 @@ mod tests {
             &call(serde_json::json!({"angle": "error-handling", "verdict": "clean"})),
             d.path(),
             "task-1",
+            1,
             &angles(),
         )
         .unwrap();
         assert!(!is_error(&r), "{r}");
-        let body =
-            std::fs::read_to_string(findings_path(d.path(), "task-1", "error-handling")).unwrap();
+        let body = std::fs::read_to_string(findings_path(d.path(), "task-1", 1, "error-handling"))
+            .unwrap();
         assert!(
             !body.contains("\"angle\""),
             "angle must be stripped: {body}"
         );
         assert!(parse_review(&body).is_ok());
+    }
+
+    /// …and that holds with findings present too: a `Finding`'s own `angle` is stamped
+    /// by the merge from the filename, so an unstamped one must not be written beside
+    /// it as an empty second copy.
+    #[test]
+    fn a_findings_angle_is_not_written_into_the_per_angle_file_either() {
+        let d = tempfile::tempdir().unwrap();
+        let r = handle(
+            &call(serde_json::json!({
+                "angle": "correctness",
+                "verdict": "changes",
+                "findings": [{"file": "a.rs", "severity": "nit", "summary": "s"}]
+            })),
+            d.path(),
+            "task-1",
+            1,
+            &angles(),
+        )
+        .unwrap();
+        assert!(!is_error(&r), "{r}");
+        let body =
+            std::fs::read_to_string(findings_path(d.path(), "task-1", 1, "correctness")).unwrap();
+        assert!(!body.contains("\"angle\""), "{body}");
+        assert!(
+            !body.contains("\"rationale\""),
+            "an empty rationale is noise: {body}"
+        );
+        // The merge is what fills it in, from the filename.
+        let merged = crate::findings::merge_reviews(vec![(
+            "correctness".to_string(),
+            parse_review(&body).unwrap(),
+        )]);
+        assert_eq!(merged.findings[0].angle, "correctness");
+        assert!(
+            serde_json::to_string(&merged)
+                .unwrap()
+                .contains("\"angle\":\"correctness\""),
+            "a stamped angle IS written to the merged review"
+        );
     }
 
     #[test]
@@ -460,9 +746,9 @@ mod tests {
             "jsonrpc": "2.0", "id": 9, "method": "tools/call",
             "params": {"name": "rm_rf", "arguments": {}}
         });
-        let r = handle(&req, d.path(), "task-1", &angles()).unwrap();
+        let r = handle(&req, d.path(), "task-1", 1, &angles()).unwrap();
         assert!(is_error(&r));
-        assert!(!findings_path(d.path(), "task-1", "correctness").exists());
+        assert!(!findings_path(d.path(), "task-1", 1, "correctness").exists());
     }
 
     /// Severity and findings round-trip, so a `changes` verdict survives the tool.
@@ -481,17 +767,18 @@ mod tests {
             })),
             d.path(),
             "task-2",
+            2,
             &angles(),
         )
         .unwrap();
         assert!(!is_error(&r), "{r}");
         let review = parse_review(
-            &std::fs::read_to_string(findings_path(d.path(), "task-2", "correctness")).unwrap(),
+            &std::fs::read_to_string(findings_path(d.path(), "task-2", 2, "correctness")).unwrap(),
         )
         .unwrap();
-        assert_eq!(review.verdict, "changes");
+        assert_eq!(review.verdict, Verdict::Changes);
         assert_eq!(review.findings.len(), 2);
         assert_eq!(review.findings[0].line, Some(4));
-        assert_eq!(review.impact.as_deref(), Some("high"));
+        assert_eq!(review.impact, Some(Impact::High));
     }
 }

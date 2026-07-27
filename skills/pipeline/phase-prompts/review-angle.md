@@ -49,20 +49,23 @@ The arguments to `submit_findings`, beyond `angle`:
 
 ```json
 {
-  "verdict": "clean | changes",
+  "verdict": "clean" | "changes",
   "findings": [
     {
       "file": "cli/src/foo.rs",
-      "line": 42,
-      "severity": "critical | important | nit",
+      "line": 42,                      // optional
+      "severity": "critical" | "important" | "nit",
       "summary": "one-line what-and-where",
-      "rationale": "why it matters / how it bites"
+      "rationale": "why it matters / how it bites"    // optional
     }
   ],
-  "impact": "optional one-line overall read of the change's risk"
+  "impact": "low" | "medium" | "high"      // optional
 }
 ```
 
+- `verdict`, `severity` and `impact` are **closed sets** — exactly the values above. A
+  value outside them is refused by the tool with an error you can read and retry from,
+  not quietly accepted.
 - `line`, `impact`, and `rationale` are optional to the parser (omit `line` when the
   finding is file-level) — but always give a `rationale`; a finding without a reason is
   hard to act on.

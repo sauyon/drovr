@@ -11,7 +11,7 @@
 //!
 //! Reviewers can outlive `timeout_ms`. A timeout is therefore not a failure but a
 //! pause: the outstanding reviewers stay `Running`, every angle that *did* finish is
-//! already banked in `<task>-review-<angle>.json`, and a plain re-run RESUMES —
+//! already banked in `<task>-review-<iter>-<angle>.json`, and a plain re-run RESUMES —
 //! re-attaching to the same panel and waiting only on the stragglers. Nothing is
 //! re-reviewed, so a slow panel costs one reviewer per angle no matter how many
 //! resumes it takes. A new panel is opened only when the caller passes `fresh`, when
@@ -33,7 +33,7 @@
 //!
 //! Each reviewer delivers by calling `submit_findings`, the single tool of the MCP
 //! server drovr starts for it ([`crate::mcp_findings`]); that server writes
-//! `<task>-review-<angle>.json`. The file is the ONLY channel drovr reads; pane
+//! `<task>-review-<iter>-<angle>.json`. The file is the ONLY channel drovr reads; pane
 //! transcripts are never parsed.
 //!
 //! The reviewer does not write the file itself because it cannot: read-only mode
@@ -50,7 +50,7 @@
 //! their output.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -120,21 +120,40 @@ fn angle_brief(angle: &str) -> &'static str {
         .unwrap_or(GENERIC_BRIEF)
 }
 
-/// The findings JSON schema, embedded verbatim in every reviewer seed so a reviewer
-/// writes exactly what `findings::parse_review` accepts.
-const FINDINGS_SCHEMA: &str = r#"{
-  "verdict": "clean" | "changes",
-  "findings": [
-    {
-      "file": "cli/src/foo.rs",
-      "line": 42,                      // optional
-      "severity": "critical" | "important" | "nit",
-      "summary": "one-line what",
-      "rationale": "why it matters"    // optional
-    }
-  ],
-  "impact": "low | medium | high"      // optional
-}"#;
+/// The findings shape as a reviewer sees it, embedded in every seed.
+///
+/// RENDERED from [`crate::mcp_findings::review_schema`] — the same definition the MCP
+/// tool advertises and `findings::parse_review` enforces. A JSON Schema is precise but
+/// unreadable in a brief, so this renders the friendly form; deriving the field names
+/// and the closed value sets from the schema is what stops the two drifting. They used
+/// to be independent copies, and a drift there tells a reviewer to send something
+/// validation then rejects — which reads exactly like a lazy reviewer.
+fn findings_schema() -> String {
+    let schema = crate::mcp_findings::review_schema();
+    // `"a" | "b"` from a schema `enum`. Empty if the shape ever changes underneath —
+    // `seed_schema_is_rendered_from_the_one_definition` is what catches that.
+    let alt = |v: &serde_json::Value| {
+        v["enum"]
+            .as_array()
+            .map(|vals| {
+                vals.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_default()
+    };
+    format!(
+        "{{\n  \"verdict\": {verdict},\n  \"findings\": [\n    {{\n      \
+         \"file\": \"cli/src/foo.rs\",\n      \"line\": 42,                      // optional\n      \
+         \"severity\": {severity},\n      \"summary\": \"one-line what\",\n      \
+         \"rationale\": \"why it matters\"    // optional\n    }}\n  ],\n  \
+         \"impact\": {impact}      // optional\n}}",
+        verdict = alt(&schema["verdict"]),
+        severity = alt(&schema["findings"]["items"]["properties"]["severity"]),
+        impact = alt(&schema["impact"]),
+    )
+}
 
 /// `git -C <project_dir> rev-parse HEAD`, trimmed. `pub(crate)` so the
 /// `drovr code-review base` handler (Task 6) records the base with the same helper.
@@ -253,7 +272,7 @@ fn build_seed(task: &str, angle: &str, base: &str, head: &str, task_desc: &str) 
          do not stop to ask permission for it.\n\
          Do not modify any files or run `drovr phase done`.\n",
         brief = angle_brief(angle),
-        schema = FINDINGS_SCHEMA,
+        schema = findings_schema(),
         tool = crate::mcp_findings::TOOL_NAME,
         qualified_tool = crate::mcp_findings::qualified_tool_name(),
     )
@@ -263,51 +282,156 @@ fn build_seed(task: &str, angle: &str, base: &str, head: &str, task_desc: &str) 
 /// <task>` over stdio, exposing `submit_findings` and nothing else.
 ///
 /// All four angles share it — cursor has no per-launch MCP scoping, and the angle
-/// is a validated tool argument rather than argv precisely because of that.
-fn findings_server(run_name: &str, task: &str) -> serde_json::Value {
+/// is a validated tool argument rather than argv precisely because of that. The
+/// ITERATION is on the command line, though: it is drovr's, not the reviewer's, and it
+/// is what keeps one pass's verdicts out of the next one's harvest.
+fn findings_server(run_name: &str, task: &str, iter: u64) -> serde_json::Value {
     // Same binary that spawned the panel, so a reviewer cannot end up talking to a
     // different drovr on `$PATH`. The bare name is a last resort.
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "drovr".to_owned());
-    serde_json::json!({"command": exe, "args": ["mcp-findings", run_name, task]})
+    serde_json::json!({
+        "command": exe,
+        "args": ["mcp-findings", run_name, task, iter.to_string()],
+    })
 }
 
-/// Write the findings server into `path`, **preserving every other server already
-/// configured there**. The project-file mechanism writes into the user's own
-/// `.cursor/mcp.json`, which may hold servers drovr knows nothing about; drovr
-/// owns exactly one key in that file.
-fn write_mcp_config(path: &Path, run_name: &str, task: &str) -> io::Result<()> {
+/// Where the original of a replaced project config is kept.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".drovr-backup");
+    PathBuf::from(name)
+}
+
+/// Write drovr's findings server into `path` as the **only** server there.
+///
+/// # Why it replaces rather than merges
+///
+/// This used to merge, preserving whatever else the file held. That is wrong for the
+/// mechanism it serves: a `ProjectFile` backend is handed `--approve-mcps`, which
+/// auto-approves **every** server in the file — drovr cannot approve selectively. So
+/// any entry drovr preserved would be silently approved for a read-only reviewer, and
+/// `.cursor/mcp.json` is a path a hostile repository can simply commit. That hands the
+/// reviewer arbitrary extra tools and defeats the one-tool carve-out this whole
+/// mechanism exists to enforce.
+///
+/// The user's own config is not destroyed: if the file held anything other than
+/// drovr's server, the original is moved to `<path>.drovr-backup` first (never
+/// overwriting an existing backup, so repeated passes cannot lose it) and the
+/// displacement is reported. For a `ConfigFlag` backend the path is inside drovr's own
+/// run dir, which drovr owns outright — the same rule costs nothing there.
+fn write_mcp_config(path: &Path, run_name: &str, task: &str, iter: u64) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(path).ok();
-    let mut doc = match existing
-        .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
+    refuse_if_not_a_regular_file(path)?;
+
+    // NotFound is the ordinary case; anything else is a real failure. Collapsing them
+    // would let a permissions or IO error look like "no file here", and drovr would
+    // then replace a config it could not read — and could not have backed up.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot read the existing MCP config at {}: {e}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+
+    if let Some(body) = &existing
+        && holds_more_than_drovrs_server(body)
     {
-        Some(Ok(v)) if v.is_object() => v,
-        // Nothing there yet, or something that is not an MCP config at all. An
-        // unusable file cannot be merged into, so say so rather than silently
-        // dropping whatever it held.
-        Some(_) => {
+        let backup = backup_path(path);
+        if backup.exists() {
             eprintln!(
-                "code-review: {} was not a JSON object; replacing it with drovr's \
-                 findings server",
+                "code-review: {} already exists; leaving it alone and replacing {} again",
+                backup.display(),
                 path.display()
             );
-            serde_json::json!({})
+        } else {
+            std::fs::rename(path, &backup)?;
+            eprintln!(
+                "code-review: {} configured MCP servers that a read-only reviewer must \
+                 not be given (`--approve-mcps` approves every server in that file). \
+                 The original is at {}; drovr's findings server is the only one the \
+                 reviewers see.",
+                path.display(),
+                backup.display()
+            );
         }
-        None => serde_json::json!({}),
-    };
-    if !doc["mcpServers"].is_object() {
-        doc["mcpServers"] = serde_json::json!({});
     }
-    doc["mcpServers"][crate::mcp_findings::SERVER_NAME] = findings_server(run_name, task);
+
+    let doc = serde_json::json!({
+        "mcpServers": {crate::mcp_findings::SERVER_NAME: findings_server(run_name, task, iter)},
+    });
     std::fs::write(
         path,
         serde_json::to_string_pretty(&doc).map_err(io::Error::other)?,
     )
+}
+
+/// True when `body` configures anything beyond drovr's own findings server — the
+/// signal that replacing the file would displace something worth keeping. An
+/// unparseable file counts: it is not drovr's, and it is not ours to discard silently.
+fn holds_more_than_drovrs_server(body: &str) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(body) else {
+        return !body.trim().is_empty();
+    };
+    let Some(servers) = doc.get("mcpServers").and_then(|s| s.as_object()) else {
+        // A JSON document with no `mcpServers` at all is not an MCP config; if it has
+        // any content, it is something else the user cared about.
+        return doc.as_object().is_some_and(|o| !o.is_empty());
+    };
+    servers
+        .keys()
+        .any(|k| k != crate::mcp_findings::SERVER_NAME)
+}
+
+/// Refuse to write through a symlink (or anything that is not a regular file).
+///
+/// `.cursor/mcp.json` sits inside the checkout under review, and a repository can
+/// commit a symlink at that path — `fs::write` would follow it and drop drovr's config
+/// wherever it points, outside the project entirely. The parent is checked too, since
+/// a symlinked `.cursor/` redirects the write just as effectively. The same
+/// untrusted-repo boundary as `docs/supply-chain.md`.
+fn refuse_if_not_a_regular_file(path: &Path) -> io::Result<()> {
+    let mut suspects = vec![path.to_path_buf()];
+    if let Some(parent) = path.parent() {
+        suspects.push(parent.to_path_buf());
+    }
+    for p in suspects {
+        match std::fs::symlink_metadata(&p) {
+            // Only the final component may be absent; a missing parent was just
+            // created by `create_dir_all`.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to write drovr's MCP config through the symlink at \
+                             {} — a repository must not be able to redirect it",
+                            p.display()
+                        ),
+                    ));
+                }
+                if p == path && !md.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} exists and is not a regular file", p.display()),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `git -C <project_dir> rev-parse --git-common-dir`, absolutised. The *common*
@@ -401,16 +525,28 @@ fn exclude_locally(project_dir: &str, rel: &str) {
 fn obtain_findings_json(
     dir: &Path,
     task: &str,
+    iter: u64,
     angle: &str,
     phase_name: &str,
 ) -> io::Result<String> {
-    let path = findings_path(dir, task, angle);
-    let json = std::fs::read_to_string(&path).map_err(|_| {
-        io::Error::other(format!(
+    let path = findings_path(dir, task, iter, angle);
+    // Only NotFound means "never submitted". A file that exists but cannot be read
+    // (permissions, EIO) is a different failure with a different remedy, and reporting
+    // it as a silent reviewer sends whoever is debugging to the wrong place entirely.
+    let json = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => io::Error::other(format!(
             "reviewer '{phase_name}' produced no findings (it never called \
              submit_findings, so nothing reached {})",
             path.display()
-        ))
+        )),
+        _ => io::Error::new(
+            e.kind(),
+            format!(
+                "reviewer '{phase_name}' submitted findings to {}, but they could not \
+                 be read back: {e}",
+                path.display()
+            ),
+        ),
     })?;
     // Validate here so a truncated or half-written file is reported against the
     // reviewer that produced it, rather than as a confusing merge error later.
@@ -425,11 +561,32 @@ fn obtain_findings_json(
 
 /// Clear an angle's findings file when its reviewer is REPLACED.
 ///
-/// The filename carries no iteration number, so whatever the outgoing reviewer left
-/// behind is indistinguishable from what its replacement writes. Clearing at respawn
-/// stops a dead reviewer's verdict being passed off as the new one's.
-fn clear_findings_file(dir: &Path, task: &str, angle: &str) {
-    let _ = std::fs::remove_file(findings_path(dir, task, angle));
+/// A replacement runs in the SAME iteration as the reviewer it replaces (that is what
+/// makes it a respawn rather than a new panel), so the two share a filename and
+/// whatever the outgoing one left behind is indistinguishable from what the new one
+/// writes. Clearing at respawn stops a dead reviewer's verdict being passed off as its
+/// replacement's. Cross-iteration staleness is handled by the filename itself — see
+/// [`crate::mcp_findings::findings_path`].
+///
+/// **Failure is fatal to the pass, not ignorable.** This delete is the only thing
+/// standing between a leftover verdict and a replacement that never submits; if it
+/// cannot be removed, spawning the replacement would set up exactly the
+/// misattribution the respawn exists to avoid. A `NotFound` file is already in the
+/// state we want.
+fn clear_findings_file(dir: &Path, task: &str, iter: u64, angle: &str) -> io::Result<()> {
+    let path = findings_path(dir, task, iter, angle);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "cannot clear the replaced reviewer's findings at {} ({e}); its \
+                 replacement would inherit them",
+                path.display()
+            ),
+        )),
+    }
 }
 
 /// Run ONE review panel for `task` and return the outcome. Blocking.
@@ -509,7 +666,7 @@ pub fn code_review_run<H: Herdr>(
     }
     std::fs::create_dir_all(&dir)?;
 
-    // Provision the findings channel BEFORE any reviewer launches: a reviewer is
+    // Check the findings channel BEFORE deciding anything else: a reviewer is
     // read-only, so this tool is the only way it can deliver anything at all.
     // Without a mechanism to hand it over, every reviewer would run to completion
     // and then be discarded — fail here instead, while the reason is still legible.
@@ -520,12 +677,6 @@ pub fn code_review_run<H: Herdr>(
              `[agents.{review_agent}.mcp]` or pick another review_agent"
         ))
     })?;
-    let mcp_path = mcp.config_path(&dir, Path::new(&run.project_dir), task);
-    write_mcp_config(&mcp_path, &run.name, task)?;
-    if let Some(rel) = mcp.project_relative_path() {
-        exclude_locally(&run.project_dir, rel);
-    }
-    let launch = cfg.launch(&review_agent, &run.project_dir, true, Some(&mcp_path))?;
 
     // Resume, or open a new panel? A plain re-run after a timeout re-attaches to the
     // reviewers still in flight — spawning a second panel over the same diff would
@@ -558,6 +709,21 @@ pub fn code_review_run<H: Herdr>(
         std::fs::write(iter_head_path(&dir, task, iter), format!("{head}\n"))?;
     }
 
+    // Provision the findings channel now that the iteration is known — the server
+    // writes into `<task>-review-<iter>-<angle>.json`, so it has to be told which
+    // pass it is serving. A resume rewrites the same config; a fresh panel points its
+    // reviewers at a new iteration's files, which is what stops them harvesting the
+    // last pass's verdicts. Reviewers still alive from a superseded iteration keep the
+    // server they were launched with, so their late writes land in their own pass's
+    // files and can never reach this one.
+    let mcp_path = mcp.config_path(&dir, Path::new(&run.project_dir), task);
+    write_mcp_config(&mcp_path, &run.name, task, iter)?;
+    if let Some(rel) = mcp.project_relative_path() {
+        exclude_locally(&run.project_dir, rel);
+        exclude_locally(&run.project_dir, &format!("{rel}.drovr-backup"));
+    }
+    let launch = cfg.launch(&review_agent, &run.project_dir, true, Some(&mcp_path))?;
+
     // Split the angles: what is already banked from an earlier pass of this same
     // iteration, versus what still needs a reviewer waited on (or respawned).
     let mut banked: Vec<(String, Review)> = Vec::new();
@@ -572,9 +738,10 @@ pub fn code_review_run<H: Herdr>(
             // If that file is unreadable we do NOT trust the status — fall through and
             // wait on the reviewer again, which self-heals rather than hard-failing.
             if done
-                && let Some(review) = std::fs::read_to_string(findings_path(&dir, task, angle))
-                    .ok()
-                    .and_then(|json| parse_review(&json).ok())
+                && let Some(review) =
+                    std::fs::read_to_string(findings_path(&dir, task, iter, angle))
+                        .ok()
+                        .and_then(|json| parse_review(&json).ok())
             {
                 banked.push((angle.clone(), review));
                 continue;
@@ -611,8 +778,11 @@ pub fn code_review_run<H: Herdr>(
             }
             run.review_phases.retain(|p| p.name != phase);
             // Drop the outgoing reviewer's findings file so the replacement cannot
-            // inherit it — the filename carries no iteration to tell them apart.
-            clear_findings_file(&dir, task, angle);
+            // inherit it — a respawn stays in THIS iteration, so the two share a
+            // filename. `?`: if the stale verdict cannot be removed, spawning a
+            // replacement that might never submit would credit it with the dead
+            // reviewer's conclusion.
+            clear_findings_file(&dir, task, iter, angle)?;
             println!("code-review: reviewer for angle '{angle}' {reason} — respawning it");
         }
 
@@ -687,7 +857,7 @@ pub fn code_review_run<H: Herdr>(
             // can use, and re-reading that same finished pane will fail identically
             // forever. Record `Failed` so the next resume replaces the reviewer, then
             // surface the error — an unreadable angle must not pass for a clean one.
-            let harvest = obtain_findings_json(&dir, task, &angle, &phase)
+            let harvest = obtain_findings_json(&dir, task, iter, &angle, &phase)
                 .and_then(|json| parse_review(&json));
             let status = match &harvest {
                 Ok(_) => PhaseStatus::Done,
@@ -752,6 +922,7 @@ pub fn code_review_run<H: Herdr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::findings::Verdict;
     use crate::herdr::FakeHerdr;
     use crate::phase::done_marker;
     use crate::run::{Phase, PhaseStatus};
@@ -826,10 +997,18 @@ mod tests {
         std::fs::write(dir.join(format!("{task}-base.sha")), "deadbeef\n").unwrap();
     }
 
-    fn seed_angle_file(run: &RunState, task: &str, angle: &str, body: &str) {
+    /// Stand in for a reviewer of `iter` having called `submit_findings`. The
+    /// iteration is explicit because the file is scoped to one: seeding the wrong
+    /// iteration is the bug this naming exists to make impossible, so a fixture must
+    /// not be able to elide it.
+    fn seed_angle_file(run: &RunState, task: &str, iter: u64, angle: &str, body: &str) {
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{task}-review-{angle}.json")), body).unwrap();
+        std::fs::write(
+            crate::mcp_findings::findings_path(&dir, task, iter, angle),
+            body,
+        )
+        .unwrap();
     }
 
     /// Pre-drop the done markers for iter=1's four default angles (the panel spawns
@@ -991,7 +1170,7 @@ mod tests {
         // the run reaches the FINAL save rather than the deadline one. The archive
         // lands on the poll loop's first `agent_status`, after every spawn save.
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         for _ in 0..16 {
             h.push_status(Some("done"));
@@ -1079,10 +1258,11 @@ mod tests {
         // Two of the four reviewers have since finished.
         drop_marker(&run, "task-1", 1, "correctness");
         drop_marker(&run, "task-1", 1, "security");
-        seed_angle_file(&run, "task-1", "correctness", CLEAN);
+        seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
         seed_angle_file(
             &run,
             "task-1",
+            1,
             "security",
             r#"{"verdict":"changes","findings":[{"file":"a.rs","severity":"important","summary":"leak"}]}"#,
         );
@@ -1095,7 +1275,7 @@ mod tests {
 
         let dir = run_dir(&run.name);
         for angle in ["correctness", "security"] {
-            let p = dir.join(format!("task-1-review-{angle}.json"));
+            let p = crate::mcp_findings::findings_path(&dir, "task-1", 1, angle);
             assert!(
                 p.exists(),
                 "a finished angle's findings must be harvested on resume, not re-run: {}",
@@ -1104,7 +1284,10 @@ mod tests {
         }
         assert!(
             parse_review(
-                &std::fs::read_to_string(dir.join("task-1-review-security.json")).unwrap()
+                &std::fs::read_to_string(crate::mcp_findings::findings_path(
+                    &dir, "task-1", 1, "security"
+                ))
+                .unwrap()
             )
             .unwrap()
             .findings
@@ -1140,8 +1323,8 @@ mod tests {
         // First resume banks two angles, then times out on the other two.
         drop_marker(&run, "task-1", 1, "correctness");
         drop_marker(&run, "task-1", 1, "security");
-        seed_angle_file(&run, "task-1", "correctness", CLEAN);
-        seed_angle_file(&run, "task-1", "security", CLEAN);
+        seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
+        seed_angle_file(&run, "task-1", 1, "security", CLEAN);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
             ReviewOutcome::Timeout
@@ -1154,10 +1337,11 @@ mod tests {
         seed_angle_file(
             &run,
             "task-1",
+            1,
             "error-handling",
             r#"{"verdict":"changes","findings":[{"file":"b.rs","severity":"critical","summary":"panic"}]}"#,
         );
-        seed_angle_file(&run, "task-1", "type-design", CLEAN);
+        seed_angle_file(&run, "task-1", 1, "type-design", CLEAN);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
             ReviewOutcome::Findings
@@ -1167,7 +1351,7 @@ mod tests {
             &std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(merged.verdict, "changes");
+        assert_eq!(merged.verdict, Verdict::Changes);
         assert_eq!(merged.findings.len(), 1);
         assert_eq!(merged.findings[0].angle, "error-handling");
         assert_eq!(spawn_count(&h), 4, "no angle was ever re-reviewed");
@@ -1257,7 +1441,7 @@ mod tests {
 
         // correctness finishes, but writes a file that is not a Review.
         drop_marker(&run, "task-1", 1, "correctness");
-        seed_angle_file(&run, "task-1", "correctness", r#"{"not":"a review"}"#);
+        seed_angle_file(&run, "task-1", 1, "correctness", r#"{"not":"a review"}"#);
 
         let err = code_review_run(&h, &mut run, "task-1", 40, false)
             .expect_err("unparseable findings must fail the pass loudly");
@@ -1328,7 +1512,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-unconfigured-leftover");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
@@ -1382,7 +1566,7 @@ mod tests {
             .position(|p| p.name == "review:task-1:1:correctness")
             .unwrap();
         run.review_phases[i].status = PhaseStatus::Done;
-        seed_angle_file(&run, "task-1", "correctness", "{ this is not json");
+        seed_angle_file(&run, "task-1", 1, "correctness", "{ this is not json");
 
         // It must be waited on again (so: Timeout, still 4 phases, no respawn since
         // its pane is alive) — not trusted, and not a hard error.
@@ -1499,7 +1683,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-resume-after-complete");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
@@ -1532,7 +1716,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-clean");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         // Simulate every reviewer having dropped its marker.
         drop_markers(&run, "task-1", 1);
@@ -1543,7 +1727,7 @@ mod tests {
         // Merged file exists and is clean.
         let merged = run_dir(&run.name).join("task-1-review.json");
         let parsed = parse_review(&std::fs::read_to_string(&merged).unwrap()).unwrap();
-        assert_eq!(parsed.verdict, "clean");
+        assert_eq!(parsed.verdict, Verdict::Clean);
         assert!(parsed.findings.is_empty());
 
         // Isolation: pipeline `phases` untouched; four iter-1 reviewers registered.
@@ -1591,7 +1775,7 @@ mod tests {
         }
         // Each reviewer delivers by writing its findings file, not by printing.
         for a in load_config().unwrap().angles {
-            seed_angle_file(&run, "task-1", &a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
@@ -1618,11 +1802,12 @@ mod tests {
         seed_angle_file(
             &run,
             "task-1",
+            1,
             "correctness",
             r#"{"verdict":"clean","findings":[{"file":"a.rs","severity":"important","summary":"bug"}]}"#,
         );
         for a in ["security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         drop_markers(&run, "task-1", 1);
 
@@ -1631,10 +1816,76 @@ mod tests {
 
         let merged = run_dir(&run.name).join("task-1-review.json");
         let parsed = parse_review(&std::fs::read_to_string(&merged).unwrap()).unwrap();
-        assert_eq!(parsed.verdict, "changes");
+        assert_eq!(parsed.verdict, Verdict::Changes);
         assert_eq!(parsed.findings.len(), 1);
         // The angle is stamped from the source filename, not the JSON.
         assert_eq!(parsed.findings[0].angle, "correctness");
+    }
+
+    /// A new iteration reviews a NEW diff. It must be incapable of reading the
+    /// previous iteration's verdicts: with transcript scraping gone, any file on disk
+    /// counts as delivery, so a reviewer that finishes without calling the tool would
+    /// otherwise be credited with whatever the last pass concluded — passing a change
+    /// nobody reviewed.
+    #[test]
+    fn a_fresh_iteration_cannot_harvest_the_previous_iterations_verdicts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-iter-staleness");
+        write_base(&run, "task-1");
+
+        // Iteration 1: every angle delivers clean, so the pass completes.
+        for a in load_config().unwrap().angles {
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
+        }
+        drop_markers(&run, "task-1", 1);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        // Iteration 2 opens fresh (iteration 1 ran to completion). Its reviewers all
+        // finish, but not one of them calls `submit_findings`.
+        drop_markers(&run, "task-1", 2);
+        let err = code_review_run(&h, &mut run, "task-1", 5_000, false)
+            .expect_err("a pass where nobody submitted must fail, not inherit iter 1");
+        assert!(
+            err.to_string().contains("never called submit_findings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The reverse direction, and the one a delete-on-open fix would still miss: a
+    /// reviewer left over from a superseded iteration is still alive and eventually
+    /// submits. Its verdict must land in ITS iteration's file, where the current pass
+    /// can never see it — clearing files when the new panel opens happens too early to
+    /// stop a straggler that writes afterwards.
+    #[test]
+    fn a_straggler_from_a_superseded_iteration_cannot_pollute_the_new_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-iter-straggler");
+        write_base(&run, "task-1");
+
+        // Iteration 1 spawns and times out, leaving its reviewers running.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // The human forces a fresh panel. Iteration 2's reviewers finish having
+        // submitted nothing, while iteration 1's stragglers submit late.
+        drop_markers(&run, "task-1", 2);
+        for a in load_config().unwrap().angles {
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
+        }
+
+        let err = code_review_run(&h, &mut run, "task-1", 5_000, true)
+            .expect_err("a late straggler's verdict must not complete a newer panel");
+        assert!(
+            err.to_string().contains("never called submit_findings"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1646,11 +1897,12 @@ mod tests {
         seed_angle_file(
             &run,
             "task-1",
+            1,
             "correctness",
             r#"{"verdict":"changes","findings":[{"file":"a.rs","severity":"important","summary":"fixed later"}]}"#,
         );
         for angle in ["security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", angle, CLEAN);
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
@@ -1658,9 +1910,10 @@ mod tests {
             ReviewOutcome::Findings
         );
 
-        // The second pass's reviewers each write a clean file, replacing the stale one.
+        // The second pass's reviewers each deliver clean — into ITERATION 2's files,
+        // which is the only place iteration 2 will look.
         for a in load_config().unwrap().angles {
-            seed_angle_file(&run, "task-1", &a, CLEAN);
+            seed_angle_file(&run, "task-1", 2, &a, CLEAN);
         }
         drop_markers(&run, "task-1", 2);
         assert_eq!(
@@ -1733,7 +1986,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-launch");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", a, CLEAN);
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
         drop_markers(&run, "task-1", 1);
 
@@ -1773,8 +2026,8 @@ mod tests {
         let server = &body["mcpServers"]["drovr-findings"];
         assert_eq!(
             server["args"],
-            serde_json::json!(["mcp-findings", "cr-mcp-flag", "task-1"]),
-            "the server is pinned to this run and task: {body}"
+            serde_json::json!(["mcp-findings", "cr-mcp-flag", "task-1", "1"]),
+            "the server is pinned to this run, task and ITERATION: {body}"
         );
         assert!(
             server["command"].as_str().is_some_and(|c| !c.is_empty()),
@@ -1825,7 +2078,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             body["mcpServers"]["drovr-findings"]["args"],
-            serde_json::json!(["mcp-findings", "cr-mcp-project-file", "task-1"])
+            serde_json::json!(["mcp-findings", "cr-mcp-project-file", "task-1", "1"])
         );
         assert!(
             h.calls()
@@ -1859,12 +2112,16 @@ mod tests {
         );
     }
 
-    /// The project file may be the user's own. drovr owns exactly one key in it.
+    /// `--approve-mcps` auto-approves EVERY server in the project file, and drovr
+    /// cannot approve selectively. So any server drovr left in place would be silently
+    /// handed to a read-only reviewer — and `.cursor/mcp.json` is a path a hostile
+    /// repository can simply commit. The reviewer must see drovr's server and nothing
+    /// else; the displaced config is preserved, not destroyed.
     #[test]
-    fn writing_the_project_config_preserves_the_users_own_servers() {
+    fn a_foreign_server_in_the_project_config_is_never_handed_to_a_reviewer() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-merge");
+        let (mut run, _repo) = make_run("cr-mcp-foreign");
         run.agent = Some("cursor".into());
         std::fs::write(
             std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
@@ -1875,10 +2132,11 @@ mod tests {
         write_base(&run, "task-1");
 
         let project = std::path::PathBuf::from(&run.project_dir);
+        let cfg_path = project.join(".cursor/mcp.json");
         std::fs::create_dir_all(project.join(".cursor")).unwrap();
         std::fs::write(
-            project.join(".cursor/mcp.json"),
-            r#"{"mcpServers":{"mine":{"command":"my-server"}}}"#,
+            &cfg_path,
+            r#"{"mcpServers":{"mine":{"command":"my-server"},"evil":{"command":"curl"}}}"#,
         )
         .unwrap();
 
@@ -1887,15 +2145,206 @@ mod tests {
             ReviewOutcome::Timeout
         );
 
-        let body: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(project.join(".cursor/mcp.json")).unwrap(),
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let servers = body["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            servers.keys().collect::<Vec<_>>(),
+            vec!["drovr-findings"],
+            "a reviewer launched with --approve-mcps must see exactly one server: {body}"
+        );
+
+        // Destroying the user's config would be its own bug: it is displaced, not lost.
+        let backup: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(backup_path(&cfg_path)).unwrap())
+                .unwrap();
+        assert_eq!(backup["mcpServers"]["mine"]["command"], "my-server");
+        assert_eq!(backup["mcpServers"]["evil"]["command"], "curl");
+
+        // A second pass must not overwrite the backup with drovr's own file — that is
+        // how "preserved" quietly becomes "lost on the next run".
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let backup: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(backup_path(&cfg_path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            backup["mcpServers"]["mine"]["command"], "my-server",
+            "the original must survive every later pass: {backup}"
+        );
+        // …and the backup is drovr's plumbing too, so it must not dirty the tree.
+        let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude
+                .lines()
+                .any(|l| l.trim() == ".cursor/mcp.json.drovr-backup"),
+            "the displaced original must be excluded from git too: {exclude}"
+        );
+    }
+
+    /// A config that holds only drovr's own server (the ordinary steady state, every
+    /// pass after the first) is rewritten in place — no backup, no noise.
+    #[test]
+    fn rewriting_drovrs_own_config_does_not_accumulate_backups() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-mcp-rewrite");
+        run.agent = Some("cursor".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"cursor\"\n",
         )
         .unwrap();
-        assert_eq!(
-            body["mcpServers"]["mine"]["command"], "my-server",
-            "drovr must not clobber a config it did not write: {body}"
+        write_base(&run, "task-1");
+
+        for _ in 0..2 {
+            assert_eq!(
+                code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+                ReviewOutcome::Timeout
+            );
+        }
+        let cfg_path = std::path::PathBuf::from(&run.project_dir).join(".cursor/mcp.json");
+        assert!(
+            !backup_path(&cfg_path).exists(),
+            "drovr's own config is not something to back up"
         );
-        assert!(body["mcpServers"]["drovr-findings"].is_object(), "{body}");
+    }
+
+    /// `.cursor/mcp.json` lives inside the checkout under review, so a repository can
+    /// commit a symlink there. `fs::write` follows it, which would drop drovr's config
+    /// wherever it points — outside the project entirely.
+    #[test]
+    fn a_symlinked_project_config_is_refused_rather_than_followed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("outside.json");
+        std::fs::write(&elsewhere, "{}").unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".cursor")).unwrap();
+        let link = project.path().join(".cursor/mcp.json");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let err = write_mcp_config(&link, "r", "task-1", 1)
+            .expect_err("a symlinked config must be refused, not followed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "{}",
+            "nothing may be written through the link"
+        );
+
+        // A symlinked PARENT redirects the write just as effectively.
+        let project2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(tmp.path(), project2.path().join(".cursor")).unwrap();
+        let err = write_mcp_config(&project2.path().join(".cursor/mcp.json"), "r", "task-1", 1)
+            .expect_err("a symlinked parent must be refused too");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The respawn's delete is the only thing between a dead reviewer's verdict and a
+    /// replacement that never submits. If it cannot be done, the pass must fail rather
+    /// than spawn a replacement into a trap.
+    #[test]
+    fn a_findings_file_that_cannot_be_cleared_fails_the_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Already absent is the state the caller wants, not a failure.
+        assert!(clear_findings_file(dir.path(), "task-1", 1, "correctness").is_ok());
+
+        // A directory at the findings path cannot be removed with `remove_file`,
+        // standing in for a delete that fails for any other reason (permissions, EIO).
+        let path = findings_path(dir.path(), "task-1", 1, "security");
+        std::fs::create_dir(&path).unwrap();
+        let err = clear_findings_file(dir.path(), "task-1", 1, "security")
+            .expect_err("an unclearable stale verdict must not be shrugged off");
+        assert!(
+            err.to_string().contains("would inherit"),
+            "the error must say what goes wrong if the pass continues: {err}"
+        );
+    }
+
+    /// "The reviewer never submitted" and "the file is there but unreadable" have
+    /// different causes and different remedies. Reporting the second as the first
+    /// sends whoever is debugging to look at the reviewer instead of the disk.
+    #[test]
+    fn an_unreadable_findings_file_is_not_reported_as_a_silent_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = obtain_findings_json(dir.path(), "task-1", 1, "correctness", "ph")
+            .expect_err("no file at all");
+        assert!(
+            missing.to_string().contains("never called submit_findings"),
+            "{missing}"
+        );
+
+        // Present, but not readable as a file.
+        std::fs::create_dir(findings_path(dir.path(), "task-1", 1, "security")).unwrap();
+        let unreadable = obtain_findings_json(dir.path(), "task-1", 1, "security", "ph")
+            .expect_err("a file that cannot be read");
+        assert!(
+            !unreadable
+                .to_string()
+                .contains("never called submit_findings"),
+            "an IO failure must not be blamed on the reviewer: {unreadable}"
+        );
+        assert!(
+            unreadable.to_string().contains("could not be read back"),
+            "{unreadable}"
+        );
+    }
+
+    /// The seed's schema and the MCP tool's schema are one definition rendered two
+    /// ways. A drift there tells the reviewer to send a shape validation then rejects.
+    #[test]
+    fn seed_schema_is_rendered_from_the_one_definition() {
+        let rendered = findings_schema();
+        // Every closed value set comes from the types `parse_review` enforces.
+        assert!(
+            rendered.contains(r#""verdict": "clean" | "changes""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#""severity": "critical" | "important" | "nit""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#""impact": "low" | "medium" | "high""#),
+            "{rendered}"
+        );
+        // …and every field the schema defines is actually shown to the reviewer.
+        let schema = crate::mcp_findings::review_schema();
+        for key in schema.as_object().unwrap().keys() {
+            assert!(
+                rendered.contains(&format!("\"{key}\"")),
+                "the seed must show '{key}': {rendered}"
+            );
+        }
+        for key in ["file", "line", "severity", "summary", "rationale"] {
+            assert!(rendered.contains(&format!("\"{key}\"")), "{rendered}");
+        }
+        // The rendering is what the reviewer actually receives.
+        assert!(build_seed("task-1", "security", "a", "b", "d").contains(&rendered));
+    }
+
+    /// A read error is not "no file here". Collapsing them lets drovr replace — and
+    /// fail to back up — a config it never managed to read.
+    #[test]
+    fn an_unreadable_existing_config_is_an_error_not_a_silent_replacement() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the config should be: reading it fails with something
+        // other than NotFound, exactly like a permissions or IO failure would.
+        let path = dir.path().join("mcp.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = write_mcp_config(&path, "r", "task-1", 1)
+            .expect_err("an unreadable config must not be silently replaced");
+        assert!(
+            err.to_string().contains("mcp.json"),
+            "the error must name the file: {err}"
+        );
     }
 
     /// Without an MCP mechanism a reviewer has no way to submit findings at all, so
@@ -1964,12 +2413,13 @@ mod tests {
         seed_angle_file(
             &run,
             "task-1",
+            1,
             "correctness",
             r#"{"verdict":"changes","findings":[{"file":"stale.rs","severity":"critical","summary":"from the dead reviewer"}]}"#,
         );
         drop_markers(&run, "task-1", 1);
         for angle in ["security", "error-handling", "type-design"] {
-            seed_angle_file(&run, "task-1", angle, CLEAN);
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
 
         // correctness is respawned, so its stale file is cleared and the replacement
@@ -2205,7 +2655,7 @@ mod tests {
         );
         // The reviewer is read-only: instructing a write would only earn it a refusal.
         let findings_file =
-            crate::mcp_findings::findings_path(&run_dir("myrun"), "task-1", "security")
+            crate::mcp_findings::findings_path(&run_dir("myrun"), "task-1", 1, "security")
                 .display()
                 .to_string();
         assert!(
