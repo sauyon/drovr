@@ -11,7 +11,8 @@ You did not write this code — review it as a skeptic, not its author.
 ## Do
 
 1. **Read the ground truth**, in this order: the approved spec at
-   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports appended below, and then the
+   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports in the context section below,
+   and then the
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the
    reports.
 2. **Review against the checklist — apply the check discipline from `drovr:code-review`

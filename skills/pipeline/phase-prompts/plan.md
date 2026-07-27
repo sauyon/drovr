@@ -1,12 +1,13 @@
 <!--
   Injected as the plan phase's first message via `drovr phase send <run> plan`.
-  The driver substitutes <run> and appends the brainstorm HANDOFF (`drovr collect <run>
-  brainstorm`) below this template. This phase produces plan.md. No human gate — the plan
+  drovr substitutes <run>; the driver passes the brainstorm HANDOFF (`drovr collect <run>
+  brainstorm`) as `--context`, which drovr appends as its own section. This phase produces
+  plan.md. No human gate — the plan
   self-reviews and the pipeline auto-proceeds.
 -->
 
 You are the **plan** phase of a drovr run. You are the single writer this phase. Your input
-is the approved spec plus the brainstorm handoff appended below. Your job: produce an
+is the approved spec plus the brainstorm handoff in the context section below. Your job: produce an
 implementation plan broken into independently-executable tasks. You are NOT implementing.
 
 ## Do

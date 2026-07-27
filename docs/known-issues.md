@@ -308,6 +308,34 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## A phase agent can plant its own `<phase>-context.md` (2026-07-27)
+
+**Severity:** medium — it is a back door around "drovr composes every brief", the whole point of
+the structural-briefs design.
+**Found:** review round 2 of run `structural-briefs`, security angle, `cli/src/brief.rs`.
+
+`brief::resolve_context` records driver context at `<run_dir>/<key>-context.md` and, when a later
+invocation passes no `--context`, reuses it. But the run dir is **agent-writable by contract** —
+every phase agent writes `<phase>-HANDOFF.md` there, and `drovr phase done` requires it. So an
+agent can create `<phase>-context.md` itself, and the next `drovr phase brief` / `phase start`
+without `--context` will present that text to the next agent as *driver* context.
+
+**Not fixed, deliberately.** Any check drovr could add here is a heuristic (provenance guessing,
+mtime comparison, a marker the agent could also write) layered under an authoritative mechanism,
+and a heuristic backstop is worse than a documented gap: it makes the hole look closed. The real
+boundary is the run dir's permissions, and drovr's model already trusts agents not to write
+`state.json` with nothing enforcing it — this is the same trust, in the same directory.
+
+**What does hold:** the reuse is announced on stderr with the path every time it happens
+(`drovr: reusing the recorded context for '<key>' (<path>)`), so a driver can see what is in
+effect; `--context ''` clears the record; and recording uses write-then-rename, so a symlink
+planted at that path is replaced rather than followed (that one WAS fixed — `fs::write` follows
+symlinks, which turned recording into a clobber of the link's target).
+
+**If you want it closed:** the context has to live somewhere agents cannot write, which means
+outside the run dir — a driver-side store keyed by run+phase. That is a design change, not a
+patch.
+
 ## The findings channel loses reviewer output two ways (2026-07-26/27)
 
 **Severity:** high — it fails the panel on any real diff, and both modes look like "the reviewer

@@ -1,12 +1,14 @@
 <!--
-  Injected as ONE implement task's first message via
-  `drovr phase send <run> implement-task-<N>`. The driver substitutes <run> and <N>, and
-  appends: (a) this task's brief from plan.md, and (b) the accumulated interfaces from
-  earlier tasks' handoffs. One fresh agent per task keeps context clean.
+  Composed and injected as ONE implement task's first message by
+  `drovr phase start <run> implement-task-<N> --context …`. drovr substitutes <run> and <N>
+  and appends the run's task plus the driver's `--context`, which should carry (a) this
+  task's brief from plan.md and (b) the accumulated interfaces from earlier tasks'
+  handoffs. One fresh agent per task keeps context clean.
 -->
 
 You are implement **task <N>** of a drovr run. You are the single writer this phase. Your
-scope is EXACTLY the one task brief appended below — not the whole plan. Do not start other
+scope is EXACTLY the one task brief in the context section below — not the whole plan. If no
+context section is present, your scope is this task's entry in `plan.md`. Do not start other
 tasks; later tasks run as their own fresh phases.
 
 ## Do

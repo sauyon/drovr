@@ -98,14 +98,22 @@ pub fn resolve_context(
     match supplied {
         Some(text) if !text.trim().is_empty() => {
             std::fs::create_dir_all(dir)?;
-            std::fs::write(&path, format!("{}\n", text.trim()))?;
+            // Write-then-rename: `fs::write` FOLLOWS a symlink at `path`, so a symlink
+            // planted in the run dir would turn recording context into a clobber of its
+            // target. `rename` replaces the link itself.
+            let tmp = path.with_extension("md.tmp");
+            std::fs::write(&tmp, format!("{}\n", text.trim()))?;
+            std::fs::rename(&tmp, &path)?;
             Ok(Some(text.trim().to_owned()))
         }
         Some(_) => {
-            // Explicitly empty: un-say it.
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                eprintln!("drovr: cleared the recorded context for '{key}'");
+            // Explicitly empty: un-say it. Remove unconditionally and tolerate NotFound,
+            // rather than exists()-then-remove, which races with anything else in the run
+            // dir and turns a benign "already gone" into an error.
+            match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("drovr: cleared the recorded context for '{key}'"),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
             Ok(None)
         }
@@ -114,16 +122,23 @@ pub fn resolve_context(
             // read error is not: proceeding contextless while the driver believes its
             // recorded context is in effect is the silent failure this mechanism exists
             // to prevent, so say so loudly and carry on.
+            // A MISSING record is the normal case (no context was ever given). Any other
+            // read error FAILS the composition: a brief that silently goes out without
+            // context the driver believes is in it is precisely the failure this
+            // mechanism exists to prevent, and a warning on stderr is too easy to miss in
+            // a pipeline. Four review angles independently called warn-and-proceed wrong.
             let recorded = match std::fs::read_to_string(&path) {
                 Ok(c) => Some(c),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => {
-                    eprintln!(
-                        "drovr: WARNING: cannot read the recorded context {} ({e}) — this brief \
-                         goes out WITHOUT it",
-                        path.display()
-                    );
-                    None
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot read the recorded context {} ({e}) — refusing to compose a \
+                             brief without it; fix the file, or pass --context '' to drop it",
+                            path.display()
+                        ),
+                    ));
                 }
             }
             .map(|c| c.trim().to_owned())
@@ -176,10 +191,17 @@ pub fn compose_phase_brief(
     // that read the run-level statement as its scope would implement the whole change.
     let mut sections = format!("## The run's task\n\n{}\n", run.task.trim());
     if matches!(kind, PhaseKind::ImplementTask(_)) {
-        sections.push_str(
+        // Point at the context section only when there IS one. Unconditionally telling an
+        // agent its scope is "the context section below" when no context was supplied
+        // sends it looking for a section that does not exist.
+        sections.push_str(if context.is_some() {
             "\nThat is the whole run, for orientation only. **Your scope is the task brief in \
-             the context section below**, not this run-level statement.\n",
-        );
+             the context section below**, not this run-level statement.\n"
+        } else {
+            "\nThat is the whole run, for orientation only. **Your scope is only this task's \
+             brief in `plan.md`** — no context was supplied with this brief, so read it there \
+             and do not widen your scope to the run.\n"
+        });
     }
     // No context renders no section: an empty heading reads as "the driver had nothing
     // to say", which is worse than silence.
@@ -190,6 +212,13 @@ pub fn compose_phase_brief(
     // Insert BEFORE the template's closing `## Done when`. Appending put the task and
     // context after the completion criteria, orphaning them: the agent read "Done when
     // …" and then hit new material, and the criteria no longer ended the brief.
+    //
+    // The split is a line-anchored `rfind`, which assumes no template contains that exact
+    // heading text inside a code block or in prose before its real closing section. All
+    // four do end with `## Done when`, and `embedded_templates_match_the_files_on_disk`
+    // plus these tests would catch a template edited into a shape this mishandles. The
+    // fallback branch (append) exists for a template without the heading at all, e.g. a
+    // future phase kind.
     let mut brief = match body.rfind("\n## Done when") {
         Some(i) => {
             let (before, done_when) = body.split_at(i);
@@ -385,6 +414,87 @@ mod tests {
             "--context '' must drop the recorded context, not fall through to it: {cleared}"
         );
         assert!(cleared.contains("make the widget reentrant"));
+    }
+
+    /// Round 2, four angles: composing a brief WITHOUT context the driver believes is
+    /// recorded is the silent failure this mechanism exists to prevent. An unreadable
+    /// record must fail the composition, not warn and ship a thinner brief.
+    #[test]
+    fn an_unreadable_context_record_fails_the_composition() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("unreadable-record");
+        let run = make_run();
+        // A DIRECTORY where the record belongs: readable path, unreadable as a file, and
+        // deterministic across platforms and privilege levels (unlike chmod 000).
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(context_record(&dir, "plan")).unwrap();
+
+        let err = compose_phase_brief(&run, "plan", None)
+            .expect_err("an unreadable record must not compose silently");
+        let msg = err.to_string();
+        assert!(msg.contains("recorded context"), "says what failed: {msg}");
+        assert!(
+            msg.contains("--context ''"),
+            "says how to get unstuck: {msg}"
+        );
+    }
+
+    /// `fs::write` follows a symlink at the destination, so a link planted in the run dir
+    /// would make recording context clobber whatever it points at. Write-then-rename
+    /// replaces the link itself.
+    #[test]
+    fn recording_context_replaces_a_symlink_instead_of_following_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("symlink-record");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, context_record(&dir, "plan")).unwrap();
+
+        compose_phase_brief(&run, "plan", Some("new context")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "the symlink target must be untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(context_record(&dir, "plan"))
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the link itself must have been replaced by a real file"
+        );
+    }
+
+    /// The implement-task scope pointer must not send an agent to a section that is not
+    /// there: with no context, its scope is the task's entry in `plan.md`.
+    #[test]
+    fn the_implement_task_scope_pointer_matches_what_the_brief_contains() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("scope-pointer");
+        let run = make_run();
+
+        // Assert on the pointer DROVR emits, not on the template's own prose (which
+        // legitimately describes both cases).
+        let ctx_pointer = "**Your scope is the task brief in the context section below**";
+        let plan_pointer = "**Your scope is only this task's brief in `plan.md`**";
+
+        let without = compose_phase_brief(&run, "implement-task-2", None).unwrap();
+        assert!(
+            !without.contains(ctx_pointer),
+            "must not point at an absent section: {without}"
+        );
+        assert!(
+            without.contains(plan_pointer),
+            "must redirect to plan.md: {without}"
+        );
+
+        let with = compose_phase_brief(&run, "implement-task-2", Some("task 2 brief")).unwrap();
+        assert!(with.contains(ctx_pointer));
+        assert!(!with.contains(plan_pointer));
     }
 
     /// Context is per phase, never shared between them.

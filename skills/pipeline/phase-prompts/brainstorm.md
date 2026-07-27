@@ -1,6 +1,7 @@
 <!--
   Injected as the brainstorm phase's first message via `drovr phase send <run> brainstorm`.
-  The driver substitutes <run> and appends the task description below this template.
+  drovr substitutes <run> and appends the run's task (and any driver `--context`) as
+  sections below this template — see `drovr phase brief`.
   This phase writes spec.md and drives the human review gate.
 -->
 

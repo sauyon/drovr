@@ -876,15 +876,26 @@ fn cmd_phase(sub: PhaseCmd) {
                     if let Some(i) = state.phases.iter().position(|p| p.name == phase_name) {
                         state.phases[i].status = run::PhaseStatus::Failed;
                         if let Err(e) = state.save() {
-                            eprintln!("drovr: could not record the failed phase: {e}");
+                            // The phase is still `Running` ON DISK, so a later
+                            // `phase wait` would block forever on an agent that was never
+                            // briefed. That is a worse state than the send failure itself,
+                            // and it is not remediable by re-sending — exit 1, not the
+                            // exit 2 that means "re-brief it".
+                            eprintln!(
+                                "drovr: could not record the failed phase ({e}) — phase \
+                                 '{phase_name}' is still Running on disk with an UNBRIEFED \
+                                 agent; fix the run dir before anything waits on it"
+                            );
+                            process::exit(1);
                         }
                     }
                     // The brief's context is recorded, so the remediation needs no
                     // --context: `phase brief` reuses it.
                     eprintln!(
-                        "drovr: phase '{phase_name}' is running but UNBRIEFED (marked failed) — \
-                         re-send with `drovr phase brief {run} {phase_name} | drovr phase send \
-                         {run} {phase_name} -` once the pane is at its composer"
+                        "drovr: phase '{phase_name}' marked FAILED — its pane is alive but the \
+                         agent was never briefed. Re-send with `drovr phase brief {run} \
+                         {phase_name} | drovr phase send {run} {phase_name} -` once the pane is \
+                         at its composer"
                     );
                     process::exit(2);
                 }
@@ -1137,9 +1148,21 @@ fn cmd_review(sub: ReviewCmd) {
 /// context to be in the brief, and silently reviewing without it is the failure this
 /// whole mechanism exists to prevent.
 fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
+    const MAX_CONTEXT: u64 = 1 << 20;
     match (context, context_file) {
         (Some(text), _) => Some(text),
         (None, Some(path)) => match std::fs::read_to_string(&path) {
+            // Same 1 MiB bound as `phase send -`: a context is prose, and the two input
+            // paths should not disagree about what is too big.
+            Ok(text) if text.len() as u64 > MAX_CONTEXT => {
+                eprintln!(
+                    "drovr: --context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — \
+                     that is not a context; check what you passed",
+                    path.display(),
+                    text.len()
+                );
+                process::exit(1);
+            }
             Ok(text) => Some(text),
             Err(e) => {
                 eprintln!("drovr: cannot read --context-file {}: {e}", path.display());
