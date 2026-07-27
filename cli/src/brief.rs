@@ -62,7 +62,10 @@ fn template(kind: PhaseKind) -> &'static str {
 /// telling an agent how its own brief is assembled invites it to assemble one itself.
 fn strip_editorial_comment(template: &str) -> &str {
     let t = template.trim_start();
-    match t.strip_prefix("<!--").and_then(|rest| rest.split_once("-->")) {
+    match t
+        .strip_prefix("<!--")
+        .and_then(|rest| rest.split_once("-->"))
+    {
         Some((_, body)) => body.trim_start(),
         None => t,
     }
@@ -190,7 +193,11 @@ mod tests {
             !brief.contains("<!--"),
             "the maintainer comment must not reach the agent: {brief}"
         );
-        assert!(brief.trim_start().starts_with("You are the **brainstorm** phase"));
+        assert!(
+            brief
+                .trim_start()
+                .starts_with("You are the **brainstorm** phase")
+        );
     }
 
     /// `answers[<id>]` in brainstorm.md is prose about a JSON shape, not a placeholder.
@@ -208,7 +215,8 @@ mod tests {
     #[test]
     fn composed_brief_carries_the_task_and_the_driver_context() {
         let run = make_run();
-        let with = compose_phase_brief(&run, "plan", Some("the vendored dir is off limits")).unwrap();
+        let with =
+            compose_phase_brief(&run, "plan", Some("the vendored dir is off limits")).unwrap();
         assert!(with.contains("make the widget reentrant"), "task: {with}");
         assert!(with.contains("## Context from the driver"));
         assert!(with.contains("the vendored dir is off limits"));

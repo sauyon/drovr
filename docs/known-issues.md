@@ -308,6 +308,20 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## `review::tests::lock_records_our_pid_and_releases_on_drop` flaked once (2026-07-26)
+
+**Severity:** low (one observation, not reproducible on demand).
+
+Seen once during the `structural-briefs` work: a full `cargo test` reported this single
+failure, and the same test passed alone and in two immediately following full runs
+(367/367 each). Conditions at the time: a live `drovr serve` from another session plus
+several sibling worktrees under `.drovr/wt/`, so more than one process could plausibly
+have been touching the serve lock.
+
+Not yet diagnosed. Recorded so a second sighting is recognised as a pattern rather than
+re-investigated from scratch — if it recurs, suspect cross-process contention on the
+lock path rather than test-internal ordering.
+
 ## `drovr code-review run` panel never completes (reviewer panes don't attach)
 
 **Severity:** medium (the automated review-until-clean panel is unusable; the driver must fall

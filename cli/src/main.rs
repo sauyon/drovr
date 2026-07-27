@@ -14,8 +14,8 @@ mod sha256;
 mod shell;
 mod worktree;
 
-use clap::{Parser, Subcommand};
 use brief::compose_phase_brief;
+use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
@@ -130,6 +130,18 @@ enum PhaseCmd {
         phase_name: String,
         #[arg(long)]
         seed: Option<PathBuf>,
+        /// Compose this phase's brief (see `phase brief`) and inject it once the
+        /// agent is at its composer. This is how a phase should be briefed: drovr
+        /// owns the frame, you supply only what it cannot know.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+        /// Spawn the agent WITHOUT a brief (the pre-brief behavior). For a phase
+        /// drovr has no template for, or when you will brief it by hand with
+        /// `phase send`.
+        #[arg(long)]
+        no_brief: bool,
     },
     /// Send text to a running phase pane. Waits for the agent to attach first;
     /// exit 2 = it never became ready within the readiness timeout (likely parked
@@ -137,6 +149,9 @@ enum PhaseCmd {
     Send {
         run: String,
         phase_name: String,
+        /// The text to send, or `-` to read it from stdin — which is how a composed
+        /// brief reaches an already-running phase:
+        /// `drovr phase brief <run> <phase> | drovr phase send <run> <phase> -`.
         text: String,
     },
     /// Wait for a phase to complete (polls for the `done` marker and the pane's
@@ -787,17 +802,66 @@ fn cmd_phase(sub: PhaseCmd) {
             run,
             phase_name,
             seed,
+            context,
+            context_file,
+            no_brief,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
+            let context = read_context_arg(context, context_file);
             let mut state = load_run(&run);
+
+            // Compose BEFORE spawning. A phase whose brief cannot be composed (no
+            // template for that name) must not end up as a live agent sitting at an
+            // empty composer waiting for a driver to improvise one — that is the
+            // failure mode this whole mechanism exists to remove.
+            let composed = if no_brief {
+                None
+            } else {
+                match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                    Ok(brief) => Some(brief),
+                    Err(e) => {
+                        eprintln!("drovr: {e}");
+                        eprintln!(
+                            "drovr: (or spawn it unbriefed with `drovr phase start {run} \
+                             {phase_name} --no-brief`)"
+                        );
+                        process::exit(1);
+                    }
+                }
+            };
+
             if let Err(e) = phase_start(&h, &mut state, &phase_name, seed.as_deref()) {
                 eprintln!("drovr: phase start failed: {e}");
                 process::exit(1);
             }
             println!("started phase '{phase_name}' for run '{run}'");
+
+            if let Some(brief) = composed {
+                if let Err(e) = phase_send(&h, &mut state, &phase_name, &brief) {
+                    // The pane is up but unbriefed. Say so precisely: the phase is
+                    // NOT running its task, and a driver that reads "started" alone
+                    // would wait forever on an agent that was never asked anything.
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
+                            eprintln!("drovr: {diag}");
+                        } else {
+                            eprintln!("drovr: {e}");
+                        }
+                    } else {
+                        eprintln!("drovr: could not deliver the brief: {e}");
+                    }
+                    eprintln!(
+                        "drovr: phase '{phase_name}' is running but UNBRIEFED — re-send with \
+                         `drovr phase brief {run} {phase_name} | drovr phase send {run} \
+                         {phase_name} -` once the pane is at its composer"
+                    );
+                    process::exit(2);
+                }
+                println!("briefed phase '{phase_name}' ({} bytes)", brief.len());
+            }
         }
         PhaseCmd::Send {
             run,
@@ -809,6 +873,22 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
+            // `-` reads stdin, so a brief drovr composed can be piped straight in
+            // without a driver retyping (or paraphrasing) it.
+            let text = if text == "-" {
+                let mut buf = String::new();
+                if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut buf) {
+                    eprintln!("drovr: cannot read the message from stdin: {e}");
+                    process::exit(1);
+                }
+                if buf.trim().is_empty() {
+                    eprintln!("drovr: refusing to send an empty message read from stdin");
+                    process::exit(1);
+                }
+                buf
+            } else {
+                text
+            };
             if let Err(e) = phase_send(&h, &mut state, &phase_name, &text) {
                 // A readiness timeout (agent never attached) is not a plain send
                 // failure — the agent is almost certainly parked on a prompt with
@@ -1656,6 +1736,7 @@ mod tests {
                         run,
                         phase_name,
                         seed,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -1819,6 +1900,79 @@ mod tests {
 
     /// `--context` and `--context-file` are alternatives, not a pair. clap enforces
     /// it, so a driver cannot supply two different contexts and leave drovr guessing.
+    /// A brief is composed by default now; `--no-brief` is the explicit opt-out, and
+    /// `--context` is the only part of the brief a driver supplies.
+    #[test]
+    fn parse_phase_start_context_and_no_brief() {
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "implement-task-2",
+            "--context",
+            "task brief from plan.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start {
+                    context, no_brief, ..
+                },
+            } => {
+                assert_eq!(context.as_deref(), Some("task brief from plan.md"));
+                assert!(!no_brief, "briefing is the default");
+            }
+            _ => panic!("wrong variant"),
+        }
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "verify-land",
+            "--no-brief",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start { no_brief, .. },
+            } => assert!(no_brief),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "phase",
+                "start",
+                "myrun",
+                "plan",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_phase_brief() {
+        let cli = parse(&["drovr", "phase", "brief", "myrun", "plan"]).unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Brief {
+                    run, phase_name, ..
+                },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(phase_name, "plan");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     #[test]
     fn parse_code_review_context_args_are_mutually_exclusive() {
         let cli = parse(&[
@@ -1868,9 +2022,10 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::CodeReview {
-                sub: CodeReviewCmd::Brief {
-                    run, task, angle, ..
-                },
+                sub:
+                    CodeReviewCmd::Brief {
+                        run, task, angle, ..
+                    },
             } => {
                 assert_eq!(run, "myrun");
                 assert_eq!(task, "task-1");
