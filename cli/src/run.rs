@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io};
 
+use crate::herdr::SessionId;
+
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Default)]
 pub enum PhaseStatus {
     #[default]
@@ -106,6 +108,58 @@ pub struct Phase {
     /// a tokened marker against it is an inconsistency and is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<PassToken>,
+    /// The herdr tab holding [`Phase::pane_id`], captured opportunistically by
+    /// the poll loops in `phase.rs`.
+    ///
+    /// **Diagnostic, not an operand.** A tab id read minutes ago may name a tab
+    /// that is gone or reused, and `Herdr::tab_close` deliberately takes a
+    /// `herdr::TabId` that only a live `pane_info` read can mint — so anything
+    /// about to close a tab resolves a fresh one first, and this field exists so
+    /// a human (or a `state.json` reader) can see which tab a phase occupied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    /// The agent session id this phase's pane is running, captured while the
+    /// agent is ALIVE because herdr drops `agent_session` the moment the agent
+    /// process exits (verified against 0.7.5) — by the time anything wants to
+    /// resume the conversation there is nothing left to read.
+    ///
+    /// Typed as a [`SessionId`] rather than a `String` on purpose. `herdr.rs`
+    /// makes "only a `kind:"id"` session, attributed to this run's backend, in
+    /// an alphabet a `--resume` can carry" a property of the TYPE
+    /// (`AgentSession::resumable_for`), and persisting it as a bare string would
+    /// drop that proof at the `state.json` boundary and force every reader to
+    /// re-derive it. `Deserialize` re-checks the alphabet, so an id loaded from
+    /// disk is as trustworthy as one just parsed off the wire.
+    ///
+    /// Implicitly owned by `RunState::agent`: capture only records an id herdr
+    /// attributes to that backend, so the pair (this id, the run's backend) is
+    /// what a resume needs.
+    ///
+    /// Once set it is only ever REPLACED, never cleared by a poll — an absent
+    /// session in a later poll is herdr forgetting, not the agent disowning it.
+    /// `phase_start` is the one exception: it launches a NEW agent process in
+    /// the pane, so the id it clears belongs to a conversation that is no longer
+    /// this phase's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<SessionId>,
+    /// The `CLAUDE_CONFIG_DIR` in effect when this phase's agent was launched,
+    /// or `None` when the launch inherited the default profile.
+    ///
+    /// Recorded because claude resolves a session id under
+    /// `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`: resuming
+    /// [`Phase::agent_session`] from a process holding a *different* profile
+    /// looks for the conversation in the wrong place and silently finds nothing.
+    /// The launch is the only moment this is knowable — a later command may run
+    /// from a plain shell with no profile set at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<String>,
+    /// Whether this phase's pane has been reaped: drovr closed it because the
+    /// phase was superseded, and the phase can be brought back only by resuming
+    /// [`Phase::agent_session`]. Written by nothing yet — reaping is a later
+    /// step; it is declared here so the whole capture record lands in one
+    /// `state.json` shape rather than migrating twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reaped: bool,
 }
 
 impl Phase {
@@ -338,6 +392,20 @@ impl RunState {
         self.phases
             .iter()
             .chain(self.review_phases.iter())
+            .find(|p| p.name == name)
+    }
+    /// [`RunState::find_phase`], mutably — same lists, same order, same caveat.
+    /// Session capture needs it because a reviewer's pane is polled through the
+    /// same readiness gate as a pipeline phase's, and a reviewer lives only in
+    /// `review_phases`.
+    ///
+    /// `phases` is searched first, and `phase::require_name_unclaimed` refuses a
+    /// name the other list already answers to, so this and `find_phase` cannot
+    /// resolve to different entries.
+    pub fn find_phase_mut(&mut self, name: &str) -> Option<&mut Phase> {
+        self.phases
+            .iter_mut()
+            .chain(self.review_phases.iter_mut())
             .find(|p| p.name == name)
     }
 }
@@ -784,6 +852,63 @@ mod tests {
             !out.contains("\"pass\""),
             "pass: None must be skipped on serialize: {out}"
         );
+    }
+
+    #[test]
+    fn missing_phase_capture_fields_default_to_absent() {
+        // The Phase-level back-compat guard for the four fields session capture
+        // adds. Same stakes as `missing_phase_pass_defaults_to_none`: `Phase`'s
+        // fields are not `#[serde(default)]` as a group, so one of these landing
+        // without its own default makes EVERY existing state.json fail to load →
+        // `load_run` exits 1 → the run STOPs. This is the state.json shape drovr
+        // wrote before session capture existed.
+        let json = r#"{
+            "name":"old","task":"t",
+            "phases":[{"name":"plan","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w:p1","pass":"abc-1"}],
+            "gate":"spec","cursor":0,"project_dir":"/tmp/proj"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        let p = &loaded.phases[0];
+        assert!(p.tab_id.is_none(), "absent tab_id → None");
+        assert!(p.agent_session.is_none(), "absent agent_session → None");
+        assert!(p.agent_profile.is_none(), "absent agent_profile → None");
+        assert!(!p.reaped, "absent reaped → false (the phase still has its pane)");
+
+        // And a phase that captured nothing must not start emitting the keys:
+        // a run written by this build stays loadable by an older one.
+        let out = serde_json::to_string(&loaded).unwrap();
+        for key in ["tab_id", "agent_session", "agent_profile", "reaped"] {
+            assert!(!out.contains(key), "empty {key} must be skipped: {out}");
+        }
+    }
+
+    #[test]
+    fn a_persisted_session_id_is_revalidated_on_load() {
+        // `state.json` is a file. A session id that reached it by any other route
+        // than a capture must clear the same bar, because task 5 interpolates it
+        // into `--resume '<id>'` — so a hand-edited one that could break out of
+        // those quotes fails the LOAD, loudly, rather than the composition.
+        let phase = |session: &str| {
+            format!(
+                r#"{{"name":"plan","status":"Running","handoff_doc":null,
+                    "herdr_session":null,"pane_id":null,"agent_session":{session}}}"#
+            )
+        };
+        let good: Phase = serde_json::from_str(&phase("\"cca92f5b-3a8c\"")).unwrap();
+        assert_eq!(
+            good.agent_session.as_ref().map(SessionId::as_str),
+            Some("cca92f5b-3a8c")
+        );
+        // Round-trips as a bare string, so state.json stays human-readable.
+        let out = serde_json::to_string(&good).unwrap();
+        assert!(out.contains(r#""agent_session":"cca92f5b-3a8c""#), "{out}");
+
+        for bad in ["\"\"", "\"a b\"", "\"a'b; rm -rf /\""] {
+            assert!(
+                serde_json::from_str::<Phase>(&phase(bad)).is_err(),
+                "{bad} must not load as a session id"
+            );
+        }
     }
 
     #[test]

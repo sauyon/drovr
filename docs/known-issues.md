@@ -680,6 +680,45 @@ CI workflow at all, so nothing enforces it today.)
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
 
+## `lock_records_our_pid_and_releases_on_drop` flakes at ~5–7%, independent of test threads
+
+**Severity:** low (a false RED on a task that changed nothing near it).
+**Found:** 2026-07-26, during task 3 of run `phase-reap`.
+**Reproduced:** `main` @ `8173f03` / branch base `310fa7f` — **2 failures in 30 consecutive
+`cargo test --bin drovr` runs**, and ~3 in 45 on the same tree with task 3's changes applied.
+Same rate either way, so it is **not** caused by anything task 3 did.
+
+### Symptom
+
+```
+---- review::tests::lock_records_our_pid_and_releases_on_drop stdout ----
+panicked at src/review.rs:2326:14: released lock must be free
+```
+
+The test claims the server lock on a file in its own fresh `tempfile::tempdir()`, drops the
+`File`, and re-claims it. Intermittently the second `try_take_lock` comes back
+`TryLockError::WouldBlock`. It passes 100% when run alone (`cargo test lock_records_our_pid`),
+so it is a whole-suite interaction, not a bug in `try_take_lock`'s logic.
+
+### Why it matters more than a normal flake
+
+It is distinct from the `--test-threads=1` entry above: that one is env-var pollution across
+parallel tests, and this test touches no process-global env. It also fails the ONE gate every
+drovr implementation task is measured against ("`cargo test` must be green"), on a file the
+task never opened — so the honest reading of a single red run is "re-run it", which is exactly
+the habit that hides real regressions.
+
+### Not yet ruled out
+
+The lock is `std::fs::File::try_lock`, whose Unix release is per open-file-description. A
+duplicated descriptor (an inherited fd in a spawned child, an fd-number race with another
+thread opening files concurrently) would explain a release that does not take effect, and the
+suite does spawn processes. Unconfirmed.
+
+### Workaround
+
+Re-run. Before believing a red `cargo test`, check whether the ONLY failure is this test.
+
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
 **Severity:** low (cosmetic; the mirror is readable but noisy).

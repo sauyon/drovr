@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[cfg(test)]
@@ -51,7 +52,7 @@ impl TabId {
 
 /// A resumable session id, carrying its own proof: the inner string is private
 /// to this module, so one can only be built here — by parsing a `kind == "id"`
-/// session.
+/// session, or by loading one drovr previously wrote.
 ///
 /// It exists to make [`AgentSession`]'s guarantee structural rather than
 /// conventional. An enum's variants are as public as the enum, so with every
@@ -60,15 +61,63 @@ impl TabId {
 /// path where a session id was expected. Giving `Id` a payload type of its own
 /// makes that or-pattern fail to type-check, and [`IdSession`] keeps the id out
 /// of reach of a direct destructure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The VALUE is constrained too, by [`SessionId::new`] — see there for why both
+/// constructors must agree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct SessionId(String);
 
-// Capability only for now: nothing in drovr resumes a session yet, so the id is
-// read by tests alone until task 5 composes `--resume`.
-#[allow(dead_code)]
+/// The only shape a session id may take: `[A-Za-z0-9._-]{1,128}`.
+///
+/// Every backend drovr knows mints ids in this alphabet (claude and codex use
+/// UUIDs, cursor an alphanumeric chat id), and it is the alphabet the resume
+/// composition needs: the id is interpolated into `<agent> --resume '<id>'`, so
+/// a quote, a space, a `;` or a `/` there is either a shell break-out or a
+/// transcript path wearing an id's clothes.
+fn session_id_is_usable(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl SessionId {
+    /// `None` for a value no `--resume` could safely carry (see
+    /// [`session_id_is_usable`]).
+    ///
+    /// The rule lives at CONSTRUCTION, so it holds for BOTH constructors — the
+    /// parser below and `Deserialize`. That symmetry is not tidiness, it is
+    /// what keeps `state.json` loadable: if only `Deserialize` validated, a
+    /// capture could persist an id the next `RunState::load` rejects, and a run
+    /// whose state does not load exits 1 and STOPs. Validating at the parse side
+    /// too means an id drovr would refuse to resume is one it never writes.
+    ///
+    /// A value that fails is NOT discarded — [`parse_agent_session`] keeps it as
+    /// an [`AgentSession::Other`] so it stays visible in diagnostics while being
+    /// unresumable by construction.
+    pub fn new(value: String) -> Option<SessionId> {
+        session_id_is_usable(&value).then_some(SessionId(value))
+    }
+
+    /// The id itself. Capture never needs it — it stores the `SessionId` whole —
+    /// so this is read by tests alone until task 5 composes `--resume`.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The second constructor: `state.json` is a file, and anything that can write
+/// it can propose a session id. Held to exactly [`SessionId::new`]'s rule, so a
+/// loaded id is as trustworthy as a parsed one and task 5 can interpolate either
+/// without re-deriving the check.
+impl TryFrom<String> for SessionId {
+    type Error = String;
+    fn try_from(value: String) -> Result<SessionId, String> {
+        SessionId::new(value)
+            .ok_or_else(|| "session id must match [A-Za-z0-9._-]{1,128}".to_string())
     }
 }
 
@@ -119,8 +168,9 @@ pub enum AgentSession {
     Other { kind: String, value: String },
 }
 
-// Capability only for now: nothing in drovr reads a session yet — capturing it
-// onto `Phase` is a later step, and resuming from it later still.
+// `resumable_for` is live — `phase::Capture` gates every persisted session on
+// it. `agent()` and `kind()` are still diagnostics-only, and the block-level
+// allow is what covers them.
 #[allow(dead_code)]
 impl AgentSession {
     /// The session id — and ONLY when this is an id session that herdr
@@ -992,21 +1042,28 @@ fn parse_pane_info(result: &Value) -> Option<PaneInfo> {
 /// a session drovr cannot classify is one it must not resume — while `agent` is
 /// optional. Note that a pane whose agent has exited has no `agent_session` key
 /// at all, which is exactly `None` here.
+///
+/// An `id` whose value [`SessionId::new`] refuses lands in
+/// [`AgentSession::Other`] carrying herdr's own `kind` and the raw value: the
+/// wire is preserved verbatim (so `kind()` still answers `"id"` and diagnostics
+/// can show what came back), but no `SessionId` is minted, so nothing
+/// downstream can persist or interpolate it.
 fn parse_agent_session(value: &Value) -> Option<AgentSession> {
     let kind = non_empty_string(value, "kind")?;
     let session_value = non_empty_string(value, "value")?;
+    let unusable = |kind: String, value: String| AgentSession::Other { kind, value };
     Some(match kind.as_str() {
-        "id" => AgentSession::Id(IdSession {
-            value: SessionId(session_value),
-            agent: non_empty_string(value, "agent"),
-        }),
+        "id" => match SessionId::new(session_value.clone()) {
+            Some(id) => AgentSession::Id(IdSession {
+                value: id,
+                agent: non_empty_string(value, "agent"),
+            }),
+            None => unusable(kind, session_value),
+        },
         "path" => AgentSession::Path {
             value: session_value,
         },
-        _ => AgentSession::Other {
-            kind,
-            value: session_value,
-        },
+        _ => unusable(kind, session_value),
     })
 }
 
@@ -1115,17 +1172,31 @@ impl FakeHerdr {
     /// The raw session-id value the fake reports for an agent attached to
     /// `pane_id`. Exposed so a test can assert on a captured/persisted id
     /// without hard-coding the derivation.
+    ///
+    /// Pane ids carry a `:` (`wAF:p1`) and real session ids never do — every
+    /// backend mints them in [`session_id_is_usable`]'s alphabet — so the
+    /// separator is folded to `-`. Without that the fake would hand out values
+    /// no `SessionId` can hold, and every test whose panes are named the way
+    /// herdr names them would see a session drovr refuses to capture.
     pub fn session_value_for(pane_id: &str) -> String {
-        format!("session-of-{pane_id}")
+        format!("session-of-{}", pane_id.replace(':', "-"))
     }
 
     /// The session the fake reports for an agent attached to `pane_id`, owned by
-    /// `claude` — the default backend. A test needing another backend scripts a
-    /// whole `PaneInfo` with [`FakeHerdr::push_pane_info`].
-    fn session_for(pane_id: &str) -> AgentSession {
+    /// `claude` — the default backend.
+    pub fn session_for(pane_id: &str) -> AgentSession {
+        Self::session_owned_by(pane_id, Some("claude"))
+    }
+
+    /// [`FakeHerdr::session_for`], attributed to `agent` instead. `IdSession`'s
+    /// fields are private (that is the point — see [`AgentSession`]), so this is
+    /// the only way a test outside this module can build a session herdr says
+    /// belongs to a DIFFERENT backend, or to none at all.
+    pub fn session_owned_by(pane_id: &str, agent: Option<&str>) -> AgentSession {
         AgentSession::Id(IdSession {
-            value: SessionId(Self::session_value_for(pane_id)),
-            agent: Some("claude".to_string()),
+            value: SessionId::new(Self::session_value_for(pane_id))
+                .expect("the fake's derived session values are always usable"),
+            agent: agent.map(str::to_string),
         })
     }
 
@@ -1960,6 +2031,75 @@ mod tests {
         let empty_tab =
             socket_result(r#"{"result":{"pane":{"pane_id":"w1:p1","tab_id":"","agent_status":"idle"}}}"#);
         assert!(parse_pane_info(&empty_tab).is_none());
+    }
+
+    // The alphabet is enforced at CONSTRUCTION, so every SessionId in the
+    // process — parsed from herdr or deserialized from state.json — is one a
+    // resume can interpolate. Both constructors, one rule.
+    #[test]
+    fn session_id_admits_only_values_a_resume_could_carry() {
+        let ok = |v: &str| SessionId::new(v.to_string()).is_some();
+        assert!(ok("cca92f5b-3a8c-4008-a9f2-e2fa191395e5"), "a claude uuid");
+        assert!(ok("abc_123.4-XYZ"), "the whole alphabet");
+        assert!(ok(&"a".repeat(128)), "128 is the limit");
+
+        assert!(!ok(""), "empty is not a session");
+        assert!(!ok("   "), "nor is whitespace");
+        assert!(!ok(&"a".repeat(129)), "129 is over the limit");
+        // Each of these would break out of `--resume '<id>'` or name a path.
+        for bad in ["a b", "a'b", "a;b", "a/b", "a$b", "a\nb", "wAF:p1"] {
+            assert!(!ok(bad), "{bad:?} must not become a SessionId");
+        }
+    }
+
+    // `Deserialize` is a SECOND constructor, reachable by anyone who can write
+    // `state.json`. It is held to exactly the rule `new` enforces, so a phase
+    // that persists an id can always load it back — and a hand-edited one that
+    // could not be resumed fails LOUDLY here rather than at composition time.
+    #[test]
+    fn session_id_serializes_as_a_bare_string_and_revalidates_on_load() {
+        let id = SessionId::new("cca92f5b-3a8c".to_string()).unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"cca92f5b-3a8c\"", "no wrapper object on disk");
+        assert_eq!(serde_json::from_str::<SessionId>(&json).unwrap(), id);
+
+        for bad in ["\"\"", "\"a b\"", "\"a'b\""] {
+            assert!(
+                serde_json::from_str::<SessionId>(bad).is_err(),
+                "{bad} must not deserialize into a SessionId"
+            );
+        }
+    }
+
+    // Faithful AND safe: herdr said `kind:"id"`, so `kind()` still says `id` and
+    // the value stays visible for diagnostics — but it never becomes a
+    // `SessionId`, so nothing downstream can interpolate it. This is what keeps
+    // "parsed" and "deserialized" the same standard: an id drovr would refuse to
+    // resume is one it never writes to `state.json` in the first place, so no
+    // save can produce a `state.json` that then fails to load.
+    #[test]
+    fn parse_agent_session_downgrades_an_id_no_resume_could_carry() {
+        let v = socket_result(
+            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"kind":"id","agent":"claude","value":"has a space"}}}}"#,
+        );
+        let session = v_session(&v);
+        assert_eq!(
+            session,
+            AgentSession::Other {
+                kind: "id".to_string(),
+                value: "has a space".to_string(),
+            },
+            "the wire is preserved verbatim"
+        );
+        assert_eq!(session.kind(), "id", "herdr said id, so we say id");
+        assert!(
+            session.resumable_for("claude").is_none(),
+            "but it is not resumable"
+        );
+    }
+
+    fn v_session(v: &Value) -> AgentSession {
+        parse_pane_info(v).unwrap().agent_session.unwrap()
     }
 
     // A `kind:"path"` session is still parsed and returned verbatim — task 5's
