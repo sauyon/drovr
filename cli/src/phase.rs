@@ -171,13 +171,14 @@ fn require_new_phase_name(phase: &str) -> io::Result<()> {
 /// sweeps `<phase>.done` on its way in, so the collision destroys the real
 /// phase's completion evidence before any of that.
 ///
-/// **CROSS-LIST ONLY — deliberately.** A reviewer name already present in
-/// `review_phases` is NOT a collision: main's panel resume re-spawns a reviewer
-/// under the same `review:<task>:<iter>:<angle>` name, reusing the resumed iter
-/// instead of bumping it. Banning that here would break the resume the moment
-/// task 6 merges main. `a_reviewer_name_may_be_re_spawned_within_review_phases`
-/// pins it. (Whether a same-list re-spawn should UPDATE rather than push a second
-/// entry is main's question to answer; see the handoff.)
+/// The SAME list counts too, for the same reason: two entries under one name
+/// means `find_phase` resolves to whichever was pushed first, so the second
+/// reviewer's pane is unreachable. main's panel resume re-spawns under the same
+/// `review:<task>:<iter>:<angle>` name and already drops the stale entry first
+/// (`run.review_phases.retain(|p| p.name != phase)` — "so `find_phase` cannot
+/// resolve to the replaced pane"), so merging it is safe; this makes that
+/// ordering a requirement rather than a convention. Pinned by
+/// `a_reviewer_must_be_de_registered_before_it_is_re_spawned`.
 ///
 /// Checked at the two CREATION sites, before any side effect. Not reachable from
 /// drovr's own naming (reviewer names carry a `review:` prefix pipeline names do
@@ -480,9 +481,11 @@ pub fn spawn_reviewer<H: Herdr>(
     launch_command: &str,
 ) -> io::Result<()> {
     require_new_phase_name(phase)?;
-    // Nothing makes a reviewer name unique against `run.phases`. A name already
-    // in `review_phases` is NOT checked — that is main's resume path.
+    // Reviewers always APPEND, so BOTH lists must be clear: `next_iter` keeps
+    // reviewer names unique across passes, but a resume re-spawning in place must
+    // de-register first (main's does).
     require_name_unclaimed(&run.phases, phase, "a pipeline phase", &run.name)?;
+    require_name_unclaimed(&run.review_phases, phase, "a reviewer", &run.name)?;
     // Same guard as phase_start: a run with no project_dir can't anchor the
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
@@ -4292,20 +4295,33 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_name_may_be_re_spawned_within_review_phases() {
-        // ⚠️ MERGE GUARD for task 6. main's panel resume re-spawns a reviewer
-        // under the SAME `review:<task>:<iter>:<angle>` name — it reuses the
-        // resumed iter rather than bumping it (`code_review.rs`, main). So the
-        // "one name, one phase" guard must be CROSS-LIST only: a reviewer name
-        // already in `review_phases` is the resume path, not a collision.
+    fn a_reviewer_must_be_de_registered_before_it_is_re_spawned() {
+        // ⚠️ TASK 6 / MERGE CONTRACT. main's panel resume re-spawns a reviewer
+        // under the SAME `review:<task>:<iter>:<angle>` name (it reuses the
+        // resumed iter rather than bumping it) — and it drops the stale entry
+        // first: `run.review_phases.retain(|p| p.name != phase)`, with the comment
+        // "so `find_phase` cannot resolve to the replaced pane". This test states
+        // that ordering as a REQUIREMENT rather than a convention: a second entry
+        // under a live name is the same corruption as the cross-list case, so
+        // `spawn_reviewer` refuses it. Merging main is safe because main already
+        // retains-then-spawns; a future respawn that forgets to will fail loudly
+        // here instead of silently rerouting the reviewer's pane.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("reviewer-respawn-test", "ws-rr");
         let name = "review:t:1:correctness";
 
         spawn_reviewer(&h, &mut run, name, None, "claude").unwrap();
+        let err = spawn_reviewer(&h, &mut run, name, None, "claude").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run.review_phases.len(), 1, "no second entry under one name");
+
+        // Drop the stale registration, exactly as main's respawn does — now it
+        // spawns.
+        run.review_phases.retain(|p| p.name != name);
         spawn_reviewer(&h, &mut run, name, None, "claude")
-            .expect("re-spawning the same reviewer is the resume path, not a collision");
+            .expect("de-registered first, so the name is free again");
+        assert_eq!(run.review_phases.len(), 1);
     }
 
     #[test]

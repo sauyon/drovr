@@ -727,10 +727,12 @@ creation sites, before any side effect. Pinned by
 `a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase` and
 `a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer`.
 
-**Cross-list only, deliberately.** A reviewer name already in `review_phases` is NOT refused: main's
-panel resume re-spawns a reviewer under the same `review:<task>:<iter>:<angle>` name, reusing the
-resumed iter rather than bumping it, and banning that would break the resume on merge. Pinned by
-`a_reviewer_name_may_be_re_spawned_within_review_phases`.
+**The same list counts too.** Two entries under one name means `find_phase` resolves to whichever
+was pushed first, so the second reviewer's pane is unreachable — the same corruption, within one
+list. main's panel resume re-spawns under the same `review:<task>:<iter>:<angle>` name and already
+drops the stale entry first (`run.review_phases.retain(|p| p.name != phase)`, "so `find_phase` cannot
+resolve to the replaced pane"), so merging it is safe; the guard makes that ordering a requirement
+rather than a convention. Pinned by `a_reviewer_must_be_de_registered_before_it_is_re_spawned`.
 
 Not reachable from drovr's own naming — reviewer names carry a `review:` prefix that pipeline names
 do not use — but the recovery commands drovr prints are bare `drovr phase start <run> <phase>`, so a
