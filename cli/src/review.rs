@@ -789,11 +789,29 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         );
         return;
     }
+    if !target.has_run() {
+        respond_str(
+            req,
+            409,
+            "text/plain",
+            format!("phase '{phase}' has never run — start it, don't rehydrate it"),
+        );
+        return;
+    }
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            respond_str(req, 500, "text/plain", format!("cannot resolve drovr binary: {e}"));
+            // JSON, like the other two 500s below: a client that parses the
+            // body on failure must not hit one branch that throws instead.
+            let msg = format!("cannot resolve drovr binary: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            );
             return;
         }
     };
@@ -817,6 +835,11 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         ),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // Log it too. Every sibling handler does (`handle_post_send`,
+            // `handle_post_keys`, `handle_get_pane`), and the browser tells the
+            // user to "see the drovr server log" — which has to actually
+            // contain something for that to be advice rather than a dead end.
+            eprintln!("drovr rehydrate: {run_name}/{phase} failed: {err}");
             respond_str(
                 req,
                 500,
@@ -824,12 +847,16 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
                 serde_json::json!({ "ok": false, "error": err }).to_string(),
             )
         }
-        Err(e) => respond_str(
-            req,
-            500,
-            "text/plain",
-            format!("failed to run drovr phase rehydrate: {e}"),
-        ),
+        Err(e) => {
+            let msg = format!("failed to run drovr phase rehydrate: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            )
+        }
     }
 }
 
@@ -853,20 +880,6 @@ fn status_str(status: &crate::run::PhaseStatus) -> String {
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default()
-}
-
-/// Whether a phase is something the tree should show at all.
-///
-/// A phase drovr REAPED is shown — dimmed, with a ⟳ — because it is exactly
-/// what a human needs to find in order to bring it back; hiding it would make a
-/// reaped pane look like a phase that never ran.
-///
-/// An unstarted placeholder (`Pending`, no pane, never reaped) stays omitted, as
-/// it always has: `phase_start` appends any name it is given, and a run whose
-/// pipeline was seeded ahead of time would otherwise render a tree of agents
-/// that do not exist.
-fn shows_in_tree(phase: &crate::run::Phase) -> bool {
-    phase.is_reaped() || phase.status != crate::run::PhaseStatus::Pending
 }
 
 /// Whether the ⟳ button should appear: is there a captured session AND a
@@ -893,7 +906,12 @@ fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::
     use std::collections::BTreeMap;
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
-        if !shows_in_tree(rp) {
+        // A placeholder is not an agent — see `Phase::has_run`, the same
+        // predicate `phase_rehydrate` refuses on, so the tree never offers a ⟳
+        // the CLI would then reject. A REAPED phase does show, dimmed: hiding
+        // it would make a pane drovr closed look like one that never ran, which
+        // is the opposite of what someone hunting for it needs.
+        if !rp.has_run() {
             continue;
         }
         let parts: Vec<&str> = rp.name.split(':').collect();
@@ -910,7 +928,7 @@ fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::
     }
     let mut nodes = Vec::new();
     for ph in &run.phases {
-        if !shows_in_tree(ph) {
+        if !ph.has_run() {
             continue;
         }
         let task_key = ph.name.strip_prefix("implement-").unwrap_or("");
@@ -2251,7 +2269,7 @@ mod tests {
         reaped.status = crate::run::PhaseStatus::Done;
         reaped.set_pane("w:p0");
         reaped.mark_reaped();
-        run.phases = vec![reaped, live];
+        run.phases = vec![reaped, live, crate::run::Phase::new("placeholder")];
         fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
         let before = fs::read_to_string(dir.join("state.json")).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
@@ -2279,6 +2297,18 @@ mod tests {
         // live conversation is exactly what rehydrate must not do.
         let (s, body) = http_post(&addr, "/api/runs/r/rehydrate?phase=plan", "text/plain", "");
         assert_eq!(s, 409, "{body}");
+
+        // A phase that has never run → 409 as well, and for a reason worth
+        // keeping separate: `drovr new` pre-seeds placeholders, so without this
+        // an unauthenticated caller could START one out of pipeline order.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=placeholder",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("never run"), "{body}");
 
         assert_eq!(
             fs::read_to_string(dir.join("state.json")).unwrap(),

@@ -291,6 +291,26 @@ impl Phase {
         }
     }
 
+    /// Whether an agent has ever been launched into this phase.
+    ///
+    /// **The one answer to "is this a real phase or a placeholder".** `drovr
+    /// new` pre-seeds every run with `Pending` phases that have never held an
+    /// agent, and `phase_start` appends any name it is handed — so "the phase
+    /// exists in `state.json`" is not evidence that anything ran in it.
+    ///
+    /// Two consumers, deliberately sharing one predicate: the review UI's agent
+    /// tree omits a phase that has not run (a placeholder is not an agent), and
+    /// `phase_rehydrate` refuses one (there is nothing to bring back — that is
+    /// `drovr phase start`). Split into two predicates, the tree could offer a
+    /// ⟳ on a node the CLI would then refuse.
+    ///
+    /// `is_reaped()` is checked first and separately from the status because
+    /// reaping does not change a phase's status: a reaped `Done` phase must
+    /// still answer `true` here, and so must a reaped phase of any status.
+    pub fn has_run(&self) -> bool {
+        self.is_reaped() || self.status != PhaseStatus::Pending
+    }
+
     /// Whether drovr has closed this phase's pane. Nothing reads it yet —
     /// task 6 (reaping) and task 5 (rehydrate) do.
     pub fn is_reaped(&self) -> bool {

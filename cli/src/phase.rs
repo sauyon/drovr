@@ -790,6 +790,25 @@ pub fn phase_rehydrate<H: Herdr>(
             ),
         ));
     }
+    // "In `state.json`" is not "has ever run". `drovr new` pre-seeds a run with
+    // `Pending` placeholder phases and `phase_start` appends any name it is
+    // handed, so without this an unauthenticated `POST /rehydrate?phase=plan`
+    // on a fresh run would LAUNCH a brand-new agent out of pipeline order —
+    // which is `drovr phase start`'s job, under a command that advertises it.
+    // The predicate is [`Phase::has_run`], shared with the review UI's tree, so
+    // a node the tree offers a ⟳ on is never one this refuses.
+    if !existing.has_run() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "phase '{phase}' of run '{run_name}' has never run, so there is nothing to \
+                 bring back. Start it: drovr phase start {quoted_run} {quoted_phase}",
+                run_name = run.name,
+                quoted_run = shell_single_quote(&run.name),
+                quoted_phase = shell_single_quote(phase),
+            ),
+        ));
+    }
     if run.project_dir.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -6814,6 +6833,33 @@ mod rehydrate_tests {
             "a refusal must not touch herdr: {:?}",
             h.calls()
         );
+    }
+
+    #[test]
+    fn rehydrate_refuses_a_phase_that_never_ran() {
+        // `drovr new` pre-seeds a run with Pending placeholders, so "the phase
+        // is in state.json" is not "the phase has an agent to bring back".
+        // Rehydrating one would launch a brand-new agent out of pipeline order
+        // — under a command that says it recovers an old one.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-placeholder");
+        run.phases.push(Phase::new("plan")); // Pending, no pane, never reaped
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("a placeholder is not rehydratable");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("drovr phase start 'rh-placeholder' 'plan'"),
+            "must name the command that IS right, ready to paste: {err}"
+        );
+        assert!(h.calls().is_empty(), "nothing launched: {:?}", h.calls());
+
+        // …and the same phase becomes rehydratable the moment it has run.
+        run.phases[0].status = PhaseStatus::Running;
+        run.phases[0].record_launch("claude", None);
+        assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
     }
 
     #[test]

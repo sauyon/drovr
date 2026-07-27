@@ -702,6 +702,8 @@
   .agent-name { font-family: var(--mono); }
   .agent-angle { color: var(--muted); font-size: 0.85em; }
   .agent-children { margin-left: 18px; border-left: 1px solid var(--border); padding-left: 6px; }
+  .agents-note { margin-top: 8px; font-size: 0.88rem; color: var(--muted); }
+  .agents-note.bad { color: var(--danger); }
 
   /* ---- New session form ---- */
   .new-session-form {
@@ -871,6 +873,11 @@
   <div id="agents-panel" style="display:none" class="panel">
     <div class="panel-title">Agents</div>
     <div id="agents-tree" class="agents-tree"></div>
+    <!-- What a ⟳ actually did. A rehydrate has three outcomes the human must
+         not have to guess between — the session came back, a fresh agent was
+         seeded from the handoff, or the seed was NOT delivered — and the last
+         one is a 200. Without this the tree just quietly stops showing the ⟳. -->
+    <div id="agents-note" class="agents-note" style="display:none"></div>
   </div>
 
   <div id="session-panel" style="display:none" class="panel">
@@ -2063,6 +2070,16 @@ function agentNodeHtml(node) {
     + '</div>' + kids;
 }
 
+// Report what a ⟳ did (or failed to do) under the tree. Cleared on navigation
+// by route(), never by a poll — a note about the rehydrate you just triggered
+// must outlive the 2s re-render that follows it.
+function agentsNote(text, bad) {
+  var el = document.getElementById('agents-note');
+  el.textContent = text || '';
+  el.classList.toggle('bad', !!bad);
+  el.style.display = text ? '' : 'none';
+}
+
 // Every pane id currently in the tree, at any depth.
 function treePanes(nodes) {
   var out = {};
@@ -2098,19 +2115,34 @@ async function pollAgents(gen) {
         ev.stopPropagation();
         b.disabled = true;
         var phase = b.getAttribute('data-phase');
+        // A rehydrate that has to re-seed waits for the fresh agent to attach,
+        // which can take tens of seconds. Say so, or a disabled button is
+        // indistinguishable from a wedged one.
+        agentsNote('Rehydrating ' + phase + '…', false);
         fetch(api('rehydrate') + '?phase=' + encodeURIComponent(phase), { method: 'POST' })
           .then(function(r) {
-            if (!r.ok) {
+            return r.json().catch(function() { return {}; })
+              .then(function(d) { return { ok: r.ok, status: r.status, body: d }; });
+          })
+          .then(function(res) {
+            if (!res.ok) {
               b.disabled = false;
-              b.title = 'Rehydrate failed (' + r.status + ') — see the drovr server log';
+              agentsNote(res.body.error || ('Rehydrate failed (' + res.status + ')'), true);
               return;
             }
+            // `detail` is the CLI's own line, and it is the whole point: it
+            // distinguishes "resumed with its session" from "relaunched, and
+            // the seed was NOT re-sent" — both of which are HTTP 200.
+            agentsNote(res.body.detail || ('Rehydrated ' + phase), false);
             // Refresh now rather than waiting out the 2s tick, and cancel the
             // pending one so the two chains don't both keep polling.
             if (agentsTimer) clearTimeout(agentsTimer);
             pollAgents(gen);
           })
-          .catch(function() { b.disabled = false; });
+          .catch(function() {
+            b.disabled = false;
+            agentsNote('Rehydrate request failed — is `drovr serve` still up?', true);
+          });
       };
     });
     // A pane that has left the tree must not stay selected. `?pane=<gone>`
@@ -2238,6 +2270,7 @@ async function route() {
   document.getElementById('session-target').textContent = 'active';
   showEl('agents-panel');
   showEl('session-panel');
+  agentsNote('', false);   // a note belongs to the run it was raised in
   pollAgents(routeGen);
   pollPane(routeGen);
   await refresh();

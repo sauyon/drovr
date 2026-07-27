@@ -84,12 +84,22 @@ pub enum ResumeSurface<'a> {
 impl AgentSpec {
     /// The one resume surface this agent offers, or `None` when it offers none.
     ///
-    /// Total by necessity — a match over two `Option`s has four arms — and the
-    /// two arms that are not (flag) / (subcommand) / (neither) resolve to
-    /// `None`: an agent configured with BOTH is ambiguous, and `load_config`
-    /// already rejects it, so this is what the type requires rather than a
-    /// second guard on the same rule. `None` degrades a rehydrate to a reseed,
-    /// which is the safe direction.
+    /// **This is the only reader of the two fields** — `compose` and the review
+    /// UI's `is_resumable` both come through here, and nothing in production
+    /// touches `resume_flag` / `resume_subcommand` directly. So the rules live
+    /// here, once:
+    ///
+    /// * an ambiguous spec (BOTH shapes) resolves to `None`;
+    /// * an empty or whitespace-only value resolves to `None`.
+    ///
+    /// [`validate_resume`] rejects both cases LOUDLY at load, which is where a
+    /// user can see the message and fix their config — but it only sees what
+    /// `load_config` parses. An `AgentSpec` assembled in memory (the fields are
+    /// `pub`) never passes it, so the quiet rule here is what those callers get.
+    /// The two are not an authoritative guard plus a backstop: one decides
+    /// whether the config LOADS, the other decides what a given spec MEANS.
+    /// `None` degrades a rehydrate to a reseed, which is the safe direction —
+    /// never a bare flag, never a guess at which shape was intended.
     pub fn resume_surface(&self) -> Option<ResumeSurface<'_>> {
         match (
             self.resume_flag.as_deref().filter(|f| !f.trim().is_empty()),
