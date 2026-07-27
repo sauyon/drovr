@@ -138,11 +138,19 @@ pub struct Phase {
     /// What is (or last was) running in this phase's pane — see [`PhaseAgent`].
     /// `None` for a phase this build never launched.
     ///
-    /// Distinct from `RunState::agent`, which is the run's DEFAULT backend. A
-    /// reviewer's backend is chosen separately by `Config::review_agent_for` and
-    /// legitimately differs.
+    /// **Named `pane_agent`, not `agent`, to keep it distinct from
+    /// `RunState::agent`.** They sat one level apart holding different types and
+    /// meaning different things — this phase's captured agent record versus the
+    /// run's configured default backend — which is a standing invitation to
+    /// reach for the wrong one. A reviewer's backend legitimately differs from
+    /// the run's (`Config::review_agent_for` picks it), so the two really are
+    /// independent facts.
+    ///
+    /// Private, like the rest of the lifecycle: read it with
+    /// [`Phase::pane_agent`], write it with [`Phase::record_launch`] /
+    /// [`Phase::record_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<PhaseAgent>,
+    pane_agent: Option<PhaseAgent>,
     /// Whether drovr closed this phase's pane — see [`Reaped`], which cannot be
     /// set to "yes" from outside this module.
     ///
@@ -151,7 +159,7 @@ pub struct Phase {
     /// migrating twice, and so the lifecycle rule is in place before the code
     /// that depends on it is written.
     #[serde(default, skip_serializing_if = "Reaped::is_no")]
-    pub reaped: Reaped,
+    reaped: Reaped,
 }
 
 /// Whether drovr has closed a phase's pane.
@@ -213,6 +221,14 @@ impl Phase {
         self.reaped = Reaped(false);
     }
 
+    /// Test-only: drop the agent record, to model a phase launched by a build
+    /// that never recorded one. There is deliberately no production way to do
+    /// this — a launch always records, and a relaunch REPLACES.
+    #[cfg(test)]
+    pub fn clear_pane_agent_for_test(&mut self) {
+        self.pane_agent = None;
+    }
+
     /// Test-only builder: the same `set_pane` transition, chainable, so a
     /// fixture can still be written as one expression now that `pane_id` is not
     /// nameable in a struct literal.
@@ -220,6 +236,56 @@ impl Phase {
     pub fn with_pane(mut self, pane_id: impl Into<String>) -> Phase {
         self.set_pane(pane_id);
         self
+    }
+
+    /// What is (or last was) running in this phase's pane.
+    pub fn pane_agent(&self) -> Option<&PhaseAgent> {
+        self.pane_agent.as_ref()
+    }
+
+    /// Everything a resume needs for this phase, or `None` — the whole bundle
+    /// or nothing. See [`ResumeTarget`]; this is the accessor task 5 uses.
+    #[allow(dead_code)]
+    pub fn resume_target(&self) -> Option<ResumeTarget<'_>> {
+        self.pane_agent.as_ref().and_then(PhaseAgent::resume)
+    }
+
+    /// Record a launch into this phase's pane: a NEW agent record, with no
+    /// session yet.
+    ///
+    /// Replaces any previous record wholesale, which is the point — a launch
+    /// starts a new agent process, so whatever session the old record named
+    /// belongs to a conversation that is no longer this phase's. There is
+    /// deliberately no way to clear a session on its own (see
+    /// [`PhaseAgent::record_session`]); replacing the record is the only way a
+    /// session is ever discarded, and it happens exactly where a new process
+    /// starts.
+    pub fn record_launch(&mut self, backend: impl Into<String>, profile: Option<String>) {
+        self.pane_agent = Some(PhaseAgent::launched(backend, profile));
+    }
+
+    /// Adopt an agent record wholesale — used when reconciling with what is
+    /// already on disk, where the persisted record may carry a profile or
+    /// backend this process never saw.
+    pub fn adopt_pane_agent(&mut self, agent: PhaseAgent) {
+        self.pane_agent = Some(agent);
+    }
+
+    /// Record a session captured from a live poll, if this phase has a launch
+    /// record to attach it to. Returns whether it landed.
+    ///
+    /// `false` means there is no `PhaseAgent`, and that is not a failure to
+    /// paper over: a session is only meaningful beside the backend that created
+    /// it, so it must not be stored without one. The caller establishes the
+    /// launch record first (`record_launch`) and retries.
+    pub fn record_session(&mut self, session: SessionId) -> bool {
+        match self.pane_agent.as_mut() {
+            Some(agent) => {
+                agent.record_session(session);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether drovr has closed this phase's pane. Nothing reads it yet —
@@ -266,9 +332,27 @@ impl Phase {
 /// atomic and still not enough to find the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumeTarget<'a> {
-    pub session: &'a SessionId,
-    pub backend: &'a str,
-    pub profile: Option<&'a str>,
+    session: &'a SessionId,
+    backend: &'a str,
+    profile: Option<&'a str>,
+}
+
+impl<'a> ResumeTarget<'a> {
+    /// The session id to resume.
+    #[allow(dead_code)]
+    pub fn session(&self) -> &'a SessionId {
+        self.session
+    }
+    /// The agent that created it — the only one it means anything to.
+    #[allow(dead_code)]
+    pub fn backend(&self) -> &'a str {
+        self.backend
+    }
+    /// The `CLAUDE_CONFIG_DIR` to resume UNDER; `None` = the default profile.
+    #[allow(dead_code)]
+    pub fn profile(&self) -> Option<&'a str> {
+        self.profile
+    }
 }
 
 /// The agent behind a phase's pane: what it was launched as, and — once a poll
@@ -1122,7 +1206,7 @@ mod tests {
         let p = &loaded.phases[0];
         assert!(p.tab_id.is_none(), "absent tab_id → None");
         assert!(
-            p.agent.is_none(),
+            p.pane_agent().is_none(),
             "absent agent → None (backend, profile, session)"
         );
         assert!(
@@ -1138,7 +1222,7 @@ mod tests {
         // wrong reason (or fail for it, as this test did when `Phase::agent`
         // arrived).
         let out = serde_json::to_string(p).unwrap();
-        for key in ["tab_id", "agent", "reaped"] {
+        for key in ["tab_id", "pane_agent", "reaped"] {
             assert!(!out.contains(key), "empty {key} must be skipped: {out}");
         }
     }
@@ -1153,12 +1237,12 @@ mod tests {
             format!(
                 r#"{{"name":"plan","status":"Running","handoff_doc":null,
                     "herdr_session":null,"pane_id":null,
-                    "agent":{{"backend":"claude","session":{session}}}}}"#
+                    "pane_agent":{{"backend":"claude","session":{session}}}}}"#
             )
         };
         let good: Phase = serde_json::from_str(&phase("\"cca92f5b-3a8c\"")).unwrap();
         assert_eq!(
-            good.agent.as_ref().and_then(|a| a.resume()),
+            good.pane_agent().and_then(|a| a.resume()),
             Some(ResumeTarget {
                 session: &SessionId::new("cca92f5b-3a8c".into()).unwrap(),
                 backend: "claude",
@@ -1204,7 +1288,7 @@ mod tests {
         // They are IGNORED, not migrated — say so out loud, so nobody reads a
         // passing test as a promise that the old values were carried over.
         assert!(
-            p.agent.is_none(),
+            p.pane_agent().is_none(),
             "unknown keys are dropped, not adopted; the next poll re-captures"
         );
     }
@@ -1353,7 +1437,7 @@ mod tests {
         // all — and `resume()` hands back both or neither.
         let bare = r#"{"name":"plan","status":"Running","handoff_doc":null,
             "herdr_session":null,"pane_id":null,
-            "agent":{"session":"cca92f5b-3a8c"}}"#;
+            "pane_agent":{"session":"cca92f5b-3a8c"}}"#;
         assert!(
             serde_json::from_str::<Phase>(bare).is_err(),
             "a session with no backend must not be representable on disk"
@@ -1362,9 +1446,9 @@ mod tests {
         // A backend with NO session is the normal pre-capture state, and stays legal.
         let pre = r#"{"name":"plan","status":"Running","handoff_doc":null,
             "herdr_session":null,"pane_id":null,
-            "agent":{"backend":"cursor","profile":"/cfg"}}"#;
+            "pane_agent":{"backend":"cursor","profile":"/cfg"}}"#;
         let p: Phase = serde_json::from_str(pre).unwrap();
-        let agent = p.agent.as_ref().unwrap();
+        let agent = p.pane_agent().unwrap();
         assert_eq!(agent.backend(), "cursor");
         assert_eq!(agent.profile(), Some("/cfg"));
         assert!(

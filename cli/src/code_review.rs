@@ -485,12 +485,7 @@ pub fn code_review_run<H: Herdr>(
             // Best-effort by construction: `poll_phase_pane` cannot fail, and the
             // error being propagated is the one that matters.
             for (_, seeded) in &pending {
-                if let Some(pane) = run
-                    .find_phase(seeded)
-                    .and_then(|p| p.pane_id().map(str::to_owned))
-                {
-                    poll_phase_pane(h, run, seeded, &pane);
-                }
+                poll_phase_pane(h, run, seeded);
             }
             return Err(e);
         }
@@ -533,13 +528,7 @@ pub fn code_review_run<H: Herdr>(
             // normal, since angles are spawned and seeded one at a time — had its
             // one capture skipped, and herdr drops the session when it exits.
             // A capture a fast agent can outrun is not a capture.
-            let pane = run
-                .find_phase(&phase)
-                .and_then(|p| p.pane_id().map(str::to_owned));
-            let status = pane
-                .as_deref()
-                .and_then(|pane| poll_phase_pane(h, run, &phase, pane))
-                .and_then(|info| info.agent_status);
+            let status = poll_phase_pane(h, run, &phase).and_then(|info| info.agent_status);
             let finished =
                 done_marker(&run.name, &phase).exists() || status == Some(AgentStatus::Done);
             if !finished {
@@ -1536,8 +1525,7 @@ mod tests {
             .expect("angle 1 was registered");
         assert_eq!(
             seeded
-                .agent
-                .as_ref()
+                .pane_agent()
                 .and_then(|a| a.session())
                 .map(SessionId::as_str),
             Some(FakeHerdr::session_value_for("pane-1").as_str()),
@@ -1599,8 +1587,7 @@ mod tests {
         let on_disk = RunState::load("cr-fast-reviewer").unwrap();
         assert_eq!(
             on_disk.review_phases[0]
-                .agent
-                .as_ref()
+                .pane_agent()
                 .and_then(|a| a.session())
                 .map(SessionId::as_str),
             Some(FakeHerdr::session_value_for("pane-1").as_str()),
@@ -1656,8 +1643,7 @@ mod tests {
         assert_eq!(run.review_phases.len(), 1);
 
         let agent = run.review_phases[0]
-            .agent
-            .as_ref()
+            .pane_agent()
             .expect("the reviewer records its launch");
         assert_eq!(
             agent.session().map(SessionId::as_str),
@@ -1669,8 +1655,7 @@ mod tests {
         let on_disk = RunState::load("cr-late-session").unwrap();
         assert!(
             on_disk.review_phases[0]
-                .agent
-                .as_ref()
+                .pane_agent()
                 .and_then(|a| a.session())
                 .is_some(),
             "the capture must be persisted, not just held in memory"
@@ -1703,7 +1688,7 @@ mod tests {
         assert!(!run.review_phases.is_empty());
         for p in &run.review_phases {
             assert_eq!(
-                p.agent.as_ref().map(|a| a.backend()),
+                p.pane_agent().map(|a| a.backend()),
                 Some("cursor"),
                 "reviewer '{}' must record the backend it was launched with",
                 p.name
