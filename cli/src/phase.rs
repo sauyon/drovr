@@ -623,7 +623,16 @@ pub fn spawn_reviewer<H: Herdr>(
     // `review_phases`), so this is uniformity rather than a fix — but it means
     // every marker in the run dir is attributable to the launch that produced it.
     let pass = new_pass_token();
-    launch_in_pane(h, &run.name, phase, &pane, launch.command(), &pass)?;
+    // Same orphan hole as `phase_start`'s, and the same fix: registration below
+    // happens only after the launch succeeds, so a failure here leaves a pane
+    // nothing records — which `drovr cleanup` then protects as the human's,
+    // forever, while it blocks `workspace_close` for the whole run. The tab is
+    // always ours (`tab_create` is three lines up, unconditionally), so there is
+    // no "did this call create it" question to answer here.
+    if let Err(e) = launch_in_pane(h, &run.name, phase, &pane, launch.command(), &pass) {
+        discard_unlaunched_pane(h, run, &pane);
+        return Err(e);
+    }
 
     // Register the reviewer in `review_phases` only. The seed path rides on
     // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
@@ -4247,6 +4256,54 @@ mod tests {
             reloaded.retired_panes.contains(&orphan),
             "the retirement must be PERSISTED before the error propagates: {:?}",
             reloaded.retired_panes
+        );
+    }
+
+    /// A reviewer's tab is orphaned by a failed launch exactly like a phase's.
+    ///
+    /// This one is NOT fallout from the root-pane change — `spawn_reviewer` has
+    /// always created its own tab — but it is the same class, and it strands a
+    /// workspace the same way: `review_phases` registration happens only after
+    /// the launch succeeds, so a failure leaves a pane nothing records, which
+    /// `drovr cleanup` then protects as the human's. Fixing one instance of a
+    /// class and leaving the other is how the class survives.
+    #[test]
+    fn a_reviewer_whose_launch_fails_does_not_strand_its_tab() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+        let mut run = make_run_with_workspace("rev-orphan", "ws-ro");
+
+        let res = spawn_reviewer(
+            &h,
+            &mut run,
+            "review:task-1:1:correctness",
+            None,
+            &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
+        );
+        assert!(res.is_err(), "the pane_run failure must propagate");
+        assert!(
+            run.review_phases.is_empty(),
+            "a reviewer that never launched must not be registered"
+        );
+
+        let calls = h.calls();
+        let orphan = calls
+            .iter()
+            .find(|c| c.contains("tab_create"))
+            .and_then(|c| c.rsplit("-> ").next())
+            .expect("the reviewer created a tab")
+            .to_owned();
+        assert!(
+            run.retired_panes.contains(&orphan),
+            "the orphan must be recorded so cleanup still owns it: {:?}",
+            run.retired_panes
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains(&format!("pane_close pane={orphan}"))),
+            "and closed best-effort: {calls:?}"
         );
     }
 
