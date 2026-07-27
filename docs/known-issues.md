@@ -439,11 +439,22 @@ After both, the run dir held all four `schema-dos-fix-review-<angle>-seed.md` fi
 showed no reviewer for this panel — only unrelated `drovr serve` / `cursor-agent` processes
 belonging to other worktrees. So the seeds were written and nothing ever consumed them.
 
-The distinguishing condition: the **driver was a plain `claude` session that drovr did not start**
-(this run's only pane, `wB8:p1`, belongs to an earlier `verify-land` phase). The panel appears to
-need a live herdr workspace it can spawn reviewer panes into; invoked from a session outside that
-workspace it seeds and then waits forever. Worth confirming, because it makes the panel unusable for
-the common case of a driver working in a worktree by hand rather than under `drovr:pipeline`.
+**Root cause unknown.** What the evidence pins down: all four angles reached the wait loop's
+`pending` list, so `spawn_reviewer` returned `Ok` for each — a spawn failure aborts the pass with
+exit 1, and a run with no `workspace` fails loudly ("run '…' has no herdr workspace; cannot spawn
+a reviewer"). Panes were therefore created and `launch_in_pane` was called, yet no reviewer
+process existed. That puts the fault at the launch inside the pane, not at the caller.
+
+Ruled out — the driver being a plain `claude` session drovr did not start. It looked
+distinguishing (this run's only pane, `wB8:p1`, belonged to an earlier `verify-land` phase), but
+the panel's only workspace requirement is `run.workspace` in that run's `state.json`
+(`spawn_reviewer`, cli/src/phase.rs), which `drovr new` records regardless of who invokes it; no
+code path consults the calling session. Two runs created from a plain `claude` session drovr had
+not started (`structural-briefs` → `wBM`, `review-full-repo` → `wBK`) got workspaces and seeded
+panels normally.
+
+**Next sighting:** capture `herdr pane get <pane>` for a reviewer pane before re-running, to see
+whether the pane holds a live shell that never ran the agent command.
 
 Credit where due: drovr handled the moving target correctly. HEAD changed between passes and pass
 2 reported `HEAD moved since review iteration 1 was seeded — starting a fresh panel instead of

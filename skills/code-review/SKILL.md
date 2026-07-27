@@ -47,8 +47,9 @@ may you report done.
 The pipeline runs this per task (see `drovr:pipeline`): one read-only reviewer per
 configured angle, each given the brief above. Findings union-merge into
 `<task>-review.json`, tagged by angle. Exit: 0 clean, 3 findings, 2 timeout, 1 error.
-The panel needs a herdr workspace to spawn panes into, so from a session drovr did
-not start, use `code-review brief` and spawn the reviewer yourself.
+It needs the run to have a herdr workspace (`drovr new` records one) and a review agent
+with a herdr integration. When the panel is not available or is wedged, use
+`code-review brief` and spawn the reviewer yourself — same brief either way.
 
 **Exit 2 is slow, not broken.** Re-running the *same* command RESUMES: re-attaches to
 the panel in flight, keeps the angles already banked, waits only on the stragglers,

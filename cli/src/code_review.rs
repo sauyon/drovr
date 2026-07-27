@@ -176,10 +176,10 @@ fn resolve_context(dir: &Path, task: &str, supplied: Option<&str>) -> io::Result
 
 /// Compose one angle's reviewer brief and return it, spawning NOTHING.
 ///
-/// This is the same text `code_review_run` injects, exposed for the path the panel
-/// cannot serve: a driver whose session drovr did not start has no herdr workspace to
-/// spawn reviewer panes into (see `docs/known-issues.md`), so it spawns its own
-/// read-only reviewer. That reviewer's prompt must still be drovr's brief rather than
+/// This is the same text `code_review_run` injects, exposed for every case where the
+/// driver spawns the reviewer instead of the panel: an in-harness read-only subagent, a
+/// host with no herdr integration for the review agent, a run with no workspace, or a
+/// panel that is wedged. That reviewer's prompt must still be drovr's brief rather than
 /// one the driver wrote, or the frame is agent-authored again.
 pub fn code_review_brief(
     run: &RunState,
@@ -1915,10 +1915,9 @@ mod tests {
         );
     }
 
-    /// The in-harness path (a driver spawning its own read-only reviewer, the only
-    /// path that works when drovr did not start the session) must be able to obtain
-    /// the composed brief WITHOUT spawning anything — otherwise its prompt goes back
-    /// to being agent-authored.
+    /// A driver that spawns its own read-only reviewer (in-harness subagent, no herdr
+    /// integration, wedged panel) must be able to obtain the composed brief WITHOUT
+    /// spawning anything — otherwise its prompt goes back to being agent-authored.
     #[test]
     fn brief_composes_the_same_frame_without_spawning() {
         let _lock = ENV_LOCK.lock().unwrap();

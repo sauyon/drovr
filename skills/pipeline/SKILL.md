@@ -12,10 +12,10 @@ Pipeline drives a full run through four phases — **brainstorm → plan → imp
 the reviewer must approve `spec.md` before any code is written. Everything after the gate
 runs unattended unless a phase fails.
 
-**REQUIRED SUB-SKILL:** every boundary uses `drovr:handoff` (start → inject → wait →
-collect; the phase agent authors its own handoff before `phase done`). This skill does not
-repeat those mechanics — read it first. Injecting
-each phase's briefing is **your** job; the CLI spawns a plain `claude` and seeds nothing.
+**REQUIRED SUB-SKILL:** every boundary uses `drovr:handoff` (start → wait → collect; the
+phase agent authors its own handoff before `phase done`). This skill does not repeat those
+mechanics — read it first. drovr composes each phase's briefing and injects it at
+`phase start`; your job is the `--context` it cannot know.
 
 You are the **driver** (single writer of the orchestration). The phase agents are the
 single writers of their own artifacts. Read-only fan-out goes to explorers, never to
