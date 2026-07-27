@@ -136,8 +136,9 @@ fn seed_runs(runs_root: &PathBuf) {
     fs::write(zeta.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
 
     // delta-idle carries the agent-tree fixture: a reaped phase whose session was
-    // captured (⟳ should appear), a reaped phase whose session was not (it must
-    // NOT), and a live phase. `implement` stays `Running` so the run remains
+    // captured (⟳, promising the conversation), a reaped phase whose session was
+    // not (⟳ too — it is still rehydratable, and the tooltip says it reseeds),
+    // a phase that never ran (NO ⟳ — the CLI would refuse it), and a live phase. `implement` stays `Running` so the run remains
     // incomplete and the list-motion checks above see the same rows they always
     // did. Reaped phases carry `pane_id: null` — drovr refuses to load a phase
     // claiming both a pane and a reaping.
@@ -147,6 +148,7 @@ fn seed_runs(runs_root: &PathBuf) {
         r#"{"name":"delta-idle","task":"task for delta-idle","gate":"spec","cursor":0,"project_dir":"","workspace":"w1","phases":[
 {"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude","session":"sess-brainstorm"}},
 {"name":"plan","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude"}},
+{"name":"never-ran","status":"Pending","handoff_doc":null,"herdr_session":null,"pane_id":null},
 {"name":"implement","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w1:p3"}]}"#,
     )
     .unwrap();

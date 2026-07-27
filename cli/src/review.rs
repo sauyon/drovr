@@ -789,22 +789,23 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         respond_str(req, 404, "text/plain", "no such phase".into());
         return;
     };
-    if let Some(pane) = target.pane_id() {
-        respond_str(
-            req,
-            409,
-            "text/plain",
-            format!("phase '{phase}' still holds pane {pane}"),
-        );
-        return;
-    }
-    if !target.has_run() {
-        respond_str(
-            req,
-            409,
-            "text/plain",
-            format!("phase '{phase}' has never run — start it, don't rehydrate it"),
-        );
+    // The SAME predicate `phase_rehydrate` gates on, off the same `state.json`
+    // — not a re-derivation. Written separately, this path checked two of the
+    // CLI's three refusals, so the button a human clicks was more permissive
+    // than the command it shells out to.
+    if let Err(why) = target.rehydratable() {
+        let msg = match why {
+            crate::run::NotRehydratable::HoldsPane(pane) => {
+                format!("phase '{phase}' still holds pane {pane}")
+            }
+            crate::run::NotRehydratable::NeverStarted => {
+                format!("phase '{phase}' has never run — start it, don't rehydrate it")
+            }
+            crate::run::NotRehydratable::NoAgentEverRan => format!(
+                "phase '{phase}' has no agent on record — start it again, with its seed"
+            ),
+        };
+        respond_str(req, 409, "text/plain", msg);
         return;
     }
 
@@ -918,23 +919,27 @@ fn status_str(status: &crate::run::PhaseStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the ⟳ button should appear: is there a captured session AND a
-/// backend that can be told to use it?
+/// Whether a rehydrate would bring the CONVERSATION back, as opposed to
+/// launching a fresh agent that re-reads the notes.
 ///
-/// Both halves matter, and the second is the one that is easy to miss. codex
-/// ships with no resume surface at all, so a codex phase can carry a perfectly
-/// good session id and still only be relaunchable — and the button promises the
-/// CONVERSATION back, not a fresh agent reading the notes. Advertising the one
-/// as the other is how a human loses work they thought was recoverable.
-fn is_resumable(phase: &crate::run::Phase, cfg: &crate::config::Config) -> bool {
+/// **This is not what gates the ⟳ button** — `rehydratable` is (a phase with no
+/// session is still worth bringing back; it reseeds). This decides what the
+/// button PROMISES, so the two are reported separately and each named for what
+/// it means. Reporting only this under a name the button reads would put a ⟳ on
+/// phases the CLI then refuses, and hide it from phases it would have recovered.
+///
+/// Both halves matter, and the second is easy to miss: codex ships with no
+/// resume surface at all, so a codex phase can carry a perfectly good session id
+/// and still only be relaunchable.
+fn has_resumable_session(phase: &crate::run::Phase, cfg: &crate::config::Config) -> bool {
     phase.resume_target().is_some_and(|target| {
         cfg.agents
             .get(target.backend())
-            .is_some_and(|spec| spec.resume_surface().is_some())
+            .is_some_and(|spec| spec.resume.is_some())
     })
 }
 
-/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
+/// Build the agent tree for `run`/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
 /// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
 /// `implement-<task>` phase. Reviews with no matching phase land in a trailing
 /// group node so nothing is dropped.
@@ -959,7 +964,8 @@ fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::
             .push(serde_json::json!({
                 "name": rp.name, "kind": "review", "angle": angle,
                 "status": status_str(&rp.status), "pane_id": rp.pane_id(),
-                "reaped": rp.is_reaped(), "resumable": is_resumable(rp, cfg),
+                "reaped": rp.is_reaped(), "rehydratable": rp.rehydratable().is_ok(),
+                "resumable": has_resumable_session(rp, cfg),
             }));
     }
     let mut nodes = Vec::new();
@@ -972,7 +978,8 @@ fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::
         nodes.push(serde_json::json!({
             "name": ph.name, "kind": "phase",
             "status": status_str(&ph.status), "pane_id": ph.pane_id(),
-            "reaped": ph.is_reaped(), "resumable": is_resumable(ph, cfg),
+            "reaped": ph.is_reaped(), "rehydratable": ph.rehydratable().is_ok(),
+            "resumable": has_resumable_session(ph, cfg),
             "children": children,
         }));
     }
@@ -2305,7 +2312,16 @@ mod tests {
         reaped.status = crate::run::PhaseStatus::Done;
         reaped.set_pane("w:p0");
         reaped.mark_reaped();
-        run.phases = vec![reaped, live, crate::run::Phase::new("placeholder")];
+        // A phase `phase_start` persisted as Running and then failed to launch:
+        // has_run() is true, but no agent was ever recorded.
+        let mut launch_failed = crate::run::Phase::new("launch-failed");
+        launch_failed.status = crate::run::PhaseStatus::Running;
+        run.phases = vec![
+            reaped,
+            live,
+            crate::run::Phase::new("placeholder"),
+            launch_failed,
+        ];
         fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
         let before = fs::read_to_string(dir.join("state.json")).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
@@ -2345,6 +2361,20 @@ mod tests {
         );
         assert_eq!(s, 409, "{body}");
         assert!(body.contains("never run"), "{body}");
+
+        // …and the third refusal, which this path used to omit entirely: a
+        // phase that LOOKS started (`phase_start` persists `Running` before it
+        // launches) but never got an agent. The CLI refuses it; so must the
+        // button, or the endpoint a human clicks is more permissive than the
+        // command it shells out to.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=launch-failed",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("no agent on record"), "{body}");
 
         assert_eq!(
             fs::read_to_string(dir.join("state.json")).unwrap(),
@@ -2388,15 +2418,23 @@ mod tests {
         assert_eq!(nodes[0]["name"], "brainstorm");
         assert_eq!(nodes[0]["reaped"], true);
         assert_eq!(nodes[0]["resumable"], true);
+        assert_eq!(nodes[0]["rehydratable"], true);
         assert!(nodes[0]["pane_id"].is_null(), "a reaped phase has no pane");
 
         assert_eq!(nodes[1]["name"], "plan");
         assert_eq!(nodes[1]["reaped"], true);
+        // No session to resume — but STILL rehydratable: it reseeds, and the ⟳
+        // is gated on that. The two fields answer different questions.
         assert_eq!(nodes[1]["resumable"], false);
+        assert_eq!(nodes[1]["rehydratable"], true);
 
         assert_eq!(nodes[2]["name"], "implement-task-1");
         assert_eq!(nodes[2]["reaped"], false);
         assert_eq!(nodes[2]["pane_id"], "w:p3");
+        assert_eq!(
+            nodes[2]["rehydratable"], false,
+            "a phase holding a live pane must not be offered a ⟳ the CLI refuses"
+        );
     }
 
     #[test]
@@ -2417,7 +2455,8 @@ mod tests {
 
         // …and it flips the moment the user opts codex in.
         let mut cfg = cfg;
-        cfg.agents.get_mut("codex").unwrap().resume_subcommand = Some("resume".into());
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::Subcommand("resume".into()));
         let tree = build_agent_tree(&run, &cfg);
         assert_eq!(tree["nodes"][0]["resumable"], true);
     }

@@ -467,8 +467,17 @@ const tree = await agentNodes();
 check('a reaped phase is still listed — hiding it would look like it never ran',
   tree.map(n => n.name), ['brainstorm', 'plan', 'implement']);
 check('reaped phases render dimmed', tree.map(n => n.reaped), [true, true, false]);
-check('⟳ appears only where the SESSION can come back',
-  tree.map(n => n.rehydrate), [true, false, false]);
+// The ⟳ is gated on `rehydratable` — the same predicate the CLI refuses on — so
+// it appears on BOTH reaped phases (the second reseeds rather than resuming, and
+// its tooltip says so) and on neither the live one nor a phase that never ran.
+// Gating it on "has a session" instead would hide a recovery that works, and
+// gating it on `reaped` alone would offer one the CLI then rejects.
+check('⟳ appears exactly where a click will work',
+  tree.map(n => n.rehydrate), [true, true, false]);
+check('the ⟳ says which one you get', await evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-rehydrate'))
+    .map(function(b){ return b.title.indexOf('resume this') !== -1 ? 'session' : 'reseed'; });`),
+  ['session', 'reseed']);
 // The stub answers the way the server does, so the click handler's real
 // response path runs — including `r.json()`, which is where the outcome the
 // human needs lives.

@@ -2054,13 +2054,17 @@ function agentNodeHtml(node) {
   var cls = 'agent-node' + (pane ? '' : ' no-pane') + (node.reaped ? ' reaped' : '')
     + (pane && pane === selectedPane ? ' selected' : '');
   var angle = node.angle ? ' <span class="agent-angle">· ' + escHtml(node.angle) + '</span>' : '';
-  // ⟳ only when the session can actually come back. A reaped phase whose
-  // session was never captured — or whose backend has no resume surface — is
-  // relaunchable, not resumable, and offering the same button for both would
-  // promise a conversation the click cannot deliver.
-  var rehydrate = (node.reaped && node.resumable)
+  // The button appears exactly when a click will WORK — `rehydratable` is the
+  // same predicate the CLI and the HTTP handler gate on, so it can never be
+  // offered on a phase that then refuses. `resumable` is a different question
+  // (will the conversation come back, or is this a fresh agent reading the
+  // notes?) and it decides what the button PROMISES, not whether it is there.
+  var rehydrate = node.rehydratable
     ? '<button class="agent-rehydrate" data-phase="' + escHtml(node.name)
-      + '" title="Rehydrate: resume this phase&#39;s session in a new pane">⟳</button>'
+      + '" title="' + (node.resumable
+          ? 'Rehydrate: resume this phase&#39;s session in a new pane'
+          : 'Rehydrate: no session to resume — launches a fresh agent and re-sends the seed')
+      + '">⟳</button>'
     : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';

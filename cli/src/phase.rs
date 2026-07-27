@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{AgentLaunch, load_config};
 use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, SessionId};
-use crate::run::{PassToken, Phase, PhaseStatus, RunState, run_dir};
+use crate::run::{NotRehydratable, PassToken, Phase, PhaseStatus, RunState, run_dir};
 use crate::shell::shell_single_quote;
 
 /// How often `phase_wait` polls the filesystem for the completion marker, and
@@ -799,75 +799,51 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             ),
         )
     })?;
-    if let Some(pane) = existing.pane_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "phase '{}/{phase}' still holds pane {pane}; rehydrate brings back a phase \
-                 whose pane is gone. Look at that pane instead: herdr pane read {quoted} \
-                 (or herdr agent attach {quoted}, if an agent is still attached to it)",
-                run.name,
-                // `herdr pane read`, not `drovr attach <run>`: the latter resolves through
-                // `RunState::live_agent_pane`, which skips `Done` phases on
-                // purpose — and a `Done` phase is exactly what rehydrate is
-                // usually asked about. It would attach to a DIFFERENT phase, or
-                // (on a finished run) refuse outright, contradicting the pane
-                // this very message just named. The pane id is in hand, so name
-                // it. And `read` rather than `agent attach`, because nothing
-                // clears `pane_id` when an agent exits (that is task 6's job),
-                // so the pane this names may well have no agent on it —
-                // `herdr agent attach` would answer `agent_not_found`.
-                quoted = shell_single_quote(pane),
+    // ONE precondition, shared with the HTTP handler and the agent tree — see
+    // `Phase::rehydratable`. Written as three checks here it drifted from the
+    // handler's two, so the button a human clicks refused less than the command.
+    if let Err(why) = existing.rehydratable() {
+        let quoted_run = shell_single_quote(&run.name);
+        let quoted_phase = shell_single_quote(phase);
+        return Err(match why {
+            NotRehydratable::HoldsPane(pane) => io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "phase '{}/{phase}' still holds pane {pane}; rehydrate brings back a \
+                     phase whose pane is gone. Look at that pane instead: herdr pane read \
+                     {quoted_pane} (or herdr agent attach {quoted_pane}, if an agent is \
+                     still attached to it)",
+                    run.name,
+                    // `herdr pane read`, not `drovr attach <run>`: the latter
+                    // resolves through `RunState::live_agent_pane`, which skips
+                    // `Done` phases on purpose — and a `Done` phase is exactly
+                    // what rehydrate is usually asked about, so it would attach
+                    // to a DIFFERENT phase or deny any pane exists. And `read`
+                    // rather than `agent attach`, because nothing clears
+                    // `pane_id` when an agent exits (that is task 6's job), so
+                    // this pane may well have no agent on it.
+                    quoted_pane = shell_single_quote(&pane),
+                ),
             ),
-        ));
-    }
-    // "In `state.json`" is not "has ever run". `drovr new` pre-seeds a run with
-    // `Pending` placeholder phases and `phase_start` appends any name it is
-    // handed, so without this an unauthenticated `POST /rehydrate?phase=plan`
-    // on a fresh run would LAUNCH a brand-new agent out of pipeline order —
-    // which is `drovr phase start`'s job, under a command that advertises it.
-    // The predicate is [`Phase::has_run`], shared with the review UI's tree, so
-    // a node the tree offers a ⟳ on is never one this refuses.
-    if !existing.has_run() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "phase '{run_name}/{phase}' has never run, so there is nothing to bring \
-                 back. Start it: drovr phase start {quoted_run} {quoted_phase}",
-                run_name = run.name,
-                quoted_run = shell_single_quote(&run.name),
-                quoted_phase = shell_single_quote(phase),
+            NotRehydratable::NeverStarted => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{}/{phase}' has never run, so there is nothing to bring back. \
+                     Start it: drovr phase start {quoted_run} {quoted_phase}",
+                    run.name
+                ),
             ),
-        ));
-    }
-    // `has_run` is not enough on its own, because `phase_start` persists
-    // `Running` and the new pass BEFORE it launches (deliberately — a launch
-    // that fails must stay fail-closed). A launch that then fails leaves
-    // exactly this: `Running`, no pane, and NO agent record, because
-    // `record_launch` only happens once the launch succeeds. Such a phase never
-    // had an agent in it at all.
-    //
-    // Relaunching it would be `phase_start` wearing a name that promises
-    // recovery — and it would quietly drop the seed the original call was given
-    // (`handoff_doc` is recorded after the launch too), which only `phase start`
-    // can carry. Refuse, and name the command that can.
-    //
-    // `is_reaped()` wins over this: a phase reaped by a build older than the
-    // agent record demonstrably ran, and reaping only ever touches a phase that
-    // held a pane.
-    if !existing.is_reaped() && existing.pane_agent().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "phase '{run_name}/{phase}' has no agent on record — its last \
-                 `phase start` never got an agent running, so there is no session, no \
-                 backend and no seed to restore. Start it again (with its seed, which a \
-                 rehydrate cannot recover): drovr phase start {quoted_run} {quoted_phase}",
-                run_name = run.name,
-                quoted_run = shell_single_quote(&run.name),
-                quoted_phase = shell_single_quote(phase),
+            NotRehydratable::NoAgentEverRan => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{}/{phase}' has no agent on record — its last `phase start` \
+                     never got an agent running, so there is no session, no backend and no \
+                     seed to restore. Start it again (with its seed, which a rehydrate \
+                     cannot recover): drovr phase start {quoted_run} {quoted_phase}",
+                    run.name
+                ),
             ),
-        ));
+        });
     }
     if run.project_dir.is_empty() {
         return Err(io::Error::new(
@@ -885,77 +861,77 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // that there is exactly one.
     let readonly = run.review_phases.iter().any(|p| p.name == phase);
     let seed = existing.handoff_doc.clone();
-    // The whole resume bundle or nothing — session, backend AND profile. It is
-    // never taken apart: an id under the wrong profile resolves to no
-    // conversation at all, silently, and the agent starts blank with no error
-    // anywhere. `resume_target()` is also the ONLY way to obtain a session id;
-    // it has already checked kind, herdr's attribution and the alphabet.
-    let resume = existing.resume_target().map(|t| {
-        (
-            t.backend().to_owned(),
-            t.profile().map(str::to_owned),
-            t.session().clone(),
-        )
-    });
-    // What a plain relaunch uses: the phase's own launch record where it has
-    // one — a phase keeps its backend and profile even when its conversation is
-    // unrecoverable — else the run's configured backend.
-    let recorded = existing.pane_agent();
-    let fresh_backend = recorded
-        .map(|a| a.backend().to_owned())
-        .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
-    // The RECORDED profile or nothing — deliberately NOT falling back to
-    // `agent_profile_env()`. This process may be the review server, a long-lived
-    // daemon whose `CLAUDE_CONFIG_DIR` has nothing to do with the account this
-    // run's agents authenticate as; letting it decide is the very thing
-    // `rehydrate_uses_the_recorded_profile_not_the_servers_environment` exists
-    // to forbid, and the fallback would have applied it on exactly the path with
-    // the least information. `None` means the default profile, which is what a
-    // phase recording no profile was launched under — an honest unknown, not a
-    // guess (see `PhaseAgent::profile`, and task 3's handoff §5.8).
-    let fresh_profile = recorded.and_then(|a| a.profile().map(str::to_owned));
-
+    // Compose while the borrow of `run` is still alive, so the resume bundle
+    // never has to be taken apart into loose owned values to escape it. The
+    // block ends before anything mutates.
+    //
+    // `resumable_for(backend)` is the single chokepoint task 2 spent three
+    // rounds building, and `ResumeTarget` is how its proof travels: session,
+    // backend AND profile, or nothing. `Config::resume_launch` takes the whole
+    // target and reads the backend out of it itself, so this call site — the
+    // one that composes `--resume` — has no way to pair an id with the wrong
+    // agent.
     let cwd = run.project_dir.clone();
     let cfg = load_config()?;
-    let resumed = match &resume {
-        Some((backend, profile, session)) => cfg
-            .resume_launch(backend, &cwd, readonly, session)?
-            .map(|launch| (launch, profile.clone())),
-        None => None,
-    };
-    // `resuming` is a fact about the composed command, not about whether a
-    // session existed: a backend with no resume surface has a perfectly good
-    // session id and still cannot be told to use it.
-    let (launch, profile, resuming) = match resumed {
-        Some((launch, profile)) => (launch, profile, true),
-        None => (
-            cfg.launch(&fresh_backend, &cwd, readonly)?,
-            fresh_profile,
-            false,
-        ),
-    };
-
-    // ORDER MATTERS, exactly as in `phase_start`: persist the new pass FIRST,
-    // destroy the previous pass's marker SECOND. A new agent process is a new
-    // pass, and a marker left from the old one would complete the next
-    // `phase wait` instantly, off work that predates this rehydrate.
-    let pass = new_pass_token();
-    {
-        let p = run
-            .find_phase_mut(phase)
+    let (launch, profile, resuming) = {
+        let existing = run
+            .find_phase(phase)
             .expect("the phase was located above and nothing removed it");
-        p.pass = Some(pass.clone());
-        if !resuming {
-            // A relaunch REPLACES the agent record, which is the only way a
-            // session is ever discarded — and it belongs here, before the
-            // launch, for `phase_start`'s reason: a launch that fails must not
-            // leave the phase advertising a conversation the next pane will not
-            // be in.
-            p.record_launch(&fresh_backend, profile.clone());
+        // What a plain relaunch uses: the phase's own launch record where it
+        // has one — a phase keeps its backend and profile even when its
+        // conversation is unrecoverable — else the run's configured backend.
+        let recorded = existing.pane_agent();
+        let fresh_backend = recorded
+            .map(|a| a.backend().to_owned())
+            .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
+        // The RECORDED profile or nothing — deliberately NOT falling back to
+        // `agent_profile_env()`. This process may be the review server, a
+        // long-lived daemon whose `CLAUDE_CONFIG_DIR` has nothing to do with
+        // the account this run's agents authenticate as. `None` means the
+        // default profile, which is what a phase recording no profile was
+        // launched under — an honest unknown, not a guess.
+        let fresh_profile = recorded.and_then(|a| a.profile().map(str::to_owned));
+
+        let resumed = match existing.resume_target() {
+            Some(target) => cfg
+                .resume_launch(&target, &cwd, readonly)?
+                .map(|launch| (launch, target.profile().map(str::to_owned))),
+            None => None,
+        };
+        // `resuming` is a fact about the composed command, not about whether a
+        // session existed: a backend with no resume surface has a perfectly good
+        // session id and still cannot be told to use it.
+        match resumed {
+            Some((launch, profile)) => (launch, profile, true),
+            None => (
+                cfg.launch(&fresh_backend, &cwd, readonly)?,
+                fresh_profile.clone(),
+                false,
+            ),
         }
-    }
-    run.save()?;
-    remove_stale_marker(&run.name, phase)?;
+    };
+    let fresh_backend = run
+        .find_phase(phase)
+        .and_then(|p| p.pane_agent().map(|a| a.backend().to_owned()))
+        .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
+
+    // ⚠️ NOTHING IS MUTATED UNTIL THE LAUNCH SUCCEEDS, and that is the opposite
+    // of `phase_start`'s persist-first order on purpose.
+    //
+    // `phase_start` re-enters a phase to do NEW work, so losing the previous
+    // pass's completion is intended and persist-then-sweep is right. A
+    // rehydrate is RECOVERY: the phase's work may already be finished, and
+    // task 1 established that the `<phase>.done` MARKER is the evidence for
+    // that — a stale `Done` status is explicitly not accepted as proof. So
+    // sweeping the marker (or minting a new pass, which makes the old marker's
+    // token mismatch) and THEN failing to relaunch leaves a phase that is
+    // neither complete-provable nor running: the next `phase wait` blocks
+    // forever, and the only way out is hand-editing the run dir.
+    //
+    // Every failure below therefore leaves the phase exactly as it was — still
+    // reaped, still `Done`, still holding its marker and the pass that marker
+    // was stamped with — so a retry starts from the same place.
+    let pass = new_pass_token();
 
     // A fresh tab, never `run.root_pane` — a rehydrated phase must be as
     // independently closeable as a started one, and the root shell anchors the
@@ -992,25 +968,47 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         // The tab is always ours (`tab_create` is one line up), so there is no
         // "did this call create it" question — see `discard_unlaunched_pane`
         // for why a pane drovr opened and never recorded is worse than a leak.
+        // The PHASE is untouched: no new pass, no cleared marker, no replaced
+        // agent record.
         discard_unlaunched_pane(h, run, &pane);
         return Err(e);
     }
-    run.find_phase_mut(phase)
-        .expect("the phase was located above and nothing removed it")
+
+    // The agent is running. Only now does any of this become true.
+    {
+        let p = run
+            .find_phase_mut(phase)
+            .expect("the phase was located above and nothing removed it");
+        p.pass = Some(pass.clone());
+        if !resuming {
+            // A relaunch REPLACES the agent record, which is the only way a
+            // session is ever discarded: a new agent process means the id the
+            // old record names is no longer this phase's conversation.
+            p.record_launch(&fresh_backend, profile.clone());
+        }
         // Clears `reaped` in the same statement: a phase with a live pane is
         // not a reaped one.
-        .set_pane(pane.clone());
+        p.set_pane(pane.clone());
+    }
+    // Save BEFORE sweeping the marker — task 1's rule, and it still applies now
+    // that both happen late: if the save fails, the marker survives alongside
+    // the pass it was stamped with, so `phase_wait` can still complete off it.
+    // Sweeping first and then failing to save is the hole that leaves a phase
+    // `Done` with its evidence gone.
     run.save()?;
+    // The old marker is already INERT — the new pass is on disk and
+    // `marker_completes_pass` rejects a token that does not match it — so this
+    // is defence in depth rather than the thing that makes the wait correct.
+    remove_stale_marker(&run.name, phase)?;
 
     // ⚠️ The readiness gate is NOT the reseed path's alone, and gating only that
     // one was a real defect. `pane_run` returning `Ok` means the shell command
-    // was *issued* — nothing more. A resume whose recorded id no longer resolves
+    // was *issued*, nothing more. A resume whose recorded id no longer resolves
     // (the session file pruned, the profile's storage cleared, the backend's id
     // format changed) launches, fails to find the conversation, and errors out or
     // parks. Reporting `Resumed` there would claim "same conversation, same
     // agent" on the strength of a spawn, and hand a driver an exit 0 for an
-    // agent that was never resumed — exactly what this outcome exists to
-    // prevent everywhere else.
+    // agent that was never resumed.
     //
     // It also re-captures the session on the way past (`poll_phase_pane`), so a
     // rehydrated phase is immediately rehydratable again.
@@ -1024,10 +1022,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         };
         // Three genuinely different things did not happen, and saying the wrong
         // one is how a human debugs the wrong problem. The no-seed case is not
-        // hypothetical: `phase_start` takes `seed: Option<&Path>`, so a phase
-        // can legitimately have none — and moving this gate ahead of the
-        // seed-less early return (which is right: "launched" should not be
-        // claimed before the agent is confirmed up) put that case here.
+        // hypothetical: `phase_start` takes `seed: Option<&Path>`.
         let why = if resuming {
             "Its recorded session may no longer resolve — the conversation was NOT restored"
         } else if seed.is_none() {
@@ -1043,10 +1038,6 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
                  that works either way, where `herdr agent attach` needs an agent to already \
                  be there — then `drovr phase send {run_name} {phase} …`",
                 run_name = run.name,
-                // The pane by name, not `drovr attach <run>` — see the refusal
-                // above. This one matters more: the pane was created seconds
-                // ago by this very call, and `drovr attach` would deny it exists
-                // whenever the phase is `Done`.
                 quoted_pane = shell_single_quote(&pane),
             ),
         });
@@ -7159,6 +7150,51 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn a_failed_rehydrate_leaves_the_phases_completion_evidence_intact() {
+        // ⚠️ THE ONE THAT DESTROYS EVIDENCE. Task 1 established that the
+        // `<phase>.done` MARKER is the proof a phase completed, and that a
+        // stale `Done` status is explicitly NOT accepted instead. So a rehydrate
+        // that swept the marker (or minted a new pass, which makes the old
+        // marker's token mismatch) and THEN failed to relaunch left a phase
+        // neither complete-provable nor running: `phase wait` blocks forever and
+        // the only way out is hand-editing the run dir.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-keeps-evidence");
+        let mut p = reaped_phase("plan", "claude", None, Some("sess-e"));
+        p.pass = crate::run::PassToken::new("the-pass-that-finished-it".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        std::fs::create_dir_all(run_dir("rh-keeps-evidence")).unwrap();
+        std::fs::write(
+            done_marker("rh-keeps-evidence", "plan"),
+            "the-pass-that-finished-it",
+        )
+        .unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+
+        assert!(phase_rehydrate(&h, &mut run, "plan").is_err());
+
+        // The evidence, and the token that makes it readable, both survive.
+        assert!(
+            done_marker("rh-keeps-evidence", "plan").exists(),
+            "a failed rehydrate must not destroy the completion marker"
+        );
+        let on_disk = RunState::load("rh-keeps-evidence").unwrap();
+        let phase = on_disk.find_phase("plan").unwrap();
+        assert_eq!(
+            phase.pass.as_ref().map(|t| t.as_str()),
+            Some("the-pass-that-finished-it"),
+            "the marker is only evidence while the phase still holds its token"
+        );
+        // …and nothing else moved either: a retry starts from the same place.
+        assert!(phase.is_reaped());
+        assert_eq!(phase.pane_id(), None);
+        assert!(phase.resume_target().is_some(), "the session survives too");
+        assert_eq!(phase.status, PhaseStatus::Done);
+    }
+
+    #[test]
     fn a_failed_reseed_launch_does_not_strand_its_tab_either() {
         // The launch-failure path was only covered on the RESUMING branch. The
         // reseed branch reaches `tab_create` through different code (it has
@@ -7279,7 +7315,8 @@ mod rehydrate_tests {
 
         assert!(
             !done_marker("rh-marker", "plan").exists(),
-            "the previous pass's marker must be gone"
+            "on SUCCESS the previous pass's marker is gone — it describes work \
+             the rehydrated agent is about to redo"
         );
         let pass = run.find_phase("plan").unwrap().pass.clone().unwrap();
         assert_ne!(pass.as_str(), "old-pass", "a new agent is a new pass");

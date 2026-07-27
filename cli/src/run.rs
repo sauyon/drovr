@@ -291,6 +291,40 @@ impl Phase {
         }
     }
 
+    /// Why this phase cannot be brought back, or `Ok(())` if it can.
+    ///
+    /// **THE rehydrate precondition, in one place.** Three callers ask this
+    /// exact question and they must not answer it differently: `phase_rehydrate`
+    /// (which refuses), the `POST /rehydrate` handler (which must refuse the
+    /// same things, or the button a human clicks is more permissive than the
+    /// command), and the agent tree (whose ⟳ must appear only where a click
+    /// will work). Written as three separate predicates it drifted once
+    /// already — the HTTP path checked two of the three.
+    ///
+    /// It is deliberately STRICTER than [`Phase::has_run`], which answers a
+    /// different question ("is this a real phase or a `drovr new` placeholder",
+    /// for display). Reusing the weaker one as the gate re-opens the door the
+    /// `NoAgentEverRan` arm exists to close.
+    pub fn rehydratable(&self) -> Result<(), NotRehydratable> {
+        if let Some(pane) = self.pane_id() {
+            return Err(NotRehydratable::HoldsPane(pane.to_owned()));
+        }
+        if !self.has_run() {
+            return Err(NotRehydratable::NeverStarted);
+        }
+        // `has_run()` is true for a phase whose launch FAILED: `phase_start`
+        // persists `Running` before it launches, and only records the agent on
+        // success. Such a phase never had an agent in it — no backend, no
+        // profile, no session, and no seed — so bringing it "back" would be
+        // `phase start` under a name that promises recovery. A phase reaped by
+        // a build older than the agent record is exempt: reaping only ever
+        // touched a phase that held a pane, so it demonstrably ran.
+        if !self.is_reaped() && self.pane_agent().is_none() {
+            return Err(NotRehydratable::NoAgentEverRan);
+        }
+        Ok(())
+    }
+
     /// Whether an agent has ever been launched into this phase.
     ///
     /// **The one answer to "is this a real phase or a placeholder".** `drovr
@@ -338,6 +372,23 @@ impl Phase {
         self.reaped = Reaped(true);
         self.pane_id.take()
     }
+}
+
+/// Why a phase cannot be rehydrated — see [`Phase::rehydratable`].
+///
+/// An enum rather than a bool because each arm needs a *different* thing said
+/// to the user (attach to the pane / start the phase / start it WITH its seed),
+/// and because the HTTP layer has to map them to status codes without
+/// re-deriving the reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRehydratable {
+    /// Still holds a pane, named here. Attach to it instead.
+    HoldsPane(String),
+    /// A `Pending` placeholder — `drovr new` seeds four of them. Nothing ran.
+    NeverStarted,
+    /// It looks started, but no agent was ever recorded: its last
+    /// `phase start` persisted `Running` and then failed to launch.
+    NoAgentEverRan,
 }
 
 /// The three things a resume needs, handed over together or not at all.

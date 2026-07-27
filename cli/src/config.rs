@@ -16,102 +16,124 @@ use std::path::PathBuf;
 use crate::herdr::SessionId;
 use crate::shell::shell_single_quote;
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-pub struct AgentSpec {
-    pub command: String,
-    /// Read-only flag; absent → this agent cannot serve as a reviewer.
+/// How an agent is told to resume a prior session. **One field, one shape** —
+/// the two TOML keys fold into this on the way in.
+///
+/// Resume is not one shape across backends: claude `-r, --resume [value]` and
+/// cursor `agent --resume [chatId]` are FLAGS whose value is optional, while
+/// codex takes a `codex resume <id>` SUBCOMMAND, which binds to the command and
+/// must precede every flag. They are mutually exclusive, and this is where that
+/// is *said by the type* rather than promised by a doc comment — an `AgentSpec`
+/// claiming both shapes is not constructible, in memory or from a config file.
+///
+/// The optional value is why the id is never separable from the surface: a bare
+/// `--resume` opens an interactive session PICKER and parks the pane forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeSpec {
+    /// `<command> … <flag> '<id>'` — where the other flags go.
+    Flag(String),
+    /// `<command> <subcommand> '<id>' …` — immediately after the command.
+    Subcommand(String),
+}
+
+impl ResumeSpec {
+    /// The flag or subcommand text, for composing.
+    fn token(&self) -> &str {
+        match self {
+            ResumeSpec::Flag(f) => f,
+            ResumeSpec::Subcommand(s) => s,
+        }
+    }
+}
+
+/// The wire shape of an agent entry: two optional resume keys, as a config file
+/// spells them. [`AgentSpec`] is built from this via `TryFrom`, which is where
+/// "both at once" and "empty" are rejected — so the validated type downstream
+/// cannot express either.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgentSpecWire {
+    command: String,
     #[serde(default)]
-    pub readonly_flag: Option<String>,
-    /// Flag used to pin the agent to the run's project directory.
+    readonly_flag: Option<String>,
     #[serde(default)]
-    pub workspace_flag: Option<String>,
-    /// Flag used to append the workspace-root guard prompt.
+    workspace_flag: Option<String>,
     #[serde(default)]
-    pub system_prompt_flag: Option<String>,
-    /// Flag used to select a model for read-only reviews.
+    system_prompt_flag: Option<String>,
     #[serde(default)]
-    pub model_flag: Option<String>,
-    /// Model selected for read-only reviews. Absent means backend default.
+    model_flag: Option<String>,
     #[serde(default)]
-    pub review_model: Option<String>,
-    /// Flag that resumes a prior session, composed as
-    /// `<command> … <flag> '<id>'` — where the rest of the flags go. Absent →
-    /// this agent offers no flag-shaped resume.
-    ///
-    /// Mutually exclusive with [`AgentSpec::resume_subcommand`]; setting both is
-    /// a config error (see [`validate_resume`]).
+    review_model: Option<String>,
+    /// Flag that resumes a prior session (claude, cursor).
     #[serde(default)]
-    pub resume_flag: Option<String>,
-    /// Subcommand that resumes a prior session, composed as
-    /// `<command> <subcommand> '<id>' …` — immediately after the command,
-    /// because a subcommand is not a flag and cannot follow one.
-    ///
-    /// No built-in agent sets this. `codex resume <id>` is the known shape, but
-    /// codex was not installed on the machine this was written on, so its
-    /// argument ordering could not be verified — and an unverified guess that
-    /// composes a wrong command line is worse than falling back to a reseed. A
-    /// codex user opts in explicitly:
+    resume_flag: Option<String>,
+    /// Subcommand that resumes a prior session. No built-in sets this:
+    /// `codex resume <id>` is the known shape, but codex was not installed on
+    /// the machine this was written on, so its argument ordering could not be
+    /// verified — and an unverified guess composes a wrong command line where
+    /// `None` merely reseeds. A codex user opts in explicitly:
     ///
     /// ```toml
     /// [agents.codex]
     /// resume_subcommand = "resume"
     /// ```
     #[serde(default)]
-    pub resume_subcommand: Option<String>,
+    resume_subcommand: Option<String>,
 }
 
-/// How an agent is asked to bring a prior session back. Exactly one shape per
-/// agent — resume is not one shape across backends:
-///
-/// * claude `-r, --resume [value]` and cursor `agent --resume [chatId]` are
-///   FLAGS whose value is optional;
-/// * codex takes a `codex resume <id>` SUBCOMMAND.
-///
-/// The optional value is why this is a type and not a `&str`: emitting the flag
-/// with no id opens an interactive session PICKER, which parks the pane forever
-/// with no agent ever attaching — the exact stuck-agent failure
-/// `diagnose_stuck_phase` exists to explain. So a surface is never composed
-/// without an id: [`Config::resume_launch`] takes a [`SessionId`], which cannot
-/// be empty or malformed, and there is no code path that emits the flag alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeSurface<'a> {
-    /// `<command> … <flag> '<id>'`
-    Flag(&'a str),
-    /// `<command> <subcommand> '<id>' …`
-    Subcommand(&'a str),
-}
-
-impl AgentSpec {
-    /// The one resume surface this agent offers, or `None` when it offers none.
-    ///
-    /// **This is the only reader of the two fields** — `compose` and the review
-    /// UI's `is_resumable` both come through here, and nothing in production
-    /// touches `resume_flag` / `resume_subcommand` directly. So the rules live
-    /// here, once:
-    ///
-    /// * an ambiguous spec (BOTH shapes) resolves to `None`;
-    /// * an empty or whitespace-only value resolves to `None`.
-    ///
-    /// [`validate_resume`] rejects both cases LOUDLY at load, which is where a
-    /// user can see the message and fix their config — but it only sees what
-    /// `load_config` parses. An `AgentSpec` assembled in memory (the fields are
-    /// `pub`) never passes it, so the quiet rule here is what those callers get.
-    /// The two are not an authoritative guard plus a backstop: one decides
-    /// whether the config LOADS, the other decides what a given spec MEANS.
-    /// `None` degrades a rehydrate to a reseed, which is the safe direction —
-    /// never a bare flag, never a guess at which shape was intended.
-    pub fn resume_surface(&self) -> Option<ResumeSurface<'_>> {
-        match (
-            self.resume_flag.as_deref().filter(|f| !f.trim().is_empty()),
-            self.resume_subcommand
-                .as_deref()
-                .filter(|s| !s.trim().is_empty()),
-        ) {
-            (Some(flag), None) => Some(ResumeSurface::Flag(flag)),
-            (None, Some(sub)) => Some(ResumeSurface::Subcommand(sub)),
-            _ => None,
+impl TryFrom<AgentSpecWire> for AgentSpec {
+    type Error = String;
+    fn try_from(w: AgentSpecWire) -> Result<AgentSpec, String> {
+        // Empty is the bare-`--resume` hazard written into a config file:
+        // `resume_flag = ""` composes `<command>  '<id>'`, i.e. the id as a
+        // positional argument. Rejected here, where the user can see why.
+        for (key, value) in [
+            ("resume_flag", &w.resume_flag),
+            ("resume_subcommand", &w.resume_subcommand),
+        ] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(format!("{key} must not be empty"));
+            }
         }
+        let resume = match (w.resume_flag, w.resume_subcommand) {
+            (Some(flag), None) => Some(ResumeSpec::Flag(flag)),
+            (None, Some(sub)) => Some(ResumeSpec::Subcommand(sub)),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(
+                    "resume_flag and resume_subcommand are mutually exclusive; set exactly one"
+                        .into(),
+                );
+            }
+        };
+        Ok(AgentSpec {
+            command: w.command,
+            readonly_flag: w.readonly_flag,
+            workspace_flag: w.workspace_flag,
+            system_prompt_flag: w.system_prompt_flag,
+            model_flag: w.model_flag,
+            review_model: w.review_model,
+            resume,
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(try_from = "AgentSpecWire")]
+pub struct AgentSpec {
+    pub command: String,
+    /// Read-only flag; absent → this agent cannot serve as a reviewer.
+    pub readonly_flag: Option<String>,
+    /// Flag used to pin the agent to the run's project directory.
+    pub workspace_flag: Option<String>,
+    /// Flag used to append the workspace-root guard prompt.
+    pub system_prompt_flag: Option<String>,
+    /// Flag used to select a model for read-only reviews.
+    pub model_flag: Option<String>,
+    /// Model selected for read-only reviews. Absent means backend default.
+    pub review_model: Option<String>,
+    /// How this agent resumes a session, if it can — see [`ResumeSpec`].
+    /// Absent → no resume surface, and a rehydrate degrades to a reseed.
+    pub resume: Option<ResumeSpec>,
 }
 
 /// Controls the SessionStart reflex the `session-start` hook injects (see
@@ -215,8 +237,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             review_model: None,
             // Verified against the real CLI: `claude -r, --resume [value]` —
             // a flag whose value is OPTIONAL.
-            resume_flag: Some("--resume".into()),
-            resume_subcommand: None,
+            resume: Some(ResumeSpec::Flag("--resume".into())),
         },
     );
     m.insert(
@@ -229,8 +250,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
             // Verified against the real CLI: `agent --resume [chatId]`.
-            resume_flag: Some("--resume".into()),
-            resume_subcommand: None,
+            resume: Some(ResumeSpec::Flag("--resume".into())),
         },
     );
     m.insert(
@@ -242,8 +262,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("-m".into()),
             review_model: None,
-            resume_flag: None,
-            resume_subcommand: None,
+            resume: None,
         },
     );
     m
@@ -320,21 +339,15 @@ pub fn load_config() -> io::Result<Config> {
     for (name, spec) in &config.agents {
         validate_command(&spec.command)
             .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
-        validate_resume(spec).map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
     }
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
-            // The resume surface merges as ONE unit, unlike every field below
-            // it. Filling the two halves independently would graft the built-in
-            // `--resume` onto an agent the user deliberately gave a
-            // `resume_subcommand`, leaving a spec that claims both shapes —
-            // which `validate_resume` has just rejected as ambiguous, except
-            // that this happens after it. The user's resume surface is a whole
-            // answer or no answer.
-            if spec.resume_flag.is_none() && spec.resume_subcommand.is_none() {
-                spec.resume_flag = builtin.resume_flag;
-                spec.resume_subcommand = builtin.resume_subcommand;
-            }
+            // One field, so this is an ordinary `.or()` like every line below
+            // it — the special-case block this used to need disappeared with
+            // the two-Options shape. Filling two halves independently was how a
+            // user's `resume_subcommand` could get the built-in `--resume`
+            // grafted on beside it.
+            spec.resume = spec.resume.take().or(builtin.resume);
             spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
             spec.workspace_flag = spec.workspace_flag.take().or(builtin.workspace_flag);
             spec.system_prompt_flag = spec
@@ -411,13 +424,13 @@ impl Config {
         agent: &str,
         project_dir: &str,
         readonly: bool,
-        resume: Option<(ResumeSurface<'_>, &SessionId)>,
+        resume: Option<(&ResumeSpec, &SessionId)>,
     ) -> io::Result<AgentLaunch> {
         let spec = self.agent(agent)?;
         let mut command = spec.command.clone();
-        if let Some((ResumeSurface::Subcommand(sub), session)) = resume {
+        if let Some((spec @ ResumeSpec::Subcommand(_), session)) = resume {
             command.push(' ');
-            command.push_str(sub);
+            command.push_str(spec.token());
             command.push(' ');
             command.push_str(&shell_single_quote(session.as_str()));
         }
@@ -463,9 +476,9 @@ impl Config {
         // LAST, and always with its id in the same push. The flag's value is
         // OPTIONAL to the agent, so the id is what separates "resume this
         // conversation" from "open the session picker and park forever".
-        if let Some((ResumeSurface::Flag(flag), session)) = resume {
+        if let Some((spec @ ResumeSpec::Flag(_), session)) = resume {
             command.push(' ');
-            command.push_str(flag);
+            command.push_str(spec.token());
             command.push(' ');
             command.push_str(&shell_single_quote(session.as_str()));
         }
@@ -491,17 +504,27 @@ impl Config {
     /// to reach this function with an empty id and emit a bare flag.
     pub fn resume_launch(
         &self,
-        agent: &str,
+        target: &crate::run::ResumeTarget<'_>,
         project_dir: &str,
         readonly: bool,
-        session: &SessionId,
     ) -> io::Result<Option<AgentLaunch>> {
-        let spec = self.agent(agent)?;
-        let Some(surface) = spec.resume_surface() else {
+        // The BACKEND comes out of the same bundle as the session, here, rather
+        // than from two arguments a caller paired up. `AgentSession::resumable_for`
+        // is the single chokepoint that ties a session id to the agent it means
+        // anything to, and `ResumeTarget` is how that proof travels — taking the
+        // pair apart at the one call site that composes `--resume` would hand it
+        // straight back.
+        let spec = self.agent(target.backend())?;
+        let Some(resume) = spec.resume.as_ref() else {
             return Ok(None);
         };
-        self.compose(agent, project_dir, readonly, Some((surface, session)))
-            .map(Some)
+        self.compose(
+            target.backend(),
+            project_dir,
+            readonly,
+            Some((resume, target.session())),
+        )
+        .map(Some)
     }
 
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
@@ -585,37 +608,6 @@ fn validate_command(command: &str) -> io::Result<()> {
             "agent command '{command}' is a relative path; use a bare name \
              (resolved via $PATH) or an absolute path"
         )));
-    }
-    Ok(())
-}
-
-/// Reject a resume surface that cannot compose a safe command line.
-///
-/// Two rules, both of which would otherwise surface as a pane that never
-/// becomes ready:
-///
-/// * **Both shapes at once is ambiguous.** `resume_flag` and
-///   `resume_subcommand` place the id in different positions; an agent claiming
-///   both has no single answer, and picking one silently would be a guess about
-///   the user's CLI.
-/// * **An empty value is the bare-flag hazard, written down.** `resume_flag =
-///   ""` composes `<command>  '<id>'` — the id as a positional argument — and a
-///   whitespace-only one composes worse. Both are rejected at load, where the
-///   user can see the message, rather than at compose time where the failure is
-///   a pane parked on a session picker.
-fn validate_resume(spec: &AgentSpec) -> io::Result<()> {
-    if spec.resume_flag.is_some() && spec.resume_subcommand.is_some() {
-        return Err(io::Error::other(
-            "resume_flag and resume_subcommand are mutually exclusive; set exactly one",
-        ));
-    }
-    for (key, value) in [
-        ("resume_flag", &spec.resume_flag),
-        ("resume_subcommand", &spec.resume_subcommand),
-    ] {
-        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
-            return Err(io::Error::other(format!("{key} must not be empty")));
-        }
     }
     Ok(())
 }
@@ -733,30 +725,41 @@ mod tests {
         SessionId::new(value.to_owned()).expect("test session id must be well-formed")
     }
 
+    /// A phase carrying a resume target, built the way production builds one.
+    /// There is deliberately no shortcut constructor for `ResumeTarget`: the
+    /// bundle exists precisely so a session id and a backend cannot be paired
+    /// up by hand, and a test-only back door would be the first thing to
+    /// re-open that.
+    fn resumable_phase(backend: &str, session: &str) -> crate::run::Phase {
+        let mut p = crate::run::Phase::new("t");
+        p.record_launch(backend, None);
+        assert!(p.record_session(sid(session)), "fixture must attach");
+        p
+    }
+
     #[test]
     fn claude_and_cursor_resume_with_a_flag_and_codex_with_nothing() {
         let cfg = Config::default();
         assert_eq!(
-            cfg.agents["claude"].resume_surface(),
-            Some(ResumeSurface::Flag("--resume"))
+            cfg.agents["claude"].resume,
+            Some(ResumeSpec::Flag("--resume".into()))
         );
         assert_eq!(
-            cfg.agents["cursor"].resume_surface(),
-            Some(ResumeSurface::Flag("--resume"))
+            cfg.agents["cursor"].resume,
+            Some(ResumeSpec::Flag("--resume".into()))
         );
         // codex gets NEITHER on purpose: `codex resume <id>` is the documented
         // shape but was never verified against the real CLI, and an unverified
         // guess composes a wrong command line where `None` merely reseeds.
-        assert_eq!(cfg.agents["codex"].resume_surface(), None);
-        assert_eq!(cfg.agents["codex"].resume_flag, None);
-        assert_eq!(cfg.agents["codex"].resume_subcommand, None);
+        assert_eq!(cfg.agents["codex"].resume, None);
     }
 
     #[test]
     fn a_flag_resume_carries_its_id_and_never_appears_bare() {
         let cfg = Config::default();
+        let ph = resumable_phase("claude", "abc-123.def_4");
         let launch = cfg
-            .resume_launch("claude", "/tmp/p", false, &sid("abc-123.def_4"))
+            .resume_launch(&ph.resume_target().unwrap(), "/tmp/p", false)
             .unwrap()
             .expect("claude offers a resume flag");
         assert_eq!(launch.backend(), "claude");
@@ -787,8 +790,9 @@ mod tests {
         // A resumed reviewer without its read-only flag is a second WRITER in a
         // run built on single-writer discipline.
         let cfg = Config::default();
+        let ph = resumable_phase("claude", "sess-1");
         let launch = cfg
-            .resume_launch("claude", "/tmp/p", true, &sid("sess-1"))
+            .resume_launch(&ph.resume_target().unwrap(), "/tmp/p", true)
             .unwrap()
             .unwrap();
         assert!(
@@ -803,9 +807,10 @@ mod tests {
     fn a_resume_subcommand_comes_immediately_after_the_command() {
         let mut cfg = Config::default();
         let codex = cfg.agents.get_mut("codex").unwrap();
-        codex.resume_subcommand = Some("resume".into());
+        codex.resume = Some(ResumeSpec::Subcommand("resume".into()));
+        let ph = resumable_phase("codex", "sess-9");
         let launch = cfg
-            .resume_launch("codex", "/tmp/p", false, &sid("sess-9"))
+            .resume_launch(&ph.resume_target().unwrap(), "/tmp/p", false)
             .unwrap()
             .unwrap();
         // A subcommand is not a flag: it binds to the command and must precede
@@ -823,13 +828,19 @@ mod tests {
         // `Ok(None)`, not an error: "this backend cannot be resumed" is a normal
         // outcome that rehydrate answers with a fresh launch plus a re-seed.
         let cfg = Config::default();
+        let codex = resumable_phase("codex", "sess-1");
         assert!(
-            cfg.resume_launch("codex", "/tmp/p", false, &sid("sess-1"))
+            cfg.resume_launch(&codex.resume_target().unwrap(), "/tmp/p", false)
                 .unwrap()
                 .is_none()
         );
-        // An unknown agent is still an error.
-        assert!(cfg.resume_launch("nope", "/tmp/p", false, &sid("s")).is_err());
+        // An unknown agent is still an error — and the backend comes out of the
+        // bundle, so this cannot be tested by passing a mismatched pair.
+        let nope = resumable_phase("nope", "s");
+        assert!(
+            cfg.resume_launch(&nope.resume_target().unwrap(), "/tmp/p", false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -849,8 +860,8 @@ mod tests {
 
         let cfg = load_config().unwrap();
         assert_eq!(
-            cfg.agents["claude"].resume_surface(),
-            Some(ResumeSurface::Flag("--resume"))
+            cfg.agents["claude"].resume,
+            Some(ResumeSpec::Flag("--resume".into()))
         );
     }
 
@@ -872,10 +883,9 @@ mod tests {
         set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
-        assert_eq!(cfg.agents["claude"].resume_flag, None);
         assert_eq!(
-            cfg.agents["claude"].resume_surface(),
-            Some(ResumeSurface::Subcommand("resume"))
+            cfg.agents["claude"].resume,
+            Some(ResumeSpec::Subcommand("resume".into()))
         );
     }
 
@@ -1122,8 +1132,7 @@ readonly_flag = "--sandbox read-only"
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
-                        resume_flag: None,
-                        resume_subcommand: None,
+                        resume: None,
                     },
                 );
                 m
@@ -1153,8 +1162,7 @@ readonly_flag = "--sandbox read-only"
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
-                        resume_flag: None,
-                        resume_subcommand: None,
+                        resume: None,
                     },
                 );
                 m
@@ -1187,8 +1195,7 @@ readonly_flag = "--sandbox read-only"
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
-                        resume_flag: None,
-                        resume_subcommand: None,
+                        resume: None,
                     },
                 );
                 m
