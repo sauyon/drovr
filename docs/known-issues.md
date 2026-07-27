@@ -391,6 +391,8 @@ re-run against current `main`.~~ **CONFIRMED 2026-07-25, independently by two ru
   reported.
 - run `phase-reap`, branch `drovr/phase-reap` — the same symptom, same cause, plus a *second*
   failure mode behind it. Detailed below.
+- run `m3-schema-dos` (2026-07-26) — same cause a third time, initially mis-filed as "no reviewer
+  ever spawned" because the triage used `pgrep` instead of reading the pane. See below.
 
 ### Dogfooded end-to-end 2026-07-25 (run `phase-reap`, task-1, branch `drovr/phase-reap`)
 
@@ -425,36 +427,34 @@ either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
 file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
 
-### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — no reviewer ever spawned
+### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — the unsubmitted paste again
 
-A third failure shape, distinct from both above: the panel produced **no reviewer processes at
-all**, not panes-that-attach-but-don't-submit. Two passes, `0 of 4 angles finished` each time:
+**Root cause: the unsubmitted-prompt bug above.** Filed at the time as a third failure shape —
+"no reviewer processes at all, not panes-that-attach-but-don't-submit" — which was a
+mis-triage. Two passes, `0 of 4 angles finished` each time:
 
 - pass 1, `--timeout-ms 540000` → exit 2, `still waiting on correctness, security, error-handling,
   type-design`;
 - pass 2, `--timeout-ms 1500000` (25 min) → exit 2, identical.
 
 After both, the run dir held all four `schema-dos-fix-review-<angle>-seed.md` files and
-`schema-dos-fix-review-{1,2}.head`, and **zero** findings files. `pgrep -af 'drovr|code-review'`
-showed no reviewer for this panel — only unrelated `drovr serve` / `cursor-agent` processes
-belonging to other worktrees. So the seeds were written and nothing ever consumed them.
+`schema-dos-fix-review-{1,2}.head`, and **zero** findings files.
 
-**Root cause unknown.** What the evidence pins down: all four angles reached the wait loop's
-`pending` list, so `spawn_reviewer` returned `Ok` for each — a spawn failure aborts the pass with
-exit 1, and a run with no `workspace` fails loudly ("run '…' has no herdr workspace; cannot spawn
-a reviewer"). Panes were therefore created and `launch_in_pane` was called, yet no reviewer
-process existed. That puts the fault at the launch inside the pane, not at the caller.
+**Why it looked like a new shape — the diagnostic was wrong.** `pgrep -af 'drovr|code-review'`
+cannot match a reviewer: reviewers run as `claude` / `agent` / `cursor-agent`, and neither string
+appears in those command lines. The `cursor-agent` processes that pattern *did* surface, and which
+were dismissed as "belonging to other worktrees", are the likeliest candidates for the parked
+reviewers themselves. Absence of a matching process was read as absence of a reviewer.
 
-Ruled out — the driver being a plain `claude` session drovr did not start. It looked
-distinguishing (this run's only pane, `wB8:p1`, belonged to an earlier `verify-land` phase), but
-the panel's only workspace requirement is `run.workspace` in that run's `state.json`
-(`spawn_reviewer`, cli/src/phase.rs), which `drovr new` records regardless of who invokes it; no
-code path consults the calling session. Two runs created from a plain `claude` session drovr had
-not started (`structural-briefs` → `wBM`, `review-full-repo` → `wBK`) got workspaces and seeded
-panels normally.
+**Triage this shape correctly:** check the pane, not the process table — `herdr pane get <pane>`
+for a reviewer pane, or `herdr agent read <pane>`. A pane sitting at `agent_status: idle` with
+`→ [Pasted text #1 +N lines]` in its composer is the unsubmitted paste, and
+`herdr agent send-keys <pane> enter` starts it.
 
-**Next sighting:** capture `herdr pane get <pane>` for a reviewer pane before re-running, to see
-whether the pane holds a live shell that never ran the agent command.
+Not the caller's session, though it looked that way at first (this run's only recorded pane,
+`wB8:p1`, belonged to an earlier `verify-land` phase). `spawn_reviewer` requires `run.workspace`
+from that run's `state.json` and nothing else — `drovr new` records it whoever invokes it, and no
+code path consults the calling session.
 
 Credit where due: drovr handled the moving target correctly. HEAD changed between passes and pass
 2 reported `HEAD moved since review iteration 1 was seeded — starting a fresh panel instead of
