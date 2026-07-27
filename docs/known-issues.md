@@ -927,6 +927,43 @@ Make `review wait` treat a transient connect failure as retryable (re-run `ensur
 resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
 exit.
 
+## herdr's `agent_status: done` is an EDGE, not a level — FIXED 2026-07-27
+
+**Severity:** was high — a reviewer that did everything right hung its panel forever.
+**Found:** 2026-07-27, running the round-2 review panel for `land-mcp-findings`.
+
+### Symptom
+
+Four cursor reviewers all delivered valid findings files. The panel reported *"3 of 4 angles
+finished; still waiting on error-handling"* and timed out (exit 2) on two consecutive runs,
+with `branch-review-2-error-handling.json` sitting complete and parseable on disk the whole
+time. `state.json` had that angle `Running`; the other three `Done`.
+
+### Cause
+
+herdr reports `agent_status: "done"` for only a moment as a turn ends; an agent parked at its
+prompt reports `"idle"`. All four finished panes read `idle` when inspected afterwards. The
+panel's completion test was `done_marker exists || agent_status == Done`, and the marker never
+fires for reviewers — their seed forbids `drovr phase done` (confirmed: zero `.done` files in
+the run dir). So the only signal was that momentary edge. Three angles were polled while it
+was showing; the fourth was not, and no later poll could ever recover it. On resume, the
+banking branch was gated on `status == Done`, so a stuck `Running` angle could not be rescued
+by its own file either. Two gates, both asking the pane, both unrecoverable once missed.
+
+### Fix
+
+Completion is the artifact. A parseable `<task>-review-<iter>-<angle>.json` finishes the
+angle at both gates, whatever the pane says (`code_review::delivered_review`). herdr is now
+consulted for exactly one question the artifact cannot answer: has a reviewer finished
+*without* delivering? The server's write is atomic (temp + rename) so a file in flight cannot
+be read as a delivery.
+
+### Not affected: ordinary phases
+
+`phase.rs` uses `agent_status` for readiness and blocked-detection, never for completion —
+a phase agent completes by running `drovr phase done`, which drops the marker the wait polls.
+Only the review panel depended on the edge, because only reviewers are told not to run it.
+
 ## `main` is not `cargo fmt` clean, and formatting one file reformats the whole crate
 
 **Severity:** medium — the last branch that got this wrong had to be rebuilt from scratch

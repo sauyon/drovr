@@ -279,7 +279,7 @@ pub(crate) fn handle(
             {
                 return tool_error(id, &format!("could not create {}: {e}", parent.display()));
             }
-            match std::fs::write(&path, &body) {
+            match write_atomically(&path, &body) {
                 Ok(()) => ok(
                     id,
                     serde_json::json!({
@@ -297,6 +297,35 @@ pub(crate) fn handle(
         // than an error: an unknown-method failure can abort a client's startup.
         _ => ok(id, serde_json::json!({})),
     }
+}
+
+/// Write `body` to `path` so that a concurrent reader sees either the previous file or
+/// the complete new one — never a prefix of it.
+///
+/// The panel polls this path and treats a parseable file as proof the angle is finished,
+/// so how the bytes land is now part of the contract. `fs::write` truncates and then
+/// fills: a poll inside that window sees a prefix, and — worse for a RE-submission — an
+/// empty file where a complete earlier verdict used to be. Parsing rejects both, so the
+/// panel would keep waiting rather than bank nonsense, but that is luck rather than a
+/// guarantee, and it makes a delivered review look undelivered for as long as the window
+/// lasts.
+///
+/// So: write a sibling temp file, then `rename` onto the destination. POSIX rename within
+/// one directory is atomic — a reader sees the old file or the new one. The temp name
+/// carries the pid so two servers writing the same angle (possible: all of a task's
+/// reviewers share one server config) cannot scribble into each other's temp file; the
+/// rename then simply picks a winner.
+fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Do not leave the partial write lying next to the real file.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// JSON-RPC "Parse error". Answered with `id: null`, per the spec: a line that did not
@@ -583,6 +612,78 @@ mod tests {
             props["findings"]["items"]["properties"]["severity"]["enum"],
             serde_json::json!(Severity::WIRE)
         );
+    }
+
+    /// The panel treats a parseable file as proof an angle finished, so the write must
+    /// be all-or-nothing: a reader must never see a prefix, and must never see the
+    /// destination empty because a re-submission truncated it.
+    #[test]
+    fn the_findings_file_is_replaced_atomically_and_leaves_no_debris() {
+        let d = tempfile::tempdir().unwrap();
+        let path = findings_path(d.path(), "task-1", 1, "security");
+
+        let submit = |verdict: &str, summary: &str| {
+            handle(
+                &call(serde_json::json!({
+                    "angle": "security",
+                    "verdict": verdict,
+                    "findings": [{"file": "a.rs", "severity": "critical", "summary": summary}]
+                })),
+                d.path(),
+                "task-1",
+                1,
+                &angles(),
+            )
+            .unwrap()
+        };
+
+        assert!(!is_error(&submit("changes", "first")), "first submission");
+        assert_eq!(
+            parse_review(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .findings[0]
+                .summary,
+            "first"
+        );
+
+        // A re-submission replaces the file. `fs::write` would truncate it first,
+        // leaving a window where the destination is empty or partial.
+        assert!(!is_error(&submit("changes", "second")), "re-submission");
+        assert_eq!(
+            parse_review(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .findings[0]
+                .summary,
+            "second"
+        );
+
+        // The rename target is the only thing left in the directory: no `.tmp` sibling
+        // survives, which is what a reader scanning the run dir would otherwise trip on.
+        let left: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec![path.file_name().unwrap().to_string_lossy().into_owned()],
+            "the atomic write must leave no temp debris: {left:?}"
+        );
+    }
+
+    /// The temp file is a sibling in the SAME directory. A rename across filesystems is
+    /// not atomic (and fails outright), so this is load-bearing, not incidental.
+    #[test]
+    fn the_temp_file_is_a_sibling_of_its_destination() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("nested").join("out.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_atomically(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(siblings, vec!["out.json".to_string()], "{siblings:?}");
     }
 
     /// A line that does not parse must still get a response. Dropping it leaves the

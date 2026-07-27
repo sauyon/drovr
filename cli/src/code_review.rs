@@ -559,6 +559,26 @@ fn obtain_findings_json(
     Ok(json)
 }
 
+/// One angle's delivered verdict, if it has actually been delivered.
+///
+/// `Some` is the panel's definition of "this angle is finished", and it is deliberately
+/// the ONLY definition that can complete an angle. The pane is not a data channel and it
+/// is not a completion channel either: herdr reports `done` as a momentary EDGE at the
+/// end of a turn and then settles to `idle`, so a poll that misses that instant could
+/// never recover it — the angle waited on a signal that would never fire again while its
+/// finished review sat on disk. Observed live, 2026-07-27: three of four angles noticed,
+/// the fourth stuck `Running` across two whole passes.
+///
+/// `None` means "nothing delivered *yet*", and it covers a file that exists but does not
+/// parse as well as one that is absent. That is what stops a write in flight being read
+/// as a completion: an unparseable file is not evidence of anything, so the caller keeps
+/// waiting rather than banking a torn verdict. (The server writes atomically — see
+/// [`crate::mcp_findings`] — so this is the second guard, not the only one.)
+fn delivered_review(dir: &Path, task: &str, iter: u64, angle: &str) -> Option<Review> {
+    let json = std::fs::read_to_string(findings_path(dir, task, iter, angle)).ok()?;
+    parse_review(&json).ok()
+}
+
 /// Clear an angle's findings file when its reviewer is REPLACED.
 ///
 /// A replacement runs in the SAME iteration as the reviewer it replaces (that is what
@@ -687,9 +707,27 @@ pub fn code_review_run<H: Herdr>(
         resumable_iter(run, task, &cfg.angles)
     } {
         Some(prev) => {
-            let seeded = std::fs::read_to_string(iter_head_path(&dir, task, prev))
-                .ok()
-                .map(|s| s.trim().to_owned());
+            // NotFound is the only readable "cannot verify the scope" — an old panel
+            // that predates the head record, which legitimately starts fresh. Any other
+            // IO error is a real failure, and collapsing it into the same `None` made
+            // drovr announce "HEAD moved" and abandon a panel of four live reviewers for
+            // a reason that was never true. Say what actually happened instead.
+            let head_path = iter_head_path(&dir, task, prev);
+            let seeded = match std::fs::read_to_string(&head_path) {
+                Ok(s) => Some(s.trim().to_owned()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot read the head record for review iteration {prev} at \
+                             {} ({e}); refusing to guess whether its reviewers are still \
+                             reviewing the current diff",
+                            head_path.display()
+                        ),
+                    ));
+                }
+            };
             if seeded.as_deref() == Some(head.as_str()) {
                 Some(prev)
             } else {
@@ -731,18 +769,19 @@ pub fn code_review_run<H: Herdr>(
     for angle in &cfg.angles {
         let phase = format!("review:{task}:{iter}:{angle}");
         if resumed.is_some() {
-            let done = run
-                .find_phase(&phase)
-                .is_some_and(|p| p.status == PhaseStatus::Done);
-            // A `Done` reviewer's findings were harvested to disk when it finished.
-            // If that file is unreadable we do NOT trust the status — fall through and
-            // wait on the reviewer again, which self-heals rather than hard-failing.
-            if done
-                && let Some(review) =
-                    std::fs::read_to_string(findings_path(&dir, task, iter, angle))
-                        .ok()
-                        .and_then(|json| parse_review(&json).ok())
-            {
+            // A delivered verdict is banked on its own evidence — NOT gated on the
+            // recorded status. Requiring `Done` here was half of a livelock: an angle
+            // whose completion edge was missed stays `Running` forever, so this branch
+            // never fired and the wait loop below then waited on a pane signal that
+            // could never fire again. The file is the contract; if it parses, that
+            // angle is in. An unreadable one banks nothing and falls through to wait
+            // again, which self-heals rather than hard-failing.
+            if let Some(review) = delivered_review(&dir, task, iter, angle) {
+                // Make the record agree with what was delivered, so the phase does not
+                // read `Running` forever in `state.json` and the web UI.
+                if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
+                    run.review_phases[i].status = PhaseStatus::Done;
+                }
                 banked.push((angle.clone(), review));
                 continue;
             }
@@ -838,6 +877,22 @@ pub fn code_review_run<H: Herdr>(
     loop {
         let mut still_pending: Vec<(String, String)> = Vec::new();
         for (angle, phase) in std::mem::take(&mut pending) {
+            // DELIVERY FIRST, and on its own. A parseable findings file for this
+            // iteration is complete evidence that the angle is done — it is the one
+            // thing a reviewer is asked to produce, and drovr wrote it itself. Asking
+            // the pane first is what hung the panel: herdr's `done` is a momentary edge
+            // at the end of a turn, and a reviewer sitting at its prompt reports
+            // `idle`, so a missed edge stranded a finished review forever.
+            if let Some(review) = delivered_review(&dir, task, iter, &angle) {
+                if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
+                    run.review_phases[i].status = PhaseStatus::Done;
+                }
+                harvested.push((angle, review));
+                continue;
+            }
+            // Nothing delivered. NOW the pane matters — but only to answer a different
+            // question: has this reviewer finished WITHOUT delivering? That is the one
+            // thing the artifact cannot tell us, and the only reason to consult herdr.
             let finished = done_marker(&run.name, &phase).exists()
                 || run
                     .find_phase(&phase)
@@ -849,22 +904,14 @@ pub fn code_review_run<H: Herdr>(
                 still_pending.push((angle, phase));
                 continue;
             }
-            // Harvest BEFORE flipping the status. A reviewer marked `Done` whose
-            // findings were never captured would be treated as banked by every later
-            // resume, silently dropping its angle from the merged review.
-            //
-            // If the harvest fails, the reviewer has finished but produced nothing we
-            // can use, and re-reading that same finished pane will fail identically
-            // forever. Record `Failed` so the next resume replaces the reviewer, then
-            // surface the error — an unreadable angle must not pass for a clean one.
+            // It finished and delivered nothing usable, and re-reading the same file
+            // will fail identically forever. Record `Failed` so the next resume
+            // replaces the reviewer, then surface the error — an angle that delivered
+            // nothing must not pass for a clean one.
             let harvest = obtain_findings_json(&dir, task, iter, &angle, &phase)
                 .and_then(|json| parse_review(&json));
-            let status = match &harvest {
-                Ok(_) => PhaseStatus::Done,
-                Err(_) => PhaseStatus::Failed,
-            };
             if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
-                run.review_phases[i].status = status;
+                run.review_phases[i].status = PhaseStatus::Failed;
             }
             harvested.push((angle, harvest?));
         }
@@ -1167,15 +1214,19 @@ mod tests {
         );
 
         // Pass two resumes with no respawn, and this time the angles finish — so
-        // the run reaches the FINAL save rather than the deadline one. The archive
-        // lands on the poll loop's first `agent_status`, after every spawn save.
+        // the run reaches the FINAL save rather than the deadline one.
+        //
+        // The archive is hooked on `integration_present`, not the poll loop's
+        // `agent_status`: a resume whose angles have all DELIVERED banks them from
+        // their files and never polls a pane at all, so `agent_status` is no longer
+        // reachable here. `integration_present` still lands where this test needs it —
+        // after `code_review_run`'s archived entry guard has passed, and before every
+        // save the pass makes. The race being guarded is unchanged: the human clicks
+        // Archive while a pass holds state that still says `archived: false`.
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        for _ in 0..16 {
-            h.push_status(Some("done"));
-        }
-        h.archive_on_call("agent_status", "cr-archive-resumed-final");
+        h.archive_on_call("integration_present", "cr-archive-resumed-final");
 
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
@@ -1822,6 +1873,166 @@ mod tests {
         assert_eq!(parsed.findings[0].angle, "correctness");
     }
 
+    /// A head record that cannot be READ is not a head record that says "HEAD moved".
+    /// Reporting the two the same way abandons a panel of four live reviewers and tells
+    /// whoever is debugging a story that never happened.
+    #[test]
+    fn an_unreadable_iter_head_record_is_surfaced_not_reported_as_a_moved_head() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-head-unreadable");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let spawned = spawn_count(&h);
+
+        // A directory where the head record should be: reading it fails with something
+        // other than NotFound, exactly as a permissions or IO failure would.
+        let head = run_dir(&run.name).join("task-1-review-1.head");
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir(&head).unwrap();
+
+        let err = code_review_run(&h, &mut run, "task-1", 40, false)
+            .expect_err("an unreadable head record must not pass for a moved HEAD");
+        assert!(
+            err.to_string().contains("head record"),
+            "the error must name what it could not read: {err}"
+        );
+        assert!(
+            err.to_string().contains("task-1-review-1.head"),
+            "…and where: {err}"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            spawned,
+            "the live panel must not be abandoned for a fresh one on an IO error"
+        );
+    }
+
+    /// The findings file is the contract, so it alone must be able to finish an angle.
+    ///
+    /// Observed live (2026-07-27, `land-mcp-findings` panel): four cursor reviewers all
+    /// delivered, but only three were noticed. herdr reports `done` as a momentary EDGE
+    /// as a turn ends and then settles to `idle`; a poll that misses that edge could
+    /// never recover it, and the angle waited forever on a signal that would never come
+    /// again — with its valid verdict sitting on disk the whole time. The fake's default
+    /// status is `idle`, which is exactly that pane.
+    #[test]
+    fn a_delivered_findings_file_completes_an_angle_with_no_pane_signal_at_all() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-artifact-only");
+        write_base(&run, "task-1");
+        // Every reviewer delivered. Nobody dropped a done-marker (the seed forbids
+        // `drovr phase done`) and no pane will ever report `done`.
+        for a in load_config().unwrap().angles {
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean,
+            "a delivered review must complete its angle whatever the pane says"
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .all(|p| p.status == PhaseStatus::Done),
+            "{:?}",
+            run.review_phases
+        );
+    }
+
+    /// The same, one pass later: an angle recorded `Running` whose verdict is on disk
+    /// must be banked on resume, not waited on again. This is the state the live panel
+    /// was stuck in — `Running` forever, with a complete review beside it.
+    #[test]
+    fn a_resume_banks_a_delivered_angle_still_recorded_running() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-artifact-resume");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .all(|p| p.status == PhaseStatus::Running),
+            "the first pass must leave them all Running for this to mean anything"
+        );
+        let spawned = spawn_count(&h);
+
+        // The reviewers deliver after the pass gave up on them.
+        for a in load_config().unwrap().angles {
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean
+        );
+        assert_eq!(
+            spawn_count(&h),
+            spawned,
+            "a delivered angle must be banked, not respawned"
+        );
+        assert!(
+            run.review_phases
+                .iter()
+                .all(|p| p.status == PhaseStatus::Done),
+            "the recorded status must catch up with what was delivered: {:?}",
+            run.review_phases
+        );
+    }
+
+    /// Completion now rests on the file, so a file being WRITTEN must not read as one
+    /// that was delivered. An unparseable file is not evidence of anything: keep
+    /// waiting (the reviewer may still be mid-write, and a resume self-heals) rather
+    /// than either completing the angle or failing the pass outright.
+    #[test]
+    fn a_half_written_findings_file_is_not_mistaken_for_completion() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-half-written");
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+        // A verdict caught mid-write: valid JSON's opening, nothing more.
+        seed_angle_file(
+            &run,
+            "task-1",
+            1,
+            "error-handling",
+            r#"{"verdict":"clean","findi"#,
+        );
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout,
+            "a torn file must neither complete the angle nor fail the pass"
+        );
+        // …and the completed angle is not credited to the torn one either.
+        assert_eq!(
+            run.find_phase("review:task-1:1:error-handling")
+                .unwrap()
+                .status,
+            PhaseStatus::Running,
+            "the angle stays waitable, so a resume can pick up the finished write"
+        );
+
+        // Once the write lands whole, the resume completes it with no pane signal.
+        seed_angle_file(&run, "task-1", 1, "error-handling", CLEAN);
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean
+        );
+    }
+
     /// A new iteration reviews a NEW diff. It must be incapable of reading the
     /// previous iteration's verdicts: with transcript scraping gone, any file on disk
     /// counts as delivery, so a reviewer that finishes without calling the tool would
@@ -2408,22 +2619,18 @@ mod tests {
 
         let dead = pane_of(&run, "review:task-1:1:correctness");
         h.kill_pane(dead.clone());
-        // What the dead reviewer left behind: harvesting it would report a critical
-        // finding no live reviewer ever made.
-        seed_angle_file(
-            &run,
-            "task-1",
-            1,
-            "correctness",
-            r#"{"verdict":"changes","findings":[{"file":"stale.rs","severity":"critical","summary":"from the dead reviewer"}]}"#,
-        );
+        // What the dead reviewer left behind — a torn write, so it is NOT a delivery
+        // and the angle is genuinely due for replacement. Harvesting this would be
+        // crediting the replacement with a file it never wrote.
+        let leftover = findings_path(&run_dir(&run.name), "task-1", 1, "correctness");
+        std::fs::write(&leftover, r#"{"verdict":"changes","findings":[{"fi"#).unwrap();
         drop_markers(&run, "task-1", 1);
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
 
-        // correctness is respawned, so its stale file is cleared and the replacement
-        // has written nothing — the pass must fail rather than reuse the leftover.
+        // correctness is respawned, so its leftover is cleared and the replacement
+        // has written nothing — the pass must fail rather than reuse it.
         let err = code_review_run(&h, &mut run, "task-1", 40, false)
             .expect_err("a respawned angle with no file of its own must not succeed");
         assert!(err.to_string().contains("correctness"), "{err}");
@@ -2432,13 +2639,45 @@ mod tests {
             dead,
             "the angle should have been respawned into a new pane"
         );
-        let merged = run_dir(&run.name).join("task-1-review.json");
         assert!(
-            !merged.exists()
-                || !std::fs::read_to_string(&merged)
-                    .unwrap()
-                    .contains("from the dead reviewer"),
-            "the dead reviewer's findings must never reach the merged review"
+            !leftover.exists(),
+            "the respawn must clear the outgoing reviewer's file, or the replacement \
+             inherits it: {}",
+            leftover.display()
+        );
+    }
+
+    /// The counterpart, and the reason the test above uses a TORN leftover: a file that
+    /// parses was written through `submit_findings` for this iteration's diff, so it is
+    /// that reviewer's verdict — and it counts even though the pane is now gone. The
+    /// pane's fate is not evidence about a review that was already delivered.
+    #[test]
+    fn a_delivered_verdict_still_counts_after_its_reviewer_s_pane_dies() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-delivered-then-died");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let spawned = spawn_count(&h);
+
+        // Every angle delivered; then one reviewer's pane went away entirely.
+        for a in load_config().unwrap().angles {
+            seed_angle_file(&run, "task-1", 1, &a, CLEAN);
+        }
+        h.kill_pane(pane_of(&run, "review:task-1:1:correctness"));
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean,
+            "a delivered verdict is not invalidated by its pane closing"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            spawned,
+            "an angle that already delivered must not be respawned"
         );
     }
 
