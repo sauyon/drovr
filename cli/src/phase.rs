@@ -801,8 +801,37 @@ pub fn phase_rehydrate<H: Herdr>(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "phase '{phase}' of run '{run_name}' has never run, so there is nothing to \
-                 bring back. Start it: drovr phase start {quoted_run} {quoted_phase}",
+                "phase '{run_name}/{phase}' has never run, so there is nothing to bring \
+                 back. Start it: drovr phase start {quoted_run} {quoted_phase}",
+                run_name = run.name,
+                quoted_run = shell_single_quote(&run.name),
+                quoted_phase = shell_single_quote(phase),
+            ),
+        ));
+    }
+    // `has_run` is not enough on its own, because `phase_start` persists
+    // `Running` and the new pass BEFORE it launches (deliberately — a launch
+    // that fails must stay fail-closed). A launch that then fails leaves
+    // exactly this: `Running`, no pane, and NO agent record, because
+    // `record_launch` only happens once the launch succeeds. Such a phase never
+    // had an agent in it at all.
+    //
+    // Relaunching it would be `phase_start` wearing a name that promises
+    // recovery — and it would quietly drop the seed the original call was given
+    // (`handoff_doc` is recorded after the launch too), which only `phase start`
+    // can carry. Refuse, and name the command that can.
+    //
+    // `is_reaped()` wins over this: a phase reaped by a build older than the
+    // agent record demonstrably ran, and reaping only ever touches a phase that
+    // held a pane.
+    if !existing.is_reaped() && existing.pane_agent().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "phase '{run_name}/{phase}' has no agent on record — its last \
+                 `phase start` never got an agent running, so there is no session, no \
+                 backend and no seed to restore. Start it again (with its seed, which a \
+                 rehydrate cannot recover): drovr phase start {quoted_run} {quoted_phase}",
                 run_name = run.name,
                 quoted_run = shell_single_quote(&run.name),
                 quoted_phase = shell_single_quote(phase),
@@ -6859,6 +6888,45 @@ mod rehydrate_tests {
         // …and the same phase becomes rehydratable the moment it has run.
         run.phases[0].status = PhaseStatus::Running;
         run.phases[0].record_launch("claude", None);
+        assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
+    }
+
+    #[test]
+    fn rehydrate_refuses_a_phase_whose_launch_never_completed() {
+        // `phase_start` persists `Running` + the new pass BEFORE it launches, so
+        // a launch that fails leaves a phase that LOOKS started — `has_run()` is
+        // true — but never had an agent in it: no record, and no `handoff_doc`,
+        // because both are written only after the launch succeeds. Relaunching
+        // it here would be `phase start` under a name that promises recovery,
+        // and would silently drop the seed the original call was given.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-failed-start");
+        let mut p = Phase::new("plan");
+        p.status = PhaseStatus::Running; // what phase_start persisted…
+        run.phases.push(p); // …and then the launch failed.
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        assert!(run.find_phase("plan").unwrap().has_run(), "the trap: it looks started");
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("a phase with no agent on record is not rehydratable");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("drovr phase start 'rh-failed-start' 'plan'"),
+            "must name the command that CAN carry the seed: {err}"
+        );
+        assert!(
+            err.to_string().contains("seed"),
+            "must say the seed is what a rehydrate cannot recover: {err}"
+        );
+        assert!(h.calls().is_empty(), "nothing launched: {:?}", h.calls());
+
+        // A phase REAPED by a build older than the agent record still qualifies:
+        // reaping only ever touches a phase that held a pane, so it demonstrably
+        // ran, and refusing it would strand exactly the case rehydrate exists for.
+        run.phases[0].set_pane("legacy-pane");
+        run.phases[0].mark_reaped();
+        run.phases[0].clear_pane_agent_for_test();
         assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
     }
 

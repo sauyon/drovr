@@ -2125,6 +2125,12 @@ async function pollAgents(gen) {
               .then(function(d) { return { ok: r.ok, status: r.status, body: d }; });
           })
           .then(function(res) {
+            // A reseed waits for the fresh agent to attach, which can take ~30s
+            // — long enough for the user to navigate to another run first. The
+            // note element is page-global, so writing to it now would file this
+            // run's outcome under whatever run is on screen. Same `routeGen`
+            // guard every poller in this file uses.
+            if (gen !== routeGen) return;
             if (!res.ok) {
               b.disabled = false;
               agentsNote(res.body.error || ('Rehydrate failed (' + res.status + ')'), true);
@@ -2140,6 +2146,7 @@ async function pollAgents(gen) {
             pollAgents(gen);
           })
           .catch(function() {
+            if (gen !== routeGen) return;
             b.disabled = false;
             agentsNote('Rehydrate request failed — is `drovr serve` still up?', true);
           });

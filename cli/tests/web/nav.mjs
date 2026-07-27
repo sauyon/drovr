@@ -513,6 +513,7 @@ check('a failed rehydrate re-enables its button', await evaluate(`
   var b = document.querySelector('#agents-tree .agent-rehydrate');
   return b ? b.disabled : null;`), false);
 
+
 // A pane that leaves the tree must not stay selected: `?pane=<gone>` answers
 // 204 on the mirror and 409 on send, which reads as a wedged UI rather than as
 // a stale selection — and a reaped node is exactly how a pane leaves.
@@ -524,6 +525,28 @@ await waitFor(() => evaluate(`return selectedPane;`), v => v === null, 8000,
   'the stale pane to be dropped');
 check('the mirror falls back to the run default once it is dropped',
   await evaluate(`return document.getElementById('session-target').textContent;`), 'active');
+
+// A reseed waits for the fresh agent to attach — up to 30s — so the response can
+// easily land after the user has moved on. `#agents-note` is page-global, so an
+// unguarded write files run A's outcome under run B. Hold the response open,
+// navigate, THEN settle it: without the guard the note lands on the wrong run.
+// `location.hash` (not Page.navigate) so the in-flight promise survives.
+check('a rehydrate response can be held open across a navigation', await evaluate(`
+  window.__settle = null;
+  var real = window.fetch;
+  window.fetch = function() { return new Promise(function(res){ window.__settle = res; }); };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  location.hash = '#/runs/beta-cache';
+  return typeof window.__settle === 'function';`), true);
+await waitFor(hash, h => h === '#/runs/beta-cache', 8000, 'the other run');
+await evaluate(`
+  window.__settle({ ok: true, status: 200,
+                    json: function(){ return Promise.resolve({ detail: 'LEAKED FROM delta-idle' }); } });
+  return 1;`);
+await sleep(400);
+check('a response arriving after navigation is dropped, not filed under the new run',
+  await evaluate(`return document.getElementById('agents-note').textContent;`), '');
 
 console.log('\n== leaving a run ==');
 await goto('#/runs/alpha-deploy', QUESTIONS_READY);
