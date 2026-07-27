@@ -698,12 +698,10 @@ mod tests {
     }
 
     fn running(name: &str) -> Phase {
-        Phase {
-            name: name.into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("w:p1".into()),
-            ..Default::default()
-        }
+        let mut p = Phase::new(name);
+        p.status = PhaseStatus::Running;
+        p.set_pane("w:p1");
+        p
     }
 
     #[test]
@@ -842,7 +840,7 @@ mod tests {
             review_phases: vec![{
                 let mut p = Phase::new("review:task-1:1:correctness");
                 p.status = PhaseStatus::Running;
-                p.pane_id = Some("p1".into());
+                p.set_pane("p1");
                 p
             }],
             gate: "spec".into(),
