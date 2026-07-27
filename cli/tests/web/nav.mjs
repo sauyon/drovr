@@ -862,6 +862,69 @@ check('...so the cursor advances to a neighbour instead of stranding',
   (await cursorName()) !== goneTarget, true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
+// (3) The render that decides must be the one that can answer. toggleArchive
+// used to decide right after awaiting its OWN render — but that render bails
+// without painting whenever a newer one has been dispatched (the 2s poll), while
+// its promise still resolves. The check then ran against pre-archive DOM, saw the
+// row still present, skipped the hand-off, and the later render parked the cursor
+// forever. Reproduced here by controlling resolution order explicitly.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const raceTarget = await cursorName();
+await evaluate(`
+  window.__rArchived = false;
+  window.__rName = ${JSON.stringify(raceTarget)};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__rArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === window.__rName && window.__rArchived
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      // Park every list fetch until the test releases it, in order.
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('a');
+// toggleArchive's own render is now in flight and held.
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'toggleArchive to dispatch its own render');
+// A second render — the 2s poll, in real use — is dispatched AFTER it, so it wins
+// the staleness guard and toggleArchive's render will bail without painting.
+await evaluate(`renderRunList(routeGen); return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the newer render to be dispatched');
+// Resolve the older one first: it bails, DOM still shows the pre-archive list.
+await evaluate(`window.__held[0](); return 1;`);
+// Then the newer one paints the truth.
+await evaluate(`window.__held[1](); return 1;`);
+await waitFor(cursorName, n => n !== null && n !== raceTarget, 6000,
+  'the cursor to advance despite the losing render');
+check('a render losing the staleness race cannot strand the cursor',
+  (await cursorName()) !== raceTarget, true);
+check('...and the cursor is on a real, visible row',
+  (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);
 await press('/');

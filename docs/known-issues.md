@@ -813,6 +813,23 @@ zombie, since zombie requires `archived == true`.
 Worth noting because the liveness/zombie machinery this branch added exists to surface exactly
 this class of mismatch, and this is the one shape it does not reach.
 
+## The `afterSeq` guard on the archive hand-off is defence in depth, not load-bearing
+
+Found 2026-07-26. Deliberate; recorded so the missing coverage is not read as an oversight.
+
+`renderRunList` resolves a pending archive hand-off only when `seq > pendingAdvance.afterSeq`,
+so that a render whose list was fetched *before* the archive committed cannot answer "did the
+row leave". Removing that condition does not fail any test, and cannot be made to: `seq` is
+bumped at render dispatch, and `toggleArchive` dispatches a render immediately after setting
+`pendingAdvance`. Every older in-flight render is therefore already stale and bails at the
+staleness guard without reaching the resolution point.
+
+It is kept because the redundancy depends on `toggleArchive` continuing to render right after
+setting the flag. If that call is ever moved or removed, the guard is the only thing stopping a
+pre-archive render from answering with stale rows — which strands the cursor exactly as the
+one-shot version did. Do not "simplify" it away, and do not add a test that pretends to cover
+it without first building a seam that can dispatch a paint from an older render.
+
 ## Three of the six `save_preserving_archived` sites are redundant, and untestable
 
 Found 2026-07-26. Working as intended; recorded so nobody "fixes" the missing coverage.

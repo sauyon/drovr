@@ -1994,7 +1994,7 @@ function runRow(run) {
     ? 'Move it back to the active list. Does NOT bring the agent back: the workspace is closed and drovr phase start cannot recreate it.'
     : (maybeLive
         ? (run.live === null
-            ? 'Archive — could not reach herdr to check for live panes; will confirm first'
+            ? 'Archive — live panes could not be checked; will confirm first'
             : 'Archive — this run still has live panes; will confirm first')
         : 'Archive — files the run away; no live panes to close');
   var btn = '<button class="run-archive' + (!run.archived && maybeLive ? ' is-live' : '') +
@@ -2025,7 +2025,8 @@ async function toggleArchive(name, archived, live) {
   var gen = routeGen;
   if (!archived && live !== '0') {
     var why = live === 'unknown'
-      ? 'Could not reach herdr to check whether "' + name + '" has live panes.'
+      ? 'Could not check whether "' + name + '" has live panes &mdash; herdr may be ' +
+        'unreachable, or this session\'s own state may be unreadable.'
       : 'Session "' + name + '" still has live panes.';
     if (!window.confirm(why + '\n\nArchiving closes its herdr workspace. The run itself ' +
         'resumes with `drovr phase start`, but the running agent\'s context is lost — ' +
@@ -2070,20 +2071,21 @@ async function toggleArchive(name, archived, live) {
   // deliberately, rather than letting a stale numeric index drift onto whatever
   // slides into the slot — that drift was the bug, and it merely happened to
   // look right in this one case.
-  await renderRunList(gen);
-  if (gen !== routeGen) return;
-  // Decide from what ACTUALLY happened, not from a prediction. Whether the row
-  // survives is settled by the server's next /api/runs, on liveness fresher than
-  // the `live` this function was handed — a zombie (close failed, panes alive)
-  // stays in the active list on purpose and must keep the cursor, while a row
-  // that really left must hand it on. Gating on the alert's condition instead got
-  // both directions wrong: a stale cached `live` of '0' silently advanced off a
-  // surviving zombie, and the common "workspace was already gone" case stranded
-  // the cursor on a row that had left.
-  if (!archived && navCursorKey === name && !isRowVisible(name)) {
-    navCursorKey = neighbour;
-    applyNavCursor(false);
+  // Hand the decision to the next render that can actually answer it, rather
+  // than deciding here. Deciding after `await renderRunList(gen)` looked right
+  // but was a race: that render bails without painting when a newer one has been
+  // dispatched (the 2s poll), yet its promise still resolves — so the check ran
+  // against pre-archive DOM, saw the row still there, and skipped the handoff.
+  // The later render then parked the cursor, and nothing re-fired the one-shot
+  // decision, stranding it with no row highlighted.
+  //
+  // `afterSeq` is what makes this correct rather than merely repeated: only a
+  // render dispatched after the POST resolved can have fetched a list reflecting
+  // the archive, so earlier ones must not be allowed to answer.
+  if (!archived) {
+    pendingAdvance = { name: name, neighbour: neighbour, gen: gen, afterSeq: listFetchSeq };
   }
+  renderRunList(gen);
 }
 
 // The row adjacent to `run` in the visible list, or '' if there is none. Called
@@ -2217,6 +2219,21 @@ async function renderRunList(gen, resetAnchor) {
         try { localStorage.setItem('drovr.completedOpen', group.open ? '1' : '0'); } catch (e) {}
         applyNavCursor(false);
       });
+    }
+    // Resolve a pending archive hand-off, now that rows reflect a list fetched
+    // after the archive committed. Whichever render gets here first answers it —
+    // this one, the 2s poll, or a filter change — so no ordering can lose it.
+    if (pendingAdvance && seq > pendingAdvance.afterSeq) {
+      if (pendingAdvance.gen === routeGen && navCursorKey === pendingAdvance.name
+          && !isRowVisible(pendingAdvance.name)) {
+        // It really left: hand the cursor to the neighbour captured while the row
+        // was still on screen. Left to `applyNavCursor`, a run that is archived
+        // but still listed reads as merely hidden, and the cursor parks on a row
+        // that is never coming back.
+        navCursorKey = pendingAdvance.neighbour;
+      }
+      // Survived as a zombie, or the reviewer moved on: either way, answered.
+      pendingAdvance = null;
     }
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
@@ -2432,6 +2449,9 @@ var navCursorKey = '';
 // Every run name the last list fetch returned, before filtering. This is what
 // separates "the anchored row is hidden" from "the anchored run is gone" — see
 // applyNavCursor, which needs the reason, not the duration.
+// A row the reviewer archived, waiting on a render fresh enough to say whether it
+// actually left the list. `{name, neighbour, gen, afterSeq}` — see toggleArchive.
+var pendingAdvance = null;
 var knownRunNames = [];
 // Monotonic id for list fetches, so a slow response cannot overwrite a newer one.
 var listFetchSeq = 0;
