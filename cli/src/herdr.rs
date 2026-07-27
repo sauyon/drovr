@@ -586,8 +586,9 @@ impl Herdr for SystemHerdr {
                 "workspace.create: could not find workspace_id in result: {result}"
             ))
         })?;
-        // The result's `root_pane.pane_id` is the auto-created shell pane the
-        // first phase will reuse (found by walking the result for `pane_id`).
+        // The result's `root_pane.pane_id` is the auto-created shell pane that
+        // anchors the workspace and stays idle (found by walking the result for
+        // `pane_id`). No phase runs in it — see [`Workspace`].
         let root_pane = find_string_field(&result, "pane_id").ok_or_else(|| {
             io::Error::other(format!(
                 "workspace.create: could not find root_pane pane_id in result: {result}"
@@ -2418,8 +2419,9 @@ mod tests {
         assert!(!calls[0].contains("text="), "call: {}", calls[0]);
     }
 
-    // workspace_create returns both the workspace id and its root shell pane id;
-    // the first phase reuses the root pane rather than splitting a new one.
+    // workspace_create returns both the workspace id and its root shell pane id.
+    // The root pane is the workspace's anchor: no phase ever runs in it, and
+    // `drovr new` records the id so cleanup can reclaim it.
     #[test]
     fn fake_workspace_create_returns_id_and_root_pane() {
         let h = FakeHerdr::new();

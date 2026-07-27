@@ -311,11 +311,19 @@ fn cmd_list() {
 /// prompt with nothing to explain it. Labelling it says what it is and which run
 /// it anchors. Best-effort: a failed rename is cosmetic and must not cost the
 /// run its workspace.
+///
+/// The rename is wrapped in the `focused_workspace`/`workspace_focus`
+/// capture-and-restore that `launch_in_pane` uses, for the same reason:
+/// `pane_rename` has no `--no-focus` flag and yanks the user's focus onto the
+/// pane it renames. `workspace_create` is deliberately called with
+/// `focus: false` so `drovr new` never disturbs whatever the user is doing —
+/// renaming without the guard would undo that one call later.
 fn create_run_workspace<H: Herdr>(
     herdr: &H,
     name: &str,
     project_dir: &str,
 ) -> (Option<String>, Option<String>) {
+    let prev_focus = herdr.focused_workspace();
     let ws = match herdr.workspace_create(&format!("drovr:{name}"), project_dir) {
         Ok(ws) => ws,
         Err(e) => {
@@ -325,6 +333,9 @@ fn create_run_workspace<H: Herdr>(
     };
     if let Err(e) = herdr.pane_rename(&ws.root_pane, &format!("drovr:{name} (idle shell)")) {
         eprintln!("drovr: warning: could not label the run's root shell pane: {e}");
+    }
+    if let Some(prev) = prev_focus {
+        let _ = herdr.workspace_focus(&prev);
     }
     (Some(ws.id), Some(ws.root_pane))
 }
@@ -481,6 +492,14 @@ enum AttachTarget<'a> {
 /// *can* be closed without taking the workspace with it. Exiting 1 on the
 /// human's "show me this run" once the panes are gone is a worse answer than the
 /// shell that anchors it.
+///
+/// **Deliberately NOT shared with `review::active_pane`**, which walks the same
+/// list for the review UI's mirror target. They agree today (no pipeline phase
+/// is ever `Failed`, so the sole `Running` phase always sits at
+/// `first_incomplete`) but they answer different questions and diverge at rung
+/// 3: a mirror must report "no live pane" honestly rather than show an idle
+/// shell, while an attach may hand the human that shell as long as it says so.
+/// Folding them together would mean one of the two lying.
 fn attach_target(run: &RunState) -> Option<AttachTarget<'_>> {
     let phase_pane = run
         .first_incomplete()
@@ -1641,6 +1660,17 @@ mod tests {
         // Nothing at all (a run whose workspace creation failed) → None.
         let run = attach_run(vec![("brainstorm", Done, None)], None);
         assert!(attach_target(&run).is_none());
+
+        // No phases at all — the shape a caller that recovered from an
+        // unreadable `state.json` holds, where `first_incomplete()` is vacuously
+        // `None`. The root shell rung must still answer, and must not panic.
+        let run = attach_run(vec![], Some("w:root"));
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+        let run = attach_run(vec![], None);
+        assert!(attach_target(&run).is_none());
     }
 
     /// `drovr new` labels the workspace's root shell so the idle tab explains
@@ -1654,9 +1684,9 @@ mod tests {
         let (ws, root) = create_run_workspace(&h, "alpha", "/tmp/p");
         let root = root.expect("workspace_create yields a root pane");
         assert!(ws.is_some());
-        let rename = h
-            .calls()
-            .into_iter()
+        let calls = h.calls();
+        let rename = calls
+            .iter()
             .find(|c| c.contains("pane_rename"))
             .expect("the root shell must be renamed");
         assert!(
@@ -1666,6 +1696,25 @@ mod tests {
         assert!(
             rename.contains("alpha") && rename.to_lowercase().contains("idle"),
             "the label must name the run and say the shell is idle: {rename}"
+        );
+
+        // `pane_rename` has no `--no-focus` flag, and `workspace_create` is
+        // called with `focus: false` precisely so `drovr new` never disturbs the
+        // user. Renaming without capture/restore would undo that one call later,
+        // yanking the user onto a brand-new idle workspace.
+        let idx = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle}: {calls:?}"))
+        };
+        assert!(
+            idx("focused_workspace") < idx("pane_rename"),
+            "focus must be captured before the rename: {calls:?}"
+        );
+        assert!(
+            idx("pane_rename") < idx("workspace_focus id=ws-focused"),
+            "focus must be restored after the rename: {calls:?}"
         );
 
         let h = FakeHerdr::new();

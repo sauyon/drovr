@@ -84,9 +84,9 @@ impl std::fmt::Display for PassToken {
 /// The cost of that convenience, for whoever adds the next field:
 /// * The compiler no longer flags construction sites that ought to populate it.
 ///   Grep the `..Default::default()` sites and decide each one deliberately.
-/// * The first five fields (`name` … `herdr_session`) are NOT
-///   `#[serde(default)]`, so deserialization requires them; every field added
-///   since (`pass`, `tab_id`, `pane_agent`, `reaped`) carries its own
+/// * The first five fields (`name`, `status`, `handoff_doc`, `herdr_session`,
+///   `pane_id`) are NOT `#[serde(default)]`, so deserialization requires them;
+///   every field added since (`pass`, `tab_id`, `pane_agent`, `reaped`) carries its own
 ///   `#[serde(default, skip_serializing_if = …)]`. There is no struct-level
 ///   default: a new field without that attribute makes every existing
 ///   `state.json` fail to load → `load_run` exits 1 → the run STOPs. Mirror what
@@ -481,11 +481,22 @@ pub struct RunState {
     /// The herdr workspace id created for this run (set by `drovr new`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    /// The workspace's auto-created root shell pane id (set by `drovr new`). The
-    /// first phase runs `claude` *inside* this pane instead of splitting a new
-    /// pane beside it, so no empty shell is left dangling. `phase_start` takes it
-    /// (leaving `None`) so later phases each get their own tab. `None` for pre-fix
-    /// runs → the first phase falls back to a fresh tab.
+    /// The workspace's auto-created root shell pane id (set by `drovr new`,
+    /// which also labels it).
+    ///
+    /// **No agent ever runs here.** Every phase and every reviewer gets its own
+    /// tab, so this stays an idle shell that anchors the workspace for the run's
+    /// lifetime — which is what makes a phase's tab closeable without taking the
+    /// workspace, and every other phase, with it. Once set it is never cleared;
+    /// `drovr cleanup` reclaims it like any other pane drovr opened
+    /// (`drovr_pane_ids` lists it first).
+    ///
+    /// `None` for a run whose workspace creation failed at `drovr new`, and for
+    /// runs created before this field existed. A `state.json` written by an
+    /// older build may instead have `None` here with the *first phase* carrying
+    /// the root pane id, because that build let the first phase claim it; such a
+    /// run keeps working — the id is simply an ordinary phase pane to every
+    /// caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_pane: Option<String>,
     /// The project directory phases should run in (trusted by claude).

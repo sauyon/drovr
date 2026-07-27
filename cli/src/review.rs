@@ -2021,6 +2021,50 @@ mod tests {
         }
     }
 
+    /// End-to-end proof that `/send` and `/keys` really use the WRITABLE
+    /// allow-list, not just that the pure resolver can tell the two apart.
+    ///
+    /// A wrong `Access` at either call site is invisible to the unit tests: the
+    /// handler would resolve the root pane, hand it to `SystemHerdr`, and fail
+    /// there instead — so this asserts 409 (gated before herdr) rather than the
+    /// 500 an ungated request would produce with no herdr running.
+    ///
+    /// The read side cannot be asserted the same way: `GET /pane` answers 204
+    /// both when the pane is gated and when herdr cannot be reached, so the
+    /// readable set is pinned by `the_root_shell_is_readable_but_never_writable`.
+    #[test]
+    fn the_root_shell_is_refused_by_the_write_endpoints_over_http() {
+        let tmp = make_root("root-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        // A run with an idle root shell and no phase panes at all — exactly the
+        // shape `drovr new` now leaves behind before the first `phase start`.
+        fs::write(
+            dir.join("state.json"),
+            r#"{"name":"r","task":"t","phases":[],"gate":"spec","cursor":0,
+                "project_dir":"","workspace":"w","root_pane":"w:root"}"#,
+        )
+        .unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (s, _) = http_post(
+            &addr,
+            "/api/runs/r/send?pane=w%3Aroot",
+            "text/plain",
+            "ls -la",
+        );
+        assert_eq!(s, 409, "/send must refuse the idle root shell");
+
+        let (s, _) = http_post(
+            &addr,
+            "/api/runs/r/keys?pane=w%3Aroot",
+            "application/json",
+            r#"{"keys":["enter"]}"#,
+        );
+        assert_eq!(s, 409, "/keys must refuse the idle root shell");
+    }
+
     #[test]
     fn post_keys_honors_pane_gating() {
         // `?pane=` outside the run must never reach herdr: same allow-list as

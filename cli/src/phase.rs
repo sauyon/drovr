@@ -535,8 +535,8 @@ pub fn spawn_reviewer<H: Herdr>(
         ));
     }
 
-    // Reviewers can't reuse the pipeline root pane; they need their own tab, which
-    // requires a workspace.
+    // Reviewers, like every pipeline phase, need their own tab — which requires
+    // a workspace. The root pane is not a fallback for anyone.
     let ws = run.workspace.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2140,8 +2140,9 @@ mod tests {
             review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,
-            // `drovr new` always creates a workspace + root shell pane; the first
-            // phase reuses the root pane, later phases each get their own tab.
+            // `drovr new` always creates a workspace + root shell pane. Every
+            // phase gets its own tab; the root pane stays idle, and is here so
+            // tests can prove nothing reaches for it.
             workspace: Some("ws-mk".into()),
             root_pane: Some("root-mk".into()),
             project_dir: "/tmp/drovr-proj-test".into(),
@@ -4032,17 +4033,21 @@ mod tests {
         let mut run = make_run("proj-cwd-test");
         run.project_dir = "/home/user/my-project".into();
 
-        // First phase reuses the root pane (whose cwd was set at workspace
-        // create); a later phase's tab must carry project_dir as its cwd.
+        // EVERY phase's tab must carry project_dir as its cwd — the first one
+        // included, now that it no longer inherits the root pane's cwd (which
+        // was set at workspace create).
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         phase_start(&h, &mut run, "plan", None).unwrap();
 
         let calls = h.calls();
-        let tab_call = calls.iter().find(|c| c.contains("tab_create")).unwrap();
-        assert!(
-            tab_call.contains("cwd=/home/user/my-project"),
-            "tab_create must use project_dir as cwd, got: {tab_call}"
-        );
+        let tabs: Vec<&String> = calls.iter().filter(|c| c.contains("tab_create")).collect();
+        assert_eq!(tabs.len(), 2, "one tab per phase: {calls:?}");
+        for tab_call in tabs {
+            assert!(
+                tab_call.contains("cwd=/home/user/my-project"),
+                "tab_create must use project_dir as cwd, got: {tab_call}"
+            );
+        }
     }
 
     // -- A1: phase_start tags the launch with DROVR_PHASE=<run>/<phase> --------
@@ -4296,7 +4301,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("rev-tab-test", "ws-rt");
-        // root_pane is Some — a pipeline phase would reuse it, but a reviewer must NOT.
+        // root_pane is Some. Nothing may run there — not a pipeline phase
+        // (see `first_phase_creates_its_own_tab_…`) and not a reviewer.
         assert!(run.root_pane.is_some());
 
         spawn_reviewer(
@@ -4317,11 +4323,11 @@ mod tests {
             tab_call.contains("workspace=ws-rt"),
             "tab in the run workspace: {tab_call}"
         );
-        // Root pane untouched — still available for the pipeline.
+        // Root pane untouched — it anchors the workspace for the whole run.
         assert_eq!(
             run.root_pane.as_deref(),
             Some("ws-rt:root"),
-            "reviewer must not consume the pipeline root pane"
+            "reviewer must not consume the workspace root pane"
         );
         let reviewer_pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
         assert_ne!(
