@@ -1361,6 +1361,72 @@ to each other — to surface it. Both paths now share `close_run_panes`.
 failed, or it was withheld because the human's panes are in there. Both warrant the warning —
 in either case something may still be live under an archived run.
 
+## The review gate writes nothing when the run directory is gone — and still reports approved
+
+**Severity:** high. A driver trusting `review wait`'s `Approved` advances past a gate that
+produced no artifacts, which is the failure the "piping a `wait`" entry describes, reached by a
+different route.
+**Found:** 2026-07-27, reviewing the archive-button merge. **Pre-existing** — not from that
+branch, which never touched these handlers. Not fixed.
+
+`handle_post_summary` and `handle_post_submit` (`cli/src/review.rs`) build a `RunPaths` from the
+run name and go straight to writing. Neither checks the run directory exists, unlike
+`handle_archive`, which does. Every write is `let _ = fs::write(...)`, so failures are silent,
+and the `ReviewState` lives in `Ctx::cells` — an in-memory map populated independently of the
+filesystem.
+
+Reproduced live: create run `foo`, `POST /summary` (state `ready`), delete the run directory —
+a concurrent `cleanup --purge`, or a name that was never `drovr new`'d. The reviewer's open page
+and any `drovr review wait foo` still see a coherent run: `GET /doc` 200s, `GET /state` says
+`ready`. Approving returns `200 {"ok":true,"state":"approved"}` and `/state` then says
+`approved` — while `feedback.json`, the approved marker and `review.state.json` were never
+written. `review_summary()` does not check either, so a mistyped run name reaches this from
+ordinary CLI use.
+
+Fix shape: both handlers should refuse a run whose directory does not exist, the way
+`handle_archive` does; and the writes should report their errors rather than discarding them.
+
+## The review-state cache is never evicted, so a reused run name inherits the old verdict
+
+**Severity:** high — it can permanently wedge a new run's gate, with no fix but restarting the
+global server, which drops every other run's cache too.
+**Found:** 2026-07-27, same review. **Pre-existing.** Not fixed.
+
+`Ctx::cell` (`cli/src/review.rs`) is `map.entry(name).or_insert_with(|| ReviewState::load(...))`
+— keyed on the run's NAME, loaded from disk once, never refreshed or evicted for the life of the
+always-on server.
+
+Reproduced live: drive run `bar` to `approved`; `cleanup --purge` it; create a brand-new,
+unrelated run also called `bar`. Its `drovr review summary bar "..."` answers
+`409 {"ok":false,"state":"approved"}` — "the review gate is closed" — for a run that has never
+been reviewed. Short, memorable, reused run names are exactly this repo's habit, and the server
+is designed to stay up for days.
+
+Worse in combination with the entry above: because the endpoints require no run to exist,
+anything that can reach the port can pre-poison the cache for a run name not yet created
+(`task-1`, `fix-login`) with a `cancel` submit, closing that gate before it opens.
+
+Fix shape: key the cache on something that changes when a run is recreated (the run dir's inode
+or creation time), or evict on `cleanup`.
+
+## `drovr new` on an existing run name orphans the old workspace
+
+**Severity:** medium — a herdr workspace no drovr command can ever close.
+**Found:** 2026-07-27, same review, by inspection (not executed, to avoid stray workspaces).
+**Pre-existing.** Not fixed.
+
+`cmd_new` (`cli/src/main.rs`) never checks whether the run dir or its `state.json` already
+exists. It creates a second herdr workspace — `workspace_create` has no uniqueness constraint on
+the label — and overwrites `state.json`, replacing `workspace`/`root_pane`/`phases`. The first
+workspace's id survives nowhere: not in the new state, not in `retired_panes`. `drovr_pane_ids`
+cannot see it, so `cleanup`, `close_run_panes` and the Archive button can never close it. It is
+discoverable only through raw `herdr workspace list`.
+
+Reachable by operator error, or a driver retrying `new` after believing the first attempt
+failed — plausible given how many drivers run concurrently here.
+
+Fix shape: refuse when the run already exists, with a flag to adopt or replace deliberately.
+
 ## `GET /api/runs` now spawns a herdr subprocess on every poll
 
 Found 2026-07-26. Accepted, not fixed.
