@@ -846,6 +846,36 @@ CI workflow at all, so nothing enforces it today.)
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
 
+### A second, distinct flake: `lock_records_our_pid_and_releases_on_drop` (2026-07-26)
+
+`review::tests::lock_records_our_pid_and_releases_on_drop` (`cli/src/review.rs:2311`) fails
+intermittently at `cli/src/review.rs:2326` with `released lock must be free` — `try_take_lock`
+returns `Ok(None)` (WouldBlock) for a lock the test just dropped.
+
+**It is NOT the env-pollution cause above**, despite also being parallelism-only. The test
+locks `tmp.path().join("server.pid")` under a `tempfile` root and never reads `XDG_DATA_HOME`,
+so no other test can name that path — its own doc comment (`cli/src/review.rs:2306-2309`)
+already claims immunity to the env flake, and that claim holds. Something else releases late.
+
+Measured 2026-07-26 on `52db1cd`:
+
+| how it was run | result |
+|---|---|
+| the `lock_*` tests alone, 25 consecutive runs | 25/25 green |
+| the whole `--bin drovr` suite, 12 consecutive runs | **1/12 red** |
+| nix sandbox build of `52db1cd` (`home-manager switch`) | red once, green on immediate retry |
+
+**Hypothesis, not yet confirmed:** an fd inheritance window. `flock(2)` locks belong to the
+open file description, which survives `fork`, so a concurrently-spawning test (several here
+start real servers) transiently holds an inherited copy of this fd between its `fork` and its
+`exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops it at `exec` — which is
+exactly why the window is narrow and the failure rare. Confirming it means tracing whether the
+red runs coincide with a process spawn; that has not been done.
+
+**Cost:** it fails the nix build, so it can break `home-manager switch` for an unrelated
+change. A retry is the workaround — the failure does not reproduce twice in a row. Note this
+means a *green* nix build is not evidence the test is sound.
+
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
 **Severity:** low (cosmetic; the mirror is readable but noisy).
