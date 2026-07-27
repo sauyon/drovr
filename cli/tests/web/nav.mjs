@@ -859,7 +859,12 @@ await evaluate(`
 await evaluate(`return renderRunList(routeGen);`);
 await press('a');
 await waitFor(() => evaluate(`return window.__gArchived;`), v => v === true, 4000, 'the archive POST fired');
-await evaluate(`return renderRunList(routeGen);`);
+// Wait for the row to go rather than asserting straight after dispatching a
+// render: `press` does not await toggleArchive, so its own render can be
+// dispatched after this one and win the staleness guard, leaving this one to bail
+// without painting. Asserting immediately made this check flake.
+await waitFor(rowNames, r => r.indexOf(goneTarget) === -1, 6000,
+  'the archived row to leave the active list');
 check('a run whose workspace was already gone really leaves the active list',
   (await rowNames()).indexOf(goneTarget), -1);
 // `press` does not await toggleArchive — its own re-render, and the cursor
@@ -1112,6 +1117,62 @@ check('archiving the last two rows leaves the cursor on a surviving row',
   survivor !== null && survivor !== secondLast && survivor !== lastRow, true);
 check('...and that row is actually visible',
   (await rowNames()).indexOf(survivor) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (7) A filter hides rows without their going anywhere. Answering "did it leave"
+// from whether a row is on screen therefore handed the cursor away from a run
+// that still exists — here a zombie, which stays active on purpose — just because
+// the filter stopped matching it. The answer has to come from the run data.
+//
+// The filter is applied BEFORE the archive: typing one deliberately resets the
+// anchor, so a filter typed afterwards could never observe the hand-off.
+await reload(LIST_READY);
+await stubConfirm();
+await evaluate(`
+  window.__kDone = false;
+  window.__kName = '';
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__kDone = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__kName || !window.__kDone) return x;
+            // A zombie: archived, panes alive, so still ACTIVE — and its task text
+            // no longer matches the filter, so it is hidden without having left.
+            return Object.assign({}, x, {live: true, archived: true, complete: false, task: 'zzz'});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('/');
+await typeText('task');
+await waitFor(rowNames, r => r.length >= 2, 4000, 'the filter to match several runs');
+const keepRow = await cursorName();
+await evaluate(`window.__kName = navCursorKey; return 1;`);
+check('the cursor is on a filtered row before archiving',
+  (await rowNames()).indexOf(keepRow) !== -1, true);
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__kName; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__kDone;`), v => v === true, 4000, 'the archive POST');
+await evaluate(`return renderRunList(routeGen);`);
+check('the zombie is hidden by the filter', (await rowNames()).indexOf(keepRow), -1);
+check('...but it is still active, so the cursor is not handed away from it',
+  await evaluate(`return navCursorKey;`), keepRow);
+await press('Escape');
 await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== opening a run ==');

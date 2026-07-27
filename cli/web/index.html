@@ -2088,24 +2088,32 @@ async function toggleArchive(name, archived, live) {
   renderRunList(gen);
 }
 
-// Answer any archive hand-offs this render is fresh enough to settle. Must be
-// called only AFTER the rows for `seq` are in the DOM: it asks what is on screen.
+// Answer any archive hand-offs this render is fresh enough to settle.
+//
+// `stillActive` is the names of runs the server still considers active, taken
+// BEFORE the filter is applied — that, not row visibility, is what says whether
+// an archived run really left. Must still be called after the rows are in the
+// DOM, because choosing the replacement row does ask what is on screen.
 //
 // Not called from the catch path on purpose — a failed fetch leaves the previous
 // list painted, which cannot say whether the row left, so entries wait for a
 // render that can answer.
-function resolvePendingAdvances(seq) {
+function resolvePendingAdvances(seq, stillActive) {
   if (!pendingAdvances.length) return;
   pendingAdvances = pendingAdvances.filter(function(p) {
     // This render's list was fetched before that archive committed, so it cannot
     // say whether the row left. Keep waiting.
     if (seq <= p.afterSeq) return true;
-    // Deliberately NOT `p.gen === routeGen`: `route()` bumps routeGen on every 2s
-    // poll, so any archive whose herdr round-trip outlasted one tick looked like
-    // a view change, and its hand-off was dropped without ever moving the cursor
-    // — stranding it. What actually matters is being on the list at all, since
-    // inside a run the cursor belongs to question rows.
-    if (!currentRun && navCursorKey === p.name && !isRowVisible(p.name)) {
+    // "Did it leave" is answered from the DATA, not from whether a row is on
+    // screen. A filter hides rows without their going anywhere, so asking the DOM
+    // handed the cursor away from a run that still exists and would come back
+    // when the filter cleared — and `stillActive` is taken before filtering, so
+    // it cannot be fooled that way. A zombie is still active and keeps the cursor.
+    //
+    // Note this is NOT gated on `p.gen === routeGen`: `route()` bumps routeGen on
+    // every 2s poll, so any archive whose herdr round-trip outlasted one tick
+    // looked like a view change and was dropped un-applied, stranding the cursor.
+    if (navCursorKey === p.name && stillActive.indexOf(p.name) === -1) {
       // The neighbour was captured before the POST and may itself be gone by now
       // — archiving the last two rows makes them each other's neighbour, so
       // following it blindly put the cursor on the other archived row. Re-check
@@ -2172,9 +2180,12 @@ async function renderRunList(gen, resetAnchor) {
     // Recorded BEFORE filtering, so the list stays "which runs exist" rather
     // than "which runs match the current filter".
     knownRunNames = runs.map(function(x) { return x.name; });
+    // Pre-filter, for the same reason `knownRunNames` is.
+    var stillActive = runs.filter(function(x) { return !x.complete; })
+                          .map(function(x) { return x.name; });
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
-      resolvePendingAdvances(seq);
+      resolvePendingAdvances(seq, stillActive);
       applyNavCursor(false);
       return;
     }
@@ -2186,7 +2197,7 @@ async function renderRunList(gen, resetAnchor) {
       });
       if (!runs.length) {
         listEl.innerHTML = '<div class="review-empty">No sessions match that filter.</div>';
-        resolvePendingAdvances(seq);
+        resolvePendingAdvances(seq, stillActive);
         applyNavCursor(false);
         return;
       }
@@ -2260,7 +2271,7 @@ async function renderRunList(gen, resetAnchor) {
     // Resolve a pending archive hand-off, now that rows reflect a list fetched
     // after the archive committed. Whichever render gets here first answers it —
     // this one, the 2s poll, or a filter change — so no ordering can lose it.
-    resolvePendingAdvances(seq);
+    resolvePendingAdvances(seq, stillActive);
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
     applyNavCursor(false);

@@ -830,6 +830,27 @@ pre-archive render from answering with stale rows — which strands the cursor e
 one-shot version did. Do not "simplify" it away, and do not add a test that pretends to cover
 it without first building a seam that can dispatch a paint from an older render.
 
+## `web_nav` has shown a rare, uncharacterised flake
+
+Observed 2026-07-26. NOT fixed, and not fully diagnosed — recorded so the next person to see
+it does not assume it is new.
+
+`cli/tests/web/nav.mjs` shares one page across sections, and several sections trigger actions
+(`press('a')`, clicking Archive) without awaiting the internal promise chain those actions
+start. A later section can therefore be measuring the cursor while an earlier action's render
+is still landing. One instance of this was found and fixed — a check asserting a row had left
+immediately after dispatching a render that can lose the staleness race to `toggleArchive`'s
+own; it now waits for the state it asserts.
+
+After that fix the suite ran 54 consecutive times green. But two failures were seen in the
+first 12-run batch after it, and their output was not captured, so they remain unexplained.
+Do not read "54 green" as proof the class is gone.
+
+If it recurs: run with `-- --nocapture` to get the failing check name, and suspect a section
+asserting immediately after `evaluate('renderRunList(...)')` rather than waiting for the
+condition. The durable fix is to make every such section either `reload()` first or wait on
+the state it is about to assert, rather than trusting a render to have painted.
+
 ## Three of the six `save_preserving_archived` sites are redundant, and untestable
 
 Found 2026-07-26. Working as intended; recorded so nobody "fixes" the missing coverage.
