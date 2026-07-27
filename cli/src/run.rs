@@ -900,13 +900,20 @@ mod tests {
         let p = &loaded.phases[0];
         assert!(p.tab_id.is_none(), "absent tab_id → None");
         assert!(p.agent_session.is_none(), "absent agent_session → None");
+        assert!(p.agent_backend.is_none(), "absent agent_backend → None");
         assert!(p.agent_profile.is_none(), "absent agent_profile → None");
         assert!(!p.reaped, "absent reaped → false (the phase still has its pane)");
 
         // And a phase that captured nothing must not start emitting the keys:
         // a run written by this build stays loadable by an older one.
         let out = serde_json::to_string(&loaded).unwrap();
-        for key in ["tab_id", "agent_session", "agent_profile", "reaped"] {
+        for key in [
+            "tab_id",
+            "agent_session",
+            "agent_backend",
+            "agent_profile",
+            "reaped",
+        ] {
             assert!(!out.contains(key), "empty {key} must be skipped: {out}");
         }
     }
