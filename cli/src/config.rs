@@ -890,6 +890,40 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_entry_with_only_a_command_still_loads() {
+        // `AgentSpec` is now built through `AgentSpecWire`, and a field that
+        // lost its `#[serde(default)]` in that move would make every real
+        // user config fail to load — `load_config` returning Err is a hard
+        // stop, not a degradation. Pin the minimal entry.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.minimal]\ncommand = \"minimal\"\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().expect("an entry with only `command` must load");
+        let spec = &cfg.agents["minimal"];
+        assert_eq!(spec.command, "minimal");
+        // Every optional field absent, and no resume surface invented for it.
+        assert_eq!(spec.readonly_flag, None);
+        assert_eq!(spec.workspace_flag, None);
+        assert_eq!(spec.system_prompt_flag, None);
+        assert_eq!(spec.model_flag, None);
+        assert_eq!(spec.review_model, None);
+        assert_eq!(spec.resume, None);
+        // …and the built-ins are still whole beside it.
+        assert_eq!(
+            cfg.agents["claude"].resume,
+            Some(ResumeSpec::Flag("--resume".into()))
+        );
+    }
+
+    #[test]
     fn an_agent_claiming_both_resume_shapes_is_rejected() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
