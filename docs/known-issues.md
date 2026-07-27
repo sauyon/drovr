@@ -336,6 +336,50 @@ symlinks, which turned recording into a clobber of the link's target).
 outside the run dir — a driver-side store keyed by run+phase. That is a design change, not a
 patch.
 
+## A read-only cursor reviewer can park at plan mode's "Ready to build?" gate (2026-07-27)
+
+**Severity:** medium — the reviewer never reports, and neither `idle` nor `blocked` distinguishes
+it from one that finished.
+**Found:** review round 4 of run `structural-briefs`, error-handling angle (`wBM:pG`).
+
+Reviewers run `cursor --mode plan`. Plan mode's natural terminus is a confirmation dialog:
+
+```
+Ready to build?
+ → 1. Yes, build locally (b)
+   2. Yes, build in cloud (c)
+   3. No, propose changes (p or Esc)
+```
+
+The agent had done the review and then offered to *implement* it. It sat at that gate with
+`agent_status: idle` — indistinguishable from a reviewer that finished and is waiting at its
+composer, which is why the panel's completion detection cannot see it either.
+
+**Never answer 1 or 2.** A reviewer that builds violates the read-only contract and drovr's
+single-writer rule at the same time.
+
+**Remedy:** `herdr agent send-keys <pane> escape` to decline, then send a reporting-only prompt
+("you are READ-ONLY; print one line per finding as SEVERITY|file:line|summary") and submit it with
+another `enter`. That recovered the angle, which then reported clean.
+
+**Distinguishing it from the unsubmitted-paste bug:** both look `idle`. Read the pane —
+`→ [Pasted text #1 +N lines]` in the composer is the paste bug; a `Ready to build?` box is this
+one. Same lesson as the `pgrep` mis-triage above: check the pane, not the status.
+
+## `rustfmt src/main.rs` (and `cargo fmt`) reformats every sibling module (2026-07-27)
+
+**Severity:** low, but it silently produces a huge unrelated diff.
+
+`cli/src` is not rustfmt-clean: `config.rs`, `herdr.rs`, `phase.rs`, `reflex.rs`, `review.rs` and
+`run.rs` all have pending formatting differences. Because rustfmt follows `mod` declarations,
+formatting `main.rs` — or running `cargo fmt` at all — rewrites all of them: ~500 lines across six
+files nobody touched, which then collide with other worktrees working on those files.
+
+**Do:** format the leaf module you edited (`rustfmt --edition 2024 cli/src/brief.rs`). Verify with
+`rustfmt --check` on that file and ignore diffs it reports for siblings.
+**Do not:** run `cargo fmt`, or `rustfmt` on `main.rs`, unless you intend to reformat the crate.
+If you do it by accident, `git checkout --` the files you did not edit.
+
 ## The findings channel loses reviewer output two ways (2026-07-26/27)
 
 **Severity:** high — it fails the panel on any real diff, and both modes look like "the reviewer
@@ -352,9 +396,12 @@ The cursor reviewers printed `Review complete. Findings below.` followed by a ba
 object — no fence. The only fenced block in the transcript was the *schema* echoed from the seed.
 So extraction found nothing even though valid findings were on screen.
 
-**Fix idea:** fall back to the last balanced top-level `{...}` that parses as a `Review` when no
-fenced block yields one. Cheap, and it makes the seed's "fenced" instruction a preference rather
-than a hard requirement.
+**FIXED** (`829a155`, hardened again in `1022510`): a fenced candidate must now PARSE as a
+`Review` — the seed's echoed schema is not JSON, and it was shadowing real findings — and when no
+fenced block yields one, `last_review_object` takes the last balanced `{...}` that parses. Its
+candidate starts are braces that begin a line, tried last-first: trying every brace was quadratic
+on a transcript full of code, and an unbalanced brace in prose could swallow the rest of the input
+so the real object was never attempted.
 
 ### 2. The pane transcript is LOSSY, so JSON cannot be reconstructed from it at all
 
