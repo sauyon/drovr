@@ -335,7 +335,13 @@ fn create_run_workspace<H: Herdr>(
         eprintln!("drovr: warning: could not label the run's root shell pane: {e}");
     }
     if let Some(prev) = prev_focus {
-        let _ = herdr.workspace_focus(&prev);
+        // Warn rather than swallow. The capture/restore exists precisely so
+        // `drovr new` does not move the user; if the restore fails they are left
+        // sitting in a brand-new idle workspace with no clue why, and the fix
+        // (switch back) is one they can only apply if they know it happened.
+        if let Err(e) = herdr.workspace_focus(&prev) {
+            eprintln!("drovr: warning: could not restore focus to workspace {prev}: {e}");
+        }
     }
     (Some(ws.id), Some(ws.root_pane))
 }
@@ -467,15 +473,66 @@ fn cmd_status(name: &str) {
     }
 }
 
-/// What `drovr attach` connects the human to.
+/// What `drovr attach` found to connect the human to.
 ///
-/// The two variants are not interchangeable: one is an agent conversation, the
-/// other is a bare shell. Attaching prints which it is, so nobody types a prompt
-/// at a `sh` prompt believing an agent is listening.
+/// The two variants are **not interchangeable**, and that is the whole point of
+/// distinguishing them: `Phase` holds an agent, `RootShell` is a bare `sh`. The
+/// only attach primitive herdr exposes is `herdr agent attach`, which requires
+/// an attached agent — there is no `herdr pane attach` — so the second variant
+/// cannot be handed to the same code path as the first. See [`AttachPlan`].
 #[derive(Debug)]
 enum AttachTarget<'a> {
     Phase { phase: &'a str, pane: &'a str },
     RootShell { pane: &'a str },
+}
+
+/// What `drovr attach` will actually DO about the target it found.
+///
+/// Split out from [`attach_target`] so the decision is testable without
+/// spawning `herdr` or calling `process::exit`. It exists because those two were
+/// once one function, and the fallback rung it added ("no phase pane → the idle
+/// root shell") silently contradicted the `herdr agent attach` it then ran: the
+/// root shell has no agent, so that attach could only ever fail with
+/// `agent_not_found`. Nothing walked that path in a test.
+#[derive(Debug)]
+enum AttachPlan {
+    /// Hand the terminal to `herdr agent attach <pane>`.
+    AttachAgent { phase: String, pane: String },
+    /// Print this to stderr and exit non-zero. There is no agent to attach to,
+    /// and saying so is more use than an opaque herdr error.
+    Refuse(String),
+}
+
+/// Decide what `drovr attach <name>` does, given the run's state.
+///
+/// A run with no live agent pane is **refused**, not silently redirected. The
+/// idle root shell is a real pane and `drovr cleanup` still owns it, but it is
+/// not a conversation: attaching there would drop the human at a `sh` prompt
+/// under a command whose entire contract is "show me this run's agent". The
+/// refusal names the workspace so they can open it in herdr themselves if the
+/// shell is genuinely what they wanted.
+fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
+    match attach_target(run) {
+        Some(AttachTarget::Phase { phase, pane }) => AttachPlan::AttachAgent {
+            phase: phase.to_owned(),
+            pane: pane.to_owned(),
+        },
+        // The workspace and its anchor shell are alive; only the agents are gone.
+        Some(AttachTarget::RootShell { pane }) => AttachPlan::Refuse(format!(
+            "run '{name}' has no live agent pane — no phase holds one. Its workspace \
+             {} is still open, anchored by the idle shell {pane} (a plain shell, not \
+             an agent, so there is nothing to attach to). Start a phase with: \
+             drovr phase start {} <phase>",
+            run.workspace.as_deref().unwrap_or("(unknown)"),
+            shell_single_quote(name),
+        )),
+        None => AttachPlan::Refuse(format!(
+            "run '{name}' has no live agent pane, and no herdr workspace either \
+             (creation failed at `drovr new`, or the run was cleaned up). Start a \
+             phase with: drovr phase start {} <phase>",
+            shell_single_quote(name),
+        )),
+    }
 }
 
 /// Pick what `drovr attach <run>` should connect to, in preference order:
@@ -487,19 +544,23 @@ enum AttachTarget<'a> {
 ///    and which therefore outlives them all;
 /// 4. otherwise nothing — a run whose workspace creation failed at `drovr new`.
 ///
-/// Rungs 2–3 matter more than they used to. Phase panes are no longer permanent:
-/// nothing yet closes them, but the point of this change is that a phase tab
-/// *can* be closed without taking the workspace with it. Exiting 1 on the
-/// human's "show me this run" once the panes are gone is a worse answer than the
-/// shell that anchors it.
+/// Rung 2 matters more than it used to: phase panes are no longer permanent, and
+/// the point of this change is that a phase tab *can* be closed without taking
+/// the workspace with it, so "the current phase" and "a phase with a live pane"
+/// come apart.
+///
+/// **Rung 3 is not an attach target** — see [`attach_plan`], which refuses it.
+/// It is reported rather than dropped because it distinguishes two refusals: a
+/// run whose workspace is still open and anchored, and one with no workspace at
+/// all. Those deserve different advice.
 ///
 /// **Deliberately NOT shared with `review::active_pane`**, which walks the same
-/// list for the review UI's mirror target. They agree today (no pipeline phase
-/// is ever `Failed`, so the sole `Running` phase always sits at
-/// `first_incomplete`) but they answer different questions and diverge at rung
-/// 3: a mirror must report "no live pane" honestly rather than show an idle
-/// shell, while an attach may hand the human that shell as long as it says so.
-/// Folding them together would mean one of the two lying.
+/// list for the review UI's mirror target. They agree on rungs 1–2 today (no
+/// pipeline phase is ever `Failed`, so the sole `Running` phase always sits at
+/// `first_incomplete`) but they answer different questions: `active_pane` stops
+/// at rung 2 and returns `None`, because a mirror has nothing to say about a
+/// pane it cannot show, whereas an attach still wants to tell the human what IS
+/// there before refusing. Folding them together would cost one of them that.
 fn attach_target(run: &RunState) -> Option<AttachTarget<'_>> {
     let phase_pane = run
         .first_incomplete()
@@ -525,33 +586,20 @@ fn cmd_attach(name: &str) {
     }
     let run = load_run(name);
 
-    let pane_id = match attach_target(&run) {
-        // Name the phase: rungs 2–3 below can land somewhere other than the
-        // phase the human had in mind, and a silent attach hides which.
-        Some(AttachTarget::Phase { phase, pane }) => {
-            eprintln!("drovr: attaching to phase '{phase}' of run '{name}'");
-            pane
-        }
-        Some(AttachTarget::RootShell { pane }) => {
-            eprintln!(
-                "drovr: no phase of run '{name}' has a live pane; attaching to the run's \
-                 idle workspace shell instead (this is a plain shell, not an agent)"
-            );
-            pane
-        }
-        None => {
-            eprintln!(
-                "drovr: run '{name}' has no pane to attach to (no phase pane, and no herdr \
-                 workspace); try: drovr phase start {} <phase>",
-                shell_single_quote(name)
-            );
+    let (phase, pane_id) = match attach_plan(&run, name) {
+        AttachPlan::AttachAgent { phase, pane } => (phase, pane),
+        AttachPlan::Refuse(msg) => {
+            eprintln!("drovr: {msg}");
             process::exit(1);
         }
     };
+    // Name the phase: `attach_target`'s rung 2 can land somewhere other than the
+    // phase the human had in mind, and a silent attach hides which.
+    eprintln!("drovr: attaching to phase '{phase}' of run '{name}'");
 
     // Shell out: herdr agent attach <pane_id>
     let status = std::process::Command::new("herdr")
-        .args(["agent", "attach", pane_id])
+        .args(["agent", "attach", &pane_id])
         .status()
         .unwrap_or_else(|e| {
             eprintln!("drovr: failed to exec herdr: {e}");
@@ -1650,7 +1698,7 @@ mod tests {
         ));
 
         // No phase pane anywhere → the run's idle root shell, reported as such
-        // so the human is not told they are looking at an agent.
+        // so `attach_plan` can refuse it by name rather than attaching to it.
         let run = attach_run(vec![("brainstorm", Done, None)], Some("w:root"));
         assert!(matches!(
             attach_target(&run),
@@ -1671,6 +1719,76 @@ mod tests {
         ));
         let run = attach_run(vec![], None);
         assert!(attach_target(&run).is_none());
+    }
+
+    /// The root-shell rung must never end in `herdr agent attach`.
+    ///
+    /// This is the test whose absence let that ship: `attach_target` was unit
+    /// tested, but nothing walked the decision `cmd_attach` makes *with* the
+    /// target it gets back, so "fall back to the root shell" and "attach to an
+    /// agent" could contradict each other undetected. `herdr agent attach`
+    /// requires an attached agent and the root shell has none — there is no
+    /// `herdr pane attach` to fall back to — so the honest answer is a refusal
+    /// that says what is actually true.
+    #[test]
+    fn attach_refuses_the_root_shell_instead_of_attaching_to_a_nonexistent_agent() {
+        use PhaseStatus::{Done, Running};
+
+        // A live phase pane is the one case that really attaches.
+        let run = attach_run(vec![("implement", Running, Some("w:p2"))], Some("w:root"));
+        match attach_plan(&run, "r") {
+            AttachPlan::AttachAgent { phase, pane } => {
+                assert_eq!(phase, "implement");
+                assert_eq!(pane, "w:p2");
+            }
+            AttachPlan::Refuse(msg) => panic!("a live phase pane must attach, got: {msg}"),
+        }
+
+        // No phase pane, but the workspace and its idle shell are still there.
+        let run = attach_run(vec![("brainstorm", Done, None)], Some("w:root"));
+        let msg = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { pane, .. } => {
+                panic!("the root shell has no agent to attach to, but got pane {pane}")
+            }
+        };
+        assert!(
+            msg.contains("no live agent pane"),
+            "must say plainly that there is no agent: {msg}"
+        );
+        assert!(
+            msg.contains('w') && msg.contains("workspace"),
+            "must name the workspace so the user can go there themselves: {msg}"
+        );
+        assert!(
+            msg.contains("drovr phase start"),
+            "must say what to do next: {msg}"
+        );
+
+        // No workspace at all — a distinct situation, and a distinct message:
+        // there is no idle shell to point the user at.
+        let run = attach_run(vec![("brainstorm", Done, None)], None);
+        let bare = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { .. } => panic!("nothing exists to attach to"),
+        };
+        assert!(
+            bare.contains("no live agent pane"),
+            "must say plainly that there is no agent: {bare}"
+        );
+        assert_ne!(
+            bare, msg,
+            "a run with no workspace must not be described as if it had an idle shell"
+        );
+
+        // `drovr phase rehydrate` is task 5 and does not exist. Neither refusal
+        // may advertise a command the user cannot run.
+        for m in [&msg, &bare] {
+            assert!(
+                !m.contains("rehydrate"),
+                "must not reference a command that does not exist: {m}"
+            );
+        }
     }
 
     /// `drovr new` labels the workspace's root shell so the idle tab explains
@@ -1723,6 +1841,17 @@ mod tests {
         assert!(
             ws.is_some() && root.is_some(),
             "a cosmetic rename failure must not discard the workspace"
+        );
+
+        // Same for a focus restore that fails: it is reported, not fatal. The
+        // run must not lose the workspace it just created over where the user
+        // happens to be looking.
+        let h = FakeHerdr::new();
+        h.fail_workspace_focus();
+        let (ws, root) = create_run_workspace(&h, "gamma", "/tmp/p");
+        assert!(
+            ws.is_some() && root.is_some(),
+            "a failed focus restore must not discard the workspace"
         );
     }
 
