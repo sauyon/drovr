@@ -1,3 +1,4 @@
+mod brief;
 mod code_review;
 mod config;
 mod findings;
@@ -14,6 +15,7 @@ mod shell;
 mod worktree;
 
 use clap::{Parser, Subcommand};
+use brief::compose_phase_brief;
 use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
@@ -146,6 +148,22 @@ enum PhaseCmd {
         phase_name: String,
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
+    },
+    /// Print a phase's composed brief and exit, spawning nothing.
+    ///
+    /// This is the text a phase agent should be given: drovr's template for that
+    /// phase, its substitutions filled in, the run's task, and your `--context`.
+    /// Pipe it into `phase send` (or read it to see exactly what a phase is told).
+    /// Composed for `brainstorm`, `plan`, `implement-task-<N>` and `review`.
+    Brief {
+        run: String,
+        phase_name: String,
+        /// What this phase needs to know that drovr cannot compose: the task brief
+        /// from `plan.md`, accumulated interfaces, why the last attempt failed.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
     /// Mark a phase complete. Run by the phase AGENT itself as its final action —
     /// it drops the completion marker `drovr phase wait` polls for. Refuses for a
@@ -871,6 +889,26 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: phase wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Brief {
+            run,
+            phase_name,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: {e}");
                     process::exit(1);
                 }
             }
