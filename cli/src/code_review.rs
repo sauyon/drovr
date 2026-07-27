@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_records_the_backend_IT_was_launched_with() {
+    fn a_reviewer_records_its_own_backend_not_the_runs() {
         // A reviewer's backend is `review_agent_for`'s answer, NOT `run.agent`:
         // config can pin it, and cursor can be auto-selected. Session capture
         // checks a pane's session against the backend recorded on the phase, and
