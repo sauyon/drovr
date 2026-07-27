@@ -227,6 +227,24 @@ fn load_run(name: &str) -> RunState {
     })
 }
 
+/// Copy the parts of a finished code-review pass onto a freshly-loaded state.
+///
+/// `code_review_run` mutates exactly two things — `review_phases` and, when it
+/// replaces a wedged reviewer, `retired_panes`. Both must survive, and nothing
+/// else in `from` may: it is a snapshot taken before a pass that runs for
+/// minutes, so writing it back whole would resurrect every pipeline phase's
+/// status as of panel-start, including a `Done` that a `phase send` re-entry has
+/// since cleared.
+///
+/// `retired_panes` is unioned rather than assigned: `fresh` may already carry
+/// retirements this snapshot predates.
+fn transplant_review_progress(fresh: &mut RunState, from: &RunState) {
+    fresh.review_phases = from.review_phases.clone();
+    for pane in &from.retired_panes {
+        fresh.retire_pane(pane);
+    }
+}
+
 fn save_run(run: &RunState) {
     run.save().unwrap_or_else(|e| {
         eprintln!("drovr: failed to save run '{}': {e}", run.name);
@@ -509,17 +527,24 @@ fn drovr_pane_ids(run: &RunState) -> Vec<String> {
 /// what is present), close the recorded panes one at a time and leave the
 /// workspace standing. Leaving an empty workspace behind is a cosmetic mistake;
 /// closing a pane that was not ours is not a recoverable one.
-fn close_run_panes<H: Herdr>(run: &RunState, ws_id: &str, herdr: &H) {
+/// Returns whether the WORKSPACE itself was closed (as opposed to individual
+/// panes). The Archive button reports that to the page, which uses it to warn
+/// that a run may still have live panes — so "I closed some panes but left the
+/// workspace standing" must not read as success.
+pub(crate) fn close_run_panes<H: Herdr>(run: &RunState, ws_id: &str, herdr: &H) -> bool {
     let ours = drovr_pane_ids(run);
     let targets = match herdr.workspace_panes(ws_id) {
         Ok(present) => {
             if present.iter().all(|p| ours.contains(p)) {
                 // Nothing in there but ours: one call reaps every pane AND the
                 // workspace, so no empty husk is left in the human's switcher.
-                if let Err(e) = herdr.workspace_close(ws_id) {
-                    eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+                match herdr.workspace_close(ws_id) {
+                    Ok(()) => return true,
+                    Err(e) => {
+                        eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+                        return false;
+                    }
                 }
-                return;
             }
             let foreign: Vec<&String> = present.iter().filter(|p| !ours.contains(p)).collect();
             println!(
@@ -559,6 +584,8 @@ fn close_run_panes<H: Herdr>(run: &RunState, ws_id: &str, herdr: &H) {
             eprintln!("drovr: warning: pane_close({pane}) failed: {e}");
         }
     }
+    // Panes may have gone; the workspace did not.
+    false
 }
 
 // Generic over `Herdr` (rather than taking `&SystemHerdr`) so the archived-marking
@@ -1012,16 +1039,23 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // only in memory, so an unconditional save here keeps disk and memory
             // in sync on every path — including the `Err` early-exit below.
             //
-            // Transplant ONLY `review_phases` onto a freshly-loaded state. A panel
-            // runs for many minutes and `state` is a snapshot from before it
-            // started; writing the whole thing back would resurrect every pipeline
+            // Transplant only what `code_review_run` mutates onto a freshly-loaded
+            // state. A panel runs for many minutes and `state` is a snapshot from
+            // before it started; writing the whole thing back would resurrect
+            // every pipeline
             // phase's status as of panel-start — including a `Done` that a
             // `phase send` re-entry has since cleared, which makes the next
             // `phase wait` report success for an agent that is mid-work.
-            // `code_review_run` only ever mutates `review_phases`, so nothing else
-            // in the snapshot is worth keeping.
+            // It mutates `retired_panes` too: replacing a wedged reviewer retires
+            // the old pane before respawning, and if that respawn then fails the
+            // function returns `Err` without ever saving. Transplanting only
+            // `review_phases` dropped that record, and a pane drovr created but
+            // never recorded is one `drovr cleanup` treats as the human's — so it
+            // is never closed, and its presence can stop the whole workspace being
+            // closed. Union rather than overwrite: the fresh state may carry
+            // retirements this snapshot predates.
             let mut merged = load_run(&run);
-            merged.review_phases = state.review_phases.clone();
+            transplant_review_progress(&mut merged, &state);
             save_run(&merged);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
@@ -1182,6 +1216,58 @@ mod tests {
     /// open their own shell or editor tab in it while the run works. Cleanup must
     /// reap only the panes drovr created and leave that workspace standing;
     /// `workspace_close` would take the human's panes down with it.
+    #[test]
+    fn transplant_carries_retired_panes_not_just_review_phases() {
+        use crate::run::Phase;
+
+        // What `code_review_run` leaves in memory when replacing a wedged reviewer
+        // and the respawn then fails: the old pane is retired, and the function
+        // returns Err without ever saving.
+        let mut snapshot = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![],
+            review_phases: vec![Phase::new("review:task-1:1:correctness")],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        snapshot.retire_pane("w:p2");
+
+        let mut fresh = snapshot.clone();
+        fresh.review_phases.clear();
+        fresh.retired_panes.clear();
+        // A retirement recorded by someone else while the pass ran.
+        fresh.retire_pane("w:p7");
+
+        transplant_review_progress(&mut fresh, &snapshot);
+
+        assert_eq!(
+            fresh.review_phases.len(),
+            1,
+            "the panel's reviewer phases must land"
+        );
+        assert!(
+            fresh.retired_panes.contains(&"w:p2".to_string()),
+            "a pane retired during the pass must survive — one drovr created but \
+             never recorded is one `cleanup` treats as the human's, so it is never \
+             closed and can keep the whole workspace open: {:?}",
+            fresh.retired_panes
+        );
+        assert!(
+            fresh.retired_panes.contains(&"w:p7".to_string()),
+            "and a retirement this snapshot predates must not be overwritten: {:?}",
+            fresh.retired_panes
+        );
+    }
+
     #[test]
     fn cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create() {
         use crate::herdr::FakeHerdr;

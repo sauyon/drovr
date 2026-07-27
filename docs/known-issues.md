@@ -1342,6 +1342,25 @@ Two consequences worth knowing:
    predates the change — plain `save` always did this — but it is now reachable from two more
    writers.
 
+## The Archive button used to destroy the human's own panes
+
+Found and fixed 2026-07-27, reviewing the merge with main. Recorded because the shape recurs.
+
+Two teardown paths existed for the same workspace. `drovr cleanup` was hardened on main to list
+the workspace's panes and refuse `workspace_close` unless every pane present is one drovr
+created — sparing the shell or editor a human keeps in the run's workspace. The Archive button's
+`close_for_archive` still called `workspace_close` outright, so one click destroyed exactly what
+cleanup had been taught to protect.
+
+Neither side was wrong on its own, which is why ten rounds of reviewing the branch never saw it:
+the branch's teardown predated the hardening, and `review.rs` did not conflict during the merge,
+so it carried through untouched. It took reviewing the MERGE — asking what the two features do
+to each other — to surface it. Both paths now share `close_run_panes`.
+
+`workspace_closed: false` consequently has two meanings now, and the page says both: the close
+failed, or it was withheld because the human's panes are in there. Both warrant the warning —
+in either case something may still be live under an archived run.
+
 ## `GET /api/runs` now spawns a herdr subprocess on every poll
 
 Found 2026-07-26. Accepted, not fixed.
@@ -1445,33 +1464,39 @@ asserting immediately after `evaluate('renderRunList(...)')` rather than waiting
 condition. The durable fix is to make every such section either `reload()` first or wait on
 the state it is about to assert, rather than trusting a render to have painted.
 
-## Only one of the six `save_preserving_archived` sites is redundant
+## `save_preserving_archived`: where it is used, and why
 
-Found 2026-07-26; **corrected 2026-07-26** after a review showed the original analysis was
-wrong. The earlier version of this entry claimed three sites were redundant AND untestable,
-and told the reader not to add coverage. Two of those three were both reachable and testable.
+Found 2026-07-26; **corrected twice**. The first version claimed three sites were redundant AND
+untestable and told the reader not to add coverage — two of the three were both reachable and
+testable. The second version was made stale by the merge with main, which deleted the one site
+it called genuinely redundant.
 
-The false claim was that `code_review_run`'s poll loop makes no herdr calls. It does:
-`agent_status` is the fallback the loop consults whenever a reviewer's done-marker is absent,
-every iteration. On a RESUMED pass where every angle is still alive, `spawn_reviewer` is
-skipped entirely — so the poll loop's own calls are the only ones in the pass, and no
-spawn-time save exists to have rescued an in-flight archive first. A human archiving a run
-while a resumed review polls is ordinary use, not an adversarial construction.
+The false claim in version one was that `code_review_run`'s poll loop makes no herdr calls. It
+does: `agent_status` (now `pane_info`) is the fallback the loop consults whenever a reviewer's
+done-marker is absent. On a RESUMED pass where every angle is still alive, `spawn_reviewer` is
+skipped entirely, so the poll loop's own calls are the only ones and nothing rescues the flag
+first. A human archiving a run while a resumed review polls is ordinary use.
 
-Both are now covered, and both fail if reverted to a plain `save`:
+Current state — five call sites, all covered, each failing the suite if reverted to a plain
+`save`:
 
-- the deadline save — `archiving_during_a_resumed_poll_survives_the_deadline_save`
-- the final save — `archiving_during_a_resumed_pass_survives_the_final_save_too`
+| site | test |
+| --- | --- |
+| `phase_start`'s pass-persist and post-launch saves | `phase_start_does_not_un_archive_a_run_archived_while_it_worked` |
+| `spawn_reviewer` | `archiving_mid_run_survives_every_save_the_review_makes` |
+| `reopen_for_re_entry` (via `phase_send`) | `phase_send_does_not_un_archive_a_run_archived_while_it_reopened` |
+| `code_review_run`'s deadline save | `archiving_during_a_resumed_poll_survives_the_deadline_save` |
+| `code_review_run`'s final save | `archiving_during_a_resumed_pass_survives_the_final_save_too` |
 
-That leaves one genuinely redundant site: `cmd_code_review`'s save in `main.rs`. By the time it
-runs, `code_review_run`'s own preserving saves have already re-read the flag into the in-memory
-`RunState`, so a plain `save` there would write the correct value anyway. It stays preserving
-for consistency, and because that redundancy depends on the callee's behaviour rather than on
-anything local.
+`cmd_code_review` no longer has such a site: the merge replaced its whole-state write with a
+fresh load plus `transplant_review_progress`, which is strictly better — it cannot clobber
+`archived` OR any other field.
 
-The lesson worth keeping: "this path cannot be reached" is a claim about code, and it needs
-checking against the code rather than reasoning from the shape of a call graph. The earlier
-entry deleted a real test on the strength of an unchecked one.
+`phase_wait` likewise no longer needs one: it re-reads fresh state and commits onto that.
+
+The lesson, now demonstrated twice on this very entry: "this path cannot be reached" is a claim
+about code and needs checking against the code. And an entry that names call sites goes stale
+when someone else moves them — check it against the tree before trusting it.
 
 ## A panicking test can poison `ENV_LOCK` for the whole suite
 

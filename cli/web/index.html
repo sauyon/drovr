@@ -2088,9 +2088,11 @@ async function toggleArchive(name, archived, live) {
     // undefined, and "we could not tell whether the panes were closed" belongs on
     // the warning side, not the silent side.
     if (!archived && live !== '0' && res.workspace_closed !== true) {
-      window.alert('Archived "' + name + '", but its herdr workspace could not be closed.\n\n' +
-        'Its panes may still be running. Check with `herdr workspace list`, and close it ' +
-        'with `drovr cleanup ' + name + '` once herdr is reachable.');
+      window.alert('Archived "' + name + '", but its herdr workspace is still open.\n\n' +
+        'Either the close failed, or it was kept deliberately because panes drovr did ' +
+        'not create are still in it — your own shell or editor. Its panes may still be ' +
+        'running. Check with `herdr workspace list`; `drovr cleanup ' + name + '` closes ' +
+        "drovr's own panes and spares yours.");
     }
   } catch (e) {
     console.error('[drovr] archive failed', e);

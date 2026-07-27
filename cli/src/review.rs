@@ -819,16 +819,17 @@ fn close_for_archive<H: Herdr>(h: &H, state: &RunState, archived: bool) -> bool 
     let Some(ws) = state.workspace.as_deref() else {
         return false;
     };
-    match h.workspace_close(ws) {
-        Ok(()) => true,
-        // Overwhelmingly "workspace not found" — the panes died long ago and this
-        // run has been stale ever since. That is precisely the case the reviewer
-        // is trying to clear, so it must not block the archive.
-        Err(e) => {
-            eprintln!("drovr archive: workspace_close({ws}) failed: {e}");
-            false
-        }
-    }
+    // The SAME teardown `drovr cleanup` performs — deliberately, not incidentally.
+    // This used to call `workspace_close` outright, which killed every pane in the
+    // workspace including the shell or editor the reviewer had open in it. Cleanup
+    // was hardened against exactly that; the button is one click and must not be
+    // the careless path to the same destruction.
+    //
+    // A `false` return now means "the workspace is still standing", which covers
+    // both a failed close and one deliberately withheld because the human's panes
+    // are in there. Both deserve the page's warning: in each case the run may
+    // still have something live attached to it.
+    crate::close_run_panes(state, ws, h)
 }
 
 fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
@@ -2234,6 +2235,42 @@ mod tests {
         assert!(!wildcard_ip_host("192.168.1.5:9999", Some(8791)));
         assert!(!wildcard_ip_host("192.168.1.5:8791", None));
         assert!(!wildcard_ip_host("192.168.1.5", Some(8791)));
+    }
+
+    #[test]
+    fn archiving_never_closes_a_workspace_holding_the_humans_own_panes() {
+        use crate::herdr::FakeHerdr;
+        let mut state = tree_run(vec![], vec![]);
+        state.workspace = Some("wAG".into());
+        state.root_pane = Some("wAG:p1".into());
+
+        let h = FakeHerdr::new();
+        // The reviewer's own shell/editor sits in the run's workspace alongside
+        // drovr's pane. `drovr cleanup` is explicitly hardened to spare it
+        // (`cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create`); the
+        // Archive button is one click and must not be the careless path.
+        h.push_workspace_panes("wAG", ["wAG:p1", "wAG:p9"]);
+
+        let closed = close_for_archive(&h, &state, true);
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_close")),
+            "archiving must not destroy a workspace holding panes drovr did not \
+             create — that is the human's work: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAG:p1"),
+            "drovr's own pane is still closed: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "pane_close pane=wAG:p9"),
+            "the human's pane must be left alone: {calls:?}"
+        );
+        assert!(
+            !closed,
+            "the workspace is still standing, so the page must not be told it closed"
+        );
     }
 
     #[test]

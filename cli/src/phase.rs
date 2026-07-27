@@ -1898,6 +1898,37 @@ mod tests {
     }
 
     #[test]
+    fn phase_send_does_not_un_archive_a_run_archived_while_it_reopened() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let mut run = make_run("phase-send-archived");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pass = run.phases[0].pass.clone().unwrap();
+        write_handoff(&run, "plan");
+        agent_signals_done(&run, "plan", &pass);
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 50).unwrap(),
+            PhaseWaitOutcome::Done
+        );
+
+        // The reviewer archives while the driver is between the wait and the
+        // re-entry send. `reopen_for_re_entry`'s save is the fourth of the
+        // snapshot writers converted to preserving, and the only one that had no
+        // test of its own — the existing archive-mid-review tests fire during
+        // `spawn_reviewer` or the poll loop, never during a plain `phase send`.
+        archive_on_disk("phase-send-archived");
+
+        phase_send(&h, &mut run, "plan", "carry on").unwrap();
+
+        assert!(
+            RunState::load("phase-send-archived").unwrap().archived,
+            "phase_send's re-entry save must not resurrect a run archived while it \
+             was re-opening the phase"
+        );
+    }
+
+    #[test]
     fn phase_wait_does_not_un_archive_a_run_archived_while_it_blocked() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = FakeHerdr::new();
