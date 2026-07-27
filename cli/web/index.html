@@ -2080,7 +2080,7 @@ function advanceCursorPast(run) {
   navCursorKey = next ? rowKey(next) : '';
 }
 
-async function renderRunList(gen) {
+async function renderRunList(gen, resetAnchor) {
   var listEl = document.getElementById('run-list-items');
   // Claimed before the try so the catch can check it too — a superseded call
   // must not report failure over a newer call's successful render.
@@ -2097,6 +2097,17 @@ async function renderRunList(gen) {
     // have since disappeared — which is enough to make a deleted run look merely
     // hidden and bring the cursor drift back.
     if (seq !== listFetchSeq) return;
+    // A new filter re-scopes the list, so the old anchor is meaningless — start
+    // at the top of whatever now matches. This is done HERE, past the staleness
+    // guard, so it is atomic with the render that carries the new filter text.
+    //
+    // Resetting in the input handler instead left the two unordered: the reset
+    // was synchronous, the render was not, and an in-flight poll's continuation
+    // could re-anchor to the top of the *unfiltered* list in between. The cursor
+    // then pointed at a run the filter excludes, which — once a filtered-out row
+    // stopped being treated as the reviewer's own doing — parked the cursor and
+    // made Enter open nothing.
+    if (resetAnchor) { navCursor = 0; navCursorKey = ''; }
     // Recorded BEFORE filtering, so the list stays "which runs exist" rather
     // than "which runs match the current filter".
     knownRunNames = runs.map(function(x) { return x.name; });
@@ -2469,12 +2480,18 @@ function applyNavCursor(scroll) {
   // never drift. It also cannot be skewed by how many times this runs per poll,
   // which the previous counter very much was.
   var gone = anchorMissing && knownRunNames.indexOf(navCursorKey) === -1;
-  // "Hidden" splits again, by whether the reviewer did the hiding. A filter is
-  // them narrowing the list, so the cursor follows into what remains — exactly as
-  // it does when they archive a row. Only a row that vanishes out from under them
-  // (Completed group collapsing, a liveness fold) parks the cursor and gets it
-  // back when the row returns.
-  var parked = anchorMissing && !gone && !listFilter;
+  // "Hidden" splits by whether the reviewer did the hiding — but that question is
+  // answered where the hiding happens, not here. Typing in the filter box resets
+  // the anchor on every keystroke, and archiving a row calls `advanceCursorPast`;
+  // both have already moved the cursor by the time this runs.
+  //
+  // So do NOT ask "is a filter active" here. The filtered set is recomputed on
+  // every 2s poll, and a run's `state` changes server-side constantly — when the
+  // selected run's new state stops matching the filter text, its row leaves with
+  // no user action at all. Treating that as the reviewer's doing handed the cursor
+  // to whatever slid into the slot: the same wrong-run archive, different trigger.
+  // Anything still in `knownRunNames` is merely hidden, so park it.
+  var parked = anchorMissing && !gone;
   if (!currentRun && !parked) navCursorKey = rowKey(rows[navCursor]);
   // Holding the KEY is only half of parking. The numeric index still points at
   // whatever row now occupies that slot, and it — not the key — is what paints
@@ -2662,14 +2679,11 @@ function initKeyNav() {
   var fin = document.getElementById('nav-filter-input');
   fin.addEventListener('input', function() {
     listFilter = fin.value.trim().toLowerCase();
-    // A new filter re-scopes the list, so the old anchor is meaningless — start
-    // at the top of whatever now matches.
-    navCursor = 0;
-    navCursorKey = '';
-    // Same generation re-check as closeFilter: a keystroke's fetch can still be
-    // in flight when the reviewer presses Enter to open the highlighted run.
+    // The anchor reset lives inside renderRunList (past its staleness guard) so
+    // it is ordered with the render carrying this filter text — see the comment
+    // there. Doing it here left the two unordered and lost the reset.
     var gen = routeGen;
-    renderRunList(gen).then(function(){ if (gen === routeGen) applyNavCursor(false); });
+    renderRunList(gen, true).then(function(){ if (gen === routeGen) applyNavCursor(false); });
   });
   // Every branch here calls stopPropagation: they all blur the input, so without
   // it the event still reaches the document listener, `inTextEntry` now reads

@@ -742,7 +742,10 @@ mod tests {
 
     #[test]
     fn archiving_mid_run_survives_every_save_the_review_makes() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        // `into_inner` on poison: this test's assert is the whole point, and a
+        // real failure here must not cascade PoisonError into every other test
+        // sharing the lock — that turns one honest failure into ~11 misleading ones.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-archive-mid-run");
         write_base(&run, "task-1");

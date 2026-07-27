@@ -1024,6 +1024,60 @@ mod tests {
         assert_eq!(run.phases[0].status, PhaseStatus::Done);
     }
 
+    // -- Neither `phase_start` nor `phase_wait` may un-archive a run ----------
+    //
+    // Both hold a `RunState` loaded before they block, and the human can archive
+    // from the web UI in between — which closes the run's herdr workspace. A
+    // plain `save` writes the stale `archived: false` back, leaving a run that
+    // looks active but whose workspace is gone and cannot be recreated. These
+    // drive the real call sites: mutating either back to `save()` fails here.
+
+    /// Model the reviewer archiving `run` from the web UI: a separate load,
+    /// flag, save — exactly what the archive endpoint does — while `run`'s
+    /// in-memory copy still says `archived: false`.
+    fn archive_on_disk(name: &str) {
+        let mut disk = RunState::load(name).expect("run is on disk");
+        disk.archived = true;
+        disk.save().expect("archive it");
+    }
+
+    #[test]
+    fn phase_start_does_not_un_archive_a_run_archived_while_it_worked() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let mut run = make_run("phase-start-archived");
+        run.save().unwrap();
+        archive_on_disk("phase-start-archived");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        assert!(
+            RunState::load("phase-start-archived").unwrap().archived,
+            "phase_start's save must not resurrect a run archived while it ran"
+        );
+    }
+
+    #[test]
+    fn phase_wait_does_not_un_archive_a_run_archived_while_it_blocked() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let mut run = make_run("phase-wait-archived");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // The phase finishes...
+        std::fs::write(done_marker("phase-wait-archived", "plan"), b"").unwrap();
+        // ...but the reviewer archived the run while the wait was blocked.
+        archive_on_disk("phase-wait-archived");
+
+        let outcome = phase_wait(&h, &mut run, "plan", 2000).unwrap();
+
+        assert_eq!(outcome, PhaseWaitOutcome::Done);
+        assert!(
+            RunState::load("phase-wait-archived").unwrap().archived,
+            "phase_wait's save must not resurrect a run archived while it blocked"
+        );
+    }
+
     #[test]
     fn wait_timeout_leaves_running() {
         let _lock = ENV_LOCK.lock().unwrap();

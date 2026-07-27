@@ -377,6 +377,62 @@ check('...and the cursor then stops drifting across rows',
   drift.every(k => k === released), true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
+console.log('\n== session list: a filtered-out row is still not the reviewer\'s doing ==');
+// A filter narrows the list, so when the reviewer TYPES, the cursor should follow
+// into what remains — and it does, because the filter input resets the anchor on
+// every keystroke. But the filtered set is recomputed on every 2s poll too, and a
+// run's `state` changes server-side constantly. If the selected run's new state
+// stops matching the filter text, its row leaves with no user action at all.
+// Treating "a filter is active" as "the reviewer did this" handed the cursor to
+// whatever slid into the slot — the same wrong-run archive, reachable again.
+await goto('#/', LIST_READY);
+await press('/');
+// Every active run's task is "task for <name>", so this matches all of them and
+// the list still has rows left after one drops out — an earlier version filtered
+// down to a single visible row, so removing it hit the empty-list branch and the
+// scenario never ran at all.
+await typeText('task');
+await waitFor(rowNames, r => r.length >= 3, 4000, 'filter matched at least three runs');
+// ArrowDown, not `j`: focus is still in the filter box, where `j` is just text.
+// (An earlier version pressed `j`, silently made the filter "taskj", matched
+// nothing, and asserted against an empty list.)
+await press('ArrowDown');
+const filtered = await cursorName();
+check('the filter is still the one we typed', await evaluate(`return listFilter;`), 'task');
+check('...and the cursor is on a row the filter matches',
+  (await rowNames()).indexOf(filtered) !== -1, true);
+// Exactly what the next poll returns when this run's task text changes so it no
+// longer matches. Nothing else changes; the reviewer touches nothing.
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === ${JSON.stringify(filtered)} ? Object.assign({}, x, {task: 'chore'}) : x;
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the filtered-out row really left the list',
+  (await rowNames()).indexOf(filtered), -1);
+check('...and rows remain, so this is not the empty-list branch',
+  (await rowNames()).length > 0, true);
+check('a poll filtering out the selected row does not reassign the anchor',
+  await evaluate(`return navCursorKey;`), filtered);
+check('...and no visible row is marked selected',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 0);
+check('...so `a` has no row to act on',
+  await evaluate(`var r = navRows()[navCursor]; return r ? rowKey(r) : null;`), null);
+await evaluate(`window.__restoreFetch(); return 1;`);
+await press('Escape');
+
 console.log('\n== session list: the cursor survives a failed fetch ==');
 await goto('#/', LIST_READY);
 await press('g');

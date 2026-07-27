@@ -772,6 +772,28 @@ Two consequences worth knowing:
    predates the change — plain `save` always did this — but it is now reachable from two more
    writers.
 
+## Three of the six `save_preserving_archived` sites are redundant, and untestable
+
+Found 2026-07-26. Working as intended; recorded so nobody "fixes" the missing coverage.
+
+Six writers now call `save_preserving_archived`: `phase_start`, `spawn_reviewer`, `phase_wait`,
+`code_review_run`'s deadline and final saves, and `cmd_code_review`'s. Mutating any of the
+first three back to a plain `save` fails the suite. The last three cannot be caught, and the
+reason is structural rather than a coverage gap:
+
+`code_review_run`'s poll loop makes NO herdr calls — it polls marker files on disk — and every
+`agent_status` call happens inside `spawn_reviewer`'s readiness wait, i.e. before that
+function's own save. So there is no point in the run where an archive can land *after* the
+last spawn save but *before* the deadline save. Any archive that reaches those later writers
+was already rescued into memory by `spawn_reviewer`, which means a plain `save` there would
+write the correct value anyway.
+
+They are kept preserving for consistency — a future writer that saves without spawning first
+would need it, and the asymmetry would be a trap. But do not add a test claiming to cover
+them without first building a seam that can actually trigger it; a test named for a path it
+does not exercise is worse than no test. One was written during this review and deleted for
+exactly that reason.
+
 ## A panicking test can poison `ENV_LOCK` for the whole suite
 
 Found 2026-07-26. Pre-existing, not fixed.
