@@ -12,8 +12,9 @@ You did not write this code — review it as a skeptic, not its author.
 ## Do
 
 1. **Read the ground truth**, in this order: the approved spec at
-   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports the driver passes to you as
-   context, and then the
+   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports in the `## Context from the
+   driver` section — if it says none were supplied, read the `*-HANDOFF.md` files in the run
+   dir yourself — and then the
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the
    reports.
 2. **Review against the checklist — apply the check discipline from `drovr:code-review`

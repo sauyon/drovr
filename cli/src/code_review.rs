@@ -265,9 +265,14 @@ fn build_seed(
 ) -> String {
     // Rendered only when there is context: an empty "## Context from the driver"
     // heading reads as "the driver had nothing to say", which is worse than silence.
+    // Always emitted, matching the phase briefs: a section that appears only sometimes is
+    // one a brief cannot refer to, and its absence is indistinguishable from a delivery
+    // failure. Say "none supplied" instead of saying nothing.
     let context_section = match context.map(str::trim).filter(|c| !c.is_empty()) {
         Some(c) => format!("## Context from the driver\n\n{c}\n\n"),
-        None => String::new(),
+        None => "## Context from the driver\n\n*(none supplied — review the diff and the \
+                 repository on their own terms.)*\n\n"
+            .to_string(),
     };
     format!(
         "# Review angle: {angle}\n\n\
@@ -1998,8 +2003,9 @@ mod tests {
             None,
         );
         assert!(
-            !without.contains("## Context from the driver"),
-            "no context must mean no empty section: {without}"
+            without.contains("## Context from the driver") && without.contains("none supplied"),
+            "the section is always present, marked unsupplied — matching the phase \
+             briefs, so a brief can always refer to it: {without}"
         );
     }
 
@@ -2070,7 +2076,10 @@ mod tests {
             !seed.contains("stale context"),
             "an explicitly empty --context must drop the record, not fall through: {seed}"
         );
-        assert!(!seed.contains("## Context from the driver"));
+        assert!(
+            seed.contains("none supplied"),
+            "and says so explicitly: {seed}"
+        );
     }
 
     /// A driver that spawns its own read-only reviewer (in-harness subagent, no herdr

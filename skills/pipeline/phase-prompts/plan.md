@@ -14,7 +14,8 @@ implementation plan broken into independently-executable tasks. You are NOT impl
 ## Do
 
 1. **Read the approved spec** at `~/.local/share/drovr/runs/<run>/spec.md` and the brainstorm
-   handoff in the `## Context from the driver` section. Read the real source (read-only
+   handoff in the `## Context from the driver` section. If that section says none was
+   supplied, run `drovr collect <run> brainstorm` yourself. Read the real source (read-only
    explorers for fan-out) so tasks bind to
    actual signatures, not guesses.
 2. **Write the plan** to `~/.local/share/drovr/runs/<run>/plan.md` as an ordered task list.

@@ -15,6 +15,7 @@
 //! becoming Rust string literals, so they remain readable and reviewable as documents.
 
 use std::io;
+use std::io::Read;
 use std::path::Path;
 
 use crate::run::{RunState, run_dir};
@@ -172,7 +173,23 @@ fn read_record_no_follow(path: &Path) -> io::Result<Option<String>> {
             ),
         ));
     }
-    if meta.len() > MAX_CONTEXT {
+    // Must be a REGULAR file, checked BEFORE opening. "Not a symlink" was not enough: a
+    // FIFO passes that check and then `read_to_string` blocks forever, hanging the driver
+    // on every brief it composes. Devices and directories are equally not records.
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a regular file; refusing to read a brief's context from it",
+                path.display()
+            ),
+        ));
+    }
+    // Recording appends a trailing newline, so a context of exactly MAX_CONTEXT bytes is
+    // MAX_CONTEXT + 1 on disk. Allowing that byte keeps an at-limit `--context` from being
+    // accepted on the way in and then refused on reuse.
+    let limit = MAX_CONTEXT + 1;
+    if meta.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -182,7 +199,21 @@ fn read_record_no_follow(path: &Path) -> io::Result<Option<String>> {
             ),
         ));
     }
-    Ok(Some(std::fs::read_to_string(path)?))
+    // Bound the READ, not just the metadata check: the file can grow between the two, so a
+    // metadata-only cap is a TOCTOU that lets an oversized record through.
+    let file = std::fs::File::open(path)?;
+    let mut text = String::new();
+    std::io::Read::take(file, limit + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past the {MAX_CONTEXT}-byte context limit while being read",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(text))
 }
 
 /// Resolve the context for a brief. Three cases, deliberately distinct:
@@ -202,6 +233,18 @@ pub fn resolve_context(
     let path = context_record(dir, key);
     match supplied {
         Some(text) if !text.trim().is_empty() => {
+            // Enforced here as well as in the CLI: this is the function every caller goes
+            // through, so the limit belongs at this boundary and not only at the one in
+            // front of it today.
+            if text.trim().len() as u64 > MAX_CONTEXT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "context is {} bytes, over the {MAX_CONTEXT}-byte limit",
+                        text.trim().len()
+                    ),
+                ));
+            }
             std::fs::create_dir_all(dir)?;
             write_no_follow(&path, &format!("{}\n", text.trim()))?;
             Ok(Some(text.trim().to_owned()))
@@ -732,12 +775,38 @@ mod tests {
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
-        let big = "x".repeat(MAX_CONTEXT as usize + 1);
+        // Clearly over: MAX + 2. (MAX + 1 is legal — recording appends a newline, so an
+        // at-limit context is MAX + 1 on disk; see the round-trip assertion below.)
+        let big = "x".repeat(MAX_CONTEXT as usize + 2);
         std::fs::write(context_record(&dir, "plan"), &big).unwrap();
 
         let err = compose_phase_brief(&run, "plan", None)
             .expect_err("an oversized record must be refused");
         assert!(err.to_string().contains("context limit"), "says why: {err}");
+    }
+
+    /// Round 5: a context of exactly `MAX_CONTEXT` was accepted on the way in and then
+    /// REFUSED on reuse, because recording appends a newline and the read cap did not
+    /// account for it. An at-limit context must survive the round trip.
+    #[test]
+    fn an_at_limit_context_survives_being_recorded_and_reused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("at-limit-roundtrip");
+        let run = make_run();
+        let at_limit = "y".repeat(MAX_CONTEXT as usize);
+
+        let first = compose_phase_brief(&run, "plan", Some(&at_limit))
+            .expect("an at-limit context must be accepted");
+        let reused =
+            compose_phase_brief(&run, "plan", None).expect("and must still be readable on reuse");
+        assert_eq!(first, reused, "the round trip must be lossless");
+
+        // One byte more must not be accepted at all.
+        let over = "y".repeat(MAX_CONTEXT as usize + 1);
+        assert!(
+            compose_phase_brief(&run, "plan", Some(&over)).is_err(),
+            "over-limit context must be refused at the boundary that records it"
+        );
     }
 
     /// The implement-task scope pointer must not send an agent to a section that is not

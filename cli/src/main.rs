@@ -917,7 +917,13 @@ fn cmd_phase(sub: PhaseCmd) {
             let text = if text == "-" {
                 // Bounded: a prompt is a message, and an accidental `cat huge.bin |` would
                 // otherwise be read wholly into memory and then typed into a pane.
-                const MAX_STDIN: u64 = 1 << 20; // 1 MiB — far above any real brief
+                //
+                // Deliberately LARGER than MAX_CONTEXT: the canonical use of `send -` is
+                // `drovr phase brief … | drovr phase send … -`, and a brief is the template
+                // frame PLUS up to MAX_CONTEXT of context. Reusing the context cap here
+                // would let a legitimate at-limit brief be rejected by the very remediation
+                // drovr prints.
+                const MAX_STDIN: u64 = 4 << 20; // 4 MiB
                 let mut buf = String::new();
                 if let Err(e) =
                     io::Read::read_to_string(&mut io::Read::take(io::stdin(), MAX_STDIN), &mut buf)
@@ -1147,6 +1153,69 @@ fn cmd_review(sub: ReviewCmd) {
 /// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
 /// context to be in the brief, and silently reviewing without it is the failure this
 /// whole mechanism exists to prevent.
+/// Read `--context-file`: a regular file, not through a symlink, size-bounded.
+///
+/// The path is often inside the run dir, which agents write to (handoffs live there), so it
+/// gets the same treatment as a recorded context: a symlink there would inject an arbitrary
+/// readable file into the brief, a FIFO would hang the driver on `read_to_string`, and a
+/// metadata-only size check is a TOCTOU the read itself has to enforce.
+fn read_context_file(path: &std::path::Path) -> String {
+    use brief::MAX_CONTEXT;
+    let bail = |msg: String| -> ! {
+        eprintln!("drovr: {msg}");
+        process::exit(1);
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    if meta.file_type().is_symlink() {
+        bail(format!(
+            "--context-file {} is a symlink; pass the real path",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        bail(format!(
+            "--context-file {} is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
+             context; check what you passed",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    let mut text = String::new();
+    if let Err(e) = io::Read::read_to_string(&mut io::Read::take(file, MAX_CONTEXT + 1), &mut text)
+    {
+        bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        ));
+    }
+    if text.len() as u64 > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} grew past the {MAX_CONTEXT}-byte limit while being read",
+            path.display()
+        ));
+    }
+    text
+}
+
 fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
     // One cap for every path context can arrive by, defined next to the record I/O that
     // enforces it on reuse.
@@ -1161,28 +1230,7 @@ fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> O
             process::exit(1);
         }
         (Some(text), _) => Some(text),
-        (None, Some(path)) => {
-            // Check the SIZE before reading, so an enormous file is refused rather than
-            // loaded into memory first and rejected afterwards.
-            if let Ok(meta) = std::fs::metadata(&path)
-                && meta.len() > MAX_CONTEXT
-            {
-                eprintln!(
-                    "drovr: --context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — \
-                     that is not a context; check what you passed",
-                    path.display(),
-                    meta.len()
-                );
-                process::exit(1);
-            }
-            match std::fs::read_to_string(&path) {
-                Ok(text) => Some(text),
-                Err(e) => {
-                    eprintln!("drovr: cannot read --context-file {}: {e}", path.display());
-                    process::exit(1);
-                }
-            }
-        }
+        (None, Some(path)) => Some(read_context_file(&path)),
         (None, None) => None,
     }
 }

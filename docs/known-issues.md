@@ -336,6 +336,13 @@ symlinks, which turned recording into a clobber of the link's target).
 outside the run dir — a driver-side store keyed by run+phase. That is a design change, not a
 patch.
 
+**Hardlinks sit inside this same gap.** Reading a record refuses symlinks and non-regular files,
+but a HARDLINK at the record path is indistinguishable from the record itself and reads through to
+its target. Not separately patched, for the same reason: an actor who can create that link can
+already write the record's content directly, so refusing `nlink > 1` would add a check whose only
+effect is to imply a boundary that is not there. The narrow residue — linking a file one can link
+but not read — is bounded by `fs.protected_hardlinks`, which is on by default on Linux.
+
 ## A read-only cursor reviewer can park at plan mode's "Ready to build?" gate (2026-07-27)
 
 **Severity:** medium — the reviewer never reports, and neither `idle` nor `blocked` distinguishes
@@ -428,11 +435,19 @@ is where the truncation is.
 100 characters. Short lines wrap instead of truncating, so they survive. Rationale is lost, which
 is a real cost — the summary alone is usually enough to act on, but not always.
 
-**Fix ideas, in order of preference:** (1) have drovr read findings from a channel it controls
-rather than the terminal — the reviewer already runs in a pane drovr spawned, so a file it is
-*permitted* to write (or a fifo) beats scraping; (2) instruct short lines in the seed itself
-rather than per-invocation context; (3) accept unfenced JSON (above), which is necessary but not
-sufficient on its own.
+**There IS a durable channel, found 2026-07-27:** a cursor reviewer in `--mode plan` saves its
+work to `~/.cursor/plans/<title>-<id>.plan.md` and prints the path
+(`Saved to home/sauyon/.cursor/plans/Security Review Findings-4ea3cb76.plan.md`). That file holds
+the FULL review — untruncated rationale, the "no finding" verifications, findings separated from
+nits — and is incomparably better than anything scraped from a pane. Round 5's security findings
+were only fully legible there.
+
+**Fix ideas, in order of preference:** (1) harvest the plan file: match the newest
+`~/.cursor/plans/*.plan.md` for the reviewer (title + mtime) and parse findings from it, falling
+back to the transcript. Cursor-specific, so it needs a per-agent hook rather than a hard-coded
+path; (2) any other channel drovr controls — the reviewer runs in a pane drovr spawned, so a file
+it is *permitted* to write beats scraping; (3) instruct short lines in the seed rather than in
+per-invocation context; (4) accept unfenced JSON — done, necessary but not sufficient.
 
 ## One failing test cascades: a panic while holding `ENV_LOCK` poisons it (2026-07-27)
 
