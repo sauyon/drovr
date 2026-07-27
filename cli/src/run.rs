@@ -84,11 +84,15 @@ impl std::fmt::Display for PassToken {
 /// The cost of that convenience, for whoever adds the next field:
 /// * The compiler no longer flags construction sites that ought to populate it.
 ///   Grep the `..Default::default()` sites and decide each one deliberately.
-/// * No field here is `#[serde(default)]`, so deserialization REQUIRES all of
-///   them. A new field without `#[serde(default)]` makes every existing
-///   `state.json` fail to load → `load_run` exits 1 → the run STOPs. Mirror
-///   `RunState`'s `#[serde(default, skip_serializing_if = "Option::is_none")]`
-///   and add a back-compat test for it.
+/// * The first five fields (`name` … `herdr_session`) are NOT
+///   `#[serde(default)]`, so deserialization requires them; every field added
+///   since (`pass`, `tab_id`, `pane_agent`, `reaped`) carries its own
+///   `#[serde(default, skip_serializing_if = …)]`. There is no struct-level
+///   default: a new field without that attribute makes every existing
+///   `state.json` fail to load → `load_run` exits 1 → the run STOPs. Mirror what
+///   the four newer fields do, and add a back-compat test for it (see
+///   `missing_phase_pass_defaults_to_none` /
+///   `missing_phase_capture_fields_default_to_absent`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Phase {
     pub name: String,

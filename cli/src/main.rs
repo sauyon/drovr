@@ -298,6 +298,37 @@ fn cmd_list() {
     }
 }
 
+/// Create the run's herdr workspace and label its root shell pane, returning
+/// `(workspace_id, root_pane_id)` — `(None, None)` if herdr could not create it,
+/// which is a warning rather than a failure (the run still exists; `phase start`
+/// is what needs the workspace).
+///
+/// The workspace is created in the project dir so the root shell and every phase
+/// tab start already `cd`'d into the project.
+///
+/// **The rename is why this is a function.** No phase ever runs in the root
+/// pane, so it sits in the switcher for the whole run showing an idle shell
+/// prompt with nothing to explain it. Labelling it says what it is and which run
+/// it anchors. Best-effort: a failed rename is cosmetic and must not cost the
+/// run its workspace.
+fn create_run_workspace<H: Herdr>(
+    herdr: &H,
+    name: &str,
+    project_dir: &str,
+) -> (Option<String>, Option<String>) {
+    let ws = match herdr.workspace_create(&format!("drovr:{name}"), project_dir) {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("drovr: warning: could not create herdr workspace: {e}");
+            return (None, None);
+        }
+    };
+    if let Err(e) = herdr.pane_rename(&ws.root_pane, &format!("drovr:{name} (idle shell)")) {
+        eprintln!("drovr: warning: could not label the run's root shell pane: {e}");
+    }
+    (Some(ws.id), Some(ws.root_pane))
+}
+
 fn cmd_new(
     name: &str,
     task: Option<String>,
@@ -368,16 +399,7 @@ fn cmd_new(
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    // Create the workspace in the project dir so its root shell pane (reused by
-    // the first phase) and every later tab start already `cd`'d into the project.
-    let (workspace, root_pane) =
-        match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
-            Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
-            Err(e) => {
-                eprintln!("drovr: warning: could not create herdr workspace: {e}");
-                (None, None)
-            }
-        };
+    let (workspace, root_pane) = create_run_workspace(herdr, name, &project_dir);
 
     let run = RunState {
         name: name.to_owned(),
@@ -434,55 +456,93 @@ fn cmd_status(name: &str) {
     }
 }
 
+/// What `drovr attach` connects the human to.
+///
+/// The two variants are not interchangeable: one is an agent conversation, the
+/// other is a bare shell. Attaching prints which it is, so nobody types a prompt
+/// at a `sh` prompt believing an agent is listening.
+#[derive(Debug)]
+enum AttachTarget<'a> {
+    Phase { phase: &'a str, pane: &'a str },
+    RootShell { pane: &'a str },
+}
+
+/// Pick what `drovr attach <run>` should connect to, in preference order:
+///
+/// 1. the phase currently being worked (`first_incomplete`), if it holds a pane;
+/// 2. otherwise the LAST phase that still holds one — a finished run, or one
+///    whose current phase has not been started yet;
+/// 3. otherwise the workspace's idle root shell, which no phase ever occupies
+///    and which therefore outlives them all;
+/// 4. otherwise nothing — a run whose workspace creation failed at `drovr new`.
+///
+/// Rungs 2–3 matter more than they used to. Phase panes are no longer permanent:
+/// nothing yet closes them, but the point of this change is that a phase tab
+/// *can* be closed without taking the workspace with it. Exiting 1 on the
+/// human's "show me this run" once the panes are gone is a worse answer than the
+/// shell that anchors it.
+fn attach_target(run: &RunState) -> Option<AttachTarget<'_>> {
+    let phase_pane = run
+        .first_incomplete()
+        .and_then(|i| run.phases.get(i))
+        .filter(|p| p.pane_id().is_some())
+        .or_else(|| run.phases.iter().rev().find(|p| p.pane_id().is_some()))
+        // Carry the pane out of the same `Option` the phase came from, so there
+        // is no second lookup to get out of step with the filter above.
+        .and_then(|p| p.pane_id().map(|pane| (p.name.as_str(), pane)));
+    match phase_pane {
+        Some((phase, pane)) => Some(AttachTarget::Phase { phase, pane }),
+        None => run
+            .root_pane
+            .as_deref()
+            .map(|pane| AttachTarget::RootShell { pane }),
+    }
+}
+
 fn cmd_attach(name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
-    // Find the current/last-running phase pane
-    let pane_id = run
-        .first_incomplete()
-        .and_then(|i| run.phases.get(i))
-        .and_then(|p| p.pane_id())
-        .or_else(|| {
-            // If all done, use the last phase's pane
-            run.phases.last().and_then(|p| p.pane_id())
-        });
 
-    match pane_id {
-        Some(id) => {
-            // Shell out: herdr agent attach <pane_id>
-            let status = std::process::Command::new("herdr")
-                .args(["agent", "attach", id])
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("drovr: failed to exec herdr: {e}");
-                    process::exit(1);
-                });
-            if !status.success() {
-                process::exit(status.code().unwrap_or(1));
-            }
+    let pane_id = match attach_target(&run) {
+        // Name the phase: rungs 2–3 below can land somewhere other than the
+        // phase the human had in mind, and a silent attach hides which.
+        Some(AttachTarget::Phase { phase, pane }) => {
+            eprintln!("drovr: attaching to phase '{phase}' of run '{name}'");
+            pane
+        }
+        Some(AttachTarget::RootShell { pane }) => {
+            eprintln!(
+                "drovr: no phase of run '{name}' has a live pane; attaching to the run's \
+                 idle workspace shell instead (this is a plain shell, not an agent)"
+            );
+            pane
         }
         None => {
             eprintln!(
-                "drovr: no active pane for run '{name}'; try: drovr phase start {} <phase>",
+                "drovr: run '{name}' has no pane to attach to (no phase pane, and no herdr \
+                 workspace); try: drovr phase start {} <phase>",
                 shell_single_quote(name)
             );
             process::exit(1);
         }
+    };
+
+    // Shell out: herdr agent attach <pane_id>
+    let status = std::process::Command::new("herdr")
+        .args(["agent", "attach", pane_id])
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("drovr: failed to exec herdr: {e}");
+            process::exit(1);
+        });
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
     }
 }
 
-/// Every pane id drovr created for `run`, in creation order and deduped: the
-/// workspace's root pane while no phase has claimed it yet (`phase_start` moves
-/// that id onto the phase, so it lives in exactly one place), each phase's pane,
-/// each reviewer's pane, and every pane retired from a phase but still drovr's
-/// (see `RunState::retired_panes`).
-///
-/// This list is the whole definition of "drovr's panes" at cleanup: a pane drovr
-/// created but failed to record is indistinguishable from one the human opened,
-/// and is therefore left alone.
 /// Carry what a code-review panel recorded onto a freshly loaded run state.
 ///
 /// **Transplant, never write `state` back wholesale.** A panel runs for many
@@ -512,6 +572,19 @@ fn merge_panel_progress(merged: &mut RunState, state: &RunState) {
     }
 }
 
+/// Every pane id drovr created for `run`, in creation order and deduped: the
+/// workspace's idle root pane, each phase's pane, each reviewer's pane, and
+/// every pane retired from a phase but still drovr's (see
+/// `RunState::retired_panes`).
+///
+/// `root_pane` is now an unconditional entry — no phase ever claims that id, so
+/// it stays in exactly one place for the run's lifetime. (It used to move onto
+/// the first phase, which is why the dedup below exists and why a `state.json`
+/// written by an older build can still list it in both places.)
+///
+/// This list is the whole definition of "drovr's panes" at cleanup: a pane drovr
+/// created but failed to record is indistinguishable from one the human opened,
+/// and is therefore left alone.
 fn drovr_pane_ids(run: &RunState) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let ids = run
@@ -1414,11 +1487,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The set of panes drovr owns: every phase pane, every reviewer pane, and
-    /// `root_pane` when no phase ever claimed it (a run cleaned up before its
-    /// first `phase start` — nothing else records that pane).
+    /// The set of panes drovr owns: `root_pane` (which no phase ever claims, so
+    /// it is always drovr's to reclaim), every phase pane, and every reviewer
+    /// pane.
     #[test]
-    fn drovr_pane_ids_covers_phases_reviewers_and_an_unclaimed_root() {
+    fn drovr_pane_ids_covers_phases_reviewers_and_the_root_shell() {
         let mut run = RunState {
             name: "r".into(),
             task: "t".into(),
@@ -1462,11 +1535,146 @@ mod tests {
         assert_eq!(drovr_pane_ids(&run), vec!["w:root", "w:p1", "w:p2", "w:p0"]);
         run.retired_panes = vec![];
 
-        // Once a phase claims the root pane, `root_pane` is cleared and the phase
-        // carries the id — it must appear exactly once either way.
+        // A `state.json` written by an older build, where the first phase DID
+        // claim the root pane: the id must still appear exactly once.
         run.root_pane = None;
         run.phases[1].set_pane("w:root");
         assert_eq!(drovr_pane_ids(&run), vec!["w:p1", "w:root", "w:p2"]);
+    }
+
+    /// A `RunState` carrying just the fields `attach_target` reads.
+    fn attach_run(phases: Vec<(&str, PhaseStatus, Option<&str>)>, root: Option<&str>) -> RunState {
+        RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: phases
+                .into_iter()
+                .map(|(name, status, pane)| {
+                    let mut p = run::Phase::new(name);
+                    p.status = status;
+                    if let Some(pane) = pane {
+                        p.set_pane(pane);
+                    }
+                    p
+                })
+                .collect(),
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: root.map(str::to_owned),
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        }
+    }
+
+    /// What `drovr attach` connects to, in preference order — and why the last
+    /// two rungs exist: once phases are reaped, a finished run holds no phase
+    /// pane at all, and exiting 1 on the human's "show me this run" is a worse
+    /// answer than the workspace's idle shell.
+    #[test]
+    fn attach_prefers_the_incomplete_phase_then_the_last_pane_then_the_root_shell() {
+        use PhaseStatus::{Done, Running};
+
+        // The phase actually being worked wins, even though a later one has a pane.
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Running, Some("w:p2")),
+                ("review", PhaseStatus::Pending, Some("w:p3")),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::Phase {
+                phase: "implement",
+                pane: "w:p2"
+            })
+        ));
+
+        // All done → the last phase that still holds a pane.
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Done, Some("w:p2")),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::Phase {
+                phase: "implement",
+                pane: "w:p2"
+            })
+        ));
+
+        // The incomplete phase has no pane (never started, or reaped) → still
+        // the last phase holding one, rather than nothing.
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Running, None),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::Phase {
+                phase: "brainstorm",
+                pane: "w:p1"
+            })
+        ));
+
+        // No phase pane anywhere → the run's idle root shell, reported as such
+        // so the human is not told they are looking at an agent.
+        let run = attach_run(vec![("brainstorm", Done, None)], Some("w:root"));
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+
+        // Nothing at all (a run whose workspace creation failed) → None.
+        let run = attach_run(vec![("brainstorm", Done, None)], None);
+        assert!(attach_target(&run).is_none());
+    }
+
+    /// `drovr new` labels the workspace's root shell so the idle tab explains
+    /// itself, and a failed rename is cosmetic — it must never cost the run its
+    /// workspace.
+    #[test]
+    fn new_labels_the_idle_root_shell_and_survives_a_failed_rename() {
+        use crate::herdr::FakeHerdr;
+
+        let h = FakeHerdr::new();
+        let (ws, root) = create_run_workspace(&h, "alpha", "/tmp/p");
+        let root = root.expect("workspace_create yields a root pane");
+        assert!(ws.is_some());
+        let rename = h
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("pane_rename"))
+            .expect("the root shell must be renamed");
+        assert!(
+            rename.contains(&format!("pane={root}")),
+            "the RUN's root pane is what gets renamed: {rename}"
+        );
+        assert!(
+            rename.contains("alpha") && rename.to_lowercase().contains("idle"),
+            "the label must name the run and say the shell is idle: {rename}"
+        );
+
+        let h = FakeHerdr::new();
+        h.fail_pane_rename();
+        let (ws, root) = create_run_workspace(&h, "beta", "/tmp/p");
+        assert!(
+            ws.is_some() && root.is_some(),
+            "a cosmetic rename failure must not discard the workspace"
+        );
     }
 
     /// `drovr cleanup` must leave the run marked archived. Without it the session

@@ -540,41 +540,74 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 // ---------------------------------------------------------------------------
 
 /// The pane that is this run's live agent session: the first phase still
-/// `Running` (with a pane), else the workspace root pane. `None` when the run
-/// has no live pane to mirror.
+/// `Running` (with a pane), else the last phase that still holds one. `None`
+/// when the run has no live agent pane to mirror.
+///
+/// **The workspace root pane is deliberately not a fallback.** It once was, but
+/// only reachably so before the first `phase start`, because that phase then
+/// claimed the pane. Phases now leave the root shell alone for the whole run
+/// (see `phase_start`), so falling back to it would point the mirror at an idle
+/// `sh` prompt and present it as the run's agent. `None` — which the endpoints
+/// render as 204 / "no live pane" — is the honest answer.
 fn active_pane(run: &RunState) -> Option<String> {
     run.phases
         .iter()
         .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id().is_some())
+        .or_else(|| run.phases.iter().rev().find(|ph| ph.pane_id().is_some()))
         .and_then(|ph| ph.pane_id().map(str::to_owned))
-        .or_else(|| run.root_pane.clone())
 }
 
-/// Every pane id that belongs to `run` (phases, review panels, root pane). The
-/// allow-list that gates `?pane=<id>` so a run-scoped endpoint can never be used
-/// to read or write an arbitrary herdr pane outside the run.
-fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    for ph in run.phases.iter().chain(run.review_phases.iter()) {
-        if let Some(pane) = ph.pane_id() {
-            set.insert(pane.to_owned());
-        }
-    }
+/// What a request wants to do with the pane it names, which decides which
+/// allow-list gates it — see [`run_writable_panes`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Every pane a run-scoped endpoint may READ: each phase pane, each reviewer
+/// pane, and the workspace's idle root shell. The allow-list that stops
+/// `?pane=<id>` from being used to reach an arbitrary herdr pane outside the run.
+fn run_readable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = run_writable_panes(run);
     if let Some(root) = &run.root_pane {
         set.insert(root.clone());
     }
     set
 }
 
-/// Resolve which pane a `/pane` or `/send` request targets. An explicit
-/// `?pane=<id>` is honored only when it belongs to `run` (else `None`); with no
-/// param, falls back to the run's [`active_pane`].
-fn resolve_pane(run: &RunState, url: &str) -> Option<String> {
+/// Every pane a run-scoped endpoint may WRITE (`/send`, `/keys`): the agent
+/// panes only — the root shell is excluded.
+///
+/// **This is not a privilege boundary.** Typing into a live claude pane is
+/// arbitrary code execution by design, so the unauthenticated server's reach is
+/// exactly what it was. It is a footgun guard: the root shell is a bare `sh`
+/// that now stays alive for the whole run, so a `/send` resolving there would
+/// execute the user's *prose* as a shell command instead of prompting an agent.
+fn run_writable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for ph in run.phases.iter().chain(run.review_phases.iter()) {
+        if let Some(pane) = ph.pane_id() {
+            set.insert(pane.to_owned());
+        }
+    }
+    set
+}
+
+/// Resolve which pane a `/pane`, `/send` or `/keys` request targets. An explicit
+/// `?pane=<id>` is honored only when it belongs to `run` under `access` (else
+/// `None`); with no param, falls back to the run's [`active_pane`], which never
+/// yields the root shell and so needs no further gating.
+fn resolve_pane(run: &RunState, url: &str, access: Access) -> Option<String> {
     match query_param(url, "pane") {
         // Pane ids contain a `:` (`w16:p3`), which the browser's
         // `encodeURIComponent` sends as `%3A` — decode before matching, or the
         // allow-list never hits and every explicitly-selected pane 409s.
-        Some(requested) => run_pane_ids(run).take(&percent_decode(&requested)),
+        Some(requested) => match access {
+            Access::Read => run_readable_panes(run),
+            Access::Write => run_writable_panes(run),
+        }
+        .take(&percent_decode(&requested)),
         None => active_pane(run),
     }
 }
@@ -613,7 +646,8 @@ fn percent_decode(s: &str) -> String {
 /// `GET /api/runs/<run>/pane[?pane=<id>]` — the recent transcript of a run
 /// agent's session, as plain text (204 when there is no such live pane).
 fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Read))
+    else {
         respond_empty(req, 204);
         return;
     };
@@ -631,7 +665,8 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// agent's pane (herdr submits it). 409 when there is no such live pane.
 fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
     let text = read_body(&mut req);
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -694,7 +729,8 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
             return;
         }
     };
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -1716,8 +1752,16 @@ mod tests {
         assert_eq!(v[0]["state"], "idle");
     }
 
+    /// The mirror's default target: the running phase, else the last phase that
+    /// still holds a pane, else nothing.
+    ///
+    /// It used to fall back to `run.root_pane`, which was dead code while the
+    /// first phase consumed that pane. Now that the root shell stays idle for
+    /// the whole run, that fallback would silently point the UI at an empty
+    /// shell — so the honest answer when no phase has a pane is `None` (204 /
+    /// "no live pane"), not a shell prompt dressed up as an agent.
     #[test]
-    fn active_pane_prefers_running_phase_then_root() {
+    fn active_pane_prefers_running_phase_then_last_pane_never_root() {
         let mkphase = |name: &str, status, pane: Option<&str>| {
             let mut p = {
                 let mut p = crate::run::Phase::new(name);
@@ -1750,12 +1794,49 @@ mod tests {
         };
         // Running phase wins.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
-        // No running phase → falls back to the workspace root pane.
+        // No running phase → the LAST phase that still holds a pane, so the
+        // mirror follows the run forward rather than snapping back to the first.
         run.phases[1].status = crate::run::PhaseStatus::Done;
-        assert_eq!(active_pane(&run).as_deref(), Some("w:root"));
-        // Neither → None.
-        run.root_pane = None;
+        assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
+        // A phase whose pane is gone is skipped, not preferred for being last.
+        run.phases[1].mark_reaped();
+        assert_eq!(active_pane(&run).as_deref(), Some("w:p1"));
+        // No phase pane at all → None, even though the idle root shell is live.
+        run.phases[0].mark_reaped();
+        assert!(
+            run.root_pane.is_some(),
+            "the root shell outlives the phases"
+        );
         assert_eq!(active_pane(&run), None);
+    }
+
+    /// `POST /send` must never resolve to the workspace's idle root shell.
+    ///
+    /// Not a privilege boundary — sending into a live claude pane is arbitrary
+    /// code execution by design, and that surface is unchanged. It is a
+    /// footgun: the root shell is a bare `sh` alive for the whole run, so a
+    /// `/send` landing there runs the user's PROSE as a shell command. Reading
+    /// it is harmless and stays allowed.
+    #[test]
+    fn the_root_shell_is_readable_but_never_writable() {
+        use crate::run::PhaseStatus::Running;
+        let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
+
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root"),
+            "mirroring the idle shell is fine"
+        );
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Write),
+            None,
+            "typing into the idle shell is not"
+        );
+        // A phase pane is writable, so the gate is about the root shell alone.
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
     }
 
     // A RunState with the given phases / review phases; other fields are inert.
@@ -1825,13 +1906,24 @@ mod tests {
             vec![],
         );
         // Explicit pane belonging to the run is honored.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:p3").as_deref(), Some("w:p3"));
-        // The root pane is in the allow-list.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:root").as_deref(), Some("w:root"));
-        // A pane outside the run is rejected (no silent fallback).
-        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99"), None);
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
+        // The root pane is in the READABLE allow-list (see
+        // `the_root_shell_is_readable_but_never_writable`).
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root")
+        );
+        // A pane outside the run is rejected (no silent fallback), read or write.
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Read), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Write), None);
         // No param → active_pane (first Running phase).
-        assert_eq!(resolve_pane(&run, "/x").as_deref(), Some("w:p1"));
+        assert_eq!(
+            resolve_pane(&run, "/x", Access::Write).as_deref(),
+            Some("w:p1")
+        );
     }
 
     #[test]
@@ -1840,11 +1932,14 @@ mod tests {
         let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
         // The browser sends encodeURIComponent("w:p3") = "w%3Ap3"; without
         // decoding it misses the allow-list and every selected pane 409s.
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3Ap3").as_deref(), Some("w:p3"));
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w%3Ap3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
         // Decoding must not open a hole: a foreign pane is still rejected.
-        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99", Access::Write), None);
         // Malformed escapes are passed through verbatim (and so simply miss).
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w%3", Access::Write), None);
     }
 
     #[test]

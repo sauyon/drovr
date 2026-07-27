@@ -417,21 +417,21 @@ pub fn phase_start<H: Herdr>(
     // Pick the pane this phase's `claude` will run in, WITHOUT splitting a new
     // pane beside an empty shell:
     //   * a restarting phase reuses its own recorded pane;
-    //   * the first phase reuses the workspace's root shell pane (taken here so
-    //     later phases don't);
-    //   * every later phase gets its own fresh tab (whose auto shell pane it
+    //   * every other phase gets its own fresh tab (whose auto shell pane it
     //     reuses).
+    //
+    // `run.root_pane` is deliberately NOT a candidate. The first phase used to
+    // claim it, which put a phase agent in the pane that anchors the whole
+    // workspace: closing that phase's tab would close the workspace out from
+    // under every other phase, and `drovr attach` / the review UI would have no
+    // stable thing to point at. The root shell now stays idle for the run's
+    // lifetime, and every phase tab is independently closeable. It is still
+    // drovr's pane — `drovr cleanup` reclaims it (`drovr_pane_ids` lists it
+    // first) — just never an agent's.
     let existing_pane =
         find_phase_idx(run, phase).and_then(|i| run.phases[i].pane_id().map(str::to_owned));
-    // `used_root` defers consuming `run.root_pane` until the launch actually
-    // succeeds — if `pane_run` fails, the root pane stays available for a retry
-    // instead of being silently forfeited to a fresh tab.
-    let mut used_root = false;
     let target_pane = if let Some(pane) = existing_pane {
         pane
-    } else if let Some(root) = run.root_pane.clone() {
-        used_root = true;
-        root
     } else if let Some(ws) = run.workspace.as_deref() {
         h.tab_create(ws, phase, &cwd)?
     } else {
@@ -451,11 +451,6 @@ pub fn phase_start<H: Herdr>(
     let agent = run.agent.as_deref().unwrap_or("claude");
     let launch = cfg.launch(agent, &cwd, false)?;
     launch_in_pane(h, &run.name, phase, &target_pane, launch.command(), &pass)?;
-    // The launch succeeded, so this phase has now claimed the root pane (if it
-    // used it); clear it so later phases don't try to reuse the same pane.
-    if used_root {
-        run.root_pane = None;
-    }
 
     // Find existing phase or append a new one
     let idx = match find_phase_idx(run, phase) {
@@ -500,8 +495,8 @@ pub fn phase_start<H: Herdr>(
 /// `DROVR_PHASE='<run>/<phase>' <launch_command>` via the shared `launch_in_pane`
 /// helper (DROVR_PHASE single-quoted; focus captured/restored).
 ///
-/// Reviewers ALWAYS get a fresh tab in the run workspace — they never consume
-/// `run.root_pane` (that belongs to the pipeline) — so a workspace is required;
+/// Reviewers ALWAYS get a fresh tab in the run workspace — like every pipeline
+/// phase, they never touch `run.root_pane` — so a workspace is required;
 /// this errors clearly if `run.workspace` is `None`.
 ///
 /// `seed` (if any) is recorded on the phase's `handoff_doc` for the caller to
@@ -2235,8 +2230,14 @@ mod tests {
         );
     }
 
+    /// The FIRST phase gets a tab of its own, exactly like every later one.
+    ///
+    /// It used to consume `run.root_pane` instead, which put a phase agent in
+    /// the pane that anchors the whole workspace — so reaping that phase's tab
+    /// would take the run's workspace with it. The root shell now stays idle
+    /// for the run's lifetime and every phase tab is independently closeable.
     #[test]
-    fn first_phase_reuses_root_pane() {
+    fn first_phase_creates_its_own_tab_and_leaves_the_root_pane_alone() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("ws-isolation-test", "ws-42");
@@ -2244,21 +2245,33 @@ mod tests {
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
         let calls = h.calls();
-        // The first phase reuses the workspace root pane — no tab is created,
-        // and no empty shell is left dangling.
+        let tab_call = calls
+            .iter()
+            .find(|c| c.contains("tab_create"))
+            .expect("the first phase must create its own tab");
         assert!(
-            !calls.iter().any(|c| c.contains("tab_create")),
-            "first phase must not create a tab: {calls:?}"
+            tab_call.contains("workspace=ws-42"),
+            "tab must be in the run workspace: {tab_call}"
         );
-        let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
         assert!(
-            run_call.contains("pane=ws-42:root"),
-            "first phase must run claude in the root pane: {run_call}"
+            tab_call.contains("label=brainstorm"),
+            "tab must be labelled with the phase: {tab_call}"
         );
-        assert_eq!(run.phases[0].pane_id(), Some("ws-42:root"));
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
+        assert_ne!(
+            pane, "ws-42:root",
+            "no phase may run in the workspace's root shell"
+        );
         assert!(
-            run.root_pane.is_none(),
-            "root_pane must be consumed after first use"
+            calls
+                .iter()
+                .any(|c| c.contains(&format!("pane_run pane={pane}"))),
+            "claude must run in the new tab's pane: {calls:?}"
+        );
+        assert_eq!(
+            run.root_pane.as_deref(),
+            Some("ws-42:root"),
+            "the root shell anchors the workspace for the whole run and is never claimed"
         );
     }
 
@@ -2268,21 +2281,25 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("later-tab-test", "ws-7");
 
-        phase_start(&h, &mut run, "brainstorm", None).unwrap(); // consumes root pane
-        phase_start(&h, &mut run, "plan", None).unwrap(); // must get its own tab
+        phase_start(&h, &mut run, "brainstorm", None).unwrap();
+        phase_start(&h, &mut run, "plan", None).unwrap();
 
         let calls = h.calls();
-        let tab_call = calls.iter().find(|c| c.contains("tab_create")).unwrap();
+        // Every phase creates a tab now, so select this phase's by its label —
+        // a bare `find("tab_create")` would match brainstorm's.
+        let tab_call = calls
+            .iter()
+            .find(|c| c.contains("tab_create") && c.contains("label=plan"))
+            .expect("plan must create its own tab");
         assert!(
             tab_call.contains("workspace=ws-7"),
             "tab must be in the run workspace: {tab_call}"
         );
-        assert!(
-            tab_call.contains("label=plan"),
-            "tab must be labelled with the phase: {tab_call}"
-        );
-        // claude runs in the new tab's pane
+        // claude runs in the new tab's pane, and the two phases are in
+        // different panes — neither shares, and neither is the root shell.
+        let brainstorm_pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let plan_pane = run.phases[1].pane_id().map(str::to_owned).unwrap();
+        assert_ne!(brainstorm_pane, plan_pane, "phases must not share a pane");
         assert!(
             calls
                 .iter()
@@ -2291,20 +2308,24 @@ mod tests {
         );
     }
 
+    /// A workspace is now the ONLY way to place a phase: without one there is
+    /// no tab to create, and the root pane is not a fallback even when present.
     #[test]
-    fn no_workspace_and_no_root_pane_errors() {
+    fn no_workspace_errors_even_with_a_root_pane() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("no-ws-test");
         run.workspace = None;
-        run.root_pane = None;
+        run.root_pane = Some("orphan:root".into());
 
         let res = phase_start(&h, &mut run, "plan", None);
-        assert!(
-            res.is_err(),
-            "must error when there is no workspace or root pane"
-        );
+        assert!(res.is_err(), "must error when there is no workspace");
         assert!(res.unwrap_err().to_string().contains("workspace"));
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_run")),
+            "must not fall back to the root shell: {:?}",
+            h.calls()
+        );
     }
 
     #[test]
@@ -4103,10 +4124,13 @@ mod tests {
     //    `phase_start_rejects_a_shell_metacharacter_phase_name` for the boundary.
     //    `shell_single_quote` itself is unit-tested in `crate::shell`.
 
-    // -- F2 (agy correctness): a failed launch must NOT consume the root pane, so
-    //    a retry can still reuse it rather than forfeiting it to a fresh tab.
+    // -- F2 (agy correctness), rewritten for the root-pane decoupling: a failed
+    //    launch must leave the root shell exactly as it found it. It no longer
+    //    "keeps" the root pane by deferring a consumption — nothing consumes it
+    //    at all — so what this pins now is that the failing launch went to the
+    //    phase's own tab and the anchor is still recorded.
     #[test]
-    fn first_phase_keeps_root_pane_on_launch_failure() {
+    fn a_failed_launch_leaves_the_root_pane_untouched() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         h.fail_pane_run();
@@ -4120,7 +4144,14 @@ mod tests {
         assert_eq!(
             run.root_pane.as_deref(),
             Some("ws-9:root"),
-            "root_pane must be retained when the launch fails"
+            "the root shell is never consumed, failure or not"
+        );
+        assert!(
+            !h.calls()
+                .iter()
+                .any(|c| c.contains("pane_run pane=ws-9:root")),
+            "the launch must have targeted the phase's own tab: {:?}",
+            h.calls()
         );
     }
 

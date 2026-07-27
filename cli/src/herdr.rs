@@ -15,13 +15,18 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 /// A freshly created herdr workspace: its id plus the id of its auto-created root
-/// shell pane. drovr runs the first phase's `claude` *inside* `root_pane` (via
-/// `pane_run`) rather than splitting a new pane beside it, so no empty shell is
-/// left dangling. The root pane is never closed mid-run — closing any pane makes
-/// herdr reassign focus and disturbs the user — and is torn down together with
-/// every phase pane at `drovr cleanup` (`close_run_panes`), which reaps drovr's
-/// panes and only drovr's: the human may have opened tabs of their own in the
-/// run's workspace.
+/// shell pane.
+///
+/// **No drovr agent ever runs in `root_pane`.** Every phase and every reviewer
+/// gets its own tab (`tab_create`, then `pane_run` in that tab's auto shell
+/// pane), so the root pane stays an idle shell that anchors the workspace for
+/// the run's lifetime — which is what makes a phase's tab closeable without
+/// taking the workspace, and every other phase, with it. `drovr new` labels it
+/// so the idle tab explains itself.
+///
+/// It is still drovr's pane: it is torn down together with every phase pane at
+/// `drovr cleanup` (`close_run_panes`), which reaps drovr's panes and only
+/// drovr's — the human may have opened tabs of their own in the run's workspace.
 #[derive(Debug)]
 pub struct Workspace {
     pub id: String,
@@ -1086,6 +1091,9 @@ pub struct FakeHerdr {
     pane_info_queue: RefCell<VecDeque<Option<PaneInfo>>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
+    /// When true, every `pane_rename` returns an error. Renaming is cosmetic and
+    /// best-effort, so callers must carry on without it.
+    fail_pane_rename: RefCell<bool>,
     /// When true, every `pane_info` reads as unreadable (`None`).
     fail_pane_info: RefCell<bool>,
     /// When true, every `tab_close` returns an error — reaping is best-effort,
@@ -1122,6 +1130,7 @@ impl FakeHerdr {
             status_queue: RefCell::new(VecDeque::new()),
             pane_info_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
+            fail_pane_rename: RefCell::new(false),
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
@@ -1243,6 +1252,12 @@ impl FakeHerdr {
         *self.fail_pane_run.borrow_mut() = true;
     }
 
+    /// Make every `pane_rename` fail. A label is cosmetic: the caller must carry
+    /// on with the pane it just created rather than discarding it.
+    pub fn fail_pane_rename(&self) {
+        *self.fail_pane_rename.borrow_mut() = true;
+    }
+
     /// Make every `pane_info` read as unreadable (`None`), whatever is queued.
     pub fn fail_pane_info(&self) {
         *self.fail_pane_info.borrow_mut() = true;
@@ -1340,6 +1355,9 @@ impl Herdr for FakeHerdr {
 
     fn pane_rename(&self, pane_id: &str, label: &str) -> io::Result<()> {
         self.record(format!("pane_rename pane={pane_id} label={label}"));
+        if *self.fail_pane_rename.borrow() {
+            return Err(io::Error::other("scripted pane_rename failure"));
+        }
         Ok(())
     }
 
