@@ -3653,7 +3653,10 @@ mod tests {
         });
         assert_eq!(run.phases[0].name, "");
         assert!(phase_done(&run, "").is_err(), "phase_done must refuse");
-        assert!(phase_wait(&h, &mut run, "", 10).is_err(), "phase_wait must refuse");
+        assert!(
+            phase_wait(&h, &mut run, "", 10).is_err(),
+            "phase_wait must refuse"
+        );
         assert!(
             phase_send(&h, &mut run, "", "text").is_err(),
             "phase_send must refuse"
@@ -4180,7 +4183,14 @@ mod tests {
         let mut run = make_run_with_workspace("rev-empty-proj-test", "ws-e");
         run.project_dir = String::new();
 
-        let result = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude", "claude");
+        let result = spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            "claude",
+            "claude",
+        );
         assert!(
             result.is_err(),
             "reviewer must error when project_dir is empty"
@@ -4290,8 +4300,15 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("inject-reviewer-test", "ws-i");
 
-        let err =
-            spawn_reviewer(&h, &mut run, "review:t$(id):1:correctness", None, "claude", "claude").unwrap_err();
+        let err = spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t$(id):1:correctness",
+            None,
+            "claude",
+            "claude",
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
             !h.calls().iter().any(|c| c.contains("pane_run")),
@@ -4759,7 +4776,10 @@ mod capture_tests {
                     value: "/tmp/transcript.jsonl".into(),
                 },
             ),
-            ("wrong-agent", FakeHerdr::session_owned_by("p", Some("cursor"))),
+            (
+                "wrong-agent",
+                FakeHerdr::session_owned_by("p", Some("cursor")),
+            ),
             ("unattributed", FakeHerdr::session_owned_by("p", None)),
         ];
         for (label, session) in cases {
@@ -4840,7 +4860,10 @@ mod capture_tests {
         other.cursor = 7;
         other.gate = "moved-on".into();
         other.save().unwrap();
-        assert_eq!(run.cursor, 0, "the poller's snapshot is stale by construction");
+        assert_eq!(
+            run.cursor, 0,
+            "the poller's snapshot is stale by construction"
+        );
 
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
@@ -4950,7 +4973,10 @@ mod capture_tests {
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane), "the gate still works");
         assert!(
-            RunState::load("vanished-on-capture").unwrap().phases.is_empty(),
+            RunState::load("vanished-on-capture")
+                .unwrap()
+                .phases
+                .is_empty(),
             "capture must not resurrect a phase that is gone"
         );
     }
@@ -5003,7 +5029,15 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("reviewer-capture");
         let phase = "review:task-1:1:correctness";
-        spawn_reviewer(&h, &mut run, phase, None, "claude", "claude --permission-mode plan").unwrap();
+        spawn_reviewer(
+            &h,
+            &mut run,
+            phase,
+            None,
+            "claude",
+            "claude --permission-mode plan",
+        )
+        .unwrap();
         let pane = run.review_phases[0].pane_id.clone().unwrap();
 
         phase_send(&h, &mut run, phase, "seed").unwrap();
@@ -5038,7 +5072,10 @@ mod capture_tests {
         let phase = "review:task-1:1:correctness";
         spawn_reviewer(&h, &mut run, phase, None, "cursor", "cursor agent").unwrap();
         let pane = run.review_phases[0].pane_id.clone().unwrap();
-        assert_eq!(run.review_phases[0].agent_backend.as_deref(), Some("cursor"));
+        assert_eq!(
+            run.review_phases[0].agent_backend.as_deref(),
+            Some("cursor")
+        );
 
         // herdr attributes the session to cursor, because cursor created it.
         h.push_pane_info(Some(PaneInfo {
@@ -5072,7 +5109,10 @@ mod capture_tests {
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
         let pass_a = run.phases[0].pass.clone().unwrap();
-        assert!(run.phases[0].agent_session.is_some(), "pass A has a session");
+        assert!(
+            run.phases[0].agent_session.is_some(),
+            "pass A has a session"
+        );
 
         h.fail_pane_run();
         assert!(
@@ -5081,7 +5121,11 @@ mod capture_tests {
         );
 
         let on_disk = RunState::load("failed-launch-session").unwrap();
-        assert_ne!(on_disk.phases[0].pass, Some(pass_a), "a new pass was minted");
+        assert_ne!(
+            on_disk.phases[0].pass,
+            Some(pass_a),
+            "a new pass was minted"
+        );
         assert!(
             on_disk.phases[0].agent_session.is_none(),
             "and pass A's conversation must not be advertised against it"
@@ -5244,5 +5288,4 @@ mod capture_tests {
             std::env::remove_var(PASS_ENV);
         }
     }
-
 }

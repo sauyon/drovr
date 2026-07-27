@@ -902,7 +902,10 @@ mod tests {
         assert!(p.agent_session.is_none(), "absent agent_session → None");
         assert!(p.agent_backend.is_none(), "absent agent_backend → None");
         assert!(p.agent_profile.is_none(), "absent agent_profile → None");
-        assert!(!p.reaped, "absent reaped → false (the phase still has its pane)");
+        assert!(
+            !p.reaped,
+            "absent reaped → false (the phase still has its pane)"
+        );
 
         // And a phase that captured nothing must not start emitting the keys:
         // a run written by this build stays loadable by an older one.
