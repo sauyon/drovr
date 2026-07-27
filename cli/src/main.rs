@@ -2,6 +2,7 @@ mod code_review;
 mod config;
 mod findings;
 mod herdr;
+mod mcp_findings;
 mod phase;
 mod reflex;
 mod review;
@@ -117,6 +118,21 @@ enum Commands {
         /// Path to the router skill markdown to inject.
         #[arg(long)]
         skill: PathBuf,
+    },
+
+    /// Serve the review panel's one-tool MCP findings channel on stdio.
+    ///
+    /// Spawned by `code-review run` for each reviewer, never by a human. Reviewers run
+    /// read-only and so cannot write their own findings file; this exposes a single
+    /// `submit_findings` tool and performs that one write for them. The reviewer names
+    /// its angle, which is validated against the configured angles — it can never name
+    /// a path, so its one write always lands inside the run dir.
+    #[command(hide = true)]
+    McpFindings {
+        /// Run whose findings are being collected.
+        run: String,
+        /// Task under review, e.g. `task-3`.
+        task: String,
     },
 }
 
@@ -1103,6 +1119,19 @@ fn main() {
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::McpFindings { run, task } => {
+            let angles = match config::load_config() {
+                Ok(c) => c.angles,
+                Err(e) => {
+                    eprintln!("drovr: mcp-findings could not load config: {e}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, &angles) {
+                eprintln!("drovr: mcp-findings failed: {e}");
+                process::exit(1);
+            }
+        }
     }
 }
 
