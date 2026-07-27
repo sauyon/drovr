@@ -22,6 +22,7 @@ const BRAINSTORM: &str = include_str!("../../skills/pipeline/phase-prompts/brain
 const PLAN: &str = include_str!("../../skills/pipeline/phase-prompts/plan.md");
 const IMPLEMENT_TASK: &str = include_str!("../../skills/pipeline/phase-prompts/implement-task.md");
 const REVIEW: &str = include_str!("../../skills/pipeline/phase-prompts/review.md");
+const HANDOFF_TEMPLATE: &str = include_str!("../../skills/handoff/HANDOFF-template.md");
 
 /// The pipeline phases drovr has a template for. A phase name outside this set has no
 /// composed brief (see [`compose_phase_brief`]).
@@ -109,6 +110,39 @@ pub fn compose_phase_brief(
         brief.push_str(&format!("\n## Context from the driver\n\n{c}\n"));
     }
     Ok(brief)
+}
+
+/// The empty handoff for a finishing agent to fill in: the fixed seven headings, each
+/// with the template's own guidance as an HTML comment, and nothing else.
+///
+/// Deliberately contains NO derived content. An earlier draft had drovr fill in the git
+/// pointers (branch, base, HEAD, changed files) it can compute; the reviewer rejected
+/// that — drovr guessing which commits and files belong to this session would be wrong
+/// exactly when it matters, and the agent knows. So the structure is drovr's and every
+/// word of substance is the agent's.
+pub fn handoff_scaffold() -> String {
+    let mut out = String::from(
+        "<!-- Scaffolded by `drovr handoff-scaffold`. Structure is fixed; fill in every\n\
+         section from your own context, then run `drovr phase done`. Delete these\n\
+         comments as you go. -->\n",
+    );
+    // Leading newline so the FIRST heading splits like every other one (the stripped
+    // body starts directly with `## Objective`).
+    let body = format!("\n{}", strip_editorial_comment(HANDOFF_TEMPLATE));
+    // Sections only: the template's trailing "## Authoring rules" is instruction for the
+    // author, not a heading the handoff itself carries.
+    for section in body.split("\n## ").skip(1) {
+        let (heading, guidance) = section.split_once('\n').unwrap_or((section, ""));
+        if heading.trim() == "Authoring rules" {
+            break;
+        }
+        out.push_str(&format!(
+            "\n## {}\n\n<!-- {} -->\n\nTODO\n",
+            heading.trim(),
+            guidance.trim().replace("\n", " ")
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +272,38 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("verify-land"), "names the phase: {msg}");
         assert!(msg.contains("phase send"), "names the escape hatch: {msg}");
+    }
+
+    /// The scaffold is structure only: seven headings, the template's guidance, and a
+    /// TODO per section. Anything drovr *derived* here would be a guess about which work
+    /// belongs to the session — the reviewer's call was that the agent knows better.
+    #[test]
+    fn handoff_scaffold_is_structure_only() {
+        let s = handoff_scaffold();
+        for heading in [
+            "## Objective",
+            "## State",
+            "## Decisions + rationale",
+            "## Interfaces / contracts",
+            "## Open questions",
+            "## Next step",
+            "## Artifact pointers",
+        ] {
+            assert!(s.contains(heading), "missing {heading}: {s}");
+        }
+        assert_eq!(
+            s.matches("\nTODO\n").count(),
+            7,
+            "every section must be left for the agent to fill: {s}"
+        );
+        assert!(
+            !s.contains("## Authoring rules"),
+            "the authoring rules are guidance for the author, not a handoff section: {s}"
+        );
+        assert!(
+            !s.contains("Scaffolded by `drovr handoff scaffold`.\n"),
+            "the scaffold note must be a single-line comment, not a stray heading"
+        );
     }
 
     /// Invariant 5: the embedded template and the file on disk must agree. This fails

@@ -98,6 +98,19 @@ enum Commands {
     /// Plumbing: collect the handoff doc for a finished phase.
     Collect { run: String, phase_name: String },
 
+    /// Write an empty `<phase>-HANDOFF.md` — the fixed seven sections and nothing
+    /// else — for the finishing agent to fill in from its own context.
+    ///
+    /// Structure only, by design: drovr does not guess which commits or files belong
+    /// to your session. Refuses to overwrite an existing handoff unless `--force`.
+    HandoffScaffold {
+        run: String,
+        phase_name: String,
+        /// Overwrite an existing `<phase>-HANDOFF.md`.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Plumbing: review subcommands.
     Review {
         #[command(subcommand)]
@@ -1110,6 +1123,40 @@ fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> O
     }
 }
 
+/// `drovr handoff-scaffold` — write the empty 7-section handoff for `phase`.
+///
+/// Never clobbers silently: a handoff already on disk is an agent's authored work (or a
+/// half-written draft), and losing it costs the whole compression pass that produced it.
+fn cmd_handoff_scaffold(run: &str, phase_name: &str, force: bool) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    if let Err(e) = validate_label("phase", phase_name) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    let dir = run::run_dir(run);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("drovr: cannot create run dir: {e}");
+        process::exit(1);
+    }
+    let path = dir.join(format!("{phase_name}-HANDOFF.md"));
+    if path.exists() && !force {
+        eprintln!(
+            "drovr: {} already exists — refusing to overwrite an authored handoff (pass \
+             --force to replace it)",
+            path.display()
+        );
+        process::exit(1);
+    }
+    if let Err(e) = std::fs::write(&path, brief::handoff_scaffold()) {
+        eprintln!("drovr: cannot write {}: {e}", path.display());
+        process::exit(1);
+    }
+    println!("scaffolded {}", path.display());
+}
+
 fn cmd_code_review(sub: CodeReviewCmd) {
     match sub {
         CodeReviewCmd::Base { run, task } => {
@@ -1296,6 +1343,11 @@ fn main() {
         Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
+        Commands::HandoffScaffold {
+            run,
+            phase_name,
+            force,
+        } => cmd_handoff_scaffold(&run, &phase_name, force),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
