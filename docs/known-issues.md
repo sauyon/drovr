@@ -308,6 +308,69 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## The findings channel loses reviewer output two ways (2026-07-26/27)
+
+**Severity:** high — it fails the panel on any real diff, and both modes look like "the reviewer
+produced nothing" rather than "drovr could not read it".
+**Found:** run `structural-briefs`, task `branch`, 4 cursor reviewers over a 1152-line diff.
+Panel exit 1: `reviewer 'review:branch:1:error-handling' produced no findings JSON (no file
+written and none found in its transcript)` — while that reviewer's JSON was plainly visible in
+its pane.
+
+### 1. Reviewers emit UNFENCED JSON; the extractor only reads fences
+
+`extract_findings_json` walks ` ``` ` fences and takes the last block whose body starts with `{`.
+The cursor reviewers printed `Review complete. Findings below.` followed by a bare top-level JSON
+object — no fence. The only fenced block in the transcript was the *schema* echoed from the seed.
+So extraction found nothing even though valid findings were on screen.
+
+**Fix idea:** fall back to the last balanced top-level `{...}` that parses as a `Review` when no
+fenced block yields one. Cheap, and it makes the seed's "fenced" instruction a preference rather
+than a hard requirement.
+
+### 2. The pane transcript is LOSSY, so JSON cannot be reconstructed from it at all
+
+`herdr agent read` (any `--source`, including `recent-unwrapped`, `--lines 800`) truncates long
+lines **mid-word**:
+
+```
+"rationale": "resolve_context treats trimmed-empty supplied context as None and falls th... A driver pas
+code-review's explicit recording semantics and dangerous on fix-loop re-runs."
+```
+
+Text is missing between `A driver pas` and `code-review's`, so the JSON is unparseable no matter
+how it is extracted. A `rationale` of any length — i.e. every useful finding — can hit this.
+
+This is the deeper form of the already-noted "make the findings channel durable, not a viewport":
+the viewport is not merely small, it is *destructive*.
+
+**Also ruled out as an escape:** asking the reviewer to write the JSON to a file. The reviewers
+run read-only (`cursor --mode plan`), which refuses the write. They fall back to printing, which
+is where the truncation is.
+
+**What actually worked** (both rounds, and it is the current workaround): tell the reviewer, via
+`--context`, to print one line per finding as `SEVERITY|file:line|summary` with every line under
+100 characters. Short lines wrap instead of truncating, so they survive. Rationale is lost, which
+is a real cost — the summary alone is usually enough to act on, but not always.
+
+**Fix ideas, in order of preference:** (1) have drovr read findings from a channel it controls
+rather than the terminal — the reviewer already runs in a pane drovr spawned, so a file it is
+*permitted* to write (or a fifo) beats scraping; (2) instruct short lines in the seed itself
+rather than per-invocation context; (3) accept unfenced JSON (above), which is necessary but not
+sufficient on its own.
+
+## One failing test cascades: a panic while holding `ENV_LOCK` poisons it (2026-07-27)
+
+**Severity:** low, but it wastes debugging time.
+
+The env-dependent tests serialize on `test_util::ENV_LOCK` and take it with
+`ENV_LOCK.lock().unwrap()`. A test that panics *while holding* it poisons the mutex, so every
+later test that locks also panics — one real failure reports as several. Seen while fixing the
+round-1 review findings: one genuine assertion failure in `brief::tests` surfaced as three
+failures, two of which passed in isolation.
+
+If a run reports N failures, re-run the first one alone before believing the other N-1.
+
 ## `review::tests::lock_records_our_pid_and_releases_on_drop` flaked once (2026-07-26)
 
 **Severity:** low (one observation, not reproducible on demand).
