@@ -927,6 +927,41 @@ Make `review wait` treat a transient connect failure as retryable (re-run `ensur
 resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
 exit.
 
+## `main` is not `cargo fmt` clean, and formatting one file reformats the whole crate
+
+**Severity:** medium — the last branch that got this wrong had to be rebuilt from scratch
+(`land-mcp-findings` exists only because of it).
+**Found:** 2026-07-27, formatting three files during `land-mcp-findings`.
+
+### The trap
+
+`cargo fmt --check` is dirty on `main` itself — currently `cli/src/herdr.rs`, `phase.rs`,
+`reflex.rs`, `review.rs`, `run.rs` and `cli/tests/web_nav.rs`. So "run `cargo fmt` before
+committing" sweeps ~450 lines of unrelated churn into your branch, which then collides with
+whatever else lands on `main`. That is exactly what forced `drovr/fix-review-json` to be
+replayed rather than merged.
+
+**And the obvious workaround does not work.** `rustfmt cli/src/main.rs` does *not* format
+one file: rustfmt follows `mod` declarations from the crate root, so naming `main.rs`
+reformats every module it reaches. Naming a leaf module (`cli/src/code_review.rs`) is
+likewise a crate-root entry for rustfmt's purposes if it is reachable. The sweep is silent —
+the command prints nothing.
+
+### What to do
+
+1. Check whether the debt is yours before touching it:
+   `git show main:<file> > /tmp/c.rs && rustfmt --edition 2024 --check /tmp/c.rs`.
+   Clean → your edit introduced it, fix it. Dirty → it is main's; leave it.
+2. After any `rustfmt`/`cargo fmt`, **`git diff --stat` before staging** and
+   `git checkout --` every file you did not otherwise change.
+3. Never `git add -A` a tree you have just formatted.
+
+### Fix
+
+Land one formatting-only commit on `main` that makes the tree clean, so `cargo fmt` becomes
+a no-op for everyone and this whole hazard disappears. It has not been done because such a
+commit conflicts with every branch in flight — it needs a quiet moment, not a fix.
+
 ## Test suite flakes under parallel `cargo test`; needs `--test-threads=1`
 
 **Severity:** low (green when run serially; false failures otherwise).
