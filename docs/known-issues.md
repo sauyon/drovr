@@ -411,6 +411,35 @@ either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
 file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
 
+### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — no reviewer ever spawned
+
+A third failure shape, distinct from both above: the panel produced **no reviewer processes at
+all**, not panes-that-attach-but-don't-submit. Two passes, `0 of 4 angles finished` each time:
+
+- pass 1, `--timeout-ms 540000` → exit 2, `still waiting on correctness, security, error-handling,
+  type-design`;
+- pass 2, `--timeout-ms 1500000` (25 min) → exit 2, identical.
+
+After both, the run dir held all four `schema-dos-fix-review-<angle>-seed.md` files and
+`schema-dos-fix-review-{1,2}.head`, and **zero** findings files. `pgrep -af 'drovr|code-review'`
+showed no reviewer for this panel — only unrelated `drovr serve` / `cursor-agent` processes
+belonging to other worktrees. So the seeds were written and nothing ever consumed them.
+
+The distinguishing condition: the **driver was a plain `claude` session that drovr did not start**
+(this run's only pane, `wB8:p1`, belongs to an earlier `verify-land` phase). The panel appears to
+need a live herdr workspace it can spawn reviewer panes into; invoked from a session outside that
+workspace it seeds and then waits forever. Worth confirming, because it makes the panel unusable for
+the common case of a driver working in a worktree by hand rather than under `drovr:pipeline`.
+
+Credit where due: drovr handled the moving target correctly. HEAD changed between passes and pass
+2 reported `HEAD moved since review iteration 1 was seeded — starting a fresh panel instead of
+resuming it`, which is the right call — a resumed panel would have reviewed an abandoned design.
+
+**Workaround used:** the self-spawned read-only reviewer above (Claude Code Agent tool,
+`general-purpose`, read-only, blocking) over `git diff <base>..HEAD`. It worked well — two such
+reviewers found two Critical defects the author's own tests had missed, including a test that passed
+while allocating ~300 MB.
+
 ### Fix ideas (from the 2026-07-25 dogfood)
 
 1. **Make the findings channel durable, not a viewport.** Have the reviewer seed instruct writing
@@ -1009,6 +1038,23 @@ is a natural thing to do and silently voids every one of those tables.
 This is the inverse of the danger the skill already names. `drovr:pipeline` warns "Only exit 0 is
 approval. A non-zero exit is never an approval" — the observed failure is an **exit 0 that is not
 an approval**, which no existing guidance covers.
+
+### Also hit on `code-review run` (2026-07-26, run `m3-schema-dos`)
+
+Same trap, different command, and it produced a **false clean review**. The driver ran
+
+```
+drovr code-review run m3-schema-dos schema-dos-fix --timeout-ms 540000 2>&1 | tail -30
+```
+
+The harness reported exit 0; the driver read that as the skill's "exit 0 clean" and told the human
+the panel had come back clean. The real status was **2 (timeout)** with `0 of 4 angles finished` —
+no angle had reviewed anything. Re-running as `cmd > log 2>&1; echo "DROVR_EXIT=$?"` showed
+`DROVR_EXIT=2` immediately.
+
+So the hazard is not specific to `review wait`: for `code-review run` the misread is arguably worse,
+because exit 0 there means "reviewed and clean" rather than merely "approved", so a piped invocation
+can certify unreviewed code.
 
 ### Workaround
 
