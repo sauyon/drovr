@@ -594,8 +594,8 @@ pub fn code_review_run<H: Herdr>(
                 continue;
             }
             // Respawn in place, same iteration, below. Drop the stale registration
-            // first so `find_phase` cannot resolve to the replaced pane — otherwise
-            // the harvest could read the old reviewer's transcript.
+            // first so `find_phase` cannot resolve to the replaced pane — the spawn
+            // must mint a new one rather than re-adopt the reviewer being replaced.
             let reason = match (existing.is_some(), failed) {
                 (false, _) => "was never spawned this iteration",
                 (true, true) => "produced nothing usable",
@@ -1241,9 +1241,9 @@ mod tests {
         );
     }
 
-    /// Unusable output is not a transient condition: re-reading the same finished
-    /// pane's transcript fails identically every time. Such an angle must be marked
-    /// `Failed` so a resume replaces the reviewer instead of retrying it forever.
+    /// Unusable output is not a transient condition: the reviewer has finished, so
+    /// re-reading the file it left fails identically every time. Such an angle must be
+    /// marked `Failed` so a resume replaces the reviewer instead of retrying forever.
     #[test]
     fn an_unparseable_reviewer_result_marks_the_angle_failed() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1268,7 +1268,7 @@ mod tests {
                 .status,
             PhaseStatus::Failed,
             "an angle whose output cannot be parsed must be Failed, so the next \
-             resume respawns it rather than re-reading the same dead transcript"
+             resume respawns it rather than re-reading the same unusable file"
         );
     }
 
