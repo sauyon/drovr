@@ -501,19 +501,27 @@ pub fn code_review_run<H: Herdr>(
     loop {
         let mut still_pending: Vec<(String, String)> = Vec::new();
         for (angle, phase) in std::mem::take(&mut pending) {
-            // `poll_phase_pane`, not `Herdr::pane_info`: this loop is a REVIEWER's
-            // only long-lived poll, and it captures the session on the way past.
-            // The readiness gate in `phase_send` returns on the first poll that
-            // reports "started", which routinely precedes herdr publishing the
-            // session — so without capture here a reviewer's session was never
-            // recorded at all, and herdr drops it the moment the reviewer exits.
+            // POLL FIRST, unconditionally — then decide whether the reviewer is
+            // finished. Never the other way round.
+            //
+            // This loop is a REVIEWER's only long-lived poll, and `poll_phase_pane`
+            // captures the session on the way past. herdr publishes `agent_status`
+            // before `agent_session`, so `phase_send`'s readiness gate routinely
+            // returns before the session exists — this loop is where it shows up.
+            //
+            // Evaluating completion first made the capture reachable only on the
+            // SLOW path: `done_marker(..).exists() || <poll>` short-circuits, so a
+            // reviewer that finished before this loop's first visit — entirely
+            // normal, since angles are spawned and seeded one at a time — had its
+            // one capture skipped, and herdr drops the session when it exits.
+            // A capture a fast agent can outrun is not a capture.
             let pane = run.find_phase(&phase).and_then(|p| p.pane_id.clone());
-            let finished = done_marker(&run.name, &phase).exists()
-                || pane
-                    .as_deref()
-                    .and_then(|pane| poll_phase_pane(h, run, &phase, pane))
-                    .and_then(|info| info.agent_status)
-                    == Some(AgentStatus::Done);
+            let status = pane
+                .as_deref()
+                .and_then(|pane| poll_phase_pane(h, run, &phase, pane))
+                .and_then(|info| info.agent_status);
+            let finished =
+                done_marker(&run.name, &phase).exists() || status == Some(AgentStatus::Done);
             if !finished {
                 still_pending.push((angle, phase));
                 continue;
@@ -1449,6 +1457,69 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewer_that_finished_before_the_first_visit_is_still_captured() {
+        // Round 2 of the same defect: the capture existed but a FAST reviewer
+        // outran it.
+        //
+        // Angles are spawned and seeded one at a time, so a reviewer can run and
+        // drop `<phase>.done` while later angles are still being launched. The
+        // wait loop's first visit to it then saw the marker — and
+        // `done_marker(..).exists() || <poll>` short-circuits, skipping the only
+        // poll that reviewer would ever get. Its session was never recorded, and
+        // herdr drops it the moment the reviewer exits.
+        //
+        // The fix is ordering: poll, THEN decide. This test pins that ordering by
+        // arranging the exact losing sequence — marker already on disk at the
+        // first visit, session published only on that visit's poll.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-fast-reviewer");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Poll 1 — `phase_send`'s readiness gate. Started, no session yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Poll 2 — the wait loop's FIRST visit, which happens with the marker
+        // already on disk (dropped below). This is the only remaining chance.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+
+        // The reviewer finishes before the loop ever looks at it: its marker is
+        // already on disk when `code_review_run` starts waiting, and its findings
+        // are in its transcript.
+        drop_marker(&run, "task-1", 1, "correctness");
+        h.push_read(format!("```json\n{CLEAN}\n```"));
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 5000, false).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Clean, "the reviewer completed");
+
+        let on_disk = RunState::load("cr-fast-reviewer").unwrap();
+        assert_eq!(
+            on_disk.review_phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session())
+                .map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a reviewer that finished before the first visit must still have been \
+             polled — the marker must not be allowed to skip the capture"
+        );
+    }
+
+    #[test]
     fn a_reviewers_session_is_captured_when_it_appears_after_the_agent_starts() {
         // THE failure this task exists to prevent, at the one pane where it is
         // unrecoverable.
@@ -1499,7 +1570,7 @@ mod tests {
             .as_ref()
             .expect("the reviewer records its launch");
         assert_eq!(
-            agent.session.as_ref().map(SessionId::as_str),
+            agent.session().map(SessionId::as_str),
             Some(FakeHerdr::session_value_for("pane-1").as_str()),
             "a session that appears after the agent reports started must still be \
              captured — the reviewer wait loop is the only place left to see it"
@@ -1510,7 +1581,7 @@ mod tests {
             on_disk.review_phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_some(),
             "the capture must be persisted, not just held in memory"
         );
@@ -1542,7 +1613,7 @@ mod tests {
         assert!(!run.review_phases.is_empty());
         for p in &run.review_phases {
             assert_eq!(
-                p.agent.as_ref().map(|a| a.backend.as_str()),
+                p.agent.as_ref().map(|a| a.backend()),
                 Some("cursor"),
                 "reviewer '{}' must record the backend it was launched with",
                 p.name

@@ -138,13 +138,105 @@ pub struct Phase {
     /// legitimately differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<PhaseAgent>,
-    /// Whether this phase's pane has been reaped: drovr closed it because the
-    /// phase was superseded, and the phase can be brought back only by resuming
-    /// its session. Written by nothing yet — reaping is a later step; it is
-    /// declared here so the whole capture record lands in one `state.json` shape
-    /// rather than migrating twice.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reaped: bool,
+    /// Whether drovr closed this phase's pane — see [`Reaped`], which cannot be
+    /// set to "yes" from outside this module.
+    ///
+    /// Written by nothing yet; reaping is a later step. It is declared now so
+    /// the whole capture record lands in one `state.json` shape rather than
+    /// migrating twice, and so the lifecycle rule is in place before the code
+    /// that depends on it is written.
+    #[serde(default, skip_serializing_if = "Reaped::is_no")]
+    pub reaped: Reaped,
+}
+
+/// Whether drovr has closed a phase's pane.
+///
+/// A newtype over `bool` whose inner value is PRIVATE, so "yes" can only be
+/// produced inside this module — in practice by [`Phase::mark_reaped`], which
+/// drops the pane id in the same statement.
+///
+/// The point is that "reaped" and "has a live pane" are contradictory claims
+/// about one phase, and as a bare `pub bool` beside `pane_id` the contradiction
+/// was one assignment away. A phase marked reaped while `pane_id` still names a
+/// pane makes `drovr attach` offer a pane that is gone, and makes cleanup and
+/// reaping disagree about whose pane it is. Task 6 is the code that will write
+/// this; the rule is here first, deliberately, because it is much harder to
+/// impose once reaping depends on the shape.
+///
+/// Serializes transparently as a bare `true`/`false`, so `state.json` is
+/// unchanged by the newtype.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Reaped(bool);
+
+impl Reaped {
+    /// Whether the pane has been reaped.
+    pub fn yes(self) -> bool {
+        self.0
+    }
+    /// For `skip_serializing_if`: an un-reaped phase stays absent from
+    /// `state.json`, so a run written by this build still loads on an older one.
+    pub fn is_no(&self) -> bool {
+        !self.0
+    }
+}
+
+impl Phase {
+    /// A `Pending` phase named `name`, with every other field at its default.
+    pub fn new(name: &str) -> Phase {
+        Phase {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether drovr has closed this phase's pane. Nothing reads it yet —
+    /// task 6 (reaping) and task 5 (rehydrate) do.
+    #[allow(dead_code)]
+    pub fn is_reaped(&self) -> bool {
+        self.reaped.yes()
+    }
+
+    /// Record that drovr closed this phase's pane, dropping the pane id in the
+    /// same step.
+    ///
+    /// **This is the only way to set `reaped`, and that is the point.** "Reaped"
+    /// and "has a live pane" are contradictory claims about one phase, and as
+    /// two independent public fields the contradiction was one assignment away:
+    /// `reaped = true` while `pane_id` still names a pane makes `drovr attach`
+    /// offer a pane that is gone, and makes cleanup and reaping disagree about
+    /// whose pane it is. Setting one requires clearing the other, here, in one
+    /// statement no caller can half-perform.
+    ///
+    /// Returns the pane id it dropped, which is what a caller needs to retire
+    /// (`RunState::retire_pane`) so cleanup still knows the pane was drovr's.
+    /// Nothing calls this yet — task 6 does.
+    #[allow(dead_code)]
+    pub fn mark_reaped(&mut self) -> Option<String> {
+        self.reaped = Reaped(true);
+        self.pane_id.take()
+    }
+}
+
+/// The three things a resume needs, handed over together or not at all.
+///
+/// Assembled only by [`PhaseAgent::resume`]. A session id alone is not enough to
+/// resume anything:
+/// * `backend` — the id is only meaningful to the agent that created it
+///   (`AgentSession::resumable_for` is built on exactly that rule);
+/// * `profile` — claude resolves a session under
+///   `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so resuming under a different
+///   profile silently finds NOTHING. `None` means the default profile, which is
+///   what the launch itself inlined.
+///
+/// Bundling all three is the difference between "atomic" and "sufficient": an
+/// earlier version of this type paired session with backend only, which is
+/// atomic and still not enough to find the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeTarget<'a> {
+    pub session: &'a SessionId,
+    pub backend: &'a str,
+    pub profile: Option<&'a str>,
 }
 
 /// The agent behind a phase's pane: what it was launched as, and — once a poll
@@ -156,22 +248,27 @@ pub struct Phase {
 /// representable at the `state.json` boundary any more than it is in `herdr.rs`.
 /// As two independent `Option` fields it was: they could disagree in both
 /// directions, and re-checking the pairing would have fallen to every reader.
-/// Here the pairing is structural — [`PhaseAgent::resume`] hands back both or
-/// neither.
+/// Here the pairing is structural — [`PhaseAgent::resume`] hands back the whole
+/// bundle or nothing.
 ///
 /// A `backend` with no `session` is the normal pre-capture state and is fine;
 /// that is the asymmetry the type encodes.
+///
+/// **Fields are private.** `Deserialize` is the one other constructor, and it is
+/// held to the same shape (`backend` required). Everything else goes through
+/// [`PhaseAgent::launched`] and [`PhaseAgent::record_session`], so there is no
+/// way to assemble a half-built record in memory and persist it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PhaseAgent {
     /// The backend the pane was launched with (`claude`, `cursor`, …).
-    pub backend: String,
+    backend: String,
     /// The `CLAUDE_CONFIG_DIR` in effect at launch; `None` = the default
     /// profile. Recorded because claude resolves a session under
     /// `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so resuming from a process
     /// holding a *different* profile silently finds nothing. The launch is the
     /// only moment it is knowable — a later command may run from a plain shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
+    profile: Option<String>,
     /// The session id, captured while the agent was ALIVE because herdr drops
     /// `agent_session` the moment the process exits (verified against 0.7.5).
     ///
@@ -187,7 +284,7 @@ pub struct PhaseAgent {
     /// pane, so the id it clears names a conversation that is no longer this
     /// phase's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionId>,
+    session: Option<SessionId>,
 }
 
 impl PhaseAgent {
@@ -200,25 +297,45 @@ impl PhaseAgent {
         }
     }
 
-    /// The `(session, backend)` pair a resume needs, or `None`. Both or
-    /// neither — that is the whole reason this is one type.
+    /// The backend this pane runs.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` the launch used, if any.
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    /// The captured session id, if a poll has caught one.
+    pub fn session(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
+    /// Record a session id captured from a live poll.
+    ///
+    /// Only ever SETS. There is deliberately no way to clear a session through
+    /// this type: herdr dropping `agent_session` means the agent exited, not
+    /// that the conversation stopped existing. `phase_start` clears by replacing
+    /// the whole `PhaseAgent`, which is the one case where the old id really
+    /// does name someone else's conversation.
+    pub fn record_session(&mut self, session: SessionId) {
+        self.session = Some(session);
+    }
+
+    /// Everything a resume needs, or `None`. All three or nothing — that is the
+    /// whole reason this is one type.
     ///
     /// Nothing resumes yet, so this is exercised by tests alone until task 5
     /// composes `--resume`; it exists now because it is the accessor that makes
-    /// the pairing impossible to take apart.
+    /// the bundle impossible to take apart.
     #[allow(dead_code)]
-    pub fn resume(&self) -> Option<(&SessionId, &str)> {
-        self.session.as_ref().map(|s| (s, self.backend.as_str()))
-    }
-}
-
-impl Phase {
-    /// A `Pending` phase named `name`, with every other field at its default.
-    pub fn new(name: &str) -> Phase {
-        Phase {
-            name: name.to_owned(),
-            ..Default::default()
-        }
+    pub fn resume(&self) -> Option<ResumeTarget<'_>> {
+        self.session.as_ref().map(|session| ResumeTarget {
+            session,
+            backend: &self.backend,
+            profile: self.profile.as_deref(),
+        })
     }
 }
 
@@ -345,7 +462,44 @@ pub fn list_runs_in(root: &std::path::Path) -> Vec<String> {
 impl RunState {
     pub fn load(name: &str) -> io::Result<RunState> {
         let p = run_dir(name).join("state.json");
-        serde_json::from_str(&fs::read_to_string(p)?).map_err(io::Error::other)
+        let state: RunState =
+            serde_json::from_str(&fs::read_to_string(p)?).map_err(io::Error::other)?;
+        state.check_pane_lifecycle()?;
+        Ok(state)
+    }
+
+    /// Refuse a `state.json` that claims a phase is both reaped and holding a
+    /// live pane.
+    ///
+    /// [`Phase::mark_reaped`] makes that state unreachable through the API, and
+    /// [`Reaped`]'s private inner makes it unconstructable outside this module —
+    /// but `Deserialize` is a third constructor, reachable by anyone who can
+    /// write the file. This closes it, the same way [`PassToken`] and
+    /// [`crate::herdr::SessionId`] close theirs.
+    ///
+    /// Failing the load is the right severity: it exits 1 and STOPs the run,
+    /// which is loud — and the alternative is a phase whose pane `drovr attach`
+    /// offers but reaping has already closed. Nothing drovr writes can produce
+    /// this, so the only way to see it is a corrupted or hand-edited file, where
+    /// stopping is exactly what a human wants.
+    fn check_pane_lifecycle(&self) -> io::Result<()> {
+        for p in self.phases.iter().chain(self.review_phases.iter()) {
+            if p.is_reaped() && p.pane_id.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "run '{}': phase '{}' is recorded as reaped but still holds pane {:?}. \
+                         drovr never writes that — reaping drops the pane id in the same step \
+                         it sets the flag — so this state.json has been corrupted or edited by \
+                         hand. Refusing to load rather than offer a pane that is gone.",
+                        self.name,
+                        p.name,
+                        p.pane_id.as_deref().unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
     /// Write `state.json` ATOMICALLY: serialize into a temp file in the same
     /// directory, then `fs::rename` it over the target. A bare `fs::write`
@@ -925,7 +1079,7 @@ mod tests {
             "absent agent → None (backend, profile, session)"
         );
         assert!(
-            !p.reaped,
+            !p.is_reaped(),
             "absent reaped → false (the phase still has its pane)"
         );
 
@@ -958,7 +1112,11 @@ mod tests {
         let good: Phase = serde_json::from_str(&phase("\"cca92f5b-3a8c\"")).unwrap();
         assert_eq!(
             good.agent.as_ref().and_then(|a| a.resume()),
-            Some((&SessionId::new("cca92f5b-3a8c".into()).unwrap(), "claude")),
+            Some(ResumeTarget {
+                session: &SessionId::new("cca92f5b-3a8c".into()).unwrap(),
+                backend: "claude",
+                profile: None,
+            }),
             "a loaded session comes back paired with its backend"
         );
         // Round-trips as a bare string, so state.json stays human-readable.
@@ -1005,6 +1163,101 @@ mod tests {
     }
 
     #[test]
+    fn the_resume_bundle_carries_the_profile_too_or_it_finds_nothing() {
+        // Atomic is not the same as sufficient. An earlier version of `resume()`
+        // handed back (session, backend) and dropped the profile — a bundle that
+        // cannot be taken apart, and still not enough to find the conversation:
+        // claude resolves a session under
+        // `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so resuming under the
+        // wrong profile silently finds NOTHING and falls back to a fresh agent.
+        let id = SessionId::new("cca92f5b-3a8c".into()).unwrap();
+        let mut agent = PhaseAgent::launched("cursor", Some("/home/u/.config/claude-work".into()));
+        assert!(agent.resume().is_none(), "no session yet → no bundle");
+
+        agent.record_session(id.clone());
+        assert_eq!(
+            agent.resume(),
+            Some(ResumeTarget {
+                session: &id,
+                backend: "cursor",
+                profile: Some("/home/u/.config/claude-work"),
+            }),
+            "all three travel together"
+        );
+
+        // `None` profile is meaningful — "the default profile", which is exactly
+        // what the launch inlined — not "unknown".
+        let mut default_profile = PhaseAgent::launched("claude", None);
+        default_profile.record_session(id.clone());
+        assert_eq!(default_profile.resume().unwrap().profile, None);
+
+        // And it survives the disk round trip, which is the only path task 5 has.
+        let round: PhaseAgent =
+            serde_json::from_str(&serde_json::to_string(&agent).unwrap()).unwrap();
+        assert_eq!(round.resume(), agent.resume());
+    }
+
+    #[test]
+    fn a_phase_cannot_be_reaped_while_it_still_holds_a_pane() {
+        // "Reaped" and "has a live pane" are contradictory claims about one
+        // phase. As a bare `pub bool` beside `pane_id` the contradiction was one
+        // assignment away, and it is the kind that reads fine and behaves badly:
+        // `drovr attach` would offer a pane that is gone, and cleanup and reaping
+        // would disagree about whose pane it is.
+        //
+        // Three doors, all shut: `Reaped`'s inner bool is private, so only this
+        // module can say "yes"; `mark_reaped` is the only thing that does, and it
+        // drops the pane in the same statement; and `RunState::load` refuses a
+        // file that claims otherwise.
+        let mut p = Phase::new("plan");
+        p.pane_id = Some("w:p1".into());
+        assert!(!p.is_reaped());
+
+        assert_eq!(
+            p.mark_reaped(),
+            Some("w:p1".to_string()),
+            "hands back the pane to retire"
+        );
+        assert!(p.is_reaped());
+        assert!(
+            p.pane_id.is_none(),
+            "setting one clears the other, in one step"
+        );
+        assert_eq!(p.mark_reaped(), None, "idempotent; nothing left to retire");
+
+        // The third door: a hand-written state.json.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let dir = run_dir("illegal");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            r#"{"name":"illegal","task":"t","gate":"spec","cursor":0,"project_dir":"/tmp/p",
+                "phases":[{"name":"plan","status":"Done","handoff_doc":null,
+                "herdr_session":null,"pane_id":"w:p1","reaped":true}]}"#,
+        )
+        .unwrap();
+        let err = RunState::load("illegal").expect_err("must refuse the contradiction");
+        assert!(
+            err.to_string().contains("reaped but still holds pane"),
+            "the refusal must say what is wrong: {err}"
+        );
+
+        // The same file WITHOUT the live pane is fine — that is a real reaped phase.
+        fs::write(
+            dir.join("state.json"),
+            r#"{"name":"illegal","task":"t","gate":"spec","cursor":0,"project_dir":"/tmp/p",
+                "phases":[{"name":"plan","status":"Done","handoff_doc":null,
+                "herdr_session":null,"pane_id":null,"reaped":true}]}"#,
+        )
+        .unwrap();
+        assert!(RunState::load("illegal").unwrap().phases[0].is_reaped());
+    }
+
+    #[test]
     fn a_session_cannot_be_persisted_without_the_backend_it_belongs_to() {
         // The invariant `PhaseAgent` exists for. `resumable_for(backend)` makes a
         // session id meaningless without the agent that created it, and two loose
@@ -1025,8 +1278,8 @@ mod tests {
             "agent":{"backend":"cursor","profile":"/cfg"}}"#;
         let p: Phase = serde_json::from_str(pre).unwrap();
         let agent = p.agent.as_ref().unwrap();
-        assert_eq!(agent.backend, "cursor");
-        assert_eq!(agent.profile.as_deref(), Some("/cfg"));
+        assert_eq!(agent.backend(), "cursor");
+        assert_eq!(agent.profile(), Some("/cfg"));
         assert!(
             agent.resume().is_none(),
             "no session yet → nothing to resume, and no half-pair to misuse"

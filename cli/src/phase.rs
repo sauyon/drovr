@@ -401,8 +401,14 @@ pub fn phase_start<H: Herdr>(
         // "none", which degrades a rehydrate to a reseed rather than to the
         // wrong conversation. `tab_id` is untouched — a relaunch reuses the
         // pane, so it reuses the tab.
-        if let Some(agent) = run.phases[i].agent.as_mut() {
-            agent.session = None;
+        // Replace the record rather than clearing a field: a new pass is a new
+        // agent process, so the backend/profile stay but the conversation the
+        // old id names is no longer this phase's. `PhaseAgent` has no way to
+        // clear a session on purpose — that is `record_session`'s whole point —
+        // so the launch record is rebuilt from what it already knows.
+        if let Some(old) = run.phases[i].agent.as_ref() {
+            let (backend, profile) = (old.backend().to_owned(), old.profile().map(str::to_owned));
+            run.phases[i].agent = Some(PhaseAgent::launched(backend, profile));
         }
         run.save()?;
     }
@@ -588,7 +594,10 @@ pub fn spawn_reviewer<H: Herdr>(
         pass: Some(pass),
         tab_id: None,
         agent: Some(PhaseAgent::launched(launch.backend(), agent_profile_env())),
-        reaped: false,
+        // A freshly spawned reviewer is not reaped, and `Reaped`'s "yes" cannot
+        // be built outside `run.rs` anyway — `Phase::mark_reaped` is the only
+        // way there. Default covers this one field; every other is listed above.
+        reaped: Default::default(),
     });
     run.save()?;
     Ok(())
@@ -689,7 +698,7 @@ impl Capture {
         let new_tab = matches!(&self.tab_id, Some(t) if p.tab_id.as_deref() != Some(t.as_str()));
         let new_session = matches!(
             &self.session,
-            Some(id) if p.agent.as_ref().and_then(|a| a.session.as_ref()) != Some(id)
+            Some(id) if p.agent.as_ref().and_then(|a| a.session()) != Some(id)
         );
         new_tab || new_session
     }
@@ -713,7 +722,7 @@ impl Capture {
         if let Some(id) = &self.session
             && let Some(agent) = p.agent.as_mut()
         {
-            agent.session = Some(id.clone());
+            agent.record_session(id.clone());
         }
         true
     }
@@ -727,67 +736,80 @@ impl Capture {
 /// Called on every poll, i.e. twice a second for the life of a phase, which
 /// shapes everything about it:
 ///
-/// * **Guarded on an actual change.** The common case — the same tab and the
-///   same session, poll after poll — does no I/O at all. Without the guard a
-///   one-hour phase would rewrite `state.json` 7200 times, and every write is a
-///   whole-file write that can lose a concurrent update.
 /// * **The write goes through FRESHLY LOADED state, never the caller's copy.**
 ///   A `phase wait` holds its `RunState` for the whole phase; saving that
 ///   snapshot mid-poll would restore an hour-old view of the run over whatever
 ///   else happened meanwhile — precisely the clobber the wait outcomes were
-///   reworked to avoid. The caller's copy is updated too, so it stays accurate,
-///   but it is never what gets written.
-/// * **Best-effort, silent, and RETRIED.** A failed load or save must leave the
-///   caller's copy exactly as it was, so the next poll asks the same question
-///   again and gets another chance. That ordering is the whole reason
+///   reworked to avoid.
+/// * **The BACKEND is read from that freshly loaded record too**, not from the
+///   caller's copy. The two can disagree: a caller that loaded before the phase
+///   was launched has no `PhaseAgent` and would fall back to the run's backend,
+///   which is wrong for exactly the case that matters — a reviewer
+///   `review_agent_for` put on a different agent. Attributing a session under a
+///   guessed backend is how it gets refused and silently dropped.
+/// * **Guarded on an actual change**, so the steady state — same tab, same
+///   session, poll after poll — writes nothing. A one-hour phase would otherwise
+///   rewrite `state.json` 7200 times, and every write is a whole-file write that
+///   can lose a concurrent update. The state READ is not guarded: it is far
+///   cheaper than the herdr round-trip that just happened, and guarding it was
+///   what forced the stale-backend read above.
+/// * **Best-effort, and RETRIED.** A failed load or save must leave the caller's
+///   copy exactly as it was, so the next poll asks again. That ordering is why
 ///   [`Capture::would_change`] exists: updating the caller first and persisting
-///   second means one transient `RunState::load` failure at the moment a session
-///   FIRST appears loses it for the rest of the phase — every later poll reports
-///   the same session, sees the in-memory copy already holding it, and concludes
-///   there is nothing to do. Nothing here may fail the wait, either: a phase
-///   whose agent is working fine does not become a failure because an
-///   opportunistic bookkeeping write did not land, and a diagnostic would print
-///   on a 500ms cadence.
+///   second means one transient failure at the moment a session FIRST appears
+///   loses it for the rest of the phase. Nothing here may fail the wait — a
+///   phase whose agent is working fine does not become a failure because a
+///   bookkeeping write did not land.
 ///
 /// Resolves the phase across BOTH lists (reviewers live only in
 /// `review_phases`). Safe despite `phase_wait` being deliberately bound to
 /// `phases`: `find_phase_mut` searches `phases` first, and
 /// `require_name_unclaimed` refuses a name the other list already answers to.
 fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
-    // THIS PHASE's backend, not the run's. A reviewer's is chosen separately by
-    // `Config::review_agent_for` and legitimately differs — checking a cursor
-    // reviewer's session against the run's `claude` would refuse it, and a
-    // reviewer is the pane whose session is most certain to be gone by the time
-    // anything else could read it.
-    //
-    // A phase with no `PhaseAgent` was launched by a build that did not record
-    // one. `RunState::agent` is then the best evidence available, and it is
-    // right for every pipeline phase (`phase_start` launches the run's backend);
-    // it deserializes to `Some("claude")` for runs older than that field, so
-    // there is no third tier. Nothing is recorded when even that is absent: a
-    // guessed backend is how a session gets captured under the wrong agent.
-    let Some(backend) = run
-        .find_phase(phase)
-        .map(|p| p.agent.as_ref().map(|a| a.backend.clone()))
-        .and_then(|recorded| recorded.or_else(|| run.agent.clone()))
-    else {
+    // Nothing readable → nothing to record, and no reason to touch the disk.
+    let Some(info) = poll else {
         return;
     };
-    let capture = Capture::from_poll(poll, &backend);
-    if capture.is_empty() {
-        return;
-    }
-    // The cheap guard: ASK the caller's own copy, do not write to it. No change
-    // → no state read, no write. This is the branch nearly every poll takes.
-    match run.find_phase(phase) {
-        Some(p) if capture.would_change(p) => {}
-        _ => return,
-    }
     let Ok(mut fresh) = RunState::load(&run.name) else {
+        capture_write_failed(&run.name, phase, "its run state could not be re-read");
         return;
     };
     // A phase absent from freshly loaded state has nowhere to record this, and
     // capture must not resurrect it.
+    let Some(target) = fresh.find_phase(phase) else {
+        return;
+    };
+    // THIS PHASE's backend, from the record just loaded. A reviewer's is chosen
+    // by `Config::review_agent_for` and legitimately differs from the run's.
+    //
+    // A phase with no `PhaseAgent` was launched by a build that did not record
+    // one; `RunState::agent` is then the best evidence available, and it is
+    // right for every pipeline phase. It deserializes to `Some("claude")` for
+    // runs older than that field, so there is no third tier. When even that is
+    // absent nothing is recorded: a guessed backend is how a session gets
+    // captured under the wrong agent.
+    let Some(backend) = target
+        .agent
+        .as_ref()
+        .map(|a| a.backend().to_owned())
+        .or_else(|| run.agent.clone())
+    else {
+        // The last silent skip, now audible. Refusing to guess is right — a
+        // guessed backend is how a session gets attributed to the wrong agent —
+        // but refusing SILENTLY means the operator learns about it from a
+        // rehydrate that finds nothing, long after the pane is gone.
+        capture_write_failed(
+            &run.name,
+            phase,
+            "neither the phase nor the run records which agent backend it runs, and a \
+             guessed one would attribute the session to the wrong agent",
+        );
+        return;
+    };
+    let capture = Capture::from_poll(Some(info), &backend);
+    if capture.is_empty() {
+        return;
+    }
     let Some(p) = fresh.find_phase_mut(phase) else {
         return;
     };
@@ -802,7 +824,14 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     // poll saw — another writer got there first, or the caller's copy had simply
     // fallen behind. Nothing to write; the adoption below still runs, which is
     // what stops the caller re-asking this question on every subsequent poll.
-    if capture.apply(p) && fresh.save().is_err() {
+    if capture.apply(p)
+        && let Err(e) = fresh.save()
+    {
+        capture_write_failed(
+            &run.name,
+            phase,
+            &format!("its run state could not be saved ({e})"),
+        );
         return;
     }
     // Only now, with the value on disk, does the caller's copy adopt it — so a
@@ -820,6 +849,56 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
         }
         capture.apply(p);
     }
+}
+
+/// Say ONCE, per run+phase, that a capture could not be persisted.
+///
+/// Capture is best-effort and must never fail a wait, but "best-effort" was
+/// silent, and the failure it hides is not recoverable on its own: if the agent
+/// exits before a later poll retries, the session is gone for good and the only
+/// symptom is a rehydrate, much later, that has nothing to resume. One line at
+/// the moment it happens is the difference between a diagnosable problem and a
+/// mystery.
+///
+/// Once per run+phase, not per poll: this sits in a loop that runs twice a
+/// second, and a repeating diagnostic is one nobody reads. Bounded the same way
+/// `herdr.rs` bounds its per-pane sets, and for the same reason — the always-on
+/// review server never restarts.
+fn capture_write_failed(run_name: &str, phase: &str, why: &str) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+    if !first_capture_failure_for(&WARNED, &format!("{run_name}/{phase}")) {
+        return;
+    }
+    eprintln!(
+        "drovr: phase '{phase}' of run '{run_name}': could not record the agent's session \
+         because {why}. Continuing — this never fails a phase — but the session id is only \
+         readable while the agent is ALIVE, so if it exits before a later poll succeeds, \
+         rehydrating this phase will have nothing to resume and will fall back to a fresh \
+         agent."
+    );
+}
+
+/// Whether this is the first capture failure seen for `key` (a `run/phase`).
+///
+/// Takes the set as a parameter — like `herdr::first_time_for`, and for the same
+/// reason: a gate wired to a `static` cannot be tested, and this one guards a
+/// diagnostic that only ever fires in the degraded case nobody exercises by
+/// hand. BOUNDED, and it clears wholesale rather than evicting: it is a
+/// de-duplication gate, not a cache, so no entry is worth more than another.
+fn first_capture_failure_for(
+    seen: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    key: &str,
+) -> bool {
+    /// Same reasoning as `herdr::WARNED_PANES_CAP`: the always-on review server
+    /// never restarts, so an unbounded set is a slow leak in the wrong place.
+    const CAP: usize = 512;
+    let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= CAP && !seen.contains(key) {
+        seen.clear();
+    }
+    seen.insert(key.to_string())
 }
 
 /// **Poll a phase's pane. THE only way to do it.**
@@ -1314,6 +1393,24 @@ pub fn phase_wait<H: Herdr>(
     // re-entered on every poll until the deadline.
     let mut token_lost_reported = false;
     loop {
+        // POLL FIRST, before any branch that can return. Exactly one poll per
+        // iteration, and it captures the session on the way past.
+        //
+        // It used to sit after the marker branch, on the reasoning that no
+        // bookkeeping write should wedge in front of a verdict. That reasoning
+        // was wrong in the direction that matters: the marker branch RETURNS
+        // (`Done`, `Superseded`), so a phase whose marker was already on disk at
+        // the first iteration was never polled at all — and its session is
+        // readable only while its agent is alive. Capture must not be reachable
+        // only on the slow path.
+        //
+        // Nothing is wedged in front of anything: capture writes through freshly
+        // loaded state, so the marker branch below re-reads it rather than
+        // racing it, and the `Done` path's `*run = fresh` picks it up.
+        let status = match pane_id.as_deref() {
+            Some(pid) => poll_phase_pane(h, run, phase, pid).and_then(|info| info.agent_status),
+            None => None,
+        };
         match std::fs::read_to_string(&marker) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
                 // Not "no marker yet" — the evidence is there and unreadable.
@@ -1463,18 +1560,16 @@ pub fn phase_wait<H: Herdr>(
         // including the `TokenLost` one — a pass token vanishing from drovr's own
         // state says nothing about whether the agent is alive, so its session
         // stays captured (and keeps being captured).
-        if let Some(pid) = pane_id.as_deref() {
-            // Captures on the way past — herdr reports `agent_session` only while
-            // the agent is alive, so the window to read it is exactly the window
-            // this loop is already awake for.
-            let status = poll_phase_pane(h, run, phase, pid).and_then(|info| info.agent_status);
-            // Proactively catch a blocked pane so the driver is signalled
-            // immediately instead of hanging until the wait's full timeout. Only
-            // `blocked` short-circuits; every other status keeps waiting for the
-            // marker.
-            if status == Some(AgentStatus::Blocked) {
-                return Ok(PhaseWaitOutcome::Blocked);
-            }
+        // Proactively catch a blocked pane so the driver is signalled immediately
+        // instead of hanging until the wait's full timeout. Only `blocked` short-
+        // circuits; every other status keeps waiting for the marker.
+        //
+        // Read from the poll taken at the top of this iteration — deliberately
+        // AFTER the marker branch, so a phase that is genuinely complete still
+        // reports `Done` even if its pane happens to read `blocked`. Moving the
+        // poll earlier changed when the pane is read, not what wins.
+        if status == Some(AgentStatus::Blocked) {
+            return Ok(PhaseWaitOutcome::Blocked);
         }
         let now = Instant::now();
         if now >= deadline {
@@ -2233,8 +2328,8 @@ mod tests {
         let mut run = make_run("wait-marker-wins-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
-        // Marker present AND a blocked status queued: the marker is checked first,
-        // so the phase is Done and the status is never consulted.
+        // Marker present AND a blocked status queued: the marker WINS, so the
+        // phase is Done rather than Blocked.
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
         agent_signals_done(&run, "plan", &pass);
@@ -2243,9 +2338,16 @@ mod tests {
         let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
         assert_eq!(outcome, PhaseWaitOutcome::Done);
         assert_eq!(run.phases[0].status, PhaseStatus::Done);
+
+        // The pane IS polled, and that is deliberate. This test used to assert
+        // the opposite — that a present marker meant the pane was never read —
+        // and that assertion was pinning a bug: the poll is where the session is
+        // captured, and a phase whose marker is already on disk at the first
+        // iteration would never have been polled at all. Precedence is what
+        // matters here (marker beats status), not whether the pane was touched.
         assert!(
-            !h.calls().iter().any(|c| c.contains("agent_status")),
-            "marker must be checked before status: {:?}",
+            h.calls().iter().any(|c| c.contains("agent_status")),
+            "the pane must still be polled — that is where capture happens: {:?}",
             h.calls()
         );
     }
@@ -4852,10 +4954,7 @@ mod capture_tests {
 
         let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
         assert_eq!(
-            run.phases[0]
-                .agent
-                .as_ref()
-                .and_then(|a| a.session.as_ref()),
+            run.phases[0].agent.as_ref().and_then(|a| a.session()),
             Some(&want),
             "the last non-empty session must survive both None cases"
         );
@@ -4866,10 +4965,7 @@ mod capture_tests {
         // And it is on DISK, which is the only place a later process can read it.
         let on_disk = RunState::load("session-survives").unwrap();
         assert_eq!(
-            on_disk.phases[0]
-                .agent
-                .as_ref()
-                .and_then(|a| a.session.as_ref()),
+            on_disk.phases[0].agent.as_ref().and_then(|a| a.session()),
             Some(&want)
         );
     }
@@ -4912,7 +5008,7 @@ mod capture_tests {
                 run.phases[0]
                     .agent
                     .as_ref()
-                    .and_then(|a| a.session.as_ref())
+                    .and_then(|a| a.session())
                     .is_none(),
                 "a {label} session must not be captured"
             );
@@ -4949,7 +5045,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_some()
         );
 
@@ -4998,10 +5094,47 @@ mod capture_tests {
             on_disk.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_some(),
             "and the capture must still land"
         );
+    }
+
+    #[test]
+    fn a_capture_failure_is_reported_once_per_phase_not_once_per_poll() {
+        // Capture is best-effort and must never fail a wait — but "best-effort"
+        // was SILENT, and the failure it hid is not self-healing: if the agent
+        // exits before a later poll retries, the session is gone and the only
+        // symptom is a rehydrate, much later, that has nothing to resume.
+        //
+        // It has to be once per phase, though. This sits in a loop that runs
+        // twice a second; a diagnostic that repeats at that rate is one nobody
+        // reads, and it would bury the wait's real output.
+        let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        assert!(
+            first_capture_failure_for(&seen, "r/plan"),
+            "the first says so"
+        );
+        assert!(
+            !first_capture_failure_for(&seen, "r/plan"),
+            "every later one is silent"
+        );
+        assert!(
+            first_capture_failure_for(&seen, "r/implement"),
+            "a different phase is its own event"
+        );
+        assert!(
+            first_capture_failure_for(&seen, "other/plan"),
+            "and so is the same phase name in another run"
+        );
+
+        // Bounded: the always-on server never restarts, so the set cannot grow
+        // forever. Past the cap it clears, and the cost is one repeated
+        // diagnostic — the same order as the guarantee it protects.
+        for i in 0..600 {
+            first_capture_failure_for(&seen, &format!("r/phase-{i}"));
+        }
+        assert!(seen.lock().unwrap().len() < 600, "the set must be bounded");
     }
 
     #[test]
@@ -5029,7 +5162,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_none(),
             "an unpersisted capture must not be claimed in memory either"
         );
@@ -5044,15 +5177,12 @@ mod capture_tests {
             RunState::load("persist-retry").unwrap().phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want),
             "the retry must land the session on disk"
         );
         assert_eq!(
-            run.phases[0]
-                .agent
-                .as_ref()
-                .and_then(|a| a.session.as_ref()),
+            run.phases[0].agent.as_ref().and_then(|a| a.session()),
             Some(&want)
         );
     }
@@ -5073,11 +5203,10 @@ mod capture_tests {
 
         // Disk gains a full launch record; this caller's copy has none.
         let mut other = RunState::load("adopt-from-disk").unwrap();
-        other.phases[0].agent = Some(PhaseAgent {
-            backend: "claude".into(),
-            profile: Some("/home/u/.config/claude-work".into()),
-            session: None,
-        });
+        other.phases[0].agent = Some(PhaseAgent::launched(
+            "claude",
+            Some("/home/u/.config/claude-work".into()),
+        ));
         other.save().unwrap();
         run.phases[0].agent = None;
 
@@ -5086,11 +5215,11 @@ mod capture_tests {
 
         let agent = run.phases[0].agent.as_ref().expect("seeded from disk");
         assert_eq!(
-            agent.profile.as_deref(),
+            agent.profile(),
             Some("/home/u/.config/claude-work"),
             "the profile on disk must survive — a rebuilt record would say None"
         );
-        assert!(agent.session.is_some(), "and the capture still lands");
+        assert!(agent.session().is_some(), "and the capture still lands");
 
         // And saving the caller's copy must not undo it.
         run.save().unwrap();
@@ -5098,7 +5227,7 @@ mod capture_tests {
             RunState::load("adopt-from-disk").unwrap().phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.profile.as_deref()),
+                .and_then(|a| a.profile()),
             Some("/home/u/.config/claude-work")
         );
     }
@@ -5121,18 +5250,16 @@ mod capture_tests {
         // Another process captured the same session and persisted it.
         let mut other = RunState::load("already-on-disk").unwrap();
         let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
-        other.phases[0].agent = Some(crate::run::PhaseAgent {
-            backend: "claude".into(),
-            profile: None,
-            session: Some(want.clone()),
-        });
+        let mut seeded = crate::run::PhaseAgent::launched("claude", None);
+        seeded.record_session(want.clone());
+        other.phases[0].agent = Some(seeded);
         other.phases[0].tab_id = Some(FakeHerdr::tab_id_for(&pane).as_str().to_owned());
         other.save().unwrap();
         assert!(
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_none(),
             "ours is behind"
         );
@@ -5143,10 +5270,7 @@ mod capture_tests {
 
         assert_eq!(ino(), before, "nothing to add → no write");
         assert_eq!(
-            run.phases[0]
-                .agent
-                .as_ref()
-                .and_then(|a| a.session.as_ref()),
+            run.phases[0].agent.as_ref().and_then(|a| a.session()),
             Some(&want),
             "and the caller's copy still catches up, or it re-asks every poll"
         );
@@ -5176,6 +5300,53 @@ mod capture_tests {
                 .phases
                 .is_empty(),
             "capture must not resurrect a phase that is gone"
+        );
+    }
+
+    #[test]
+    fn a_phase_whose_marker_is_already_there_is_still_polled() {
+        // The SAME skip the reviewer wait loop had, in the other loop. Asked
+        // explicitly — "what else can skip this capture?" — this is what turned
+        // up: `phase_wait`'s marker branch RETURNS (`Done`, `Superseded`), so a
+        // phase whose marker was already on disk at the first iteration was
+        // never polled at all, and a session is readable only while its agent
+        // lives. Under task 6 that phase is then reaped with nothing to resume.
+        //
+        // The fix is the same: poll at the top of the loop, before any branch
+        // that can return.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("wait-marker-first");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+
+        // The agent finished before this wait ever started, and the ONLY poll
+        // this wait will make is the one carrying the session.
+        agent_signals_done(&run, "plan", &pass);
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 5000).unwrap(),
+            PhaseWaitOutcome::Done,
+            "the marker still completes the phase on the first look"
+        );
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("wait-marker-first").unwrap().phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session()),
+            Some(&want),
+            "a marker already on disk must not skip the one poll this wait makes"
+        );
+        // And the caller holds it too — `Done` adopts the freshly loaded state,
+        // which must include what the poll just wrote.
+        assert_eq!(
+            run.phases[0].agent.as_ref().and_then(|a| a.session()),
+            Some(&want)
         );
     }
 
@@ -5212,7 +5383,7 @@ mod capture_tests {
             RunState::load("wait-keeps-session").unwrap().phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want),
             "the agent exiting must not take its session id with it"
         );
@@ -5245,7 +5416,7 @@ mod capture_tests {
             run.review_phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want),
             "a reviewer's session must be captured too"
         );
@@ -5259,7 +5430,7 @@ mod capture_tests {
             on_disk.review_phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want)
         );
     }
@@ -5287,10 +5458,7 @@ mod capture_tests {
         .unwrap();
         let pane = run.review_phases[0].pane_id.clone().unwrap();
         assert_eq!(
-            run.review_phases[0]
-                .agent
-                .as_ref()
-                .map(|a| a.backend.as_str()),
+            run.review_phases[0].agent.as_ref().map(|a| a.backend()),
             Some("cursor")
         );
 
@@ -5307,7 +5475,7 @@ mod capture_tests {
             run.review_phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want),
             "a cursor reviewer's session must be captured under cursor"
         );
@@ -5333,7 +5501,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_some(),
             "pass A has a session"
         );
@@ -5354,7 +5522,7 @@ mod capture_tests {
             on_disk.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_none(),
             "and pass A's conversation must not be advertised against it"
         );
@@ -5378,7 +5546,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_some()
         );
 
@@ -5388,7 +5556,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_none(),
             "a relaunched pane holds a different conversation"
         );
@@ -5401,7 +5569,7 @@ mod capture_tests {
             RunState::load("new-pass-session").unwrap().phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref())
+                .and_then(|a| a.session())
                 .is_none(),
             "and the stale id must not survive on disk either"
         );
@@ -5437,7 +5605,7 @@ mod capture_tests {
             RunState::load("token-lost-capture").unwrap().phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.session.as_ref()),
+                .and_then(|a| a.session()),
             Some(&want),
             "the session must be captured and kept through the TokenLost branch"
         );
@@ -5467,17 +5635,14 @@ mod capture_tests {
             )
             .unwrap();
             assert_eq!(
-                run.phases[0]
-                    .agent
-                    .as_ref()
-                    .and_then(|a| a.profile.as_deref()),
+                run.phases[0].agent.as_ref().and_then(|a| a.profile()),
                 Some("/home/u/.config/claude-work")
             );
             assert_eq!(
                 run.review_phases[0]
                     .agent
                     .as_ref()
-                    .and_then(|a| a.profile.as_deref()),
+                    .and_then(|a| a.profile()),
                 Some("/home/u/.config/claude-work"),
                 "a reviewer is resumed the same way, so it needs the same profile"
             );
@@ -5495,7 +5660,7 @@ mod capture_tests {
             run.phases[0]
                 .agent
                 .as_ref()
-                .and_then(|a| a.profile.as_deref())
+                .and_then(|a| a.profile())
                 .is_none()
         );
     }
@@ -5513,7 +5678,7 @@ mod capture_tests {
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
 
-        assert!(!run.phases[0].reaped);
+        assert!(!run.phases[0].is_reaped());
         assert_eq!(run.phases[0].pane_id.as_deref(), Some(pane.as_str()));
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
         assert!(
