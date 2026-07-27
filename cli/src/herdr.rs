@@ -1094,6 +1094,9 @@ pub struct FakeHerdr {
     /// When true, every `agent_send` returns an error (tests what a caller
     /// reports about the state a failed send leaves behind).
     fail_agent_send: RefCell<bool>,
+    /// How many `agent_send` calls still succeed before they start failing.
+    /// `None` = the `fail_agent_send` bool decides on its own.
+    agent_send_ok_budget: RefCell<Option<usize>>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
     /// Panes each workspace holds, as `workspace_panes` will report them. A
@@ -1122,6 +1125,7 @@ impl FakeHerdr {
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
+            agent_send_ok_budget: RefCell::new(None),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
@@ -1256,6 +1260,17 @@ impl FakeHerdr {
         *self.fail_agent_send.borrow_mut() = true;
     }
 
+    /// Let the next `ok` sends succeed, then fail every one after that.
+    ///
+    /// For a caller that seeds several agents in a loop and must be tested for
+    /// what it does to the EARLIER ones when a LATER seed fails — the blunt
+    /// `fail_agent_send` fails the first too, so the loop aborts before it has
+    /// anything to get wrong.
+    pub fn fail_agent_send_after(&self, ok: usize) {
+        *self.fail_agent_send.borrow_mut() = true;
+        *self.agent_send_ok_budget.borrow_mut() = Some(ok);
+    }
+
     fn record(&self, call: String) {
         self.calls.borrow_mut().push(call);
     }
@@ -1341,6 +1356,13 @@ impl Herdr for FakeHerdr {
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
         if *self.fail_agent_send.borrow() {
+            let mut budget = self.agent_send_ok_budget.borrow_mut();
+            if let Some(left) = budget.as_mut()
+                && *left > 0
+            {
+                *left -= 1;
+                return Ok(());
+            }
             return Err(io::Error::other("scripted agent_send failure"));
         }
         Ok(())

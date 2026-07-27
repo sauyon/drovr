@@ -703,6 +703,45 @@ impl Capture {
         new_tab || new_session
     }
 
+    /// Whether a poll could possibly add anything to `p` — answerable WITHOUT
+    /// knowing which backend the phase runs, so it can be asked before the state
+    /// read that establishes it.
+    ///
+    /// **Deliberately optimistic, and the asymmetry is the safety argument.** It
+    /// may answer "yes" when the authoritative capture turns out to add nothing
+    /// (costing one state read); it must never answer "no" when the capture
+    /// would add something. Each arm:
+    ///
+    /// * the poll reports NO session — nothing to add, ever, since capture never
+    ///   clears;
+    /// * the poll reports one and the phase holds none — say yes and let the
+    ///   real, backend-attributed check decide. This is the arm that keeps a
+    ///   stale or missing cached backend harmless: the guard does not consult
+    ///   the backend at all here;
+    /// * both hold one — compare through `resumable_for` with the phase's OWN
+    ///   backend. Safe because a recorded session lives INSIDE the `PhaseAgent`
+    ///   that names its backend, so having the session means having the backend
+    ///   it was captured under.
+    ///
+    /// The tab is compared directly; it is a plain string with no attribution.
+    fn might_add(info: &PaneInfo, p: &Phase) -> bool {
+        let new_tab = p.tab_id.as_deref() != Some(info.tab_id.as_str());
+        let new_session = match (
+            info.agent_session.as_ref(),
+            p.agent.as_ref().and_then(|a| a.session()),
+        ) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(reported), Some(held)) => {
+                p.agent
+                    .as_ref()
+                    .and_then(|a| reported.resumable_for(a.backend()))
+                    != Some(held)
+            }
+        };
+        new_tab || new_session
+    }
+
     /// Apply to `p`, returning whether anything actually changed. Only ever
     /// writes; see the type's note on why there is no clearing path.
     ///
@@ -770,6 +809,16 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     let Some(info) = poll else {
         return;
     };
+    // The cheap guard: ASK the caller's own copy whether this poll could add
+    // anything, before reading state. The steady state — same tab, same session,
+    // poll after poll — does no I/O at all. See `Capture::might_add` for why a
+    // stale cached backend can only cost an extra read here, never a lost
+    // capture; that asymmetry is what lets the guard run before the load that
+    // establishes the authoritative backend.
+    match run.find_phase(phase) {
+        Some(p) if Capture::might_add(info, p) => {}
+        _ => return,
+    }
     let Ok(mut fresh) = RunState::load(&run.name) else {
         capture_write_failed(&run.name, phase, "its run state could not be re-read");
         return;
@@ -5101,6 +5150,57 @@ mod capture_tests {
     }
 
     #[test]
+    fn a_session_appearing_after_the_tab_is_already_known_is_still_captured() {
+        // Isolates the cheap guard's session arm. Every other capture test
+        // happens to change the TAB on its first poll (it starts unrecorded), so
+        // the guard passes on the tab alone and a false negative in the session
+        // arm goes unnoticed — verified: inverting that arm passes the whole
+        // suite without this test.
+        //
+        // The real sequence it models is the ordinary one: herdr publishes
+        // `agent_status` (and the tab) before `agent_session`, so the first poll
+        // that sees the pane commonly records only the tab, and the session
+        // arrives on a later poll with everything else identical. If the guard
+        // says "nothing new" there, the session is never captured at all.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("session-after-tab");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+
+        // Poll 1: tab only, no session.
+        h.push_pane_info(session_less(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+        assert_eq!(
+            run.phases[0].tab_id.as_deref(),
+            Some(FakeHerdr::tab_id_for(&pane).as_str()),
+            "the tab is recorded on the first poll"
+        );
+        assert!(
+            run.phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session())
+                .is_none(),
+            "and no session yet — which is the setup, not the assertion"
+        );
+
+        // Poll 2: SAME tab, session now published. Nothing but the session differs.
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("session-after-tab").unwrap().phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session()),
+            Some(&want),
+            "a session arriving after the tab must not be filtered out by the guard"
+        );
+    }
+
+    #[test]
     fn a_capture_failure_is_reported_once_per_phase_not_once_per_poll() {
         // Capture is best-effort and must never fail a wait — but "best-effort"
         // was SILENT, and the failure it hid is not self-healing: if the agent
@@ -5135,6 +5235,56 @@ mod capture_tests {
             first_capture_failure_for(&seen, &format!("r/phase-{i}"));
         }
         assert!(seen.lock().unwrap().len() < 600, "the set must be bounded");
+    }
+
+    #[test]
+    fn a_capture_whose_save_failed_is_also_retried() {
+        // The load-failure path has its own test; this is the other half. They
+        // are separate branches with separate diagnostics, and the reason both
+        // matter is the same: the caller's copy must NOT adopt a value that
+        // never reached disk, or the guard sees "nothing new" on every later
+        // poll and the session is lost for the life of the phase.
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("save-fails");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+        let dir = run_dir("save-fails");
+
+        // The run dir is readable but not writable: `RunState::load` still
+        // works, so capture gets all the way to the save and fails there.
+        let orig = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        let ready = quick(&h, &mut run, "plan", &pane);
+        // Restore before asserting, so a failure cannot leave an undeletable dir.
+        std::fs::set_permissions(&dir, orig).unwrap();
+
+        assert!(ready, "a failed capture write must never fail the wait");
+        assert!(
+            run.phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session())
+                .is_none(),
+            "an unpersisted capture must not be claimed in memory either"
+        );
+
+        // Writable again: the very next poll reports the same thing and must
+        // land it.
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("save-fails").unwrap().phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session()),
+            Some(&want),
+            "the retry must land the session on disk"
+        );
     }
 
     #[test]

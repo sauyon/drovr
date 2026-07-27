@@ -474,6 +474,21 @@ pub fn code_review_run<H: Herdr>(
             if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
                 run.review_phases[i].status = PhaseStatus::Failed;
             }
+            // Give every reviewer already seeded this pass one last poll before
+            // abandoning the pass. They are live, working agents that this
+            // function is about to stop looking at: the wait loop below never
+            // runs, so without this their only capture was the readiness gate —
+            // which routinely returns before herdr publishes the session. They
+            // then exit, herdr drops it, and a later resume finds a reviewer it
+            // cannot rehydrate.
+            //
+            // Best-effort by construction: `poll_phase_pane` cannot fail, and the
+            // error being propagated is the one that matters.
+            for (_, seeded) in &pending {
+                if let Some(pane) = run.find_phase(seeded).and_then(|p| p.pane_id.clone()) {
+                    poll_phase_pane(h, run, seeded, &pane);
+                }
+            }
             return Err(e);
         }
         pending.push((angle.clone(), phase));
@@ -1454,6 +1469,74 @@ mod tests {
         assert_eq!(outcome, ReviewOutcome::Error);
         // Nothing spawned.
         assert!(run.review_phases.is_empty());
+    }
+
+    #[test]
+    fn an_aborted_pass_still_captures_the_reviewers_it_already_seeded() {
+        // The third instance of the same class, found by auditing "what else can
+        // skip this capture?" rather than by a bug report.
+        //
+        // Angles are spawned and seeded one at a time. If angle N's `phase_send`
+        // fails, the pass aborts — and the wait loop below, which is where a
+        // reviewer's session is normally captured, never runs at all. Reviewers
+        // 1..N-1 are live, working agents nobody will look at again this
+        // invocation; their only poll was the readiness gate, which routinely
+        // returns before herdr publishes the session. They exit, herdr drops it,
+        // and a later resume finds a reviewer it cannot rehydrate.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-aborted-pass");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\", \"security\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Angle 1's readiness gate: started, but no session published yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Angle 2's readiness gate — its send then fails, aborting the pass.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-2"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // The drain poll of angle 1, on the way out. Its session is up by now,
+        // and this is the last look anything will take at it.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+        // Angle 1 seeds fine; angle 2 fails, which aborts the pass.
+        h.fail_agent_send_after(1);
+
+        assert!(
+            code_review_run(&h, &mut run, "task-1", 40, false).is_err(),
+            "a failed seed aborts the pass"
+        );
+
+        let seeded = run
+            .review_phases
+            .iter()
+            .find(|p| p.name == "review:task-1:1:correctness")
+            .expect("angle 1 was registered");
+        assert_eq!(
+            seeded
+                .agent
+                .as_ref()
+                .and_then(|a| a.session())
+                .map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a reviewer already seeded when the pass aborted must still be polled — \
+             nothing else will ever look at it"
+        );
     }
 
     #[test]

@@ -477,6 +477,13 @@ impl RunState {
     /// write the file. This closes it, the same way [`PassToken`] and
     /// [`crate::herdr::SessionId`] close theirs.
     ///
+    /// **Scope, precisely: this guards `RunState::load`, not every deserialize.**
+    /// `cmd_list` reads run states directly with `serde_json::from_str(..).ok()`
+    /// to render `drovr list`, and deliberately keeps doing so — it only
+    /// displays, never acts, and a run whose state is inconsistent is one a
+    /// human most wants to SEE listed rather than have silently vanish. Every
+    /// path that acts on a run goes through here.
+    ///
     /// Failing the load is the right severity: it exits 1 and STOPs the run,
     /// which is loud — and the alternative is a phase whose pane `drovr attach`
     /// offers but reaping has already closed. Nothing drovr writes can produce
