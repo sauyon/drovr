@@ -796,7 +796,7 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     // capture would be silently dropped for exactly the legacy phases the
     // fallback exists to serve.
     if p.agent.is_none() && capture.session.is_some() {
-        p.agent = Some(PhaseAgent::launched(backend.clone(), None));
+        p.agent = Some(PhaseAgent::launched(backend, None));
     }
     // `apply` is false when the freshly-loaded state ALREADY carries what this
     // poll saw — another writer got there first, or the caller's copy had simply
@@ -807,9 +807,16 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     }
     // Only now, with the value on disk, does the caller's copy adopt it — so a
     // failure above leaves that copy stale on purpose, and the next poll retries.
+    //
+    // The caller's `PhaseAgent` is seeded from what is now ON DISK, never rebuilt
+    // here. Another writer may have recorded a profile (or a backend) this
+    // process never saw, and re-deriving one would hand the caller a
+    // `profile: None` that its next `run.save()` would write over the real one.
+    // Seeding only when the caller has none keeps this a write, never a clear.
+    let persisted_agent = fresh.find_phase(phase).and_then(|p| p.agent.clone());
     if let Some(p) = run.find_phase_mut(phase) {
-        if p.agent.is_none() && capture.session.is_some() {
-            p.agent = Some(PhaseAgent::launched(backend, None));
+        if p.agent.is_none() {
+            p.agent = persisted_agent;
         }
         capture.apply(p);
     }
@@ -4764,6 +4771,7 @@ mod capture_tests {
     use super::*;
     use crate::config::AgentLaunch;
     use crate::herdr::{AgentSession, FakeHerdr, PaneInfo, SessionId};
+    use crate::run::PhaseAgent;
     use crate::test_util::ENV_LOCK;
 
     fn capture_run(name: &str) -> RunState {
@@ -5046,6 +5054,52 @@ mod capture_tests {
                 .as_ref()
                 .and_then(|a| a.session.as_ref()),
             Some(&want)
+        );
+    }
+
+    #[test]
+    fn the_callers_copy_adopts_the_launch_record_from_disk_not_a_rebuilt_one() {
+        // The caller's `RunState` can be missing a `PhaseAgent` that disk already
+        // has — another process launched or re-entered the phase after this one
+        // loaded. Capture must seed the caller from DISK, not rebuild a record
+        // from what it happens to know: a rebuilt one carries `profile: None`,
+        // and the caller's next `run.save()` would write that over the real
+        // profile, which is exactly what a resume needs to find the session.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("adopt-from-disk");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+
+        // Disk gains a full launch record; this caller's copy has none.
+        let mut other = RunState::load("adopt-from-disk").unwrap();
+        other.phases[0].agent = Some(PhaseAgent {
+            backend: "claude".into(),
+            profile: Some("/home/u/.config/claude-work".into()),
+            session: None,
+        });
+        other.save().unwrap();
+        run.phases[0].agent = None;
+
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+
+        let agent = run.phases[0].agent.as_ref().expect("seeded from disk");
+        assert_eq!(
+            agent.profile.as_deref(),
+            Some("/home/u/.config/claude-work"),
+            "the profile on disk must survive — a rebuilt record would say None"
+        );
+        assert!(agent.session.is_some(), "and the capture still lands");
+
+        // And saving the caller's copy must not undo it.
+        run.save().unwrap();
+        assert_eq!(
+            RunState::load("adopt-from-disk").unwrap().phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.profile.as_deref()),
+            Some("/home/u/.config/claude-work")
         );
     }
 
