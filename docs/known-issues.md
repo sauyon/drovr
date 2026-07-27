@@ -772,6 +772,47 @@ Two consequences worth knowing:
    predates the change — plain `save` always did this — but it is now reachable from two more
    writers.
 
+## Archive/restore failures are reported only to the browser console
+
+Found 2026-07-26. Not fixed.
+
+`toggleArchive` (`cli/web/index.html`) returns silently on both failure paths — a non-OK
+response and a thrown fetch — logging only via `console.error`. The button is not disabled or
+spun while the request is in flight either, so "still working", "failed", and "nothing
+happened" are indistinguishable to the reviewer. Reachable today: archiving a run whose
+`state.json` does not parse answers 409, and a run deleted concurrently answers 404. The
+`workspace_closed: false` case is the one failure that does speak up, via an alert.
+
+Fix shape: an inline error on the row, or reuse of the alert path. Left undone because it is
+UI work with no failing behaviour behind it, and this branch was already several rounds deep
+in cursor correctness.
+
+## `code-review run` only checks `archived` at entry
+
+Found 2026-07-26. Deliberate, and narrow; recorded because it is not obvious.
+
+`code_review_run` refuses to start against an archived run, but never re-checks. If the human
+archives mid-review AND the workspace close fails (the zombie case, so the reviewer panes are
+still alive), the review keeps going: it harvests findings and flips `review_phases` to Done
+on a run the UI shows as filed away. Nothing is corrupted and `archived` itself survives (see
+the preserving-save entry), but work continues on a run the human believes they stopped.
+
+A mid-run re-check would need to decide what to do with reviewers already in flight, which is
+a bigger question than this branch should answer.
+
+## `cleanup --purge` can leave a run with a destroyed workspace and `archived: false`
+
+Found 2026-07-26. Pre-existing, not introduced here.
+
+`cmd_cleanup` sets `archived: true` only on the non-purge path. `--purge` closes the workspace
+and then deletes the run directory — so if that delete fails (permissions, a busy file), the
+run is left on disk with its workspace destroyed and `archived` still false. In `/api/runs`
+that is indistinguishable from a normal idle run: `live: false`, `archived: false`, and not a
+zombie, since zombie requires `archived == true`.
+
+Worth noting because the liveness/zombie machinery this branch added exists to surface exactly
+this class of mismatch, and this is the one shape it does not reach.
+
 ## Three of the six `save_preserving_archived` sites are redundant, and untestable
 
 Found 2026-07-26. Working as intended; recorded so nobody "fixes" the missing coverage.

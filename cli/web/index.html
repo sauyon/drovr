@@ -2033,9 +2033,10 @@ async function toggleArchive(name, archived, live) {
       return;
     }
   }
-  // Set when the archive left the row VISIBLE: the close failed while panes were
-  // live, so the run is a zombie and stays in the active list on purpose.
-  var zombied = false;
+  // Where the cursor should land IF this archive removes the row. Captured now,
+  // while the row is still on screen; whether it actually leaves is not knowable
+  // until the next /api/runs, so the decision itself happens after the render.
+  var neighbour = neighbourKey(name);
   try {
     var r = await fetch('/api/runs/' + encodeURIComponent(name) + '/archive', {
       method: 'POST',
@@ -2049,8 +2050,10 @@ async function toggleArchive(name, archived, live) {
     // running. That must not pass silently: the only other record is the
     // server's stderr, which nobody looking at this page can see.
     var res = await r.json().catch(function() { return {}; });
-    if (!archived && live !== '0' && res.workspace_closed === false) {
-      zombied = true;
+    // `!== true` rather than `=== false`: an unparseable body leaves this
+    // undefined, and "we could not tell whether the panes were closed" belongs on
+    // the warning side, not the silent side.
+    if (!archived && live !== '0' && res.workspace_closed !== true) {
       window.alert('Archived "' + name + '", but its herdr workspace could not be closed.\n\n' +
         'Its panes may still be running. Check with `herdr workspace list`, and close it ' +
         'with `drovr cleanup ' + name + '` once herdr is reachable.');
@@ -2067,25 +2070,38 @@ async function toggleArchive(name, archived, live) {
   // deliberately, rather than letting a stale numeric index drift onto whatever
   // slides into the slot — that drift was the bug, and it merely happened to
   // look right in this one case.
-  // Only when the row actually leaves. A zombie stays in the active list by
-  // design (`complete` is forced false server-side while its panes are alive),
-  // so advancing here would walk the cursor off a row that is still on screen —
-  // the same wrong-row class as the collapsed group and the filter, third route.
-  if (!archived && !zombied) advanceCursorPast(name);
-  renderRunList(gen);
+  await renderRunList(gen);
+  if (gen !== routeGen) return;
+  // Decide from what ACTUALLY happened, not from a prediction. Whether the row
+  // survives is settled by the server's next /api/runs, on liveness fresher than
+  // the `live` this function was handed — a zombie (close failed, panes alive)
+  // stays in the active list on purpose and must keep the cursor, while a row
+  // that really left must hand it on. Gating on the alert's condition instead got
+  // both directions wrong: a stale cached `live` of '0' silently advanced off a
+  // surviving zombie, and the common "workspace was already gone" case stranded
+  // the cursor on a row that had left.
+  if (!archived && navCursorKey === name && !isRowVisible(name)) {
+    navCursorKey = neighbour;
+    applyNavCursor(false);
+  }
 }
 
-// Move the anchor off `run` to an adjacent visible row, for when the reviewer
-// themselves removes it from the list. Only the key is set: `applyNavCursor`
-// re-derives the index from it after the rebuild, so it does not matter that
-// every row is about to be replaced.
-function advanceCursorPast(run) {
-  if (currentRun || navCursorKey !== run) return;
+// The row adjacent to `run` in the visible list, or '' if there is none. Called
+// BEFORE an action that may remove `run`, since afterwards its neighbours can no
+// longer be identified from it.
+function neighbourKey(run) {
   var rows = navRows(), i = -1;
   rows.forEach(function(el, n) { if (i < 0 && rowKey(el) === run) i = n; });
-  if (i < 0) return;
+  if (i < 0) return '';
   var next = rows[i + 1] || rows[i - 1];
-  navCursorKey = next ? rowKey(next) : '';
+  return next ? rowKey(next) : '';
+}
+
+// Whether `run` currently has a selectable row. A run folded into the collapsed
+// Completed group is NOT visible by this measure, which is the point: the cursor
+// cannot sit on something the reviewer cannot see.
+function isRowVisible(run) {
+  return navRows().some(function(el) { return rowKey(el) === run; });
 }
 
 async function renderRunList(gen, resetAnchor) {
@@ -2144,9 +2160,14 @@ async function renderRunList(gen, resetAnchor) {
     // reviewer would read "Completed" as verified when nothing verified it — and
     // an archived run whose workspace never actually closed folds away unseen.
     var unknownLive = runs.some(function(r) { return r.live === null; });
+    // Deliberately does not name a cause. `live: null` means two different things
+    // — herdr could not be reached, or that run's own state.json did not parse so
+    // its workspace id was never read — and the page cannot tell which. Naming
+    // herdr was simply wrong in the second case.
     var banner = unknownLive
-      ? '<div class="live-unknown">Could not reach herdr &mdash; whether any session still ' +
-        'has live panes is unknown. Grouping below assumes not.</div>'
+      ? '<div class="live-unknown">Whether some sessions still have live panes is ' +
+        'unknown &mdash; herdr may be unreachable, or a session\'s own state may be ' +
+        'unreadable. Grouping below assumes not live.</div>'
       : '';
 
     var html = banner + active.map(runRow).join('');

@@ -835,7 +835,17 @@ fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
 
     let dir = ctx.runs_root.join(run);
     let Some(state) = load_run_state(&dir) else {
-        respond_str(req, 404, "text/plain", "no such run".into());
+        // "Not there" and "there but unreadable" are different answers, and the
+        // reviewer can tell them apart: `list_runs_in` lists any run whose
+        // state.json merely EXISTS, so an unparseable one is visible on the page
+        // with a working-looking Archive button. Answering 404 to a click on a row
+        // they can plainly see reads as a bug in the page.
+        let (code, msg): (u16, &str) = if dir.join("state.json").is_file() {
+            (409, "run state is unreadable; fix or remove its state.json")
+        } else {
+            (404, "no such run")
+        };
+        respond_str(req, code, "text/plain", msg.into());
         return;
     };
 
@@ -1245,13 +1255,20 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
         // archived it, or when the human cancelled at the gate — the one terminal
         // verdict that ends a run without completing it. An unreadable state.json
         // is `None` here and stays visible rather than being hidden as complete.
-        let live = match (
-            live_workspaces,
-            run_state.as_ref().and_then(|s| s.workspace.as_deref()),
-        ) {
+        let live = match (live_workspaces, run_state.as_ref()) {
+            // herdr could not be reached: unknown for every run.
             (None, _) => None,
-            (Some(_), None) => Some(false),
-            (Some(ids), Some(ws)) => Some(ids.iter().any(|i| i == ws)),
+            // The run's own state.json did not parse, so we never learned its
+            // workspace id. That is UNKNOWN, not "no panes" — the ambiguity is
+            // this run's file rather than herdr, but the answer is the same, and
+            // claiming `false` asserts a fact we have no basis for. `list_runs_in`
+            // only checks state.json EXISTS, so such runs really are listed.
+            (Some(_), None) => None,
+            (Some(ids), Some(st)) => match st.workspace.as_deref() {
+                // Parsed, and genuinely has no workspace recorded.
+                None => Some(false),
+                Some(ws) => Some(ids.iter().any(|i| i == ws)),
+            },
         };
         // Liveness gates the ARCHIVED case only, and nothing else.
         //
@@ -1797,6 +1814,21 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
 
+        // An unreadable state.json means the run's workspace id was never read, so
+        // liveness is UNKNOWN. Reporting `false` asserts "no live panes", which is
+        // a claim we have no basis for — and the row IS listed (`list_runs_in`
+        // only checks the file exists), so the reviewer sees and acts on it.
+        assert!(
+            row_for(&rows, "broken")["live"].is_null(),
+            "an unparseable state.json makes liveness unknown, not false"
+        );
+        // ...while a run that parsed and genuinely records no workspace is not live.
+        assert_eq!(
+            row_for(&rows, "midflight")["live"],
+            false,
+            "a parsed run with no workspace really is not live"
+        );
+
         assert_eq!(row_for(&rows, "finished")["complete"], true);
         assert_eq!(row_for(&rows, "finished")["done"], 4);
         assert_eq!(row_for(&rows, "finished")["total"], 4);
@@ -2176,6 +2208,40 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_endpoint_separates_missing_from_unreadable() {
+        let tmp = std::env::temp_dir().join(format!("drovr-arch404-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Present on the page (listing only requires state.json to EXIST), but its
+        // contents do not parse.
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+
+        let addr = start_server(tmp.clone());
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/broken/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(
+            code, 409,
+            "a run that is listed but unreadable must not answer 'no such run' — \
+             the reviewer can see the row, so 404 reads as a bug in the page"
+        );
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/ghost/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(code, 404, "a genuinely absent run is still 404");
     }
 
     #[test]

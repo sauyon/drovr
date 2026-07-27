@@ -758,6 +758,110 @@ check('...so the cursor stays on it rather than walking to a neighbour',
   await cursorName(), zTarget);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
+// The cursor decision must come from what ACTUALLY happened, not from the
+// client's cached `live` at click time — those disagree in both directions.
+
+// (1) Cached live '0' (so no confirm), but the run comes back a real zombie.
+// Predicting from the cached value advanced the cursor off a surviving row, and
+// silently: the "panes may still be running" alert did not fire either.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const staleTarget = await cursorName();
+await evaluate(`
+  window.__zArchived = false;
+  window.__zName = ${JSON.stringify(staleTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__zArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__zName) return x;
+            // Before the click the page is told "definitely not live", so the
+            // key does not prompt. Afterwards the truth: panes alive.
+            return window.__zArchived
+              ? Object.assign({}, x, {live: true, archived: true, complete: false})
+              : Object.assign({}, x, {live: false, archived: false, complete: false});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the stale-liveness fixture reports not-live before the click', await evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.live : null;`), '0');
+await press('a');
+await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
+await evaluate(`return renderRunList(routeGen);`);
+check('a run that turns out to be a zombie stays in the active list',
+  (await rowNames()).indexOf(staleTarget) !== -1, true);
+check('...so the cursor stays on it even though cached liveness said otherwise',
+  await cursorName(), staleTarget);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (2) The converse. `workspace_closed:false` is overwhelmingly "the workspace was
+// already gone", so the row really does leave — the cursor must move on rather
+// than park on a row that is never coming back.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const goneTarget = await cursorName();
+await evaluate(`
+  window.__gArchived = false;
+  window.__gName = ${JSON.stringify(goneTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__gArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__gName) return x;
+            return window.__gArchived
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : Object.assign({}, x, {live: null, archived: false, complete: false});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+await press('a');
+await waitFor(() => evaluate(`return window.__gArchived;`), v => v === true, 4000, 'the archive POST fired');
+await evaluate(`return renderRunList(routeGen);`);
+check('a run whose workspace was already gone really leaves the active list',
+  (await rowNames()).indexOf(goneTarget), -1);
+// `press` does not await toggleArchive — its own re-render, and the cursor
+// decision that follows it, land afterwards. Wait for that rather than probing
+// mid-flight; if the advance never happens this still fails, on the timeout.
+await waitFor(cursorName, n => n !== null && n !== goneTarget, 6000,
+  'the cursor to advance off the archived row');
+check('...so the cursor advances to a neighbour instead of stranding',
+  (await cursorName()) !== goneTarget, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);
 await press('/');
