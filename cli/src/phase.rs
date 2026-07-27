@@ -753,10 +753,23 @@ impl Capture {
             p.tab_id = Some(tab.clone());
         }
         if let Some(id) = &self.session {
-            // `false` = no launch record to attach it to. `record_capture`
-            // establishes one first, so this cannot silently drop a session
-            // there; anywhere else, refusing is right — a session without its
-            // backend is not a thing this codebase stores.
+            // The return is deliberately ignored, and the reason is an invariant
+            // `record_capture` maintains rather than something visible here — so
+            // it is written down, because a reader (and a reviewer) otherwise has
+            // to re-derive it:
+            //
+            //   * on the `fresh` copy, the `if pane_agent().is_none() &&
+            //     session.is_some() { record_launch(..) }` immediately above the
+            //     call guarantees a record exists whenever there is a session;
+            //   * on the caller's copy, `adopt_pane_agent` seeds it from `fresh`
+            //     — which by then has been through that same block.
+            //
+            // So `false` is unreachable HERE whenever there is a session to lose.
+            // Everywhere else `false` is the right answer: a session without the
+            // backend that created it is not a thing this codebase stores.
+            //
+            // If you add a third `apply` call site, re-establish that guarantee
+            // or check the bool.
             p.record_session(id.clone());
         }
         true
