@@ -14,7 +14,7 @@ mod shell;
 mod worktree;
 
 use clap::{Parser, Subcommand};
-use code_review::{ReviewOutcome, code_review_run, head_sha};
+use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
     PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
@@ -194,6 +194,32 @@ enum CodeReviewCmd {
         /// diff you no longer care about.
         #[arg(long)]
         fresh: bool,
+        /// What this change is about, in your words. drovr composes the brief; this
+        /// is the one part of it you supply. Recorded in the run dir, so a resume
+        /// briefs its reviewers identically.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        /// Read `--context` from a file (use for anything longer than a sentence).
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+    },
+    /// Print one angle's reviewer brief and exit, spawning nothing.
+    ///
+    /// For the case the panel cannot serve: a driver whose session drovr did not
+    /// start has no herdr workspace to spawn reviewer panes into, so it spawns its
+    /// own read-only reviewer. Pass this text to that reviewer VERBATIM — it is the
+    /// same brief `code-review run` injects, so the frame stays drovr's rather than
+    /// one the driver improvised.
+    Brief {
+        run: String,
+        task: String,
+        #[arg(long)]
+        angle: String,
+        /// See `code-review run --context`.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
 }
 
@@ -947,6 +973,25 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+/// Resolve `--context` / `--context-file` into the context text. clap enforces that
+/// the two are mutually exclusive, so this only has to read the file. An unreadable
+/// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
+/// context to be in the brief, and silently reviewing without it is the failure this
+/// whole mechanism exists to prevent.
+fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
+    match (context, context_file) {
+        (Some(text), _) => Some(text),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("drovr: cannot read --context-file {}: {e}", path.display());
+                process::exit(1);
+            }
+        },
+        (None, None) => None,
+    }
+}
+
 fn cmd_code_review(sub: CodeReviewCmd) {
     match sub {
         CodeReviewCmd::Base { run, task } => {
@@ -988,11 +1033,42 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                 path.display()
             );
         }
+        CodeReviewCmd::Brief {
+            run,
+            task,
+            angle,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("task", &task) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("angle", &angle) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match code_review_brief(&state, &task, &angle, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: cannot compose brief: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         CodeReviewCmd::Run {
             run,
             task,
             timeout_ms,
             fresh,
+            context,
+            context_file,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
@@ -1004,7 +1080,9 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             }
             let h = SystemHerdr::new();
             let mut state = load_run(&run);
-            let outcome = code_review_run(&h, &mut state, &task, timeout_ms, fresh);
+            let context = read_context_arg(context, context_file);
+            let outcome =
+                code_review_run(&h, &mut state, &task, timeout_ms, fresh, context.as_deref());
             // Persist the review_phases progress the panel recorded (spawned
             // reviewers, done/running status) BEFORE handling the result:
             // `code_review_run` appends reviewer phases as it spawns them and can
@@ -1685,6 +1763,7 @@ mod tests {
                         task,
                         timeout_ms,
                         fresh,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -1698,6 +1777,73 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `--context` and `--context-file` are alternatives, not a pair. clap enforces
+    /// it, so a driver cannot supply two different contexts and leave drovr guessing.
+    #[test]
+    fn parse_code_review_context_args_are_mutually_exclusive() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "run",
+            "myrun",
+            "task-1",
+            "--context",
+            "the retry loop is new",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Run { context, .. },
+            } => assert_eq!(context.as_deref(), Some("the retry loop is new")),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "code-review",
+                "run",
+                "myrun",
+                "task-1",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected, not silently resolved"
+        );
+    }
+
+    #[test]
+    fn parse_code_review_brief() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "brief",
+            "myrun",
+            "task-1",
+            "--angle",
+            "security",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Brief {
+                    run, task, angle, ..
+                },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(task, "task-1");
+                assert_eq!(angle, "security");
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&["drovr", "code-review", "brief", "myrun", "task-1"]).is_err(),
+            "an angle-less brief has no frame to compose"
+        );
     }
 
     #[test]

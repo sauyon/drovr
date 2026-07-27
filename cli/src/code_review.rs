@@ -145,6 +145,72 @@ fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     Ok(std::fs::read_to_string(&p)?.trim().to_owned())
 }
 
+/// `<task>-review-context.md` — the driver's statement of what this change is about,
+/// as supplied to `--context` / `--context-file`.
+///
+/// Recorded rather than passed through because of invariant 4: a resumed or respawned
+/// reviewer must get the SAME brief as its panel-mates. Without a record, a second
+/// invocation that omitted the argument would compose a thinner brief than the first,
+/// and the two reviewers would be reviewing under different instructions.
+fn context_path(dir: &Path, task: &str) -> std::path::PathBuf {
+    dir.join(format!("{task}-review-context.md"))
+}
+
+/// Resolve the context for this pass: `supplied` wins and is RECORDED; absent, the
+/// recorded context (if any) is reused. An unreadable record is treated as absent —
+/// a brief with no context is worse than no review, but not worth failing a pass over.
+fn resolve_context(dir: &Path, task: &str, supplied: Option<&str>) -> io::Result<Option<String>> {
+    let path = context_path(dir, task);
+    match supplied.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&path, format!("{c}\n"))?;
+            Ok(Some(c.to_owned()))
+        }
+        None => Ok(std::fs::read_to_string(&path)
+            .ok()
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty())),
+    }
+}
+
+/// Compose one angle's reviewer brief and return it, spawning NOTHING.
+///
+/// This is the same text `code_review_run` injects, exposed for the path the panel
+/// cannot serve: a driver whose session drovr did not start has no herdr workspace to
+/// spawn reviewer panes into (see `docs/known-issues.md`), so it spawns its own
+/// read-only reviewer. That reviewer's prompt must still be drovr's brief rather than
+/// one the driver wrote, or the frame is agent-authored again.
+pub fn code_review_brief(
+    run: &RunState,
+    task: &str,
+    angle: &str,
+    context: Option<&str>,
+) -> io::Result<String> {
+    let dir = run_dir(&run.name);
+    let base = base_sha(&dir, task).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "no review base recorded for '{task}' ({e}); run \
+                 `drovr code-review base {} {task}` at task start",
+                run.name
+            ),
+        )
+    })?;
+    let head = head_sha(&run.project_dir)?;
+    let context = resolve_context(&dir, task, context)?;
+    Ok(build_seed(
+        task,
+        angle,
+        &base,
+        &head,
+        &run.task,
+        &run.project_dir,
+        context.as_deref(),
+    ))
+}
+
 /// The iteration a re-run should RESUME, if any: the newest one, and only while a
 /// reviewer for a **currently configured** angle is still `Running`.
 ///
@@ -212,7 +278,14 @@ fn build_seed(
     head: &str,
     task_desc: &str,
     project_dir: &str,
+    context: Option<&str>,
 ) -> String {
+    // Rendered only when there is context: an empty "## Context from the driver"
+    // heading reads as "the driver had nothing to say", which is worse than silence.
+    let context_section = match context.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!("## Context from the driver\n\n{c}\n\n"),
+        None => String::new(),
+    };
     format!(
         "# Review angle: {angle}\n\n\
          You are a READ-ONLY reviewer on the drovr review panel for task `{task}`.\n\
@@ -227,6 +300,7 @@ fn build_seed(
          invariants and neighbouring code it has to hold up against, and run the tests.\n\
          Reading is unrestricted; only writing is not.\n\n\
          ## Task under review\n\n{task_desc}\n\n\
+         {context_section}\
          ## Output\n\n\
          Return your findings in a fenced JSON block matching:\n\n\
          ```json\n{schema}\n```\n\n\
@@ -323,6 +397,7 @@ pub fn code_review_run<H: Herdr>(
     task: &str,
     timeout_ms: u64,
     fresh: bool,
+    context: Option<&str>,
 ) -> io::Result<ReviewOutcome> {
     let dir = run_dir(&run.name);
 
@@ -349,6 +424,10 @@ pub fn code_review_run<H: Herdr>(
             return Ok(ReviewOutcome::Error);
         }
     };
+
+    // Resolved once per pass, so every angle in this panel — and every angle a later
+    // resume respawns — is briefed identically.
+    let context = resolve_context(&dir, task, context)?;
 
     let cfg = load_config()?;
     let auto_cursor_integrated = cfg.review_agent.is_none() && h.integration_present("cursor");
@@ -459,7 +538,15 @@ pub fn code_review_run<H: Herdr>(
         // single-writer invariant holds — the panel never has a reviewer alive while a
         // writer runs.
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
-        let seed_text = build_seed(task, angle, &base, &head, &run.task, &run.project_dir);
+        let seed_text = build_seed(
+            task,
+            angle,
+            &base,
+            &head,
+            &run.task,
+            &run.project_dir,
+            context.as_deref(),
+        );
         std::fs::write(&seed_path, &seed_text)?;
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
@@ -728,7 +815,7 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert_eq!(
@@ -744,7 +831,7 @@ mod tests {
 
         // A plain re-run must RESUME iter 1 — not open a second panel on the same diff.
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert_eq!(
@@ -783,7 +870,7 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -797,7 +884,7 @@ mod tests {
 
         // Still Timeout (two stragglers), but the finished work is banked on disk.
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -841,7 +928,7 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -851,7 +938,7 @@ mod tests {
         h.push_read(format!("```json\n{CLEAN}\n```"));
         h.push_read(format!("```json\n{CLEAN}\n```"));
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -864,7 +951,7 @@ mod tests {
         );
         h.push_read(format!("```json\n{CLEAN}\n```"));
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Findings
         );
 
@@ -886,7 +973,7 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         let dead = pane_of(&run, "review:task-1:1:type-design");
@@ -894,7 +981,7 @@ mod tests {
         h.kill_pane(dead.clone());
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -931,7 +1018,7 @@ mod tests {
         write_base(&run, "task-1");
         h.fail_agent_send();
 
-        let err = code_review_run(&h, &mut run, "task-1", 40, false)
+        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
             .expect_err("a reviewer that cannot be seeded must fail the pass loudly");
         assert!(err.to_string().contains("agent_send"), "surfaced: {err}");
 
@@ -956,7 +1043,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-bad-json");
         write_base(&run, "task-1");
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -965,7 +1052,7 @@ mod tests {
         let pane = pane_of(&run, "review:task-1:1:correctness");
         h.push_read_for(&pane, "```json\n{\"not\":\"a review\"}\n```");
 
-        let err = code_review_run(&h, &mut run, "task-1", 40, false)
+        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
             .expect_err("unparseable findings must fail the pass loudly");
         assert!(!err.to_string().is_empty());
         assert_eq!(
@@ -985,7 +1072,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-resume-failed");
         write_base(&run, "task-1");
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -999,7 +1086,7 @@ mod tests {
         run.review_phases[i].status = PhaseStatus::Failed;
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1034,7 +1121,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-respawn-harvest");
         write_base(&run, "task-1");
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1058,7 +1145,7 @@ mod tests {
             );
         }
         h.push_read(format!("```json\n{CLEAN}\n```"));
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
 
         let fresh_pane = pane_of(&run, "review:task-1:1:correctness");
         assert_ne!(fresh_pane, dead);
@@ -1095,7 +1182,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
         );
 
@@ -1109,7 +1196,7 @@ mod tests {
         });
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert!(
@@ -1134,7 +1221,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-banked-corrupt");
         write_base(&run, "task-1");
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1150,7 +1237,7 @@ mod tests {
         // It must be waited on again (so: Timeout, still 4 phases, no respawn since
         // its pane is alive) — not trusted, and not a hard error.
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert_eq!(run.review_phases.len(), 4);
@@ -1170,14 +1257,14 @@ mod tests {
         let (mut run, _repo) = make_run("cr-no-head-record");
         write_base(&run, "task-1");
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
         std::fs::remove_file(run_dir(&run.name).join("task-1-review-1.head")).unwrap();
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert!(
@@ -1196,11 +1283,11 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, true).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, true, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1230,7 +1317,7 @@ mod tests {
         write_base(&run, "task-1");
 
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1239,7 +1326,7 @@ mod tests {
         // a diff that no longer exists.
         commit_more(&run);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
 
@@ -1266,14 +1353,14 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
         );
 
         // The fix loop re-reviews after the implementer acts on findings: iter 1 is
         // fully Done, so there is nothing to resume — this must be a fresh panel.
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
         assert!(
@@ -1300,7 +1387,7 @@ mod tests {
         // Simulate every reviewer having dropped its marker.
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
 
         // Merged file exists and is clean.
@@ -1354,7 +1441,7 @@ mod tests {
             h.push_read(format!("```json\n{CLEAN}\n```"));
         }
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
         assert!(
             run.review_phases
@@ -1386,7 +1473,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Findings);
 
         let merged = run_dir(&run.name).join("task-1-review.json");
@@ -1414,7 +1501,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Findings
         );
 
@@ -1423,7 +1510,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 2);
         assert_eq!(
-            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
         );
         let merged = run_dir(&run.name).join("task-1-review.json");
@@ -1441,7 +1528,7 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-nobase");
         // No base.sha written.
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Error);
         // Nothing spawned.
         assert!(run.review_phases.is_empty());
@@ -1455,7 +1542,7 @@ mod tests {
         write_base(&run, "task-1");
 
         // No markers dropped → tiny timeout → Timeout.
-        let outcome = code_review_run(&h, &mut run, "task-1", 40, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Timeout);
         assert_eq!(run.review_phases.len(), 4);
         assert!(
@@ -1496,7 +1583,7 @@ mod tests {
         }
         drop_markers(&run, "task-1", 1);
 
-        code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
 
         let calls = h.calls();
         let run_calls: Vec<&String> = calls.iter().filter(|c| c.contains("pane_run")).collect();
@@ -1526,7 +1613,7 @@ mod tests {
         );
         drop_markers(&run, "task-1", 1);
 
-        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap();
+        let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
         // drovr wrote the missing per-angle file from the transcript.
         let recovered = run_dir(&run.name).join("task-1-review-type-design.json");
@@ -1708,6 +1795,7 @@ mod tests {
             "bbb",
             "do the thing",
             "/checkout/here",
+            None,
         );
         assert!(
             seed.contains("git diff aaa..bbb"),
@@ -1741,6 +1829,7 @@ mod tests {
             "bbb",
             "do the thing",
             "/checkout/here",
+            None,
         );
         assert!(
             seed.contains("/checkout/here"),
@@ -1753,6 +1842,120 @@ mod tests {
         assert!(
             seed.contains("run the tests") || seed.contains("run tests"),
             "seed must allow running the tests: {seed}"
+        );
+    }
+    /// Context the driver supplies must reach the reviewer as a labelled section of
+    /// the brief drovr composes — not as prose the driver wraps around it.
+    #[test]
+    fn seed_carries_driver_context_when_given() {
+        let with = build_seed(
+            "task-1",
+            "correctness",
+            "aaa",
+            "bbb",
+            "do the thing",
+            "/checkout/here",
+            Some("the retry loop is new; ignore the vendored dir"),
+        );
+        assert!(
+            with.contains("## Context from the driver"),
+            "context must land in its own labelled section: {with}"
+        );
+        assert!(with.contains("the retry loop is new; ignore the vendored dir"));
+
+        let without = build_seed(
+            "task-1",
+            "correctness",
+            "aaa",
+            "bbb",
+            "do the thing",
+            "/checkout/here",
+            None,
+        );
+        assert!(
+            !without.contains("## Context from the driver"),
+            "no context must mean no empty section: {without}"
+        );
+    }
+
+    /// Invariant 4: a resume must compose the SAME brief. The context is therefore
+    /// recorded in the run dir on the pass that supplies it, and a later pass that
+    /// passes none reuses the record rather than silently dropping it.
+    #[test]
+    fn context_is_recorded_and_reused_by_a_later_pass() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-context-persist");
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, Some("watch the retry loop")).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let dir = run_dir(&run.name);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("task-1-review-context.md"))
+                .unwrap()
+                .trim(),
+            "watch the retry loop",
+            "the pass that supplies context must record it"
+        );
+
+        // A fresh panel with NO context argument: the recorded context still has to
+        // reach the reviewers, or the second panel reviews with less than the first.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, true, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let seed =
+            std::fs::read_to_string(dir.join("task-1-review-correctness-seed.md")).unwrap();
+        assert!(
+            seed.contains("watch the retry loop"),
+            "a later pass must reuse the recorded context: {seed}"
+        );
+    }
+
+    /// The in-harness path (a driver spawning its own read-only reviewer, the only
+    /// path that works when drovr did not start the session) must be able to obtain
+    /// the composed brief WITHOUT spawning anything — otherwise its prompt goes back
+    /// to being agent-authored.
+    #[test]
+    fn brief_composes_the_same_frame_without_spawning() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (run, _repo) = make_run("cr-brief");
+        write_base(&run, "task-1");
+
+        let brief = code_review_brief(&run, "task-1", "security", Some("only the parser changed"))
+            .expect("brief must compose from recorded base + current HEAD");
+
+        assert!(brief.contains("# Review angle: security"));
+        assert!(brief.contains("READ-ONLY reviewer"));
+        assert!(brief.contains("read any file"), "full-repo grant: {brief}");
+        assert!(brief.contains("only the parser changed"));
+        assert!(
+            brief.contains(&run.project_dir),
+            "brief must name the checkout: {brief}"
+        );
+        assert_eq!(
+            h.calls().len(),
+            0,
+            "composing a brief must not touch herdr: {:?}",
+            h.calls()
+        );
+    }
+
+    /// A brief with no recorded base cannot state its scope, so it must fail loudly
+    /// rather than print a frame with an empty diff range.
+    #[test]
+    fn brief_without_a_recorded_base_is_an_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (run, _repo) = make_run("cr-brief-no-base");
+        let err = code_review_brief(&run, "task-1", "security", None)
+            .expect_err("no base recorded must be an error");
+        assert!(
+            err.to_string().contains("code-review base"),
+            "the error must say how to fix it: {err}"
         );
     }
 }
