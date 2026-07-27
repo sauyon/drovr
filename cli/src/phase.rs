@@ -873,7 +873,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // agent.
     let cwd = run.project_dir.clone();
     let cfg = load_config()?;
-    let (launch, profile, resuming) = {
+    let (launch, profile, resuming, fresh_backend) = {
         let existing = run
             .find_phase(phase)
             .expect("the phase was located above and nothing removed it");
@@ -902,18 +902,15 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         // session existed: a backend with no resume surface has a perfectly good
         // session id and still cannot be told to use it.
         match resumed {
-            Some((launch, profile)) => (launch, profile, true),
+            Some((launch, profile)) => (launch, profile, true, fresh_backend),
             None => (
                 cfg.launch(&fresh_backend, &cwd, readonly)?,
-                fresh_profile.clone(),
+                fresh_profile,
                 false,
+                fresh_backend,
             ),
         }
     };
-    let fresh_backend = run
-        .find_phase(phase)
-        .and_then(|p| p.pane_agent().map(|a| a.backend().to_owned()))
-        .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
 
     // ⚠️ NOTHING IS MUTATED UNTIL THE LAUNCH SUCCEEDS, and that is the opposite
     // of `phase_start`'s persist-first order on purpose.
@@ -928,9 +925,15 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // neither complete-provable nor running: the next `phase wait` blocks
     // forever, and the only way out is hand-editing the run dir.
     //
-    // Every failure below therefore leaves the phase exactly as it was — still
-    // reaped, still `Done`, still holding its marker and the pass that marker
-    // was stamped with — so a retry starts from the same place.
+    // Every failure below therefore leaves the phase exactly as it was ON DISK
+    // — still reaped, still `Done`, still holding its marker and the pass that
+    // marker was stamped with — so a retry starts from the same place.
+    //
+    // ⚠️ On disk, not in memory: if `run.save()` below fails, the in-memory
+    // `RunState` has already been mutated while `state.json` (written tmp+rename)
+    // has not. No caller is exposed to that today — the CLI exits the process on
+    // `Err` and the HTTP path shells out to a fresh one — but a caller that kept
+    // `run` alive across a failed rehydrate would be holding a lie.
     let pass = new_pass_token();
 
     // A fresh tab, never `run.root_pane` — a rehydrated phase must be as
@@ -996,10 +999,28 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // Sweeping first and then failing to save is the hole that leaves a phase
     // `Done` with its evidence gone.
     run.save()?;
-    // The old marker is already INERT — the new pass is on disk and
-    // `marker_completes_pass` rejects a token that does not match it — so this
-    // is defence in depth rather than the thing that makes the wait correct.
-    remove_stale_marker(&run.name, phase)?;
+    // Best-effort, and NOT `?`. By this line the agent is running and its pane
+    // is durably recorded, so a hard error here would report a rehydrate that
+    // fully succeeded as a failure — the CLI would exit 1 and the HTTP handler
+    // would answer 500 "nothing happened" about a live pane, and the retry that
+    // invites is then refused with `HoldsPane`, sending the operator to look at
+    // a pane they were just told did not exist. That is the same
+    // reports-the-wrong-thing class as the bug this ordering fixed, inverted.
+    //
+    // Safe to swallow because the marker is already INERT: the new pass is on
+    // disk, and `marker_completes_pass` rejects a token that does not match it.
+    // Sweeping is defence in depth here, so its failure is a warning, not an
+    // outcome. (In `phase_start` the same call IS fatal — there nothing else
+    // invalidates the marker at that point.)
+    if let Err(e) = remove_stale_marker(&run.name, phase) {
+        eprintln!(
+            "drovr: warning: could not remove the stale completion marker for \
+             '{}/{phase}' ({e}). The phase is rehydrated and the marker is inert \
+             (its token no longer matches this pass), so `phase wait` is correct \
+             either way — but the file is still there.",
+            run.name
+        );
+    }
 
     // ⚠️ The readiness gate is NOT the reseed path's alone, and gating only that
     // one was a real defect. `pane_run` returning `Ok` means the shell command
@@ -7146,6 +7167,42 @@ mod rehydrate_tests {
             !h.calls().iter().any(|c| c.contains("agent_send")),
             "nothing was sent to an agent that never became ready: {:?}",
             h.calls()
+        );
+    }
+
+    #[test]
+    fn an_unremovable_marker_does_not_fail_a_rehydrate_that_worked() {
+        // The inverse of the evidence bug, and a regression the reordering
+        // introduced: by the time the marker is swept, the agent is running and
+        // its pane is durably recorded. A hard error there reports a rehydrate
+        // that fully SUCCEEDED as a failure — exit 1, or an HTTP 500 claiming
+        // nothing happened about a live pane — and the retry that invites is
+        // then refused with `HoldsPane`, sending the operator to look at a pane
+        // they were just told did not exist.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-stuck-marker");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-sm")));
+        run.save().unwrap();
+        // A DIRECTORY where the marker file goes: `remove_file` cannot remove it.
+        std::fs::create_dir_all(done_marker("rh-stuck-marker", "plan")).unwrap();
+        let h = FakeHerdr::new();
+
+        let outcome = phase_rehydrate(&h, &mut run, "plan")
+            .expect("a live, recorded pane is not a failed rehydrate");
+        assert!(matches!(outcome, RehydrateOutcome::Resumed), "{outcome:?}");
+
+        // The pane is real and recorded; only the (inert) file lingers.
+        let on_disk = RunState::load("rh-stuck-marker").unwrap();
+        let phase = on_disk.find_phase("plan").unwrap();
+        assert!(phase.pane_id().is_some(), "the pane must be recorded");
+        assert!(!phase.is_reaped());
+        // Inert: the phase now holds a pass the leftover marker cannot match, so
+        // `phase_wait` is correct whether or not the sweep worked.
+        let pass = phase.pass.clone().expect("a new pass was minted");
+        assert!(
+            !pass.matches_marker(""),
+            "an untokenized leftover cannot complete a tokened phase"
         );
     }
 

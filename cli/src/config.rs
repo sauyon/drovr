@@ -428,9 +428,9 @@ impl Config {
     ) -> io::Result<AgentLaunch> {
         let spec = self.agent(agent)?;
         let mut command = spec.command.clone();
-        if let Some((spec @ ResumeSpec::Subcommand(_), session)) = resume {
+        if let Some((resume @ ResumeSpec::Subcommand(_), session)) = resume {
             command.push(' ');
-            command.push_str(spec.token());
+            command.push_str(resume.token());
             command.push(' ');
             command.push_str(&shell_single_quote(session.as_str()));
         }
@@ -476,9 +476,9 @@ impl Config {
         // LAST, and always with its id in the same push. The flag's value is
         // OPTIONAL to the agent, so the id is what separates "resume this
         // conversation" from "open the session picker and park forever".
-        if let Some((spec @ ResumeSpec::Flag(_), session)) = resume {
+        if let Some((resume @ ResumeSpec::Flag(_), session)) = resume {
             command.push(' ');
-            command.push_str(spec.token());
+            command.push_str(resume.token());
             command.push(' ');
             command.push_str(&shell_single_quote(session.as_str()));
         }

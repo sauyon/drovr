@@ -939,7 +939,7 @@ fn has_resumable_session(phase: &crate::run::Phase, cfg: &crate::config::Config)
     })
 }
 
-/// Build the agent tree for `run`/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
+/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
 /// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
 /// `implement-<task>` phase. Reviews with no matching phase land in a trailing
 /// group node so nothing is dropped.
