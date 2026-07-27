@@ -15,8 +15,9 @@
 //! becoming Rust string literals, so they remain readable and reviewable as documents.
 
 use std::io;
+use std::path::Path;
 
-use crate::run::RunState;
+use crate::run::{RunState, run_dir};
 
 const BRAINSTORM: &str = include_str!("../../skills/pipeline/phase-prompts/brainstorm.md");
 const PLAN: &str = include_str!("../../skills/pipeline/phase-prompts/plan.md");
@@ -72,6 +73,73 @@ fn strip_editorial_comment(template: &str) -> &str {
     }
 }
 
+/// `<key>-context.md` — the driver's context for a brief, recorded so a later invocation
+/// that omits the argument composes the SAME brief. Shared by the phase briefs here and
+/// the reviewer briefs in `code_review`, so the two cannot drift apart.
+pub fn context_record(dir: &Path, key: &str) -> std::path::PathBuf {
+    dir.join(format!("{key}-context.md"))
+}
+
+/// Resolve the context for a brief. Three cases, deliberately distinct:
+///
+/// * `Some(text)` — record it and use it. A later invocation that passes nothing reuses it.
+/// * `Some("")` — the flag was given EMPTY, which is a request for *no* context. Clears the
+///   record. Previously this fell through to "absent" and silently resurrected stale
+///   context, so there was no way to un-say something.
+/// * `None` — the flag was absent: reuse whatever is recorded, and say so on stderr. Silence
+///   was the real defect here; a driver has to be able to see which context is in effect.
+///   (stderr, never stdout — `phase brief`'s stdout is the brief itself, often piped.)
+pub fn resolve_context(
+    dir: &Path,
+    key: &str,
+    supplied: Option<&str>,
+) -> io::Result<Option<String>> {
+    let path = context_record(dir, key);
+    match supplied {
+        Some(text) if !text.trim().is_empty() => {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&path, format!("{}\n", text.trim()))?;
+            Ok(Some(text.trim().to_owned()))
+        }
+        Some(_) => {
+            // Explicitly empty: un-say it.
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                eprintln!("drovr: cleared the recorded context for '{key}'");
+            }
+            Ok(None)
+        }
+        None => {
+            // A MISSING record is the normal case (no context was ever given). Any other
+            // read error is not: proceeding contextless while the driver believes its
+            // recorded context is in effect is the silent failure this mechanism exists
+            // to prevent, so say so loudly and carry on.
+            let recorded = match std::fs::read_to_string(&path) {
+                Ok(c) => Some(c),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    eprintln!(
+                        "drovr: WARNING: cannot read the recorded context {} ({e}) — this brief \
+                         goes out WITHOUT it",
+                        path.display()
+                    );
+                    None
+                }
+            }
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty());
+            if recorded.is_some() {
+                eprintln!(
+                    "drovr: reusing the recorded context for '{key}' ({}) — pass --context to \
+                     replace it, or --context '' to drop it",
+                    path.display()
+                );
+            }
+            Ok(recorded)
+        }
+    }
+}
+
 /// Compose the full brief for `phase`: the embedded template with drovr's substitutions,
 /// the run's task, and the driver's `context` as its own section.
 pub fn compose_phase_brief(
@@ -99,15 +167,43 @@ pub fn compose_phase_brief(
         body = body.replace("<N>", &n.to_string());
     }
 
-    let mut brief = body;
+    // Recorded, so the UNBRIEFED remediation (`phase brief | phase send -`) reproduces
+    // the SAME brief without the driver having to re-supply context it already gave.
+    let context = resolve_context(&run_dir(&run.name), phase, context)?;
+
+    // `## Task` alone was ambiguous for implement-task: this is the RUN's task, while
+    // that phase's actual scope is the per-task brief in the context section. An agent
+    // that read the run-level statement as its scope would implement the whole change.
+    let mut sections = format!("## The run's task\n\n{}\n", run.task.trim());
+    if matches!(kind, PhaseKind::ImplementTask(_)) {
+        sections.push_str(
+            "\nThat is the whole run, for orientation only. **Your scope is the task brief in \
+             the context section below**, not this run-level statement.\n",
+        );
+    }
+    // No context renders no section: an empty heading reads as "the driver had nothing
+    // to say", which is worse than silence.
+    if let Some(c) = context.as_deref() {
+        sections.push_str(&format!("\n## Context from the driver\n\n{c}\n"));
+    }
+
+    // Insert BEFORE the template's closing `## Done when`. Appending put the task and
+    // context after the completion criteria, orphaning them: the agent read "Done when
+    // …" and then hit new material, and the criteria no longer ended the brief.
+    let mut brief = match body.rfind("\n## Done when") {
+        Some(i) => {
+            let (before, done_when) = body.split_at(i);
+            format!(
+                "{}\n{}\n{}",
+                before.trim_end(),
+                sections,
+                done_when.trim_start_matches('\n')
+            )
+        }
+        None => format!("{}\n\n{}", body.trim_end(), sections),
+    };
     if !brief.ends_with('\n') {
         brief.push('\n');
-    }
-    brief.push_str(&format!("\n## Task\n\n{}\n", run.task.trim()));
-    // Same rule as the reviewer brief: no context renders no section, because an empty
-    // heading reads as "the driver had nothing to say".
-    if let Some(c) = context.map(str::trim).filter(|c| !c.is_empty()) {
-        brief.push_str(&format!("\n## Context from the driver\n\n{c}\n"));
     }
     Ok(brief)
 }
@@ -153,6 +249,18 @@ pub fn handoff_scaffold() -> String {
 mod tests {
     use super::*;
     use crate::run::RunState;
+    use crate::test_util::ENV_LOCK;
+
+    /// Composition now records/reads `<phase>-context.md`, so every test that composes
+    /// needs its own data home. Caller holds ENV_LOCK.
+    fn isolate(name: &str) -> std::path::PathBuf {
+        let data = std::path::PathBuf::from(format!("/tmp/drovr-brief-test-{name}"));
+        let _ = std::fs::remove_dir_all(&data);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data);
+        }
+        data
+    }
 
     fn make_run() -> RunState {
         RunState {
@@ -196,6 +304,8 @@ mod tests {
 
     #[test]
     fn composed_brief_substitutes_run_and_task_number() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("composed_brief_substitutes_run_and_task_number");
         let run = make_run();
         let brief = compose_phase_brief(&run, "implement-task-3", None).unwrap();
         assert!(
@@ -222,6 +332,8 @@ mod tests {
     /// assemble one itself.
     #[test]
     fn composed_brief_drops_the_editorial_comment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("composed_brief_drops_the_editorial_comment");
         let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
         assert!(
             !brief.contains("<!--"),
@@ -239,6 +351,8 @@ mod tests {
     /// brackets".
     #[test]
     fn composition_leaves_non_placeholder_angle_brackets_alone() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("composition_leaves_non_placeholder_angle_brackets_alone");
         let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
         assert!(
             brief.contains("answers[<id>]"),
@@ -248,6 +362,8 @@ mod tests {
 
     #[test]
     fn composed_brief_carries_the_task_and_the_driver_context() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("carries-context");
         let run = make_run();
         let with =
             compose_phase_brief(&run, "plan", Some("the vendored dir is off limits")).unwrap();
@@ -255,18 +371,64 @@ mod tests {
         assert!(with.contains("## Context from the driver"));
         assert!(with.contains("the vendored dir is off limits"));
 
-        let without = compose_phase_brief(&run, "plan", None).unwrap();
-        assert!(without.contains("make the widget reentrant"));
+        // Absent argument REUSES the record: the UNBRIEFED remediation
+        // (`phase brief | phase send -`) must reproduce the same brief, not a thinner
+        // one, without the driver re-supplying context it already gave.
+        let again = compose_phase_brief(&run, "plan", None).unwrap();
+        assert_eq!(with, again, "a re-brief must be byte-identical");
+
+        // An explicitly EMPTY --context is a request for NO context, and must be able to
+        // un-say what was recorded.
+        let cleared = compose_phase_brief(&run, "plan", Some("   ")).unwrap();
         assert!(
-            !without.contains("## Context from the driver"),
-            "no context must mean no empty section: {without}"
+            !cleared.contains("## Context from the driver"),
+            "--context '' must drop the recorded context, not fall through to it: {cleared}"
         );
+        assert!(cleared.contains("make the widget reentrant"));
+    }
+
+    /// Context is per phase, never shared between them.
+    #[test]
+    fn recorded_context_does_not_leak_across_phases() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("context-per-phase");
+        let run = make_run();
+        compose_phase_brief(&run, "plan", Some("plan-only context")).unwrap();
+        let other = compose_phase_brief(&run, "review", None).unwrap();
+        assert!(
+            !other.contains("plan-only context"),
+            "one phase's context must not reach another: {other}"
+        );
+    }
+
+    /// The template's closing `## Done when` states the completion criteria. Appending
+    /// the task and context after it orphaned those criteria mid-brief.
+    #[test]
+    fn task_and_context_land_before_the_completion_criteria() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("section-order");
+        let run = make_run();
+        let brief = compose_phase_brief(&run, "plan", Some("ctx here")).unwrap();
+        let task = brief.find("## The run's task").expect("task section");
+        let ctx = brief
+            .find("## Context from the driver")
+            .expect("context section");
+        let done = brief
+            .rfind("## Done when")
+            .expect("templates end with Done when");
+        assert!(
+            task < done && ctx < done,
+            "criteria must stay last:\n{brief}"
+        );
+        assert!(task < ctx);
     }
 
     /// A phase drovr has no template for must fail loudly and point at the escape hatch
     /// the reviewer kept (decision A: `phase send` survives for free-form injection).
     #[test]
     fn an_unknown_phase_is_an_error_that_names_the_escape_hatch() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("an_unknown_phase_is_an_error_that_names_the_escape_hatch");
         let err = compose_phase_brief(&make_run(), "verify-land", None)
             .expect_err("no template must not mean an improvised brief");
         let msg = err.to_string();

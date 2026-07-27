@@ -188,6 +188,7 @@ enum PhaseCmd {
         phase_name: String,
         /// What this phase needs to know that drovr cannot compose: the task brief
         /// from `plan.md`, accumulated interfaces, why the last attempt failed.
+        /// RECORDED, so a re-brief of this phase reuses it; `--context ''` clears it.
         #[arg(long, conflicts_with = "context_file")]
         context: Option<String>,
         #[arg(long)]
@@ -251,9 +252,9 @@ enum CodeReviewCmd {
     },
     /// Print one angle's reviewer brief and exit, spawning nothing.
     ///
-    /// For the case the panel cannot serve: a driver whose session drovr did not
-    /// start has no herdr workspace to spawn reviewer panes into, so it spawns its
-    /// own read-only reviewer. Pass this text to that reviewer VERBATIM — it is the
+    /// For whenever you spawn the reviewer yourself instead of through the panel: an
+    /// in-harness read-only subagent, a host with no herdr integration for the review
+    /// agent, or a wedged panel. Pass this text to that reviewer VERBATIM — it is the
     /// same brief `code-review run` injects, so the frame stays drovr's rather than
     /// one the driver improvised.
     Brief {
@@ -261,7 +262,8 @@ enum CodeReviewCmd {
         task: String,
         #[arg(long)]
         angle: String,
-        /// See `code-review run --context`.
+        /// See `code-review run --context`. Supplying it here RECORDS it too, so a
+        /// later `run` or `brief` for this task reuses it; `--context ''` clears it.
         #[arg(long, conflicts_with = "context_file")]
         context: Option<String>,
         #[arg(long)]
@@ -866,10 +868,23 @@ fn cmd_phase(sub: PhaseCmd) {
                     } else {
                         eprintln!("drovr: could not deliver the brief: {e}");
                     }
+                    // Mark it Failed, exactly as the reviewer path does for the same
+                    // condition. Left `Running`, a `phase wait` blocks forever on an
+                    // agent that was never asked anything, and a re-entry believes the
+                    // phase is live. The pane stays up (never closed mid-run) and is
+                    // still recorded, so `drovr cleanup` reclaims it.
+                    if let Some(i) = state.phases.iter().position(|p| p.name == phase_name) {
+                        state.phases[i].status = run::PhaseStatus::Failed;
+                        if let Err(e) = state.save() {
+                            eprintln!("drovr: could not record the failed phase: {e}");
+                        }
+                    }
+                    // The brief's context is recorded, so the remediation needs no
+                    // --context: `phase brief` reuses it.
                     eprintln!(
-                        "drovr: phase '{phase_name}' is running but UNBRIEFED — re-send with \
-                         `drovr phase brief {run} {phase_name} | drovr phase send {run} \
-                         {phase_name} -` once the pane is at its composer"
+                        "drovr: phase '{phase_name}' is running but UNBRIEFED (marked failed) — \
+                         re-send with `drovr phase brief {run} {phase_name} | drovr phase send \
+                         {run} {phase_name} -` once the pane is at its composer"
                     );
                     process::exit(2);
                 }
@@ -889,13 +904,25 @@ fn cmd_phase(sub: PhaseCmd) {
             // `-` reads stdin, so a brief drovr composed can be piped straight in
             // without a driver retyping (or paraphrasing) it.
             let text = if text == "-" {
+                // Bounded: a prompt is a message, and an accidental `cat huge.bin |` would
+                // otherwise be read wholly into memory and then typed into a pane.
+                const MAX_STDIN: u64 = 1 << 20; // 1 MiB — far above any real brief
                 let mut buf = String::new();
-                if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut buf) {
+                if let Err(e) =
+                    io::Read::read_to_string(&mut io::Read::take(io::stdin(), MAX_STDIN), &mut buf)
+                {
                     eprintln!("drovr: cannot read the message from stdin: {e}");
                     process::exit(1);
                 }
                 if buf.trim().is_empty() {
                     eprintln!("drovr: refusing to send an empty message read from stdin");
+                    process::exit(1);
+                }
+                if buf.len() as u64 == MAX_STDIN {
+                    eprintln!(
+                        "drovr: refusing to send {MAX_STDIN} bytes from stdin — that is not a \
+                         brief; check what you piped in"
+                    );
                     process::exit(1);
                 }
                 buf

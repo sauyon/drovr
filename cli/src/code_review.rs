@@ -145,33 +145,12 @@ fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     Ok(std::fs::read_to_string(&p)?.trim().to_owned())
 }
 
-/// `<task>-review-context.md` — the driver's statement of what this change is about,
-/// as supplied to `--context` / `--context-file`.
-///
-/// Recorded rather than passed through because of invariant 4: a resumed or respawned
-/// reviewer must get the SAME brief as its panel-mates. Without a record, a second
-/// invocation that omitted the argument would compose a thinner brief than the first,
-/// and the two reviewers would be reviewing under different instructions.
-fn context_path(dir: &Path, task: &str) -> std::path::PathBuf {
-    dir.join(format!("{task}-review-context.md"))
-}
-
-/// Resolve the context for this pass: `supplied` wins and is RECORDED; absent, the
-/// recorded context (if any) is reused. An unreadable record is treated as absent —
-/// a brief with no context is worse than no review, but not worth failing a pass over.
+/// Resolve this pass's context via the shared recorder in [`crate::brief`], keyed
+/// `<task>-review` (file `<task>-review-context.md`). Shared so the reviewer and phase
+/// briefs cannot drift: `--context` records, `--context ''` clears, absent reuses and
+/// says so.
 fn resolve_context(dir: &Path, task: &str, supplied: Option<&str>) -> io::Result<Option<String>> {
-    let path = context_path(dir, task);
-    match supplied.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(c) => {
-            std::fs::create_dir_all(dir)?;
-            std::fs::write(&path, format!("{c}\n"))?;
-            Ok(Some(c.to_owned()))
-        }
-        None => Ok(std::fs::read_to_string(&path)
-            .ok()
-            .map(|c| c.trim().to_owned())
-            .filter(|c| !c.is_empty())),
-    }
+    crate::brief::resolve_context(dir, &format!("{task}-review"), supplied)
 }
 
 /// Compose one angle's reviewer brief and return it, spawning NOTHING.
@@ -1913,6 +1892,32 @@ mod tests {
             seed.contains("watch the retry loop"),
             "a later pass must reuse the recorded context: {seed}"
         );
+    }
+
+    /// `--context ''` must be able to un-say a recorded context on the reviewer path too
+    /// (shared resolver, so this pins the delegation as much as the behavior).
+    #[test]
+    fn an_empty_context_clears_the_recorded_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-context-clear");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, Some("stale context")).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, true, Some("")).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let seed =
+            std::fs::read_to_string(run_dir(&run.name).join("task-1-review-correctness-seed.md"))
+                .unwrap();
+        assert!(
+            !seed.contains("stale context"),
+            "an explicitly empty --context must drop the record, not fall through: {seed}"
+        );
+        assert!(!seed.contains("## Context from the driver"));
     }
 
     /// A driver that spawns its own read-only reviewer (in-harness subagent, no herdr
