@@ -10,6 +10,7 @@ mod run;
 /// embedded third-party assets to known-good digests.
 #[cfg(test)]
 mod sha256;
+mod shell;
 mod worktree;
 
 use clap::{Parser, Subcommand};
@@ -21,6 +22,7 @@ use phase::{
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
+use shell::shell_single_quote;
 use std::io;
 use std::path::PathBuf;
 use std::process;
@@ -137,7 +139,8 @@ enum PhaseCmd {
     },
     /// Wait for a phase to complete (polls for the `done` marker and the pane's
     /// herdr status). Exit 0 = done, 2 = timeout, 4 = blocked (agent hit a
-    /// safety/permission prompt — see the triage diagnostic), 1 = io error.
+    /// safety/permission prompt — see the triage diagnostic), 5 = superseded (a
+    /// newer pass re-entered the phase; re-run the wait), 1 = io error.
     Wait {
         run: String,
         phase_name: String,
@@ -226,15 +229,6 @@ fn load_run(name: &str) -> RunState {
 
 fn save_run(run: &RunState) {
     run.save().unwrap_or_else(|e| {
-        eprintln!("drovr: failed to save run '{}': {e}", run.name);
-        process::exit(1);
-    });
-}
-
-/// [`save_run`] for writers holding a long-stale copy — see
-/// [`RunState::save_preserving_archived`].
-fn save_run_preserving_archived(run: &mut RunState) {
-    run.save_preserving_archived().unwrap_or_else(|e| {
         eprintln!("drovr: failed to save run '{}': {e}", run.name);
         process::exit(1);
     });
@@ -391,34 +385,10 @@ fn cmd_new(
         agent: Some(agent),
         project_dir,
         phases: vec![
-            run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "plan".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "implement".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
-            run::Phase {
-                name: "review".into(),
-                status: PhaseStatus::Pending,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
-            },
+            run::Phase::new("brainstorm"),
+            run::Phase::new("plan"),
+            run::Phase::new("implement"),
+            run::Phase::new("review"),
         ],
         review_phases: vec![],
         gate: "spec".into(),
@@ -428,6 +398,7 @@ fn cmd_new(
         worktree_path,
         worktree_branch,
         archived: false,
+        retired_panes: vec![],
     };
 
     save_run(&run);
@@ -495,9 +466,97 @@ fn cmd_attach(name: &str) {
         }
         None => {
             eprintln!(
-                "drovr: no active pane for run '{name}'; try 'drovr phase start {name} <phase>'"
+                "drovr: no active pane for run '{name}'; try: drovr phase start {} <phase>",
+                shell_single_quote(name)
             );
             process::exit(1);
+        }
+    }
+}
+
+/// Every pane id drovr created for `run`, in creation order and deduped: the
+/// workspace's root pane while no phase has claimed it yet (`phase_start` moves
+/// that id onto the phase, so it lives in exactly one place), each phase's pane,
+/// each reviewer's pane, and every pane retired from a phase but still drovr's
+/// (see `RunState::retired_panes`).
+///
+/// This list is the whole definition of "drovr's panes" at cleanup: a pane drovr
+/// created but failed to record is indistinguishable from one the human opened,
+/// and is therefore left alone.
+fn drovr_pane_ids(run: &RunState) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let ids = run
+        .root_pane
+        .iter()
+        .chain(run.phases.iter().filter_map(|p| p.pane_id.as_ref()))
+        .chain(run.review_phases.iter().filter_map(|p| p.pane_id.as_ref()))
+        .chain(run.retired_panes.iter());
+    for id in ids {
+        if !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Tear down the panes drovr created for `run`, and *only* those.
+///
+/// drovr creates the run's workspace at `drovr new`, but the human keeps working
+/// in it — a shell to run the tests, an editor, their own agent in a spare tab.
+/// So `workspace_close` is only correct once we have established that the
+/// workspace holds nothing but drovr's own panes; otherwise it kills the human's
+/// work as collateral. When anything foreign is present (or when we cannot tell
+/// what is present), close the recorded panes one at a time and leave the
+/// workspace standing. Leaving an empty workspace behind is a cosmetic mistake;
+/// closing a pane that was not ours is not a recoverable one.
+fn close_run_panes<H: Herdr>(run: &RunState, ws_id: &str, herdr: &H) {
+    let ours = drovr_pane_ids(run);
+    let targets = match herdr.workspace_panes(ws_id) {
+        Ok(present) => {
+            if present.iter().all(|p| ours.contains(p)) {
+                // Nothing in there but ours: one call reaps every pane AND the
+                // workspace, so no empty husk is left in the human's switcher.
+                if let Err(e) = herdr.workspace_close(ws_id) {
+                    eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+                }
+                return;
+            }
+            let foreign: Vec<&String> = present.iter().filter(|p| !ours.contains(p)).collect();
+            println!(
+                "drovr: keeping workspace {ws_id} — {} pane(s) drovr did not create are still open ({})",
+                foreign.len(),
+                foreign
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            // Only panes still listed: one drovr recorded but that has since been
+            // closed would just make `pane.close` fail and print a warning about
+            // a pane the human already dealt with.
+            ours.iter()
+                .filter(|p| present.contains(p))
+                .cloned()
+                .collect()
+        }
+        Err(e) => {
+            // "Cannot tell" — a daemon blip, a changed result shape — is not
+            // "the workspace is all mine". Fall back to closing the recorded
+            // panes, skipping the ones herdr can prove are already gone.
+            eprintln!(
+                "drovr: warning: could not list panes in workspace {ws_id}: {e}; \
+                 closing only the panes drovr created"
+            );
+            ours.iter()
+                .filter(|p| herdr.pane_exists(p))
+                .cloned()
+                .collect::<Vec<String>>()
+        }
+    };
+
+    for pane in &targets {
+        if let Err(e) = herdr.pane_close(pane) {
+            eprintln!("drovr: warning: pane_close({pane}) failed: {e}");
         }
     }
 }
@@ -513,12 +572,10 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
     }
     let run = load_run(name);
 
-    // Close the run's workspace (this closes all phase panes within it).
-    // Older runs without a recorded workspace id are skipped gracefully.
-    if let Some(ws_id) = &run.workspace
-        && let Err(e) = herdr.workspace_close(ws_id)
-    {
-        eprintln!("drovr: warning: workspace_close({ws_id}) failed: {e}");
+    // Reap the run's panes. Older runs without a recorded workspace id are
+    // skipped gracefully.
+    if let Some(ws_id) = &run.workspace {
+        close_run_panes(&run, ws_id, herdr);
     }
 
     // Mark it archived HERE — immediately after the panes die, before any git
@@ -558,7 +615,10 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
             // recoverable/purge-able instead of wedged on a vanished worktree.
             eprintln!("drovr: worktree {wt} no longer exists; skipping prune");
             if !purge && let Some(b) = branch {
-                println!("drovr: kept branch {b} — merge it with: git merge {b}");
+                println!(
+                    "drovr: kept branch {b} — merge it with: git merge {}",
+                    shell_single_quote(b)
+                );
             }
         } else {
             // Non-purge: land the run's accumulated work as one squash commit on
@@ -584,7 +644,10 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
             match worktree::remove(wt_path, delete_branch, purge) {
                 Ok(()) => {
                     if !purge && let Some(b) = branch {
-                        println!("drovr: kept branch {b} — merge it with: git merge {b}");
+                        println!(
+                            "drovr: kept branch {b} — merge it with: git merge {}",
+                            shell_single_quote(b)
+                        );
                     }
                 }
                 Err(e) => {
@@ -635,8 +698,9 @@ fn cmd_resurrect(name: &str) {
             }
             println!();
             println!(
-                "To resume: drovr phase start {name} {}",
-                run.phases[idx].name
+                "To resume: drovr phase start {} {}",
+                shell_single_quote(name),
+                shell_single_quote(&run.phases[idx].name)
             );
         }
         None => {
@@ -656,7 +720,13 @@ fn cmd_serve(host: Option<String>, port: u16) {
             })
     });
     if let Err(e) = serve(&host, port) {
-        eprintln!("drovr: serve failed: {e}");
+        // A refused duplicate already reads as a full sentence naming the live
+        // server; "serve failed:" in front of it only buries the point.
+        if e.kind() == io::ErrorKind::AddrInUse {
+            eprintln!("drovr: {e}");
+        } else {
+            eprintln!("drovr: serve failed: {e}");
+        }
         process::exit(1);
     }
 }
@@ -694,8 +764,8 @@ fn cmd_phase(sub: PhaseCmd) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
-            let state = load_run(&run);
-            if let Err(e) = phase_send(&h, &state, &phase_name, &text) {
+            let mut state = load_run(&run);
+            if let Err(e) = phase_send(&h, &mut state, &phase_name, &text) {
                 // A readiness timeout (agent never attached) is not a plain send
                 // failure — the agent is almost certainly parked on a prompt with
                 // no human at the pane. Raise it to the driver with the same
@@ -741,6 +811,23 @@ fn cmd_phase(sub: PhaseCmd) {
                         eprintln!("drovr: [{:?}] {}", t.class, t.diagnostic);
                     }
                     process::exit(4);
+                }
+                Ok(PhaseWaitOutcome::Superseded) => {
+                    // NOT a timeout, and deliberately not exit 2. Another pass
+                    // re-entered this phase while the wait ran, so this wait is
+                    // obsolete and the agent it was watching is not the live one.
+                    // Re-arming the same wait is the RIGHT move (the new pass's
+                    // completion will satisfy it) — the wrong move is triaging a
+                    // stuck agent that does not exist, which exit 2 invites.
+                    //
+                    // stdout, like the benign timeout line above it: nothing is
+                    // wrong with the PHASE. `phase_wait` has already explained on
+                    // stderr which pass went away, so this line stays the action.
+                    println!(
+                        "phase '{phase_name}' was superseded by a newer pass — re-run the wait \
+                         to follow the live one"
+                    );
+                    process::exit(5);
                 }
                 Ok(PhaseWaitOutcome::TimedOut) => {
                     // Liveness net: a timeout can mean the agent is genuinely
@@ -810,7 +897,8 @@ fn cmd_review(sub: ReviewCmd) {
                     println!("review: run '{run}' is ready for the reviewer");
                     println!("  page:  http://{}/#/runs/{run}", display_addr(&addr));
                     println!(
-                        "  watch: drovr review wait {run}   # run this BACKGROUNDED, then end your turn"
+                        "  watch: drovr review wait {}   # run this BACKGROUNDED, then end your turn",
+                        shell_single_quote(&run)
                     );
                 }
                 Err(e) => {
@@ -924,10 +1012,17 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // only in memory, so an unconditional save here keeps disk and memory
             // in sync on every path — including the `Err` early-exit below.
             //
-            // `state` was loaded before a review pass that can block for the full
-            // timeout; the human may have archived the run in that window, so this
-            // write must not carry a stale `archived: false` back over it.
-            save_run_preserving_archived(&mut state);
+            // Transplant ONLY `review_phases` onto a freshly-loaded state. A panel
+            // runs for many minutes and `state` is a snapshot from before it
+            // started; writing the whole thing back would resurrect every pipeline
+            // phase's status as of panel-start — including a `Done` that a
+            // `phase send` re-entry has since cleared, which makes the next
+            // `phase wait` report success for an agent that is mid-work.
+            // `code_review_run` only ever mutates `review_phases`, so nothing else
+            // in the snapshot is worth keeping.
+            let mut merged = load_run(&run);
+            merged.review_phases = state.review_phases.clone();
+            save_run(&merged);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
                 process::exit(1);
@@ -1036,6 +1131,270 @@ mod tests {
 
     // -- cleanup ----------------------------------------------------------------
 
+    /// Point `XDG_DATA_HOME` at a scratch dir unique to this test, and return it
+    /// so the caller can remove it. Callers must hold `ENV_LOCK`.
+    #[cfg(test)]
+    fn cleanup_scratch(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("drovr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+        tmp
+    }
+
+    /// A saved run in workspace `wAC` whose recorded drovr panes are `wAC:p1`
+    /// (the brainstorm phase, mid-flight) and `wAC:p2` (a reviewer). No worktree,
+    /// so `cmd_cleanup` runs to completion instead of exiting on the prune path.
+    #[cfg(test)]
+    fn seed_paned_run(name: &str) -> RunState {
+        let run = RunState {
+            name: name.into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![run::Phase {
+                name: "brainstorm".into(),
+                status: PhaseStatus::Running,
+                pane_id: Some("wAC:p1".into()),
+                ..Default::default()
+            }],
+            review_phases: vec![run::Phase {
+                name: "review:brainstorm:1:correctness".into(),
+                status: PhaseStatus::Running,
+                pane_id: Some("wAC:p2".into()),
+                ..Default::default()
+            }],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("wAC".into()),
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.save().expect("seed run");
+        run
+    }
+
+    /// The workspace drovr created for a run is still the human's to use — they
+    /// open their own shell or editor tab in it while the run works. Cleanup must
+    /// reap only the panes drovr created and leave that workspace standing;
+    /// `workspace_close` would take the human's panes down with it.
+    #[test]
+    fn cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("cleanup-foreign");
+        seed_paned_run("keep-ws");
+
+        let fake = FakeHerdr::new();
+        // The human's own pane (wAC:p9) sits alongside drovr's two.
+        fake.push_workspace_panes("wAC", ["wAC:p1", "wAC:p2", "wAC:p9"]);
+        cmd_cleanup("keep-ws", false, &fake);
+
+        let calls = fake.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_close")),
+            "must not close a workspace holding the human's panes: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p1"),
+            "the phase pane must be closed: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
+            "the reviewer pane must be closed: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("wAC:p9")),
+            "a pane drovr did not create must be left alone: {calls:?}"
+        );
+        assert!(
+            RunState::load("keep-ws").expect("run kept").archived,
+            "the run is still archived when only its panes were reaped"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// When the workspace holds nothing but drovr's own panes, one
+    /// `workspace_close` reaps them all and leaves no empty workspace behind.
+    #[test]
+    fn cleanup_closes_the_workspace_when_only_drovr_panes_remain() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("cleanup-owned");
+        seed_paned_run("close-ws");
+
+        let fake = FakeHerdr::new();
+        fake.push_workspace_panes("wAC", ["wAC:p1", "wAC:p2"]);
+        cmd_cleanup("close-ws", false, &fake);
+
+        let calls = fake.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("workspace_close id=wAC")),
+            "a workspace of only drovr panes must be closed outright: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pane_close")),
+            "no per-pane close is needed once the workspace goes: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A failed pane listing means "cannot tell what is in there", never "it is
+    /// all ours". Closing the workspace on that answer is how the human's panes
+    /// get killed by a transient daemon blip, so fall back to closing only the
+    /// panes drovr recorded — an empty workspace husk is the cheaper mistake.
+    #[test]
+    fn cleanup_closes_only_drovr_panes_when_the_listing_fails() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("cleanup-blind");
+        seed_paned_run("blind-ws");
+
+        let fake = FakeHerdr::new();
+        fake.fail_workspace_panes();
+        cmd_cleanup("blind-ws", false, &fake);
+
+        let calls = fake.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_close")),
+            "must not close a workspace it could not inspect: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p1"),
+            "the phase pane must still be closed: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
+            "the reviewer pane must still be closed: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The blind fallback must still skip a pane herdr can prove is gone: closing
+    /// it would only print a warning about a pane the human already dealt with.
+    #[test]
+    fn cleanup_blind_fallback_skips_panes_proven_gone() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("cleanup-blind-dead");
+        seed_paned_run("blind-dead-ws");
+
+        let fake = FakeHerdr::new();
+        fake.fail_workspace_panes();
+        fake.kill_pane("wAC:p1");
+        cmd_cleanup("blind-dead-ws", false, &fake);
+
+        let calls = fake.calls();
+        assert!(
+            !calls.iter().any(|c| c == "pane_close pane=wAC:p1"),
+            "a pane herdr reports gone must not be closed again: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
+            "the surviving pane must still be closed: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A pane drovr recorded but that is already gone (the human closed the tab)
+    /// must not be closed again — the failed `pane.close` would print a warning
+    /// about a pane the human already dealt with.
+    #[test]
+    fn cleanup_skips_drovr_panes_that_are_already_gone() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("cleanup-gone");
+        seed_paned_run("gone-ws");
+
+        let fake = FakeHerdr::new();
+        // p1 is gone; p9 (the human's) keeps the workspace alive.
+        fake.push_workspace_panes("wAC", ["wAC:p2", "wAC:p9"]);
+        cmd_cleanup("gone-ws", false, &fake);
+
+        let calls = fake.calls();
+        assert!(
+            !calls.iter().any(|c| c == "pane_close pane=wAC:p1"),
+            "a pane that is no longer in the workspace must not be closed: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
+            "the pane that is still there must be closed: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The set of panes drovr owns: every phase pane, every reviewer pane, and
+    /// `root_pane` when no phase ever claimed it (a run cleaned up before its
+    /// first `phase start` — nothing else records that pane).
+    #[test]
+    fn drovr_pane_ids_covers_phases_reviewers_and_an_unclaimed_root() {
+        let mut run = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                run::Phase {
+                    name: "brainstorm".into(),
+                    status: PhaseStatus::Done,
+                    pane_id: Some("w:p1".into()),
+                    ..Default::default()
+                },
+                run::Phase {
+                    name: "plan".into(),
+                    status: PhaseStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            review_phases: vec![run::Phase {
+                name: "review:plan:1:correctness".into(),
+                status: PhaseStatus::Running,
+                pane_id: Some("w:p2".into()),
+                ..Default::default()
+            }],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        assert_eq!(drovr_pane_ids(&run), vec!["w:root", "w:p1", "w:p2"]);
+
+        // A retired pane — one drovr opened whose phase registration was replaced
+        // (a respawned reviewer) — is still drovr's to reap.
+        run.retired_panes = vec!["w:p0".into()];
+        assert_eq!(drovr_pane_ids(&run), vec!["w:root", "w:p1", "w:p2", "w:p0"]);
+        run.retired_panes = vec![];
+
+        // Once a phase claims the root pane, `root_pane` is cleared and the phase
+        // carries the id — it must appear exactly once either way.
+        run.root_pane = None;
+        run.phases[1].pane_id = Some("w:root".into());
+        assert_eq!(drovr_pane_ids(&run), vec!["w:p1", "w:root", "w:p2"]);
+    }
+
     /// `drovr cleanup` must leave the run marked archived. Without it the session
     /// list has no way to tell a torn-down run from a live one: the phase statuses
     /// stay frozen at their last write (`Running`, against a pane that no longer
@@ -1047,37 +1406,12 @@ mod tests {
         use crate::test_util::ENV_LOCK;
 
         let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("drovr-cleanup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &tmp);
-        }
+        let tmp = cleanup_scratch("cleanup-archived");
 
         // Cleaned up mid-brainstorm: the shape that used to strand a run on a
         // live-looking status. No worktree, so the prune path is a no-op and the
         // function runs to completion instead of exiting.
-        let run = RunState {
-            name: "cleanup-me".into(),
-            task: "t".into(),
-            agent: None,
-            phases: vec![run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Running,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: Some("wAC:p1".into()),
-            }],
-            review_phases: vec![],
-            gate: "spec".into(),
-            cursor: 0,
-            workspace: Some("wAC".into()),
-            root_pane: None,
-            project_dir: "/tmp/p".into(),
-            worktree_path: None,
-            worktree_branch: None,
-            archived: false,
-        };
-        run.save().expect("seed run");
+        let run = seed_paned_run("cleanup-me");
         assert!(
             !run.is_complete(),
             "precondition: not complete before cleanup"
@@ -1455,30 +1789,13 @@ mod tests {
             name: "r".into(),
             task: "t".into(),
             agent: None,
-            phases: vec![
-                run::Phase {
-                    name: "brainstorm".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
-                run::Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
-            ],
+            phases: vec![run::Phase::new("brainstorm"), run::Phase::new("plan")],
             // A populated review_phases list must not shift the "0/2" progress or
             // the "current" phase — format_progress walks `phases` only.
             review_phases: vec![run::Phase {
                 name: "review:task-1:1:correctness".into(),
                 status: PhaseStatus::Running,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             }],
             gate: "spec".into(),
             cursor: 0,
@@ -1488,6 +1805,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         let s = format_progress(&run);
         assert!(s.contains("0/2"), "got: {s}");
@@ -1503,9 +1821,7 @@ mod tests {
             phases: vec![run::Phase {
                 name: "brainstorm".into(),
                 status: PhaseStatus::Done,
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             }],
             review_phases: vec![],
             gate: "spec".into(),
@@ -1516,6 +1832,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         let s = format_progress(&run);
         assert!(s.contains("1/1"), "got: {s}");

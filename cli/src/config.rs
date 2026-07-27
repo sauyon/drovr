@@ -13,6 +13,8 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+use crate::shell::shell_single_quote;
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct AgentSpec {
     pub command: String,
@@ -157,10 +159,6 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
         },
     );
     m
-}
-
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Detect the agent backend invoking drovr.

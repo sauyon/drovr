@@ -16,7 +16,14 @@
 //! The server binds a fixed port (default 8791) and writes two global files in
 //! the drovr data dir:
 //!   * `server.addr` — the bound `host:port`
-//!   * `server.pid`  — the daemon pid
+//!   * `server.pid`  — the daemon pid, and the file the single-server lock is on
+//!
+//! Exactly one server may serve a data dir: [`serve`] takes an exclusive lock on
+//! `server.pid` for its lifetime ([`acquire_pid_lock`]) and a second invocation
+//! refuses instead of starting, since two servers would fight over these two files
+//! and each hold half the drivers. The lock is the whole test: a server that holds
+//! no lock — one from a build predating it, or one whose lock file was deleted
+//! underneath it — is not detected.
 //!
 //! [`ensure_server`] reads `server.addr`; if it is missing or nothing is
 //! listening, it spawns `drovr serve` as a detached background daemon and waits
@@ -31,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -1355,8 +1363,15 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
 // ---------------------------------------------------------------------------
 
 /// Start the always-on review server, serving every run under the drovr data
-/// dir. Writes `server.addr` and `server.pid` immediately after the socket
-/// opens, then blocks serving requests until the process exits.
+/// dir. Takes the `server.pid` lock, writes `server.addr` once the socket opens,
+/// then blocks serving requests until the process exits.
+///
+/// Refuses to start a *second* server for the same data dir: one server owns
+/// `server.addr` / `server.pid`, which is how every driver finds it, so a
+/// duplicate would silently steal discovery from the live one and leave two
+/// servers holding split in-memory run state. The lock (see [`acquire_pid_lock`])
+/// is the whole test — it is held by the kernel, so it needs nothing to be judged
+/// stale, and it catches a duplicate on *any* port, which the OS bind would not.
 pub fn serve(host: &str, port: u16) -> io::Result<()> {
     let root = runs_dir();
     fs::create_dir_all(&root)?;
@@ -1370,8 +1385,17 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         let _ = fs::set_permissions(data_dir(), fs::Permissions::from_mode(0o700));
     }
 
+    // Single-writer for the discovery files: take the lock before touching the
+    // socket or rewriting `server.addr`, so a live server keeps serving untouched.
+    // Held until this function returns, which for a serving process means until it
+    // exits; the kernel drops it either way.
+    let _lock = acquire_pid_lock()?;
+
     let addr = format!("{host}:{port}");
-    let server = Server::http(&addr).map_err(|e| io::Error::other(e.to_string()))?;
+    // Losing the bind means something foreign holds the port (a duplicate drovr
+    // server was already turned away above); the error names which.
+    let server =
+        Server::http(&addr).map_err(|e| io::Error::other(format!("cannot bind {addr}: {e}")))?;
 
     let bound_addr = server
         .server_addr()
@@ -1379,7 +1403,6 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         .map(|a| a.to_string())
         .unwrap_or_else(|| addr.clone());
     fs::write(server_addr_file(), bound_addr.as_bytes())?;
-    fs::write(server_pid_file(), std::process::id().to_string().as_bytes())?;
 
     eprintln!("drovr review server listening on http://{bound_addr}");
     eprintln!("  runs: {root:?}");
@@ -1422,6 +1445,8 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     for h in handles {
         let _ = h.join();
     }
+    // `_lock` drops here (and on every error path above), so the next
+    // `drovr serve` can take it the moment this one stops serving.
     Ok(())
 }
 
@@ -1453,6 +1478,97 @@ pub fn ensure_server() -> io::Result<String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Take the single-server lock, held for as long as the returned file lives.
+///
+/// The lock is an advisory exclusive lock on `server.pid`, not the pid inside it:
+/// the kernel holds it for this process and drops it however the process dies, so
+/// a crashed server never leaves a claim anyone has to judge stale, and nothing
+/// has to guess whether some pid is still a server. It is also the only check that
+/// catches a duplicate on an *arbitrary* port, where the OS bind would not
+/// serialize two starts at all.
+///
+/// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
+/// refusal message — never for the decision.
+fn acquire_pid_lock() -> io::Result<File> {
+    match try_take_lock(&server_pid_file())? {
+        Some(lock) => Ok(lock),
+        // Someone holds it: they are serving (or about to), so stand down.
+        None => Err(duplicate_server_error(recorded_addr(), lock_holder())),
+    }
+}
+
+/// Lock `path` and stamp this process's pid into it, or `Ok(None)` if another
+/// process holds it. Takes the path so it is testable without the data dir (and
+/// so without the process-global `XDG_DATA_HOME` other tests mutate).
+///
+/// The pid is written *after* the lock is taken, so for the moment between the two
+/// the file still names the previous holder — which is why the pid only ever
+/// informs the message, never a decision.
+fn try_take_lock(path: &Path) -> io::Result<Option<File>> {
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(e)) => return Err(e),
+    }
+
+    lock.set_len(0)?;
+    lock.write_all(std::process::id().to_string().as_bytes())?;
+    lock.flush()?;
+    Ok(Some(lock))
+}
+
+/// The pid recorded in `server.pid`, if it holds a readable one.
+fn lock_holder() -> Option<u32> {
+    fs::read_to_string(server_pid_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// The refusal a second `drovr serve` exits with, naming the live server as
+/// precisely as it can be named.
+///
+/// Both parts are conditional on what is known: a start that lost the lock race by
+/// microseconds sees a holder that has neither written its pid nor bound yet.
+fn duplicate_server_error(addr: Option<String>, pid: Option<u32>) -> io::Error {
+    let where_ = match addr {
+        Some(addr) => format!(" on http://{}", display_addr(&addr)),
+        None => String::new(),
+    };
+    let (who, how) = match pid {
+        Some(pid) => (
+            format!(" (pid {pid})"),
+            format!(", or stop it with: kill {pid}"),
+        ),
+        None => (String::new(), String::new()),
+    };
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "a drovr review server is already running{where_}{who} — the server is global \
+             and serves every run, so use that one{how}"
+        ),
+    )
+}
+
+/// The address in `server.addr`, unverified.
+///
+/// Only ever used to put a URL in the refusal above, never to decide anything —
+/// which is why "unverified" is good enough. A holder that has taken the lock but
+/// not yet bound leaves the *previous* server's address here, so the URL can be
+/// stale for as long as a start takes; the refusal itself never depends on it.
+fn recorded_addr() -> Option<String> {
+    let addr = fs::read_to_string(server_addr_file()).ok()?;
+    let addr = addr.trim().to_string();
+    (!addr.is_empty()).then_some(addr)
 }
 
 /// The bound address if `server.addr` names a reachable server, else `None`.
@@ -1761,9 +1877,7 @@ mod tests {
             .map(|(i, s)| crate::run::Phase {
                 name: format!("phase{i}"),
                 status: s.clone(),
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             })
             .collect();
         let state = RunState {
@@ -1780,6 +1894,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived,
+            retired_panes: vec![],
         };
         fs::write(
             dir.join("state.json"),
@@ -2444,9 +2559,8 @@ mod tests {
         let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         };
         let mut run = RunState {
             name: "r".into(),
@@ -2465,6 +2579,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         // Running phase wins.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
@@ -2492,6 +2607,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         }
     }
 
@@ -2499,9 +2615,8 @@ mod tests {
         crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         }
     }
 
@@ -3018,6 +3133,55 @@ mod tests {
         assert!(
             text.contains(MARKDOWN_IT_SHA256),
             "PROVENANCE.toml does not record the pinned markdown-it digest {MARKDOWN_IT_SHA256}"
+        );
+    }
+
+    // -- the single-server lock ------------------------------------------------
+
+    /// Exclusivity *between processes* is what matters, and it is pinned by
+    /// `tests/serve_single.rs` (a second `drovr serve` is refused, and six racing
+    /// starts leave one server). Taking the same lock twice inside one process is
+    /// explicitly unspecified in std, so this covers the rest of the contract: the
+    /// pid lands in the file for humans, and dropping releases the claim.
+    ///
+    /// Deliberately path-based rather than data-dir based: nothing here touches
+    /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
+    /// that do — see "Test suite flakes under parallel `cargo test`" in
+    /// `docs/known-issues.md`.
+    #[test]
+    fn lock_records_our_pid_and_releases_on_drop() {
+        let tmp = make_root("lock-claim");
+        let path = tmp.path().join("server.pid");
+
+        let held = try_take_lock(&path).expect("claim").expect("uncontended");
+        assert_eq!(
+            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "the holder records its pid for humans to kill"
+        );
+
+        // Nothing has to prove the holder died for the lock to be free again.
+        drop(held);
+        let _held = try_take_lock(&path)
+            .expect("claim after release")
+            .expect("released lock must be free");
+    }
+
+    /// A server that was killed leaves the file behind with its pid in it. The
+    /// kernel released the lock when it died, so the file must not wedge a start.
+    #[test]
+    fn lock_ignores_a_stale_pid_in_the_file() {
+        let tmp = make_root("lock-stale");
+        let path = tmp.path().join("server.pid");
+        fs::write(&path, b"999999").expect("stale pid file");
+
+        let _held = try_take_lock(&path)
+            .expect("claim")
+            .expect("an unlocked file must be claimable");
+        assert_eq!(
+            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "claiming replaces the dead server's pid with ours"
         );
     }
 

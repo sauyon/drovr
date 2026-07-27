@@ -943,7 +943,7 @@
     <div id="diff-content" class="diff-content md-content"></div>
   </div>
 
-  <div id="doc-panel" class="panel">
+  <div id="doc-panel" style="display:none" class="panel">
     <div class="panel-title">Current spec</div>
     <div id="doc-content" class="md-content"></div>
   </div>
@@ -1356,6 +1356,12 @@ function legacyRenderReviewDiff(diffText, locMap) {
 // Additive and defensive: absent endpoints render an empty panel; any error
 // leaves the panel hidden so the spec-review loop is unaffected.
 async function refreshReview() {
+  // Every other async flow in this file captures routeGen and bails if it moved;
+  // this one did not, and it is called fire-and-forget from refresh(). Its own two
+  // awaits below outlive a navigation, so without this the late resolution painted
+  // the previous task's findings and diff and then unconditionally re-showed the
+  // panel — over the session list, which only hid it once on the way out.
+  var gen = routeGen;
   var task = reviewTask();
   if (!task) { hideEl('review-panel'); return; }
   var q = '?task=' + encodeURIComponent(task);
@@ -1365,6 +1371,7 @@ async function refreshReview() {
     var fr = await fetch(api('review/findings') + q);
     if (fr.ok) review = await fr.json();
   } catch (e) { review = {}; }
+  if (gen !== routeGen) return;
   var findings = (review && review.findings) || [];
 
   document.getElementById('review-task').textContent = task;
@@ -1377,9 +1384,14 @@ async function refreshReview() {
   document.getElementById('review-findings').innerHTML = renderFindings(findings);
 
   var diffText = await fetchText(api('review/diff') + q);
+  if (gen !== routeGen) return;
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
-    diffEl.innerHTML = await renderReviewDiff(diffText, findings);
+    // renderReviewDiff() awaits internally (it preloads the patch renderer), so
+    // this is a third suspension point and needs the same guard as the two above.
+    var rendered = await renderReviewDiff(diffText, findings);
+    if (gen !== routeGen) return;
+    diffEl.innerHTML = rendered;
     fillFindingAnnotations(diffEl, diffText, findings);
   } else {
     diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
@@ -1407,16 +1419,22 @@ function saveAnnotations() {
   } catch (e) {}
 }
 function loadAnnotations(turn) {
+  // Reset FIRST, unconditionally: every mutation calls saveAnnotations(), so
+  // localStorage is authoritative and nothing in-progress is lost. Falling
+  // through any branch below with the previous run's map still in place let its
+  // line comments ride along in this run's submit (collectAnnotations feeds the
+  // payload) with nothing on screen to reveal them — the same cross-run
+  // misattribution as the stale doc panel, but data-losing rather than cosmetic.
+  annotations = {};
   try {
     var raw = localStorage.getItem(annotKey());
-    if (!raw) { annotations = {}; return; }
+    if (!raw) return;
     var stored = JSON.parse(raw);
     if (stored && stored.turn === turn && stored.annotations) {
       annotations = stored.annotations;
       _annotIdSeq = stored.seq || _annotIdSeq;
     } else if (stored && stored.turn !== turn) {
-      localStorage.removeItem(annotKey()); // stale (new turn) — clear
-      annotations = {};
+      localStorage.removeItem(annotKey()); // stale (new turn) — already cleared above
     }
   } catch (e) {}
 }
@@ -1676,6 +1694,11 @@ function blankCustomAnswer() {
 // ---- State ----
 var pollTimer = null;
 var currentDocText = '';
+// Bumped once per refresh() whose fetches landed for the run still on screen.
+// Monotonic on purpose: it is the only signal that distinguishes "this run has
+// been rendered" from "nothing has rendered yet", both of which look like an
+// empty currentDocText. cli/tests/web/nav.mjs waits on it.
+var refreshSeq = 0;
 
 function showEl(id) { document.getElementById(id).style.display = ''; }
 function hideEl(id) { document.getElementById(id).style.display = 'none'; }
@@ -1701,6 +1724,7 @@ async function refresh() {
 
   // Navigated away while these fetches were in flight → drop this stale render.
   if (gen !== routeGen) return;
+  refreshSeq++;
 
   currentDocText = docText;
   var state = stateRes.state;
@@ -1723,12 +1747,21 @@ async function refresh() {
     hideEl('summary-banner');
   }
 
-  // doc panel — render with source-line attributes then wire annotations
+  // doc panel — render with source-line attributes then wire annotations.
+  // The empty case MUST clear and hide, not just skip the write: a run has no
+  // spec.md until its gate is first opened, so /doc answers 200-with-no-body, and
+  // leaving the last render in place showed the PREVIOUS run's spec under this
+  // run's name. route() deliberately does not show this panel — visibility is
+  // owned here, so the stale doc is never briefly visible on the way in either.
+  var docContentEl = document.getElementById('doc-content');
   if (docText) {
-    var docContentEl = document.getElementById('doc-content');
     docContentEl.innerHTML = renderMd(docText);
     var sourceLines = docText.split('\n');
     wireAnnotations(docContentEl, sourceLines);
+    showEl('doc-panel');
+  } else {
+    docContentEl.innerHTML = '';
+    hideEl('doc-panel');
   }
 
   // diff panel — before→after diff of the raw markdown SOURCE (not rendered
@@ -2464,7 +2497,43 @@ async function route() {
   // and its answers could be submitted against THIS run.
   clearQuestions();
   showEl('back-link');
-  showEl('doc-panel');
+  // Everything below is a CROSS-RUN reset, so it is gated on the run actually
+  // changing. `#/runs/<run>?task=<t>` is a supported URL (see reviewTask() and the
+  // router comment above), so back/forward — or opening a task link while already
+  // on that run — re-enters route() with the same run; wiping the form there would
+  // destroy the reviewer's half-typed feedback, which is persisted nowhere.
+  if (h.run !== prevRun) {
+    // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
+    // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
+    // run with no spec never flashes the previously-viewed run's doc — and if
+    // refresh() throws mid-flight the stale spec is already gone rather than left
+    // on screen under this run's name.
+    hideEl('doc-panel');
+    document.getElementById('doc-content').innerHTML = '';
+    currentDocText = '';   // keep it in step with the DOM it describes
+    // The review panel is fetched by refreshReview() behind two awaits, so on a
+    // direct run-to-run jump it would otherwise keep painting the OLD task's
+    // findings and diff under the new run's name until those resolve.
+    hideEl('review-panel');
+    // Annotations must be dropped HERE, synchronously, not just in
+    // loadAnnotations(): that runs after refresh()'s awaits, so between this point
+    // and those fetches resolving, collectAnnotations() still returns the previous
+    // run's line comments while api('submit') already addresses THIS run — and if
+    // refresh() rejects, loadAnnotations() never runs at all and they stay
+    // submittable indefinitely. loadAnnotations() then restores this run's own
+    // in-progress comments from localStorage.
+    annotations = {};
+    // Same class again, and the worst instance of it: the decision radio and the
+    // feedback box are plain form fields that nothing ever reset, so prose typed
+    // for one run stayed in the box — and the radio stayed on whatever was picked
+    // — after navigating to another. Submitting there wrote one run's decision and
+    // feedback into the OTHER run's feedback.json, which an agent then acts on.
+    // Back to the markup default: request-changes selected, box empty.
+    var rcRadio = document.querySelector('input[name="decision"][value="request-changes"]');
+    if (rcRadio) rcRadio.checked = true;
+    document.getElementById('feedback').value = '';
+    hideEl('form-error');
+  }
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;

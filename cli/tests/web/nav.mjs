@@ -160,6 +160,7 @@ const checkedIn = qi => evaluate(`
   var r = it.querySelector('input[type="radio"]:checked');
   return r ? r.value : null;`);
 const hash = () => evaluate(`return location.hash;`);
+const docText = () => evaluate(`return (document.getElementById('doc-content').textContent || '').trim();`);
 const filterOpen = () => evaluate(`return document.getElementById('nav-filter').style.display !== 'none';`);
 const helpOpen = () => evaluate(`return document.getElementById('key-help').classList.contains('open');`);
 const activeId = () => evaluate(`
@@ -533,6 +534,10 @@ await evaluate(`return renderRunList(routeGen);`);
 // reach: the STALE call FAILS after the fresh one already rendered. Guarding
 // only the success path let its catch wipe a correct list to "Failed to load
 // sessions" — a phantom failure, easily read as the archive having failed.
+// Counted rather than hard-coded: this asserts the list is UNCHANGED, so the
+// number is whatever the fixture happens to hold. A hard-coded 6 broke the moment
+// a seventh fixture run was added upstream.
+const beforeStale = await evaluate(`return document.querySelectorAll('.run-row').length;`);
 check('a stale FAILED fetch cannot wipe a newer successful render', await evaluate(`
   var realFetch = window.fetch;
   var call = 0;
@@ -553,9 +558,14 @@ check('a stale FAILED fetch cannot wipe a newer successful render', await evalua
     return new Promise(function(res){ setTimeout(res, 320); });
   }).then(function(){
     window.fetch = realFetch;
+    // The claim is that the older call's rejection did not replace a good list
+    // with "Failed to load sessions" — so ask exactly that. Reporting a literal
+    // row count instead coupled this to the fixture size, and it broke the moment
+    // a seventh fixture run was added upstream.
     var failed = document.querySelector('#run-list-items .review-empty');
-    return failed ? 'wiped: ' + failed.textContent : 'rows:' + document.querySelectorAll('.run-row').length;
-  });`), 'rows:6');
+    if (failed) return 'wiped: ' + failed.textContent;
+    return document.querySelectorAll('.run-row').length > 0 ? 'intact' : 'empty';
+  });`), 'intact');
 await evaluate(`return renderRunList(routeGen);`);
 
 console.log('\n== session list: filter ==');
@@ -586,7 +596,9 @@ console.log('\n== session list: cursor is anchored to its run, not its slot ==')
 // Explicitly not alpha-deploy: posting a summary overwrites the target's
 // summary.txt, and the detail-view checks below assert on alpha's seeded summary.
 // Picking "the last row" blind silently clobbered it whenever alpha sorted last.
-const bump = names.filter(n => n !== 'alpha-deploy').pop();
+// epsilon-nospec is out for the same reason: it is the fixture for "no spec yet",
+// and POSTing a summary would move it to `ready` under the stale-doc check below.
+const bump = names.filter(n => n !== 'alpha-deploy' && n !== 'epsilon-nospec').pop();
 await press('g'); await press('j');
 const anchored = await cursorName();
 check('cursor sits on a row the re-sort will move', anchored, names[1]);
@@ -1314,6 +1326,186 @@ console.log('\n== leaving a run ==');
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');
+
+console.log('\n== switching runs never leaves the previous run\'s spec on screen ==');
+// A run has no spec.md until its gate is first opened with `review summary`, so
+// /doc answers 200-with-an-empty-body. The doc panel was only ever WRITTEN when
+// the fetched doc was non-empty, so navigating from a run that has a spec to one
+// that does not left the old spec rendered under the new run's name — the
+// reviewer reads a stale document and believes it belongs to this run.
+// Gate on the panel being VISIBLE, not just on its text: leaving a run hides the
+// panel without emptying it, and textContent reads hidden nodes — so probing the
+// text alone is satisfied by the previous visit's leftovers and this goto() would
+// return before the navigation had happened at all.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec",
+});
+check('a run with a spec renders it', (await docText()).indexOf('Spec for alpha-deploy') !== -1, true);
+
+// In-page hash navigation, not a reload: a fresh page load would start with an
+// empty #doc-content and pass no matter what, proving nothing.
+const seqBefore = await evaluate(`return refreshSeq;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(hash, h => h === '#/runs/epsilon-nospec', 4000, 'nospec hash');
+// refreshSeq is monotonic and bumped only once a refresh's fetches have landed,
+// so "advanced past seqBefore" really does mean refresh() ran for THIS run.
+// currentDocText would not: it reads empty both after a spec-less refresh and
+// before anything has rendered at all, so a reload would satisfy it instantly.
+await waitFor(() => evaluate(`return currentRun + '|' + (refreshSeq > ${seqBefore});`),
+  v => v === 'epsilon-nospec|true', 8000, 'refresh for the spec-less run');
+check('a run with no spec shows no doc at all', await docText(), '');
+check('...and does not claim to be showing a spec',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+// The two checks above pass on route()'s defensive clear alone, so they do NOT
+// pin the invariant where it actually has to hold: refresh() re-runs on the poll
+// timer with no navigation, so IT must never leave a doc it did not fetch. Plant
+// a stale render, call refresh() directly, and require it to clean up.
+await evaluate(`
+  document.getElementById('doc-content').innerHTML = '<p>STALE DOC FROM ANOTHER RUN</p>';
+  document.getElementById('doc-panel').style.display = '';
+  return 1;`);
+check('the planted stale doc is really on screen', (await docText()).indexOf('STALE DOC') !== -1, true);
+// Surface a rejection as a check failure rather than an uncaught exception that
+// kills the driver before it prints its summary.
+check('refresh() completed without throwing', await evaluate(`
+  return refresh().then(function(){ return ''; }, function(e){ return String((e && e.message) || e); });`), '');
+check('refresh() alone clears a doc it did not fetch', await docText(), '');
+check('refresh() alone hides the panel it did not fill',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+console.log('\n== a refresh that never completes still leaves no stale doc ==');
+// route()'s own defensive clear is invisible on the happy path, because route()
+// awaits refresh() before any probe can sample the DOM — so the checks above pass
+// even with that clear reverted. What it actually defends is refresh() FAILING:
+// the reviewer navigates, the fetches reject, and nothing downstream ever runs.
+// Force that by rejecting every fetch, and require the old spec to be gone anyway.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec (again)",
+});
+// Plant a line comment on ALPHA first, so there is something real to leak: with
+// no annotations on the outgoing run this check would pass no matter what.
+await evaluate(`
+  annotations = { 1: { quote: 'Spec for alpha-deploy', comments: [{ id: 1, text: 'alpha-only comment' }] } };
+  return JSON.stringify(collectAnnotations()).indexOf('alpha-only') !== -1;`);
+check('the planted annotation is really submittable on alpha',
+  await evaluate(`return collectAnnotations().length;`), 1);
+await evaluate(`
+  window.__origFetch = window.fetch;
+  window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+  return 1;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('a failed refresh leaves no stale doc behind', await docText(), '');
+check('...and no panel claiming to show one',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+// The same window is what let the previous run's line comments stay submittable:
+// loadAnnotations() runs after refresh()'s awaits, so a rejected fetch skips it
+// entirely and alpha's comment would still be in the payload POSTed for epsilon.
+check('...and no stale annotations to submit under this run',
+  await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
+await evaluate(`window.fetch = window.__origFetch; return 1;`);
+
+console.log('\n== the decision form does not carry across runs ==');
+// The decision radio and the feedback box are plain form fields, so nothing reset
+// them on navigation: prose typed for one run stayed in the box and the radio kept
+// its pick, and submitting on the next run wrote them into THAT run's
+// feedback.json — a decision the reviewer never made about a spec they never read.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'alpha-only feedback, must not follow me';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  return 1;`);
+check('the planted decision is really staged on alpha', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r.value + '|' + (document.getElementById('feedback').value.length > 0);`), 'approve|true');
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('the feedback box is empty on the next run',
+  await evaluate(`return document.getElementById('feedback').value;`), '');
+check('the decision falls back to request-changes, not the previous pick',
+  await evaluate(`
+    var r = document.querySelector('input[name="decision"]:checked');
+    return r ? r.value : null;`), 'request-changes');
+
+console.log('\n== staying on the same run keeps the reviewer\'s work ==');
+// The cross-run resets above must fire on a RUN CHANGE, not on every route().
+// `#/runs/<run>?task=<t>` is a supported URL (reviewTask(), and the router
+// comment documents it), so browser back/forward — or opening a task link while
+// already on that run — re-enters route() with the SAME run. Feedback is never
+// persisted anywhere, so clearing it there destroys the reviewer's typed prose
+// with no warning and no way back.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'half-written feedback I am still editing';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  annotations = { 2: { quote: 'Content.', comments: [{ id: 9, text: 'in-progress note' }] } };
+  saveAnnotations();   // every real mutation site does this, so match real usage
+  return 1;`);
+const sameRunGen = await evaluate(`return routeGen;`);
+await evaluate(`location.hash = '#/runs/alpha-deploy?task=task-1'; return 1;`);
+await waitFor(hash, h => h === '#/runs/alpha-deploy?task=task-1', 4000, 'same-run task hash');
+// Wait on routeGen, NOT refreshSeq: refreshSeq is also bumped by the background
+// pollState->refresh() loop that runs for a `ready` run, so it can advance before
+// route() has touched the hashchange at all — which made these checks pass whether
+// or not the reset block ran. routeGen is incremented only by route(), on entry,
+// in the same synchronous task as the reset block below it.
+await waitFor(() => evaluate(`return routeGen;`), g => g > sameRunGen, 8000,
+  'route() to process the same-run navigation');
+check('typed feedback survives a same-run navigation',
+  await evaluate(`return document.getElementById('feedback').value;`),
+  'half-written feedback I am still editing');
+check('the decision pick survives too', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r ? r.value : null;`), 'approve');
+// Note this one holds via loadAnnotations() restoring from localStorage, not via
+// the run-change gate — it still passes with the gate removed. Kept because the
+// user-visible invariant is worth pinning (it would catch persistence breaking),
+// but it is not what proves the gate works: the two checks above are.
+check('and in-progress annotations survive',
+  await evaluate(`return collectAnnotations().length;`), 1);
+
+console.log('\n== a stale review panel cannot repaint over the session list ==');
+// refreshReview() is called fire-and-forget and awaits twice, so it outlives a
+// navigation. Without a routeGen guard its late resolution re-showed the panel —
+// on the session list, which had already hidden it once on the way out.
+await goto('#/runs/alpha-deploy?task=task-1', {
+  probe: () => evaluate(`return currentRun;`), ok: r => r === 'alpha-deploy', label: 'alpha detail',
+});
+// Hold the findings fetch open, navigate away, then release it: the resolution
+// lands with the reviewer already back on the list.
+await evaluate(`
+  window.__release = null;
+  window.__origFetch2 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('review/findings') !== -1) {
+      return new Promise(function(res) { window.__release = function() { res(window.__origFetch2(u)); }; });
+    }
+    return window.__origFetch2.apply(window, arguments);
+  };
+  refreshReview();
+  return 1;`);
+await waitFor(() => evaluate(`return !!window.__release;`), v => v === true, 4000, 'findings fetch parked');
+await evaluate(`location.hash = '#/'; return 1;`);
+await waitFor(rowNames, r => r.length > 0, 8000, 'back on the session list');
+await evaluate(`window.__release(); return 1;`);
+// Give the released promise a turn to resolve and (wrongly) paint.
+await waitFor(() => evaluate(`return 1;`), () => true, 500, 'tick');
+await sleep(300);
+check('the review panel stays hidden on the session list',
+  await evaluate(`return document.getElementById('review-panel').style.display;`), 'none');
+check('...and the session list is still what is on screen', (await rowNames()).length > 0, true);
+await evaluate(`window.fetch = window.__origFetch2; return 1;`);
 
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();

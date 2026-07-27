@@ -1,5 +1,239 @@
 # Known issues
 
+## Reviewers judge an intermediate task against the WHOLE run's goal
+
+**Severity:** medium (every intermediate task of every multi-task run draws a spurious CRITICAL, and
+each one costs a review round to adjudicate).
+**Found:** 2026-07-25, run `phase-reap` task-2 iteration 5.
+
+### Symptom
+
+On a multi-task run, `drovr code-review run <run> <task>` returns a CRITICAL finding of the form
+"task behavior is not implemented" for work the plan deliberately schedules in a *later* task.
+
+Observed on run `phase-reap`, `task-2`, iteration 5: task 2 adds herdr capability only — the plan
+says "Nothing is ever closed until task 6" — and the correctness reviewer reported the absence of
+reaping and of `--resume` rehydration as a critical defect of that diff.
+
+### Root cause
+
+`build_seed` (`cli/src/code_review.rs`) seeds every reviewer with `run.task`, the run's overall goal
+("Reap finished phase panes, with rehydrate-in-the-UI"). The reviewer never sees the per-task brief
+that bounds the diff, so it measures an intermediate diff against the finished feature and correctly
+observes that most of the feature is missing.
+
+### Impact
+
+It fires on every intermediate task of every multi-task run, and it is expensive: a spurious CRITICAL
+costs a review round to adjudicate, and the driver must recognise it as a scope artifact rather than
+route it as a fix. It also crowds out real findings in the same angle.
+
+### Fix idea
+
+Seed the reviewer with the per-task brief instead of `run.task` — or pass both, and state explicitly
+which one bounds the diff's scope.
+
+## `phase wait` times out on a phase completed by a PRE-pass-token drovr build
+
+Introduced by the pass-token change (task 1 of the phase-reap work).
+
+### Symptom
+
+`drovr phase wait <run> <phase>` exits 2 (timeout) for a phase whose `state.json` already says
+`"status": "Done"`, and the run dir has no `<phase>.done` marker.
+
+### Root cause
+
+The build before pass tokens CONSUMED the completion marker when a wait accepted it, and relied on
+a `status == Done` short-circuit to make a re-wait idempotent. That short-circuit is gone: a stale
+`Done` on disk is no longer accepted as evidence, because every "marker destroyed but state write
+did not land" failure produced exactly that state and would have been reported as a false
+completion. The verdict now derives solely from the marker plus its pass token.
+
+So a phase completed by the older binary has `Done` recorded but no marker left to prove it, and
+the new binary honestly reports that it has no evidence.
+
+### Working around it
+
+Only affects a phase that was already `Done` before the upgrade AND is waited on again. The normal
+flow self-heals: `drovr phase send <run> <phase> "<instructions>"` re-opens the phase (clearing the
+stale status), and the live agent's next `drovr phase done` completes it normally.
+
+To accept the old completion as-is, re-signal it deliberately from the run dir:
+
+```
+: > "$(drovr path <run>)/<phase>.done"      # or: touch <run_dir>/<phase>.done
+```
+
+An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
+case.
+
+## Review UI presents one run's state as another's (spec, feedback, annotations, findings) — FIXED 2026-07-25
+
+**Status:** fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
+panel in the empty case, and `route()` no longer shows it. Regression checks: "a run with no
+spec shows no doc at all" / "...and does not claim to be showing a spec" in
+`cli/tests/web/nav.mjs`, against a new `epsilon-nospec` fixture run seeded with `state.json`
+but no `spec.md`.
+
+**Severity:** high (silent misattribution — the reviewer reads one run's plan believing it is
+another's, and every other element on the page corroborates the wrong run).
+**Found:** 2026-07-25, while reviewing run `phase-reap` and being shown run
+`skill-stickiness`'s plan.
+
+### Symptom
+
+Navigate to a run whose gate has never been opened (no `spec.md`) after viewing a run that
+has one, and the previous run's rendered spec stays on screen under the new run's name. The
+turn badge, summary banner and questions panel all correctly update to the new run, so the
+page reads as a coherent review of it — only the document body is wrong.
+
+Verified on the live server (`100.71.58.39:8795`):
+
+| run | `GET /doc` | `GET /state` | `spec.md` on disk |
+|---|---|---|---|
+| `phase-reap` | 200, **0 bytes** | `{"state":"idle","turn":0}` | absent (only `plan.md`) |
+| `skill-stickiness` | 200, 24833 bytes | `{"state":"ready","turn":0}` | present, 24833 bytes |
+
+### Root cause
+
+Not server-side run leakage — the run is resolved per-request from the URL path
+(`cli/src/review.rs:364-370`, `452`) and `spec.md` is read fresh every time, so there is no
+shared "current run" anywhere in the stack. The fault is purely client-side.
+
+`refresh()` in `cli/web/index.html` wrote `#doc-content` only when the fetched doc was
+non-empty, with no `else`:
+
+```js
+if (docText) {
+  docContentEl.innerHTML = renderMd(docText);
+  wireAnnotations(docContentEl, docText.split('\n'));
+}
+```
+
+Meanwhile `route()` unconditionally did `showEl('doc-panel')` on entering any run detail
+view. A run has no `spec.md` until its first `drovr review summary`, at which point `/doc`
+answers 200-with-an-empty-body (`cli/src/review.rs:467-470` deliberately prefers an empty
+200 over a 404) — so `docText` is `''`, the write is skipped, and the panel is shown still
+holding the last run's markup.
+
+Second-order hazard: `currentDocText` **was** assigned unconditionally, so the visible text
+and the annotation source line array were desynced — annotations anchored against an empty
+document while the reviewer selected lines of the stale one.
+
+### The same bug class, one layer down: annotations could submit against the wrong run
+
+Found by the review pass on the fix, and worse than the visible symptom. `loadAnnotations()`
+had two fall-through paths that left the **previous run's** annotation map in `annotations`:
+a swallowed `JSON.parse` failure (`catch (e) {}`), and a `stored.turn === turn` record whose
+`annotations` field was missing. Previously those stale line comments at least rendered as
+chips on the (stale) doc and could be deleted; with the doc correctly cleared, nothing renders
+them — but `collectAnnotations()` still ships them in the submit payload and the server writes
+them verbatim into `feedback.json` (`cli/src/review.rs:817-820`, `846-853`, which gates submit
+on `is_terminal()` only, not on `state == ready`). Run A's line comments would land silently in
+run B's `feedback.json`, invisible to the reviewer.
+
+Fixed by resetting `annotations = {}` at the top of `loadAnnotations()`, unconditionally,
+before reading localStorage. Safe because every mutation site calls `saveAnnotations()`
+immediately (`cli/web/index.html:1451`, `1475`), so localStorage is authoritative and no
+in-progress comment is lost.
+
+### Fix
+
+1. Give the empty case an explicit branch that clears `#doc-content` and hides `doc-panel`.
+2. Move panel visibility out of `route()` into `refresh()`, and have `route()` defensively
+   clear + hide on navigation, so the stale doc is neither briefly visible on the way in nor
+   left on screen if `refresh()` throws mid-flight.
+3. `#doc-panel` now carries inline `style="display:none"` like every other refresh-owned
+   panel, so it is not visible-and-empty on first paint.
+4. Reset `annotations` unconditionally in `loadAnnotations()` (above).
+
+### Three more instances of the same class, found by the review panel on the fix
+
+All pre-existing, all "run A's state presented or submitted as run B's", all fixed on the
+same branch. Listed because the pattern is the point: **any run-scoped state that is not
+reset synchronously in `route()` is a cross-run leak waiting to happen.**
+
+1. **The decision radio and feedback textarea were never reset** (`cli/web/index.html:908-915`).
+   The worst of the set, and worse than the doc panel: no race needed and completely silent.
+   Type feedback for run A, select a decision, navigate to run B (list, bookmark, or
+   back/forward), submit — and A's prose and A's decision are written into B's
+   `feedback.json`, which an autonomous agent then acts on. `submitDecision()` reads the live
+   DOM (`:1773`, `:1777`); nothing in `route()` or `refresh()` ever touched those values.
+   Fixed by resetting both to the markup default in `route()`'s synchronous block.
+
+2. **`annotations` was reset too late.** `loadAnnotations()` runs *after* `refresh()`'s
+   awaits, so between `route()`'s synchronous body and those fetches resolving,
+   `collectAnnotations()` still returned the outgoing run's line comments while
+   `api('submit')` already addressed the incoming one — and if `refresh()` rejects,
+   `loadAnnotations()` never runs at all and they stay submittable indefinitely with nothing
+   on screen to reveal them. Fixed by dropping them synchronously in `route()`;
+   `loadAnnotations()` still restores this run's own in-progress comments from localStorage.
+
+3. **`refreshReview()` had no `routeGen` guard** (`cli/web/index.html:1286-1317`). Every other
+   async flow in the file captures `routeGen` and bails if it moved; this one did not, and it
+   is called fire-and-forget from `refresh()`. Its two sequential awaits outlive a
+   navigation, so a late resolution painted the previous task's findings and diff and then
+   unconditionally re-showed the panel — **over the session list**, which had only hidden it
+   once on the way out. Strictly worse than the original symptom. Fixed with the standard
+   guard after each await.
+
+### A regression the fix itself introduced, caught by the final review round
+
+Worth recording because it is the natural failure mode of this kind of fix: **the cure for a
+cross-run leak is a reset, and a reset in the wrong place destroys the reviewer's work.**
+
+The resets above were added to `route()` ungated. But `route()` fires on every `hashchange`,
+and `#/runs/<run>?task=<t>` is a supported URL (`reviewTask()`, `cli/web/index.html:1119`, and
+the router comment at the top of the file documents it) — so browser back/forward, or opening
+a task link while already on that run, re-enters `route()` with the *same* run. That silently
+cleared the feedback textarea and reset the decision radio mid-edit. Feedback is persisted
+nowhere, so it was simply gone, with no warning.
+
+Note the pre-existing `if (h.run !== prevRun)` guard higher in `route()` covers only the
+nav-cursor bits — it is not a general run-change gate, which is easy to misread. The resets
+now sit in their own `h.run !== prevRun` block.
+
+Two reviewers disagreed on this: one reported it Critical with a live repro, the other cleared
+the same code as "reset is gated on navigation, not on poll" — true but not the point, since a
+same-run navigation is still a navigation. The repro decided it.
+
+**Two test traps hit while pinning it**, both of which made the check pass against broken code:
+- Waiting on `refreshSeq` was wrong — the background `pollState` → `refresh()` loop bumps it
+  for a `ready` run, so it advances before `route()` has touched the hashchange. The checks
+  now wait on `routeGen`, which only `route()` increments, in the same synchronous task as the
+  reset block.
+- The "annotations survive" check passes with the gate removed, because `loadAnnotations()`
+  restores them from localStorage. It is labelled in-place as not being what proves the gate
+  works.
+
+### Still open (follow-ups, not blocking)
+
+- `fetchText()` (`cli/web/index.html`) collapses 204, non-OK and a genuinely empty body all to
+  `''`, so a 500 on `/doc` is indistinguishable from "this run has no spec" and silently
+  renders as the latter. The reviewer is told "no spec yet" when the truth is "the server
+  broke".
+- `/doc` is the one maybe-absent-markdown endpoint that answers **200-with-empty-body**;
+  its siblings `/prior` (`cli/src/review.rs:472-478`) and `/review/diff` (`:791-797`) both
+  answer `204`, the latter with an explicit comment reading *"not a misleading empty 200."*
+  `/doc` should match. Given `fetchText`'s current collapsing this is a consistency fix, not
+  a behavioral one — but the conflation is the root design flaw behind this whole entry.
+- `agents-panel` / `session-panel` are shown by `route()` before their own poll lands. Their
+  catch blocks leave prior content untouched, so a persistently-failing endpoint leaves the
+  previous run's agent tree visible under the new run's header. Self-heals in ~1-2s on the
+  normal path.
+
+### Testing note
+
+The regression checks are deliberately split. "A run with no spec shows no doc" passes on
+`route()`'s defensive clear alone, so it does **not** pin the real invariant; the two
+`refresh() alone ...` checks plant a stale render and call `refresh()` directly, and those are
+the ones that fail if the `else` branch is removed. Both halves were verified to fail against
+the unfixed page before being kept. `refreshSeq` (`cli/web/index.html`) exists purely so the
+driver can tell "this run has rendered" from "nothing has rendered yet" — an empty
+`currentDocText` cannot distinguish the two, and waiting on it made the check vacuous under a
+real page reload.
+
 ## The agent's change summary is hidden on the first review — FIXED 2026-07-25
 
 **Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;
@@ -297,66 +531,211 @@ path** while `code-review run` used a bare `agent_send`.
 reviewer raises a `TimedOut` error that aborts the pass instead of erroring with "target not
 found". So the "agent target not found" symptom above should no longer occur.
 
-**CONFIRMED 2026-07-25** (run `review-resume`, branch `drovr/review-resume`, dogfooding the panel
-on the code-review resume change): the *second* symptom reproduces, and it is **not** a distinct
-bug — it is the unsubmitted-paste failure documented in the next section. All four cursor
-reviewer panes launched, attached, and received their seed, but the brief sits in the composer as
-`→ [Pasted text #1 +46 lines]`, never submitted. The agents therefore never start, never reach
-`done`, and `code-review run` times out with no `<task>-review.json` — exactly as reported.
+~~**Unverified as of 2026-07-25:** the *second* symptom — reviewer panes attach and get seeded but
+never reach `done`, so `code-review run` times out with no `<task>-review.json` — has not been
+re-run against current `main`.~~ **CONFIRMED 2026-07-25, independently by two runs**, and it is
+**not** a distinct bug — it is the unsubmitted-prompt failure documented in the next section:
+
+- run `review-resume`, branch `drovr/review-resume`, dogfooding the code-review resume change. All
+  four cursor reviewer panes launched, attached, and received their seed, but the brief sits in the
+  composer as `→ [Pasted text #1 +46 lines]`, never submitted. The agents therefore never start,
+  never reach `done`, and `code-review run` times out with no `<task>-review.json` — exactly as
+  reported.
+- run `phase-reap`, branch `drovr/phase-reap` — the same symptom, same cause, plus a *second*
+  failure mode behind it. Detailed below.
+
+### Dogfooded end-to-end 2026-07-25 (run `phase-reap`, task-1, branch `drovr/phase-reap`)
+
+Two full panel passes on a host where **cursor IS integrated** (so `review_agent_for` resolves to
+cursor). The panel failed **three distinct ways**, none of which is the spawn race:
+
+**Pass 1 — exit 2 (timeout), root cause is the unsubmitted paste.** All four reviewer panes
+(`wAF:p2`–`p5`) attached fine and sat at `agent_status: idle` with the seed visible in the composer
+as `→ [Pasted text #1 +46 lines]`. This is the *"`drovr phase send` still lands a large briefing
+unsubmitted"* bug below, reaching the **reviewer-spawn** path via `code_review.rs`'s `phase_send`
+call — the seed is never submitted, so the reviewer never starts and the panel burns its whole
+`timeout_ms`. `herdr agent send-keys <pane> enter` on each pane started all four immediately, and
+all four then produced valid verdicts.
+
+**Pass 2 — exit 1, findings emitted but not extractable.** With `enter` sent proactively, all four
+panes (`wAF:p7`–`pA`) ran to completion and reached `agent_status: done`. The panel still failed:
+
+```
+drovr: code-review run failed: reviewer 'review:task-1:2:correctness' produced no findings
+JSON (no file written and none found in its transcript)
+```
+
+`wAF:p7`'s transcript **did** contain a well-formed `{"verdict":"changes","findings":[…]}` block.
+`obtain_findings_json` could not see it because `agent_read` reads
+`source:"recent"` — a *viewport* snapshot, not the full scrollback. Cursor renders long tool output
+collapsed (`… NN output lines hidden · ctrl+o to expand`) and keeps scrolling, so by the time the
+panel reads the pane the emitted JSON has left the recent window. The file fallback never helps
+either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers deliberately write
+**no** `<task>-review-<angle>.json` file — the transcript is the only channel, and it is lossy.
+
+**Correction to an easy misdiagnosis:** cursor reviewers *do* reach `done`. In pass 1 they merely
+appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
+file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
+
+### Fix ideas (from the 2026-07-25 dogfood)
+
+1. **Make the findings channel durable, not a viewport.** Have the reviewer seed instruct writing
+   `<run_dir>/<task>-review-<angle>.json` *and* echoing it, then prefer the file. The file fallback
+   in `obtain_findings_json` already exists but is dead code today because nothing writes the file.
+2. If the transcript must stay the channel, read full scrollback rather than
+   `source:"recent"`, and fail with the captured transcript attached so the driver can hand-merge.
+3. Submit the seed reliably (see the entry below) — one fix removes failure mode 1 for the panel,
+   `phase send`, and the review gate at once.
+
+**Workaround used:** send `enter` to each reviewer pane after the panel spawns them, then read the
+four panes directly and hand-merge into `<run_dir>/<task>-review.json`. Both passes of task-1's
+review were merged this way, and both produced real, actionable findings — the reviewers work; only
+the plumbing around them fails.
 
 Reading a reviewer pane (`herdr agent read <pane>`) shows the full seed rendered in the composer
 with the correct `base..head` scope, so seeding and scope selection are fine; only the submit
-keystroke is missing. Fixing "`phase send` lands a large briefing unsubmitted" (below) fixes the
-panel too — they are one bug, and the panel is simply its most visible victim. Keep the
-self-spawned-reviewer workaround above until that lands.
+keystroke is missing. Fixing "`drovr phase send` returns success with the prompt left
+unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
+visible victim. Keep the self-spawned-reviewer workaround above until that lands.
 
-## `drovr phase send` still lands a large briefing unsubmitted (post-readiness-fix)
+## `drovr phase send` returns success with the prompt left unsubmitted
 
-**Severity:** low (recoverable, but every phase injection needs a manual nudge, so an
-unattended pipeline stalls silently at each phase start).
+**Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as
+`low` originally on the grounds that it is recoverable; that undersold it. Recovery requires a
+human noticing that nothing is happening, and the failure is indistinguishable from an agent
+that is simply working.)
 **Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
-binary that carries the phase-send agent-readiness fix.
-**Reproduced 2026-07-25** (run `mcp-endpoint`) — see "Still reproducing" below.
+binary carrying the phase-send agent-readiness fix.
+**Reproduced:** 2026-07-25 (`mcp-endpoint`), 2026-07-25 (`phase-reap`, three callers, 12 sends),
+2026-07-26 (`skill-stickiness`, three times). See "Occurrences".
 
 ### Symptom
 
-`drovr phase send <run> <phase> "<large briefing>"` returns success, and (post-fix) no longer
-errors with "agent target not found" — but the briefing sits in the agent's composer as a
-collapsed bracketed paste (`❯ [Pasted text #1 +NN lines]`, cost `$0.00`) and is **not
-submitted**. The agent never starts; `phase wait` would time out.
+`drovr phase send <run> <phase> "<text>"` exits `0` with no stderr. The text reaches the agent's
+composer but is **never submitted** — it sits at the `❯` prompt, cost `$0.00`. The agent is idle
+and unaware. `phase wait` runs to its full timeout, and any watch keyed on the work the message
+asked for stays correctly silent, because nothing happened.
 
-### Root cause (suspected)
+Two distinct renderings, depending on payload:
 
-The readiness fix (await attach/composer before sending) resolved the *race* that caused
-"target not found", but the submit itself — a large **bracketed paste** followed by a single
-CR — still leaves the paste uncommitted in the composer for big payloads; the trailing CR does
-not submit it.
+- large payloads appear as a collapsed bracketed paste — `❯ [Pasted text #1 +NN lines]`;
+- small payloads appear as ordinary inline wrapped text.
+
+Both fail the same way. There is also a rarer third mode where the send lands **nothing at all**
+and the composer stays empty (see Occurrences, `mcp-endpoint` case 1) — the payload is dropped
+outright while the command still reports success.
+
+### Root cause — not established
+
+Unknown. Two plausible-sounding explanations have been **ruled out** by evidence; do not fix
+against either.
+
+- **Not payload size, and not a bracketed-paste commit failure.** Three sends of a few hundred
+  bytes each failed on 2026-07-26, none rendering as a paste. Whatever fails, fails for inline
+  text too. Independently confirmed from the other direction on run `phase-reap`: an **8-line**
+  payload failed while rendering *as* a collapsed paste (`❯ [Pasted text #3 +8 lines]`), against
+  the 6586-byte / 124-line payload previously recorded. Neither size nor rendering predicts it —
+  any fix predicated on "large bracketed paste" will miss this.
+- **Not the `drovr phase send` CLI entry point.** Run `phase-reap` reproduced it from three
+  different callers, including `code_review.rs`'s reviewer spawn, so the failure is in
+  `phase::phase_send` itself (and therefore `agent_send` → socket `agent.prompt`). See
+  Occurrences.
+- **Not a stale herdr-version assumption.** `cli/src/herdr.rs:265-271` issues the socket call
+  `agent.prompt`, documented to type *and* submit natively, which is why the 0.7.3 flush-CR
+  handshake was removed. herdr was 0.7.5 during the 2026-07-26 failures, so the version premise
+  held and the submit still did not happen.
+
+One unconfirmed contributor: in the first 2026-07-26 case the target had been failing tool calls
+against a degraded classifier and had parked itself, with the TUI showing a `new task? /clear to
+save …` hint. A readiness probe reporting "ready" for an agent parked mid-error would explain
+both the exit `0` and the swallowed submit. The other two cases had no such state, so it is at
+most partial.
 
 ### Workaround
 
-After `phase send`, submit with `herdr agent send-keys <pane> Enter` (verify first with
-`herdr agent read <pane>`).
+Treat exit `0` as "text reached the composer", never as "the agent received it". Follow **every**
+send — large or small, paste or inline — with an explicit submit, then verify:
 
-### Fix idea
+```sh
+drovr phase send "$RUN" "$PHASE" "$TEXT"
+sleep 2
+herdr pane send-keys "$PANE" Enter                    # pane_id is in the run's state.json
+herdr pane read "$PANE" --source recent --lines 12    # confirm the composer cleared
+```
 
-For large payloads, either send the submit key(s) separately after a short settle, or detect a
-still-populated composer post-send and re-issue the submit until the input clears.
+A redundant `Enter` on an already-submitted message is harmless — it lands on an empty prompt.
+This is reliable: `herdr agent send-keys <pane> enter` after every `phase send` worked **12/12
+times** across run `phase-reap`.
 
-### Still reproducing (2026-07-25, run `mcp-endpoint`, pane `wAC:p1`)
+**A follow-up empty `phase send` does not work.** `drovr phase send <run> <phase> ""` is rejected
+with `drovr: phase send failed: agent prompt must not be empty`. If you are carrying that as a
+remembered workaround, drop it; `herdr pane send-keys` is the only thing that submits.
 
-Confirmed live on the installed nix-profile binary with a 6586-byte / 124-line briefing:
+**Sending a short pointer instead of a large briefing does not avoid this bug** — it was tried
+and failed (Occurrences, 2026-07-26 case 3). The write-to-a-file-and-send-a-pointer pattern is
+still worth using, but for an unrelated reason: the agent can re-read the file if its context
+compacts mid-task. It is not a mitigation for this issue and must still be followed by an
+explicit submit.
 
-1. The **first** `drovr phase send` landed **nothing at all** — the composer stayed empty at
-   `$0.00`. That is the readiness race described in the entry above's addendum (
-   "`code-review run` panel never completes") reaching the `phase send` CLI path too, not just
-   the reviewer-spawn path: the command reports success while the payload is dropped.
-2. A **second, identical** send landed as the documented collapsed paste:
-   `❯ [Pasted text #1 +124 lines]`, `$0.00`, **unsubmitted**.
-3. `herdr agent send-keys wAC:p1 Enter` submitted it — the documented workaround still works.
+**Never read a quiet watch as progress.** Silence is equally consistent with "working", "never
+started", and "dead". When a watch has been quiet longer than the work plausibly takes, read the
+pane — that is the only thing that distinguishes them. This bug is invisible from the outside;
+it was caught both times only by reading the pane directly.
 
-So there are two failure modes on this path, not one: a silent *drop* and a silent
-*non-submit*. Any fix must cover both — verifying the composer is non-empty after the send is
-what distinguishes them.
+### Occurrences
+
+**2026-07-25, run `mcp-endpoint`, pane `wAC:p1`** — installed nix-profile binary, 6586-byte /
+124-line briefing:
+
+1. The first `drovr phase send` landed **nothing at all** — composer empty at `$0.00`. That is
+   the readiness race described under "`drovr code-review run` panel never completes" reaching
+   the `phase send` CLI path, not just the reviewer-spawn path: success reported, payload
+   dropped.
+2. A second, identical send landed as a collapsed paste: `❯ [Pasted text #1 +124 lines]`,
+   `$0.00`, unsubmitted.
+3. `herdr agent send-keys wAC:p1 Enter` submitted it.
+
+**2026-07-26, run `skill-stickiness`, panes `wAG:p1` / `wAG:p2`** — herdr 0.7.5. Three sends,
+all small, none rendering as a paste, all unsubmitted until an explicit `Enter`:
+
+1. `wAG:p1`, ~300 bytes — "GATE APPROVED … Read `<path>` … then run `drovr phase done`".
+2. `wAG:p1`, ~430 bytes — a one-paragraph correction.
+3. `wAG:p2`, ~400 bytes — the plan phase's pointer injection, i.e. already using the
+   short-pointer pattern.
+
+
+**2026-07-25, run `phase-reap`, workspace `wAF`** — installed nix-profile binary, **three
+different callers**, which together show this is `phase::phase_send` itself and not the
+`drovr phase send` CLI entry point:
+
+1. **Reviewer spawn (`code_review.rs:318`) — 8 for 8.** Both panel passes, all four angles each
+   (`wAF:p2`–`p5`, then `wAF:p7`–`pA`): every reviewer sat `idle` with
+   `→ [Pasted text #1 +46 lines]` unsubmitted. This is what makes the review panel time out; see
+   the panel entry above. Cost: the panel's entire `timeout_ms` (30 min here) per pass.
+2. **Driver re-entry into a live implement phase.** `drovr phase send phase-reap
+   implement-task-1 "<review findings>"` reported success; the payload landed in the claude
+   pane's composer as `❯ [Pasted text #3 +8 lines]` and was never submitted, so the re-entry
+   silently did nothing until nudged. This makes the implement↔review loop a silent no-op — the
+   driver believes it forwarded findings and then waits on an agent that was never told anything.
+3. Both **cursor** (reviewers) and **claude** (implementer) panes are affected, so it is not a
+   backend-specific quirk.
+
+So the failure spans at least two orders of magnitude of payload size and both composer
+renderings.
+
+### Fix ideas
+
+1. **Verify submission rather than assuming it.** After `agent.prompt`, poll for a bounded
+   interval and confirm the composer cleared / the agent moved to `working`. Exit non-zero with a
+   distinct code if the text is still sitting there. This covers the drop mode too — checking
+   that the composer is non-empty *before* submitting is what distinguishes a drop from a
+   non-submit.
+2. **Re-issue the submit as a fallback** — not the unconditional 0.7.3 handshake, but a single
+   `Enter` sent only when step 1 detects the prompt was not consumed, retried until the input
+   clears.
+3. **Harden `wait_agent_ready`.** If an agent parked after an error reports ready, readiness is
+   measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
+   it gave up".
 
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
@@ -467,6 +846,36 @@ CI workflow at all, so nothing enforces it today.)
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
 
+### A second, distinct flake: `lock_records_our_pid_and_releases_on_drop` (2026-07-26)
+
+`review::tests::lock_records_our_pid_and_releases_on_drop` (`cli/src/review.rs:2311`) fails
+intermittently at `cli/src/review.rs:2326` with `released lock must be free` — `try_take_lock`
+returns `Ok(None)` (WouldBlock) for a lock the test just dropped.
+
+**It is NOT the env-pollution cause above**, despite also being parallelism-only. The test
+locks `tmp.path().join("server.pid")` under a `tempfile` root and never reads `XDG_DATA_HOME`,
+so no other test can name that path — its own doc comment (`cli/src/review.rs:2306-2309`)
+already claims immunity to the env flake, and that claim holds. Something else releases late.
+
+Measured 2026-07-26 on `52db1cd`:
+
+| how it was run | result |
+|---|---|
+| the `lock_*` tests alone, 25 consecutive runs | 25/25 green |
+| the whole `--bin drovr` suite, 12 consecutive runs | **1/12 red** |
+| nix sandbox build of `52db1cd` (`home-manager switch`) | red once, green on immediate retry |
+
+**Hypothesis, not yet confirmed:** an fd inheritance window. `flock(2)` locks belong to the
+open file description, which survives `fork`, so a concurrently-spawning test (several here
+start real servers) transiently holds an inherited copy of this fd between its `fork` and its
+`exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops it at `exec` — which is
+exactly why the window is narrow and the failure rare. Confirming it means tracing whether the
+red runs coincide with a process spawn; that has not been done.
+
+**Cost:** it fails the nix build, so it can break `home-manager switch` for an unrelated
+change. A retry is the workaround — the failure does not reproduce twice in a row. Note this
+means a *green* nix build is not evidence the test is sound.
+
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
 **Severity:** low (cosmetic; the mirror is readable but noisy).
@@ -570,6 +979,162 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## drovr never moves the driver out of the invoking checkout
+
+**Severity:** high (the driver's every git observation is silently about the wrong tree, and on a
+repo with concurrent agents it is how one clobbers another).
+**Found:** 2026-07-26, run `phase-reap` — by the driver of that run, after 25 commits.
+
+### Symptom
+
+A driver agent runs `drovr new <run> --worktree`, is told the run lives in `.drovr/wt/<run>` on
+branch `drovr/<run>` — and then keeps working **in the main checkout**. It reads main, runs
+`git status` and `git log` against main, and (if careless) edits main.
+
+Because cwd never moved, every bare git command resolves against the invoking checkout, so the
+driver reports *other agents'* uncommitted files as if they were its own branch's state. During this
+run the repo had **13 worktrees live at once, 7 of them `drovr/*` runs**. A driver that believes
+main's dirt is its own will "clean up" or commit work belonging to someone else.
+
+### Root cause
+
+Two halves, and neither is sufficient on its own.
+
+**1. There is no mechanism.** Nothing in `cli/src` ever changes the caller's directory — no
+`std::env::set_current_dir`, no `chdir`, no `drovr enter`/`drovr cd` subcommand. `drovr new
+--worktree` only *prints* the destination (`drovr: worktree <path> on branch <branch>`,
+`cli/src/main.rs:348`). Nor can it do more: a subprocess cannot change its parent's working
+directory, so a plain CLI cannot close this gap by itself. **That is precisely why the
+documentation has to carry it.**
+
+**2. The docs pointed the other way.** `skills/worktrees/SKILL.md` motivated isolation as "the
+invoking checkout stays clean and usable" and described the worktree as the **run's**. Nothing told
+the driver to leave the invoking checkout, so the natural reading was "the worktree is for the phase
+agents; I stay put." That reading is wrong, and it is the one the text invited.
+
+**This half is now fixed**: the skill says "clean and usable *for other work*", states that the
+driver goes to the worktree too, and carries the move as an explicit step in the flow. Half 1 stands
+— drovr still cannot move anyone.
+
+### Working around it
+
+**`cd` does not work.** In Claude Code the Bash tool's cwd resets to the session's primary working
+directory after every call, so a `cd` in one command is gone by the next.
+
+The mechanism that does work is the harness tool `EnterWorktree({path: ".drovr/wt/<run>"})`, which
+switches the **session's** directory and persists across calls; `ExitWorktree({action})` leaves.
+Neither drovr nor the skill mentioned it until now — `skills/worktrees/SKILL.md` now carries it as
+an explicit driver step.
+
+So: immediately after `drovr new <run> --worktree`, enter the worktree, and do not operate from the
+main checkout for the rest of the run.
+
+### Fix idea
+
+1. Have `drovr new --worktree` print the enter-the-worktree instruction as part of its success line.
+   That print is the one moment the driver is guaranteed to be paying attention, and it is where the
+   path is already in hand.
+2. Add a `drovr path <run>` helper that emits the worktree path alone, so the instruction is
+   copy-pasteable and scriptable rather than something the driver reconstructs from a sentence.
+   **The demand for this is already on the page, and so is the bug:** the pre-token `phase wait`
+   entry above offers `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in `5beb62f`),
+   but there is no `path` subcommand — `drovr path` exits with "unrecognized subcommand", and
+   `cli/src/main.rs`'s `Commands` enum has no `Path` variant — so that command does not run today.
+   Either add the helper or rewrite that line against `<run_dir>`. **Task 7's docs pass owns it**;
+   left unedited here because this change is scoped to the worktree gap.
+
+Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
+making the documented step harder to miss, not a substitute for it.
+
+## A phase name registered in BOTH lists resolves to the wrong phase — FIXED 2026-07-26
+
+Found by a review subagent during task 1's second fixes round of the phase-reap work; the gap itself
+predates that work.
+
+### Symptom
+
+`drovr phase start <run> review:t:1:correctness` — pointing `phase start` at a name a REVIEWER
+already holds — silently deleted that reviewer's `<phase>.done` marker, launched a second agent, and
+appended a second `Phase` entry under the same name in `run.phases`.
+
+From then on `RunState::find_phase` (which searches `phases` before `review_phases` and returns the
+first match) resolved that reviewer to the impostor: `phase send` reached the wrong pane,
+`phase done` from the reviewer's own pane was rejected as a token mismatch and demanded a
+pipeline-only `-HANDOFF.md`, and `code-review`'s wait polled the wrong pane and could time out on a
+reviewer that had actually finished.
+
+### Root cause
+
+`find_phase_idx` searches `run.phases` only, so a reviewer's name looked brand new to `phase_start`.
+Neither creation site checked the other list.
+
+### Fix
+
+`require_name_unclaimed` (`cli/src/phase.rs`) refuses a name the OTHER list already holds, at both
+creation sites, before any side effect. Pinned by
+`a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase` and
+`a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer`.
+
+**The same list counts too.** Two entries under one name means `find_phase` resolves to whichever
+was pushed first, so the second reviewer's pane is unreachable — the same corruption, within one
+list. main's panel resume re-spawns under the same `review:<task>:<iter>:<angle>` name and already
+drops the stale entry first (`run.review_phases.retain(|p| p.name != phase)`, "so `find_phase` cannot
+resolve to the replaced pane"), so merging it is safe; the guard makes that ordering a requirement
+rather than a convention. Pinned by `a_reviewer_must_be_de_registered_before_it_is_re_spawned`.
+
+Not reachable from drovr's own naming — reviewer names carry a `review:` prefix that pipeline names
+do not use — but the recovery commands drovr prints are bare `drovr phase start <run> <phase>`, so a
+human or a driver pasting one against the wrong name hit it with no guard.
+
+## A `<task>` or a review `angle` with a space or a shell metacharacter no longer produces a phase
+
+Introduced by the phase-name hardening (task 1's second fixes round of the phase-reap work).
+
+### Symptom
+
+`drovr code-review run <run> "my task"` — or any run whose config sets
+`angles = ["type design", "api & contracts"]` — fails with
+
+```
+invalid phase name "review:my task:1:correctness": may use only letters, digits,
+'-', '_', '.' and ':' …
+```
+
+It used to work. Both halves of the name are affected: `<task>` comes from argv or from the review
+server's HTTP layer, and `<angle>` comes from `${XDG_CONFIG_HOME}/drovr/config.toml`, which is
+free-form and validated nowhere else.
+
+### Root cause
+
+`require_new_phase_name` (`cli/src/phase.rs`) is an ALLOWLIST — `[A-Za-z0-9._:-]` — applied wherever
+drovr CREATES a phase (`phase_start`, `spawn_reviewer`). A reviewer phase is
+`review:<task>:<iter>:<angle>`, so both interpolated parts inherit the rule.
+
+A phase name is interpolated into file paths, into the `herdr pane run` command, and into the
+remediation commands drovr PRINTS for a human to paste — three grammars, so a denylist would have to
+be right in all of them forever. Rejecting at creation means no phase drovr mints from here on needs
+quoting to be safe to mention. (Emission sites quote independently — `cli/src/shell.rs` — because run
+and task names remain unrestricted.)
+
+### Scope — an EXISTING phase is not affected
+
+The strict alphabet gates creation only — a name being INTRODUCED. `require_phase_name`, used by
+`phase done` / `phase wait` / `phase send` / `collect` **and by `phase start` when the phase already
+exists**, keeps the older path-safety rule. So a phase an earlier drovr created under a now-illegal
+name is still fully operable: its live agent can signal done, and it can still be RE-ENTERED, which
+matters because `drovr phase start <run> <phase>` is the recovery drovr itself prints for a lost pass
+token. Pinned by `a_phase_already_on_disk_under_an_old_name_is_still_reachable` and
+`an_old_named_phase_can_still_be_re_entered`. **Do not "align" the two rules, and do not hoist the
+strict check to the top of `phase_start`** — either bricks these phases with no migration path.
+
+### Working around it
+
+Name tasks and angles in the same alphabet drovr itself mints: `task-1`, `fix-login-bug`,
+`type-design`, `api-contracts`. Hyphens instead of spaces. There is no opt-out, by design.
+
+There is no validation at config load, so a bad `angle` is reported only when a panel is spawned —
+the error names the whole phase name, which is where the offending angle is visible.
+
 ## `drovr cleanup` can clobber a concurrent `state.json` write
 
 **Severity:** low (narrow window, and the panes it would race are already dead).
@@ -594,10 +1159,10 @@ this window is new — it is a real (if small) regression introduced alongside t
 
 ### Why it is small
 
-The write was deliberately placed immediately after `herdr.workspace_close`, which kills every
-pane in the run, and it re-reads `state.json` from disk rather than saving the copy loaded at the
-top of the function. The race therefore needs a phase agent to write during the `workspace_close`
-call itself, after which it no longer exists.
+The write was deliberately placed immediately after the pane teardown (`close_run_panes`, which
+closes every pane the run recorded), and it re-reads `state.json` from disk rather than saving the
+copy loaded at the top of the function. The race therefore needs a phase agent to write during
+that teardown itself, after which it no longer exists.
 
 ### Fix ideas
 
@@ -924,6 +1489,377 @@ unrelated to this change.
 Related: the `SystemHerdr::with_bin` seam exists precisely so herdr's own tests need no env
 mutation at all — injecting the binary path beats locking around a global. Prefer that shape
 for new tests rather than adding another `ENV_LOCK` consumer.
+## Piping a `wait` command destroys its exit-code contract — a timeout reads as approval
+
+**Severity:** high (the failure is silent and points the wrong way: a *timeout* is
+indistinguishable from an *approval*, so an unapproved spec can walk straight into the implement
+phase — the exact outcome the gate exists to prevent).
+**Found:** 2026-07-25, run `skill-stickiness`, brainstorm spec gate.
+
+### Symptom
+
+The driver backgrounded the gate watch as:
+
+```
+drovr review wait skill-stickiness 2>&1 | tail -5
+```
+
+The harness reported **exit code 0** — which `drovr:pipeline` defines as *approved*. The command's
+actual output was `review: no reviewer action for run 'skill-stickiness' within timeout (re-run to
+resume)`, i.e. a **timeout (exit 2)**. On-disk state confirmed no decision: `review.state.json`
+still `{"state":"ready"}`, no `approved` marker, no `feedback.json`.
+
+### Root cause
+
+A shell pipeline's exit status is the status of its **last** command. `tail` succeeds, so the
+pipeline exits 0 regardless of what `drovr review wait` returned. Both `drovr:pipeline` ("The spec
+gate" → exit-code table) and `drovr:handoff` (step 3 → exit-code table) define precise exit-code
+contracts for `review wait`, `phase wait`, and `code-review run`, and **neither warns that piping
+the command destroys the contract**. Adding `| tail`, `| head`, `| grep`, or `| jq` to trim output
+is a natural thing to do and silently voids every one of those tables.
+
+This is the inverse of the danger the skill already names. `drovr:pipeline` warns "Only exit 0 is
+approval. A non-zero exit is never an approval" — the observed failure is an **exit 0 that is not
+an approval**, which no existing guidance covers.
+
+### Workaround
+
+Never pipe a command whose exit code you depend on. Capture it explicitly:
+
+```
+drovr review wait <run>; rc=$?; echo "EXIT=$rc"; exit $rc
+```
+
+This preserves the real status for the harness *and* records it in the output. Independently,
+**verify against on-disk state before acting on an approval** — `approved`/`cancelled` markers and
+`review.state.json` are the source of truth; the exit code is a convenience.
+
+### Fix ideas
+
+1. Add a red-flag row to `drovr:pipeline` and `drovr:handoff`: *"Piping `wait`/`code-review run`
+   → the pipeline's exit status is the last command's; use `cmd; rc=$?` instead."* Cheapest fix,
+   and it belongs next to the exit-code tables that create the expectation.
+2. Have `review wait` / `phase wait` write their outcome to a marker file in the run dir as well as
+   returning it, so a lost exit code is recoverable rather than fatal.
+3. Consider making the approval path require the on-disk `approved` marker, so that no exit-code
+   mishap alone can advance a gated run.
+
+## `review.state.json` state is sticky — polling it detects a condition, not a transition
+
+**Severity:** medium (a driver that polls for `state == "ready"` fires immediately on a
+*previous* revision and reports a revision that has not happened).
+**Found:** 2026-07-25, run `skill-stickiness`, while watching the gate for a post-review revision.
+
+### Symptom
+
+The driver armed a watch that fired when `review.state.json` reported `state: "ready"`, intending
+"the agent posted a new revision". It fired at once and reported a revision that did not exist:
+`spec.md`'s mtime predated the feedback file the agent was supposed to be acting on, and the
+agent was still mid-work.
+
+### Root cause
+
+`ready` is a **resting state**, not an edge. It is set by `drovr review summary` and persists
+until the reviewer acts. After any earlier revision the run sits in `ready` indefinitely, so a
+predicate of the form `state == "ready"` is true continuously — it says *"a revision is available
+for review"*, never *"a new revision just arrived"*.
+
+A second bug in the same watch is worth recording because it fails silently in the dangerous
+direction: the turn threshold was hardcoded (`turn > 4`) while `feedback.json` was at turn 3, so
+the reviewer's *next* decision (turn 4) would never have matched and the watch would have waited
+forever while the human had already acted.
+
+### Workaround
+
+Watch **mtimes**, not state. Capture `stat -c %Y` for `summary.txt` and `spec.md` at arm time and
+fire when they increase; derive any turn threshold from `feedback.json` at arm time rather than
+hardcoding it. A useful extra alarm: if `summary.txt` is re-posted while `spec.md` is unchanged,
+the agent has claimed work it did not do.
+
+### Fix ideas
+
+1. Add a monotonically increasing `revision` counter (or a `last_summary_at` timestamp) to
+   `review.state.json`, so watchers have an edge to trigger on.
+2. Document in `drovr:pipeline` that `state` is a resting value and that `drovr review wait` — not
+   a hand-rolled state poll — is the sanctioned way to detect a decision.
+
+## The review server binds to the configured host, so the documented `127.0.0.1` URL can fail
+
+**Severity:** low (cosmetic for a human who can read the bind address, but it silently breaks any
+scripted `localhost` poll).
+**Found:** 2026-07-25, run `skill-stickiness`.
+
+### Symptom
+
+`drovr:pipeline` documents the run's page as `http://127.0.0.1:8791/#/runs/<run>` and the state
+endpoint as `/api/runs/<run>/state`. On this machine the server was listening on the Tailscale
+address (`100.71.58.39:8791`), so:
+
+- `curl 127.0.0.1:8791/...` returned **empty** — a scripted poll for `"ready"` never matched and
+  silently ran to timeout.
+- On the correct host, `/` and `/#/runs/<run>` returned **200**, but `/api/runs` and
+  `/api/runs/<run>/state` returned **404**.
+
+### Root cause
+
+Partly configuration (the server was bound to a Tailscale host rather than loopback, which the
+skill explicitly supports via `drovr serve --host <tailscale-host>`) — the skill just hardcodes
+`127.0.0.1` in the URL it tells the driver to hand the human.
+
+**The 404s are not diagnosed.** The correct API path was not determined; it may simply differ from
+what the skill documents, or the endpoint may be versioned differently. Do not treat "the API path
+is wrong" as established — that needs checking against `cli/src/` before anyone acts on it.
+
+### Workaround
+
+Read the actual bind address (`ss -ltnp | grep 8791`) rather than assuming loopback, and prefer the
+on-disk markers (`review.state.json`, `approved`, `cancelled`, `feedback.json`) over HTTP for any
+programmatic check. They are the source of truth and need no network.
+
+### Fix ideas
+
+1. Have `drovr review summary` print the URL using the address the server actually bound to (it
+   already prints the reviewer URL — it should be the *real* one).
+2. Confirm the correct `/api/...` path and fix either the server or the skill's documentation.
+
+## Upstream (not a drovr bug): context-percentage readouts are computed against 200k
+
+**Severity:** informational — recorded because it distorts drovr's primary escalation signal, not
+because drovr should change.
+**Found:** 2026-07-25, run `skill-stickiness`, on `claude-opus-5`.
+
+### Symptom
+
+The statusline reported `ctx:83%` when the session held 165,258 tokens. 165,258 / 200,000 = 82.6%
+— an exact match, so the denominator is 200k. On a model with a 1M context window the true
+fullness was 16.5%, i.e. readings are inflated roughly 5×.
+
+More consequential than the display: the harness's **auto-compaction trigger uses the same
+number**, so an agent is compacted at ~200k regardless of the model's real capacity. The
+practical ceiling therefore *is* ~200k in behaviour even though the displayed percentage is wrong.
+
+### Why it is recorded here
+
+`drovr:using-drovr`'s escalation contract names **context fullness as the primary signal** for
+escalating a task into its own phase. An inflated reading pushes drovr to escalate far earlier
+than warranted — chopping work that would fit comfortably in one context, which inverts the
+project's value. During this run it nearly triggered an unnecessary mid-flight handoff at a
+displayed 63% (true fullness ~13%).
+
+### Status — do not design around this
+
+This is an upstream harness bug that is expected to be fixed, and the maintainer's explicit
+instruction was **not to change any drovr skill because of it**. No drovr change is warranted.
+Recorded only so that a reading taken before the upstream fix is not mistaken for a drovr defect,
+and so the interaction with the escalation contract is on record.
+
+Until it is fixed: when a context reading would actually change a decision, read real token counts
+from the session transcript (`~/.claude/projects/<munged-cwd>/<session>.jsonl`, summing
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens` on the last `usage` entry)
+rather than trusting the percentage.
+
+## A stale `server.addr` plus an occupied port deadlocks server discovery permanently
+
+**Severity:** high — `drovr review summary` / `review wait` fail with no path to recovery, so a
+run's gate cannot be opened at all.
+**Found:** 2026-07-26, run `skill-stickiness`.
+
+### Symptom
+
+Every `drovr review summary` fails with `timed out waiting for `drovr serve` to start`, while a
+perfectly healthy review server is running and reachable the whole time. Opening the URL a
+previous `summary` printed gives a connection refused — the human reads this as "the server isn't
+live" when in fact a server *is* live, just not the one drovr is looking for.
+
+Observed state during the incident:
+
+```
+~/.local/share/drovr/server.addr  ->  127.0.0.1:18732   (written 2026-07-25 20:37:46)
+~/.local/share/drovr/server.pid   ->  1662301           (process DEAD)
+actual live server                ->  100.71.58.39:8791 (pid 1289722, serving every run fine)
+```
+
+### Root cause
+
+Three mechanisms compose into a trap. Each is individually reasonable.
+
+1. **`server.addr` is a single global last-writer-wins pointer.** `serve()`
+   (`cli/src/review.rs:1052-1053`) writes `server.addr`/`server.pid` unconditionally right after
+   binding. Every drovr binary on the machine shares one `~/.local/share/drovr/`, so **dev builds
+   from other worktrees overwrite the pointer for everyone.** This repo routinely has 10+
+   worktrees live, several running their own `serve` on their own port — so the pointer churns.
+2. **A writer that exits leaves the pointer dangling.** Nothing clears `server.addr` on shutdown.
+   The last binary to start wins the pointer, and when it dies the pointer survives it, now naming
+   a dead port.
+3. **The recovery path cannot recover, because it has no port fallback.** `ensure_server()`
+   (`:1090-1112`) correctly detects the dead pointer — `live_server_addr()` connect-tests it and
+   returns `None` — and calls `spawn_daemon()`. But `spawn_daemon()` (`:1206-1221`) shells a bare
+   `drovr serve` with **no `--port`**, so the child always tries the default `8791` on the config
+   `serve_host`. That address is already held by the live server. The child dies instantly,
+   `server.addr` is never updated, and `ensure_server` polls a dead pointer for 5s and errors.
+
+The deadlock is stable: it recurs on every invocation and cannot self-heal, because the very
+condition that makes discovery fail (a live server on the port) is also what makes the fix
+attempt fail. Note the healthy-looking failure — the server is *up*, the runs are *fine*, and the
+error message points at startup, which is the one thing that is not the problem.
+
+### Workaround
+
+Point the file at the server that is actually running:
+
+```sh
+# find the live server and its bound address
+pgrep -af 'drovr serve'
+# then, with its real host:port
+printf '%s' '100.71.58.39:8791' > ~/.local/share/drovr/server.addr
+```
+
+Do **not** kill the dev-build servers to "clean up" — they belong to other worktrees and other
+people's sessions. Repointing the file is sufficient and non-destructive.
+
+To confirm before and after: `curl -s -m2 http://$(cat ~/.local/share/drovr/server.addr)/api/runs`
+should return a JSON array of runs. An empty `[]` means you have found a server pointed at a
+*different data dir* (another worktree's dev build) — that is a different, equally misleading
+failure: discovery succeeds, and the UI shows no runs.
+
+### Fix ideas
+
+1. **Give `spawn_daemon` a port fallback.** If the configured port is occupied, bind `:0`, let the
+   OS choose, and record the real bound address. This alone breaks the deadlock.
+2. **Validate before trusting, and self-heal.** `live_server_addr()` already connect-tests. Extend
+   it to also confirm the responder is a drovr server *for this data dir* (a `/api/health`
+   returning the runs root) — that catches the empty-`[]` cross-worktree case too.
+3. **Do not let dev builds clobber the shared pointer.** Namespace the discovery files by data dir,
+   or have non-default `--port`/`--host` invocations write a per-instance file instead of the
+   global one. A `serve` on a non-default port is almost by definition not the one to advertise.
+4. **Clear `server.pid`/`server.addr` on clean shutdown**, and treat a dead `server.pid` as
+   grounds to ignore `server.addr` without waiting for the TCP timeout.
+
+## A finished phase reports `running` forever unless the driver happens to run `phase wait`
+
+**Severity:** high — every read-only view of the run lies about its state, and `drovr status`
+actively instructs you to resume a phase that already finished.
+**Found:** 2026-07-26, run `skill-stickiness`.
+
+### Symptom
+
+The phase agent ran `drovr phase done <run> brainstorm` successfully. The marker
+`~/.local/share/drovr/runs/<run>/brainstorm.done` exists. And yet:
+
+```
+$ drovr status skill-stickiness
+  [ 0] brainstorm      running <-- resume
+  [ 1] plan            pending
+resume at phase 0: brainstorm
+```
+
+The phase had been complete for some time. `drovr list` and the review web UI agree with
+`status`, because they read the same field. There is no indication anywhere that the run is
+ready to advance — and the one line that looks like guidance (`resume at phase 0`) is wrong.
+
+### Root cause
+
+`phase done` deliberately writes only a marker file and never mutates `state.json` — by design,
+so the orchestrator stays the sole writer of run state (`cli/src/phase.rs:377-382`). The
+reconciliation from marker to `PhaseStatus::Done` happens in exactly **one** place:
+
+```rust
+// cli/src/phase.rs:466-471  — inside phase_wait's poll loop
+if marker.exists() {
+    run.phases[idx].status = PhaseStatus::Done;
+    run.save()?;
+    return Ok(PhaseWaitOutcome::Done);
+}
+```
+
+So `state.json` only catches up **if the driver runs `drovr phase wait` for that phase**. Any
+path that skips it strands the run:
+
+- the driver drove the phase by hand (as here — the spec gate was managed directly, and the
+  brainstorm phase never got a `phase wait`);
+- the driver's context was compacted or its session ended, and the resumed driver did not know
+  a wait was owed;
+- the wait was run, returned `Blocked` or `TimedOut`, and was never re-run.
+
+Everything downstream reads the stale field: `cmd_status` (`cli/src/main.rs:436-454`) prints
+`p.status` verbatim and derives `<-- resume` from `first_incomplete()` (`cli/src/run.rs:144`),
+which is itself `status`-based. `review.rs:715`'s `status_str` feeds the web UI the same value.
+None of them consult the marker that is sitting right next to `state.json` in the same
+directory.
+
+The failure is silent and stable: nothing times out, nothing errors, and the run simply never
+advances.
+
+### Consequence for orchestration
+
+**Do not write a watch keyed on `state.json` phase status.** It is a field only the driver can
+change, so a driver waiting on it is waiting on itself — the watch can never fire. This cost a
+long stall in the run where it was found: a monitor polled `phases[0].status` while the phase
+had already dropped its marker.
+
+The completion signal is the marker file, and only the marker file:
+
+```sh
+ls ~/.local/share/drovr/runs/<run>/<phase>.done
+```
+
+### Workaround
+
+Check the markers, not the status, whenever you need ground truth:
+
+```sh
+ls ~/.local/share/drovr/runs/<run>/*.done
+```
+
+To repair a stranded `state.json`, run the wait that was skipped — it reconciles immediately
+and returns, because the marker is already there:
+
+```sh
+drovr phase wait <run> <phase> --timeout-ms 5000
+```
+
+### Fix ideas
+
+1. **Make the read-only views marker-aware.** `cmd_status`, `drovr list` and `status_str`
+   should treat "marker present" as done regardless of `state.json`, so a stranded run is at
+   worst a cosmetic lag and never a wrong instruction. This is the cheap fix and it removes the
+   misleading `<-- resume`.
+2. **Reconcile on load.** Have `load_run` (or `RunState::first_incomplete`) sweep for `.done`
+   markers and promote statuses, so any command touching the run heals it. Keeps the
+   sole-writer intent — the reconciliation still happens in drovr, not in the agent.
+3. **Surface the discrepancy loudly** if 1 and 2 are both rejected: `drovr status` should print
+   something like `marker present, state not reconciled — run: drovr phase wait <run> <phase>`
+   rather than silently reporting `running`.
+4. **Document the invariant** in `drovr:pipeline`: every phase needs its `phase wait`, including
+   ones whose completion the driver observed by other means. The skill's flow implies this but
+   never says that skipping the wait corrupts run state.
+
+## `drovr cleanup` can leave an empty workspace behind when herdr cannot list its panes
+
+**Severity:** low (cosmetic — an empty workspace in the switcher, closable by hand).
+**Found:** 2026-07-26, while making cleanup reap only drovr's own panes.
+
+### Symptom
+
+`close_run_panes` (`cli/src/main.rs`) decides whether it may call `workspace_close` by diffing
+`pane.list` for the run's workspace against the panes the run recorded. If that listing fails —
+daemon blip, changed result shape — it cannot prove the workspace holds nothing of the human's, so
+it closes only the recorded panes and leaves the workspace open. The workspace may then be empty
+but still listed.
+
+### Why it is deliberate
+
+The alternative is closing the workspace on an answer we do not have, which is exactly how the
+human's own tabs used to die. An empty workspace is a cosmetic mistake; a closed pane holding
+someone's unsaved work is not. Same reasoning for a pane drovr created but never recorded in
+`state.json` (see `RunState::retired_panes`): unrecorded panes are treated as the human's and left
+running.
+
+### Fix ideas
+
+1. Retry `pane.list` a couple of times before giving up — most failures here are transient.
+2. Or ask herdr whether the workspace is empty after the pane closes (`workspace.get`
+   `pane_count`) and close it only on a definitive zero.
 
 ## Resolved
 
@@ -937,3 +1873,43 @@ for new tests rather than adding another `ENV_LOCK` consumer.
   `skills/handoff/SKILL.md:55-56, 138`). Nothing compresses a transcript, so the
   over-weight-the-visible-briefing failure mode cannot recur. Do not re-file this against the
   handoff flow — a bad *self-authored* handoff is a different bug with a different cause.
+
+## Two `drovr serve` daemons can still slip past the single-server guard
+
+**Severity:** low (the ordinary duplicate — a second `drovr serve` on any port, or several
+racing at once — is refused; see `cli/tests/serve_single.rs`).
+**Found:** 2026-07-26, while adding the guard on `drovr/single-server`. The prompting incident:
+`~/.local/share/drovr/server.pid` named a **dead** pid (1662301) while a live server was serving
+on `100.71.58.39:8791` as pid 1289722 — i.e. two servers had run, and one had died, leaving
+discovery pointing at neither.
+
+### How the guard works
+
+`drovr serve` takes an advisory exclusive lock on `server.pid` (`acquire_pid_lock` /
+`try_take_lock` → `File::try_lock`, i.e. `flock`) and refuses to start if another process holds
+it. The kernel holds that lock for the server's lifetime and releases it however the process
+dies, so a crashed server never leaves a claim anyone has to judge stale.
+
+That lock is the *only* check. `server.addr` is read solely to put a URL in the refusal message.
+
+### The gaps
+
+- **A server that holds no lock is invisible.** Two ways to get one: a `drovr serve` from a build
+  older than this guard, or a current one whose `server.pid` was deleted while it ran (`flock` is
+  on the inode, not the path, so a later start creates a fresh inode there and locks it happily).
+  Either way the next `drovr serve` starts, and discovery moves to it. During an upgrade this is
+  guaranteed, not unlucky: **restart the server after upgrading drovr**, or the first new-build
+  start will duplicate the running old one.
+- **A data dir on a filesystem where `flock` is not enforced** (some NFS mounts / `nolock`) has no
+  protection at all. drovr assumes a local data dir.
+
+### Fix ideas
+
+- Re-check after taking the lock that the file we hold is still the one at the path (compare
+  inode) and refuse if it is not — closes the delete-while-held case in one direction.
+- Ask `server.addr` whether a drovr server answers there as a second signal. This existed and
+  was removed deliberately: it made a start's outcome depend on a *stale* file plus a network
+  probe, which mistook unrelated services for drovr and needed a "delete `server.addr`" escape
+  hatch that could itself cause the split brain. Any second signal needs to identify *which*
+  server answered (e.g. a per-server nonce in the response and in a discovery file), not just
+  that something did.

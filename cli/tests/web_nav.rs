@@ -77,10 +77,22 @@ fn http_get_ok(addr: &str, path: &str) -> bool {
     resp.lines().next().is_some_and(|l| l.contains(" 200"))
 }
 
-/// The fixture the driver's assertions are written against: four runs so the
-/// list has something to move over and re-sort, and one run carrying the three
-/// open questions the detail-view checks answer.
+/// The fixture the driver's assertions are written against: five runs so the
+/// list has something to move over and re-sort, one carrying the three open
+/// questions the detail-view checks answer, and one with no spec at all.
 fn seed_runs(runs_root: &PathBuf) {
+    // A run whose gate was never opened, so it has NO spec.md at all — the state
+    // a run sits in between `drovr new` and the first `review summary`. The
+    // driver navigates into it from a run that DOES have a spec, to prove the
+    // doc panel is cleared rather than left showing the previous run's spec.
+    let nospec = runs_root.join("epsilon-nospec");
+    fs::create_dir_all(&nospec).expect("create run dir");
+    fs::write(
+        nospec.join("state.json"),
+        r#"{"name":"epsilon-nospec","task":"task for epsilon-nospec","phases":[],"gate":"spec","cursor":0,"project_dir":""}"#,
+    )
+    .unwrap();
+
     for run in ["alpha-deploy", "beta-cache", "gamma-review", "delta-idle"] {
         let dir = runs_root.join(run);
         fs::create_dir_all(&dir).expect("create run dir");
