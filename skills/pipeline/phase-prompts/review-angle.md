@@ -14,14 +14,19 @@ Your one job: review this task's change through the **<angle>** lens and emit fi
 
 - The change under review is `git diff <base>..<head>` in the run's project directory
   (`<base>` = the pre-task `HEAD`, `<head>` = the current `HEAD`).
+- That project directory is a **full checkout**, and all of it is yours to read. The diff
+  shows what changed; whether it is *right* shows in the code around it, so read past the
+  hunks freely.
 - Review **through the <angle> lens** — do not re-review the whole codebase. Stay on the
   angle you were spawned for; other angles run as their own reviewers in parallel.
 
 ## Do
 
-1. **Read the change.** Run `git diff <base>..<head>` and read the working tree. You may
-   read **any file** for context and **run the tests** to check whether they actually
-   exercise the behavior — read-only exploration is fine.
+1. **Read the change, then the code it lands in.** Run `git diff <base>..<head>` and read
+   the working tree. You may read **any file in the repo** for context — follow the
+   change's callers and callees, check the invariants and neighbouring code it has to hold
+   up against — and **run the tests** to check whether they actually exercise the behavior.
+   Reading is unrestricted; only writing is not.
 2. **Find real problems for <angle>.** Prefer few high-confidence findings over a long
    list. Classify each: `critical` / `important` (these block the clean gate) or `nit`
    (advisory). Cite `file` and, where you can, `line`.
