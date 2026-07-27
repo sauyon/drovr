@@ -104,8 +104,8 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr status <name>` | Print each phase, its status, and the resume point. |
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
-| `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
-| `drovr cleanup <name> [--purge]` | Stop herdr sessions. With `--purge`, remove the run directory. |
+| `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
+| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
 
 ### Review UI keyboard navigation
 
@@ -186,7 +186,7 @@ The always-on server writes two files in the drovr data dir (not per-run):
 | File | Written by | Purpose |
 |---|---|---|
 | `server.addr` | `drovr serve` | Bound `host:port`; read by `drovr review summary`/`wait` and `ensure_server`. |
-| `server.pid` | `drovr serve` | Daemon pid (liveness). |
+| `server.pid` | `drovr serve` | Daemon pid, and the file the single-server lock is taken on: the running server holds an exclusive lock on it, so a second `drovr serve` refuses (on any port) instead of stealing `server.addr`. The kernel releases the lock however the server exits, so a crashed server never wedges the next start — the pid inside is only for humans (`kill $(cat server.pid)`). Nothing else is checked: a server holding no lock (a build predating it, or one whose lock file was deleted) is not detected. |
 
 ### Per-run review files
 

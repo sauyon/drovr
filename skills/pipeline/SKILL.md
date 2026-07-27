@@ -166,7 +166,9 @@ drovr code-review run <run> task-<N>          # blocking; spawns one reviewer pe
 case $? in
   0)  # clean — proceed to task N+1
   3)  # findings — re-enter implement, forward the review, re-run the panel (loop)
-  2)  # timeout — re-run the panel (resumable; the re-run bumps the iteration)
+  2)  # timeout — reviewers are slow, not broken. Re-run the SAME command: it resumes
+      #   the panel in flight, banks the angles already in, waits only on stragglers.
+      #   Loop on 2 as freely as on 3. Never add --fresh to "unstick" it.
   1)  # error — STOP and diagnose (see Failure model)
 esac
 ```

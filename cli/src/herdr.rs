@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -18,7 +18,9 @@ use std::collections::VecDeque;
 /// `pane_run`) rather than splitting a new pane beside it, so no empty shell is
 /// left dangling. The root pane is never closed mid-run — closing any pane makes
 /// herdr reassign focus and disturbs the user — and is torn down together with
-/// every phase pane by the single `workspace_close` at `drovr cleanup`.
+/// every phase pane at `drovr cleanup` (`close_run_panes`), which reaps drovr's
+/// panes and only drovr's: the human may have opened tabs of their own in the
+/// run's workspace.
 #[derive(Debug)]
 pub struct Workspace {
     pub id: String,
@@ -343,9 +345,17 @@ pub trait Herdr {
     /// Create a new `--no-focus` herdr workspace (label + cwd); returns its id and
     /// its auto-created root shell pane id.
     fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace>;
-    /// Close a herdr workspace (closes all its panes). This is the only pane
-    /// teardown drovr performs — once, at end-of-run.
+    /// Close a herdr workspace (closes all its panes). `drovr cleanup` uses this
+    /// only once it knows the workspace holds nothing but drovr's own panes.
     fn workspace_close(&self, id: &str) -> io::Result<()>;
+    /// Close a single pane. `drovr cleanup` reaps the run's panes one by one when
+    /// the workspace also holds panes the human opened, which
+    /// [`Herdr::workspace_close`] would take down with them.
+    fn pane_close(&self, pane_id: &str) -> io::Result<()>;
+    /// Every pane currently in `workspace`. `Err` means "could not tell" — it must
+    /// never be read as "the workspace is empty", because the caller's next move
+    /// on that answer is deciding whether it may close the workspace outright.
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>>;
     /// Create a new `--no-focus` tab in `workspace` (label + cwd); returns the
     /// tab's auto-created shell pane id. Every phase after the first gets its own
     /// tab so each phase agent occupies a full pane with no split.
@@ -395,6 +405,14 @@ pub trait Herdr {
     // later step, and this landing on its own must not change any behavior.
     #[allow(dead_code)]
     fn tab_close(&self, tab_id: &TabId) -> io::Result<()>;
+    /// Whether `pane_id` still exists. Distinct from [`Herdr::pane_info`], which
+    /// returns `None` both for a pane that is gone *and* for a poll that merely
+    /// failed — too ambiguous to act on. Callers use this to decide a pane is
+    /// genuinely dead (e.g. `code-review` resume respawning a reviewer), so it is
+    /// deliberately biased toward `true`: only a definitive "no such pane" answer
+    /// returns `false`; an unreachable daemon reports `true` (unknown → assume
+    /// alive) so a transient blip never kills live work.
+    fn pane_exists(&self, pane_id: &str) -> bool;
     fn integration_present(&self, agent: &str) -> bool;
 }
 
@@ -532,6 +550,19 @@ impl Herdr for SystemHerdr {
         Ok(())
     }
 
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        self.socket_call("pane.close", json!({ "pane_id": pane_id }))?;
+        Ok(())
+    }
+
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>> {
+        // `pane.list` already filters by workspace; `collect_pane_ids` re-checks
+        // each pane's own `workspace_id` so a server that ignored the filter
+        // cannot make another workspace's panes look like this run's.
+        let result = self.socket_call("pane.list", json!({ "workspace_id": workspace }))?;
+        Ok(collect_pane_ids(&result, workspace))
+    }
+
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
         // Socket `tab.create`, carrying the auth env explicitly. A tab's shell
         // pane does NOT inherit the workspace-level env set at `workspace.create`
@@ -606,10 +637,7 @@ impl Herdr for SystemHerdr {
         // 0.7.5 socket API: agent.prompt types AND submits the prompt natively,
         // so the old PASTE_SETTLE/flush-CR handshake (0.7.3's `agent send`, which
         // only wrote text into the input box) is gone.
-        self.socket_call(
-            "agent.prompt",
-            json!({ "target": target, "text": text }),
-        )?;
+        self.socket_call("agent.prompt", json!({ "target": target, "text": text }))?;
         Ok(())
     }
 
@@ -683,6 +711,20 @@ impl Herdr for SystemHerdr {
                 io::Error::new(err.kind(), tab_close_error_message(tab_id, &err.to_string()))
             })?;
         Ok(())
+    }
+
+    fn pane_exists(&self, pane_id: &str) -> bool {
+        // `pane get` is read-only and does not move focus. Bias toward "alive": a
+        // nonzero exit alone proves nothing (an unreachable daemon exits nonzero
+        // too), so only herdr's explicit `pane_not_found` counts as death — see
+        // `pane_get_proves_missing`. Anything else, including a failure to run the
+        // binary at all, reports alive so a blip never respawns live work.
+        match self.run(&["pane", "get", pane_id]) {
+            Ok(out) if !out.status.success() => {
+                !pane_get_proves_missing(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => true,
+        }
     }
 
     fn integration_present(&self, agent: &str) -> bool {
@@ -837,6 +879,63 @@ fn herdr_error_kind(code: Option<&str>, message: &str) -> io::ErrorKind {
     }
 }
 
+/// Collect every pane id in a `pane.list` result that belongs to `workspace`.
+///
+/// Walks the value rather than indexing a fixed path (`result.panes[]`) so a
+/// changed nesting cannot silently yield an empty list — and an empty list is the
+/// dangerous answer here: `drovr cleanup` reads "no panes I did not create" as
+/// permission to close the whole workspace. A pane object that carries a
+/// `workspace_id` other than `workspace` is skipped; one with no `workspace_id`
+/// at all is kept, since the filtered listing is already scoped to the workspace.
+fn collect_pane_ids(value: &Value, workspace: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_pane_ids_into(value, workspace, &mut out);
+    out
+}
+
+fn collect_pane_ids_into(value: &Value, workspace: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(id)) = map.get("pane_id") {
+                let belongs = match map.get("workspace_id") {
+                    Some(Value::String(ws)) => ws == workspace,
+                    _ => true,
+                };
+                if belongs && !id.is_empty() && !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+            for v in map.values() {
+                collect_pane_ids_into(v, workspace, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_pane_ids_into(v, workspace, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a failed `herdr pane get` proves the pane is GONE, as opposed to merely
+/// failing for some other reason.
+///
+/// `pane get` exits non-zero for a missing pane *and* for an unreachable daemon, a
+/// bad socket path, a permissions problem — every one of which would otherwise read
+/// as "pane is dead" and make [`Herdr::pane_exists`] tell callers to respawn a
+/// reviewer that is alive and working. Only herdr's explicit `pane_not_found` error
+/// code is treated as proof of death; anything else is "cannot tell", i.e. alive.
+fn pane_get_proves_missing(stdout: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(stdout) else {
+        return false;
+    };
+    v.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        == Some("pane_not_found")
+}
+
 /// herdr's own error text, with its machine code appended when there is one.
 ///
 /// The message stays FIRST and verbatim: `pane_get_error_message` and
@@ -938,6 +1037,19 @@ pub struct FakeHerdr {
     /// When true, every `agent_send` returns an error (tests what a caller
     /// reports about the state a failed send leaves behind).
     fail_agent_send: RefCell<bool>,
+    /// Pane ids that `pane_exists` reports as gone; every other pane exists.
+    dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Panes each workspace holds, as `workspace_panes` will report them. A
+    /// workspace with no entry reports empty — the "nothing but drovr's own panes"
+    /// case most tests want.
+    panes_by_workspace: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// When true, `workspace_panes` returns an error (models a daemon that cannot
+    /// say what is in the workspace).
+    fail_workspace_panes: RefCell<bool>,
+    /// Per-pane `agent_read` queues, consulted before the global `read_queue`. Real
+    /// transcripts belong to a specific pane; a test that cares which pane it is
+    /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
+    read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
 }
 
 #[cfg(test)]
@@ -953,7 +1065,44 @@ impl FakeHerdr {
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
+            dead_panes: RefCell::new(std::collections::HashSet::new()),
+            panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
+            fail_workspace_panes: RefCell::new(false),
+            read_by_pane: RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Declare what `workspace_panes` reports for `workspace`.
+    pub fn push_workspace_panes<I, S>(&self, workspace: impl Into<String>, panes: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.panes_by_workspace.borrow_mut().insert(
+            workspace.into(),
+            panes.into_iter().map(Into::into).collect(),
+        );
+    }
+
+    /// Make `workspace_panes` fail: the caller cannot learn what is in the
+    /// workspace and must not assume it is all its own.
+    pub fn fail_workspace_panes(&self) {
+        *self.fail_workspace_panes.borrow_mut() = true;
+    }
+
+    /// Model `pane_id` having disappeared (crashed agent, closed tab): from now on
+    /// `pane_exists` reports `false` for it.
+    pub fn kill_pane(&self, pane_id: impl Into<String>) {
+        self.dead_panes.borrow_mut().insert(pane_id.into());
+    }
+
+    /// Queue a transcript for one specific pane, taking priority over `push_read`.
+    pub fn push_read_for(&self, pane_id: impl Into<String>, text: impl Into<String>) {
+        self.read_by_pane
+            .borrow_mut()
+            .entry(pane_id.into())
+            .or_default()
+            .push_back(text.into());
     }
 
     /// The tab the fake reports for `pane_id` when a test has not scripted a
@@ -1069,6 +1218,24 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        self.record(format!("pane_close pane={pane_id}"));
+        Ok(())
+    }
+
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>> {
+        self.record(format!("workspace_panes workspace={workspace}"));
+        if *self.fail_workspace_panes.borrow() {
+            return Err(io::Error::other("scripted workspace_panes failure"));
+        }
+        Ok(self
+            .panes_by_workspace
+            .borrow()
+            .get(workspace)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
         let id = self.next_id();
         self.record(format!(
@@ -1103,7 +1270,7 @@ impl Herdr for FakeHerdr {
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()> {
         self.record(format!("agent_send target={target} text={text:?}"));
         if *self.fail_agent_send.borrow() {
-            return Err(io::Error::other("fake agent_send failure"));
+            return Err(io::Error::other("scripted agent_send failure"));
         }
         Ok(())
     }
@@ -1115,6 +1282,16 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
+        // A transcript queued for this exact pane wins; otherwise fall back to the
+        // pane-agnostic queue most tests use.
+        if let Some(text) = self
+            .read_by_pane
+            .borrow_mut()
+            .get_mut(target)
+            .and_then(|q| q.pop_front())
+        {
+            return Ok(text);
+        }
         let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
         Ok(text)
     }
@@ -1184,6 +1361,11 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    fn pane_exists(&self, pane_id: &str) -> bool {
+        self.record(format!("pane_exists target={pane_id}"));
+        !self.dead_panes.borrow().contains(pane_id)
+    }
+
     fn integration_present(&self, agent: &str) -> bool {
         self.record(format!("integration_present agent={agent}"));
         true
@@ -1238,20 +1420,16 @@ mod tests {
 
     #[test]
     fn find_string_field_extracts_top_level() {
-        let v: Value = serde_json::from_str(
-            r#"{"pane_id":"w1:pXY","tab_id":"w1:tXY"}"#,
-        )
-        .unwrap();
+        let v: Value = serde_json::from_str(r#"{"pane_id":"w1:pXY","tab_id":"w1:tXY"}"#).unwrap();
         assert_eq!(find_string_field(&v, "pane_id").as_deref(), Some("w1:pXY"));
     }
 
     #[test]
     fn find_string_field_extracts_nested() {
         // workspace.create wraps the id inside a nested object.
-        let v: Value = serde_json::from_str(
-            r#"{"workspace":{"workspace_id":"w7","label":"drovr:demo"}}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"workspace":{"workspace_id":"w7","label":"drovr:demo"}}"#)
+                .unwrap();
         assert_eq!(find_string_field(&v, "workspace_id").as_deref(), Some("w7"));
     }
 
@@ -1265,6 +1443,89 @@ mod tests {
     fn find_string_field_ignores_empty() {
         let v: Value = serde_json::from_str(r#"{"pane_id":""}"#).unwrap();
         assert!(find_string_field(&v, "pane_id").is_none());
+    }
+
+    #[test]
+    fn only_pane_not_found_proves_a_pane_is_missing() {
+        // The one answer that proves death.
+        assert!(pane_get_proves_missing(
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+        ));
+
+        // Every other nonzero exit must read as "cannot tell" → alive. Reporting a
+        // live reviewer dead makes `code-review` resume respawn work in progress.
+        assert!(
+            !pane_get_proves_missing(
+                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+            ),
+            "an unreachable daemon must never be read as a dead pane"
+        );
+        assert!(
+            !pane_get_proves_missing(
+                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+            ),
+            "a non-JSON failure (bad socket path) must not be read as a dead pane"
+        );
+        assert!(!pane_get_proves_missing(""), "empty output proves nothing");
+    }
+
+    // -- collect_pane_ids: what is actually in a workspace ---------------------
+    // `drovr cleanup` decides whether it may close a whole workspace by diffing
+    // this listing against the panes it created, so a pane it fails to see is a
+    // pane it will kill. The parse must therefore pick up EVERY pane in the
+    // listing — and only those belonging to the workspace asked about, so a
+    // server that ignored the filter cannot make foreign panes look like ours.
+    #[test]
+    fn collect_pane_ids_reads_every_pane_in_the_workspace() {
+        let v: Value = serde_json::from_str(
+            r#"{"result":{"type":"pane_list","panes":[
+                {"pane_id":"wAG:p1","tab_id":"wAG:t1","workspace_id":"wAG","label":"brainstorm"},
+                {"pane_id":"wAG:p2","tab_id":"wAG:t2","workspace_id":"wAG","label":"plan"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1", "wAG:p2"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_drops_panes_from_other_workspaces() {
+        let v: Value = serde_json::from_str(
+            r#"{"result":{"panes":[
+                {"pane_id":"wAG:p1","workspace_id":"wAG"},
+                {"pane_id":"w1:p4","workspace_id":"w1"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_keeps_panes_with_no_workspace_field() {
+        // A shape that omits `workspace_id` is the filtered listing itself; the
+        // pane still counts (dropping it would mean closing the workspace blind).
+        let v: Value =
+            serde_json::from_str(r#"{"result":{"panes":[{"pane_id":"wAG:p1"}]}}"#).unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_empty_listing_is_empty() {
+        let v: Value = serde_json::from_str(r#"{"result":{"panes":[]}}"#).unwrap();
+        assert!(collect_pane_ids(&v, "wAG").is_empty());
+    }
+
+    #[test]
+    fn fake_workspace_panes_scripted_and_failable() {
+        let h = FakeHerdr::new();
+        // Unscripted: an empty workspace (nothing foreign to protect).
+        assert_eq!(h.workspace_panes("ws-1").unwrap(), Vec::<String>::new());
+        h.push_workspace_panes("ws-1", ["ws-1:p1", "ws-1:p9"]);
+        assert_eq!(
+            h.workspace_panes("ws-1").unwrap(),
+            vec!["ws-1:p1", "ws-1:p9"]
+        );
+        h.fail_workspace_panes();
+        assert!(h.workspace_panes("ws-1").is_err());
     }
 
     /// A verbatim `pane.get` response from herdr 0.7.5 for a pane whose claude
@@ -1968,7 +2229,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("agent_send_keys"), "call: {}", calls[0]);
         assert!(calls[0].contains("target=pane-1"), "call: {}", calls[0]);
-        assert!(calls[0].contains("keys=[\"3\", \"enter\"]"), "call: {}", calls[0]);
+        assert!(
+            calls[0].contains("keys=[\"3\", \"enter\"]"),
+            "call: {}",
+            calls[0]
+        );
         // Must be distinguishable from a text send.
         assert!(!calls[0].contains("text="), "call: {}", calls[0]);
     }
@@ -2080,7 +2345,11 @@ mod tests {
             std::env::remove_var("ANTHROPIC_MODEL");
         }
         let map = env.as_object().expect("agent_env must be a JSON object");
-        assert_eq!(map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str), Some("/cfg"), "{env}");
+        assert_eq!(
+            map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str),
+            Some("/cfg"),
+            "{env}"
+        );
         assert_eq!(
             map.get("ANTHROPIC_API_KEY").and_then(Value::as_str),
             Some("sk-test"),

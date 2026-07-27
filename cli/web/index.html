@@ -597,11 +597,43 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .run-dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
+  /* These five are GATE states, not lifecycle states. `approved` in particular is
+     set when the human approves spec.md at the brainstorm gate — near the START of
+     a run — so it must never be styled as "finished". Completion is the separate
+     .is-complete axis below, driven by `complete` from /api/runs. */
   .run-dot.state-ready { background: #f5a623; }      /* awaiting reviewer */
   .run-dot.state-waiting { background: #4098ff; }    /* awaiting agent */
-  .run-dot.state-approved { background: #3ec46d; }   /* done */
+  .run-dot.state-approved { background: #3ec46d; }   /* spec approved, run proceeding */
   .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
+
+  /* ---- Completion ---- */
+  .run-row.is-complete { opacity: 0.55; }
+  .run-row.is-complete:hover { opacity: 1; }
+  .run-row.is-complete .run-dot { background: #6b6b6b; }
+  .run-row.is-complete .run-dot.state-cancelled { background: #7d4340; }
+  .run-check { color: #3ec46d; font-weight: 700; }
+
+  .run-group { border-top: 1px solid var(--border, #2a2a2a); }
+  .run-group > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 10px 14px;
+    font-size: 12px;
+    opacity: 0.7;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .run-group > summary::-webkit-details-marker { display: none; }
+  .run-group > summary:hover { background: var(--hover, rgba(127,127,127,0.08)); opacity: 1; }
+  .run-group > summary::before {
+    content: '▸';
+    display: inline-block;
+    transition: transform 0.12s ease;
+  }
+  .run-group[open] > summary::before { transform: rotate(90deg); }
 
   /* ---- Live session mirror ---- */
   .session-view {
@@ -1876,6 +1908,38 @@ async function createSession() {
 // `gen` is the routeGen at call time, matching the other pollers: a list fetch in
 // flight when the reviewer navigates into a run must not paint its result over
 // the detail view (or drag the cursor with it).
+// Whether the "Completed (N)" group is expanded. Completed sessions are collapsed
+// by default — they are the majority over a project's life and none of them need
+// the reviewer. Persisted so the choice survives the 2s re-render and reloads.
+var completedOpen = (function() {
+  try { return localStorage.getItem('drovr.completedOpen') === '1'; } catch (e) { return false; }
+})();
+
+// One list row. `complete` runs are dimmed and led by a check instead of the gate
+// dot, and their meta reports phase progress rather than the gate state — for a
+// finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
+function runRow(run) {
+  var meta;
+  if (run.complete) {
+    if (run.state === 'cancelled') meta = 'cancelled';
+    else if (run.archived) meta = 'archived · ' + run.done + '/' + run.total;
+    else meta = 'complete · ' + run.done + '/' + run.total;
+  } else {
+    meta = (run.state || '') + (run.turn ? ' · turn ' + run.turn : '');
+    if (run.total) meta += ' · ' + run.done + '/' + run.total;
+  }
+  var dot = run.complete && run.state !== 'cancelled'
+    ? '<span class="run-check">✓</span>'
+    : '<span class="run-dot state-' + escHtml(run.state) + '"></span>';
+  return '<a class="run-row' + (run.complete ? ' is-complete' : '') +
+      '" href="#/runs/' + encodeURIComponent(run.name) + '">' +
+    dot +
+    '<span class="run-name">' + escHtml(run.name) + '</span>' +
+    '<span class="run-state">' + escHtml(meta) + '</span>' +
+    '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
+  '</a>';
+}
+
 async function renderRunList(gen) {
   var listEl = document.getElementById('run-list-items');
   try {
@@ -1899,15 +1963,42 @@ async function renderRunList(gen) {
         return;
       }
     }
-    listEl.innerHTML = runs.map(function(run) {
-      var meta = escHtml(run.state) + (run.turn ? ' · turn ' + run.turn : '');
-      return '<a class="run-row" href="#/runs/' + encodeURIComponent(run.name) + '">' +
-        '<span class="run-dot state-' + escHtml(run.state) + '"></span>' +
-        '<span class="run-name">' + escHtml(run.name) + '</span>' +
-        '<span class="run-state">' + meta + '</span>' +
-        '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
-      '</a>';
-    }).join('');
+    var active = runs.filter(function(r) { return !r.complete; });
+    var complete = runs.filter(function(r) { return r.complete; });
+
+    var html = active.map(runRow).join('');
+    if (complete.length) {
+      // A filter is an explicit search — honour it over the collapsed default,
+      // or matches would hide inside a closed group with no hint they exist.
+      var rendered = !!(completedOpen || listFilter);
+      html += '<details class="run-group"' + (rendered ? ' open' : '') + '>' +
+        '<summary>Completed (' + complete.length + ')</summary>' +
+        complete.map(runRow).join('') +
+      '</details>';
+    }
+    listEl.innerHTML = html;
+
+    var group = listEl.querySelector('.run-group');
+    if (group) {
+      // The list re-renders every 2s; without this the group would snap shut
+      // under the reviewer mid-read.
+      //
+      // Parsing `<details open>` fires `toggle` on its own, so this listener
+      // hears two very different things through one event. Comparing against the
+      // state we just rendered separates them: equal means the browser is only
+      // echoing our own markup back (every poll tick while expanded, and — worse
+      // — the force-open that `listFilter` applies, which would otherwise write
+      // "keep completed expanded" to localStorage merely because the reviewer
+      // searched for something that matched a finished run). Only a real
+      // divergence is the human's doing, and only that is worth persisting.
+      group.addEventListener('toggle', function() {
+        if (group.open === rendered) return;
+        rendered = group.open;
+        completedOpen = group.open;
+        try { localStorage.setItem('drovr.completedOpen', group.open ? '1' : '0'); } catch (e) {}
+        applyNavCursor(false);
+      });
+    }
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
     applyNavCursor(false);
@@ -2114,8 +2205,13 @@ var navCursorKey = '';
 // QUESTION_ITEM_SEL so the two can never disagree about what a question is.
 var QUESTION_ITEM_SEL = '#questions-area .question-item';
 
+// Rows inside a COLLAPSED "Completed" group are deliberately excluded: they are
+// not on screen, and j/k must never park the cursor somewhere invisible. The two
+// selectors are in document order, so active rows still precede completed ones.
+var RUN_ROW_SEL = '#run-list-items > .run-row, #run-list-items details[open] .run-row';
+
 function navRows() {
-  var sel = currentRun ? QUESTION_ITEM_SEL : '#run-list-items .run-row';
+  var sel = currentRun ? QUESTION_ITEM_SEL : RUN_ROW_SEL;
   return Array.prototype.slice.call(document.querySelectorAll(sel));
 }
 
@@ -2366,6 +2462,17 @@ function initKeyNav() {
     }
 
     if (inTextEntry(document.activeElement)) return;
+
+    // A focused <summary> owns its own activation keys. Without this, Enter on
+    // the "Completed" disclosure would be preventDefault()ed out of toggling the
+    // group and would instead open whatever run the (invisible, elsewhere) nav
+    // cursor sat on — a keyboard user activating one control and landing in an
+    // unrelated session. Space is listed for the same reason: it is the other
+    // native activation key for a disclosure.
+    if (document.activeElement && document.activeElement.tagName === 'SUMMARY'
+        && (e.key === 'Enter' || e.key === ' ')) {
+      return;
+    }
 
     // Emacs paging: C-v / M-v. Kept above the plain-key switch because they
     // apply in both views and while the help overlay is up.
