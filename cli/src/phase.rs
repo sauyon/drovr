@@ -768,6 +768,19 @@ pub fn phase_rehydrate<H: Herdr>(
     run: &mut RunState,
     phase: &str,
 ) -> io::Result<RehydrateOutcome> {
+    phase_rehydrate_with_timeout(h, run, phase, SEND_READY_TIMEOUT, POLL_INTERVAL)
+}
+
+/// [`phase_rehydrate`] with an injectable readiness timeout + poll interval, so
+/// a test can exercise the reseed path's not-ready branch without waiting out
+/// the full production timeout. Mirrors [`phase_send_with_timeout`].
+fn phase_rehydrate_with_timeout<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    ready_timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<RehydrateOutcome> {
     require_phase_name(phase)?;
     let existing = run.find_phase(phase).ok_or_else(|| {
         io::Error::new(
@@ -783,10 +796,17 @@ pub fn phase_rehydrate<H: Herdr>(
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
-                "phase '{phase}' of run '{}' still holds pane {pane}; rehydrate brings back \
-                 a phase whose pane is gone. Attach to it instead: {attach}",
+                "phase '{}/{phase}' still holds pane {pane}; rehydrate brings back a phase \
+                 whose pane is gone. Attach to that pane instead: herdr agent attach {quoted}",
                 run.name,
-                attach = attach_command(&run.name),
+                // NOT `drovr attach <run>`: that resolves through
+                // `RunState::live_agent_pane`, which skips `Done` phases on
+                // purpose — and a `Done` phase is exactly what rehydrate is
+                // usually asked about. It would attach to a DIFFERENT phase, or
+                // (on a finished run) refuse outright, contradicting the pane
+                // this very message just named. The pane id is in hand, so name
+                // it.
+                quoted = shell_single_quote(pane),
             ),
         ));
     }
@@ -933,6 +953,15 @@ pub fn phase_rehydrate<H: Herdr>(
         )
     })?;
     let pane = h.tab_create(&ws, phase, &cwd)?;
+    // `pane_run` (via `launch_in_pane`), NOT `herdr agent start <pane>`, which
+    // was raised as the likelier fit and checked against the real CLI:
+    // `herdr agent start <NAME> --kind <KIND> --pane <ID> [-- <AGENT_ARG>…]`
+    // *can* carry `--resume <id>` in its trailing args, but it has **no env
+    // option** — and `DROVR_PASS` (what makes the marker this agent drops
+    // attributable to this pass) and `CLAUDE_CONFIG_DIR` (what decides where the
+    // session resolves) both have to be in the agent's environment. Its `--kind`
+    // is a closed list too, while drovr's agent map takes an arbitrary command.
+    // So a rehydrated pane is launched exactly the way a started one is.
     if let Err(e) = launch_in_pane(
         h,
         &run.name,
@@ -971,15 +1000,26 @@ pub fn phase_rehydrate<H: Herdr>(
     // The readiness gate, not a bare send: a pane whose agent has not attached
     // yet swallows the text. It also re-captures the NEW session, so the phase
     // is rehydratable again straight away.
-    if !wait_agent_ready(h, run, phase, SEND_READY_TIMEOUT, POLL_INTERVAL) {
+    if !wait_agent_ready(h, run, phase, ready_timeout, poll_interval) {
+        // Sub-second timeouts render as ms, so an injected test timeout does not
+        // print a misleading "within 0s" — the same rendering `phase_send` uses.
+        let waited = if ready_timeout.as_secs() >= 1 {
+            format!("{}s", ready_timeout.as_secs())
+        } else {
+            format!("{}ms", ready_timeout.as_millis())
+        };
         return Ok(RehydrateOutcome::Relaunched {
             note: format!(
-                "the fresh agent for phase '{phase}' did not become ready within {}s, so its \
-                 seed was NOT re-sent — it is likely parked on a first-run or permission \
-                 prompt. Attach to check ({attach}), then `drovr phase send {} {phase} …`",
-                SEND_READY_TIMEOUT.as_secs(),
-                run.name,
-                attach = attach_command(&run.name),
+                "the fresh agent for phase '{phase}' did not become ready within {waited}, so \
+                 its seed was NOT re-sent — it is likely parked on a first-run or permission \
+                 prompt. Look at pane {pane} (herdr agent attach {quoted_pane}), then \
+                 `drovr phase send {run_name} {phase} …`",
+                run_name = run.name,
+                // The pane by name, not `drovr attach <run>` — see the refusal
+                // above. This one matters more: the pane was created seconds
+                // ago by this very call, and `drovr attach` would deny it exists
+                // whenever the phase is `Done`.
+                quoted_pane = shell_single_quote(&pane),
             ),
         });
     }
@@ -6857,6 +6897,18 @@ mod rehydrate_tests {
             .expect_err("a phase with a live pane is not rehydrated");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
         assert!(err.to_string().contains("ws-rh:p7"), "{err}");
+        // It must send the user at THAT pane, not at `drovr attach <run>`,
+        // which resolves through `live_agent_pane` — and that skips `Done`
+        // phases, i.e. exactly the ones rehydrate is asked about. It would
+        // attach to a different phase, or deny any pane exists at all.
+        assert!(
+            err.to_string().contains("herdr agent attach 'ws-rh:p7'"),
+            "the refusal must name the pane it is talking about: {err}"
+        );
+        assert!(
+            !err.to_string().contains("drovr attach"),
+            "must not route through the Done-skipping resolver: {err}"
+        );
         assert!(
             h.calls().is_empty(),
             "a refusal must not touch herdr: {:?}",
@@ -6889,6 +6941,59 @@ mod rehydrate_tests {
         run.phases[0].status = PhaseStatus::Running;
         run.phases[0].record_launch("claude", None);
         assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
+    }
+
+    #[test]
+    fn a_reseed_that_cannot_be_delivered_names_the_pane_it_just_made() {
+        // The mainline failure of rehydrate's OWN recovery: the fresh agent is
+        // up but never becomes ready (a first-run or permission prompt), so the
+        // seed is not delivered. The note must point at the pane this call just
+        // created — `drovr attach <run>` would NOT find it, because
+        // `live_agent_pane` skips `Done` phases and `Done` is the usual reason a
+        // phase was reaped in the first place.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-not-ready");
+        let mut p = reaped_phase("plan", "claude", None, None); // no session → reseed
+        p.handoff_doc = Some("/tmp/seed.md".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // An agent that never reports a started status: the readiness gate polls
+        // it out. `Blocked` is the real-world shape — parked on a prompt.
+        for _ in 0..40 {
+            h.push_status(Some("blocked"));
+        }
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
+        let RehydrateOutcome::Relaunched { note } = outcome else {
+            panic!("an undeliverable seed must not report as Reseeded: {outcome:?}");
+        };
+        assert!(note.contains(&pane), "must name the pane it created: {note}");
+        assert!(
+            note.contains(&format!("herdr agent attach '{pane}'")),
+            "ready to paste: {note}"
+        );
+        assert!(
+            !note.contains("drovr attach"),
+            "must not route through the Done-skipping resolver: {note}"
+        );
+        assert!(note.contains("NOT re-sent"), "must be honest about the seed: {note}");
+        // The pane really is live and recorded — only the seed did not land.
+        assert!(!run.find_phase("plan").unwrap().is_reaped());
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send")),
+            "nothing was sent to an agent that never became ready: {:?}",
+            h.calls()
+        );
     }
 
     #[test]
