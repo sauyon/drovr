@@ -159,6 +159,44 @@ fn require_new_phase_name(phase: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Refuse a name some OTHER phase in this run already answers to.
+///
+/// `run.phases` and `run.review_phases` are separate lists, and
+/// `RunState::find_phase` searches `phases` first and returns the first match.
+/// So the same name in both is not a harmless duplicate — it is a phase that
+/// resolves to the WRONG one, permanently. Every downstream lookup follows:
+/// `require_pane_id` sends to the impostor's pane, `phase_done` reads the
+/// impostor's pass token and applies the pipeline-only handoff contract to a
+/// reviewer, and `code_review`'s wait polls the wrong pane. `phase_start` also
+/// sweeps `<phase>.done` on its way in, so the collision destroys the real
+/// phase's completion evidence before any of that.
+///
+/// Checked at the two CREATION sites, before any side effect. Not reachable from
+/// drovr's own naming (reviewer names carry a `review:` prefix pipeline names do
+/// not use) — but nothing stops a human or a driver typing
+/// `drovr phase start <run> <reviewer-name>`, and the recovery commands drovr
+/// prints are bare `drovr phase start <run> <phase>`.
+fn require_unclaimed_phase_name(run: &RunState, phase: &str) -> io::Result<()> {
+    let claimant = if run.phases.iter().any(|p| p.name == phase) {
+        "a pipeline phase"
+    } else if run.review_phases.iter().any(|p| p.name == phase) {
+        "a reviewer"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "phase name {phase:?} is already taken by {claimant} in run '{}'. \
+             A name must identify ONE phase: registering it twice makes every \
+             later lookup resolve to whichever list is searched first, and \
+             silently reroutes that phase's pane, pass token and completion \
+             marker.",
+            run.name
+        ),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -286,6 +324,9 @@ pub fn phase_start<H: Herdr>(
     // working, on the recovery drovr itself suggests.
     if find_phase_idx(run, phase).is_none() {
         require_new_phase_name(phase)?;
+        // A name a REVIEWER already answers to is not free, even though
+        // `find_phase_idx` (which searches `phases` only) says it is.
+        require_unclaimed_phase_name(run, phase)?;
     } else {
         require_phase_name(phase)?;
     }
@@ -431,6 +472,9 @@ pub fn spawn_reviewer<H: Herdr>(
     launch_command: &str,
 ) -> io::Result<()> {
     require_new_phase_name(phase)?;
+    // Reviewers always APPEND — `next_iter` makes their names unique among
+    // themselves, but nothing makes them unique against `run.phases`.
+    require_unclaimed_phase_name(run, phase)?;
     // Same guard as phase_start: a run with no project_dir can't anchor the
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
@@ -4188,6 +4232,55 @@ mod tests {
         assert!(marker.exists());
         collect(&run, legacy).expect_err("no handoff file — but the NAME was accepted");
         phase_send(&h, &mut run, legacy, "text").expect("and can still be sent to");
+    }
+
+    #[test]
+    fn a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase() {
+        // `find_phase_idx` searches `run.phases` only, so a reviewer's name looks
+        // brand new to `phase_start` — it appends a SECOND entry under the same
+        // name into the other list. `RunState::find_phase` searches `phases`
+        // first, so from then on every lookup for that reviewer resolves to the
+        // impostor: its pane, its pass token, and the pipeline-only handoff
+        // contract. `phase_start` also sweeps `<phase>.done` on the way in,
+        // destroying the reviewer's genuine completion marker.
+        //
+        // A phase name must identify ONE phase.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("name-collision-test", "ws-nc");
+        let name = "review:t:1:correctness";
+        spawn_reviewer(&h, &mut run, name, None, "claude").unwrap();
+        // The reviewer finished and left its evidence.
+        let marker = done_marker(&run.name, name);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+
+        let err = phase_start(&h, &mut run, name, None).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            run.phases.is_empty(),
+            "no impostor entry: {:?}",
+            run.phases.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        assert!(
+            marker.exists(),
+            "the reviewer's completion marker must survive the refusal"
+        );
+    }
+
+    #[test]
+    fn a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("name-collision-rev-test", "ws-ncr");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        let err = spawn_reviewer(&h, &mut run, "plan", None, "claude").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(run.review_phases.is_empty(), "no shadow reviewer");
+        assert_eq!(run.phases.len(), 1, "and the pipeline phase is untouched");
     }
 
     #[test]

@@ -698,6 +698,39 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## A phase name registered in BOTH lists resolves to the wrong phase — FIXED 2026-07-26
+
+Found by a review subagent during task 1's second fixes round of the phase-reap work; the gap itself
+predates that work.
+
+### Symptom
+
+`drovr phase start <run> review:t:1:correctness` — pointing `phase start` at a name a REVIEWER
+already holds — silently deleted that reviewer's `<phase>.done` marker, launched a second agent, and
+appended a second `Phase` entry under the same name in `run.phases`.
+
+From then on `RunState::find_phase` (which searches `phases` before `review_phases` and returns the
+first match) resolved that reviewer to the impostor: `phase send` reached the wrong pane,
+`phase done` from the reviewer's own pane was rejected as a token mismatch and demanded a
+pipeline-only `-HANDOFF.md`, and `code-review`'s wait polled the wrong pane and could time out on a
+reviewer that had actually finished.
+
+### Root cause
+
+`find_phase_idx` searches `run.phases` only, so a reviewer's name looked brand new to `phase_start`.
+Neither creation site checked the other list.
+
+### Fix
+
+`require_unclaimed_phase_name` (`cli/src/phase.rs`) refuses a name the other list already holds, at
+both creation sites, before any side effect. Pinned by
+`a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase` and
+`a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer`.
+
+Not reachable from drovr's own naming — reviewer names carry a `review:` prefix that pipeline names
+do not use — but the recovery commands drovr prints are bare `drovr phase start <run> <phase>`, so a
+human or a driver pasting one against the wrong name hit it with no guard.
+
 ## A `<task>` or a review `angle` with a space or a shell metacharacter no longer produces a phase
 
 Introduced by the phase-name hardening (task 1's second fixes round of the phase-reap work).
