@@ -762,6 +762,14 @@ check('the zombie fixture reports unknown liveness', await evaluate(`
 await press('a');
 await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
 await evaluate(`return renderRunList(routeGen);`);
+// The checks below assert the cursor did NOT move, so waiting for the expected
+// value would pass instantly whether or not the render landed. Wait for the
+// render's observable EFFECT instead — the row showing as archived — which is
+// what proves the state under test was actually reached.
+await waitFor(() => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.archived : null;`), v => v === '1', 6000, 'the archive to reach the row');
 check('a zombie row stays in the active list', (await rowNames()).indexOf(zTarget) !== -1, true);
 check('...so the cursor stays on it rather than walking to a neighbour',
   await cursorName(), zTarget);
@@ -815,6 +823,11 @@ check('the stale-liveness fixture reports not-live before the click', await eval
 await press('a');
 await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
 await evaluate(`return renderRunList(routeGen);`);
+// Same reason as above: assert-a-negative needs the render's effect waited on.
+await waitFor(() => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.archived : null;`), v => v === '1', 6000, 'the archive to reach the row');
 check('a run that turns out to be a zombie stays in the active list',
   (await rowNames()).indexOf(staleTarget) !== -1, true);
 check('...so the cursor stays on it even though cached liveness said otherwise',
@@ -1169,6 +1182,10 @@ await evaluate(`
   return 1;`);
 await waitFor(() => evaluate(`return window.__kDone;`), v => v === true, 4000, 'the archive POST');
 await evaluate(`return renderRunList(routeGen);`);
+// The cursor check below is an assert-a-negative, so wait for the render's
+// effect — the row leaving the filtered list — before trusting it.
+await waitFor(rowNames, r => r.indexOf(keepRow) === -1, 6000,
+  'the zombie to drop out of the filtered list');
 check('the zombie is hidden by the filter', (await rowNames()).indexOf(keepRow), -1);
 check('...but it is still active, so the cursor is not handed away from it',
   await evaluate(`return navCursorKey;`), keepRow);

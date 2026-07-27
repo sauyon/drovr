@@ -844,7 +844,15 @@ own; it now waits for the state it asserts.
 
 After that fix the suite ran 54 consecutive times green. But two failures were seen in the
 first 12-run batch after it, and their output was not captured, so they remain unexplained.
-Do not read "54 green" as proof the class is gone.
+Do not read a long green streak as proof the class is gone.
+
+A later audit found the most likely cause without reproducing it: three sections asserted a
+NEGATIVE ("the cursor stays on this row") immediately after a single `renderRunList` call.
+Waiting for the expected value is useless there — it is already the current value — so they
+implicitly depended on microtask ordering to have delivered the render, which CPU contention
+can break. All three now wait for the render's observable EFFECT first (the row showing as
+archived, or dropping out of the filtered list) before asserting the cursor. 125 consecutive
+runs green since, including batches under deliberate load. Still not proof.
 
 If it recurs: run with `-- --nocapture` to get the failing check name, and suspect a section
 asserting immediately after `evaluate('renderRunList(...)')` rather than waiting for the

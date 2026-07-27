@@ -2149,7 +2149,15 @@ function isRowVisible(run) {
   return navRows().some(function(el) { return rowKey(el) === run; });
 }
 
+// `gen` is REQUIRED, and `route()` must keep bumping `routeGen` before it
+// reassigns `currentRun`. Together those make it impossible for
+// `resolvePendingAdvances` to run while the reviewer is inside a run — which is
+// why it needs no `!currentRun` guard of its own. A call site that omits `gen`,
+// or a reordering of those two lines in `route()`, silently breaks that and lets
+// an archive hand-off move the list cursor under someone reading a run. No test
+// catches it structurally, so it is asserted here.
 async function renderRunList(gen, resetAnchor) {
+  console.assert(gen !== undefined, 'renderRunList needs a gen; see the note above');
   var listEl = document.getElementById('run-list-items');
   // Claimed before the try so the catch can check it too — a superseded call
   // must not report failure over a newer call's successful render.
