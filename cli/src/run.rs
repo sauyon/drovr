@@ -94,6 +94,19 @@ pub struct Phase {
     pub name: String,
     pub status: PhaseStatus,
     pub handoff_doc: Option<String>,
+    /// DEAD. Always written as `None` (`phase_start`), asserted `None` by a
+    /// test, and pinned `null` by four back-compat fixtures below. It predates
+    /// pane-id-based cleanup, which made it unnecessary.
+    ///
+    /// Kept BESIDE [`Phase::agent_session`] rather than repurposed into it, and
+    /// the near-collision of the two names is the cost of that. Repurposing
+    /// would have meant a field whose meaning on disk changes between drovr
+    /// builds: every `state.json` already carries `"herdr_session": null`, and a
+    /// build that started reading it as a resumable session id would be reading
+    /// a key written under different rules by a different version. A dead field
+    /// that is obviously dead is safer than a live one that used to mean
+    /// something else. Removing it outright is a separate, mechanical change
+    /// (four fixtures and an assertion) and is not this task's.
     pub herdr_session: Option<String>,
     pub pane_id: Option<String>,
     /// Token identifying the CURRENT pass over this phase, minted by each
@@ -131,8 +144,8 @@ pub struct Phase {
     /// re-derive it. `Deserialize` re-checks the alphabet, so an id loaded from
     /// disk is as trustworthy as one just parsed off the wire.
     ///
-    /// Implicitly owned by `RunState::agent`: capture only records an id herdr
-    /// attributes to that backend, so the pair (this id, the run's backend) is
+    /// Implicitly owned by [`Phase::agent_backend`]: capture only records an id
+    /// herdr attributes to that backend, so the pair (this id, that backend) is
     /// what a resume needs.
     ///
     /// Once set it is only ever REPLACED, never cleared by a poll — an absent
@@ -142,6 +155,22 @@ pub struct Phase {
     /// this phase's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<SessionId>,
+    /// The agent backend this phase's pane was launched with (`claude`,
+    /// `cursor`, …), or `None` for a phase started before this was recorded.
+    ///
+    /// NOT derivable from `RunState::agent`, which is why it is here. A
+    /// REVIEWER's backend is chosen separately by `Config::review_agent_for` and
+    /// legitimately differs from the run's — an explicit `review_agent` in
+    /// config, or the cursor auto-selection. Checking a cursor reviewer's
+    /// session against the run's `claude` would (correctly, by its own rule)
+    /// refuse it, so the session of the pane most certain to exit would be the
+    /// one never captured.
+    ///
+    /// It is also what a resume needs: [`Phase::agent_session`] is only
+    /// meaningful to the agent that created it, and by task 5 the config may
+    /// have moved on from whatever selection produced this launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_backend: Option<String>,
     /// The `CLAUDE_CONFIG_DIR` in effect when this phase's agent was launched,
     /// or `None` when the launch inherited the default profile.
     ///

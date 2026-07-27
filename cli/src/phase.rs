@@ -386,6 +386,22 @@ pub fn phase_start<H: Herdr>(
     if let Some(i) = find_phase_idx(run, phase) {
         run.phases[i].status = PhaseStatus::Running;
         run.phases[i].pass = Some(pass.clone());
+        // The ONE place a captured session is discarded, and it belongs HERE,
+        // beside the token that invalidates it — not after the launch. Minting a
+        // new pass is what makes the recorded id inapplicable: whatever happens
+        // next, this phase is no longer the conversation that id names. Clearing
+        // it after `launch_in_pane` would skip exactly the case that needs it —
+        // a launch that FAILS still leaves the new `pass` and `Running` on disk
+        // (both are persisted right here, before the pane is touched), so the
+        // phase would sit on a pass no agent ever ran under while advertising
+        // the *previous* pass's conversation as resumable.
+        //
+        // Conservative in the right direction: the next poll captures the new id
+        // the moment an agent attaches, and until then the honest answer is
+        // "none", which degrades a rehydrate to a reseed rather than to the
+        // wrong conversation. `tab_id` is untouched — a relaunch reuses the
+        // pane, so it reuses the tab.
+        run.phases[i].agent_session = None;
         run.save()?;
     }
     remove_stale_marker(&run.name, phase)?;
@@ -450,14 +466,10 @@ pub fn phase_start<H: Herdr>(
     run.phases[idx].pass = Some(pass);
     run.phases[idx].status = PhaseStatus::Running;
     run.phases[idx].agent_profile = agent_profile_env();
-    // The ONE place a captured session is discarded, and it is discarded on
-    // EVIDENCE, not on a poll's silence: this just ran the agent command again
-    // in the pane, so whatever conversation the recorded id names has been
-    // replaced by a brand-new one. Keeping it would point a later resume at the
-    // PREVIOUS pass's conversation. The next poll captures the new id; until
-    // then the honest answer is "none". `tab_id` is untouched — a relaunch
-    // reuses the pane, so it reuses the tab.
-    run.phases[idx].agent_session = None;
+    run.phases[idx].agent_backend = Some(agent.to_owned());
+    // NOTE: `agent_session` is cleared where the new pass is PERSISTED, above —
+    // not here. See the comment there; clearing at this point would miss the
+    // launch-failure path.
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
     // focus, disturbing the user. Every pane drovr opens (the root pane, each
@@ -484,11 +496,19 @@ pub fn phase_start<H: Herdr>(
 ///
 /// `seed` (if any) is recorded on the phase's `handoff_doc` for the caller to
 /// inject via `phase_send`; it is NOT placed on the command line.
+///
+/// `backend` is the agent NAME behind `launch_command` (`claude`, `cursor`, …).
+/// It is a separate parameter rather than something derived from the command
+/// because a reviewer's backend is chosen by `Config::review_agent_for` and
+/// legitimately differs from the run's — see [`crate::run::Phase::agent_backend`].
+/// Session capture checks a pane's session against it, so getting it wrong means
+/// silently never capturing that reviewer's session.
 pub fn spawn_reviewer<H: Herdr>(
     h: &H,
     run: &mut RunState,
     phase: &str,
     seed: Option<&Path>,
+    backend: &str,
     launch_command: &str,
 ) -> io::Result<()> {
     require_new_phase_name(phase)?;
@@ -548,8 +568,9 @@ pub fn spawn_reviewer<H: Herdr>(
     // Every field is decided here, deliberately: `..Default::default()` costs the
     // compiler's exhaustiveness check, so a field added later would silently
     // land as `None` at the one production site that builds a `Phase` literal.
-    //   * `agent_profile` — recorded now because the launch is the only moment
-    //     it is knowable, and a reviewer is resumed the same way a phase is.
+    //   * `agent_backend` / `agent_profile` — recorded now because the launch is
+    //     the only moment either is knowable, and a reviewer is resumed the same
+    //     way a phase is. The backend is NOT `run.agent`: see the field's doc.
     //   * `tab_id` / `agent_session` — genuinely unknown here: `tab_create`
     //     returns a PANE id, and the agent has not attached yet. Both are
     //     captured by the readiness gate in the `phase_send` that seeds this
@@ -564,6 +585,7 @@ pub fn spawn_reviewer<H: Herdr>(
         pass: Some(pass),
         tab_id: None,
         agent_session: None,
+        agent_backend: Some(backend.to_owned()),
         agent_profile: agent_profile_env(),
         reaped: false,
     });
@@ -589,19 +611,41 @@ fn agent_profile_env() -> Option<String> {
 /// What one `pane_info` poll has to say about a phase's persisted record.
 ///
 /// Both fields are "set this if you can", never "set this to whatever you got":
-/// a field herdr did not report stays `None` here and is therefore not applied,
-/// which is how "never clear on absence" ends up structural rather than being a
-/// rule each caller has to remember. There is no representable way to say
-/// "clear it".
+/// a field herdr did not report stays `None` here and is therefore not applied.
+/// That is what makes "never clear on absence" a property of the DATA — a
+/// `Capture` cannot express "clear it", so no caller can ask for it and no
+/// caller has to remember not to.
+///
+/// Precisely: the guarantee is enforced by [`Capture::apply`], which is the only
+/// writer and assigns only inside `if let Some(..)`. It is not something the
+/// compiler would flag if a future edit added an `else` arm or a third field
+/// that assigns unconditionally. Keep the writing in `apply`, keep it
+/// `Some`-gated, and keep the mutation tests that pin it (a version of `apply`
+/// that clears on absence fails four of them).
 struct Capture {
     tab_id: Option<String>,
     agent_session: Option<SessionId>,
 }
 
 impl Capture {
-    /// Read a poll result. `poll == None` is the poll having FAILED — herdr
-    /// unreachable, or the pane gone — which says nothing about the agent and
-    /// therefore yields nothing to record.
+    /// Read a poll result, covering all three [`crate::herdr::PaneState`]
+    /// outcomes:
+    ///
+    /// * `Unreadable` (`poll == None`) — the poll FAILED: herdr unreachable, or
+    ///   the pane gone. It says nothing about the agent, so nothing is recorded
+    ///   and the phase keeps whatever it already had.
+    /// * `AgentAttached` — tab AND session recorded (the session only if it
+    ///   passes the gate below).
+    /// * `NoAgentSession` — the tab is recorded; the session is not, because
+    ///   there is none to read. herdr having dropped it is not the agent
+    ///   disowning it, so the phase keeps the id it already has.
+    ///
+    /// Matching on `PaneState` itself would add a branch and remove none: the
+    /// values live on the `PaneInfo`, so the classification and the extraction
+    /// are the same `Option` inspection. Task 6 is the caller that genuinely
+    /// needs the enum, because it has to tell `NoAgentSession` from
+    /// `Unreadable` to decide whether closing is safe. Capture treats both the
+    /// same way, deliberately: keep what you have.
     ///
     /// `backend` is the run's agent (`RunState::agent`). It is threaded all the
     /// way here because `AgentSession::resumable_for` is the single chokepoint
@@ -630,23 +674,36 @@ impl Capture {
         self.tab_id.is_none() && self.agent_session.is_none()
     }
 
+    /// Whether applying this to `p` would change anything.
+    ///
+    /// Split out from [`Capture::apply`] so a caller can ASK before it commits:
+    /// `record_capture` must be able to decide "is there anything to do" without
+    /// having already done it, or a persist that fails leaves the in-memory copy
+    /// claiming a write that never landed — and every later poll then answers
+    /// "nothing to do" and never retries.
+    fn would_change(&self, p: &Phase) -> bool {
+        let new_tab = matches!(&self.tab_id, Some(t) if p.tab_id.as_deref() != Some(t.as_str()));
+        let new_session =
+            matches!(&self.agent_session, Some(id) if p.agent_session.as_ref() != Some(id));
+        new_tab || new_session
+    }
+
     /// Apply to `p`, returning whether anything actually changed. Only ever
     /// writes; see the type's note on why there is no clearing path.
+    ///
+    /// One rule, one writer: the decision is entirely [`Capture::would_change`],
+    /// so the two can never disagree about whether there was work to do.
     fn apply(&self, p: &mut Phase) -> bool {
-        let mut changed = false;
-        if let Some(tab) = &self.tab_id
-            && p.tab_id.as_deref() != Some(tab.as_str())
-        {
+        if !self.would_change(p) {
+            return false;
+        }
+        if let Some(tab) = &self.tab_id {
             p.tab_id = Some(tab.clone());
-            changed = true;
         }
-        if let Some(id) = &self.agent_session
-            && p.agent_session.as_ref() != Some(id)
-        {
+        if let Some(id) = &self.agent_session {
             p.agent_session = Some(id.clone());
-            changed = true;
         }
-        changed
+        true
     }
 }
 
@@ -665,11 +722,17 @@ impl Capture {
 ///   else happened meanwhile — precisely the clobber the wait outcomes were
 ///   reworked to avoid. The caller's copy is updated too, so it stays accurate,
 ///   but it is never what gets written.
-/// * **Best-effort, and silent.** A failed load or save leaves the capture in
-///   memory and retries on the phase's next visit. It must not fail the wait: a
-///   phase whose agent is working fine does not become a failure because an
-///   opportunistic bookkeeping write did not land, and a diagnostic here would
-///   print on a 500ms cadence.
+/// * **Best-effort, silent, and RETRIED.** A failed load or save must leave the
+///   caller's copy exactly as it was, so the next poll asks the same question
+///   again and gets another chance. That ordering is the whole reason
+///   [`Capture::would_change`] exists: updating the caller first and persisting
+///   second means one transient `RunState::load` failure at the moment a session
+///   FIRST appears loses it for the rest of the phase — every later poll reports
+///   the same session, sees the in-memory copy already holding it, and concludes
+///   there is nothing to do. Nothing here may fail the wait, either: a phase
+///   whose agent is working fine does not become a failure because an
+///   opportunistic bookkeeping write did not land, and a diagnostic would print
+///   on a 500ms cadence.
 ///
 /// Resolves the phase across BOTH lists (a reviewer's readiness gate runs
 /// through here too, and reviewers live only in `review_phases`). Safe despite
@@ -677,18 +740,27 @@ impl Capture {
 /// `phases` first, and `require_name_unclaimed` refuses a name the other list
 /// already answers to.
 fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
-    let backend = run.agent.clone().unwrap_or_else(|| "claude".to_string());
+    // THIS PHASE's backend, not the run's. A reviewer's is chosen separately by
+    // `Config::review_agent_for` and legitimately differs — checking a cursor
+    // reviewer's session against the run's `claude` would refuse it, and a
+    // reviewer is the pane whose session is most certain to be gone by the time
+    // anything else could read it. `run.agent` is the fallback for phases
+    // started before the backend was recorded; `"claude"` for runs older still,
+    // matching `phase_start`'s own default.
+    let backend = run
+        .find_phase(phase)
+        .and_then(|p| p.agent_backend.clone())
+        .or_else(|| run.agent.clone())
+        .unwrap_or_else(|| "claude".to_string());
     let capture = Capture::from_poll(poll, &backend);
     if capture.is_empty() {
         return;
     }
-    // The cheap guard, against the caller's own copy: no change → no state read,
-    // no write. This is the branch nearly every poll takes.
-    let Some(p) = run.find_phase_mut(phase) else {
-        return;
-    };
-    if !capture.apply(p) {
-        return;
+    // The cheap guard: ASK the caller's own copy, do not write to it. No change
+    // → no state read, no write. This is the branch nearly every poll takes.
+    match run.find_phase(phase) {
+        Some(p) if capture.would_change(p) => {}
+        _ => return,
     }
     let Ok(mut fresh) = RunState::load(&run.name) else {
         return;
@@ -696,8 +768,17 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     let Some(p) = fresh.find_phase_mut(phase) else {
         return;
     };
-    if capture.apply(p) {
-        let _ = fresh.save();
+    // `apply` is false when the freshly-loaded state ALREADY carries what this
+    // poll saw — another writer got there first, or the caller's copy had simply
+    // fallen behind. Nothing to write; the adoption below still runs, which is
+    // what stops the caller re-asking this question on every subsequent poll.
+    if capture.apply(p) && fresh.save().is_err() {
+        return;
+    }
+    // Only now, with the value on disk, does the caller's copy adopt it — so a
+    // failure above leaves that copy stale on purpose, and the next poll retries.
+    if let Some(p) = run.find_phase_mut(phase) {
+        capture.apply(p);
     }
 }
 
@@ -1888,8 +1969,8 @@ mod tests {
             &mut run,
             "review:t:1:correctness",
             None,
-            "claude --permission-mode plan --add-dir '/tmp/drovr-proj-test'",
-        )
+            "claude",
+            "claude --permission-mode plan --add-dir '/tmp/drovr-proj-test'",)
         .unwrap();
 
         let calls = h.calls();
@@ -3577,7 +3658,7 @@ mod tests {
             "phase_send must refuse"
         );
         assert!(
-            spawn_reviewer(&h, &mut run, "", None, "claude").is_err(),
+            spawn_reviewer(&h, &mut run, "", None, "claude", "claude").is_err(),
             "spawn_reviewer must refuse an unnamed reviewer too"
         );
         assert!(run.review_phases.is_empty());
@@ -3872,8 +3953,8 @@ mod tests {
             &mut run,
             "review:task-1:1:correctness",
             None,
-            "claude --permission-mode plan",
-        )
+            "claude",
+            "claude --permission-mode plan",)
         .unwrap();
 
         // Registered in review_phases, NOT the pipeline `phases` list.
@@ -3912,8 +3993,8 @@ mod tests {
             &mut run,
             "review:task-1:1:security",
             None,
-            "claude --permission-mode plan",
-        )
+            "claude",
+            "claude --permission-mode plan",)
         .unwrap();
 
         let calls = h.calls();
@@ -3955,8 +4036,8 @@ mod tests {
             &mut run,
             "review:t:1:correctness",
             None,
-            "claude --permission-mode plan",
-        )
+            "claude",
+            "claude --permission-mode plan",)
         .unwrap();
 
         let calls = h.calls();
@@ -3979,8 +4060,8 @@ mod tests {
             &mut run,
             "review:t:1:correctness",
             None,
-            "claude --permission-mode plan",
-        );
+            "claude",
+            "claude --permission-mode plan",);
         assert!(res.is_err(), "must error when the run has no workspace");
         assert!(res.unwrap_err().to_string().contains("workspace"));
     }
@@ -3997,8 +4078,8 @@ mod tests {
             &mut run,
             "review:t:1:correctness",
             Some(seed),
-            "claude --permission-mode plan",
-        )
+            "claude",
+            "claude --permission-mode plan",)
         .unwrap();
 
         // Seed path recorded on handoff_doc for later injection — NOT on the command line.
@@ -4045,8 +4126,8 @@ mod tests {
             &mut run,
             "review:t:1:correctness",
             None,
-            "claude --permission-mode plan",
-        )
+            "claude",
+            "claude --permission-mode plan",)
         .unwrap();
 
         let calls = h.calls();
@@ -4092,7 +4173,7 @@ mod tests {
         let mut run = make_run_with_workspace("rev-empty-proj-test", "ws-e");
         run.project_dir = String::new();
 
-        let result = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude");
+        let result = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude", "claude");
         assert!(
             result.is_err(),
             "reviewer must error when project_dir is empty"
@@ -4203,7 +4284,7 @@ mod tests {
         let mut run = make_run_with_workspace("inject-reviewer-test", "ws-i");
 
         let err =
-            spawn_reviewer(&h, &mut run, "review:t$(id):1:correctness", None, "claude").unwrap_err();
+            spawn_reviewer(&h, &mut run, "review:t$(id):1:correctness", None, "claude", "claude").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
             !h.calls().iter().any(|c| c.contains("pane_run")),
@@ -4416,7 +4497,7 @@ mod tests {
 
         // The name may no longer be CREATED …
         assert!(
-            spawn_reviewer(&h, &mut run, legacy, None, "claude").is_err(),
+            spawn_reviewer(&h, &mut run, legacy, None, "claude", "claude").is_err(),
             "the creation boundary still rejects it"
         );
         // … but the phase that already exists under it still works end to end.
@@ -4441,7 +4522,7 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run_with_workspace("name-collision-test", "ws-nc");
         let name = "review:t:1:correctness";
-        spawn_reviewer(&h, &mut run, name, None, "claude").unwrap();
+        spawn_reviewer(&h, &mut run, name, None, "claude", "claude").unwrap();
         // The reviewer finished and left its evidence.
         let marker = done_marker(&run.name, name);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -4468,7 +4549,7 @@ mod tests {
         let mut run = make_run_with_workspace("name-collision-rev-test", "ws-ncr");
         phase_start(&h, &mut run, "plan", None).unwrap();
 
-        let err = spawn_reviewer(&h, &mut run, "plan", None, "claude").unwrap_err();
+        let err = spawn_reviewer(&h, &mut run, "plan", None, "claude", "claude").unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(run.review_phases.is_empty(), "no shadow reviewer");
@@ -4492,15 +4573,15 @@ mod tests {
         let mut run = make_run_with_workspace("reviewer-respawn-test", "ws-rr");
         let name = "review:t:1:correctness";
 
-        spawn_reviewer(&h, &mut run, name, None, "claude").unwrap();
-        let err = spawn_reviewer(&h, &mut run, name, None, "claude").unwrap_err();
+        spawn_reviewer(&h, &mut run, name, None, "claude", "claude").unwrap();
+        let err = spawn_reviewer(&h, &mut run, name, None, "claude", "claude").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(run.review_phases.len(), 1, "no second entry under one name");
 
         // Drop the stale registration, exactly as main's respawn does — now it
         // spawns.
         run.review_phases.retain(|p| p.name != name);
-        spawn_reviewer(&h, &mut run, name, None, "claude")
+        spawn_reviewer(&h, &mut run, name, None, "claude", "claude")
             .expect("de-registered first, so the name is free again");
         assert_eq!(run.review_phases.len(), 1);
     }
@@ -4767,6 +4848,145 @@ mod capture_tests {
     }
 
     #[test]
+    fn a_capture_that_could_not_be_persisted_is_retried() {
+        // The subtle half of "best-effort". A poll reports a session; the state
+        // read needed to persist it fails. If the caller's own copy were updated
+        // anyway, EVERY later poll would report the same session, find that copy
+        // already holding it, and conclude there is nothing to do — so one
+        // transient failure at the moment a session first appears would lose it
+        // for the whole phase. A session id does not change again to re-trigger
+        // the guard, and this is the only window in which it can be read at all.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("persist-retry");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+        let state = run_dir("persist-retry").join("state.json");
+        let good = std::fs::read(&state).unwrap();
+
+        // `RunState::load` cannot parse this, so the capture cannot be written.
+        std::fs::write(&state, b"{ not json").unwrap();
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+        assert!(
+            run.phases[0].agent_session.is_none(),
+            "an unpersisted capture must not be claimed in memory either"
+        );
+
+        // The very next poll reports exactly the same thing. It must try again.
+        std::fs::write(&state, &good).unwrap();
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("persist-retry").unwrap().phases[0]
+                .agent_session
+                .as_ref(),
+            Some(&want),
+            "the retry must land the session on disk"
+        );
+        assert_eq!(run.phases[0].agent_session.as_ref(), Some(&want));
+    }
+
+    #[test]
+    fn a_capture_already_on_disk_is_adopted_without_a_write() {
+        // The inner guard, in the one situation the outer one cannot cover: the
+        // caller's copy is behind, so it asks — but the freshly loaded state
+        // already carries exactly this capture, because another writer got there
+        // first. Writing anyway would be a whole-file save with nothing to say.
+        use std::os::unix::fs::MetadataExt;
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("already-on-disk");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+        let state = run_dir("already-on-disk").join("state.json");
+        let ino = || std::fs::metadata(&state).unwrap().ino();
+
+        // Another process captured the same session and persisted it.
+        let mut other = RunState::load("already-on-disk").unwrap();
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        other.phases[0].agent_session = Some(want.clone());
+        other.phases[0].tab_id = Some(FakeHerdr::tab_id_for(&pane).as_str().to_owned());
+        other.save().unwrap();
+        assert!(run.phases[0].agent_session.is_none(), "ours is behind");
+
+        let before = ino();
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+
+        assert_eq!(ino(), before, "nothing to add → no write");
+        assert_eq!(
+            run.phases[0].agent_session.as_ref(),
+            Some(&want),
+            "and the caller's copy still catches up, or it re-asks every poll"
+        );
+    }
+
+    #[test]
+    fn a_phase_missing_from_fresh_state_is_left_alone() {
+        // A phase can vanish from disk between the poll and the write (another
+        // writer rewrote the run). There is nothing to record it against, so the
+        // capture is dropped rather than re-creating the phase — and the wait it
+        // is running inside must survive it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("vanished-on-capture");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+
+        let mut other = RunState::load("vanished-on-capture").unwrap();
+        other.phases.clear();
+        other.save().unwrap();
+
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane), "the gate still works");
+        assert!(
+            RunState::load("vanished-on-capture").unwrap().phases.is_empty(),
+            "capture must not resurrect a phase that is gone"
+        );
+    }
+
+    #[test]
+    fn phase_wait_also_keeps_a_session_herdr_stops_reporting() {
+        // `a_session_survives_herdr_forgetting_it` proves the rule through the
+        // readiness gate. This proves the OTHER loop applies it too — the one
+        // that runs for the whole life of a phase, and so is the loop that
+        // actually watches an agent exit. `POLL_INTERVAL` is not injectable
+        // here, so the timeout is sized to buy exactly two polls.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("wait-keeps-session");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+
+        h.push_pane_info(attached(&pane, AgentStatus::Working));
+        h.push_pane_info(session_less(&pane, AgentStatus::Unknown));
+
+        assert_eq!(
+            phase_wait(&h, &mut run, "plan", 700).unwrap(),
+            PhaseWaitOutcome::TimedOut,
+            "no marker was written, so this is an honest timeout"
+        );
+        let polls = h
+            .calls()
+            .iter()
+            .filter(|c| c.contains("agent_status"))
+            .count();
+        assert!(polls >= 2, "the sequence needs both polls, saw {polls}");
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("wait-keeps-session").unwrap().phases[0]
+                .agent_session
+                .as_ref(),
+            Some(&want),
+            "the agent exiting must not take its session id with it"
+        );
+    }
+
+    #[test]
     fn a_reviewers_session_is_captured_through_the_same_gate() {
         // Reviewers live in `review_phases`, are seeded through `phase_send`, and
         // are explicitly TOLD to exit — so they are the panes most certain to have
@@ -4776,7 +4996,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("reviewer-capture");
         let phase = "review:task-1:1:correctness";
-        spawn_reviewer(&h, &mut run, phase, None, "claude --permission-mode plan").unwrap();
+        spawn_reviewer(&h, &mut run, phase, None, "claude", "claude --permission-mode plan").unwrap();
         let pane = run.review_phases[0].pane_id.clone().unwrap();
 
         phase_send(&h, &mut run, phase, "seed").unwrap();
@@ -4794,6 +5014,71 @@ mod capture_tests {
         );
         let on_disk = RunState::load("reviewer-capture").unwrap();
         assert_eq!(on_disk.review_phases[0].agent_session.as_ref(), Some(&want));
+    }
+
+    #[test]
+    fn a_reviewer_on_another_backend_still_gets_its_session_captured() {
+        // `Config::review_agent_for` picks a reviewer's backend independently of
+        // the run's — an explicit `review_agent`, or the cursor auto-selection.
+        // Checking such a reviewer's session against `run.agent` would refuse it
+        // by the resume rule's own (correct) logic, and silently never capture
+        // the session of the pane MOST certain to have exited by the time
+        // anything wants it. So the check is against the phase's own backend.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("cross-backend-reviewer");
+        assert_eq!(run.agent.as_deref(), Some("claude"), "the RUN is claude");
+        let phase = "review:task-1:1:correctness";
+        spawn_reviewer(&h, &mut run, phase, None, "cursor", "cursor agent").unwrap();
+        let pane = run.review_phases[0].pane_id.clone().unwrap();
+        assert_eq!(run.review_phases[0].agent_backend.as_deref(), Some("cursor"));
+
+        // herdr attributes the session to cursor, because cursor created it.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for(&pane),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_owned_by(&pane, Some("cursor"))),
+        }));
+        assert!(quick(&h, &mut run, phase, &pane));
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            run.review_phases[0].agent_session.as_ref(),
+            Some(&want),
+            "a cursor reviewer's session must be captured under cursor"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_failed_does_not_leave_the_old_session_advertised() {
+        // `phase_start` persists the new pass and `Running` BEFORE it touches the
+        // pane, so a failed launch still leaves the phase on a pass no agent ever
+        // ran under. If the session were cleared only after a successful launch,
+        // that phase would sit there advertising the PREVIOUS pass's
+        // conversation as resumable — the one state the clear exists to prevent,
+        // reachable on the one path that skips it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("failed-launch-session");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id.clone().unwrap();
+        h.push_pane_info(attached(&pane, AgentStatus::Idle));
+        assert!(quick(&h, &mut run, "plan", &pane));
+        let pass_a = run.phases[0].pass.clone().unwrap();
+        assert!(run.phases[0].agent_session.is_some(), "pass A has a session");
+
+        h.fail_pane_run();
+        assert!(
+            phase_start(&h, &mut run, "plan", None).is_err(),
+            "the relaunch must fail"
+        );
+
+        let on_disk = RunState::load("failed-launch-session").unwrap();
+        assert_ne!(on_disk.phases[0].pass, Some(pass_a), "a new pass was minted");
+        assert!(
+            on_disk.phases[0].agent_session.is_none(),
+            "and pass A's conversation must not be advertised against it"
+        );
     }
 
     #[test]
@@ -4886,8 +5171,8 @@ mod capture_tests {
                 &mut run,
                 "review:task-1:1:correctness",
                 None,
-                "claude --permission-mode plan",
-            )
+                "claude",
+                "claude --permission-mode plan",)
             .unwrap();
             assert_eq!(
                 run.phases[0].agent_profile.as_deref(),

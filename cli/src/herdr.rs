@@ -1044,10 +1044,12 @@ fn parse_pane_info(result: &Value) -> Option<PaneInfo> {
 /// at all, which is exactly `None` here.
 ///
 /// An `id` whose value [`SessionId::new`] refuses lands in
-/// [`AgentSession::Other`] carrying herdr's own `kind` and the raw value: the
-/// wire is preserved verbatim (so `kind()` still answers `"id"` and diagnostics
-/// can show what came back), but no `SessionId` is minted, so nothing
-/// downstream can persist or interpolate it.
+/// [`AgentSession::Other`] carrying herdr's own `kind` and the raw value, so
+/// `kind()` still answers `"id"` and a diagnostic can show what came back — but
+/// no `SessionId` is minted, so nothing downstream can persist or interpolate
+/// it. `Other` has no `agent` slot, so the session's ATTRIBUTION is dropped on
+/// this path; it is only ever consulted to decide whether a resume is safe, and
+/// this session can never be resumed under any backend.
 fn parse_agent_session(value: &Value) -> Option<AgentSession> {
     let kind = non_empty_string(value, "kind")?;
     let session_value = non_empty_string(value, "value")?;

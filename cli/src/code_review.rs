@@ -452,7 +452,7 @@ pub fn code_review_run<H: Herdr>(
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
         let seed_text = build_seed(&run.name, task, angle, &base, &head, &run.task, iter);
         std::fs::write(&seed_path, &seed_text)?;
-        spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
+        spawn_reviewer(h, run, &phase, Some(&seed_path), "claude", &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
         // write findings or drop a marker, so pressing on would only guarantee a
