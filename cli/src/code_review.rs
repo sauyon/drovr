@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use crate::config::load_config;
 use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
-use crate::phase::{done_marker, phase_send, spawn_reviewer};
+use crate::phase::{done_marker, phase_send, poll_phase_pane, spawn_reviewer};
 use crate::run::{PhaseStatus, RunState, run_dir};
 
 /// How often the private wait loop polls the filesystem for a reviewer's marker.
@@ -452,11 +452,11 @@ pub fn code_review_run<H: Herdr>(
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
         let seed_text = build_seed(&run.name, task, angle, &base, &head, &run.task, iter);
         std::fs::write(&seed_path, &seed_text)?;
-        // `review_agent`, NOT `run.agent`: it is the backend `launch` was composed
-        // from, and it is what session capture checks this reviewer's session
-        // against. Passing the run's backend here would silently never capture a
-        // reviewer that `review_agent_for` put on a different agent.
-        spawn_reviewer(h, run, &phase, Some(&seed_path), &review_agent, &launch)?;
+        // `launch` carries its own backend, so the reviewer cannot be recorded
+        // as running an agent it was not launched with — that mismatch used to be
+        // expressible, and it silently defeated session capture for any reviewer
+        // `review_agent_for` put on a different agent than the run.
+        spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
         // write findings or drop a marker, so pressing on would only guarantee a
@@ -501,11 +501,17 @@ pub fn code_review_run<H: Herdr>(
     loop {
         let mut still_pending: Vec<(String, String)> = Vec::new();
         for (angle, phase) in std::mem::take(&mut pending) {
+            // `poll_phase_pane`, not `Herdr::pane_info`: this loop is a REVIEWER's
+            // only long-lived poll, and it captures the session on the way past.
+            // The readiness gate in `phase_send` returns on the first poll that
+            // reports "started", which routinely precedes herdr publishing the
+            // session — so without capture here a reviewer's session was never
+            // recorded at all, and herdr drops it the moment the reviewer exits.
+            let pane = run.find_phase(&phase).and_then(|p| p.pane_id.clone());
             let finished = done_marker(&run.name, &phase).exists()
-                || run
-                    .find_phase(&phase)
-                    .and_then(|p| p.pane_id.as_deref())
-                    .and_then(|pane| h.pane_info(pane))
+                || pane
+                    .as_deref()
+                    .and_then(|pane| poll_phase_pane(h, run, &phase, pane))
                     .and_then(|info| info.agent_status)
                     == Some(AgentStatus::Done);
             if !finished {
@@ -585,7 +591,7 @@ pub fn code_review_run<H: Herdr>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::FakeHerdr;
+    use crate::herdr::{FakeHerdr, PaneInfo, SessionId};
     use crate::phase::done_marker;
     use crate::run::{Phase, PhaseStatus};
     use crate::test_util::ENV_LOCK;
@@ -1443,6 +1449,74 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewers_session_is_captured_when_it_appears_after_the_agent_starts() {
+        // THE failure this task exists to prevent, at the one pane where it is
+        // unrecoverable.
+        //
+        // `phase_send`'s readiness gate returns on the FIRST poll reporting a
+        // started agent — and herdr routinely publishes `agent_status` before it
+        // publishes `agent_session`, so that poll can carry no session at all.
+        // A pipeline phase survives that: `phase_wait` polls again every 500ms
+        // for the life of the phase. A reviewer has no such second chance unless
+        // ITS wait loop captures too — and reviewers are told to exit, at which
+        // point herdr drops the session for good, and task 6 closes the pane.
+        //
+        // So: first poll started-but-session-less, later polls carrying one.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-late-session");
+        // One angle, so the poll queue below maps to one reviewer deterministically.
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Poll 1 — the readiness gate. Started, so the gate returns at once, but
+        // herdr has not published a session yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Poll 2+ — the reviewer wait loop. NOW the session is there. Status stays
+        // Idle so the reviewer never "finishes" and the pass times out.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Timeout);
+        assert_eq!(run.review_phases.len(), 1);
+
+        let agent = run.review_phases[0]
+            .agent
+            .as_ref()
+            .expect("the reviewer records its launch");
+        assert_eq!(
+            agent.session.as_ref().map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a session that appears after the agent reports started must still be \
+             captured — the reviewer wait loop is the only place left to see it"
+        );
+        // And on disk, which is the only place task 5 can read it from.
+        let on_disk = RunState::load("cr-late-session").unwrap();
+        assert!(
+            on_disk.review_phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session.as_ref())
+                .is_some(),
+            "the capture must be persisted, not just held in memory"
+        );
+    }
+
+    #[test]
     fn a_reviewer_records_its_own_backend_not_the_runs() {
         // A reviewer's backend is `review_agent_for`'s answer, NOT `run.agent`:
         // config can pin it, and cursor can be auto-selected. Session capture
@@ -1468,7 +1542,7 @@ mod tests {
         assert!(!run.review_phases.is_empty());
         for p in &run.review_phases {
             assert_eq!(
-                p.agent_backend.as_deref(),
+                p.agent.as_ref().map(|a| a.backend.as_str()),
                 Some("cursor"),
                 "reviewer '{}' must record the backend it was launched with",
                 p.name

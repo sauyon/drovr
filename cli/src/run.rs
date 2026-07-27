@@ -98,8 +98,7 @@ pub struct Phase {
     /// test, and pinned `null` by four back-compat fixtures below. It predates
     /// pane-id-based cleanup, which made it unnecessary.
     ///
-    /// Kept BESIDE [`Phase::agent_session`] rather than repurposed into it, and
-    /// the near-collision of the two names is the cost of that. Repurposing
+    /// Kept rather than repurposed into [`PhaseAgent::session`]. Repurposing
     /// would have meant a field whose meaning on disk changes between drovr
     /// builds: every `state.json` already carries `"herdr_session": null`, and a
     /// build that started reading it as a resumable session id would be reading
@@ -131,64 +130,86 @@ pub struct Phase {
     /// a human (or a `state.json` reader) can see which tab a phase occupied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
-    /// The agent session id this phase's pane is running, captured while the
-    /// agent is ALIVE because herdr drops `agent_session` the moment the agent
-    /// process exits (verified against 0.7.5) — by the time anything wants to
-    /// resume the conversation there is nothing left to read.
+    /// What is (or last was) running in this phase's pane — see [`PhaseAgent`].
+    /// `None` for a phase this build never launched.
     ///
-    /// Typed as a [`SessionId`] rather than a `String` on purpose. `herdr.rs`
-    /// makes "only a `kind:"id"` session, attributed to this run's backend, in
-    /// an alphabet a `--resume` can carry" a property of the TYPE
-    /// (`AgentSession::resumable_for`), and persisting it as a bare string would
-    /// drop that proof at the `state.json` boundary and force every reader to
-    /// re-derive it. `Deserialize` re-checks the alphabet, so an id loaded from
-    /// disk is as trustworthy as one just parsed off the wire.
+    /// Distinct from `RunState::agent`, which is the run's DEFAULT backend. A
+    /// reviewer's backend is chosen separately by `Config::review_agent_for` and
+    /// legitimately differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PhaseAgent>,
+    /// Whether this phase's pane has been reaped: drovr closed it because the
+    /// phase was superseded, and the phase can be brought back only by resuming
+    /// its session. Written by nothing yet — reaping is a later step; it is
+    /// declared here so the whole capture record lands in one `state.json` shape
+    /// rather than migrating twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reaped: bool,
+}
+
+/// The agent behind a phase's pane: what it was launched as, and — once a poll
+/// caught it while it was alive — the session a resume can bring back.
+///
+/// **The point of this type is that `backend` is REQUIRED.** A session id is
+/// only meaningful to the agent that created it (`AgentSession::resumable_for`
+/// is built on exactly that), so "a session with no backend" must not be
+/// representable at the `state.json` boundary any more than it is in `herdr.rs`.
+/// As two independent `Option` fields it was: they could disagree in both
+/// directions, and re-checking the pairing would have fallen to every reader.
+/// Here the pairing is structural — [`PhaseAgent::resume`] hands back both or
+/// neither.
+///
+/// A `backend` with no `session` is the normal pre-capture state and is fine;
+/// that is the asymmetry the type encodes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PhaseAgent {
+    /// The backend the pane was launched with (`claude`, `cursor`, …).
+    pub backend: String,
+    /// The `CLAUDE_CONFIG_DIR` in effect at launch; `None` = the default
+    /// profile. Recorded because claude resolves a session under
+    /// `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so resuming from a process
+    /// holding a *different* profile silently finds nothing. The launch is the
+    /// only moment it is knowable — a later command may run from a plain shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The session id, captured while the agent was ALIVE because herdr drops
+    /// `agent_session` the moment the process exits (verified against 0.7.5).
     ///
-    /// Implicitly owned by [`Phase::agent_backend`]: capture only records an id
-    /// herdr attributes to that backend, so the pair (this id, that backend) is
-    /// what a resume needs.
+    /// A [`SessionId`], not a `String`: `herdr.rs` makes "a `kind:"id"` session,
+    /// attributed to this backend, in an alphabet a `--resume` can carry" a
+    /// property of the type, and a bare string would drop that proof here.
+    /// `Deserialize` re-checks the alphabet, so a loaded id is as trustworthy as
+    /// a parsed one.
     ///
     /// Once set it is only ever REPLACED, never cleared by a poll — an absent
     /// session in a later poll is herdr forgetting, not the agent disowning it.
-    /// `phase_start` is the one exception: it launches a NEW agent process in
-    /// the pane, so the id it clears belongs to a conversation that is no longer
-    /// this phase's.
+    /// `phase_start` is the one exception: it launches a NEW process in the
+    /// pane, so the id it clears names a conversation that is no longer this
+    /// phase's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_session: Option<SessionId>,
-    /// The agent backend this phase's pane was launched with (`claude`,
-    /// `cursor`, …), or `None` for a phase started before this was recorded.
+    pub session: Option<SessionId>,
+}
+
+impl PhaseAgent {
+    /// A freshly launched agent: backend and profile known, no session yet.
+    pub fn launched(backend: impl Into<String>, profile: Option<String>) -> PhaseAgent {
+        PhaseAgent {
+            backend: backend.into(),
+            profile,
+            session: None,
+        }
+    }
+
+    /// The `(session, backend)` pair a resume needs, or `None`. Both or
+    /// neither — that is the whole reason this is one type.
     ///
-    /// NOT derivable from `RunState::agent`, which is why it is here. A
-    /// REVIEWER's backend is chosen separately by `Config::review_agent_for` and
-    /// legitimately differs from the run's — an explicit `review_agent` in
-    /// config, or the cursor auto-selection. Checking a cursor reviewer's
-    /// session against the run's `claude` would (correctly, by its own rule)
-    /// refuse it, so the session of the pane most certain to exit would be the
-    /// one never captured.
-    ///
-    /// It is also what a resume needs: [`Phase::agent_session`] is only
-    /// meaningful to the agent that created it, and by task 5 the config may
-    /// have moved on from whatever selection produced this launch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_backend: Option<String>,
-    /// The `CLAUDE_CONFIG_DIR` in effect when this phase's agent was launched,
-    /// or `None` when the launch inherited the default profile.
-    ///
-    /// Recorded because claude resolves a session id under
-    /// `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`: resuming
-    /// [`Phase::agent_session`] from a process holding a *different* profile
-    /// looks for the conversation in the wrong place and silently finds nothing.
-    /// The launch is the only moment this is knowable — a later command may run
-    /// from a plain shell with no profile set at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_profile: Option<String>,
-    /// Whether this phase's pane has been reaped: drovr closed it because the
-    /// phase was superseded, and the phase can be brought back only by resuming
-    /// [`Phase::agent_session`]. Written by nothing yet — reaping is a later
-    /// step; it is declared here so the whole capture record lands in one
-    /// `state.json` shape rather than migrating twice.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reaped: bool,
+    /// Nothing resumes yet, so this is exercised by tests alone until task 5
+    /// composes `--resume`; it exists now because it is the accessor that makes
+    /// the pairing impossible to take apart.
+    #[allow(dead_code)]
+    pub fn resume(&self) -> Option<(&SessionId, &str)> {
+        self.session.as_ref().map(|s| (s, self.backend.as_str()))
+    }
 }
 
 impl Phase {
@@ -899,9 +920,10 @@ mod tests {
         let loaded: RunState = serde_json::from_str(json).unwrap();
         let p = &loaded.phases[0];
         assert!(p.tab_id.is_none(), "absent tab_id → None");
-        assert!(p.agent_session.is_none(), "absent agent_session → None");
-        assert!(p.agent_backend.is_none(), "absent agent_backend → None");
-        assert!(p.agent_profile.is_none(), "absent agent_profile → None");
+        assert!(
+            p.agent.is_none(),
+            "absent agent → None (backend, profile, session)"
+        );
         assert!(
             !p.reaped,
             "absent reaped → false (the phase still has its pane)"
@@ -909,14 +931,13 @@ mod tests {
 
         // And a phase that captured nothing must not start emitting the keys:
         // a run written by this build stays loadable by an older one.
-        let out = serde_json::to_string(&loaded).unwrap();
-        for key in [
-            "tab_id",
-            "agent_session",
-            "agent_backend",
-            "agent_profile",
-            "reaped",
-        ] {
+        //
+        // Serialize the PHASE, not the whole run — `RunState` has an `agent` key
+        // of its own, and matching against the run's JSON would pass for the
+        // wrong reason (or fail for it, as this test did when `Phase::agent`
+        // arrived).
+        let out = serde_json::to_string(p).unwrap();
+        for key in ["tab_id", "agent", "reaped"] {
             assert!(!out.contains(key), "empty {key} must be skipped: {out}");
         }
     }
@@ -930,17 +951,19 @@ mod tests {
         let phase = |session: &str| {
             format!(
                 r#"{{"name":"plan","status":"Running","handoff_doc":null,
-                    "herdr_session":null,"pane_id":null,"agent_session":{session}}}"#
+                    "herdr_session":null,"pane_id":null,
+                    "agent":{{"backend":"claude","session":{session}}}}}"#
             )
         };
         let good: Phase = serde_json::from_str(&phase("\"cca92f5b-3a8c\"")).unwrap();
         assert_eq!(
-            good.agent_session.as_ref().map(SessionId::as_str),
-            Some("cca92f5b-3a8c")
+            good.agent.as_ref().and_then(|a| a.resume()),
+            Some((&SessionId::new("cca92f5b-3a8c".into()).unwrap(), "claude")),
+            "a loaded session comes back paired with its backend"
         );
         // Round-trips as a bare string, so state.json stays human-readable.
         let out = serde_json::to_string(&good).unwrap();
-        assert!(out.contains(r#""agent_session":"cca92f5b-3a8c""#), "{out}");
+        assert!(out.contains(r#""session":"cca92f5b-3a8c""#), "{out}");
 
         for bad in ["\"\"", "\"a b\"", "\"a'b; rm -rf /\""] {
             assert!(
@@ -948,6 +971,35 @@ mod tests {
                 "{bad} must not load as a session id"
             );
         }
+    }
+
+    #[test]
+    fn a_session_cannot_be_persisted_without_the_backend_it_belongs_to() {
+        // The invariant `PhaseAgent` exists for. `resumable_for(backend)` makes a
+        // session id meaningless without the agent that created it, and two loose
+        // `Option` fields let `state.json` say otherwise in both directions. Here
+        // `backend` is REQUIRED, so a session with no backend does not parse at
+        // all — and `resume()` hands back both or neither.
+        let bare = r#"{"name":"plan","status":"Running","handoff_doc":null,
+            "herdr_session":null,"pane_id":null,
+            "agent":{"session":"cca92f5b-3a8c"}}"#;
+        assert!(
+            serde_json::from_str::<Phase>(bare).is_err(),
+            "a session with no backend must not be representable on disk"
+        );
+
+        // A backend with NO session is the normal pre-capture state, and stays legal.
+        let pre = r#"{"name":"plan","status":"Running","handoff_doc":null,
+            "herdr_session":null,"pane_id":null,
+            "agent":{"backend":"cursor","profile":"/cfg"}}"#;
+        let p: Phase = serde_json::from_str(pre).unwrap();
+        let agent = p.agent.as_ref().unwrap();
+        assert_eq!(agent.backend, "cursor");
+        assert_eq!(agent.profile.as_deref(), Some("/cfg"));
+        assert!(
+            agent.resume().is_none(),
+            "no session yet → nothing to resume, and no half-pair to misuse"
+        );
     }
 
     #[test]

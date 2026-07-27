@@ -314,9 +314,6 @@ pub struct PaneInfo {
 /// down a pane whose agent is alive and working, while treating
 /// `NoAgentSession` as `Unreadable` means finished panes never get reaped at
 /// all.
-// Capability only for now: reaping and session capture are later steps, so
-// `Unreadable` is constructed by tests alone until one of them polls.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneState {
     /// The poll FAILED — herdr unreachable, a socket error, or the pane is gone.
@@ -348,7 +345,6 @@ pub enum PaneState {
     NoAgentSession,
 }
 
-#[allow(dead_code)]
 impl PaneState {
     /// Classify a whole `pane_info` result, `None` and all.
     pub fn from_poll(poll: Option<&PaneInfo>) -> PaneState {
@@ -359,8 +355,6 @@ impl PaneState {
     }
 }
 
-// Capability only for now: reaping and session capture are later steps.
-#[allow(dead_code)]
 impl PaneInfo {
     /// This pane's state. Never [`PaneState::Unreadable`] — holding a `PaneInfo`
     /// is itself proof the poll succeeded. Use [`PaneState::from_poll`] to
@@ -386,6 +380,10 @@ impl PaneInfo {
     /// from [`PaneInfo::has_agent_session`] — an exited agent has a status
     /// (`unknown`), and a live agent may momentarily have none. Callers that
     /// gate on a status should treat this as "not yet known", never as done.
+    ///
+    /// No production caller yet — the poll sites read `agent_status` directly.
+    /// Task 6 is the one that has to tell "not yet known" from "done".
+    #[allow(dead_code)]
     pub fn status_unreadable(&self) -> bool {
         self.agent_status.is_none()
     }

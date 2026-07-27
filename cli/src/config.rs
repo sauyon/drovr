@@ -286,8 +286,18 @@ impl Config {
         Ok(name.to_owned())
     }
 
-    /// Compose an agent launch command pinned to `project_dir`.
-    pub fn launch(&self, agent: &str, project_dir: &str, readonly: bool) -> io::Result<String> {
+    /// Compose an agent launch command pinned to `project_dir`, together with the
+    /// backend it was composed from.
+    ///
+    /// Returns an [`AgentLaunch`] rather than a bare `String` so the command and
+    /// the backend name cannot be passed around separately and drift — see that
+    /// type for the bug that motivated it.
+    pub fn launch(
+        &self,
+        agent: &str,
+        project_dir: &str,
+        readonly: bool,
+    ) -> io::Result<AgentLaunch> {
         let spec = self.agent(agent)?;
         let mut command = spec.command.clone();
         if readonly {
@@ -329,7 +339,10 @@ impl Config {
             command.push(' ');
             command.push_str(&shell_single_quote(&prompt));
         }
-        Ok(command)
+        Ok(AgentLaunch {
+            backend: agent.to_owned(),
+            command,
+        })
     }
 
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
@@ -345,6 +358,46 @@ impl Config {
             ))
         })?;
         Ok(format!("{} {}", spec.command, flag))
+    }
+}
+
+/// A composed agent invocation, inseparable from the backend that composed it.
+///
+/// The two travel together because they are one fact — "this pane runs THIS
+/// agent, invoked THIS way" — and splitting them into two `&str` parameters put
+/// a real bug in the tree: a caller passed a literal `"claude"` alongside a
+/// command composed for a different backend, and the phase then recorded a
+/// backend its pane was not running. Session capture checks a pane's session
+/// against the recorded backend, so the mismatch silently captured nothing, for
+/// exactly the panes (reviewers) whose session cannot be re-read later.
+///
+/// Only [`Config::launch`] constructs one, so the backend is always the name the
+/// command was actually built from. There is no constructor that lets a caller
+/// supply them independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunch {
+    backend: String,
+    command: String,
+}
+
+impl AgentLaunch {
+    /// The agent name (`claude`, `cursor`, …) this launch runs.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+    /// The full shell invocation to run in the pane.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+    /// Test-only: build a launch without a `Config`. The pairing this type
+    /// exists to guarantee is a property of `Config::launch`, and a test that
+    /// deliberately wants a cursor launch has no config to compose one from.
+    #[cfg(test)]
+    pub fn for_test(backend: &str, command: &str) -> AgentLaunch {
+        AgentLaunch {
+            backend: backend.to_owned(),
+            command: command.to_owned(),
+        }
     }
 }
 
@@ -442,13 +495,48 @@ mod tests {
         );
         assert!(cfg.agents.contains_key("cursor"));
         assert_eq!(
-            cfg.launch("cursor", "/tmp/my worktree", false).unwrap(),
+            cfg.launch("cursor", "/tmp/my worktree", false)
+                .unwrap()
+                .command(),
             "agent --workspace '/tmp/my worktree'"
         );
         assert_eq!(
-            cfg.launch("cursor", "/tmp/my worktree", true).unwrap(),
+            cfg.launch("cursor", "/tmp/my worktree", true)
+                .unwrap()
+                .command(),
             "agent --mode plan --model 'composer-2.5' --workspace '/tmp/my worktree'"
         );
+    }
+
+    #[test]
+    fn a_launch_carries_the_backend_it_was_composed_from() {
+        // The command and the backend name are one fact, and splitting them into
+        // two arguments put a real bug in the tree: a caller passed a literal
+        // "claude" beside a command composed for another agent, so the phase
+        // recorded a backend its pane was not running and session capture — which
+        // checks a session against that backend — silently recorded nothing.
+        //
+        // `Config::launch` is the only constructor, so the pair cannot disagree:
+        // the backend is always the name the command was built from. Note the
+        // command here does not contain the string "cursor" anywhere — nothing
+        // downstream could recover the backend by inspecting it.
+        let cfg = Config::default();
+        let launch = cfg.launch("cursor", "/tmp/p", true).unwrap();
+        assert_eq!(launch.backend(), "cursor");
+        assert!(
+            launch.command().starts_with("agent "),
+            "{}",
+            launch.command()
+        );
+        assert!(
+            !launch.command().contains("cursor"),
+            "the backend is NOT recoverable from the command: {}",
+            launch.command()
+        );
+
+        let claude = cfg.launch("claude", "/tmp/p", false).unwrap();
+        assert_eq!(claude.backend(), "claude");
+        assert!(claude.command().starts_with("claude"));
     }
 
     #[test]
@@ -621,7 +709,9 @@ readonly_flag = "--sandbox read-only"
         assert!(cfg.reviewer_launch(Some("claude")).is_ok());
         assert!(cfg.reviewer_launch(Some("cursor")).is_ok());
         assert_eq!(
-            cfg.launch("codex", "/tmp/project", false).unwrap(),
+            cfg.launch("codex", "/tmp/project", false)
+                .unwrap()
+                .command(),
             "codex -C '/tmp/project'"
         );
     }
