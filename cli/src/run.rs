@@ -746,13 +746,28 @@ impl RunState {
     /// reaping closes — the fallback would hand back a pane id that is dead, or
     /// worse, recycled by herdr for something else entirely.
     ///
-    /// **"Current" is `first_incomplete`, not `status == Running`.** A phase
-    /// that failed or is blocked still holds the pane worth looking at — that is
-    /// precisely when a human attaches — and a `Pending` phase has no pane, so
-    /// it falls out as `None` on its own.
+    /// **The rule is "the first NOT-`Done` phase that holds a pane".** Two
+    /// halves, and each is doing work:
+    ///
+    /// * *not `Done`* — never `status == Running`. A phase that failed still
+    ///   holds the pane worth looking at, and that is precisely when a human
+    ///   attaches. It is also what makes the no-fallback rule safe against
+    ///   reaping: reaping only ever closes `Done` phases, so a pane this returns
+    ///   is by construction not one that reaping took.
+    /// * *that holds a pane* — the search skips FORWARD over phases with no
+    ///   pane, so a run whose earlier phases were never started still finds the
+    ///   agent actually running later in the list. It never walks BACKWARD.
+    ///
+    /// The forward skip is not hypothetical: `phase_start` appends any phase
+    /// name it is given, so a driver that starts `implement-task-1` without
+    /// starting `plan` leaves a `Pending` phase sitting in front of a live one.
+    /// Stopping at the first incomplete phase would report that run as empty
+    /// while its agent is right there.
     pub fn live_agent_pane(&self) -> Option<(&str, &str)> {
-        let phase = self.first_incomplete().and_then(|i| self.phases.get(i))?;
-        Some((phase.name.as_str(), phase.pane_id()?))
+        self.phases
+            .iter()
+            .filter(|p| p.status != PhaseStatus::Done)
+            .find_map(|p| Some((p.name.as_str(), p.pane_id()?)))
     }
 
     pub fn retire_pane(&mut self, pane_id: impl Into<String>) {
@@ -989,8 +1004,8 @@ mod tests {
         assert_eq!(s.live_agent_pane(), Some(("plan", "w:p2")));
 
         // Current phase has NO pane (never started, or reaped) → None. It must
-        // NOT walk back to brainstorm's pane, even though that pane is right
-        // there and looks alive.
+        // NOT walk BACK to brainstorm's pane, even though that pane is right
+        // there and looks alive: a Done phase is exactly what reaping closes.
         let s = run(
             vec![
                 mk("brainstorm", PhaseStatus::Done, Some("w:p1")),
@@ -1002,6 +1017,25 @@ mod tests {
             s.live_agent_pane(),
             None,
             "an earlier phase's pane is not this run's current state"
+        );
+
+        // But it MUST skip FORWARD over a phase that was never started. A
+        // driver can `phase start implement-task-1` without ever starting
+        // `plan`, which leaves a Pending phase in front of a live one — and
+        // reporting that run as empty while its agent sits right there would be
+        // its own kind of lie.
+        let s = run(
+            vec![
+                mk("brainstorm", PhaseStatus::Done, Some("w:p1")),
+                mk("plan", PhaseStatus::Pending, None),
+                mk("implement-task-1", PhaseStatus::Running, Some("w:p7")),
+            ],
+            Some("w:root"),
+        );
+        assert_eq!(
+            s.live_agent_pane(),
+            Some(("implement-task-1", "w:p7")),
+            "a live later phase must not be hidden by an unstarted earlier one"
         );
 
         // Every phase Done → the run is finished; there is no current phase.

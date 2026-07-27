@@ -286,6 +286,12 @@ fn launch_in_pane<H: Herdr>(
         env_prefix.push_str(&format!(" CLAUDE_CONFIG_DIR={}", shell_single_quote(&dir)));
     }
     let full = format!("{env_prefix} {command}");
+    // ⚠️ `pane_run` is the LAST fallible step, and that is load-bearing, not
+    // incidental. `phase_start` treats an `Err` from this function as "no agent
+    // was started" and CLOSES the pane it just created
+    // (`discard_unlaunched_pane`). Everything after this line is therefore
+    // best-effort by necessity: a `?` added below would make a cosmetic rename
+    // failure kill a live agent mid-conversation.
     h.pane_run(pane, &full)?;
     // Cosmetic pane label; best-effort (a rename failure must not fail the phase).
     let _ = h.pane_rename(pane, phase);
@@ -334,6 +340,11 @@ fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
 /// is about to return — that error is what the human needs to see. The `save`
 /// matters on its own: a retry runs in a fresh process, so a retirement that
 /// only ever existed in memory is a retirement that never happened.
+///
+/// ⚠️ **Only safe because `launch_in_pane` cannot fail after `pane_run`
+/// succeeds** — every step after it is `let _ =`. If that ever changes, this
+/// closes a pane with a live agent in it. The invariant is pinned by a comment
+/// at that `pane_run?`; do not weaken either half.
 fn discard_unlaunched_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
     run.retire_pane(pane);
     if let Err(e) = run.save() {
