@@ -453,7 +453,13 @@ const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Claude auth env vars propagated to spawned agents so they use the caller's
 /// authenticated profile rather than the default `~/.claude` dir.
-const AGENT_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"];
+const AGENT_ENV_VARS: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+];
 
 pub struct SystemHerdr {
     /// The `herdr` executable to shell out to. Always plain `"herdr"` (resolved
@@ -2590,6 +2596,8 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let env = SystemHerdr::new().agent_env();
         unsafe {
@@ -2631,6 +2639,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let env = SystemHerdr::new().agent_env();
         let map = env.as_object().expect("agent_env must be a JSON object");
@@ -2661,12 +2671,16 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-test");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://example.test");
         }
         let env = SystemHerdr::new().agent_env();
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let map = env.as_object().expect("agent_env must be a JSON object");
         assert_eq!(
@@ -2682,6 +2696,16 @@ mod tests {
         assert_eq!(
             map.get("ANTHROPIC_MODEL").and_then(Value::as_str),
             Some("claude-opus-4-5"),
+            "{env}"
+        );
+        assert_eq!(
+            map.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str),
+            Some("tok-test"),
+            "{env}"
+        );
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").and_then(Value::as_str),
+            Some("https://example.test"),
             "{env}"
         );
         assert_eq!(
