@@ -1992,11 +1992,13 @@ var completedOpen = (function() {
 // dot, and their meta reports phase progress rather than the gate state — for a
 // finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
 function runRow(run) {
-  // Archived AND still live: the server archives even when closing the workspace
-  // failed, so this row is filed away while its agent keeps running. Say so —
-  // otherwise it renders identically to a cleanly-closed run and the panes leak
-  // unnoticed. Declared here, before first use: `var` hoists the declaration but
-  // not the value.
+  // Archived AND the workspace still open. Two ways to get here, and the row means
+  // the same in both: filed away with something still live in it.
+  //   * the close FAILED — the run's agent keeps running, unnoticed;
+  //   * the close was WITHHELD because panes drovr did not create are in there —
+  //     drovr's own panes went, the human's shell or editor holds the workspace.
+  // Either way it must not render identically to a cleanly-closed run. Declared
+  // here, before first use: `var` hoists the declaration but not the value.
   var zombie = run.archived && run.live === true;
   var meta;
   if (zombie) {

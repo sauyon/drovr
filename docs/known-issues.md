@@ -1543,8 +1543,8 @@ done-marker is absent. On a RESUMED pass where every angle is still alive, `spaw
 skipped entirely, so the poll loop's own calls are the only ones and nothing rescues the flag
 first. A human archiving a run while a resumed review polls is ordinary use.
 
-Current state — five call sites, all covered, each failing the suite if reverted to a plain
-`save`:
+Current state — six call sites across five tests (`phase_start` has two: the pass-persist write
+and the post-launch one), each failing the suite if reverted to a plain `save`:
 
 | site | test |
 | --- | --- |
@@ -1557,6 +1557,13 @@ Current state — five call sites, all covered, each failing the suite if revert
 `cmd_code_review` no longer has such a site: the merge replaced its whole-state write with a
 fresh load plus `transplant_review_progress`, which is strictly better — it cannot clobber
 `archived` OR any other field.
+
+Archiving pays a second herdr RPC for this. `close_for_archive` now asks `workspace_panes`
+before it will close anything, so if herdr is flaky on the LIST call specifically — while the
+close itself would have worked — the close is never attempted and the page warns that the
+workspace is still open. That is deliberate: closing on an answer we do not have is how the
+human's own tabs used to die. `cleanup` already carried the same trade-off; the Archive button
+is simply clicked more often. Worst case is a spurious warning and a manual `drovr cleanup`.
 
 `phase_wait` likewise no longer needs one: it re-reads fresh state and commits onto that.
 
