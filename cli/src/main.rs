@@ -1161,10 +1161,6 @@ mod tests {
         tmp
     }
 
-    /// A saved run in workspace `wAC` whose recorded drovr panes are `wAC:p1`
-    /// (the brainstorm phase, mid-flight) and `wAC:p2` (a reviewer). No worktree,
-    /// so `cmd_cleanup` runs to completion instead of exiting on the prune path.
-    #[cfg(test)]
     #[test]
     fn the_panel_merge_carries_retired_panes_not_just_review_phases() {
         // `retired_panes` is what tells `drovr cleanup` a pane is drovr's. Since
@@ -1216,6 +1212,9 @@ mod tests {
         assert_eq!(on_disk.phases.len(), 1);
     }
 
+    /// A saved run in workspace `wAC` whose recorded drovr panes are `wAC:p1`
+    /// (the brainstorm phase, mid-flight) and `wAC:p2` (a reviewer). No worktree,
+    /// so `cmd_cleanup` runs to completion instead of exiting on the prune path.
     fn seed_paned_run(name: &str) -> RunState {
         let run = RunState {
             name: name.into(),
