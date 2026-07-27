@@ -105,7 +105,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
-| `drovr cleanup <name> [--purge]` | Stop herdr sessions. With `--purge`, remove the run directory. |
+| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
 
 ### Review UI keyboard navigation
 

@@ -652,10 +652,10 @@ this window is new — it is a real (if small) regression introduced alongside t
 
 ### Why it is small
 
-The write was deliberately placed immediately after `herdr.workspace_close`, which kills every
-pane in the run, and it re-reads `state.json` from disk rather than saving the copy loaded at the
-top of the function. The race therefore needs a phase agent to write during the `workspace_close`
-call itself, after which it no longer exists.
+The write was deliberately placed immediately after the pane teardown (`close_run_panes`, which
+closes every pane the run recorded), and it re-reads `state.json` from disk rather than saving the
+copy loaded at the top of the function. The race therefore needs a phase agent to write during
+that teardown itself, after which it no longer exists.
 
 ### Fix ideas
 
@@ -1017,6 +1017,33 @@ drovr phase wait <run> <phase> --timeout-ms 5000
 4. **Document the invariant** in `drovr:pipeline`: every phase needs its `phase wait`, including
    ones whose completion the driver observed by other means. The skill's flow implies this but
    never says that skipping the wait corrupts run state.
+
+## `drovr cleanup` can leave an empty workspace behind when herdr cannot list its panes
+
+**Severity:** low (cosmetic — an empty workspace in the switcher, closable by hand).
+**Found:** 2026-07-26, while making cleanup reap only drovr's own panes.
+
+### Symptom
+
+`close_run_panes` (`cli/src/main.rs`) decides whether it may call `workspace_close` by diffing
+`pane.list` for the run's workspace against the panes the run recorded. If that listing fails —
+daemon blip, changed result shape — it cannot prove the workspace holds nothing of the human's, so
+it closes only the recorded panes and leaves the workspace open. The workspace may then be empty
+but still listed.
+
+### Why it is deliberate
+
+The alternative is closing the workspace on an answer we do not have, which is exactly how the
+human's own tabs used to die. An empty workspace is a cosmetic mistake; a closed pane holding
+someone's unsaved work is not. Same reasoning for a pane drovr created but never recorded in
+`state.json` (see `RunState::retired_panes`): unrecorded panes are treated as the human's and left
+running.
+
+### Fix ideas
+
+1. Retry `pane.list` a couple of times before giving up — most failures here are transient.
+2. Or ask herdr whether the workspace is empty after the pane closes (`workspace.get`
+   `pane_count`) and close it only on a definitive zero.
 
 ## Resolved
 

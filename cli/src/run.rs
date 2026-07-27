@@ -62,8 +62,9 @@ pub struct RunState {
     /// human can merge it; deleted only under `--purge`. `None` when no worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
-    /// Set by `cmd_cleanup`: the human is done with this run, its workspace is
-    /// closed and its panes are gone. Needed because nothing else reconciles a
+    /// Set by `cmd_cleanup`: the human is done with this run and its panes are
+    /// gone (the workspace too, unless the human's own panes kept it alive —
+    /// `close_run_panes`). Needed because nothing else reconciles a
     /// torn-down run — phase statuses are frozen at their last write and the
     /// review gate keeps whatever verdict slot it was parked in, so a cleaned-up
     /// run that never finished its phases would otherwise display as live
@@ -71,6 +72,20 @@ pub struct RunState {
     /// `state.json` files loading (and re-serializing) unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// Panes drovr opened that no longer belong to any phase, yet are still
+    /// drovr's to reap: a reviewer that was replaced in place (`code_review`'s
+    /// resume drops the stale registration so the harvest cannot read the old
+    /// pane's transcript) leaves its pane running.
+    ///
+    /// Load-bearing for cleanup, not bookkeeping trivia. `drovr cleanup` closes
+    /// exactly the panes this file records and leaves everything else alone —
+    /// panes in the run's workspace belong to the human unless drovr can prove
+    /// otherwise. A pane dropped from `review_phases` without landing here would
+    /// therefore be both immortal and mistaken for the human's, keeping the
+    /// workspace open forever. `#[serde(default)]` + skip-if-empty keeps
+    /// pre-existing `state.json` files loading unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_panes: Vec<String>,
 }
 
 fn legacy_agent() -> Option<String> {
@@ -164,6 +179,15 @@ impl RunState {
             .count();
         (done, self.phases.len())
     }
+    /// Remember `pane_id` as drovr's even though no phase points at it any more —
+    /// see [`RunState::retired_panes`]. Idempotent, so a caller may retire the
+    /// same pane twice without growing the list.
+    pub fn retire_pane(&mut self, pane_id: impl Into<String>) {
+        let id = pane_id.into();
+        if !self.retired_panes.contains(&id) {
+            self.retired_panes.push(id);
+        }
+    }
     /// Look up a phase by name across BOTH `phases` and `review_phases`. Reviewer
     /// lookups (marker-drop, seed injection) need to resolve names living in
     /// `review_phases`; pipeline progress deliberately does NOT use this (it stays
@@ -199,6 +223,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         }
     }
 
@@ -243,7 +268,7 @@ mod tests {
 
     #[test]
     fn archived_forces_complete_even_mid_flight() {
-        // `drovr cleanup` tore the workspace down; the phase statuses are frozen
+        // `drovr cleanup` tore the run's panes down; the phase statuses are frozen
         // mid-run and no longer reflect anything live (see cmd_cleanup).
         let mut s = completion_run(vec![done("brainstorm"), running("plan")]);
         assert!(!s.is_complete());
@@ -269,6 +294,34 @@ mod tests {
         let round: RunState =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
         assert!(round.archived);
+    }
+
+    #[test]
+    fn retired_panes_defaults_empty_and_round_trips() {
+        // A state.json written before the field existed must still load: cleanup
+        // reads this list to decide which panes are drovr's, and a hard parse error
+        // here would wedge every pre-existing run.
+        let json = r#"{
+            "name": "legacy", "task": "t", "phases": [], "gate": "spec",
+            "cursor": 0, "project_dir": "/tmp/p"
+        }"#;
+        let s: RunState = serde_json::from_str(json).expect("legacy state.json must load");
+        assert!(s.retired_panes.is_empty());
+
+        // Empty stays invisible on disk (skip-if-empty), so writing a run that never
+        // retired a pane leaves its state.json shape unchanged.
+        assert!(
+            !serde_json::to_string(&s).unwrap().contains("retired_panes"),
+            "an empty list must not be serialized"
+        );
+
+        let mut s = completion_run(vec![done("brainstorm")]);
+        s.retire_pane("w:p7");
+        s.retire_pane("w:p7");
+        assert_eq!(s.retired_panes, vec!["w:p7"], "retire_pane is idempotent");
+        let round: RunState =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
+        assert_eq!(round.retired_panes, vec!["w:p7"]);
     }
 
     #[test]
@@ -350,6 +403,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         s.save().unwrap();
         let loaded = RunState::load("demo").unwrap();
@@ -441,6 +495,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         assert_eq!(s.find_phase("plan").map(|p| p.name.as_str()), Some("plan"));
         assert_eq!(

@@ -16,7 +16,9 @@ use std::collections::VecDeque;
 /// `pane_run`) rather than splitting a new pane beside it, so no empty shell is
 /// left dangling. The root pane is never closed mid-run — closing any pane makes
 /// herdr reassign focus and disturbs the user — and is torn down together with
-/// every phase pane by the single `workspace_close` at `drovr cleanup`.
+/// every phase pane at `drovr cleanup` (`close_run_panes`), which reaps drovr's
+/// panes and only drovr's: the human may have opened tabs of their own in the
+/// run's workspace.
 #[derive(Debug)]
 pub struct Workspace {
     pub id: String,
@@ -27,9 +29,17 @@ pub trait Herdr {
     /// Create a new `--no-focus` herdr workspace (label + cwd); returns its id and
     /// its auto-created root shell pane id.
     fn workspace_create(&self, label: &str, cwd: &str) -> io::Result<Workspace>;
-    /// Close a herdr workspace (closes all its panes). This is the only pane
-    /// teardown drovr performs — once, at end-of-run.
+    /// Close a herdr workspace (closes all its panes). `drovr cleanup` uses this
+    /// only once it knows the workspace holds nothing but drovr's own panes.
     fn workspace_close(&self, id: &str) -> io::Result<()>;
+    /// Close a single pane. `drovr cleanup` reaps the run's panes one by one when
+    /// the workspace also holds panes the human opened, which
+    /// [`Herdr::workspace_close`] would take down with them.
+    fn pane_close(&self, pane_id: &str) -> io::Result<()>;
+    /// Every pane currently in `workspace`. `Err` means "could not tell" — it must
+    /// never be read as "the workspace is empty", because the caller's next move
+    /// on that answer is deciding whether it may close the workspace outright.
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>>;
     /// Create a new `--no-focus` tab in `workspace` (label + cwd); returns the
     /// tab's auto-created shell pane id. Every phase after the first gets its own
     /// tab so each phase agent occupies a full pane with no split.
@@ -190,6 +200,19 @@ impl Herdr for SystemHerdr {
         // `herdr workspace close`.
         self.socket_call("workspace.close", json!({ "workspace_id": id }))?;
         Ok(())
+    }
+
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        self.socket_call("pane.close", json!({ "pane_id": pane_id }))?;
+        Ok(())
+    }
+
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>> {
+        // `pane.list` already filters by workspace; `collect_pane_ids` re-checks
+        // each pane's own `workspace_id` so a server that ignored the filter
+        // cannot make another workspace's panes look like this run's.
+        let result = self.socket_call("pane.list", json!({ "workspace_id": workspace }))?;
+        Ok(collect_pane_ids(&result, workspace))
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
@@ -363,6 +386,45 @@ fn find_string_field(value: &Value, key: &str) -> Option<String> {
     }
 }
 
+/// Collect every pane id in a `pane.list` result that belongs to `workspace`.
+///
+/// Walks the value rather than indexing a fixed path (`result.panes[]`) so a
+/// changed nesting cannot silently yield an empty list — and an empty list is the
+/// dangerous answer here: `drovr cleanup` reads "no panes I did not create" as
+/// permission to close the whole workspace. A pane object that carries a
+/// `workspace_id` other than `workspace` is skipped; one with no `workspace_id`
+/// at all is kept, since the filtered listing is already scoped to the workspace.
+fn collect_pane_ids(value: &Value, workspace: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_pane_ids_into(value, workspace, &mut out);
+    out
+}
+
+fn collect_pane_ids_into(value: &Value, workspace: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(id)) = map.get("pane_id") {
+                let belongs = match map.get("workspace_id") {
+                    Some(Value::String(ws)) => ws == workspace,
+                    _ => true,
+                };
+                if belongs && !id.is_empty() && !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+            for v in map.values() {
+                collect_pane_ids_into(v, workspace, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_pane_ids_into(v, workspace, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parse a pane's `agent_status` from herdr's `pane get` / `pane list` JSON.
 /// The status may live directly on `result` (`pane get`) or on a pane object
 /// inside `result.panes` (`pane list`); this walks the value recursively and
@@ -431,6 +493,13 @@ pub struct FakeHerdr {
     fail_agent_send: RefCell<bool>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Panes each workspace holds, as `workspace_panes` will report them. A
+    /// workspace with no entry reports empty — the "nothing but drovr's own panes"
+    /// case most tests want.
+    panes_by_workspace: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// When true, `workspace_panes` returns an error (models a daemon that cannot
+    /// say what is in the workspace).
+    fail_workspace_panes: RefCell<bool>,
     /// Per-pane `agent_read` queues, consulted before the global `read_queue`. Real
     /// transcripts belong to a specific pane; a test that cares which pane it is
     /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
@@ -448,8 +517,28 @@ impl FakeHerdr {
             fail_pane_run: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
+            panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
+            fail_workspace_panes: RefCell::new(false),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Declare what `workspace_panes` reports for `workspace`.
+    pub fn push_workspace_panes<I, S>(&self, workspace: impl Into<String>, panes: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.panes_by_workspace.borrow_mut().insert(
+            workspace.into(),
+            panes.into_iter().map(Into::into).collect(),
+        );
+    }
+
+    /// Make `workspace_panes` fail: the caller cannot learn what is in the
+    /// workspace and must not assume it is all its own.
+    pub fn fail_workspace_panes(&self) {
+        *self.fail_workspace_panes.borrow_mut() = true;
     }
 
     /// Model `pane_id` having disappeared (crashed agent, closed tab): from now on
@@ -527,6 +616,24 @@ impl Herdr for FakeHerdr {
     fn workspace_close(&self, id: &str) -> io::Result<()> {
         self.record(format!("workspace_close id={id}"));
         Ok(())
+    }
+
+    fn pane_close(&self, pane_id: &str) -> io::Result<()> {
+        self.record(format!("pane_close pane={pane_id}"));
+        Ok(())
+    }
+
+    fn workspace_panes(&self, workspace: &str) -> io::Result<Vec<String>> {
+        self.record(format!("workspace_panes workspace={workspace}"));
+        if *self.fail_workspace_panes.borrow() {
+            return Err(io::Error::other("scripted workspace_panes failure"));
+        }
+        Ok(self
+            .panes_by_workspace
+            .borrow()
+            .get(workspace)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
@@ -709,6 +816,65 @@ mod tests {
             "a non-JSON failure (bad socket path) must not be read as a dead pane"
         );
         assert!(!pane_get_proves_missing(""), "empty output proves nothing");
+    }
+
+    // -- collect_pane_ids: what is actually in a workspace ---------------------
+    // `drovr cleanup` decides whether it may close a whole workspace by diffing
+    // this listing against the panes it created, so a pane it fails to see is a
+    // pane it will kill. The parse must therefore pick up EVERY pane in the
+    // listing — and only those belonging to the workspace asked about, so a
+    // server that ignored the filter cannot make foreign panes look like ours.
+    #[test]
+    fn collect_pane_ids_reads_every_pane_in_the_workspace() {
+        let v: Value = serde_json::from_str(
+            r#"{"result":{"type":"pane_list","panes":[
+                {"pane_id":"wAG:p1","tab_id":"wAG:t1","workspace_id":"wAG","label":"brainstorm"},
+                {"pane_id":"wAG:p2","tab_id":"wAG:t2","workspace_id":"wAG","label":"plan"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1", "wAG:p2"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_drops_panes_from_other_workspaces() {
+        let v: Value = serde_json::from_str(
+            r#"{"result":{"panes":[
+                {"pane_id":"wAG:p1","workspace_id":"wAG"},
+                {"pane_id":"w1:p4","workspace_id":"w1"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_keeps_panes_with_no_workspace_field() {
+        // A shape that omits `workspace_id` is the filtered listing itself; the
+        // pane still counts (dropping it would mean closing the workspace blind).
+        let v: Value =
+            serde_json::from_str(r#"{"result":{"panes":[{"pane_id":"wAG:p1"}]}}"#).unwrap();
+        assert_eq!(collect_pane_ids(&v, "wAG"), vec!["wAG:p1"]);
+    }
+
+    #[test]
+    fn collect_pane_ids_empty_listing_is_empty() {
+        let v: Value = serde_json::from_str(r#"{"result":{"panes":[]}}"#).unwrap();
+        assert!(collect_pane_ids(&v, "wAG").is_empty());
+    }
+
+    #[test]
+    fn fake_workspace_panes_scripted_and_failable() {
+        let h = FakeHerdr::new();
+        // Unscripted: an empty workspace (nothing foreign to protect).
+        assert_eq!(h.workspace_panes("ws-1").unwrap(), Vec::<String>::new());
+        h.push_workspace_panes("ws-1", ["ws-1:p1", "ws-1:p9"]);
+        assert_eq!(
+            h.workspace_panes("ws-1").unwrap(),
+            vec!["ws-1:p1", "ws-1:p9"]
+        );
+        h.fail_workspace_panes();
+        assert!(h.workspace_panes("ws-1").is_err());
     }
 
     #[test]

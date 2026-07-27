@@ -190,15 +190,17 @@ pub fn phase_start<H: Herdr>(
 
     let seed_str = seed.map(|p| p.to_string_lossy().into_owned());
     run.phases[idx].handoff_doc = seed_str;
-    // pane_id only — herdr_session is not used for cleanup (workspace_close handles that)
+    // pane_id only — herdr_session is not used for cleanup, which closes panes by
+    // id (`close_run_panes` in main.rs)
     run.phases[idx].herdr_session = None;
     run.phases[idx].pane_id = Some(target_pane);
     run.phases[idx].status = PhaseStatus::Running;
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
-    // focus, disturbing the user. The run's workspace (root pane + every phase
-    // pane) is torn down in one shot at the end by `drovr cleanup`
-    // (`workspace_close`), once the user confirms.
+    // focus, disturbing the user. Every pane drovr opens (the root pane, each
+    // phase pane, each reviewer pane) is torn down at the end by `drovr cleanup`,
+    // once the user confirms — which is why `pane_id` is recorded here: it is how
+    // cleanup knows which panes are drovr's and which are the human's.
     run.save()?;
     Ok(())
 }
@@ -811,6 +813,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         }
     }
 
@@ -837,7 +840,7 @@ mod tests {
         assert_eq!(p.name, "brainstorm");
         assert_eq!(p.status, PhaseStatus::Running);
         assert!(p.pane_id.is_some(), "pane_id must be recorded");
-        // herdr_session is no longer written (cleanup uses workspace_close, not session_stop)
+        // herdr_session is no longer written (cleanup closes panes by id, not session_stop)
         assert!(p.herdr_session.is_none(), "herdr_session must be None");
         // claude is launched via `pane run`, NOT a split-creating `agent start`.
         let calls = h.calls();
@@ -1599,9 +1602,9 @@ mod tests {
         );
     }
 
-    // Panes are never closed mid-run (herdr reassigns focus on any close);
-    // cleanup is a single `workspace_close` at end-of-run. `phase_start` must
-    // therefore never close a pane.
+    // Panes are never closed mid-run (herdr reassigns focus on any close); every
+    // pane drovr opened is reaped at end-of-run by `drovr cleanup`. `phase_start`
+    // must therefore never close a pane.
     #[test]
     fn phase_start_never_closes_a_pane() {
         let _lock = ENV_LOCK.lock().unwrap();

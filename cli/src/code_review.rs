@@ -433,6 +433,14 @@ pub fn code_review_run<H: Herdr>(
                 (true, true) => "produced nothing usable",
                 (true, false) => "is gone",
             };
+            // The dropped pane may well still be alive (a `Failed` angle is one
+            // whose reviewer produced nothing usable, not necessarily one whose
+            // pane died). Retire it so `drovr cleanup` still knows it is drovr's:
+            // cleanup reaps only the panes this state file records, and treats
+            // everything else in the workspace as the human's.
+            if let Some(pane) = existing.and_then(|p| p.pane_id.clone()) {
+                run.retire_pane(pane);
+            }
             run.review_phases.retain(|p| p.name != phase);
             println!("code-review: reviewer for angle '{angle}' {reason} — respawning it");
         }
@@ -449,8 +457,9 @@ pub fn code_review_run<H: Herdr>(
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
         // write findings or drop a marker, so pressing on would only guarantee a
         // timeout. Any reviewer panes already spawned this pass are left running and
-        // reclaimed by the single `workspace_close` at `drovr cleanup` — the codebase
-        // invariant is "never close a pane mid-run" (mirrors `phase_start`).
+        // reclaimed at `drovr cleanup` (they are recorded in `review_phases`, so it
+        // knows they are drovr's) — the codebase invariant is "never close a pane
+        // mid-run" (mirrors `phase_start`).
         //
         // Mark it `Failed` first, though. `spawn_reviewer` has already registered the
         // phase as `Running` with a live pane, and the caller saves state even on the
@@ -635,6 +644,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         (run, repo)
     }
@@ -995,6 +1005,15 @@ mod tests {
             "a Failed angle must get a NEW reviewer even though its pane still exists"
         );
         assert_eq!(spawn_count(&h), 5, "only the failed angle is respawned");
+        // The replaced reviewer's pane is still alive but no longer registered under
+        // any phase. It must be retired, not forgotten: `drovr cleanup` reaps exactly
+        // the panes the run records, so an unrecorded pane of drovr's would be left
+        // running forever AND read as the human's, keeping the workspace open.
+        assert!(
+            run.retired_panes.contains(&wedged),
+            "the replaced reviewer's pane must be retired for cleanup to reap: {:?}",
+            run.retired_panes
+        );
     }
 
     /// The respawn must not merely happen — the replacement reviewer's findings must
@@ -1542,6 +1561,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         assert_eq!(next_iter(&base, "task-1"), 1);
 
@@ -1579,6 +1599,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         let mk = |name: &str, status: PhaseStatus| Phase {
             name: name.into(),

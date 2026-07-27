@@ -1551,6 +1551,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived,
+            retired_panes: vec![],
         };
         fs::write(
             dir.join("state.json"),
@@ -1740,6 +1741,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         };
         // Running phase wins.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
@@ -1767,6 +1769,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
             archived: false,
+            retired_panes: vec![],
         }
     }
 
