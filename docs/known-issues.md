@@ -698,6 +698,73 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## drovr never moves the driver out of the invoking checkout
+
+**Severity:** high (the driver's every git observation is silently about the wrong tree, and on a
+repo with concurrent agents it is how one clobbers another).
+**Found:** 2026-07-26, run `phase-reap` — by the driver of that run, after 25 commits.
+
+### Symptom
+
+A driver agent runs `drovr new <run> --worktree`, is told the run lives in `.drovr/wt/<run>` on
+branch `drovr/<run>` — and then keeps working **in the main checkout**. It reads main, runs
+`git status` and `git log` against main, and (if careless) edits main.
+
+Because cwd never moved, every bare git command resolves against the invoking checkout, so the
+driver reports *other agents'* uncommitted files as if they were its own branch's state. During this
+run the repo had **13 worktrees live at once, 7 of them `drovr/*` runs**. A driver that believes
+main's dirt is its own will "clean up" or commit work belonging to someone else.
+
+### Root cause
+
+Two halves, and neither is sufficient on its own.
+
+**1. There is no mechanism.** Nothing in `cli/src` ever changes the caller's directory — no
+`std::env::set_current_dir`, no `chdir`, no `drovr enter`/`drovr cd` subcommand. `drovr new
+--worktree` only *prints* the destination (`drovr: worktree <path> on branch <branch>`,
+`cli/src/main.rs:348`). Nor can it do more: a subprocess cannot change its parent's working
+directory, so a plain CLI cannot close this gap by itself. **That is precisely why the
+documentation has to carry it.**
+
+**2. The docs pointed the other way.** `skills/worktrees/SKILL.md` motivated isolation as "the
+invoking checkout stays clean and usable" and described the worktree as the **run's**. Nothing told
+the driver to leave the invoking checkout, so the natural reading was "the worktree is for the phase
+agents; I stay put." That reading is wrong, and it is the one the text invited.
+
+**This half is now fixed**: the skill says "clean and usable *for other work*", states that the
+driver goes to the worktree too, and carries the move as an explicit step in the flow. Half 1 stands
+— drovr still cannot move anyone.
+
+### Working around it
+
+**`cd` does not work.** In Claude Code the Bash tool's cwd resets to the session's primary working
+directory after every call, so a `cd` in one command is gone by the next.
+
+The mechanism that does work is the harness tool `EnterWorktree({path: ".drovr/wt/<run>"})`, which
+switches the **session's** directory and persists across calls; `ExitWorktree({action})` leaves.
+Neither drovr nor the skill mentioned it until now — `skills/worktrees/SKILL.md` now carries it as
+an explicit driver step.
+
+So: immediately after `drovr new <run> --worktree`, enter the worktree, and do not operate from the
+main checkout for the rest of the run.
+
+### Fix idea
+
+1. Have `drovr new --worktree` print the enter-the-worktree instruction as part of its success line.
+   That print is the one moment the driver is guaranteed to be paying attention, and it is where the
+   path is already in hand.
+2. Add a `drovr path <run>` helper that emits the worktree path alone, so the instruction is
+   copy-pasteable and scriptable rather than something the driver reconstructs from a sentence.
+   **The demand for this is already on the page, and so is the bug:** the pre-token `phase wait`
+   entry above offers `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in `5beb62f`),
+   but there is no `path` subcommand — `drovr path` exits with "unrecognized subcommand", and
+   `cli/src/main.rs`'s `Commands` enum has no `Path` variant — so that command does not run today.
+   Either add the helper or rewrite that line against `<run_dir>`. **Task 7's docs pass owns it**;
+   left unedited here because this change is scoped to the worktree gap.
+
+Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
+making the documented step harder to miss, not a substitute for it.
+
 ## A phase name registered in BOTH lists resolves to the wrong phase — FIXED 2026-07-26
 
 Found by a review subagent during task 1's second fixes round of the phase-reap work; the gap itself
