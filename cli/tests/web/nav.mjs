@@ -433,6 +433,33 @@ check('...so `a` has no row to act on',
 await evaluate(`window.__restoreFetch(); return 1;`);
 await press('Escape');
 
+// A new filter must land the cursor at the top of whatever matches — including
+// when that keystroke's own fetch fails. The reset lives past an `await`, so a
+// rejected fetch skipped it entirely, leaving the anchor on a run the new filter
+// excludes; the cursor then parked and stayed invisible even after recovery.
+await goto('#/', LIST_READY);
+await press('g');
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) return Promise.reject(new Error('boom'));
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('/');
+await typeText('beta');
+await waitFor(() => evaluate(`return document.getElementById('run-list-items').textContent;`),
+  x => x.indexOf('Failed to load sessions') !== -1, 4000, 'the failed filter render');
+await evaluate(`window.__restoreFetch(); return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('a filter typed during a failed fetch still lands the cursor once it recovers',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 1);
+check('...on a row the filter actually matches',
+  (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await press('Escape');
+await waitFor(rowNames, r => r.length > 1, 4000, 'filter cleared');
+
 console.log('\n== session list: the cursor survives a failed fetch ==');
 await goto('#/', LIST_READY);
 await press('g');
@@ -678,6 +705,58 @@ await clickArchive(aTarget);
 await waitFor(rowNames, r => r.indexOf(aTarget) !== -1, 6000, `${aTarget} restored`);
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === false, 4000, 'group collapsed after restore');
+
+// A failed workspace close leaves the run a ZOMBIE: archived, but its panes are
+// still alive, so the server forces `complete: false` and the row deliberately
+// stays in the active list. Advancing the cursor off it — as archiving normally
+// should — walks the selection onto a row that is still on screen, which is the
+// wrong-row class again by a third route.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const zTarget = await cursorName();
+await evaluate(`
+  window.__zArchived = false;
+  window.__zName = ${JSON.stringify(zTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    // The archive POST "succeeds" but reports the workspace could not be closed.
+    if (s.indexOf('/archive') !== -1) {
+      window.__zArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    // ...and the run comes back archived with live panes and complete:false —
+    // exactly what the server emits for a zombie.
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === window.__zName
+              ? Object.assign({}, x, {live: null, archived: window.__zArchived, complete: false})
+              : x;
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the zombie fixture reports unknown liveness', await evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.live : null;`), 'unknown');
+await press('a');
+await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
+await evaluate(`return renderRunList(routeGen);`);
+check('a zombie row stays in the active list', (await rowNames()).indexOf(zTarget) !== -1, true);
+check('...so the cursor stays on it rather than walking to a neighbour',
+  await cursorName(), zTarget);
+await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);

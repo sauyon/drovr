@@ -2033,6 +2033,9 @@ async function toggleArchive(name, archived, live) {
       return;
     }
   }
+  // Set when the archive left the row VISIBLE: the close failed while panes were
+  // live, so the run is a zombie and stays in the active list on purpose.
+  var zombied = false;
   try {
     var r = await fetch('/api/runs/' + encodeURIComponent(name) + '/archive', {
       method: 'POST',
@@ -2047,6 +2050,7 @@ async function toggleArchive(name, archived, live) {
     // server's stderr, which nobody looking at this page can see.
     var res = await r.json().catch(function() { return {}; });
     if (!archived && live !== '0' && res.workspace_closed === false) {
+      zombied = true;
       window.alert('Archived "' + name + '", but its herdr workspace could not be closed.\n\n' +
         'Its panes may still be running. Check with `herdr workspace list`, and close it ' +
         'with `drovr cleanup ' + name + '` once herdr is reachable.');
@@ -2063,7 +2067,11 @@ async function toggleArchive(name, archived, live) {
   // deliberately, rather than letting a stale numeric index drift onto whatever
   // slides into the slot — that drift was the bug, and it merely happened to
   // look right in this one case.
-  if (!archived) advanceCursorPast(name);
+  // Only when the row actually leaves. A zombie stays in the active list by
+  // design (`complete` is forced false server-side while its panes are alive),
+  // so advancing here would walk the cursor off a row that is still on screen —
+  // the same wrong-row class as the collapsed group and the filter, third route.
+  if (!archived && !zombied) advanceCursorPast(name);
   renderRunList(gen);
 }
 
@@ -2199,6 +2207,12 @@ async function renderRunList(gen, resetAnchor) {
     // sees a phantom failure — and if an archive was in flight, reads it as that
     // action having failed.
     if (seq !== listFetchSeq) return;
+    // The reset lives past the `await` above, so a rejected fetch skips it and
+    // the anchor keeps naming a run the new filter excludes — the cursor then
+    // parks and stays invisible even after a later poll succeeds. Apply it here
+    // too: the reviewer asked for a new scope, and whether the fetch happened to
+    // fail is not their concern.
+    if (resetAnchor) { navCursor = 0; navCursorKey = ''; }
     listEl.innerHTML = '<div class="review-empty">Failed to load sessions.</div>';
     applyNavCursor(false);
   }
