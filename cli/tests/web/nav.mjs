@@ -178,6 +178,15 @@ async function goto(hashPath, ready) {
   await send('Page.navigate', { url: BASE + '/' + hashPath });
   await waitFor(ready.probe, ready.ok, 8000, ready.label);
 }
+// A real document reload, unlike `goto`, which only changes the hash. Needed
+// before a test that measures render ORDERING: earlier sections press `a` and
+// click Archive without awaiting those actions' internal chains, so promises from
+// them can still be in flight and touch the cursor mid-measurement — which is
+// exactly how the race test below passed against a deliberately broken build.
+async function reload(ready) {
+  await send('Page.reload', { ignoreCache: false });
+  await waitFor(ready.probe, ready.ok, 8000, ready.label);
+}
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
 const QUESTIONS_READY = { probe: cursorQuestion, ok: q => !!q, label: 'questions panel' };
 
@@ -868,7 +877,9 @@ await evaluate(`window.__restoreFetch(); return 1;`);
 // its promise still resolves. The check then ran against pre-archive DOM, saw the
 // row still present, skipped the hand-off, and the later render parked the cursor
 // forever. Reproduced here by controlling resolution order explicitly.
-await goto('#/', LIST_READY);
+// A clean document: no leftover chains from earlier sections may touch the
+// cursor while this test is measuring who answers the hand-off.
+await reload(LIST_READY);
 await stubConfirm();
 await press('g');
 const raceTarget = await cursorName();
@@ -923,6 +934,67 @@ check('a render losing the staleness race cannot strand the cursor',
   (await cursorName()) !== raceTarget, true);
 check('...and the cursor is on a real, visible row',
   (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (4) Two archives before either repaints. `pendingAdvance` was a single slot, so
+// the second overwrote the first and nothing ever answered for row A — the cursor
+// stayed naming it, and since archived runs remain in knownRunNames, applyNavCursor
+// read that as merely hidden and parked forever. Two ordinary clicks, no
+// adversarial timing: batch-archiving finished sessions does it.
+await reload(LIST_READY);
+await stubConfirm();
+await press('g');
+const firstRow = await cursorName();
+const secondRow = (await rowNames()).filter(n => n !== firstRow)[0];
+await evaluate(`
+  window.__done = {};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    var m = s.match(/\\/api\\/runs\\/([^/]+)\\/archive/);
+    if (m) {
+      window.__done[decodeURIComponent(m[1])] = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return window.__done[x.name]
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+// Archive the row under the cursor, then a different row, before either repaints.
+await press('a');
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the first archive to dispatch its render');
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(secondRow)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the second archive to dispatch its render');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(rowNames, r => r.indexOf(firstRow) === -1, 6000, 'the first row to leave');
+// Both halves matter, and the first is deliberately not just `!== firstRow`: a
+// parked cursor reads as null, which satisfies that on its own.
+check('the first archive is still answered after a second one is started',
+  (await cursorName()) !== null && (await cursorName()) !== firstRow, true);
+check('...and the cursor is on a visible row, not parked',
+  (await cursorName()) !== null && (await rowNames()).indexOf(await cursorName()) !== -1, true);
 await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== opening a run ==');

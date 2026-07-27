@@ -2083,7 +2083,7 @@ async function toggleArchive(name, archived, live) {
   // render dispatched after the POST resolved can have fetched a list reflecting
   // the archive, so earlier ones must not be allowed to answer.
   if (!archived) {
-    pendingAdvance = { name: name, neighbour: neighbour, gen: gen, afterSeq: listFetchSeq };
+    pendingAdvances.push({ name: name, neighbour: neighbour, gen: gen, afterSeq: listFetchSeq });
   }
   renderRunList(gen);
 }
@@ -2223,17 +2223,21 @@ async function renderRunList(gen, resetAnchor) {
     // Resolve a pending archive hand-off, now that rows reflect a list fetched
     // after the archive committed. Whichever render gets here first answers it —
     // this one, the 2s poll, or a filter change — so no ordering can lose it.
-    if (pendingAdvance && seq > pendingAdvance.afterSeq) {
-      if (pendingAdvance.gen === routeGen && navCursorKey === pendingAdvance.name
-          && !isRowVisible(pendingAdvance.name)) {
-        // It really left: hand the cursor to the neighbour captured while the row
-        // was still on screen. Left to `applyNavCursor`, a run that is archived
-        // but still listed reads as merely hidden, and the cursor parks on a row
-        // that is never coming back.
-        navCursorKey = pendingAdvance.neighbour;
-      }
-      // Survived as a zombie, or the reviewer moved on: either way, answered.
-      pendingAdvance = null;
+    if (pendingAdvances.length) {
+      pendingAdvances = pendingAdvances.filter(function(p) {
+        // This render's list was fetched before that archive committed, so it
+        // cannot say whether the row left. Keep waiting.
+        if (seq <= p.afterSeq) return true;
+        if (p.gen === routeGen && navCursorKey === p.name && !isRowVisible(p.name)) {
+          // It really left: hand the cursor to the neighbour captured while the
+          // row was still on screen. Left to `applyNavCursor`, a run that is
+          // archived but still listed reads as merely hidden, and the cursor
+          // parks on a row that is never coming back.
+          navCursorKey = p.neighbour;
+        }
+        // Survived as a zombie, or the reviewer moved on: either way, answered.
+        return false;
+      });
     }
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
@@ -2449,9 +2453,13 @@ var navCursorKey = '';
 // Every run name the last list fetch returned, before filtering. This is what
 // separates "the anchored row is hidden" from "the anchored run is gone" — see
 // applyNavCursor, which needs the reason, not the duration.
-// A row the reviewer archived, waiting on a render fresh enough to say whether it
-// actually left the list. `{name, neighbour, gen, afterSeq}` — see toggleArchive.
-var pendingAdvance = null;
+// Rows the reviewer archived, each waiting on a render fresh enough to say
+// whether it actually left the list. `{name, neighbour, gen, afterSeq}` — see
+// toggleArchive. A LIST, not one slot: archiving a second row before the first
+// repaints is two ordinary clicks, and a single slot silently discarded the
+// first row's hand-off, stranding the cursor on it exactly as the one-shot
+// version did.
+var pendingAdvances = [];
 var knownRunNames = [];
 // Monotonic id for list fetches, so a slow response cannot overwrite a newer one.
 var listFetchSeq = 0;
