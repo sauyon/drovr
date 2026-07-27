@@ -731,6 +731,64 @@ type into live agent panes, approve or cancel specs.
 3. (2) is the smaller change and prevents the dangerous configuration outright; (1) is what
    would make serving across a tailnet actually usable.
 
+## `serve --port 80` locks the reviewer out of every write button
+
+Found 2026-07-26 during review of the archive button. Not fixed — narrow, and it fails closed.
+
+`allowed_hosts_for` (`cli/src/review.rs`) always builds its candidates as `"{host}:{port}"`.
+Browsers omit the port from the `Host` header, and from `location.origin`, when it is the
+scheme's default — 80 for plain HTTP, which is all this server speaks. Bind with `--port 80`
+(needs root or `setcap`, so this is unusual but not impossible for a memorable local URL) and
+every browser request arrives as `Host: <host>` with no `:80`, matching no allowed host. Every
+POST 403s, including from the server's own same-origin page. `wildcard_ip_host` does not
+rescue it: a portless `Host` never matches there either.
+
+Fix shape: when the bound port is 80, also accept the bare host. Left undone because the
+failure is loud, immediate, and safe — nothing is exposed, the buttons simply stop working.
+
+## `save_preserving_archived` rescues one field, and only that field
+
+Found 2026-07-26. Working as designed; recorded so the limit is not mistaken for a guarantee.
+
+`RunState::save_preserving_archived` (`cli/src/run.rs`) re-reads `archived` from disk and
+carries it forward, so a command holding a long-stale state cannot un-archive a run. Every
+*other* field is still written from the snapshot the caller loaded, which for
+`code-review run` or `phase wait` can be the full timeout ago. A concurrent writer touching
+`phases`, `cursor`, `workspace` or `root_pane` in that window is still silently lost. Only
+`archived` is rescued because it is the one field a *different* process sets while we hold
+our copy; the general fix is the compare-and-swap or lockfile already proposed above for the
+`state.json` clobber window.
+
+Two consequences worth knowing:
+
+1. The `|=` merge (rescue false→true, never true→false) is deliberately defensive but
+   currently unreachable: every caller reaching it has `archived == false` in memory, because
+   `code_review_run` refuses archived runs up front. Changing it to `=` passes the whole
+   suite. It is kept as `|=` because a future writer that legitimately holds `true` should
+   not have it cleared, but no test defends that and none can until such a writer exists.
+2. The re-read swallows a load error (`if let Ok(disk)`), then `save` does `create_dir_all`.
+   If `drovr cleanup --purge` deletes the run directory while a review is blocked, the
+   eventual save recreates a `state.json` for a run the human explicitly deleted. This
+   predates the change — plain `save` always did this — but it is now reachable from two more
+   writers.
+
+## A panicking test can poison `ENV_LOCK` for the whole suite
+
+Found 2026-07-26. Pre-existing, not fixed.
+
+`test_util::ENV_LOCK` serialises tests that mutate process-global env. Almost every consumer
+takes it with `.lock().unwrap()`, so the *first* test that panics while holding it poisons the
+mutex and every later consumer panics on acquisition — one real failure becomes ~90
+misleading ones across unrelated modules, which makes root-causing nearly impossible.
+
+Fix shape: `.lock().unwrap_or_else(|e| e.into_inner())` at every consumer. The `herdr.rs`
+helpers already do this. Not done wholesale here because it is a sweep across five files
+unrelated to this change.
+
+Related: the `SystemHerdr::with_bin` seam exists precisely so herdr's own tests need no env
+mutation at all — injecting the binary path beats locking around a global. Prefer that shape
+for new tests rather than adding another `ENV_LOCK` consumer.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**

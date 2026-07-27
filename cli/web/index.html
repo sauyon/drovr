@@ -2056,7 +2056,28 @@ async function toggleArchive(name, archived, live) {
     return;
   }
   if (gen !== routeGen) return;
+  // Archiving hides the row by the reviewer's OWN action, so the cursor should
+  // move on to a neighbour. That is the opposite of a row hidden out from under
+  // them (collapsed group, liveness flap), where `applyNavCursor` parks the
+  // cursor off screen and restores it when the row returns. Re-anchor here,
+  // deliberately, rather than letting a stale numeric index drift onto whatever
+  // slides into the slot — that drift was the bug, and it merely happened to
+  // look right in this one case.
+  if (!archived) advanceCursorPast(name);
   renderRunList(gen);
+}
+
+// Move the anchor off `run` to an adjacent visible row, for when the reviewer
+// themselves removes it from the list. Only the key is set: `applyNavCursor`
+// re-derives the index from it after the rebuild, so it does not matter that
+// every row is about to be replaced.
+function advanceCursorPast(run) {
+  if (currentRun || navCursorKey !== run) return;
+  var rows = navRows(), i = -1;
+  rows.forEach(function(el, n) { if (i < 0 && rowKey(el) === run) i = n; });
+  if (i < 0) return;
+  var next = rows[i + 1] || rows[i - 1];
+  navCursorKey = next ? rowKey(next) : '';
 }
 
 async function renderRunList(gen) {
@@ -2448,7 +2469,24 @@ function applyNavCursor(scroll) {
   // never drift. It also cannot be skewed by how many times this runs per poll,
   // which the previous counter very much was.
   var gone = anchorMissing && knownRunNames.indexOf(navCursorKey) === -1;
-  if (!currentRun && (!anchorMissing || gone)) navCursorKey = rowKey(rows[navCursor]);
+  // "Hidden" splits again, by whether the reviewer did the hiding. A filter is
+  // them narrowing the list, so the cursor follows into what remains — exactly as
+  // it does when they archive a row. Only a row that vanishes out from under them
+  // (Completed group collapsing, a liveness fold) parks the cursor and gets it
+  // back when the row returns.
+  var parked = anchorMissing && !gone && !listFilter;
+  if (!currentRun && !parked) navCursorKey = rowKey(rows[navCursor]);
+  // Holding the KEY is only half of parking. The numeric index still points at
+  // whatever row now occupies that slot, and it — not the key — is what paints
+  // `.nav-cursor` and what `a`/Enter resolve through. Leaving it set showed a
+  // selection on a row the reviewer never chose, and `a` archived that row: a
+  // destructive action on the wrong session.
+  //
+  // A parked cursor simply has no position. -1 matches no index, so nothing
+  // paints and `navRows()[navCursor]` is undefined, which every action handler
+  // already treats as "no row". `moveCursor` brings it back (both j and k clamp
+  // -1 to row 0) and re-anchors the key there.
+  if (!currentRun && parked) navCursor = -1;
   rows.forEach(function(el, i) {
     var on = i === navCursor;
     el.classList.toggle('nav-cursor', on);
@@ -2456,9 +2494,9 @@ function applyNavCursor(scroll) {
     // class is purely visual, and we deliberately do not move DOM focus here.
     if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
   });
-  if (scroll) rows[navCursor].scrollIntoView({ block: 'nearest' });
+  if (scroll && rows[navCursor]) rows[navCursor].scrollIntoView({ block: 'nearest' });
   renderKeyhint();
-  announceCursor(rows[navCursor]);
+  announceCursor(rows[navCursor] || null);
 }
 
 // Mirrors the cursor into a polite live region. Without this the cursor is

@@ -199,7 +199,12 @@ pub fn phase_start<H: Herdr>(
     // focus, disturbing the user. The run's workspace (root pane + every phase
     // pane) is torn down in one shot at the end by `drovr cleanup`
     // (`workspace_close`), once the user confirms.
-    run.save()?;
+    //
+    // `save_preserving_archived`, not `save`: the caller has held this state since
+    // before the pane was launched, and the human may have archived the run from
+    // the web UI in between. Writing a stale `archived: false` back would
+    // un-archive a run whose workspace is already destroyed.
+    run.save_preserving_archived()?;
     Ok(())
 }
 
@@ -269,7 +274,10 @@ pub fn spawn_reviewer<H: Herdr>(
         herdr_session: None,
         pane_id: Some(pane),
     });
-    run.save()?;
+    // Preserving, as in `phase_start`: this runs once per angle inside
+    // `code_review_run`'s spawn loop, each iteration a herdr round trip, so an
+    // Archive click lands here far more easily than the name suggests.
+    run.save_preserving_archived()?;
     Ok(())
 }
 
@@ -467,7 +475,9 @@ pub fn phase_wait<H: Herdr>(
         if marker.exists() {
             let idx = find_phase_idx(run, phase).unwrap();
             run.phases[idx].status = PhaseStatus::Done;
-            run.save()?;
+            // Preserving: this is the longest hold of them all — the wait blocks
+            // for its full timeout before landing here.
+            run.save_preserving_archived()?;
             return Ok(PhaseWaitOutcome::Done);
         }
         // Proactively catch a blocked pane so the driver is signalled immediately

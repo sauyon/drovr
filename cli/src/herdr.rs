@@ -104,17 +104,37 @@ const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// authenticated profile rather than the default `~/.claude` dir.
 const AGENT_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"];
 
-pub struct SystemHerdr;
+pub struct SystemHerdr {
+    /// The `herdr` executable to shell out to. Always plain `"herdr"` (resolved
+    /// via `PATH`) in production; tests point it at a stub instead.
+    ///
+    /// This exists so tests never have to mutate the process-global `PATH`.
+    /// Doing that corrupted unrelated tests: `cargo test` runs the whole binary's
+    /// tests in ONE process, and the ones that shell out to `git` do not take the
+    /// env lock, so they failed with "No such file or directory" whenever they
+    /// overlapped a `PATH`-rewriting test.
+    bin: std::path::PathBuf,
+}
 
 impl SystemHerdr {
     pub fn new() -> Self {
-        Self
+        Self {
+            bin: std::path::PathBuf::from("herdr"),
+        }
+    }
+
+    /// A `SystemHerdr` that shells out to `bin` instead of whatever `PATH` says.
+    /// Test-only: it is the seam that lets the real implementation's failure
+    /// branches be driven without touching global state.
+    #[cfg(test)]
+    pub fn with_bin(bin: impl Into<std::path::PathBuf>) -> Self {
+        Self { bin: bin.into() }
     }
 
     /// Shell out to the `herdr` binary (still used for `integration status` and
     /// `session stop`, which are unchanged in 0.7.5).
     fn run(&self, args: &[&str]) -> io::Result<std::process::Output> {
-        Command::new("herdr").args(args).output()
+        Command::new(&self.bin).args(args).output()
     }
 
     /// Perform one JSON-RPC call over the herdr Unix socket. Writes a single
@@ -473,6 +493,12 @@ pub struct FakeHerdr {
     /// transcripts belong to a specific pane; a test that cares which pane it is
     /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
     read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
+    /// `(call substring, run name)`. The first recorded call containing the
+    /// substring writes `archived: true` into that run's `state.json`, then
+    /// disarms. This models the human clicking Archive in the web UI *while* a
+    /// long-running command holds its own copy of that state — the only way to
+    /// drive that race deterministically from a test.
+    archive_on_call: RefCell<Option<(String, String)>>,
 }
 
 #[cfg(test)]
@@ -489,6 +515,7 @@ impl FakeHerdr {
             fail_agent_send: RefCell::new(false),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
+            archive_on_call: RefCell::new(None),
         }
     }
 
@@ -545,8 +572,26 @@ impl FakeHerdr {
         *self.fail_pane_run.borrow_mut() = true;
     }
 
+    /// Arm the concurrent-archive hook: the next recorded call containing
+    /// `needle` archives run `run` on disk. See [`FakeHerdr::archive_on_call`].
+    pub fn archive_on_call(&self, needle: &str, run: &str) {
+        *self.archive_on_call.borrow_mut() = Some((needle.to_owned(), run.to_owned()));
+    }
+
     fn record(&self, call: String) {
-        self.calls.borrow_mut().push(call);
+        self.calls.borrow_mut().push(call.clone());
+        // Borrow, clone, drop — the write below re-enters nothing, but holding a
+        // RefCell borrow across it would be a latent panic.
+        let armed = self.archive_on_call.borrow().clone();
+        if let Some((needle, run)) = armed
+            && call.contains(&needle)
+        {
+            *self.archive_on_call.borrow_mut() = None;
+            if let Ok(mut s) = crate::run::RunState::load(&run) {
+                s.archived = true;
+                s.save().expect("hook: archive the run on disk");
+            }
+        }
     }
 
     fn next_id(&self) -> String {
@@ -679,13 +724,21 @@ impl Herdr for FakeHerdr {
 mod tests {
     use super::*;
 
-    /// Run `f` against a real [`SystemHerdr`] with a stub `herdr` first on `PATH`
-    /// that prints `stdout` and exits `code`.
+    /// Run `f` against a real [`SystemHerdr`] wired to a stub `herdr` that prints
+    /// `stdout` and exits `code`.
     ///
     /// `FakeHerdr` cannot cover this: it *is* the stand-in, so it can never show
     /// that `SystemHerdr` — the only impl that talks to the daemon — honours the
-    /// unknown-vs-empty and biased-toward-alive contracts. `PATH` is prepended
-    /// rather than replaced so the `git` other tests shell out to still resolves.
+    /// unknown-vs-empty and biased-toward-alive contracts.
+    ///
+    /// The stub is injected via [`SystemHerdr::with_bin`] rather than by putting it
+    /// on `PATH`. Two earlier versions of this helper got that wrong: one relied on
+    /// `execvp` refusing a non-executable `PATH` entry (it skips it and keeps
+    /// searching, so the test silently ran against the developer's real herdr), and
+    /// the replacement mutated the process-global `PATH`, which broke unrelated
+    /// tests that shell out to `git` without taking the env lock. Injection touches
+    /// no global state, so these tests are safe under `cargo test`'s parallelism and
+    /// need no lock at all.
     #[cfg(unix)]
     fn with_stub_herdr<T>(stdout: &str, code: i32, f: impl FnOnce(&SystemHerdr) -> T) -> T {
         use std::os::unix::fs::PermissionsExt;
@@ -695,73 +748,42 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("herdr");
-        // `echo` is a shell BUILTIN, deliberately: an external `cat` would have to be
-        // found on the very PATH this helper is rewriting, so the stub would break
-        // whenever it ran alongside `with_no_herdr_on_path`.
-        std::fs::write(&bin, format!("#!/bin/sh\necho '{stdout}'\nexit {code}\n")).unwrap();
+        let ran = tmp.path().join("ran");
+        // `:> ran` records that the stub really executed, so a test cannot pass by
+        // silently failing to invoke it — the exact way the first version broke.
+        // Both `:` and the redirect are shell builtins, needing nothing from PATH.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n:> '{}'\necho '{stdout}'\nexit {code}\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        with_herdr_path(tmp.path(), true, f)
-    }
-
-    /// Run `f` with NO `herdr` anywhere on `PATH`, so `Command::output` fails to
-    /// launch it at all — a branch distinct from "ran and exited nonzero", and the
-    /// only way to reach `pane_exists`'s catch-all arm.
-    ///
-    /// `PATH` is REPLACED, not prepended. An earlier version of this helper instead
-    /// put a non-executable stub first on `PATH`, which does not work: `execvp`
-    /// skips a `PATH` entry it cannot execute and keeps searching, so it silently
-    /// fell through to the developer's real herdr binary and the test passed
-    /// against a live daemon rather than against a missing one.
-    #[cfg(unix)]
-    fn with_no_herdr_on_path<T>(f: impl FnOnce(&SystemHerdr) -> T) -> T {
-        let tmp = tempfile::tempdir().unwrap();
-        with_herdr_path(tmp.path(), false, f)
-    }
-
-    /// Point `PATH` at `dir` — prepended to the existing `PATH` when `prepend`,
-    /// otherwise replacing it outright — run `f` against a real [`SystemHerdr`],
-    /// then restore `PATH`.
-    ///
-    /// The new `PATH` is composed *under the lock*. Reading the old one outside it
-    /// races with the helper that replaces `PATH` wholesale: a stub could end up
-    /// prepended to an empty `PATH` and lose access to everything it needs.
-    #[cfg(unix)]
-    fn with_herdr_path<T>(
-        dir: &std::path::Path,
-        prepend: bool,
-        f: impl FnOnce(&SystemHerdr) -> T,
-    ) -> T {
-        // `into_inner` on poison: one unrelated panicking test must not cascade
-        // into every test that touches the env.
-        let _lock = crate::test_util::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let saved = std::env::var_os("PATH");
-        let path = match (prepend, &saved) {
-            (true, Some(p)) => format!("{}:{}", dir.display(), p.to_string_lossy()),
-            _ => dir.display().to_string(),
-        };
-        unsafe {
-            std::env::set_var("PATH", path);
-        }
-        // Call under the modified PATH, assert *outside* it: a panic here would
-        // leave PATH clobbered for every later test in this process.
-        let out = f(&SystemHerdr::new());
-        unsafe {
-            match saved {
-                Some(p) => std::env::set_var("PATH", p),
-                None => std::env::remove_var("PATH"),
-            }
-        }
+        let out = f(&SystemHerdr::with_bin(&bin));
+        assert!(
+            ran.exists(),
+            "the stub herdr was never executed — this test is not testing what it claims"
+        );
         out
+    }
+
+    /// Run `f` against a [`SystemHerdr`] pointed at a path that does not exist, so
+    /// `Command::output` fails to launch it at all — a branch distinct from "ran and
+    /// exited nonzero", and the only way to reach `pane_exists`'s catch-all arm.
+    #[cfg(unix)]
+    fn with_missing_herdr<T>(f: impl FnOnce(&SystemHerdr) -> T) -> T {
+        let tmp = tempfile::tempdir().unwrap();
+        f(&SystemHerdr::with_bin(tmp.path().join("herdr-does-not-exist")))
     }
 
     #[test]
     #[cfg(unix)]
     fn an_unreachable_herdr_reports_unknown_liveness_and_assumes_panes_alive() {
-        // Daemon down: nonzero exit, nothing parseable on stdout.
+        // herdr is installed and runs, but the daemon is down: nonzero exit,
+        // nothing parseable on stdout.
         let (live, alive) = with_stub_herdr("", 1, |h| (h.workspace_list(), h.pane_exists("w1:p1")));
 
         assert_eq!(
@@ -779,10 +801,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_herdr_that_cannot_be_launched_is_unknown_and_assumes_panes_alive() {
-        // No herdr on PATH at all: `Command::output` fails to launch. A DIFFERENT
-        // branch from "ran and exited nonzero" — `pane_exists`'s catch-all
-        // `_ => true` is only reachable this way.
-        let (live, alive) = with_no_herdr_on_path(|h| (h.workspace_list(), h.pane_exists("w1:p1")));
+        // The binary is not there at all, so `Command::output` fails to launch it.
+        // A DIFFERENT branch from "ran and exited nonzero" — `pane_exists`'s
+        // catch-all `_ => true` is only reachable this way.
+        let (live, alive) = with_missing_herdr(|h| (h.workspace_list(), h.pane_exists("w1:p1")));
 
         assert_eq!(
             live, None,

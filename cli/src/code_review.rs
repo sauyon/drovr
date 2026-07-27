@@ -741,6 +741,28 @@ mod tests {
     }
 
     #[test]
+    fn archiving_mid_run_survives_every_save_the_review_makes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-archive-mid-run");
+        write_base(&run, "task-1");
+        run.save().unwrap();
+
+        // The human clicks Archive in the web UI while reviewers are being
+        // spawned — i.e. after `code_review_run`'s entry guard has already passed
+        // and while it holds a copy of the state that still says `archived: false`.
+        h.archive_on_call("tab_create", "cr-archive-mid-run");
+
+        let _ = code_review_run(&h, &mut run, "task-1", 40, false);
+
+        assert!(
+            RunState::load("cr-archive-mid-run").unwrap().archived,
+            "no save made by a review pass may un-archive a run the human filed \
+             away mid-flight — its workspace is already destroyed"
+        );
+    }
+
+    #[test]
     fn rerun_after_timeout_resumes_the_same_iter_without_respawning() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();

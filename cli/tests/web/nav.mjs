@@ -326,6 +326,15 @@ check('collapsing the group does not steal the selection',
 for (let i = 0; i < 5; i++) await evaluate(`return renderRunList(routeGen);`);
 check('...and it still is not stolen after repeated polls',
   await evaluate(`return navCursorKey;`), insideGroup);
+// Holding the KEY is only half of it. While the anchored row is off screen the
+// cursor has no on-screen position, so nothing may be painted as selected and no
+// key may resolve to a row. Keeping the numeric index instead silently repainted
+// the cursor onto whatever row slid into that slot — and `a` then archived THAT
+// run: a destructive action on a session the reviewer never selected.
+check('...and no visible row is marked selected while the anchor is hidden',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 0);
+check('...and no row resolves under the cursor while the anchor is hidden',
+  await evaluate(`var r = navRows()[navCursor]; return r ? rowKey(r) : null;`), null);
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === true, 4000, 'group reopened');
 check('...so reopening the group restores the cursor to it',
