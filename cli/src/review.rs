@@ -825,11 +825,30 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
             "application/json",
             serde_json::json!({
                 "ok": true,
+                "complete": true,
                 "phase": phase,
                 // The CLI's own line, which distinguishes "resumed with its
                 // session" from "relaunched and reseeded" — the difference the
                 // human actually cares about.
                 "detail": String::from_utf8_lossy(&o.stdout).trim(),
+            })
+            .to_string(),
+        ),
+        // ⚠️ Exit 2 is the CLI's "the pane is back, but the agent was NOT given
+        // this phase's context". It must NOT flatten into either bucket: a 500
+        // would claim nothing happened (a pane really was created and recorded),
+        // and a plain `ok: true` would let a caller checking only the status
+        // treat an agent that never received its seed as fully recovered. 200
+        // with `complete: false`, and the note on stderr says what to do.
+        Ok(o) if o.status.code() == Some(2) => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({
+                "ok": true,
+                "complete": false,
+                "phase": phase,
+                "detail": String::from_utf8_lossy(&o.stderr).trim(),
             })
             .to_string(),
         ),

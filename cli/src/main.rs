@@ -150,6 +150,11 @@ enum PhaseCmd {
     /// Bring back a phase whose pane is gone, RESUMING its recorded agent
     /// session where the backend offers one (`claude --resume <id>`).
     ///
+    /// Exit 0 = the pane is back AND the agent has this phase's context (its
+    /// session was resumed, or its seed was re-sent). Exit 2 = the pane is back
+    /// but the agent was NOT given its context — treat it like `phase send`'s
+    /// exit 2 and act, never as success. Exit 1 = refused or failed.
+    ///
     /// A fresh tab in the run's project dir, launched under the profile the
     /// phase originally ran with. When no session was captured — or the backend
     /// has no resume surface — a fresh agent is launched instead and the
@@ -549,6 +554,48 @@ fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
              phase with: drovr phase start {} <phase>",
             shell_single_quote(name),
         )),
+    }
+}
+
+/// Where a line goes and what it costs: stdout+exit 0, or stderr+a code.
+#[derive(Debug, PartialEq, Eq)]
+struct Report {
+    code: i32,
+    to_stderr: bool,
+    line: String,
+}
+
+/// How a [`RehydrateOutcome`] is reported — the DECISION, split from the
+/// printing and the `process::exit` so a test can reach it. Task 4's handoff
+/// §3d: a decision that is tested while what the caller does with it is not is
+/// how two halves come to contradict each other undetected.
+///
+/// **`Relaunched` is exit 2, not 0.** The pane is back, but the agent in it was
+/// never given this phase's context — no seed was recorded, it could not be
+/// delivered, or the agent never became ready. `phase send` already reserves
+/// exit 2 for exactly that ("so the driver can escalate rather than assume the
+/// seed landed"), and a driver that only checks the status would otherwise run
+/// `phase wait` against an agent nobody ever told what to do.
+fn rehydrate_report(phase: &str, outcome: &RehydrateOutcome) -> Report {
+    match outcome {
+        RehydrateOutcome::Resumed => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!("phase '{phase}' resumed with its recorded session"),
+        },
+        RehydrateOutcome::Reseeded => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "phase '{phase}' relaunched — its session was not recoverable, so a fresh \
+                 agent was seeded from the handoff"
+            ),
+        },
+        RehydrateOutcome::Relaunched { note } => Report {
+            code: 2,
+            to_stderr: true,
+            line: format!("drovr: phase '{phase}' relaunched INCOMPLETE — {note}"),
+        },
     }
 }
 
@@ -1044,17 +1091,18 @@ fn cmd_phase(sub: PhaseCmd) {
             }
             let mut state = load_run(&run);
             match phase_rehydrate(&h, &mut state, &phase_name) {
-                Ok(RehydrateOutcome::Resumed) => {
-                    println!("phase '{phase_name}' resumed with its recorded session")
-                }
-                Ok(RehydrateOutcome::Reseeded) => println!(
-                    "phase '{phase_name}' relaunched — its session was not recoverable, so a \
-                     fresh agent was seeded from the handoff"
-                ),
-                // stdout, not stderr: the pane IS back, which is what was asked
-                // for. The note says what did not happen and how to finish it.
-                Ok(RehydrateOutcome::Relaunched { note }) => {
-                    println!("phase '{phase_name}' relaunched — {note}")
+                // The decision lives in `rehydrate_report`; this is only the
+                // doing. See there for why an incomplete rehydrate exits 2.
+                Ok(outcome) => {
+                    let r = rehydrate_report(&phase_name, &outcome);
+                    if r.to_stderr {
+                        eprintln!("{}", r.line);
+                    } else {
+                        println!("{}", r.line);
+                    }
+                    if r.code != 0 {
+                        process::exit(r.code);
+                    }
                 }
                 Err(e) => {
                     eprintln!("drovr: phase rehydrate failed: {e}");
@@ -1840,12 +1888,51 @@ mod tests {
     }
 
     #[test]
+    fn an_incomplete_rehydrate_never_reports_as_success() {
+        use phase::RehydrateOutcome::*;
+        // The failure class `docs/known-issues.md` keeps recording: a driver
+        // reads an exit code as success and carries on. A rehydrate that
+        // brought the pane back but never gave the agent its context is NOT
+        // success — a `phase wait` after it would block on an agent nobody told
+        // what to do — and `phase send` already reserves exit 2 for exactly
+        // this. Assert the code AND the stream: a driver reads one, a human the
+        // other.
+        let done = rehydrate_report("plan", &Resumed);
+        assert_eq!(done.code, 0);
+        assert!(!done.to_stderr);
+        assert!(done.line.contains("resumed with its recorded session"), "{done:?}");
+
+        let seeded = rehydrate_report("plan", &Reseeded);
+        assert_eq!(seeded.code, 0, "a reseeded agent DID get its context");
+        assert!(!seeded.to_stderr);
+
+        let partial = rehydrate_report(
+            "plan",
+            &Relaunched {
+                note: "its seed was NOT re-sent".into(),
+            },
+        );
+        assert_eq!(
+            partial.code, 2,
+            "the pane is back but the agent was never told what it is doing: {partial:?}"
+        );
+        assert!(partial.to_stderr, "{partial:?}");
+        assert!(partial.line.contains("INCOMPLETE"), "{partial:?}");
+        assert!(partial.line.contains("its seed was NOT re-sent"), "{partial:?}");
+    }
+
+    #[test]
     fn attach_offers_a_rehydrate_when_a_phase_was_reaped() {
         // The counterpart to the assertion above: once a pane HAS been closed,
         // the refusal has somewhere to send the user.
         use crate::run::PhaseStatus::Done;
         let mut run = attach_run(vec![("brainstorm", Done, None), ("plan", Done, None)], Some("ws-77:root"));
         run.workspace = Some("ws-77".into());
+        // BOTH reaped, so "picks the last" is a real assertion rather than
+        // "picks the only one" — the run has moved past brainstorm, and that is
+        // the phase a human losing their pane is asking about.
+        run.phases[0].set_pane("ws-77:p1");
+        run.phases[0].mark_reaped();
         run.phases[1].set_pane("ws-77:p9");
         run.phases[1].mark_reaped();
 
@@ -1857,8 +1944,8 @@ mod tests {
             msg.contains("drovr phase rehydrate 'r' 'plan'"),
             "must name the run AND the phase, ready to paste: {msg}"
         );
-        // The LAST reaped phase, not the first: `brainstorm` was never reaped
-        // here, and even if it had been, `plan` is where the run got to.
+        // The LAST reaped phase, not the first — both are reaped, and `plan` is
+        // where the run got to.
         assert!(!msg.contains("'brainstorm'"), "{msg}");
         // It is an addition, not a replacement — starting a new phase is still
         // the answer for someone who does not want the old one back.

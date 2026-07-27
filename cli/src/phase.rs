@@ -797,15 +797,19 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             io::ErrorKind::AlreadyExists,
             format!(
                 "phase '{}/{phase}' still holds pane {pane}; rehydrate brings back a phase \
-                 whose pane is gone. Attach to that pane instead: herdr agent attach {quoted}",
+                 whose pane is gone. Look at that pane instead: herdr pane read {quoted} \
+                 (or herdr agent attach {quoted}, if an agent is still attached to it)",
                 run.name,
-                // NOT `drovr attach <run>`: that resolves through
+                // `herdr pane read`, not `drovr attach <run>`: the latter resolves through
                 // `RunState::live_agent_pane`, which skips `Done` phases on
                 // purpose — and a `Done` phase is exactly what rehydrate is
                 // usually asked about. It would attach to a DIFFERENT phase, or
                 // (on a finished run) refuse outright, contradicting the pane
                 // this very message just named. The pane id is in hand, so name
-                // it.
+                // it. And `read` rather than `agent attach`, because nothing
+                // clears `pane_id` when an agent exits (that is task 6's job),
+                // so the pane this names may well have no agent on it —
+                // `herdr agent attach` would answer `agent_not_found`.
                 quoted = shell_single_quote(pane),
             ),
         ));
@@ -893,9 +897,16 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     let fresh_backend = recorded
         .map(|a| a.backend().to_owned())
         .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
-    let fresh_profile = recorded
-        .and_then(|a| a.profile().map(str::to_owned))
-        .or_else(agent_profile_env);
+    // The RECORDED profile or nothing — deliberately NOT falling back to
+    // `agent_profile_env()`. This process may be the review server, a long-lived
+    // daemon whose `CLAUDE_CONFIG_DIR` has nothing to do with the account this
+    // run's agents authenticate as; letting it decide is the very thing
+    // `rehydrate_uses_the_recorded_profile_not_the_servers_environment` exists
+    // to forbid, and the fallback would have applied it on exactly the path with
+    // the least information. `None` means the default profile, which is what a
+    // phase recording no profile was launched under — an honest unknown, not a
+    // guess (see `PhaseAgent::profile`, and task 3's handoff §5.8).
+    let fresh_profile = recorded.and_then(|a| a.profile().map(str::to_owned));
 
     let cwd = run.project_dir.clone();
     let cfg = load_config()?;
@@ -1010,9 +1021,11 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         };
         return Ok(RehydrateOutcome::Relaunched {
             note: format!(
-                "the fresh agent for phase '{phase}' did not become ready within {waited}, so \
-                 its seed was NOT re-sent — it is likely parked on a first-run or permission \
-                 prompt. Look at pane {pane} (herdr agent attach {quoted_pane}), then \
+                "the fresh agent for phase '{phase}' did not become ready within {waited} on \
+                 pane {pane}, so its seed was NOT re-sent. It may be parked on a first-run or \
+                 permission prompt, or it may never have attached at all. Look with \
+                 herdr pane read {quoted_pane} — that works either way, where \
+                 `herdr agent attach` needs an agent to already be there — then \
                  `drovr phase send {run_name} {phase} …`",
                 run_name = run.name,
                 // The pane by name, not `drovr attach <run>` — see the refusal
@@ -6744,9 +6757,6 @@ mod rehydrate_tests {
 
         phase_rehydrate(&h, &mut run, "plan").unwrap();
         let launch = pane_run_call(&h);
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
         assert!(
             launch.contains("CLAUDE_CONFIG_DIR='/tmp/the-phases-profile'"),
             "{launch}"
@@ -6754,6 +6764,27 @@ mod rehydrate_tests {
         assert!(
             !launch.contains("the-servers-profile"),
             "the process env must not leak in: {launch}"
+        );
+
+        // …and the same holds on the RESEED path, which has the LEAST recorded
+        // information and so is the most tempting place to fall back to the
+        // process environment. A phase that recorded no profile ran under the
+        // DEFAULT one; inheriting the daemon's would silently move a reseeded
+        // agent onto a different account from every other phase in the run.
+        let h2 = FakeHerdr::new();
+        let mut p = reaped_phase("replan", "claude", None, None); // no profile, no session
+        p.handoff_doc = Some("/tmp/seed.md".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        phase_rehydrate(&h2, &mut run, "replan").unwrap();
+        let relaunch = pane_run_call(&h2);
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        assert!(
+            !relaunch.contains("CLAUDE_CONFIG_DIR"),
+            "a phase that recorded no profile is launched under the DEFAULT one, \
+             not under whatever this process happens to hold: {relaunch}"
         );
     }
 
@@ -6902,7 +6933,7 @@ mod rehydrate_tests {
         // phases, i.e. exactly the ones rehydrate is asked about. It would
         // attach to a different phase, or deny any pane exists at all.
         assert!(
-            err.to_string().contains("herdr agent attach 'ws-rh:p7'"),
+            err.to_string().contains("herdr pane read 'ws-rh:p7'"),
             "the refusal must name the pane it is talking about: {err}"
         );
         assert!(
@@ -6979,8 +7010,8 @@ mod rehydrate_tests {
         };
         assert!(note.contains(&pane), "must name the pane it created: {note}");
         assert!(
-            note.contains(&format!("herdr agent attach '{pane}'")),
-            "ready to paste: {note}"
+            note.contains(&format!("herdr pane read '{pane}'")),
+            "ready to paste, and readable even if no agent ever attached: {note}"
         );
         assert!(
             !note.contains("drovr attach"),
@@ -6994,6 +7025,39 @@ mod rehydrate_tests {
             "nothing was sent to an agent that never became ready: {:?}",
             h.calls()
         );
+    }
+
+    #[test]
+    fn a_failed_reseed_launch_does_not_strand_its_tab_either() {
+        // The launch-failure path was only covered on the RESUMING branch. The
+        // reseed branch reaches `tab_create` through different code (it has
+        // already replaced the agent record), and it must dispose of its orphan
+        // the same way — a pane drovr opened and never recorded is one cleanup
+        // protects as the human's, forever, while it blocks `workspace_close`.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-reseed-failed");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, None)); // no session → reseed
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+
+        assert!(phase_rehydrate(&h, &mut run, "plan").is_err());
+
+        let tab = h
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("tab_create"))
+            .expect("it got as far as making a tab");
+        let pane = tab.rsplit("-> ").next().unwrap().to_owned();
+        let on_disk = RunState::load("rh-reseed-failed").unwrap();
+        assert!(
+            on_disk.retired_panes.contains(&pane),
+            "the orphan must stay recorded as drovr's: {:?}",
+            on_disk.retired_panes
+        );
+        assert!(on_disk.find_phase("plan").unwrap().is_reaped(), "still reaped");
+        assert_eq!(on_disk.find_phase("plan").unwrap().pane_id(), None);
     }
 
     #[test]
@@ -7032,7 +7096,21 @@ mod rehydrate_tests {
         run.phases[0].set_pane("legacy-pane");
         run.phases[0].mark_reaped();
         run.phases[0].clear_pane_agent_for_test();
+        // `run.agent` is the ONLY backend such a phase can be relaunched under —
+        // there is no agent record to read one from. Set it to something that is
+        // NOT the built-in default, or "falls back to run.agent" and "hardcodes
+        // claude" are the same assertion.
+        run.agent = Some("cursor".into());
         assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
+        let launch = pane_run_call(&h);
+        assert!(
+            launch.contains("agent --workspace"),
+            "the run's backend decides, not a hardcoded claude: {launch}"
+        );
+        assert!(
+            !launch.contains("claude"),
+            "no trace of the default backend: {launch}"
+        );
     }
 
     #[test]

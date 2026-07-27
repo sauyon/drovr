@@ -2138,8 +2138,11 @@ async function pollAgents(gen) {
             }
             // `detail` is the CLI's own line, and it is the whole point: it
             // distinguishes "resumed with its session" from "relaunched, and
-            // the seed was NOT re-sent" — both of which are HTTP 200.
-            agentsNote(res.body.detail || ('Rehydrated ' + phase), false);
+            // the seed was NOT re-sent" — both of which are HTTP 200. The
+            // second is flagged, because a pane that is back but was never told
+            // what it is doing is not a success the user should scroll past.
+            agentsNote(res.body.detail || ('Rehydrated ' + phase),
+                       res.body.complete === false);
             // Refresh now rather than waiting out the 2s tick, and cancel the
             // pending one so the two chains don't both keep polling.
             if (agentsTimer) clearTimeout(agentsTimer);

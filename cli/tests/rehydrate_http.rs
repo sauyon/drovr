@@ -138,3 +138,60 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     let after = fs::read_to_string(run_dir.join("state.json")).expect("state.json still there");
     assert!(after.contains("\"reaped\":true"), "{after}");
 }
+
+/// A rehydrate that cannot finish must not exit 0, end to end through the real
+/// binary.
+///
+/// **Scope, stated honestly:** this drives the *refusal* path (no herdr to make
+/// a tab in), not the `Relaunched` one — reaching that needs a live herdr and a
+/// real agent that fails to become ready, which no test here can arrange. The
+/// outcome→exit mapping itself is pinned by
+/// `main::tests::an_incomplete_rehydrate_never_reports_as_success`, which is
+/// where a mutation of the exit code dies. What this adds is that the mapping is
+/// actually reached: the real CLI, spawned as a subprocess, does exit non-zero
+/// and leaves the phase alone.
+#[test]
+fn a_rehydrate_that_cannot_finish_does_not_exit_zero() {
+    let tmp = tempfile::Builder::new()
+        .prefix("drovr-rehydrate-exit-")
+        .tempdir()
+        .expect("tempdir");
+    let xdg = tmp.path().join("xdg");
+    let run_dir = xdg.join("drovr").join("runs").join("rh");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    // A reaped phase with a workspace but NO herdr running: `tab_create` fails,
+    // so this exercises the refusal/exit plumbing rather than a real launch.
+    // What matters here is only that a NON-completing outcome never exits 0.
+    fs::write(
+        run_dir.join("state.json"),
+        r#"{"name":"rh","task":"t","gate":"spec","cursor":0,"project_dir":"/tmp",
+"phases":[{"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,
+"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude"}}]}"#,
+    )
+    .expect("state.json");
+
+    let out = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_drovr")))
+        .args(["phase", "rehydrate", "rh", "brainstorm"])
+        .env("XDG_DATA_HOME", &xdg)
+        .env("HERDR_SOCKET_PATH", xdg.join("no-such-herdr.sock"))
+        .output()
+        .expect("run drovr phase rehydrate");
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a rehydrate that did not finish the job must never look like success. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // And the phase is still reaped, so a retry starts from the same place.
+    // Parsed, not substring-matched: the CLI rewrites `state.json` pretty-printed
+    // (it persists the new pass before it touches herdr), so the compact spelling
+    // this fixture was written with is not what comes back.
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).expect("state.json"))
+            .expect("state.json stays valid JSON");
+    assert_eq!(after["phases"][0]["reaped"], true, "{after}");
+    assert!(after["phases"][0]["pane_id"].is_null(), "{after}");
+}

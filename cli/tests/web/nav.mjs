@@ -487,21 +487,34 @@ const agentsNoteText = () => evaluate(`
   return { text: e.textContent, bad: e.classList.contains('bad'), shown: e.style.display !== 'none' };`);
 
 check('⟳ posts to the run-scoped rehydrate endpoint',
-  await stubbedClick(true, { ok: true, phase: 'brainstorm',
-    detail: "phase 'brainstorm' relaunched — its seed was NOT re-sent" }),
+  await stubbedClick(true, { ok: true, complete: false, phase: 'brainstorm',
+    detail: "phase 'brainstorm' relaunched INCOMPLETE — its seed was NOT re-sent" }),
   { url: '/api/runs/delta-idle/rehydrate?phase=brainstorm', method: 'POST' });
 // A rehydrate that could not deliver the seed is an HTTP 200. If the page drops
 // the body, the user sees the ⟳ vanish and never learns the agent is blank.
 await waitFor(agentsNoteText, n => n.text.indexOf('NOT re-sent') !== -1, 8000,
   'the outcome detail to be shown');
-check('a 200 that did not do everything still says so', (await agentsNoteText()).bad, false);
+// …and it must READ as a problem. `complete: false` means the pane came back
+// but the agent was never told what it is doing — not a success to scroll past.
+check('an incomplete rehydrate is flagged, not reported as plain success',
+  (await agentsNoteText()).bad, true);
+
+// The control: a rehydrate that DID everything must not be flagged, or "flag
+// everything" would pass the check above.
+const enabledButton = () => evaluate(`
+  var b = document.querySelector('#agents-tree .agent-rehydrate');
+  return !!b && !b.disabled;`);
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
+await stubbedClick(true, { ok: true, complete: true, phase: 'brainstorm',
+  detail: "phase 'brainstorm' resumed with its recorded session" });
+await waitFor(agentsNoteText, n => n.text.indexOf('resumed with') !== -1, 8000,
+  'the success detail');
+check('a complete rehydrate is NOT flagged', (await agentsNoteText()).bad, false);
 
 // Wait for a button that is ENABLED, not merely present: the click above left
 // the old element disabled on purpose, and clicking a disabled button is a
 // silent no-op — the next check would then assert against the previous note.
-await waitFor(() => evaluate(`
-  var b = document.querySelector('#agents-tree .agent-rehydrate');
-  return !!b && !b.disabled;`), v => v === true, 8000, 'the tree to re-render');
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
 check('a failed rehydrate reports the reason the server gave, not just a status code',
   await (async () => {
     await stubbedClick(false, { ok: false, error: 'run has no herdr workspace' });

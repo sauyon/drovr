@@ -909,6 +909,20 @@ mod tests {
         )
         .unwrap();
         assert!(load_config().is_err(), "an empty resume_flag must be rejected");
+
+        // BOTH keys are checked, not just the first. An empty subcommand
+        // composes `<command>  '<id>'` — the id as a positional argument —
+        // which is its own kind of wrong.
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.codex]\ncommand = \"codex\"\nresume_subcommand = \"   \"\n",
+        )
+        .unwrap();
+        let err = load_config().expect_err("an empty resume_subcommand must be rejected");
+        assert!(
+            err.to_string().contains("resume_subcommand"),
+            "the error must name the key at fault: {err}"
+        );
     }
 
     #[test]
