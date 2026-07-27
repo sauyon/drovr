@@ -570,9 +570,10 @@ struct Report {
 /// §3d: a decision that is tested while what the caller does with it is not is
 /// how two halves come to contradict each other undetected.
 ///
-/// **`Relaunched` is exit 2, not 0.** The pane is back, but the agent in it was
-/// never given this phase's context — no seed was recorded, it could not be
-/// delivered, or the agent never became ready. `phase send` already reserves
+/// **`Incomplete` is exit 2, not 0.** The pane is back, but the agent in it was
+/// not confirmed to have this phase's context — it never became ready (so a
+/// resume was never confirmed, or a seed never sent), there was no seed
+/// recorded, or the delivery failed. `phase send` already reserves
 /// exit 2 for exactly that ("so the driver can escalate rather than assume the
 /// seed landed"), and a driver that only checks the status would otherwise run
 /// `phase wait` against an agent nobody ever told what to do.
@@ -591,7 +592,7 @@ fn rehydrate_report(phase: &str, outcome: &RehydrateOutcome) -> Report {
                  agent was seeded from the handoff"
             ),
         },
-        RehydrateOutcome::Relaunched { note } => Report {
+        RehydrateOutcome::Incomplete { note } => Report {
             code: 2,
             to_stderr: true,
             line: format!("drovr: phase '{phase}' relaunched INCOMPLETE — {note}"),
@@ -1908,7 +1909,7 @@ mod tests {
 
         let partial = rehydrate_report(
             "plan",
-            &Relaunched {
+            &Incomplete {
                 note: "its seed was NOT re-sent".into(),
             },
         );

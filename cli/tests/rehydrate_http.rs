@@ -91,7 +91,9 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
         run_dir.join("state.json"),
         r#"{"name":"rh","task":"t","gate":"spec","cursor":0,"project_dir":"","phases":[
 {"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,
- "reaped":true,"pane_agent":{"backend":"claude","session":"sess-http"}}]}"#,
+ "reaped":true,"pane_agent":{"backend":"claude","session":"sess-http"}},
+{"name":"-weird","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,
+ "reaped":true,"pane_agent":{"backend":"claude"}}]}"#,
     )
     .expect("state.json");
 
@@ -133,6 +135,26 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     let (status, _) = http_post(&addr, "/api/runs/rh/rehydrate?phase=nope");
     assert_eq!(status, 404);
 
+    // A dash-led phase name must not be parsed as a FLAG by the spawned CLI.
+    // `-weird` IS in this run, so every pre-spawn check passes and the request
+    // really reaches `Command::new(exe)`. clap exits 2 on a usage error and the
+    // handler reads exit 2 as "the pane is back but incomplete" — so without the
+    // `--` in the shell-out this answers 200 `complete:false` for a request that
+    // created nothing at all. With it, the CLI parses the name as a value and
+    // fails for the honest reason (no project_dir) → 500.
+    let (status, body) = http_post(&addr, "/api/runs/rh/rehydrate?phase=-weird");
+    assert!(
+        !body.contains("unexpected argument"),
+        "the name must reach the CLI as a value, not as a flag: {body}"
+    );
+    assert_eq!(status, 500, "a spawn that created nothing is not a 200: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(json["ok"], false, "{body}");
+    assert!(
+        json["error"].as_str().unwrap_or("").contains("project_dir"),
+        "the CLI's own diagnosis, for the real reason: {body}"
+    );
+
     // …and nothing the request did wrote state.json: the CLI refused before
     // mutating, and the handler never writes at all.
     let after = fs::read_to_string(run_dir.join("state.json")).expect("state.json still there");
@@ -143,7 +165,7 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
 /// binary.
 ///
 /// **Scope, stated honestly:** this drives the *refusal* path (no herdr to make
-/// a tab in), not the `Relaunched` one — reaching that needs a live herdr and a
+/// a tab in), not the `Incomplete` one — reaching that needs a live herdr and a
 /// real agent that fails to become ready, which no test here can arrange. The
 /// outcome→exit mapping itself is pinned by
 /// `main::tests::an_incomplete_rehydrate_never_reports_as_success`, which is

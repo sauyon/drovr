@@ -815,8 +815,16 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
             return;
         }
     };
+    // ⚠️ `--` before the positionals is LOAD-BEARING, not tidiness. The exit-2
+    // arm below reads exit 2 as the CLI's "incomplete" outcome — but clap uses
+    // exit 2 for its own usage errors, and neither `safe_component` here nor
+    // `require_phase_name` in the CLI rejects a phase name starting with `-`.
+    // Without the `--`, `?phase=-weird` would make clap fail to parse, exit 2,
+    // and be reported as "the pane is back but incomplete" when in fact nothing
+    // was ever created. `--` makes every positional a value, so exit 2 from the
+    // child can only come from `phase_rehydrate`.
     match Command::new(&exe)
-        .args(["phase", "rehydrate", run_name, &phase])
+        .args(["phase", "rehydrate", "--", run_name, &phase])
         .output()
     {
         Ok(o) if o.status.success() => respond_str(

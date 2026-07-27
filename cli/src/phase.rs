@@ -704,16 +704,23 @@ pub fn spawn_reviewer<H: Herdr>(
 /// human must not have to guess at.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RehydrateOutcome {
-    /// The recorded session was resumed: same conversation, same agent.
+    /// The recorded session was resumed: same conversation, same agent, and the
+    /// agent confirmed ready on its new pane.
     Resumed,
     /// No session was recoverable, so a fresh agent was launched and the
     /// phase's seed re-sent. The conversation is gone; the written record is
     /// what the new agent has.
     Reseeded,
-    /// A fresh agent was launched and the seed was NOT delivered. `note` says
-    /// why — there was nothing recorded to send, or the delivery failed — and
-    /// is meant to be printed verbatim.
-    Relaunched { note: String },
+    /// The pane is back, but the agent in it was NOT confirmed to have this
+    /// phase's context. `note` says why — the agent never became ready (so a
+    /// resume was never confirmed, or a seed was never sent), there was no seed
+    /// recorded to send, or the delivery failed — and is meant to be printed
+    /// verbatim.
+    ///
+    /// **This is the only outcome that is not a success**, and the CLI gives it
+    /// exit 2 (see `main::rehydrate_report`). Every path that cannot prove the
+    /// agent is up and informed lands here rather than in `Resumed`/`Reseeded`.
+    Incomplete { note: String },
 }
 
 /// The prompt a reseeded agent gets. It says the conversation is gone, because
@@ -995,22 +1002,18 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         .set_pane(pane.clone());
     run.save()?;
 
-    if resuming {
-        return Ok(RehydrateOutcome::Resumed);
-    }
-    let Some(seed) = seed else {
-        return Ok(RehydrateOutcome::Relaunched {
-            note: format!(
-                "phase '{phase}' has no recorded seed document, so the fresh agent was \
-                 launched with no context. Send it some: `drovr phase send {} {phase} \
-                 '<what to do>'`",
-                run.name
-            ),
-        });
-    };
-    // The readiness gate, not a bare send: a pane whose agent has not attached
-    // yet swallows the text. It also re-captures the NEW session, so the phase
-    // is rehydratable again straight away.
+    // ⚠️ The readiness gate is NOT the reseed path's alone, and gating only that
+    // one was a real defect. `pane_run` returning `Ok` means the shell command
+    // was *issued* — nothing more. A resume whose recorded id no longer resolves
+    // (the session file pruned, the profile's storage cleared, the backend's id
+    // format changed) launches, fails to find the conversation, and errors out or
+    // parks. Reporting `Resumed` there would claim "same conversation, same
+    // agent" on the strength of a spawn, and hand a driver an exit 0 for an
+    // agent that was never resumed — exactly what this outcome exists to
+    // prevent everywhere else.
+    //
+    // It also re-captures the session on the way past (`poll_phase_pane`), so a
+    // rehydrated phase is immediately rehydratable again.
     if !wait_agent_ready(h, run, phase, ready_timeout, poll_interval) {
         // Sub-second timeouts render as ms, so an injected test timeout does not
         // print a misleading "within 0s" — the same rendering `phase_send` uses.
@@ -1019,14 +1022,18 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         } else {
             format!("{}ms", ready_timeout.as_millis())
         };
-        return Ok(RehydrateOutcome::Relaunched {
+        let why = if resuming {
+            "Its recorded session may no longer resolve — the conversation was NOT restored"
+        } else {
+            "Its seed was NOT re-sent"
+        };
+        return Ok(RehydrateOutcome::Incomplete {
             note: format!(
-                "the fresh agent for phase '{phase}' did not become ready within {waited} on \
-                 pane {pane}, so its seed was NOT re-sent. It may be parked on a first-run or \
-                 permission prompt, or it may never have attached at all. Look with \
-                 herdr pane read {quoted_pane} — that works either way, where \
-                 `herdr agent attach` needs an agent to already be there — then \
-                 `drovr phase send {run_name} {phase} …`",
+                "the agent for phase '{phase}' did not become ready within {waited} on pane \
+                 {pane}. {why}. It may be parked on a first-run or permission prompt, or it \
+                 may never have attached at all. Look with herdr pane read {quoted_pane} — \
+                 that works either way, where `herdr agent attach` needs an agent to already \
+                 be there — then `drovr phase send {run_name} {phase} …`",
                 run_name = run.name,
                 // The pane by name, not `drovr attach <run>` — see the refusal
                 // above. This one matters more: the pane was created seconds
@@ -1036,9 +1043,22 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             ),
         });
     }
+    if resuming {
+        return Ok(RehydrateOutcome::Resumed);
+    }
+    let Some(seed) = seed else {
+        return Ok(RehydrateOutcome::Incomplete {
+            note: format!(
+                "phase '{phase}' has no recorded seed document, so the fresh agent was \
+                 launched with no context. Send it some: `drovr phase send {} {phase} \
+                 '<what to do>'`",
+                run.name
+            ),
+        });
+    };
     match h.agent_send(&pane, &reseed_text(&run.name, phase, &seed)) {
         Ok(()) => Ok(RehydrateOutcome::Reseeded),
-        Err(e) => Ok(RehydrateOutcome::Relaunched {
+        Err(e) => Ok(RehydrateOutcome::Incomplete {
             note: format!(
                 "the fresh agent for phase '{phase}' is up, but its seed could not be \
                  delivered ({e}). Re-send it: `drovr phase send {} {phase} '<read {seed}>'`",
@@ -6975,6 +6995,49 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn a_resume_that_never_comes_up_is_not_reported_as_resumed() {
+        // `pane_run` returning Ok means the command was ISSUED. A recorded
+        // session id that no longer resolves — pruned session file, cleared
+        // profile storage, a backend that changed its id format — launches,
+        // finds no conversation, and errors out or parks. Reporting `Resumed`
+        // there would claim "same conversation, same agent" on the strength of
+        // a spawn, and hand a driver exit 0 for an agent that was never resumed.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-resume-dead");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-stale")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        for _ in 0..40 {
+            h.push_status(Some("blocked")); // never reaches a started state
+        }
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        // The resume WAS composed — this is not a fallback to reseed.
+        assert!(pane_run_call(&h).contains("--resume 'sess-stale'"));
+        let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
+        let RehydrateOutcome::Incomplete { note } = outcome else {
+            panic!("an unconfirmed resume must not report as Resumed: {outcome:?}");
+        };
+        assert!(
+            note.contains("conversation was NOT restored"),
+            "must say what did not happen, in the resume's own terms: {note}"
+        );
+        assert!(note.contains(&pane), "must name the pane: {note}");
+        // The pane is real and recorded either way — this is "came back but
+        // unconfirmed", not "nothing happened".
+        assert!(!run.find_phase("plan").unwrap().is_reaped());
+    }
+
+    #[test]
     fn a_reseed_that_cannot_be_delivered_names_the_pane_it_just_made() {
         // The mainline failure of rehydrate's OWN recovery: the fresh agent is
         // up but never becomes ready (a first-run or permission prompt), so the
@@ -7005,7 +7068,7 @@ mod rehydrate_tests {
         .unwrap();
 
         let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
-        let RehydrateOutcome::Relaunched { note } = outcome else {
+        let RehydrateOutcome::Incomplete { note } = outcome else {
             panic!("an undeliverable seed must not report as Reseeded: {outcome:?}");
         };
         assert!(note.contains(&pane), "must name the pane it created: {note}");
