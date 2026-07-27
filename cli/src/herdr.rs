@@ -107,8 +107,8 @@ impl SessionId {
     }
 
     /// The id itself. Capture never needs it — it stores the `SessionId` whole —
-    /// so this is read by tests alone until task 5 composes `--resume`.
-    #[allow(dead_code)]
+    /// so this is read by `Config::compose`, which interpolates it into a
+    /// `--resume`, and by tests.
     pub fn as_str(&self) -> &str {
         &self.0
     }

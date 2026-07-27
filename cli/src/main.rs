@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
-    PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
-    phase_wait, triage_blocked_phase,
+    PhaseWaitOutcome, RehydrateOutcome, collect, diagnose_stuck_phase, phase_done,
+    phase_rehydrate, phase_send, phase_start, phase_wait, triage_blocked_phase,
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
@@ -147,6 +147,16 @@ enum PhaseCmd {
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
     },
+    /// Bring back a phase whose pane is gone, RESUMING its recorded agent
+    /// session where the backend offers one (`claude --resume <id>`).
+    ///
+    /// A fresh tab in the run's project dir, launched under the profile the
+    /// phase originally ran with. When no session was captured — or the backend
+    /// has no resume surface — a fresh agent is launched instead and the
+    /// phase's seed re-sent, which recovers the artifacts but not the
+    /// conversation. Refuses a phase that still holds a pane (attach to that
+    /// instead) and never creates a phase that does not exist.
+    Rehydrate { run: String, phase_name: String },
     /// Mark a phase complete. Run by the phase AGENT itself as its final action —
     /// it drops the completion marker `drovr phase wait` polls for. Refuses for a
     /// pipeline phase until that phase has authored its `<phase>-HANDOFF.md`.
@@ -527,10 +537,11 @@ fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
         Some(AttachTarget::RootShell { pane }) => AttachPlan::Refuse(format!(
             "run '{name}' has no live agent pane — no phase holds one. Its workspace \
              {} is still open, anchored by the idle shell {pane} (a plain shell, not \
-             an agent, so there is nothing to attach to). Start a phase with: \
-             drovr phase start {} <phase>",
+             an agent, so there is nothing to attach to).{recover} Start a phase with: \
+             drovr phase start {quoted} <phase>",
             run.workspace.as_deref().unwrap_or("(unknown)"),
-            shell_single_quote(name),
+            quoted = shell_single_quote(name),
+            recover = rehydrate_hint(run, name),
         )),
         None => AttachPlan::Refuse(format!(
             "run '{name}' has no live agent pane, and no herdr workspace either \
@@ -538,6 +549,27 @@ fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
              phase with: drovr phase start {} <phase>",
             shell_single_quote(name),
         )),
+    }
+}
+
+/// The " Or bring back …" clause for a refusal, when the run has a phase whose
+/// pane drovr closed. Empty otherwise — a refusal must never advertise a
+/// recovery that would just error.
+///
+/// The LAST reaped phase, because a run's phases are appended in order and the
+/// most recent one is the one a human losing their pane is asking about.
+/// Reviewers are excluded: they live in `review_phases` and are not what
+/// `drovr attach <run>` is looking for.
+fn rehydrate_hint(run: &RunState, name: &str) -> String {
+    match run.phases.iter().rev().find(|p| p.is_reaped()) {
+        Some(p) => format!(
+            " Phase '{}' was closed by drovr and can be brought back (resuming its \
+             session where the agent supports it): drovr phase rehydrate {} {}.",
+            p.name,
+            shell_single_quote(name),
+            shell_single_quote(&p.name),
+        ),
+        None => String::new(),
     }
 }
 
@@ -1001,6 +1033,31 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: phase wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Rehydrate { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let mut state = load_run(&run);
+            match phase_rehydrate(&h, &mut state, &phase_name) {
+                Ok(RehydrateOutcome::Resumed) => {
+                    println!("phase '{phase_name}' resumed with its recorded session")
+                }
+                Ok(RehydrateOutcome::Reseeded) => println!(
+                    "phase '{phase_name}' relaunched — its session was not recoverable, so a \
+                     fresh agent was seeded from the handoff"
+                ),
+                // stdout, not stderr: the pane IS back, which is what was asked
+                // for. The note says what did not happen and how to finish it.
+                Ok(RehydrateOutcome::Relaunched { note }) => {
+                    println!("phase '{phase_name}' relaunched — {note}")
+                }
+                Err(e) => {
+                    eprintln!("drovr: phase rehydrate failed: {e}");
                     process::exit(1);
                 }
             }
@@ -1771,14 +1828,41 @@ mod tests {
             "a run with no workspace must not be described as if it had an idle shell"
         );
 
-        // `drovr phase rehydrate` is task 5 and does not exist. Neither refusal
-        // may advertise a command the user cannot run.
+        // Nothing in this run was reaped, so neither refusal may advertise a
+        // rehydrate: `phase_rehydrate` would refuse a phase that never had its
+        // pane closed, and a refusal must not send the user at a second error.
         for m in [&msg, &bare] {
             assert!(
                 !m.contains("rehydrate"),
-                "must not reference a command that does not exist: {m}"
+                "nothing is reaped here, so nothing to bring back: {m}"
             );
         }
+    }
+
+    #[test]
+    fn attach_offers_a_rehydrate_when_a_phase_was_reaped() {
+        // The counterpart to the assertion above: once a pane HAS been closed,
+        // the refusal has somewhere to send the user.
+        use crate::run::PhaseStatus::Done;
+        let mut run = attach_run(vec![("brainstorm", Done, None), ("plan", Done, None)], Some("ws-77:root"));
+        run.workspace = Some("ws-77".into());
+        run.phases[1].set_pane("ws-77:p9");
+        run.phases[1].mark_reaped();
+
+        let msg = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { pane, .. } => panic!("a reaped phase has no pane: {pane}"),
+        };
+        assert!(
+            msg.contains("drovr phase rehydrate 'r' 'plan'"),
+            "must name the run AND the phase, ready to paste: {msg}"
+        );
+        // The LAST reaped phase, not the first: `brainstorm` was never reaped
+        // here, and even if it had been, `plan` is where the run got to.
+        assert!(!msg.contains("'brainstorm'"), "{msg}");
+        // It is an addition, not a replacement — starting a new phase is still
+        // the answer for someone who does not want the old one back.
+        assert!(msg.contains("drovr phase start"), "{msg}");
     }
 
     /// `drovr new` labels the workspace's root shell so the idle tab explains

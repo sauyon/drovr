@@ -13,6 +13,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+use crate::herdr::SessionId;
 use crate::shell::shell_single_quote;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -33,6 +34,74 @@ pub struct AgentSpec {
     /// Model selected for read-only reviews. Absent means backend default.
     #[serde(default)]
     pub review_model: Option<String>,
+    /// Flag that resumes a prior session, composed as
+    /// `<command> … <flag> '<id>'` — where the rest of the flags go. Absent →
+    /// this agent offers no flag-shaped resume.
+    ///
+    /// Mutually exclusive with [`AgentSpec::resume_subcommand`]; setting both is
+    /// a config error (see [`validate_resume`]).
+    #[serde(default)]
+    pub resume_flag: Option<String>,
+    /// Subcommand that resumes a prior session, composed as
+    /// `<command> <subcommand> '<id>' …` — immediately after the command,
+    /// because a subcommand is not a flag and cannot follow one.
+    ///
+    /// No built-in agent sets this. `codex resume <id>` is the known shape, but
+    /// codex was not installed on the machine this was written on, so its
+    /// argument ordering could not be verified — and an unverified guess that
+    /// composes a wrong command line is worse than falling back to a reseed. A
+    /// codex user opts in explicitly:
+    ///
+    /// ```toml
+    /// [agents.codex]
+    /// resume_subcommand = "resume"
+    /// ```
+    #[serde(default)]
+    pub resume_subcommand: Option<String>,
+}
+
+/// How an agent is asked to bring a prior session back. Exactly one shape per
+/// agent — resume is not one shape across backends:
+///
+/// * claude `-r, --resume [value]` and cursor `agent --resume [chatId]` are
+///   FLAGS whose value is optional;
+/// * codex takes a `codex resume <id>` SUBCOMMAND.
+///
+/// The optional value is why this is a type and not a `&str`: emitting the flag
+/// with no id opens an interactive session PICKER, which parks the pane forever
+/// with no agent ever attaching — the exact stuck-agent failure
+/// `diagnose_stuck_phase` exists to explain. So a surface is never composed
+/// without an id: [`Config::resume_launch`] takes a [`SessionId`], which cannot
+/// be empty or malformed, and there is no code path that emits the flag alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeSurface<'a> {
+    /// `<command> … <flag> '<id>'`
+    Flag(&'a str),
+    /// `<command> <subcommand> '<id>' …`
+    Subcommand(&'a str),
+}
+
+impl AgentSpec {
+    /// The one resume surface this agent offers, or `None` when it offers none.
+    ///
+    /// Total by necessity — a match over two `Option`s has four arms — and the
+    /// two arms that are not (flag) / (subcommand) / (neither) resolve to
+    /// `None`: an agent configured with BOTH is ambiguous, and `load_config`
+    /// already rejects it, so this is what the type requires rather than a
+    /// second guard on the same rule. `None` degrades a rehydrate to a reseed,
+    /// which is the safe direction.
+    pub fn resume_surface(&self) -> Option<ResumeSurface<'_>> {
+        match (
+            self.resume_flag.as_deref().filter(|f| !f.trim().is_empty()),
+            self.resume_subcommand
+                .as_deref()
+                .filter(|s| !s.trim().is_empty()),
+        ) {
+            (Some(flag), None) => Some(ResumeSurface::Flag(flag)),
+            (None, Some(sub)) => Some(ResumeSurface::Subcommand(sub)),
+            _ => None,
+        }
+    }
 }
 
 /// Controls the SessionStart reflex the `session-start` hook injects (see
@@ -134,6 +203,10 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: Some("--append-system-prompt".into()),
             model_flag: Some("--model".into()),
             review_model: None,
+            // Verified against the real CLI: `claude -r, --resume [value]` —
+            // a flag whose value is OPTIONAL.
+            resume_flag: Some("--resume".into()),
+            resume_subcommand: None,
         },
     );
     m.insert(
@@ -145,6 +218,9 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
+            // Verified against the real CLI: `agent --resume [chatId]`.
+            resume_flag: Some("--resume".into()),
+            resume_subcommand: None,
         },
     );
     m.insert(
@@ -156,6 +232,8 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("-m".into()),
             review_model: None,
+            resume_flag: None,
+            resume_subcommand: None,
         },
     );
     m
@@ -232,9 +310,21 @@ pub fn load_config() -> io::Result<Config> {
     for (name, spec) in &config.agents {
         validate_command(&spec.command)
             .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+        validate_resume(spec).map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
     }
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
+            // The resume surface merges as ONE unit, unlike every field below
+            // it. Filling the two halves independently would graft the built-in
+            // `--resume` onto an agent the user deliberately gave a
+            // `resume_subcommand`, leaving a spec that claims both shapes —
+            // which `validate_resume` has just rejected as ambiguous, except
+            // that this happens after it. The user's resume surface is a whole
+            // answer or no answer.
+            if spec.resume_flag.is_none() && spec.resume_subcommand.is_none() {
+                spec.resume_flag = builtin.resume_flag;
+                spec.resume_subcommand = builtin.resume_subcommand;
+            }
             spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
             spec.workspace_flag = spec.workspace_flag.take().or(builtin.workspace_flag);
             spec.system_prompt_flag = spec
@@ -298,8 +388,29 @@ impl Config {
         project_dir: &str,
         readonly: bool,
     ) -> io::Result<AgentLaunch> {
+        self.compose(agent, project_dir, readonly, None)
+    }
+
+    /// The one composer, shared by [`Config::launch`] and
+    /// [`Config::resume_launch`] so a fresh launch and a resumed one cannot
+    /// drift in their flags. `resume` decides only WHERE the id goes:
+    /// a subcommand binds to the command and must precede every flag; a flag
+    /// joins the flags.
+    fn compose(
+        &self,
+        agent: &str,
+        project_dir: &str,
+        readonly: bool,
+        resume: Option<(ResumeSurface<'_>, &SessionId)>,
+    ) -> io::Result<AgentLaunch> {
         let spec = self.agent(agent)?;
         let mut command = spec.command.clone();
+        if let Some((ResumeSurface::Subcommand(sub), session)) = resume {
+            command.push(' ');
+            command.push_str(sub);
+            command.push(' ');
+            command.push_str(&shell_single_quote(session.as_str()));
+        }
         if readonly {
             let flag = spec.readonly_flag.as_ref().ok_or_else(|| {
                 io::Error::other(format!(
@@ -339,10 +450,48 @@ impl Config {
             command.push(' ');
             command.push_str(&shell_single_quote(&prompt));
         }
+        // LAST, and always with its id in the same push. The flag's value is
+        // OPTIONAL to the agent, so the id is what separates "resume this
+        // conversation" from "open the session picker and park forever".
+        if let Some((ResumeSurface::Flag(flag), session)) = resume {
+            command.push(' ');
+            command.push_str(flag);
+            command.push(' ');
+            command.push_str(&shell_single_quote(session.as_str()));
+        }
         Ok(AgentLaunch {
             backend: agent.to_owned(),
             command,
         })
+    }
+
+    /// Compose a launch that RESUMES `session` instead of starting a fresh
+    /// conversation, or `Ok(None)` when `agent` offers no resume surface — in
+    /// which case the caller must fall back to a plain [`Config::launch`] and
+    /// re-seed the agent, because there is no way to ask this backend for its
+    /// old session.
+    ///
+    /// `readonly` is re-passed exactly as it is for a fresh launch, and that is
+    /// load-bearing for reviewers: a resumed reviewer launched without its
+    /// `readonly_flag` is a second WRITER in a run that guarantees a single one.
+    ///
+    /// The id arrives as a [`SessionId`], whose alphabet
+    /// (`[A-Za-z0-9._-]{1,128}`) is enforced at both of its constructors — so
+    /// there is no "validate before composing" step to forget here, and no way
+    /// to reach this function with an empty id and emit a bare flag.
+    pub fn resume_launch(
+        &self,
+        agent: &str,
+        project_dir: &str,
+        readonly: bool,
+        session: &SessionId,
+    ) -> io::Result<Option<AgentLaunch>> {
+        let spec = self.agent(agent)?;
+        let Some(surface) = spec.resume_surface() else {
+            return Ok(None);
+        };
+        self.compose(agent, project_dir, readonly, Some((surface, session)))
+            .map(Some)
     }
 
     /// Return the composed reviewer launch command `"<command> <readonly_flag>"` for `agent`
@@ -426,6 +575,37 @@ fn validate_command(command: &str) -> io::Result<()> {
             "agent command '{command}' is a relative path; use a bare name \
              (resolved via $PATH) or an absolute path"
         )));
+    }
+    Ok(())
+}
+
+/// Reject a resume surface that cannot compose a safe command line.
+///
+/// Two rules, both of which would otherwise surface as a pane that never
+/// becomes ready:
+///
+/// * **Both shapes at once is ambiguous.** `resume_flag` and
+///   `resume_subcommand` place the id in different positions; an agent claiming
+///   both has no single answer, and picking one silently would be a guess about
+///   the user's CLI.
+/// * **An empty value is the bare-flag hazard, written down.** `resume_flag =
+///   ""` composes `<command>  '<id>'` — the id as a positional argument — and a
+///   whitespace-only one composes worse. Both are rejected at load, where the
+///   user can see the message, rather than at compose time where the failure is
+///   a pane parked on a session picker.
+fn validate_resume(spec: &AgentSpec) -> io::Result<()> {
+    if spec.resume_flag.is_some() && spec.resume_subcommand.is_some() {
+        return Err(io::Error::other(
+            "resume_flag and resume_subcommand are mutually exclusive; set exactly one",
+        ));
+    }
+    for (key, value) in [
+        ("resume_flag", &spec.resume_flag),
+        ("resume_subcommand", &spec.resume_subcommand),
+    ] {
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(io::Error::other(format!("{key} must not be empty")));
+        }
     }
     Ok(())
 }
@@ -537,6 +717,188 @@ mod tests {
         let claude = cfg.launch("claude", "/tmp/p", false).unwrap();
         assert_eq!(claude.backend(), "claude");
         assert!(claude.command().starts_with("claude"));
+    }
+
+    fn sid(value: &str) -> SessionId {
+        SessionId::new(value.to_owned()).expect("test session id must be well-formed")
+    }
+
+    #[test]
+    fn claude_and_cursor_resume_with_a_flag_and_codex_with_nothing() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.agents["claude"].resume_surface(),
+            Some(ResumeSurface::Flag("--resume"))
+        );
+        assert_eq!(
+            cfg.agents["cursor"].resume_surface(),
+            Some(ResumeSurface::Flag("--resume"))
+        );
+        // codex gets NEITHER on purpose: `codex resume <id>` is the documented
+        // shape but was never verified against the real CLI, and an unverified
+        // guess composes a wrong command line where `None` merely reseeds.
+        assert_eq!(cfg.agents["codex"].resume_surface(), None);
+        assert_eq!(cfg.agents["codex"].resume_flag, None);
+        assert_eq!(cfg.agents["codex"].resume_subcommand, None);
+    }
+
+    #[test]
+    fn a_flag_resume_carries_its_id_and_never_appears_bare() {
+        let cfg = Config::default();
+        let launch = cfg
+            .resume_launch("claude", "/tmp/p", false, &sid("abc-123.def_4"))
+            .unwrap()
+            .expect("claude offers a resume flag");
+        assert_eq!(launch.backend(), "claude");
+        assert!(
+            launch.command().contains("--resume 'abc-123.def_4'"),
+            "{}",
+            launch.command()
+        );
+        // A bare `--resume` opens claude's interactive session picker, which
+        // parks the pane forever. The id is never optional here.
+        assert!(
+            !launch.command().ends_with("--resume"),
+            "never a bare flag: {}",
+            launch.command()
+        );
+        assert!(
+            !launch.command().contains("--resume  "),
+            "never an empty id: {}",
+            launch.command()
+        );
+        // Same project pinning a fresh launch gets: a session resolves under
+        // `<profile>/projects/<escaped-cwd>/`, so the cwd must not drift.
+        assert!(launch.command().contains("--add-dir '/tmp/p'"), "{}", launch.command());
+    }
+
+    #[test]
+    fn a_resumed_reviewer_still_carries_its_readonly_flag() {
+        // A resumed reviewer without its read-only flag is a second WRITER in a
+        // run built on single-writer discipline.
+        let cfg = Config::default();
+        let launch = cfg
+            .resume_launch("claude", "/tmp/p", true, &sid("sess-1"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            launch.command().contains("--permission-mode plan"),
+            "{}",
+            launch.command()
+        );
+        assert!(launch.command().contains("--resume 'sess-1'"), "{}", launch.command());
+    }
+
+    #[test]
+    fn a_resume_subcommand_comes_immediately_after_the_command() {
+        let mut cfg = Config::default();
+        let codex = cfg.agents.get_mut("codex").unwrap();
+        codex.resume_subcommand = Some("resume".into());
+        let launch = cfg
+            .resume_launch("codex", "/tmp/p", false, &sid("sess-9"))
+            .unwrap()
+            .unwrap();
+        // A subcommand is not a flag: it binds to the command and must precede
+        // every flag, so the ORDER is the assertion, not mere presence.
+        assert!(
+            launch.command().starts_with("codex resume 'sess-9' "),
+            "{}",
+            launch.command()
+        );
+        assert!(launch.command().contains("-C '/tmp/p'"), "{}", launch.command());
+    }
+
+    #[test]
+    fn an_agent_with_no_resume_surface_asks_the_caller_to_reseed() {
+        // `Ok(None)`, not an error: "this backend cannot be resumed" is a normal
+        // outcome that rehydrate answers with a fresh launch plus a re-seed.
+        let cfg = Config::default();
+        assert!(
+            cfg.resume_launch("codex", "/tmp/p", false, &sid("sess-1"))
+                .unwrap()
+                .is_none()
+        );
+        // An unknown agent is still an error.
+        assert!(cfg.resume_launch("nope", "/tmp/p", false, &sid("s")).is_err());
+    }
+
+    #[test]
+    fn an_explicit_agent_block_keeps_the_builtin_resume_flag() {
+        // The documented merge trap: a user config with an explicit
+        // `[agents.claude]` block must not silently drop fields it omits.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\ncommand = \"claude\"\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert_eq!(
+            cfg.agents["claude"].resume_surface(),
+            Some(ResumeSurface::Flag("--resume"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_resume_subcommand_is_not_joined_by_the_builtin_flag() {
+        // The resume surface merges as ONE unit. Filling each field
+        // independently would graft the built-in `--resume` onto an agent the
+        // user deliberately gave a subcommand, producing a spec with both —
+        // i.e. an ambiguous, unusable resume.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\ncommand = \"claude\"\nresume_subcommand = \"resume\"\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert_eq!(cfg.agents["claude"].resume_flag, None);
+        assert_eq!(
+            cfg.agents["claude"].resume_surface(),
+            Some(ResumeSurface::Subcommand("resume"))
+        );
+    }
+
+    #[test]
+    fn an_agent_claiming_both_resume_shapes_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\ncommand = \"claude\"\nresume_flag = \"--resume\"\n\
+             resume_subcommand = \"resume\"\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let err = load_config().expect_err("both resume shapes must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "error should name the agent: {msg}");
+        assert!(
+            msg.contains("resume_flag") && msg.contains("resume_subcommand"),
+            "error should name both keys: {msg}"
+        );
+
+        // An empty flag is the bare-`--resume` hazard written into a config
+        // file, and it is rejected at load rather than composed.
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\ncommand = \"claude\"\nresume_flag = \"\"\n",
+        )
+        .unwrap();
+        assert!(load_config().is_err(), "an empty resume_flag must be rejected");
     }
 
     #[test]
@@ -735,7 +1097,10 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        resume_flag: None,
+                        resume_subcommand: None,
+                    },
                 );
                 m
             },
@@ -763,7 +1128,10 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        resume_flag: None,
+                        resume_subcommand: None,
+                    },
                 );
                 m
             },
@@ -794,7 +1162,10 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        resume_flag: None,
+                        resume_subcommand: None,
+                    },
                 );
                 m
             },

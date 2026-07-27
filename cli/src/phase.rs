@@ -249,6 +249,14 @@ fn phase_done_command(run_name: &str, phase: &str, pass: Option<&PassToken>) -> 
 /// PURE pane mechanics: it performs NO phase-list lookup and NO state mutation, so
 /// callers stay in control of where (and whether) the phase is registered — a
 /// reviewer name must never collide into a pipeline phase's pane.
+///
+/// `profile` is the `CLAUDE_CONFIG_DIR` to launch UNDER — a parameter rather
+/// than a read of this process's environment, because a rehydrate must relaunch
+/// under the profile the phase's pane originally authenticated with. The review
+/// server is a long-lived daemon whose environment need not match the driver's,
+/// and claude resolves a session beneath `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`,
+/// so the wrong one silently finds no conversation at all. Fresh launches pass
+/// [`agent_profile_env`], which is also what they record on the phase.
 fn launch_in_pane<H: Herdr>(
     h: &H,
     run_name: &str,
@@ -256,6 +264,7 @@ fn launch_in_pane<H: Herdr>(
     pane: &str,
     command: &str,
     pass: &PassToken,
+    profile: Option<&str>,
 ) -> io::Result<()> {
     // Capture focus so the pane operations below don't steal it from the user.
     let prev_focus = h.focused_workspace();
@@ -271,19 +280,20 @@ fn launch_in_pane<H: Herdr>(
     //     environment precisely because that is immutable for the life of the
     //     agent: a previous pass's agent keeps ITS token no matter what later
     //     writes to state.json, so the marker it drops is always attributable.
-    //   * CLAUDE_CONFIG_DIR selects the caller's claude profile so the agent
+    //   * CLAUDE_CONFIG_DIR selects the claude profile so the agent
     //     authenticates as the right account instead of falling back to
-    //     ~/.claude. It is a path, not a secret, so inlining it is safe; it is
-    //     propagated from drovr's own environment when set (e.g. under a
-    //     `claude-prof` profile). Real secrets (API keys) are never inlined.
+    //     ~/.claude. It is a path, not a secret, so inlining it is safe; a
+    //     fresh launch propagates drovr's own environment (e.g. under a
+    //     `claude-prof` profile) and a rehydrate propagates the one the phase
+    //     recorded. Real secrets (API keys) are never inlined.
     // Values are single-quoted so spaces/metacharacters can't break out.
     let mut env_prefix = format!(
         "env DROVR_PHASE={} {PASS_ENV}={}",
         shell_single_quote(&format!("{run_name}/{phase}")),
         shell_single_quote(pass.as_str()),
     );
-    if let Some(dir) = agent_profile_env() {
-        env_prefix.push_str(&format!(" CLAUDE_CONFIG_DIR={}", shell_single_quote(&dir)));
+    if let Some(dir) = profile {
+        env_prefix.push_str(&format!(" CLAUDE_CONFIG_DIR={}", shell_single_quote(dir)));
     }
     let full = format!("{env_prefix} {command}");
     // ⚠️ `pane_run` is the LAST fallible step, and that is load-bearing, not
@@ -504,7 +514,19 @@ pub fn phase_start<H: Herdr>(
     let cfg = load_config()?;
     let agent = run.agent.as_deref().unwrap_or("claude");
     let launch = cfg.launch(agent, &cwd, false)?;
-    if let Err(e) = launch_in_pane(h, &run.name, phase, &target_pane, launch.command(), &pass) {
+    // Read ONCE: the profile inlined into the agent's environment and the one
+    // recorded on the phase have to be the same value, or a later rehydrate
+    // resumes under a profile this pane never authenticated with.
+    let profile = agent_profile_env();
+    if let Err(e) = launch_in_pane(
+        h,
+        &run.name,
+        phase,
+        &target_pane,
+        launch.command(),
+        &pass,
+        profile.as_deref(),
+    ) {
         if created_pane {
             discard_unlaunched_pane(h, run, &target_pane);
         }
@@ -533,7 +555,7 @@ pub fn phase_start<H: Herdr>(
     // NOTE: the session is cleared where the new pass is PERSISTED, above — not
     // here. See the comment there; clearing at this point would miss the
     // launch-failure path.
-    run.phases[idx].record_launch(launch.backend(), agent_profile_env());
+    run.phases[idx].record_launch(launch.backend(), profile);
 
     // Panes are never closed mid-run: closing any pane makes herdr reassign
     // focus, disturbing the user. Every pane drovr opens (the root pane, each
@@ -623,13 +645,25 @@ pub fn spawn_reviewer<H: Herdr>(
     // `review_phases`), so this is uniformity rather than a fix — but it means
     // every marker in the run dir is attributable to the launch that produced it.
     let pass = new_pass_token();
+    // Read ONCE, for the same reason `phase_start` does: the profile inlined
+    // into the agent's environment and the one recorded on the phase must be
+    // the same value.
+    let profile = agent_profile_env();
     // Same orphan hole as `phase_start`'s, and the same fix: registration below
     // happens only after the launch succeeds, so a failure here leaves a pane
     // nothing records — which `drovr cleanup` then protects as the human's,
     // forever, while it blocks `workspace_close` for the whole run. The tab is
     // always ours (`tab_create` is three lines up, unconditionally), so there is
     // no "did this call create it" question to answer here.
-    if let Err(e) = launch_in_pane(h, &run.name, phase, &pane, launch.command(), &pass) {
+    if let Err(e) = launch_in_pane(
+        h,
+        &run.name,
+        phase,
+        &pane,
+        launch.command(),
+        &pass,
+        profile.as_deref(),
+    ) {
         discard_unlaunched_pane(h, run, &pane);
         return Err(e);
     }
@@ -655,10 +689,262 @@ pub fn spawn_reviewer<H: Herdr>(
     reviewer.handoff_doc = seed_str;
     reviewer.set_pane(pane);
     reviewer.pass = Some(pass);
-    reviewer.record_launch(launch.backend(), agent_profile_env());
+    reviewer.record_launch(launch.backend(), profile);
     run.review_phases.push(reviewer);
     run.save()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rehydrate
+// ---------------------------------------------------------------------------
+
+/// What a [`phase_rehydrate`] actually did — the difference between "your
+/// conversation is back" and "a fresh agent is reading the notes", which the
+/// human must not have to guess at.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RehydrateOutcome {
+    /// The recorded session was resumed: same conversation, same agent.
+    Resumed,
+    /// No session was recoverable, so a fresh agent was launched and the
+    /// phase's seed re-sent. The conversation is gone; the written record is
+    /// what the new agent has.
+    Reseeded,
+    /// A fresh agent was launched and the seed was NOT delivered. `note` says
+    /// why — there was nothing recorded to send, or the delivery failed — and
+    /// is meant to be printed verbatim.
+    Relaunched { note: String },
+}
+
+/// The prompt a reseeded agent gets. It says the conversation is gone, because
+/// an agent that believes it is continuing its own work will confidently invent
+/// the parts it cannot remember.
+fn reseed_text(run_name: &str, phase: &str, seed: &str) -> String {
+    format!(
+        "You are phase '{phase}' of drovr run '{run_name}'. A previous agent held this \
+         phase and its session could not be restored, so you are starting from the written \
+         record rather than continuing a conversation: read {seed} and take it from there. \
+         Anything the previous agent did not write down is gone — re-derive it from the \
+         repository and the run directory instead of assuming it."
+    )
+}
+
+/// Bring a phase whose pane is gone back on a fresh tab, RESUMING its recorded
+/// agent session where one exists.
+///
+/// This is the inverse of reaping, and it deliberately lands before any reaping
+/// does: closing panes is only safe once bringing them back provably works.
+///
+/// The shape of the recovery, in order:
+///
+/// 1. **Refuse a phase that still holds a pane.** "Has a pane" is the single
+///    rule, on both this path and the HTTP one — there is no second, herdr-level
+///    liveness check that could disagree with it. A phase drovr still records a
+///    pane for is one to `drovr attach` to, not to duplicate an agent into.
+///    (Cost of the simple rule: a phase whose pane herdr has lost, but which
+///    drovr still records, cannot be rehydrated until something clears the
+///    registration. Nothing does that before reaping exists.)
+/// 2. **Never append.** Unlike [`phase_start`], an unknown name is an error —
+///    the HTTP caller is unauthenticated and `safe_component` is a filename
+///    check, not an authorization one.
+/// 3. **Compose from the phase's own record, not this process's world.** The
+///    backend, the profile and the session are one bundle
+///    ([`crate::run::ResumeTarget`]); `run.project_dir` is the cwd. A daemon's
+///    environment must not decide where a session resolves.
+/// 4. **Persist the new pass, then sweep the marker, then launch** — the order
+///    [`phase_start`] uses and for the same reason: no failure may leave a
+///    state where `phase_wait` reports a completion for a pass whose agent is
+///    not running.
+/// 5. **On no session (or a backend with no resume surface), relaunch and
+///    re-seed.** The fallback is the common case for anything cursor or codex
+///    ran, and it must work.
+///
+/// The phase's `status` is deliberately NOT changed. A rehydrate restores an
+/// agent; it does not decide whether the phase's work is finished, and flipping
+/// a `Done` phase back to `Running` would tell `first_incomplete` and
+/// `RunState::live_agent_pane` that the whole run had moved backwards.
+pub fn phase_rehydrate<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+) -> io::Result<RehydrateOutcome> {
+    require_phase_name(phase)?;
+    let existing = run.find_phase(phase).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "run '{}' has no phase '{phase}' — rehydrate never creates one \
+                 (use `drovr phase start` for that)",
+                run.name
+            ),
+        )
+    })?;
+    if let Some(pane) = existing.pane_id() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "phase '{phase}' of run '{}' still holds pane {pane}; rehydrate brings back \
+                 a phase whose pane is gone. Attach to it instead: {attach}",
+                run.name,
+                attach = attach_command(&run.name),
+            ),
+        ));
+    }
+    if run.project_dir.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no project_dir (created before this fix); \
+                 please recreate the run with `drovr new`",
+                run.name
+            ),
+        ));
+    }
+    // A reviewer lives in `review_phases`, and that is the ONLY thing that
+    // decides read-only here. A resumed reviewer launched without its
+    // `readonly_flag` is a second WRITER in a run whose entire discipline is
+    // that there is exactly one.
+    let readonly = run.review_phases.iter().any(|p| p.name == phase);
+    let seed = existing.handoff_doc.clone();
+    // The whole resume bundle or nothing — session, backend AND profile. It is
+    // never taken apart: an id under the wrong profile resolves to no
+    // conversation at all, silently, and the agent starts blank with no error
+    // anywhere. `resume_target()` is also the ONLY way to obtain a session id;
+    // it has already checked kind, herdr's attribution and the alphabet.
+    let resume = existing.resume_target().map(|t| {
+        (
+            t.backend().to_owned(),
+            t.profile().map(str::to_owned),
+            t.session().clone(),
+        )
+    });
+    // What a plain relaunch uses: the phase's own launch record where it has
+    // one — a phase keeps its backend and profile even when its conversation is
+    // unrecoverable — else the run's configured backend.
+    let recorded = existing.pane_agent();
+    let fresh_backend = recorded
+        .map(|a| a.backend().to_owned())
+        .unwrap_or_else(|| run.agent.clone().unwrap_or_else(|| "claude".to_string()));
+    let fresh_profile = recorded
+        .and_then(|a| a.profile().map(str::to_owned))
+        .or_else(agent_profile_env);
+
+    let cwd = run.project_dir.clone();
+    let cfg = load_config()?;
+    let resumed = match &resume {
+        Some((backend, profile, session)) => cfg
+            .resume_launch(backend, &cwd, readonly, session)?
+            .map(|launch| (launch, profile.clone())),
+        None => None,
+    };
+    // `resuming` is a fact about the composed command, not about whether a
+    // session existed: a backend with no resume surface has a perfectly good
+    // session id and still cannot be told to use it.
+    let (launch, profile, resuming) = match resumed {
+        Some((launch, profile)) => (launch, profile, true),
+        None => (
+            cfg.launch(&fresh_backend, &cwd, readonly)?,
+            fresh_profile,
+            false,
+        ),
+    };
+
+    // ORDER MATTERS, exactly as in `phase_start`: persist the new pass FIRST,
+    // destroy the previous pass's marker SECOND. A new agent process is a new
+    // pass, and a marker left from the old one would complete the next
+    // `phase wait` instantly, off work that predates this rehydrate.
+    let pass = new_pass_token();
+    {
+        let p = run
+            .find_phase_mut(phase)
+            .expect("the phase was located above and nothing removed it");
+        p.pass = Some(pass.clone());
+        if !resuming {
+            // A relaunch REPLACES the agent record, which is the only way a
+            // session is ever discarded — and it belongs here, before the
+            // launch, for `phase_start`'s reason: a launch that fails must not
+            // leave the phase advertising a conversation the next pane will not
+            // be in.
+            p.record_launch(&fresh_backend, profile.clone());
+        }
+    }
+    run.save()?;
+    remove_stale_marker(&run.name, phase)?;
+
+    // A fresh tab, never `run.root_pane` — a rehydrated phase must be as
+    // independently closeable as a started one, and the root shell anchors the
+    // workspace for the run's whole lifetime.
+    let ws = run.workspace.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no herdr workspace (creation failed at `drovr new`); \
+                 please recreate the run with `drovr new`",
+                run.name
+            ),
+        )
+    })?;
+    let pane = h.tab_create(&ws, phase, &cwd)?;
+    if let Err(e) = launch_in_pane(
+        h,
+        &run.name,
+        phase,
+        &pane,
+        launch.command(),
+        &pass,
+        profile.as_deref(),
+    ) {
+        // The tab is always ours (`tab_create` is one line up), so there is no
+        // "did this call create it" question — see `discard_unlaunched_pane`
+        // for why a pane drovr opened and never recorded is worse than a leak.
+        discard_unlaunched_pane(h, run, &pane);
+        return Err(e);
+    }
+    run.find_phase_mut(phase)
+        .expect("the phase was located above and nothing removed it")
+        // Clears `reaped` in the same statement: a phase with a live pane is
+        // not a reaped one.
+        .set_pane(pane.clone());
+    run.save()?;
+
+    if resuming {
+        return Ok(RehydrateOutcome::Resumed);
+    }
+    let Some(seed) = seed else {
+        return Ok(RehydrateOutcome::Relaunched {
+            note: format!(
+                "phase '{phase}' has no recorded seed document, so the fresh agent was \
+                 launched with no context. Send it some: `drovr phase send {} {phase} \
+                 '<what to do>'`",
+                run.name
+            ),
+        });
+    };
+    // The readiness gate, not a bare send: a pane whose agent has not attached
+    // yet swallows the text. It also re-captures the NEW session, so the phase
+    // is rehydratable again straight away.
+    if !wait_agent_ready(h, run, phase, SEND_READY_TIMEOUT, POLL_INTERVAL) {
+        return Ok(RehydrateOutcome::Relaunched {
+            note: format!(
+                "the fresh agent for phase '{phase}' did not become ready within {}s, so its \
+                 seed was NOT re-sent — it is likely parked on a first-run or permission \
+                 prompt. Attach to check ({attach}), then `drovr phase send {} {phase} …`",
+                SEND_READY_TIMEOUT.as_secs(),
+                run.name,
+                attach = attach_command(&run.name),
+            ),
+        });
+    }
+    match h.agent_send(&pane, &reseed_text(&run.name, phase, &seed)) {
+        Ok(()) => Ok(RehydrateOutcome::Reseeded),
+        Err(e) => Ok(RehydrateOutcome::Relaunched {
+            note: format!(
+                "the fresh agent for phase '{phase}' is up, but its seed could not be \
+                 delivered ({e}). Re-send it: `drovr phase send {} {phase} '<read {seed}>'`",
+                run.name
+            ),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4807,11 +5093,18 @@ mod tests {
             "p1",
             "claude",
             &PassToken::new("t'k".into()).unwrap(),
+            // A rehydrate passes a RECORDED profile, which came off disk and is
+            // no more trustworthy than the run name beside it.
+            Some("/pro'file"),
         )
         .unwrap();
 
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
+        assert!(
+            run_call.contains(r"CLAUDE_CONFIG_DIR='/pro'\\''file'"),
+            "the profile is quoted the same way: {run_call}"
+        );
         assert!(
             run_call.contains(r"DROVR_PHASE='r; rm -rf ~/plan'"),
             "the run name is quoted into one literal word: {run_call}"
@@ -6217,5 +6510,410 @@ mod capture_tests {
         unsafe {
             std::env::remove_var(PASS_ENV);
         }
+    }
+}
+
+#[cfg(test)]
+mod rehydrate_tests {
+    use super::*;
+    use crate::herdr::{FakeHerdr, SessionId};
+    use crate::run::PhaseAgent;
+    use crate::test_util::ENV_LOCK;
+
+    /// A run whose config is the built-in map, whatever the developer's own
+    /// `~/.config/drovr/config.toml` says. Rehydrate composes from config, so a
+    /// user-configured `resume_flag` would otherwise decide these assertions.
+    ///
+    /// Returns the tempdir guard: dropping it removes the config home, so the
+    /// caller must bind it.
+    fn rehydrate_run(name: &str) -> (RunState, tempfile::TempDir) {
+        // Caller must hold ENV_LOCK.
+        let cfg_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-rehydrate-test-{name}"));
+            std::env::set_var("XDG_CONFIG_HOME", cfg_home.path());
+            std::env::remove_var(PASS_ENV);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        let _ = std::fs::remove_dir_all(run_dir(name));
+        let run = RunState {
+            name: name.to_owned(),
+            task: "test task".into(),
+            agent: Some("claude".into()),
+            phases: vec![],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("ws-rh".into()),
+            root_pane: Some("ws-rh:root".into()),
+            project_dir: "/tmp/drovr-proj-test".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        (run, cfg_home)
+    }
+
+    /// A phase that ran, was captured, and has since had its pane closed —
+    /// exactly the state reaping will leave behind (task 6) and the one
+    /// rehydrate exists to recover from.
+    fn reaped_phase(
+        name: &str,
+        backend: &str,
+        profile: Option<&str>,
+        session: Option<&str>,
+    ) -> Phase {
+        let mut p = Phase::new(name);
+        p.status = PhaseStatus::Done;
+        p.set_pane("old-pane");
+        p.record_launch(backend, profile.map(str::to_owned));
+        if let Some(s) = session {
+            assert!(
+                p.record_session(SessionId::new(s.to_owned()).unwrap()),
+                "fixture session must attach to the launch record"
+            );
+        }
+        p.mark_reaped();
+        p
+    }
+
+    fn pane_run_call(h: &FakeHerdr) -> String {
+        h.calls()
+            .into_iter()
+            .find(|c| c.contains("pane_run"))
+            .expect("rehydrate must launch something")
+    }
+
+    #[test]
+    fn rehydrate_resumes_the_recorded_session_in_a_fresh_tab() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-resume");
+        run.phases
+            .push(reaped_phase("plan", "claude", Some("/tmp/prof"), Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
+        assert!(
+            matches!(outcome, RehydrateOutcome::Resumed),
+            "{outcome:?}"
+        );
+
+        let calls = h.calls();
+        let tab = calls
+            .iter()
+            .find(|c| c.contains("tab_create"))
+            .expect("rehydrate creates its own tab, never the root pane");
+        assert!(
+            tab.contains("cwd=/tmp/drovr-proj-test"),
+            "the run's project_dir decides where the session resolves: {tab}"
+        );
+        let launch = pane_run_call(&h);
+        assert!(
+            launch.contains("--resume 'sess-abc'"),
+            "the id must be quoted and present: {launch}"
+        );
+        assert!(
+            launch.contains("CLAUDE_CONFIG_DIR='/tmp/prof'"),
+            "the RECORDED profile, not this process's: {launch}"
+        );
+        assert!(
+            !launch.contains("--permission-mode plan"),
+            "a pipeline phase is not read-only: {launch}"
+        );
+
+        let p = run.find_phase("plan").unwrap();
+        assert!(!p.is_reaped(), "a phase with a live pane is not reaped");
+        let pane = p.pane_id().expect("the new pane is recorded");
+        assert_ne!(pane, "old-pane", "a fresh pane, not the closed one");
+        // …and on disk, which is where every later command reads it.
+        let on_disk = RunState::load("rh-resume").unwrap();
+        assert_eq!(on_disk.find_phase("plan").unwrap().pane_id(), Some(pane));
+        assert!(!on_disk.find_phase("plan").unwrap().is_reaped());
+    }
+
+    #[test]
+    fn rehydrate_uses_the_recorded_profile_not_the_servers_environment() {
+        // The review server is a long-lived daemon: its environment is whatever
+        // it was started with, which need not be the profile the pane
+        // authenticated under. claude resolves a session beneath
+        // `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so reading the wrong one
+        // silently finds NOTHING and the resume degrades to a blank agent.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-profile");
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/the-servers-profile");
+        }
+        run.phases.push(reaped_phase(
+            "plan",
+            "claude",
+            Some("/tmp/the-phases-profile"),
+            Some("sess-p"),
+        ));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_rehydrate(&h, &mut run, "plan").unwrap();
+        let launch = pane_run_call(&h);
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        assert!(
+            launch.contains("CLAUDE_CONFIG_DIR='/tmp/the-phases-profile'"),
+            "{launch}"
+        );
+        assert!(
+            !launch.contains("the-servers-profile"),
+            "the process env must not leak in: {launch}"
+        );
+    }
+
+    #[test]
+    fn a_rehydrated_reviewer_is_still_read_only() {
+        // A resumed reviewer launched without its readonly flag is a SECOND
+        // writer in a run whose whole discipline is that there is one.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-reviewer");
+        run.review_phases.push(reaped_phase(
+            "review:task-1:1:security",
+            "claude",
+            None,
+            Some("sess-rev"),
+        ));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_rehydrate(&h, &mut run, "review:task-1:1:security").unwrap();
+        let launch = pane_run_call(&h);
+        assert!(
+            launch.contains("--permission-mode plan"),
+            "the readonly flag must be re-passed: {launch}"
+        );
+        assert!(launch.contains("--resume 'sess-rev'"), "{launch}");
+    }
+
+    #[test]
+    fn a_subcommand_backend_is_resumed_after_the_command() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, cfg) = rehydrate_run("rh-subcommand");
+        let dir = cfg.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[agents.codex]\ncommand = \"codex\"\nresume_subcommand = \"resume\"\n",
+        )
+        .unwrap();
+        run.agent = Some("codex".into());
+        run.phases
+            .push(reaped_phase("plan", "codex", None, Some("sess-cx")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        assert!(matches!(
+            phase_rehydrate(&h, &mut run, "plan").unwrap(),
+            RehydrateOutcome::Resumed
+        ));
+        let launch = pane_run_call(&h);
+        assert!(
+            launch.contains("codex resume 'sess-cx' "),
+            "the subcommand binds to the command, before every flag: {launch}"
+        );
+    }
+
+    #[test]
+    fn no_session_reseeds_instead_of_emitting_a_bare_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-noseed");
+        let mut p = reaped_phase("plan", "claude", None, None);
+        p.handoff_doc = Some("/tmp/seed.md".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
+        assert!(matches!(outcome, RehydrateOutcome::Reseeded), "{outcome:?}");
+
+        let launch = pane_run_call(&h);
+        assert!(
+            !launch.contains("--resume"),
+            "a bare --resume opens the session picker and parks the pane: {launch}"
+        );
+        // The seed is re-sent, so the fresh agent knows what phase it is in.
+        let sent = h
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("agent_send"))
+            .expect("the fallback must re-seed");
+        assert!(sent.contains("/tmp/seed.md"), "{sent}");
+        // The readiness gate polls, so the FRESH agent's session is captured on
+        // the way past: a phase that has just been reseeded is immediately
+        // rehydratable again rather than waiting for the next `phase wait`.
+        let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
+        assert_eq!(
+            run.find_phase("plan")
+                .unwrap()
+                .pane_agent()
+                .and_then(PhaseAgent::session)
+                .map(|s| s.as_str().to_owned()),
+            Some(FakeHerdr::session_value_for(&pane))
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_resume_surface_reseeds() {
+        // codex ships with NEITHER resume field, deliberately: an unverified
+        // guess at its argument order composes a wrong command line, where a
+        // reseed merely costs the conversation.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-nosurface");
+        run.agent = Some("codex".into());
+        let mut p = reaped_phase("plan", "codex", None, Some("sess-cx"));
+        p.handoff_doc = Some("/tmp/seed.md".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
+        assert!(matches!(outcome, RehydrateOutcome::Reseeded), "{outcome:?}");
+        let launch = pane_run_call(&h);
+        assert!(!launch.contains("resume"), "{launch}");
+        assert!(launch.contains("codex"), "{launch}");
+        // A relaunch REPLACES the agent record, so the id of a conversation
+        // this pane is NOT in does not survive to be offered again. (Nothing
+        // re-captures here: the fake's session is owned by claude, and this
+        // phase runs codex.)
+        assert_eq!(
+            run.find_phase("plan")
+                .unwrap()
+                .pane_agent()
+                .and_then(PhaseAgent::session),
+            None,
+            "the stale session must not outlive the agent that held it"
+        );
+    }
+
+    #[test]
+    fn rehydrate_refuses_a_phase_that_still_holds_a_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-live");
+        let mut p = Phase::new("plan");
+        p.status = PhaseStatus::Running;
+        p.set_pane("ws-rh:p7");
+        p.record_launch("claude", None);
+        run.phases.push(p);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("a phase with a live pane is not rehydrated");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("ws-rh:p7"), "{err}");
+        assert!(
+            h.calls().is_empty(),
+            "a refusal must not touch herdr: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn rehydrate_of_an_unknown_phase_does_not_append_it() {
+        // `phase_start` appends any name it is given; rehydrate must not, or a
+        // typo (or an HTTP caller) silently creates a phase.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-unknown");
+        run.phases.push(reaped_phase("plan", "claude", None, Some("s1")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let err = phase_rehydrate(&h, &mut run, "nope").expect_err("unknown phase must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(run.phases.len(), 1, "nothing appended");
+        assert!(run.find_phase("nope").is_none());
+        assert!(h.calls().is_empty(), "{:?}", h.calls());
+    }
+
+    #[test]
+    fn rehydrate_clears_the_stale_marker_and_mints_a_new_pass() {
+        // The old pass's marker would otherwise complete the next `phase wait`
+        // instantly, off work that predates this rehydrate.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-marker");
+        let mut p = reaped_phase("plan", "claude", None, Some("sess-m"));
+        p.pass = crate::run::PassToken::new("old-pass".into());
+        run.phases.push(p);
+        run.save().unwrap();
+        std::fs::create_dir_all(run_dir("rh-marker")).unwrap();
+        std::fs::write(done_marker("rh-marker", "plan"), "old-pass").unwrap();
+        let h = FakeHerdr::new();
+
+        phase_rehydrate(&h, &mut run, "plan").unwrap();
+
+        assert!(
+            !done_marker("rh-marker", "plan").exists(),
+            "the previous pass's marker must be gone"
+        );
+        let pass = run.find_phase("plan").unwrap().pass.clone().unwrap();
+        assert_ne!(pass.as_str(), "old-pass", "a new agent is a new pass");
+        let launch = pane_run_call(&h);
+        assert!(
+            launch.contains(&format!("{PASS_ENV}='{}'", pass.as_str())),
+            "the agent carries the pass it was launched under: {launch}"
+        );
+    }
+
+    #[test]
+    fn a_rehydrate_whose_launch_fails_does_not_strand_its_tab() {
+        // Same class as `phase_start`'s: a pane drovr opened and never recorded
+        // is one `drovr cleanup` protects as the human's, forever — and it
+        // blocks `workspace_close` for the whole run.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-failed-launch");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-f")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+
+        assert!(phase_rehydrate(&h, &mut run, "plan").is_err());
+
+        let tab = h
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("tab_create"))
+            .unwrap();
+        let pane = tab.rsplit("-> ").next().unwrap().to_owned();
+        let on_disk = RunState::load("rh-failed-launch").unwrap();
+        assert!(
+            on_disk.retired_panes.contains(&pane),
+            "the orphan must stay recorded as drovr's: {:?}",
+            on_disk.retired_panes
+        );
+        // The phase itself is untouched: still reaped, still resumable.
+        assert!(on_disk.find_phase("plan").unwrap().is_reaped());
+        assert!(on_disk.find_phase("plan").unwrap().resume_target().is_some());
+    }
+
+    #[test]
+    fn rehydrate_never_reaps_or_closes_anything() {
+        // Scope guard: task 5 brings panes BACK. Closing is task 6's, and the
+        // only pane this task may close is one whose own launch just failed.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-no-close");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-n")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_rehydrate(&h, &mut run, "plan").unwrap();
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("tab_close")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pane_close")),
+            "{calls:?}"
+        );
     }
 }

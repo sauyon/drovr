@@ -249,7 +249,6 @@ impl Phase {
 
     /// Everything a resume needs for this phase, or `None` — the whole bundle
     /// or nothing. See [`ResumeTarget`]; this is the accessor task 5 uses.
-    #[allow(dead_code)]
     pub fn resume_target(&self) -> Option<ResumeTarget<'_>> {
         self.pane_agent.as_ref().and_then(PhaseAgent::resume)
     }
@@ -294,7 +293,6 @@ impl Phase {
 
     /// Whether drovr has closed this phase's pane. Nothing reads it yet —
     /// task 6 (reaping) and task 5 (rehydrate) do.
-    #[allow(dead_code)]
     pub fn is_reaped(&self) -> bool {
         self.reaped.yes()
     }
@@ -343,17 +341,14 @@ pub struct ResumeTarget<'a> {
 
 impl<'a> ResumeTarget<'a> {
     /// The session id to resume.
-    #[allow(dead_code)]
     pub fn session(&self) -> &'a SessionId {
         self.session
     }
     /// The agent that created it — the only one it means anything to.
-    #[allow(dead_code)]
     pub fn backend(&self) -> &'a str {
         self.backend
     }
     /// The `CLAUDE_CONFIG_DIR` to resume UNDER; `None` = the default profile.
-    #[allow(dead_code)]
     pub fn profile(&self) -> Option<&'a str> {
         self.profile
     }
@@ -449,7 +444,6 @@ impl PhaseAgent {
     /// Nothing resumes yet, so this is exercised by tests alone until task 5
     /// composes `--resume`; it exists now because it is the accessor that makes
     /// the bundle impossible to take apart.
-    #[allow(dead_code)]
     pub fn resume(&self) -> Option<ResumeTarget<'_>> {
         self.session.as_ref().map(|session| ResumeTarget {
             session,
