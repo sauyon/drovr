@@ -719,10 +719,15 @@ impl Herdr for SystemHerdr {
         // too), so only herdr's explicit `pane_not_found` counts as death — see
         // `pane_get_proves_missing`. Anything else, including a failure to run the
         // binary at all, reports alive so a blip never respawns live work.
+        //
+        // The verdict reads BOTH streams: herdr answers a missing pane on stderr
+        // with an empty stdout, so consulting stdout alone made every dead pane
+        // report alive.
         match self.run(&["pane", "get", pane_id]) {
-            Ok(out) if !out.status.success() => {
-                !pane_get_proves_missing(&String::from_utf8_lossy(&out.stdout))
-            }
+            Ok(out) if !out.status.success() => !pane_get_proves_missing(
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
             _ => true,
         }
     }
@@ -926,14 +931,19 @@ fn collect_pane_ids_into(value: &Value, workspace: &str, out: &mut Vec<String>) 
 /// as "pane is dead" and make [`Herdr::pane_exists`] tell callers to respawn a
 /// reviewer that is alive and working. Only herdr's explicit `pane_not_found` error
 /// code is treated as proof of death; anything else is "cannot tell", i.e. alive.
-fn pane_get_proves_missing(stdout: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<Value>(stdout) else {
-        return false;
-    };
-    v.get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(Value::as_str)
-        == Some("pane_not_found")
+///
+/// BOTH streams are examined because herdr puts the error on **stderr** and leaves
+/// stdout empty (see `pane_get_error_on_stderr_proves_a_pane_is_missing`). Checking
+/// stdout alone made this function answer "cannot tell" for every real dead pane.
+fn pane_get_proves_missing(stdout: &str, stderr: &str) -> bool {
+    [stdout, stderr].iter().any(|s| {
+        serde_json::from_str::<Value>(s).is_ok_and(|v| {
+            v.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str)
+                == Some("pane_not_found")
+        })
+    })
 }
 
 /// herdr's own error text, with its machine code appended when there is one.
@@ -1445,28 +1455,81 @@ mod tests {
         assert!(find_string_field(&v, "pane_id").is_none());
     }
 
+    // -- where herdr actually puts the error -----------------------------------
+    // `herdr pane get <missing>` exits 1, prints NOTHING on stdout, and writes its
+    // error JSON to STDERR (verified against herdr 0.7.5 — protocol 18):
+    //
+    //   stdout: ""
+    //   stderr: {"error":{"code":"pane_not_found","message":"pane w1:p9 not found"}}
+    //
+    // Reading only stdout therefore made `pane_exists` blind: no real pane could
+    // ever be proven dead, so `code-review`'s resume waited forever on reviewers
+    // whose panes were gone instead of respawning them, and `cleanup`'s
+    // already-gone-pane guard never fired. Both streams are checked now.
+    #[test]
+    fn pane_get_error_on_stderr_proves_a_pane_is_missing() {
+        assert!(
+            pane_get_proves_missing(
+                "",
+                r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+            ),
+            "herdr writes the error to stderr — a pane proven gone there must count as gone"
+        );
+    }
+
+    #[test]
+    fn pane_get_error_on_stdout_still_proves_a_pane_is_missing() {
+        // Older herdr (and the socket path) answer on stdout. Keep honoring it, so
+        // the fix is additive rather than a swap of one blind spot for another.
+        assert!(pane_get_proves_missing(
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"}}"#,
+            ""
+        ));
+    }
+
+    #[test]
+    fn a_stderr_failure_that_is_not_pane_not_found_still_means_alive() {
+        // The whole point of the bias: an unreachable daemon must never read as a
+        // dead pane, whichever stream it complains on.
+        assert!(!pane_get_proves_missing(
+            "",
+            r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+        ));
+        assert!(!pane_get_proves_missing(
+            "",
+            "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+        ));
+        assert!(!pane_get_proves_missing("", ""), "silence proves nothing");
+    }
+
     #[test]
     fn only_pane_not_found_proves_a_pane_is_missing() {
         // The one answer that proves death.
         assert!(pane_get_proves_missing(
-            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#,
+            ""
         ));
 
         // Every other nonzero exit must read as "cannot tell" → alive. Reporting a
         // live reviewer dead makes `code-review` resume respawn work in progress.
         assert!(
             !pane_get_proves_missing(
-                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#,
+                ""
             ),
             "an unreachable daemon must never be read as a dead pane"
         );
         assert!(
             !pane_get_proves_missing(
-                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }",
+                ""
             ),
             "a non-JSON failure (bad socket path) must not be read as a dead pane"
         );
-        assert!(!pane_get_proves_missing(""), "empty output proves nothing");
+        assert!(
+            !pane_get_proves_missing("", ""),
+            "empty output proves nothing"
+        );
     }
 
     // -- collect_pane_ids: what is actually in a workspace ---------------------
