@@ -1970,7 +1970,8 @@ mod tests {
             "review:t:1:correctness",
             None,
             "claude",
-            "claude --permission-mode plan --add-dir '/tmp/drovr-proj-test'",)
+            "claude --permission-mode plan --add-dir '/tmp/drovr-proj-test'",
+        )
         .unwrap();
 
         let calls = h.calls();
@@ -3954,7 +3955,8 @@ mod tests {
             "review:task-1:1:correctness",
             None,
             "claude",
-            "claude --permission-mode plan",)
+            "claude --permission-mode plan",
+        )
         .unwrap();
 
         // Registered in review_phases, NOT the pipeline `phases` list.
@@ -3994,7 +3996,8 @@ mod tests {
             "review:task-1:1:security",
             None,
             "claude",
-            "claude --permission-mode plan",)
+            "claude --permission-mode plan",
+        )
         .unwrap();
 
         let calls = h.calls();
@@ -4037,7 +4040,8 @@ mod tests {
             "review:t:1:correctness",
             None,
             "claude",
-            "claude --permission-mode plan",)
+            "claude --permission-mode plan",
+        )
         .unwrap();
 
         let calls = h.calls();
@@ -4061,7 +4065,8 @@ mod tests {
             "review:t:1:correctness",
             None,
             "claude",
-            "claude --permission-mode plan",);
+            "claude --permission-mode plan",
+        );
         assert!(res.is_err(), "must error when the run has no workspace");
         assert!(res.unwrap_err().to_string().contains("workspace"));
     }
@@ -4079,7 +4084,8 @@ mod tests {
             "review:t:1:correctness",
             Some(seed),
             "claude",
-            "claude --permission-mode plan",)
+            "claude --permission-mode plan",
+        )
         .unwrap();
 
         // Seed path recorded on handoff_doc for later injection — NOT on the command line.
@@ -4127,7 +4133,8 @@ mod tests {
             "review:t:1:correctness",
             None,
             "claude",
-            "claude --permission-mode plan",)
+            "claude --permission-mode plan",
+        )
         .unwrap();
 
         let calls = h.calls();
@@ -5172,7 +5179,8 @@ mod capture_tests {
                 "review:task-1:1:correctness",
                 None,
                 "claude",
-                "claude --permission-mode plan",)
+                "claude --permission-mode plan",
+            )
             .unwrap();
             assert_eq!(
                 run.phases[0].agent_profile.as_deref(),
