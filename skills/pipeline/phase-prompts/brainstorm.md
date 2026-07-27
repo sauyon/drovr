@@ -87,6 +87,3 @@ b. **Signal completion:**
 
 Leave `spec.md` complete and current. Reference source by path; do not paste large code blocks
 into the spec or handoff.
-
----
-TASK:

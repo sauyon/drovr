@@ -324,49 +324,75 @@ fn extract_findings_json(transcript: &str) -> Option<String> {
     result.or_else(|| last_review_object(transcript))
 }
 
-/// The LAST balanced top-level `{...}` in `text` that parses as a [`Review`].
+/// The LAST balanced `{...}` in `text` that parses as a [`Review`].
 ///
-/// Scans for `{`, then walks forward tracking brace depth while ignoring braces inside
-/// JSON strings (and escapes within them), so a `summary` containing `{` cannot end the
-/// object early. Every candidate is validated by `parse_review`, so prose that merely
-/// contains braces is skipped rather than mistaken for findings.
+/// Candidate starts are only those `{` that are the first non-whitespace character on
+/// their line, which is where a reviewer's findings object always begins in a terminal
+/// transcript. That restriction is what keeps this cheap: trying EVERY brace was quadratic
+/// on a transcript full of code and JSON, and an unbalanced brace in prose could swallow
+/// the rest of the input so the real object was never even attempted.
+///
+/// Candidates are tried from the LAST backwards and the first one that both balances and
+/// parses wins, so the newest findings block is what gets returned.
 fn last_review_object(text: &str) -> Option<String> {
-    let mut found = None;
-    for (start, _) in text.char_indices().filter(|(_, c)| *c == '{') {
-        let mut depth = 0usize;
-        let mut in_str = false;
-        let mut escaped = false;
-        for (offset, c) in text[start..].char_indices() {
-            if in_str {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let end = start + offset;
-                        if let Some(slice) = text.get(start..=end)
-                            && parse_review(slice).is_ok()
-                        {
-                            found = Some(slice.to_string());
-                        }
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    let mut starts = Vec::new();
+    for (line_start, line) in line_offsets(text) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('{') {
+            starts.push(line_start + (line.len() - trimmed.len()));
         }
     }
-    found
+    for &s in starts.iter().rev() {
+        if let Some(e) = balanced_end(text, s)
+            && let Some(slice) = text.get(s..=e)
+            && parse_review(slice).is_ok()
+        {
+            return Some(slice.to_string());
+        }
+    }
+    None
+}
+
+/// `(byte offset, line)` for each line in `text`, newline excluded.
+fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut at = 0usize;
+    text.split('\n').map(move |line| {
+        let here = at;
+        at += line.len() + 1;
+        (here, line)
+    })
+}
+
+/// Byte index of the `}` closing the object that opens at `open`, or `None` if it never
+/// balances. Braces inside JSON strings (and escapes within them) do not count.
+fn balanced_end(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (offset, c) in text[open..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Obtain one reviewer's findings JSON: read the file it wrote (primary), else fall
@@ -457,7 +483,19 @@ pub fn code_review_run<H: Herdr>(
 
     // Resolved once per pass, so every angle in this panel — and every angle a later
     // resume respawns — is briefed identically.
-    let context = resolve_context(&dir, task, context)?;
+    //
+    // A failure here is a SETUP failure in the same class as a missing base or an
+    // unreadable HEAD, so it takes the same channel: print why, return `Error` (exit 1 via
+    // the outcome) rather than an `Err` that would exit 1 through a different path and read
+    // as an internal fault. It happens BEFORE any reviewer is spawned, so nothing is left
+    // half-started.
+    let context = match resolve_context(&dir, task, context) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("code-review: cannot resolve the review context for '{task}' ({e})");
+            return Ok(ReviewOutcome::Error);
+        }
+    };
 
     let cfg = load_config()?;
     let auto_cursor_integrated = cfg.review_agent.is_none() && h.integration_present("cursor");
@@ -1820,6 +1858,28 @@ mod tests {
         let review = parse_review(&got).expect("and must parse as a Review");
         assert_eq!(review.findings.len(), 1);
         assert_eq!(review.verdict, "changes");
+    }
+
+    /// Round 3: the first scanner tried EVERY `{` as a candidate start, which is quadratic
+    /// on a transcript full of code and JSON — i.e. every reviewer transcript. This pins
+    /// both that it still finds the object behind decoy braces, and that a large
+    /// brace-heavy input completes (a quadratic scan over 60k braces would not).
+    #[test]
+    fn last_review_object_survives_a_brace_heavy_transcript() {
+        let decoys = "{ not json } fn f() { let x = HashMap::new(); } { \"a\": ".repeat(2_000);
+        let real =
+            r#"{"verdict":"changes","findings":[{"file":"a.rs","severity":"nit","summary":"s"}]}"#;
+        let t = format!("{decoys}\nReview complete.\n{real}\n{decoys}");
+        let got = last_review_object(&t).expect("the real object must be found among decoys");
+        assert_eq!(parse_review(&got).unwrap().findings.len(), 1);
+    }
+
+    /// A stray unbalanced `{` before the findings must not swallow them.
+    #[test]
+    fn last_review_object_recovers_after_an_unparseable_candidate() {
+        let t = "{ this { is not } json at all\n{\"verdict\":\"clean\",\"findings\":[]}\n";
+        let got = last_review_object(t).expect("must resume past the stray brace");
+        assert_eq!(parse_review(&got).unwrap().verdict, "clean");
     }
 
     /// The seed echoes the SCHEMA inside a fence, and that schema is not valid JSON

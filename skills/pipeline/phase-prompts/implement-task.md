@@ -70,6 +70,3 @@ your final action. Reference source by path; do not paste large diffs into the r
 If you cannot complete the task (blocked, or the plan contradicts reality), STOP and say so
 plainly in the report — a failed task halts the loop rather than cascading a broken interface
 forward.
-
----
-TASK BRIEF + ACCUMULATED INTERFACES:

@@ -1150,6 +1150,14 @@ fn cmd_review(sub: ReviewCmd) {
 fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
     const MAX_CONTEXT: u64 = 1 << 20;
     match (context, context_file) {
+        (Some(text), _) if text.len() as u64 > MAX_CONTEXT => {
+            eprintln!(
+                "drovr: --context is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not \
+                 a context; check what you passed",
+                text.len()
+            );
+            process::exit(1);
+        }
         (Some(text), _) => Some(text),
         (None, Some(path)) => match std::fs::read_to_string(&path) {
             // Same 1 MiB bound as `phase send -`: a context is prose, and the two input

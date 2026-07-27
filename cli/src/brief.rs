@@ -98,21 +98,60 @@ pub fn resolve_context(
     match supplied {
         Some(text) if !text.trim().is_empty() => {
             std::fs::create_dir_all(dir)?;
-            // Write-then-rename: `fs::write` FOLLOWS a symlink at `path`, so a symlink
-            // planted in the run dir would turn recording context into a clobber of its
-            // target. `rename` replaces the link itself.
-            let tmp = path.with_extension("md.tmp");
-            std::fs::write(&tmp, format!("{}\n", text.trim()))?;
-            std::fs::rename(&tmp, &path)?;
+            // Write-then-rename: `fs::write` FOLLOWS a symlink at the destination, so a
+            // symlink planted in the run dir would turn recording context into a clobber
+            // of its target. `rename` replaces the link itself.
+            //
+            // The temp file needs the same care, which the first version of this fix
+            // missed: `fs::write` to a FIXED `.tmp` path follows a symlink planted there
+            // just as readily, so the hole moved rather than closed. `create_new` refuses
+            // to open anything that already exists — symlink included — and the pid makes
+            // concurrent recordings of the same key use different temps.
+            let tmp = dir.join(format!(".{key}-context.{}.tmp", std::process::id()));
+            let write = (|| -> io::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?;
+                std::io::Write::write_all(&mut f, format!("{}\n", text.trim()).as_bytes())
+            })();
+            if let Err(e) = write {
+                // Leave nothing behind for the next invocation to trip over.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
             Ok(Some(text.trim().to_owned()))
         }
         Some(_) => {
             // Explicitly empty: un-say it. Remove unconditionally and tolerate NotFound,
             // rather than exists()-then-remove, which races with anything else in the run
             // dir and turns a benign "already gone" into an error.
+            // `--context ''` is what the unreadable-record error tells the driver to run,
+            // so it has to work in the states that produce that error — including a
+            // DIRECTORY sitting at the record path, where `remove_file` fails outright.
+            // A non-empty directory is not cleared automatically: recursive deletion of
+            // something drovr did not create is not a clear-the-context operation.
             match std::fs::remove_file(&path) {
                 Ok(()) => eprintln!("drovr: cleared the recorded context for '{key}'"),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) if path.is_dir() => match std::fs::remove_dir(&path) {
+                    Ok(()) => eprintln!("drovr: cleared the recorded context for '{key}'"),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!(
+                                "cannot clear the recorded context: {} is a non-empty \
+                                 directory ({e}) — remove it yourself; drovr will not delete \
+                                 a tree it did not create",
+                                path.display()
+                            ),
+                        ));
+                    }
+                },
                 Err(e) => return Err(e),
             }
             Ok(None)
@@ -141,8 +180,20 @@ pub fn resolve_context(
                     ));
                 }
             }
-            .map(|c| c.trim().to_owned())
-            .filter(|c| !c.is_empty());
+            .map(|c| c.trim().to_owned());
+            // A record that exists but holds only whitespace is a broken state, not "no
+            // context": say so rather than composing as if nothing was ever recorded.
+            let recorded = match recorded {
+                Some(c) if c.is_empty() => {
+                    eprintln!(
+                        "drovr: the recorded context for '{key}' ({}) is empty — composing \
+                         without it",
+                        path.display()
+                    );
+                    None
+                }
+                other => other,
+            };
             if recorded.is_some() {
                 eprintln!(
                     "drovr: reusing the recorded context for '{key}' ({}) — pass --context to \
@@ -469,6 +520,56 @@ mod tests {
         );
     }
 
+    /// Round 3, security: the first version of the symlink fix protected the DESTINATION
+    /// and then wrote the temp file with `fs::write` at a fixed path — which follows a
+    /// symlink planted there just as readily. The hole moved rather than closed, which is
+    /// worse than not fixing it, because it reads as solved.
+    #[test]
+    fn recording_context_does_not_follow_a_symlink_at_the_temp_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("symlink-tmp");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        // Plant a link at the temp path this process will use.
+        let tmp = dir.join(format!(".plan-context.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        // Either outcome is acceptable — refuse, or write elsewhere — but the victim must
+        // survive either way.
+        let _ = compose_phase_brief(&run, "plan", Some("new context"));
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "a symlink at the TEMP path must not be followed either"
+        );
+    }
+
+    /// The unreadable-record error tells the driver to run `--context ''`, so that must
+    /// work in the state that produces the error — including a directory at the path.
+    #[test]
+    fn clearing_context_works_when_the_record_is_a_directory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("clear-a-directory");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(context_record(&dir, "plan")).unwrap();
+
+        // Precondition: this is exactly the state that fails to compose.
+        assert!(compose_phase_brief(&run, "plan", None).is_err());
+
+        // The advertised remedy must actually clear it.
+        let brief = compose_phase_brief(&run, "plan", Some(""))
+            .expect("--context '' must clear a directory record, as the error says it will");
+        assert!(!brief.contains("## Context from the driver"));
+        assert!(
+            !context_record(&dir, "plan").exists(),
+            "the bogus record must be gone"
+        );
+    }
+
     /// The implement-task scope pointer must not send an agent to a section that is not
     /// there: with no context, its scope is the task's entry in `plan.md`.
     #[test]
@@ -495,6 +596,39 @@ mod tests {
         let with = compose_phase_brief(&run, "implement-task-2", Some("task 2 brief")).unwrap();
         assert!(with.contains(ctx_pointer));
         assert!(!with.contains(plan_pointer));
+    }
+
+    /// The templates used to end with a paste-target footer (`--- BRAINSTORM HANDOFF:`,
+    /// `--- TASK BRIEF + ACCUMULATED INTERFACES:`) that the driver filled in by hand. drovr
+    /// appends a context section now, so those were empty duplicates of the same channel
+    /// sitting after the completion criteria. `## Done when` must be the LAST heading of
+    /// every composed brief, with or without context.
+    #[test]
+    fn no_composed_brief_ends_with_a_stale_paste_footer() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("no-stale-footer");
+        let run = make_run();
+        for phase in ["brainstorm", "plan", "review", "implement-task-1"] {
+            for context in [None, Some("some context")] {
+                let brief = compose_phase_brief(&run, phase, context).unwrap();
+                let last = brief
+                    .lines()
+                    .rfind(|l| l.starts_with("## "))
+                    .unwrap_or_else(|| panic!("{phase} has no headings"));
+                assert_eq!(
+                    last,
+                    "## Done when",
+                    "{phase} (context: {}) must end on its completion criteria",
+                    context.is_some()
+                );
+                for stale in ["HANDOFF:", "TASK BRIEF +", "IMPLEMENT REPORTS", "\nTASK:"] {
+                    assert!(
+                        !brief.contains(stale),
+                        "{phase}: stale paste footer {stale:?} is back:\n{brief}"
+                    );
+                }
+            }
+        }
     }
 
     /// Context is per phase, never shared between them.
