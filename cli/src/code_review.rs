@@ -272,7 +272,7 @@ fn obtain_findings_json<H: Herdr>(
     // pass cannot make resolved findings persist forever.
     let pane = run
         .find_phase(phase_name)
-        .and_then(|p| p.pane_id.clone())
+        .and_then(|p| p.pane_id().map(str::to_owned))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -419,7 +419,7 @@ pub fn code_review_run<H: Herdr>(
             let existing = run.find_phase(&phase);
             let failed = existing.is_some_and(|p| p.status == PhaseStatus::Failed);
             let alive = existing
-                .and_then(|p| p.pane_id.as_deref())
+                .and_then(|p| p.pane_id())
                 .is_some_and(|pane| h.pane_exists(pane));
             if alive && !failed {
                 pending.push((angle.clone(), phase));
@@ -438,7 +438,7 @@ pub fn code_review_run<H: Herdr>(
             // pane died). Retire it so `drovr cleanup` still knows it is drovr's:
             // cleanup reaps only the panes this state file records, and treats
             // everything else in the workspace as the human's.
-            if let Some(pane) = existing.and_then(|p| p.pane_id.clone()) {
+            if let Some(pane) = existing.and_then(|p| p.pane_id().map(str::to_owned)) {
                 run.retire_pane(pane);
             }
             run.review_phases.retain(|p| p.name != phase);
@@ -485,7 +485,10 @@ pub fn code_review_run<H: Herdr>(
             // Best-effort by construction: `poll_phase_pane` cannot fail, and the
             // error being propagated is the one that matters.
             for (_, seeded) in &pending {
-                if let Some(pane) = run.find_phase(seeded).and_then(|p| p.pane_id.clone()) {
+                if let Some(pane) = run
+                    .find_phase(seeded)
+                    .and_then(|p| p.pane_id().map(str::to_owned))
+                {
                     poll_phase_pane(h, run, seeded, &pane);
                 }
             }
@@ -530,7 +533,9 @@ pub fn code_review_run<H: Herdr>(
             // normal, since angles are spawned and seeded one at a time — had its
             // one capture skipped, and herdr drops the session when it exits.
             // A capture a fast agent can outrun is not a capture.
-            let pane = run.find_phase(&phase).and_then(|p| p.pane_id.clone());
+            let pane = run
+                .find_phase(&phase)
+                .and_then(|p| p.pane_id().map(str::to_owned));
             let status = pane
                 .as_deref()
                 .and_then(|pane| poll_phase_pane(h, run, &phase, pane))
@@ -734,7 +739,7 @@ mod tests {
 
     fn pane_of(run: &RunState, phase: &str) -> String {
         run.find_phase(phase)
-            .and_then(|p| p.pane_id.clone())
+            .and_then(|p| p.pane_id().map(str::to_owned))
             .unwrap_or_else(|| panic!("phase {phase} has no pane"))
     }
 
@@ -763,7 +768,7 @@ mod tests {
         let panes: Vec<String> = run
             .review_phases
             .iter()
-            .map(|p| p.pane_id.clone().unwrap())
+            .map(|p| p.pane_id().map(str::to_owned).unwrap())
             .collect();
 
         // A plain re-run must RESUME iter 1 — not open a second panel on the same diff.
@@ -794,7 +799,7 @@ mod tests {
         let panes_after: Vec<String> = run
             .review_phases
             .iter()
-            .map(|p| p.pane_id.clone().unwrap())
+            .map(|p| p.pane_id().map(str::to_owned).unwrap())
             .collect();
         assert_eq!(panes, panes_after, "resume re-attaches to the same panes");
     }
@@ -1125,12 +1130,14 @@ mod tests {
 
         // An angle that was dropped from config mid-run, still Running from an
         // earlier pass. The configured angles are all Done, so this pass is over.
-        run.review_phases.push(Phase {
-            name: "review:task-1:1:performance".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("pane-stale".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new("review:task-1:1:performance");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("pane-stale"),
+        );
 
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
@@ -1831,10 +1838,10 @@ mod tests {
         assert_eq!(next_iter(&base, "task-1"), 1);
 
         let mut run = base.clone();
-        let mk = |name: &str| Phase {
-            name: name.into(),
-            status: PhaseStatus::Running,
-            ..Default::default()
+        let mk = |name: &str| {
+            let mut p = Phase::new(name);
+            p.status = PhaseStatus::Running;
+            p
         };
         run.review_phases = vec![
             mk("review:task-1:1:correctness"),
@@ -1864,10 +1871,10 @@ mod tests {
             archived: false,
             retired_panes: vec![],
         };
-        let mk = |name: &str, status: PhaseStatus| Phase {
-            name: name.into(),
-            status,
-            ..Default::default()
+        let mk = |name: &str, status: PhaseStatus| {
+            let mut p = Phase::new(name);
+            p.status = status;
+            p
         };
 
         let angles: Vec<String> = ["correctness", "security"]

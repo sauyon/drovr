@@ -303,7 +303,7 @@ fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
     let p = run.find_phase(phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
-    p.pane_id.clone().ok_or_else(|| {
+    p.pane_id().map(str::to_owned).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("phase has no pane_id: {phase}"),
@@ -421,7 +421,8 @@ pub fn phase_start<H: Herdr>(
     //     later phases don't);
     //   * every later phase gets its own fresh tab (whose auto shell pane it
     //     reuses).
-    let existing_pane = find_phase_idx(run, phase).and_then(|i| run.phases[i].pane_id.clone());
+    let existing_pane =
+        find_phase_idx(run, phase).and_then(|i| run.phases[i].pane_id().map(str::to_owned));
     // `used_root` defers consuming `run.root_pane` until the launch actually
     // succeeds — if `pane_run` fails, the root pane stays available for a retry
     // instead of being silently forfeited to a fresh tab.
@@ -470,7 +471,7 @@ pub fn phase_start<H: Herdr>(
     // pane_id only — herdr_session is not used for cleanup, which closes panes by
     // id (`close_run_panes` in main.rs)
     run.phases[idx].herdr_session = None;
-    run.phases[idx].pane_id = Some(target_pane);
+    run.phases[idx].set_pane(target_pane);
     run.phases[idx].pass = Some(pass);
     run.phases[idx].status = PhaseStatus::Running;
     // Backend + profile as one value: both are facts about THIS launch, and the
@@ -573,9 +574,10 @@ pub fn spawn_reviewer<H: Herdr>(
     // Register the reviewer in `review_phases` only. The seed path rides on
     // handoff_doc for later `phase_send` injection, mirroring `phase_start`.
     let seed_str = seed.map(|p| p.to_string_lossy().into_owned());
-    // Every field is decided here, deliberately: `..Default::default()` costs the
-    // compiler's exhaustiveness check, so a field added later would silently
-    // land as `None` at the one production site that builds a `Phase` literal.
+    // Built field by field rather than as a literal: `pane_id` and `reaped` are
+    // private (they are a lifecycle pair — see `Phase::set_pane`), so a literal
+    // cannot name them. Every field is still decided here deliberately, which is
+    // what a literal used to buy:
     //   * `agent` — backend + profile, recorded now because the launch is the
     //     only moment either is knowable, and a reviewer is resumed the same way
     //     a phase is. The backend is NOT `run.agent`: see `PhaseAgent`.
@@ -583,22 +585,15 @@ pub fn spawn_reviewer<H: Herdr>(
     //     `tab_create` returns a PANE id, and the agent has not attached yet.
     //     Both are captured by `poll_phase_pane`, from the readiness gate in the
     //     `phase_send` that seeds this reviewer and from `code_review`'s wait
-    //     loop thereafter.
-    //   * `reaped` — false; this pane was just created.
-    run.review_phases.push(Phase {
-        name: phase.to_owned(),
-        status: PhaseStatus::Running,
-        handoff_doc: seed_str,
-        herdr_session: None,
-        pane_id: Some(pane),
-        pass: Some(pass),
-        tab_id: None,
-        agent: Some(PhaseAgent::launched(launch.backend(), agent_profile_env())),
-        // A freshly spawned reviewer is not reaped, and `Reaped`'s "yes" cannot
-        // be built outside `run.rs` anyway — `Phase::mark_reaped` is the only
-        // way there. Default covers this one field; every other is listed above.
-        reaped: Default::default(),
-    });
+    //     loop thereafter. Left at their defaults on purpose.
+    //   * `reaped` — `set_pane` clears it; a pane just created is not reaped.
+    let mut reviewer = Phase::new(phase);
+    reviewer.status = PhaseStatus::Running;
+    reviewer.handoff_doc = seed_str;
+    reviewer.set_pane(pane);
+    reviewer.pass = Some(pass);
+    reviewer.agent = Some(PhaseAgent::launched(launch.backend(), agent_profile_env()));
+    run.review_phases.push(reviewer);
     run.save()?;
     Ok(())
 }
@@ -819,9 +814,20 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
         Some(p) if Capture::might_add(info, p) => {}
         _ => return,
     }
-    let Ok(mut fresh) = RunState::load(&run.name) else {
-        capture_write_failed(&run.name, phase, "its run state could not be re-read");
-        return;
+    let mut fresh = match RunState::load(&run.name) {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            // Carry the reason. Capture failures are invisible by design
+            // (best-effort, never fails a wait), so the message is the only
+            // thing a human will ever have when a rehydrate later finds nothing
+            // to resume — "could not be re-read" alone names no cause.
+            capture_write_failed(
+                &run.name,
+                phase,
+                &format!("its run state could not be re-read ({e})"),
+            );
+            return;
+        }
     };
     // A phase absent from freshly loaded state has nowhere to record this, and
     // capture must not resurrect it.
@@ -837,11 +843,16 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     // runs older than that field, so there is no third tier. When even that is
     // absent nothing is recorded: a guessed backend is how a session gets
     // captured under the wrong agent.
+    // BOTH branches read `fresh`, never the caller's copy. Round 2 fixed the
+    // phase-level source and left this legacy fallback resolving from the
+    // caller's `run.agent` — the same stale-source bug, one branch over. When
+    // the rule is "attribute from what is on disk", it has to hold for every
+    // branch that resolves the value, not the one that was pointed at.
     let Some(backend) = target
         .agent
         .as_ref()
         .map(|a| a.backend().to_owned())
-        .or_else(|| run.agent.clone())
+        .or_else(|| fresh.agent.clone())
     else {
         // The last silent skip, now audible. Refusing to guess is right — a
         // guessed backend is how a session gets attributed to the wrong agent —
@@ -866,6 +877,17 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     // resolved above — otherwise `apply` has nowhere to put the session and the
     // capture would be silently dropped for exactly the legacy phases the
     // fallback exists to serve.
+    //
+    // `profile: None` here is CORRECT and deliberate — reviewed and declined as
+    // a finding, recorded so it is not re-raised. A phase launched before
+    // profile capture existed genuinely has no recorded profile, and `None`
+    // already means "the default profile", which is what such a launch used.
+    // The tempting alternative — filling it from the CURRENT environment — is a
+    // guess: whatever `CLAUDE_CONFIG_DIR` this process happens to hold need not
+    // be the one that pane authenticated under, and a wrong profile resolves to
+    // the wrong `projects/<escaped-cwd>/` directory and silently finds no
+    // session at all. An honest "unknown" degrades to a reseed; a confident
+    // wrong answer degrades to a mystery.
     if p.agent.is_none() && capture.session.is_some() {
         p.agent = Some(PhaseAgent::launched(backend, None));
     }
@@ -1432,7 +1454,7 @@ pub fn phase_wait<H: Herdr>(
     // NOTE: there is deliberately NO `status == Done` short-circuit, and the
     // marker is deliberately NOT consumed on success. See the doc comment above —
     // the marker is the evidence, the status is only a cache of it.
-    let pane_id = run.phases[idx].pane_id.clone();
+    let pane_id = run.phases[idx].pane_id().map(str::to_owned);
     let expected_pass = run.phases[idx].pass.clone();
     let marker = done_marker(&run.name, phase);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -1856,7 +1878,7 @@ fn tail_snippet(pane: &str, n: usize) -> String {
 /// loop. A failed pane read is swallowed (returns `None`) — a best-effort
 /// diagnostic must never mask the underlying timeout with a new error.
 pub fn diagnose_stuck_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Option<String> {
-    let pane_id = run.find_phase(phase)?.pane_id.clone()?;
+    let pane_id = run.find_phase(phase)?.pane_id().map(str::to_owned)?;
     let pane = h.agent_read(&pane_id).ok()?;
     let matched = detect_stuck_prompt(&pane)?;
     let snippet = tail_snippet(&pane, 6);
@@ -2001,7 +2023,7 @@ pub fn triage_blocked_phase<H: Herdr>(h: &H, run: &RunState, phase: &str) -> Blo
             "(phase has no recorded pane; cannot read the prompt)".into(),
         );
     };
-    let Some(pane_id) = run.phases[idx].pane_id.clone() else {
+    let Some(pane_id) = run.phases[idx].pane_id().map(str::to_owned) else {
         return escalate(
             BlockedClass::Unknown,
             "(phase has no pane_id; cannot read the prompt)".into(),
@@ -2136,7 +2158,7 @@ mod tests {
         let p = &run.phases[0];
         assert_eq!(p.name, "brainstorm");
         assert_eq!(p.status, PhaseStatus::Running);
-        assert!(p.pane_id.is_some(), "pane_id must be recorded");
+        assert!(p.pane_id().is_some(), "pane_id must be recorded");
         // herdr_session is no longer written (cleanup closes panes by id, not session_stop)
         assert!(p.herdr_session.is_none(), "herdr_session must be None");
         // claude is launched via `pane run`, NOT a split-creating `agent start`.
@@ -2212,7 +2234,7 @@ mod tests {
             run_call.contains("pane=ws-42:root"),
             "first phase must run claude in the root pane: {run_call}"
         );
-        assert_eq!(run.phases[0].pane_id.as_deref(), Some("ws-42:root"));
+        assert_eq!(run.phases[0].pane_id(), Some("ws-42:root"));
         assert!(
             run.root_pane.is_none(),
             "root_pane must be consumed after first use"
@@ -2239,7 +2261,7 @@ mod tests {
             "tab must be labelled with the phase: {tab_call}"
         );
         // claude runs in the new tab's pane
-        let plan_pane = run.phases[1].pane_id.clone().unwrap();
+        let plan_pane = run.phases[1].pane_id().map(str::to_owned).unwrap();
         assert!(
             calls
                 .iter()
@@ -2527,7 +2549,7 @@ mod tests {
             t.diagnostic
         );
         // The accept keystroke was sent to the phase pane.
-        let pane_id = run.phases[0].pane_id.clone().unwrap();
+        let pane_id = run.phases[0].pane_id().map(str::to_owned).unwrap();
         assert!(
             h.calls()
                 .iter()
@@ -2570,10 +2592,10 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run("triage-no-pane-test");
         // A phase with no pane_id yet.
-        run.phases.push(Phase {
-            name: "code".into(),
-            status: PhaseStatus::Running,
-            ..Default::default()
+        run.phases.push({
+            let mut p = Phase::new("code");
+            p.status = PhaseStatus::Running;
+            p
         });
 
         let t = triage_blocked_phase(&h, &run, "code");
@@ -2594,10 +2616,10 @@ mod tests {
         // stray marker.
         assert!(phase_done(&run, "nonexistent").is_err());
         // Even with a review phase present, a name in NEITHER list is rejected.
-        run.review_phases.push(Phase {
-            name: "review:t:1:correctness".into(),
-            status: PhaseStatus::Running,
-            ..Default::default()
+        run.review_phases.push({
+            let mut p = Phase::new("review:t:1:correctness");
+            p.status = PhaseStatus::Running;
+            p
         });
         assert!(phase_done(&run, "nonexistent").is_err());
     }
@@ -2608,12 +2630,14 @@ mod tests {
         let mut run = make_run("done-review-test");
         // A reviewer phase lives only in `review_phases`, yet must be able to drop
         // its completion marker via `drovr phase done` (which calls phase_done).
-        run.review_phases.push(Phase {
-            name: "review:t:1:correctness".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("rp1".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new("review:t:1:correctness");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("rp1"),
+        );
         let marker = phase_done(&run, "review:t:1:correctness").unwrap();
         assert!(
             marker.exists(),
@@ -2628,12 +2652,14 @@ mod tests {
     fn done_requires_handoff_for_pipeline_phase() {
         let _lock = ENV_LOCK.lock().unwrap();
         let mut run = make_run("done-requires-handoff");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         // The finishing agent authors <phase>-HANDOFF.md itself, in-context, BEFORE
         // signalling done. With no handoff present, phase_done must refuse — the
         // completion contract is atomic (no marker without a handoff).
@@ -2666,12 +2692,14 @@ mod tests {
     fn done_rejects_empty_handoff_for_pipeline_phase() {
         let _lock = ENV_LOCK.lock().unwrap();
         let mut run = make_run("done-empty-handoff");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         // A whitespace-only handoff is treated as absent (guards the degenerate
         // 2-line-garbage case the old compressor produced).
         let hp = run_dir(&run.name).join("plan-HANDOFF.md");
@@ -2694,12 +2722,14 @@ mod tests {
         let mut run = make_run("send-review-test");
         // A reviewer pane registered only in `review_phases` must still be
         // reachable by `phase_send` (require_pane_id falls back to review_phases).
-        run.review_phases.push(Phase {
-            name: "review:t:1:correctness".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("review-pane-9".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new("review:t:1:correctness");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("review-pane-9"),
+        );
         // Report the pane ready so the readiness gate returns on the first poll.
         h.push_status(Some("idle"));
         phase_send(&h, &mut run, "review:t:1:correctness", "seed text").unwrap();
@@ -2728,8 +2758,8 @@ mod tests {
         let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
         assert!(send_call.contains("hello agent"));
         // Target should match the pane_id recorded
-        let pane_id = run.phases[0].pane_id.as_ref().unwrap();
-        assert!(send_call.contains(pane_id.as_str()));
+        let pane_id = run.phases[0].pane_id().unwrap();
+        assert!(send_call.contains(pane_id));
     }
 
     // -- agent_has_started: which statuses mean "attached AND at the composer" -
@@ -3236,12 +3266,14 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("vanished-phase-test");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         assert!(run.phases[0].pass.is_none(), "legacy phase: no token");
         run.save().unwrap();
         write_handoff(&run, "plan");
@@ -3713,12 +3745,14 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("legacy-pass-test");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         assert!(run.phases[0].pass.is_none());
         run.save().unwrap(); // phase_wait re-reads state to verify supersession
         write_handoff(&run, "plan");
@@ -3755,12 +3789,14 @@ mod tests {
         // phase does not have.
         let _lock = ENV_LOCK.lock().unwrap();
         let mut run = make_run("untokened-write-test");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         assert!(run.phases[0].pass.is_none());
         run.save().unwrap();
         write_handoff(&run, "plan");
@@ -3859,11 +3895,10 @@ mod tests {
         // `..Default::default()` pattern needs `Default`), so instead every entry
         // point refuses to ADDRESS one. Even a hand-edited state.json holding an
         // unnamed phase is inert: no command can reach it.
-        run.phases.push(Phase {
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        let mut unnamed = Phase::new("");
+        unnamed.status = PhaseStatus::Running;
+        unnamed.set_pane("p1");
+        run.phases.push(unnamed);
         assert_eq!(run.phases[0].name, "");
         assert!(phase_done(&run, "").is_err(), "phase_done must refuse");
         assert!(
@@ -4190,7 +4225,7 @@ mod tests {
         let p = &run.review_phases[0];
         assert_eq!(p.name, "review:task-1:1:correctness");
         assert_eq!(p.status, PhaseStatus::Running);
-        assert!(p.pane_id.is_some(), "pane_id must be recorded");
+        assert!(p.pane_id().is_some(), "pane_id must be recorded");
 
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
@@ -4236,7 +4271,7 @@ mod tests {
             Some("ws-rt:root"),
             "reviewer must not consume the pipeline root pane"
         );
-        let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
+        let reviewer_pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
         assert_ne!(
             reviewer_pane, "ws-rt:root",
             "reviewer must not run in the root pane"
@@ -4331,7 +4366,7 @@ mod tests {
             .rev()
             .find(|c| c.contains("agent_send"))
             .unwrap();
-        let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
+        let reviewer_pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
         assert!(
             send_call.contains(&reviewer_pane),
             "send must route to the reviewer pane: {send_call}"
@@ -4587,12 +4622,14 @@ mod tests {
 
         // Case 2: an untokened phase holding a token — remedy DROPS it.
         let mut legacy = make_run("done-quote-legacy; id");
-        legacy.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
+        legacy.phases.push(
+            {
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"),
+        );
         legacy.save().unwrap();
         write_handoff(&legacy, "plan");
         unsafe {
@@ -4656,12 +4693,14 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("send-fail-reviewer-test");
-        run.review_phases.push(Phase {
-            name: "review:t:1:correctness".into(),
-            status: PhaseStatus::Done,
-            pane_id: Some("p9".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new("review:t:1:correctness");
+                p.status = PhaseStatus::Done;
+                p
+            }
+            .with_pane("p9"),
+        );
         run.save().unwrap();
         // A reviewer's marker, written by the reviewer itself before it exited.
         let marker = done_marker(&run.name, "review:t:1:correctness");
@@ -4723,12 +4762,14 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run("old-name-test");
         let legacy = "review:t:1:api & contracts";
-        run.review_phases.push(Phase {
-            name: legacy.into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p7".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new(legacy);
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p7"),
+        );
         run.save().unwrap();
 
         // The name may no longer be CREATED …
@@ -4876,16 +4917,22 @@ mod tests {
         let h = FakeHerdr::new();
         let mut run = make_run("old-name-reentry-test");
         let legacy = "my task 1";
-        run.phases.push(Phase {
-            name: legacy.into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p3".into()),
-            ..Default::default()
-        });
+        run.phases.push(
+            {
+                let mut p = Phase::new(legacy);
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p3"),
+        );
         run.save().unwrap();
 
         phase_start(&h, &mut run, legacy, None).expect("re-entry of an existing phase is allowed");
-        assert_eq!(run.phases.len(), 1, "re-entry reuses the entry, never appends");
+        assert_eq!(
+            run.phases.len(),
+            1,
+            "re-entry reuses the entry, never appends"
+        );
         assert!(
             run.phases[0].pass.is_some(),
             "and it really did mint a new pass"
@@ -4988,7 +5035,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("session-survives");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         // 1. an attached agent (blocked → not "started", so the gate polls on)
         h.push_pane_info(attached(&pane, AgentStatus::Blocked));
@@ -5044,7 +5091,7 @@ mod capture_tests {
             let h = FakeHerdr::new();
             let mut run = capture_run(&format!("unusable-{label}"));
             phase_start(&h, &mut run, "plan", None).unwrap();
-            let pane = run.phases[0].pane_id.clone().unwrap();
+            let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
             h.push_pane_info(Some(PaneInfo {
                 tab_id: FakeHerdr::tab_id_for(&pane),
@@ -5080,7 +5127,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("save-guard");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("save-guard").join("state.json");
         let ino = || std::fs::metadata(&state).unwrap().ino();
 
@@ -5121,7 +5168,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("no-clobber");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         // Another process advances the run while this poller holds its snapshot.
         let mut other = RunState::load("no-clobber").unwrap();
@@ -5166,7 +5213,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("session-after-tab");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         // Poll 1: tab only, no session.
         h.push_pane_info(session_less(&pane, AgentStatus::Idle));
@@ -5249,7 +5296,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("save-fails");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let dir = run_dir("save-fails");
 
         // The run dir is readable but not writable: `RunState::load` still
@@ -5300,7 +5347,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("persist-retry");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("persist-retry").join("state.json");
         let good = std::fs::read(&state).unwrap();
 
@@ -5349,7 +5396,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("adopt-from-disk");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         // Disk gains a full launch record; this caller's copy has none.
         let mut other = RunState::load("adopt-from-disk").unwrap();
@@ -5393,7 +5440,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("already-on-disk");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("already-on-disk").join("state.json");
         let ino = || std::fs::metadata(&state).unwrap().ino();
 
@@ -5436,7 +5483,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("vanished-on-capture");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         let mut other = RunState::load("vanished-on-capture").unwrap();
         other.phases.clear();
@@ -5468,7 +5515,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("wait-marker-first");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
 
@@ -5511,7 +5558,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("wait-keeps-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
         h.push_pane_info(attached(&pane, AgentStatus::Working));
         h.push_pane_info(session_less(&pane, AgentStatus::Unknown));
@@ -5557,7 +5604,7 @@ mod capture_tests {
             &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
         )
         .unwrap();
-        let pane = run.review_phases[0].pane_id.clone().unwrap();
+        let pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
 
         phase_send(&h, &mut run, phase, "seed").unwrap();
 
@@ -5586,6 +5633,51 @@ mod capture_tests {
     }
 
     #[test]
+    fn the_legacy_backend_fallback_reads_disk_not_the_callers_copy() {
+        // A REPEAT of the round-2 attribution bug, one branch over. That round
+        // fixed the phase-level source and left this legacy fallback resolving
+        // from the caller's `run.agent` — which a long-running wait holds from
+        // before the run's backend was known, or from a stale snapshot.
+        //
+        // The lesson, and why this test exists rather than just the fix: when
+        // the rule is "attribute from what is on disk", sweep EVERY branch that
+        // resolves the value, not the one the reviewer happened to cite.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = capture_run("legacy-fallback-source");
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        let pane = run.phases[0].pane_id().unwrap().to_owned();
+
+        // A legacy phase: no launch record, so the fallback decides. Disk says
+        // the run is claude; the caller's stale copy says cursor.
+        let mut disk = RunState::load("legacy-fallback-source").unwrap();
+        disk.phases[0].agent = None;
+        disk.agent = Some("claude".into());
+        disk.save().unwrap();
+        run.phases[0].agent = None;
+        run.agent = Some("cursor".into());
+
+        // herdr attributes the session to claude, because claude created it.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for(&pane),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for(&pane)),
+        }));
+        assert!(quick(&h, &mut run, "plan", &pane));
+
+        let want = SessionId::new(FakeHerdr::session_value_for(&pane)).unwrap();
+        assert_eq!(
+            RunState::load("legacy-fallback-source").unwrap().phases[0]
+                .agent
+                .as_ref()
+                .and_then(|a| a.session()),
+            Some(&want),
+            "the fallback must attribute from the run state on DISK; the caller's \
+             copy says cursor, which would refuse this claude session"
+        );
+    }
+
+    #[test]
     fn a_reviewer_on_another_backend_still_gets_its_session_captured() {
         // `Config::review_agent_for` picks a reviewer's backend independently of
         // the run's — an explicit `review_agent`, or the cursor auto-selection.
@@ -5606,7 +5698,7 @@ mod capture_tests {
             &AgentLaunch::for_test("cursor", "cursor agent"),
         )
         .unwrap();
-        let pane = run.review_phases[0].pane_id.clone().unwrap();
+        let pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
         assert_eq!(
             run.review_phases[0].agent.as_ref().map(|a| a.backend()),
             Some("cursor")
@@ -5643,7 +5735,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("failed-launch-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
         let pass_a = run.phases[0].pass.clone().unwrap();
@@ -5689,7 +5781,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("new-pass-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
         assert!(
@@ -5735,7 +5827,7 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("token-lost-capture");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
         agent_signals_done(&run, "plan", &pass);
@@ -5823,13 +5915,13 @@ mod capture_tests {
         let h = FakeHerdr::new();
         let mut run = capture_run("no-reaping");
         phase_start(&h, &mut run, "plan", None).unwrap();
-        let pane = run.phases[0].pane_id.clone().unwrap();
+        let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(session_less(&pane, AgentStatus::Unknown));
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
         assert!(quick(&h, &mut run, "plan", &pane));
 
         assert!(!run.phases[0].is_reaped());
-        assert_eq!(run.phases[0].pane_id.as_deref(), Some(pane.as_str()));
+        assert_eq!(run.phases[0].pane_id(), Some(pane.as_str()));
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
         assert!(
             !h.calls().iter().any(|c| c.contains("tab_close")),

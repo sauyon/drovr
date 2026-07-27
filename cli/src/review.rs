@@ -545,8 +545,8 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 fn active_pane(run: &RunState) -> Option<String> {
     run.phases
         .iter()
-        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id.is_some())
-        .and_then(|ph| ph.pane_id.clone())
+        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id().is_some())
+        .and_then(|ph| ph.pane_id().map(str::to_owned))
         .or_else(|| run.root_pane.clone())
 }
 
@@ -556,8 +556,8 @@ fn active_pane(run: &RunState) -> Option<String> {
 fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for ph in run.phases.iter().chain(run.review_phases.iter()) {
-        if let Some(pane) = &ph.pane_id {
-            set.insert(pane.clone());
+        if let Some(pane) = ph.pane_id() {
+            set.insert(pane.to_owned());
         }
     }
     if let Some(root) = &run.root_pane {
@@ -735,18 +735,21 @@ fn build_agent_tree(run: &RunState) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
-        let Some(pane) = &rp.pane_id else { continue };
+        let Some(pane) = rp.pane_id() else { continue };
         let parts: Vec<&str> = rp.name.split(':').collect();
         let task = parts.get(1).copied().unwrap_or("").to_string();
         let angle = parts.get(3).copied().unwrap_or("").to_string();
-        reviews_by_task.entry(task).or_default().push(serde_json::json!({
-            "name": rp.name, "kind": "review", "angle": angle,
-            "status": status_str(&rp.status), "pane_id": pane,
-        }));
+        reviews_by_task
+            .entry(task)
+            .or_default()
+            .push(serde_json::json!({
+                "name": rp.name, "kind": "review", "angle": angle,
+                "status": status_str(&rp.status), "pane_id": pane,
+            }));
     }
     let mut nodes = Vec::new();
     for ph in &run.phases {
-        let Some(pane) = &ph.pane_id else { continue };
+        let Some(pane) = ph.pane_id() else { continue };
         let task_key = ph.name.strip_prefix("implement-").unwrap_or("");
         let children = reviews_by_task.remove(task_key).unwrap_or_default();
         nodes.push(serde_json::json!({
@@ -1529,10 +1532,10 @@ mod tests {
         let phases: Vec<crate::run::Phase> = statuses
             .iter()
             .enumerate()
-            .map(|(i, s)| crate::run::Phase {
-                name: format!("phase{i}"),
-                status: s.clone(),
-                ..Default::default()
+            .map(|(i, s)| {
+                let mut p = crate::run::Phase::new(&format!("phase{i}"));
+                p.status = s.clone();
+                p
             })
             .collect();
         let state = RunState {
@@ -1715,11 +1718,16 @@ mod tests {
 
     #[test]
     fn active_pane_prefers_running_phase_then_root() {
-        let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
-            name: name.into(),
-            status,
-            pane_id: pane.map(|s| s.to_string()),
-            ..Default::default()
+        let mkphase = |name: &str, status, pane: Option<&str>| {
+            let mut p = {
+                let mut p = crate::run::Phase::new(name);
+                p.status = status;
+                p
+            };
+            if let Some(pane) = pane {
+                p.set_pane(pane);
+            }
+            p
         };
         let mut run = RunState {
             name: "r".into(),
@@ -1771,12 +1779,12 @@ mod tests {
     }
 
     fn ph(name: &str, status: crate::run::PhaseStatus, pane: Option<&str>) -> crate::run::Phase {
-        crate::run::Phase {
-            name: name.into(),
-            status,
-            pane_id: pane.map(|s| s.to_string()),
-            ..Default::default()
+        let mut p = crate::run::Phase::new(name);
+        p.status = status;
+        if let Some(pane) = pane {
+            p.set_pane(pane);
         }
+        p
     }
 
     #[test]

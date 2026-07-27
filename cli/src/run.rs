@@ -78,7 +78,7 @@ impl std::fmt::Display for PassToken {
 }
 
 /// One phase of a run. Construct via [`Phase::new`] or
-/// `Phase { name: …, ..Default::default() }` — never by listing every field, so
+/// `{ let mut p = Phase::new(&…); p }` — never by listing every field, so
 /// adding a field stays a one-line diff instead of touching ~25 literal sites.
 ///
 /// The cost of that convenience, for whoever adds the next field:
@@ -107,7 +107,12 @@ pub struct Phase {
     /// something else. Removing it outright is a separate, mechanical change
     /// (four fixtures and an assertion) and is not this task's.
     pub herdr_session: Option<String>,
-    pub pane_id: Option<String>,
+    /// The live herdr pane this phase occupies, if any. **Private — see
+    /// [`Phase::set_pane`] and [`Phase::mark_reaped`].**
+    ///
+    /// It is half of a lifecycle pair with [`Phase::reaped`], and as two public
+    /// fields the contradictory combination was one assignment away.
+    pane_id: Option<String>,
     /// Token identifying the CURRENT pass over this phase, minted by each
     /// `phase_start` and exported into the agent's environment as `DROVR_PASS`.
     /// `drovr phase done` stamps it into `<phase>.done`, and `phase_wait` accepts
@@ -188,6 +193,33 @@ impl Phase {
             name: name.to_owned(),
             ..Default::default()
         }
+    }
+
+    /// The live pane this phase occupies, if any.
+    pub fn pane_id(&self) -> Option<&str> {
+        self.pane_id.as_deref()
+    }
+
+    /// Give this phase a live pane.
+    ///
+    /// Clears `reaped` in the same statement, which is not a convenience but the
+    /// definition: a phase holding a live pane is not a reaped one. That closes
+    /// the contradictory state from the only direction [`Phase::mark_reaped`]
+    /// leaves open — assigning a pane to an already-reaped phase — and it is
+    /// exactly the transition rehydrate performs when it brings a reaped phase
+    /// back on a fresh pane.
+    pub fn set_pane(&mut self, pane_id: impl Into<String>) {
+        self.pane_id = Some(pane_id.into());
+        self.reaped = Reaped(false);
+    }
+
+    /// Test-only builder: the same `set_pane` transition, chainable, so a
+    /// fixture can still be written as one expression now that `pane_id` is not
+    /// nameable in a struct literal.
+    #[cfg(test)]
+    pub fn with_pane(mut self, pane_id: impl Into<String>) -> Phase {
+        self.set_pane(pane_id);
+        self
     }
 
     /// Whether drovr has closed this phase's pane. Nothing reads it yet —
@@ -491,7 +523,7 @@ impl RunState {
     /// stopping is exactly what a human wants.
     fn check_pane_lifecycle(&self) -> io::Result<()> {
         for p in self.phases.iter().chain(self.review_phases.iter()) {
-            if p.is_reaped() && p.pane_id.is_some() {
+            if p.is_reaped() && p.pane_id().is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -501,7 +533,7 @@ impl RunState {
                          hand. Refusing to load rather than offer a pane that is gone.",
                         self.name,
                         p.name,
-                        p.pane_id.as_deref().unwrap_or_default()
+                        p.pane_id().unwrap_or_default()
                     ),
                 ));
             }
@@ -537,6 +569,16 @@ impl RunState {
     ///   enumerates inside a run dir.
     pub fn save(&self) -> io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Refuse to WRITE what `load` would refuse to READ.
+        //
+        // Asymmetric validation is worse than none: a `save` that happily wrote
+        // a lifecycle contradiction would strand the run outright, because every
+        // later `load_run` exits 1 and the pipeline STOPs — with no way back
+        // except hand-editing the file drovr itself produced. Checking the same
+        // invariant here means the failure surfaces at the write, on the caller
+        // that caused it, while the last good `state.json` is still on disk.
+        self.check_pane_lifecycle()?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
         let dir = run_dir(&self.name);
@@ -788,20 +830,20 @@ mod tests {
             task: "t".into(),
             agent: Some("claude".into()),
             phases: vec![
-                Phase {
-                    name: "brainstorm".into(),
-                    status: PhaseStatus::Done,
-                    ..Default::default()
+                {
+                    let mut p = Phase::new("brainstorm");
+                    p.status = PhaseStatus::Done;
+                    p
                 },
                 Phase::new("plan"),
             ],
             // A populated review_phases list must NOT influence pipeline progress:
             // it round-trips but `first_incomplete` (and `format_progress`) ignore it.
-            review_phases: vec![Phase {
-                name: "review:task-1:1:correctness".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("p1".into()),
-                ..Default::default()
+            review_phases: vec![{
+                let mut p = Phase::new("review:task-1:1:correctness");
+                p.status = PhaseStatus::Running;
+                p.pane_id = Some("p1".into());
+                p
             }],
             gate: "spec".into(),
             cursor: 1,
@@ -1021,10 +1063,10 @@ mod tests {
             task: "t".repeat(200),
             agent: Some("claude".into()),
             phases: (0..n)
-                .map(|i| Phase {
-                    name: format!("phase-{i}-{}", "x".repeat(64)),
-                    handoff_doc: Some("h".repeat(128)),
-                    ..Default::default()
+                .map(|i| {
+                    let mut p = Phase::new(&format!("phase-{i}-{}", "x".repeat(64)));
+                    p.handoff_doc = Some("h".repeat(128));
+                    p
                 })
                 .collect(),
             review_phases: vec![],
@@ -1160,7 +1202,7 @@ mod tests {
             "agent_profile":"/cfg","some_future_field":{"nested":true}
         }"#;
         let p: Phase = serde_json::from_str(json).expect("unknown keys must not fail the load");
-        assert_eq!(p.pane_id.as_deref(), Some("w:p1"));
+        assert_eq!(p.pane_id(), Some("w:p1"));
         // They are IGNORED, not migrated — say so out loud, so nobody reads a
         // passing test as a promise that the old values were carried over.
         assert!(
@@ -1205,6 +1247,46 @@ mod tests {
     }
 
     #[test]
+    fn save_refuses_exactly_what_load_refuses() {
+        // Asymmetric validation is worse than none. If `save` wrote a lifecycle
+        // contradiction that `load` rejects, drovr would produce a `state.json`
+        // it then refuses to read — every later `load_run` exits 1, the pipeline
+        // STOPs, and there is no way back except hand-editing the file drovr
+        // itself wrote. Checking the same invariant on both sides means the
+        // failure lands on the caller that caused it, while the last good file
+        // is still on disk.
+        //
+        // Reaching the illegal state needs this module's own privacy (that is
+        // the point — `set_pane` clears `reaped`, so the public API cannot build
+        // it), which is exactly why the write-side check is defence in depth
+        // rather than dead code.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![done("plan")]);
+        s.name = "asym".into();
+        s.save().expect("a consistent state saves");
+
+        s.phases[0].mark_reaped();
+        s.phases[0].pane_id = Some("w:p1".into()); // module-private; no caller can do this
+        let err = s
+            .save()
+            .expect_err("save must refuse what load would reject");
+        assert!(
+            err.to_string().contains("reaped but still holds pane"),
+            "same message as the read side: {err}"
+        );
+
+        // And the last good file is untouched — the refusal did not corrupt it.
+        assert!(
+            RunState::load("asym").is_ok(),
+            "a refused save must leave the previous state.json loadable"
+        );
+    }
+
+    #[test]
     fn a_phase_cannot_be_reaped_while_it_still_holds_a_pane() {
         // "Reaped" and "has a live pane" are contradictory claims about one
         // phase. As a bare `pub bool` beside `pane_id` the contradiction was one
@@ -1217,7 +1299,7 @@ mod tests {
         // drops the pane in the same statement; and `RunState::load` refuses a
         // file that claims otherwise.
         let mut p = Phase::new("plan");
-        p.pane_id = Some("w:p1".into());
+        p.set_pane("w:p1");
         assert!(!p.is_reaped());
 
         assert_eq!(
@@ -1227,7 +1309,7 @@ mod tests {
         );
         assert!(p.is_reaped());
         assert!(
-            p.pane_id.is_none(),
+            p.pane_id().is_none(),
             "setting one clears the other, in one step"
         );
         assert_eq!(p.mark_reaped(), None, "idempotent; nothing left to retire");
@@ -1342,17 +1424,17 @@ mod tests {
         assert_eq!(p.status, PhaseStatus::Pending);
         assert!(p.handoff_doc.is_none());
         assert!(p.herdr_session.is_none());
-        assert!(p.pane_id.is_none());
+        assert!(p.pane_id().is_none());
         assert_eq!(Phase::default().name, "");
         assert_eq!(PhaseStatus::default(), PhaseStatus::Pending);
     }
 
     #[test]
     fn find_phase_searches_both_lists() {
-        let mk = |name: &str| Phase {
-            name: name.into(),
-            status: PhaseStatus::Running,
-            ..Default::default()
+        let mk = |name: &str| {
+            let mut p = Phase::new(name);
+            p.status = PhaseStatus::Running;
+            p
         };
         let s = RunState {
             name: "r".into(),

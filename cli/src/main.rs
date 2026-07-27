@@ -444,10 +444,10 @@ fn cmd_attach(name: &str) {
     let pane_id = run
         .first_incomplete()
         .and_then(|i| run.phases.get(i))
-        .and_then(|p| p.pane_id.as_deref())
+        .and_then(|p| p.pane_id())
         .or_else(|| {
             // If all done, use the last phase's pane
-            run.phases.last().and_then(|p| p.pane_id.as_deref())
+            run.phases.last().and_then(|p| p.pane_id())
         });
 
     match pane_id {
@@ -483,17 +483,47 @@ fn cmd_attach(name: &str) {
 /// This list is the whole definition of "drovr's panes" at cleanup: a pane drovr
 /// created but failed to record is indistinguishable from one the human opened,
 /// and is therefore left alone.
+/// Carry what a code-review panel recorded onto a freshly loaded run state.
+///
+/// **Transplant, never write `state` back wholesale.** A panel runs for many
+/// minutes and `state` is a snapshot from before it started; saving the whole
+/// thing would resurrect every pipeline phase's status as of panel-start —
+/// including a `Done` that a `phase send` re-entry has since cleared, which
+/// makes the next `phase wait` report success for an agent that is mid-work.
+///
+/// `code_review_run` mutates exactly two things, and BOTH have to come across:
+///
+/// * `review_phases` — the reviewers it spawned and their status.
+/// * `retired_panes` — load-bearing, not bookkeeping. `drovr cleanup` closes
+///   exactly the panes this file records and treats everything else in the
+///   workspace as the human's, so a pane dropped from `review_phases` without
+///   landing here is immortal AND blocks `workspace_close` for the whole run.
+///   The resume path retires a replaced reviewer's pane immediately before
+///   `spawn_reviewer`, which can then fail — leaving that retirement in memory
+///   only. This used to drop it on exactly that path.
+///
+/// `retired_panes` is UNIONED, not assigned: the freshly loaded state may
+/// already record retirements this snapshot never saw, and `retire_pane` is
+/// idempotent, so neither side loses.
+fn merge_panel_progress(merged: &mut RunState, state: &RunState) {
+    merged.review_phases = state.review_phases.clone();
+    for pane in &state.retired_panes {
+        merged.retire_pane(pane.clone());
+    }
+}
+
 fn drovr_pane_ids(run: &RunState) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let ids = run
         .root_pane
         .iter()
-        .chain(run.phases.iter().filter_map(|p| p.pane_id.as_ref()))
-        .chain(run.review_phases.iter().filter_map(|p| p.pane_id.as_ref()))
-        .chain(run.retired_panes.iter());
+        .map(String::as_str)
+        .chain(run.phases.iter().filter_map(|p| p.pane_id()))
+        .chain(run.review_phases.iter().filter_map(|p| p.pane_id()))
+        .chain(run.retired_panes.iter().map(String::as_str));
     for id in ids {
-        if !out.contains(id) {
-            out.push(id.clone());
+        if !out.iter().any(|seen| seen == id) {
+            out.push(id.to_owned());
         }
     }
     out
@@ -1005,23 +1035,11 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             let h = SystemHerdr::new();
             let mut state = load_run(&run);
             let outcome = code_review_run(&h, &mut state, &task, timeout_ms, fresh);
-            // Persist the review_phases progress the panel recorded (spawned
-            // reviewers, done/running status) BEFORE handling the result:
-            // `code_review_run` appends reviewer phases as it spawns them and can
-            // then fail (e.g. a mid-spawn `phase_send` error) with those phases
-            // only in memory, so an unconditional save here keeps disk and memory
-            // in sync on every path — including the `Err` early-exit below.
-            //
-            // Transplant ONLY `review_phases` onto a freshly-loaded state. A panel
-            // runs for many minutes and `state` is a snapshot from before it
-            // started; writing the whole thing back would resurrect every pipeline
-            // phase's status as of panel-start — including a `Done` that a
-            // `phase send` re-entry has since cleared, which makes the next
-            // `phase wait` report success for an agent that is mid-work.
-            // `code_review_run` only ever mutates `review_phases`, so nothing else
-            // in the snapshot is worth keeping.
+            // Persist what the panel recorded, on EVERY path including the
+            // `Err` early-exit below — `code_review_run` mutates state in memory
+            // and can then fail with none of it saved.
             let mut merged = load_run(&run);
-            merged.review_phases = state.review_phases.clone();
+            merge_panel_progress(&mut merged, &state);
             save_run(&merged);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
@@ -1147,23 +1165,78 @@ mod tests {
     /// (the brainstorm phase, mid-flight) and `wAC:p2` (a reviewer). No worktree,
     /// so `cmd_cleanup` runs to completion instead of exiting on the prune path.
     #[cfg(test)]
+    #[test]
+    fn the_panel_merge_carries_retired_panes_not_just_review_phases() {
+        // `retired_panes` is what tells `drovr cleanup` a pane is drovr's. Since
+        // main's `8173f03`, cleanup closes only panes it can prove it opened and
+        // leaves everything else standing as the human's — so a pane that is
+        // dropped from `review_phases` but never lands in `retired_panes` is
+        // immortal, and blocks `workspace_close` for the whole run.
+        //
+        // The resume path retires a replaced reviewer's pane immediately before
+        // `spawn_reviewer`, which can then fail — so the retirement exists only
+        // in the panel's in-memory copy when this merge runs. Transplanting just
+        // `review_phases` dropped it on exactly that path.
+        let mut on_disk = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![run::Phase::new("plan")],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec!["w:earlier".into()],
+        };
+        // What the panel held when it failed: a respawned reviewer registered,
+        // the replaced one's pane retired — neither of them saved.
+        let mut panel = on_disk.clone();
+        panel.review_phases = vec![run::Phase::new("review:task-1:1:correctness")];
+        panel.retire_pane("w:replaced");
+
+        merge_panel_progress(&mut on_disk, &panel);
+
+        assert_eq!(on_disk.review_phases.len(), 1, "reviewers come across");
+        assert!(
+            on_disk.retired_panes.contains(&"w:replaced".to_string()),
+            "and so does the retirement, or that pane is immortal: {:?}",
+            on_disk.retired_panes
+        );
+        assert!(
+            on_disk.retired_panes.contains(&"w:earlier".to_string()),
+            "unioned, not assigned — a retirement the panel never saw must survive"
+        );
+        // Pipeline phases are deliberately NOT transplanted: the panel's snapshot
+        // is minutes old and would resurrect a status a re-entry has since cleared.
+        assert_eq!(on_disk.phases.len(), 1);
+    }
+
     fn seed_paned_run(name: &str) -> RunState {
         let run = RunState {
             name: name.into(),
             task: "t".into(),
             agent: None,
-            phases: vec![run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("wAC:p1".into()),
-                ..Default::default()
-            }],
-            review_phases: vec![run::Phase {
-                name: "review:brainstorm:1:correctness".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("wAC:p2".into()),
-                ..Default::default()
-            }],
+            phases: vec![
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAC:p1"),
+            ],
+            review_phases: vec![
+                {
+                    let mut p = run::Phase::new("review:brainstorm:1:correctness");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAC:p2"),
+            ],
             gate: "spec".into(),
             cursor: 0,
             workspace: Some("wAC".into()),
@@ -1352,24 +1425,26 @@ mod tests {
             task: "t".into(),
             agent: None,
             phases: vec![
-                run::Phase {
-                    name: "brainstorm".into(),
-                    status: PhaseStatus::Done,
-                    pane_id: Some("w:p1".into()),
-                    ..Default::default()
-                },
-                run::Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    ..Default::default()
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Done;
+                    p
+                }
+                .with_pane("w:p1"),
+                {
+                    let mut p = run::Phase::new("plan");
+                    p.status = PhaseStatus::Pending;
+                    p
                 },
             ],
-            review_phases: vec![run::Phase {
-                name: "review:plan:1:correctness".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("w:p2".into()),
-                ..Default::default()
-            }],
+            review_phases: vec![
+                {
+                    let mut p = run::Phase::new("review:plan:1:correctness");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("w:p2"),
+            ],
             gate: "spec".into(),
             cursor: 0,
             workspace: Some("w".into()),
@@ -1391,7 +1466,7 @@ mod tests {
         // Once a phase claims the root pane, `root_pane` is cleared and the phase
         // carries the id — it must appear exactly once either way.
         run.root_pane = None;
-        run.phases[1].pane_id = Some("w:root".into());
+        run.phases[1].set_pane("w:root");
         assert_eq!(drovr_pane_ids(&run), vec!["w:p1", "w:root", "w:p2"]);
     }
 
@@ -1792,10 +1867,10 @@ mod tests {
             phases: vec![run::Phase::new("brainstorm"), run::Phase::new("plan")],
             // A populated review_phases list must not shift the "0/2" progress or
             // the "current" phase — format_progress walks `phases` only.
-            review_phases: vec![run::Phase {
-                name: "review:task-1:1:correctness".into(),
-                status: PhaseStatus::Running,
-                ..Default::default()
+            review_phases: vec![{
+                let mut p = run::Phase::new("review:task-1:1:correctness");
+                p.status = PhaseStatus::Running;
+                p
             }],
             gate: "spec".into(),
             cursor: 0,
@@ -1818,10 +1893,10 @@ mod tests {
             name: "r".into(),
             task: "t".into(),
             agent: None,
-            phases: vec![run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Done,
-                ..Default::default()
+            phases: vec![{
+                let mut p = run::Phase::new("brainstorm");
+                p.status = PhaseStatus::Done;
+                p
             }],
             review_phases: vec![],
             gate: "spec".into(),
