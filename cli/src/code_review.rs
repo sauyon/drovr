@@ -200,14 +200,18 @@ fn next_iter(run: &RunState, task: &str) -> u64 {
 }
 
 /// Build the per-angle reviewer seed.
+///
+/// `project_dir` is named in the seed on purpose: the diff is what changed, but
+/// whether the change is *right* only shows in the code around it — callers,
+/// invariants, existing tests. A reviewer handed a diff and no repo grant reviews
+/// the hunks and stops, so the seed spells out that the whole checkout is readable.
 fn build_seed(
-    _run_name: &str,
     task: &str,
     angle: &str,
     base: &str,
     head: &str,
     task_desc: &str,
-    _iter: u64,
+    project_dir: &str,
 ) -> String {
     format!(
         "# Review angle: {angle}\n\n\
@@ -215,8 +219,13 @@ fn build_seed(
          You are NOT a writer of project source or `state.json`. Do not edit either.\n\n\
          ## Your angle\n\n{brief}\n\n\
          ## Scope\n\n\
-         Review the diff `git diff {base}..{head}` **plus** the current working tree in\n\
-         the project. You may read any file and run tests. Base = `{base}`, head = `{head}`.\n\n\
+         The change under review is `git diff {base}..{head}` **plus** the current\n\
+         working tree. Base = `{base}`, head = `{head}`.\n\n\
+         You also have the WHOLE REPOSITORY to read: it is a full checkout at\n\
+         `{project_dir}`. Do not review the diff in isolation — you may read any file\n\
+         in it, follow the change's callers and callees outside the diff, check the\n\
+         invariants and neighbouring code it has to hold up against, and run the tests.\n\
+         Reading is unrestricted; only writing is not.\n\n\
          ## Task under review\n\n{task_desc}\n\n\
          ## Output\n\n\
          Return your findings in a fenced JSON block matching:\n\n\
@@ -450,7 +459,7 @@ pub fn code_review_run<H: Herdr>(
         // single-writer invariant holds — the panel never has a reviewer alive while a
         // writer runs.
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
-        let seed_text = build_seed(&run.name, task, angle, &base, &head, &run.task, iter);
+        let seed_text = build_seed(task, angle, &base, &head, &run.task, &run.project_dir);
         std::fs::write(&seed_path, &seed_text)?;
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
@@ -1693,13 +1702,12 @@ mod tests {
     #[test]
     fn seed_contains_scope_schema_and_readonly_finish_instruction() {
         let seed = build_seed(
-            "myrun",
             "task-1",
             "security",
             "aaa",
             "bbb",
             "do the thing",
-            3,
+            "/checkout/here",
         );
         assert!(
             seed.contains("git diff aaa..bbb"),
@@ -1718,5 +1726,33 @@ mod tests {
             "seed must preserve strict read-only behavior"
         );
         assert!(seed.contains("critical") && seed.contains("important") && seed.contains("nit"));
+    }
+
+    /// The diff alone cannot show whether a change is right — a reviewer has to read
+    /// the callers, the invariants, and the tests it lands among. The seed must
+    /// therefore name the checkout and grant whole-repo reads explicitly, or a
+    /// reviewer reads the diff and stops.
+    #[test]
+    fn seed_grants_full_repo_reads_not_just_the_diff() {
+        let seed = build_seed(
+            "task-1",
+            "correctness",
+            "aaa",
+            "bbb",
+            "do the thing",
+            "/checkout/here",
+        );
+        assert!(
+            seed.contains("/checkout/here"),
+            "seed must name the checkout the reviewer can read: {seed}"
+        );
+        assert!(
+            seed.contains("read any file"),
+            "seed must grant reads beyond the diffed files: {seed}"
+        );
+        assert!(
+            seed.contains("run the tests") || seed.contains("run tests"),
+            "seed must allow running the tests: {seed}"
+        );
     }
 }
