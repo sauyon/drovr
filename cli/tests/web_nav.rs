@@ -139,6 +139,18 @@ fn seed_runs(runs_root: &PathBuf) {
     // reviewer actually meets it in — `ready`, still on turn 0 (the counter only
     // moves when the reviewer submits), with the agent's summary posted.
     let alpha = runs_root.join("alpha-deploy");
+    // Link fixture for the "spec links" checks: a bare URL (the way specs
+    // actually cite sources), an explicit inline link, and a bare `.rs` filename
+    // — `.rs` is a live TLD, so an over-eager linkifier turns it into a URL.
+    fs::write(
+        alpha.join("spec.md"),
+        "# Spec for alpha-deploy\n\nContent.\n\n\
+         Source: https://example.com/paper\n\n\
+         Inline [the docs](https://example.com/docs) too.\n\n\
+         Touches cli/src/review.rs and phase.rs.\n\n\
+         Jump to [the top](#spec-for-alpha-deploy).\n",
+    )
+    .unwrap();
     fs::write(alpha.join("summary.txt"), "spec drafted and ready for review").unwrap();
     fs::write(alpha.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
     fs::write(

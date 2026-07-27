@@ -106,7 +106,9 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
-   `{turn, decision, feedback, answers, annotations}`. Forward it to the agent:
+   `{turn, decision, feedback, answers, annotations}`. An empty `feedback` does not mean an empty
+   turn — the reviewer may have said everything in `annotations` (per-line comments on the spec).
+   Forward it to the agent:
    ```
    drovr phase send <run> brainstorm "Reviewer requested changes (see feedback.json). Revise spec.md, then run: drovr review summary <run> \"<what changed>\""
    ```
