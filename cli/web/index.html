@@ -683,6 +683,17 @@
   .agent-node:hover { background: var(--hover, rgba(127,127,127,0.08)); }
   .agent-node.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .agent-node.no-pane { cursor: default; opacity: 0.7; }
+  /* Reaped: drovr closed this pane. Dimmer than merely pane-less, because it
+     is a phase that RAN and is now recoverable rather than one still to come. */
+  .agent-node.reaped { opacity: 0.5; }
+  .agent-node.reaped:hover { opacity: 0.85; }
+  .agent-rehydrate {
+    margin-left: auto; background: none; border: 1px solid var(--border);
+    color: var(--muted); border-radius: 4px; cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 2px 6px;
+  }
+  .agent-rehydrate:hover { color: var(--fg); border-color: var(--accent); }
+  .agent-rehydrate:disabled { cursor: progress; opacity: 0.5; }
   .agent-dot { width: 9px; height: 9px; border-radius: 50%; background: #888; flex: 0 0 auto; }
   .agent-dot.st-Running { background: #f5a623; }
   .agent-dot.st-Done { background: #3ec46d; }
@@ -2033,14 +2044,35 @@ function selectPane(pane, name) {
 
 function agentNodeHtml(node) {
   var pane = node.pane_id || '';
-  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (pane && pane === selectedPane ? ' selected' : '');
+  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (node.reaped ? ' reaped' : '')
+    + (pane && pane === selectedPane ? ' selected' : '');
   var angle = node.angle ? ' <span class="agent-angle">· ' + escHtml(node.angle) + '</span>' : '';
+  // ⟳ only when the session can actually come back. A reaped phase whose
+  // session was never captured — or whose backend has no resume surface — is
+  // relaunchable, not resumable, and offering the same button for both would
+  // promise a conversation the click cannot deliver.
+  var rehydrate = (node.reaped && node.resumable)
+    ? '<button class="agent-rehydrate" data-phase="' + escHtml(node.name)
+      + '" title="Rehydrate: resume this phase&#39;s session in a new pane">⟳</button>'
+    : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
   return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
     + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
-    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + rehydrate
     + '</div>' + kids;
+}
+
+// Every pane id currently in the tree, at any depth.
+function treePanes(nodes) {
+  var out = {};
+  (function walk(list) {
+    (list || []).forEach(function(n) {
+      if (n.pane_id) out[n.pane_id] = true;
+      walk(n.children);
+    });
+  })(nodes);
+  return out;
 }
 
 async function pollAgents(gen) {
@@ -2059,6 +2091,33 @@ async function pollAgents(gen) {
       var pane = n.getAttribute('data-pane');
       if (pane) n.onclick = function() { selectPane(pane, n.querySelector('.agent-name').textContent); };
     });
+    el.querySelectorAll('.agent-rehydrate').forEach(function(b) {
+      b.onclick = function(ev) {
+        // The row's own click selects a pane; this row has none, but a future
+        // one might — never let the button double as a row click.
+        ev.stopPropagation();
+        b.disabled = true;
+        var phase = b.getAttribute('data-phase');
+        fetch(api('rehydrate') + '?phase=' + encodeURIComponent(phase), { method: 'POST' })
+          .then(function(r) {
+            if (!r.ok) {
+              b.disabled = false;
+              b.title = 'Rehydrate failed (' + r.status + ') — see the drovr server log';
+              return;
+            }
+            // Refresh now rather than waiting out the 2s tick, and cancel the
+            // pending one so the two chains don't both keep polling.
+            if (agentsTimer) clearTimeout(agentsTimer);
+            pollAgents(gen);
+          })
+          .catch(function() { b.disabled = false; });
+      };
+    });
+    // A pane that has left the tree must not stay selected. `?pane=<gone>`
+    // answers 204 on the mirror and 409 on send, which reads as a wedged UI
+    // rather than as a stale selection — and a reaped node is exactly how a
+    // selected pane leaves.
+    if (selectedPane && !treePanes(nodes)[selectedPane]) selectPane(null, '');
   } catch (e) { /* transient; keep polling */ }
   if (gen === routeGen) agentsTimer = setTimeout(function(){ pollAgents(gen); }, 2000);
 }

@@ -178,6 +178,13 @@ async function goto(hashPath, ready) {
 }
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
 const QUESTIONS_READY = { probe: cursorQuestion, ok: q => !!q, label: 'questions panel' };
+const agentNodes = () => evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-node')).map(function(e){
+    return { name: e.querySelector('.agent-name').textContent,
+             reaped: e.classList.contains('reaped'),
+             rehydrate: !!e.querySelector('.agent-rehydrate') };
+  });`);
+const AGENTS_READY = { probe: agentNodes, ok: n => n.length > 0, label: 'agent tree' };
 
 // ---------------------------------------------------------------------------
 console.log('\n== session list: motion ==');
@@ -454,7 +461,36 @@ check('the page can scroll clear of the fixed hint bar', await evaluate(`
   var bar = document.getElementById('keyhint').getBoundingClientRect().height;
   return pad >= bar * 2;`), true);
 
+console.log('\n== agent tree: a reaped phase ==');
+await goto('#/runs/delta-idle', AGENTS_READY);
+const tree = await agentNodes();
+check('a reaped phase is still listed — hiding it would look like it never ran',
+  tree.map(n => n.name), ['brainstorm', 'plan', 'implement']);
+check('reaped phases render dimmed', tree.map(n => n.reaped), [true, true, false]);
+check('⟳ appears only where the SESSION can come back',
+  tree.map(n => n.rehydrate), [true, false, false]);
+check('⟳ posts to the run-scoped rehydrate endpoint', await evaluate(`
+  var seen = null, real = window.fetch;
+  window.fetch = function(u, o) { seen = { url: u, method: (o || {}).method }; return Promise.resolve({ ok: true }); };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  return seen;`),
+  { url: '/api/runs/delta-idle/rehydrate?phase=brainstorm', method: 'POST' });
+
+// A pane that leaves the tree must not stay selected: `?pane=<gone>` answers
+// 204 on the mirror and 409 on send, which reads as a wedged UI rather than as
+// a stale selection — and a reaped node is exactly how a pane leaves.
+check('a live pane can be selected', await evaluate(`
+  selectPane('w1:p3', 'implement'); return selectedPane;`), 'w1:p3');
+check('a pane outside the tree starts out selected too', await evaluate(`
+  selectPane('w1:gone', 'ghost'); return selectedPane;`), 'w1:gone');
+await waitFor(() => evaluate(`return selectedPane;`), v => v === null, 8000,
+  'the stale pane to be dropped');
+check('the mirror falls back to the run default once it is dropped',
+  await evaluate(`return document.getElementById('session-target').textContent;`), 'active');
+
 console.log('\n== leaving a run ==');
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');

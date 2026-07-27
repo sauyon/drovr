@@ -135,6 +135,22 @@ fn seed_runs(runs_root: &PathBuf) {
     .unwrap();
     fs::write(zeta.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
 
+    // delta-idle carries the agent-tree fixture: a reaped phase whose session was
+    // captured (⟳ should appear), a reaped phase whose session was not (it must
+    // NOT), and a live phase. `implement` stays `Running` so the run remains
+    // incomplete and the list-motion checks above see the same rows they always
+    // did. Reaped phases carry `pane_id: null` — drovr refuses to load a phase
+    // claiming both a pane and a reaping.
+    let delta = runs_root.join("delta-idle");
+    fs::write(
+        delta.join("state.json"),
+        r#"{"name":"delta-idle","task":"task for delta-idle","gate":"spec","cursor":0,"project_dir":"","workspace":"w1","phases":[
+{"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude","session":"sess-brainstorm"}},
+{"name":"plan","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude"}},
+{"name":"implement","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w1:p3"}]}"#,
+    )
+    .unwrap();
+
     // alpha-deploy is the run the detail-view checks drive: put it in the state a
     // reviewer actually meets it in — `ready`, still on turn 0 (the counter only
     // moves when the reviewer submits), with the agent's summary posted.
