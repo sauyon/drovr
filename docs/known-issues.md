@@ -686,6 +686,11 @@ reuses a recorded `pane_id`, then `root_pane`, then `tab_create` against the run
 `workspace` id; all three are dead after a close, and the only code that creates a workspace
 is `cmd_new`. So `drovr phase start` on a restored run fails.
 
+One exception, and it is exactly the row the UI flags as anomalous: a ZOMBIE — archived while
+`workspace_close` failed — still has a live workspace and live panes recorded. Restoring one
+and running `drovr phase start` should reuse them and work. The blanket "restore does not make
+it runnable" is therefore wrong for the one case where the run was never really torn down.
+
 The run's artifacts survive (spec, handoffs, branch), so the work is not lost — but continuing
 it means a new run seeded from the handoff, not a restore.
 
@@ -771,6 +776,22 @@ Two consequences worth knowing:
    eventual save recreates a `state.json` for a run the human explicitly deleted. This
    predates the change — plain `save` always did this — but it is now reachable from two more
    writers.
+
+## `GET /api/runs` now spawns a herdr subprocess on every poll
+
+Found 2026-07-26. Accepted, not fixed.
+
+The list endpoint calls `SystemHerdr::workspace_list()`, which shells `herdr workspace list`.
+The page polls that endpoint every 2s while the session list is open, so each open tab spawns
+a subprocess every 2 seconds for as long as it is open. Before this branch the endpoint was
+pure filesystem reads.
+
+It buys the liveness column, the zombie warning, and the archive confirm — all of which need a
+fresh answer, and one call answers for every run at once (the per-run alternative is a herdr
+round trip per row). Left as is because the cost is small and bounded per tab, but it is worth
+knowing before leaving a review page open for hours, and it mildly amplifies the documented
+"no authentication" surface: GETs are not covered by the write guard, so a page in the same
+browser can drive that spawn loop.
 
 ## Archive/restore failures are reported only to the browser console
 
@@ -859,27 +880,33 @@ asserting immediately after `evaluate('renderRunList(...)')` rather than waiting
 condition. The durable fix is to make every such section either `reload()` first or wait on
 the state it is about to assert, rather than trusting a render to have painted.
 
-## Three of the six `save_preserving_archived` sites are redundant, and untestable
+## Only one of the six `save_preserving_archived` sites is redundant
 
-Found 2026-07-26. Working as intended; recorded so nobody "fixes" the missing coverage.
+Found 2026-07-26; **corrected 2026-07-26** after a review showed the original analysis was
+wrong. The earlier version of this entry claimed three sites were redundant AND untestable,
+and told the reader not to add coverage. Two of those three were both reachable and testable.
 
-Six writers now call `save_preserving_archived`: `phase_start`, `spawn_reviewer`, `phase_wait`,
-`code_review_run`'s deadline and final saves, and `cmd_code_review`'s. Mutating any of the
-first three back to a plain `save` fails the suite. The last three cannot be caught, and the
-reason is structural rather than a coverage gap:
+The false claim was that `code_review_run`'s poll loop makes no herdr calls. It does:
+`agent_status` is the fallback the loop consults whenever a reviewer's done-marker is absent,
+every iteration. On a RESUMED pass where every angle is still alive, `spawn_reviewer` is
+skipped entirely — so the poll loop's own calls are the only ones in the pass, and no
+spawn-time save exists to have rescued an in-flight archive first. A human archiving a run
+while a resumed review polls is ordinary use, not an adversarial construction.
 
-`code_review_run`'s poll loop makes NO herdr calls — it polls marker files on disk — and every
-`agent_status` call happens inside `spawn_reviewer`'s readiness wait, i.e. before that
-function's own save. So there is no point in the run where an archive can land *after* the
-last spawn save but *before* the deadline save. Any archive that reaches those later writers
-was already rescued into memory by `spawn_reviewer`, which means a plain `save` there would
-write the correct value anyway.
+Both are now covered, and both fail if reverted to a plain `save`:
 
-They are kept preserving for consistency — a future writer that saves without spawning first
-would need it, and the asymmetry would be a trap. But do not add a test claiming to cover
-them without first building a seam that can actually trigger it; a test named for a path it
-does not exercise is worse than no test. One was written during this review and deleted for
-exactly that reason.
+- the deadline save — `archiving_during_a_resumed_poll_survives_the_deadline_save`
+- the final save — `archiving_during_a_resumed_pass_survives_the_final_save_too`
+
+That leaves one genuinely redundant site: `cmd_code_review`'s save in `main.rs`. By the time it
+runs, `code_review_run`'s own preserving saves have already re-read the flag into the in-memory
+`RunState`, so a plain `save` there would write the correct value anyway. It stays preserving
+for consistency, and because that redundancy depends on the callee's behaviour rather than on
+anything local.
+
+The lesson worth keeping: "this path cannot be reached" is a claim about code, and it needs
+checking against the code rather than reasoning from the shape of a call graph. The earlier
+entry deleted a real test on the strength of an unchecked one.
 
 ## A panicking test can poison `ENV_LOCK` for the whole suite
 

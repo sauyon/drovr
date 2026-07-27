@@ -766,6 +766,82 @@ mod tests {
     }
 
     #[test]
+    fn archiving_during_a_resumed_poll_survives_the_deadline_save() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-archive-resumed-poll");
+        write_base(&run, "task-1");
+        run.save().unwrap();
+
+        // First pass spawns the reviewers and times out, leaving them Running.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let spawned = spawn_count(&h);
+
+        // The resume respawns NOTHING — every angle is still alive — so the poll
+        // loop's own `agent_status` fallback (it fires whenever the done-marker is
+        // absent) is the only herdr call in the whole pass. No `spawn_reviewer`
+        // save runs to rescue the flag first, which makes the deadline save the
+        // one that has to preserve it.
+        //
+        // This is the case an earlier docs claim said could not exist. It can: a
+        // human archiving a run while a resumed review polls is ordinary use.
+        h.archive_on_call("agent_status", "cr-archive-resumed-poll");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert_eq!(
+            spawn_count(&h),
+            spawned,
+            "the resume must not respawn, or this exercises the spawn save instead"
+        );
+        assert!(
+            RunState::load("cr-archive-resumed-poll").unwrap().archived,
+            "the deadline save must not un-archive a run filed away during the poll"
+        );
+    }
+
+    #[test]
+    fn archiving_during_a_resumed_pass_survives_the_final_save_too() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-archive-resumed-final");
+        write_base(&run, "task-1");
+        run.save().unwrap();
+
+        // Pass one spawns and times out.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Pass two resumes with no respawn, and this time the angles finish — so
+        // the run reaches the FINAL save rather than the deadline one. The archive
+        // lands on the poll loop's first `agent_status`, after every spawn save.
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", a, CLEAN);
+        }
+        for _ in 0..16 {
+            h.push_status(Some("done"));
+        }
+        h.archive_on_call("agent_status", "cr-archive-resumed-final");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false).unwrap(),
+            ReviewOutcome::Clean,
+            "the pass must actually COMPLETE, or it exercises the deadline save instead"
+        );
+        assert!(
+            RunState::load("cr-archive-resumed-final").unwrap().archived,
+            "the final save must not un-archive a run filed away during the poll"
+        );
+    }
+
+    #[test]
     fn rerun_after_timeout_resumes_the_same_iter_without_respawning() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
