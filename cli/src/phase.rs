@@ -602,9 +602,9 @@ pub fn spawn_reviewer<H: Herdr>(
 ///
 /// One function so [`launch_in_pane`] (which inlines it into the agent's
 /// environment) and the two sites that RECORD it onto the phase cannot drift:
-/// `Phase::agent_profile` is only useful if it is exactly the profile the agent
-/// authenticated under, and "exactly" is not something two `std::env::var` calls
-/// in different files stay agreed on.
+/// [`crate::run::PhaseAgent::profile`] is only useful if it is exactly the
+/// profile the agent authenticated under, and "exactly" is not something two
+/// `std::env::var` calls in different files stay agreed on.
 fn agent_profile_env() -> Option<String> {
     std::env::var("CLAUDE_CONFIG_DIR").ok()
 }

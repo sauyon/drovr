@@ -974,6 +974,37 @@ mod tests {
     }
 
     #[test]
+    fn keys_a_phase_does_not_recognise_must_never_fail_the_load() {
+        // `Phase` must stay tolerant of keys it does not know. Two independent
+        // reasons, and the second is the one that bites:
+        //
+        //  * A newer drovr writes a field an older one has never heard of; the
+        //    older binary must still load the run rather than exit 1 and STOP it.
+        //  * Adding `#[serde(deny_unknown_fields)]` here — an innocuous-looking
+        //    tightening — would do exactly that to every run in flight.
+        //
+        // The literal below is this branch's own intermediate shape (`agent_session`
+        // / `agent_backend` / `agent_profile` as three loose fields, before they
+        // became one `PhaseAgent`). No released or installed build ever wrote it,
+        // so nothing in the wild carries those keys and no migration is owed — but
+        // it is a free, honest example of "keys this build does not know".
+        let json = r#"{
+            "name":"plan","status":"Running","handoff_doc":null,
+            "herdr_session":null,"pane_id":"w:p1",
+            "agent_session":"cca92f5b-3a8c","agent_backend":"cursor",
+            "agent_profile":"/cfg","some_future_field":{"nested":true}
+        }"#;
+        let p: Phase = serde_json::from_str(json).expect("unknown keys must not fail the load");
+        assert_eq!(p.pane_id.as_deref(), Some("w:p1"));
+        // They are IGNORED, not migrated — say so out loud, so nobody reads a
+        // passing test as a promise that the old values were carried over.
+        assert!(
+            p.agent.is_none(),
+            "unknown keys are dropped, not adopted; the next poll re-captures"
+        );
+    }
+
+    #[test]
     fn a_session_cannot_be_persisted_without_the_backend_it_belongs_to() {
         // The invariant `PhaseAgent` exists for. `resumable_for(backend)` makes a
         // session id meaningless without the agent that created it, and two loose
