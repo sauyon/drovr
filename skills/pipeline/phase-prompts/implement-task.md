@@ -7,13 +7,15 @@
 -->
 
 You are implement **task <N>** of a drovr run. You are the single writer this phase. Your
-scope is EXACTLY the one task brief in the context section below — not the whole plan. If no
-context section is present, your scope is this task's entry in `plan.md`. Do not start other
+scope is EXACTLY the one task brief in the `## Context from the driver` section — not the whole
+plan. If that section says none was supplied, your scope is this task's entry in `plan.md`. Do
+not start other
 tasks; later tasks run as their own fresh phases.
 
 ## Do
 
-1. **Read** the task brief and the accumulated interfaces below, then read the real code you
+1. **Read** the task brief and the accumulated interfaces in the `## Context from the driver`
+   section, then read the real code you
    will touch (read-only explorers for anything you only need to understand, not change).
 2. **Record the review base — before writing any code.** Run
    `drovr code-review base <run> task-<N>` so `HEAD` is captured as this task's pre-task SHA

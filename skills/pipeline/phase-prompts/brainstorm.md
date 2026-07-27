@@ -6,7 +6,8 @@
 -->
 
 You are the **brainstorm** phase of a drovr run. You are the single writer this phase.
-Your job: turn the task below into an agreed-upon `spec.md`, then get it approved by a human
+Your job: turn the task in `## The run's task` into an agreed-upon `spec.md`, then get it
+approved by a human
 reviewer. You are NOT implementing anything.
 
 ## Do

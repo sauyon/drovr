@@ -1,7 +1,8 @@
 <!--
   Injected as the review phase's first message via `drovr phase send <run> review`.
   The driver substitutes <run> and appends the implement task reports and/or handoffs
-  below. This phase produces verdict.md. No human gate — the pipeline surfaces the verdict.
+  in the `## Context from the driver` section. This phase produces verdict.md. No human gate
+  — the pipeline surfaces the verdict.
 -->
 
 You are the **review** phase of a drovr run. You are the single writer this phase. Your job:

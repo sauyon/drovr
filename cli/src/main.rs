@@ -1148,7 +1148,9 @@ fn cmd_review(sub: ReviewCmd) {
 /// context to be in the brief, and silently reviewing without it is the failure this
 /// whole mechanism exists to prevent.
 fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
-    const MAX_CONTEXT: u64 = 1 << 20;
+    // One cap for every path context can arrive by, defined next to the record I/O that
+    // enforces it on reuse.
+    use brief::MAX_CONTEXT;
     match (context, context_file) {
         (Some(text), _) if text.len() as u64 > MAX_CONTEXT => {
             eprintln!(
@@ -1159,24 +1161,28 @@ fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> O
             process::exit(1);
         }
         (Some(text), _) => Some(text),
-        (None, Some(path)) => match std::fs::read_to_string(&path) {
-            // Same 1 MiB bound as `phase send -`: a context is prose, and the two input
-            // paths should not disagree about what is too big.
-            Ok(text) if text.len() as u64 > MAX_CONTEXT => {
+        (None, Some(path)) => {
+            // Check the SIZE before reading, so an enormous file is refused rather than
+            // loaded into memory first and rejected afterwards.
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.len() > MAX_CONTEXT
+            {
                 eprintln!(
                     "drovr: --context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — \
                      that is not a context; check what you passed",
                     path.display(),
-                    text.len()
+                    meta.len()
                 );
                 process::exit(1);
             }
-            Ok(text) => Some(text),
-            Err(e) => {
-                eprintln!("drovr: cannot read --context-file {}: {e}", path.display());
-                process::exit(1);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    eprintln!("drovr: cannot read --context-file {}: {e}", path.display());
+                    process::exit(1);
+                }
             }
-        },
+        }
         (None, None) => None,
     }
 }

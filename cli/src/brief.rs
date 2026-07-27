@@ -80,6 +80,111 @@ pub fn context_record(dir: &Path, key: &str) -> std::path::PathBuf {
     dir.join(format!("{key}-context.md"))
 }
 
+/// Cap on any context drovr will put in a brief, whatever path it arrives by: `--context`,
+/// `--context-file`, `phase send -` stdin, or a reused record. Round 4: the three input
+/// paths were capped while the RECORD was not, so the limit was bypassable by writing the
+/// record directly.
+pub const MAX_CONTEXT: u64 = 1 << 20;
+
+/// Write `contents` to `path` without ever following a symlink at `path` or at the temp
+/// file, and without leaving a partial file behind.
+///
+/// `fs::write` follows a symlink at its destination, which turns "record this" into
+/// "clobber whatever that link points at". Round 3 caught it at the context record; round 4
+/// caught the same thing at the review-JSON paths, because the fix had been applied to one
+/// site and not its siblings. This helper is that fix, in one place, for all of them.
+///
+/// `create_new` refuses to open anything that already exists — symlink included. The pid
+/// keeps concurrent writers apart, and a stale temp from a crashed process is removed and
+/// retried once rather than blocking every future write with `AlreadyExists`.
+pub fn write_no_follow(path: &Path, contents: &str) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "record".into());
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let open = |tmp: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    };
+    let mut file = match open(&tmp) {
+        Ok(f) => f,
+        // A temp left by a crashed process (or a reused pid) must not block writing
+        // forever. It is drovr's own name in drovr's own dir, so removing it is safe.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp).map_err(|rm| {
+                io::Error::new(
+                    rm.kind(),
+                    format!(
+                        "stale temp {} could not be removed ({rm}); the original error was {e}",
+                        tmp.display()
+                    ),
+                )
+            })?;
+            open(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let write = std::io::Write::write_all(&mut file, contents.as_bytes());
+    drop(file);
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Read a record drovr wrote, refusing to follow a symlink and refusing anything over
+/// [`MAX_CONTEXT`].
+///
+/// Round 4, security: hardening the WRITE path left the READ path following symlinks, so a
+/// link planted at the record path made drovr read an arbitrary file and inject it into a
+/// brief. There is no `O_NOFOLLOW` in std, so this is a `symlink_metadata` check — racy in
+/// principle, decisive against a planted link in practice, and the run dir is not a
+/// contested directory (see docs/known-issues.md on what its permissions do and do not
+/// buy).
+fn read_record_no_follow(path: &Path) -> io::Result<Option<String>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is a symlink; refusing to read a brief's context through it",
+                path.display()
+            ),
+        ));
+    }
+    if meta.len() > MAX_CONTEXT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, over the {MAX_CONTEXT}-byte context limit",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    Ok(Some(std::fs::read_to_string(path)?))
+}
+
 /// Resolve the context for a brief. Three cases, deliberately distinct:
 ///
 /// * `Some(text)` — record it and use it. A later invocation that passes nothing reuses it.
@@ -98,32 +203,7 @@ pub fn resolve_context(
     match supplied {
         Some(text) if !text.trim().is_empty() => {
             std::fs::create_dir_all(dir)?;
-            // Write-then-rename: `fs::write` FOLLOWS a symlink at the destination, so a
-            // symlink planted in the run dir would turn recording context into a clobber
-            // of its target. `rename` replaces the link itself.
-            //
-            // The temp file needs the same care, which the first version of this fix
-            // missed: `fs::write` to a FIXED `.tmp` path follows a symlink planted there
-            // just as readily, so the hole moved rather than closed. `create_new` refuses
-            // to open anything that already exists — symlink included — and the pid makes
-            // concurrent recordings of the same key use different temps.
-            let tmp = dir.join(format!(".{key}-context.{}.tmp", std::process::id()));
-            let write = (|| -> io::Result<()> {
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)?;
-                std::io::Write::write_all(&mut f, format!("{}\n", text.trim()).as_bytes())
-            })();
-            if let Err(e) = write {
-                // Leave nothing behind for the next invocation to trip over.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
+            write_no_follow(&path, &format!("{}\n", text.trim()))?;
             Ok(Some(text.trim().to_owned()))
         }
         Some(_) => {
@@ -166,21 +246,18 @@ pub fn resolve_context(
             // context the driver believes is in it is precisely the failure this
             // mechanism exists to prevent, and a warning on stderr is too easy to miss in
             // a pipeline. Four review angles independently called warn-and-proceed wrong.
-            let recorded = match std::fs::read_to_string(&path) {
-                Ok(c) => Some(c),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(io::Error::new(
+            let recorded = read_record_no_follow(&path)
+                .map_err(|e| {
+                    io::Error::new(
                         e.kind(),
                         format!(
-                            "cannot read the recorded context {} ({e}) — refusing to compose a \
+                            "cannot use the recorded context {} ({e}) — refusing to compose a \
                              brief without it; fix the file, or pass --context '' to drop it",
                             path.display()
                         ),
-                    ));
-                }
-            }
-            .map(|c| c.trim().to_owned());
+                    )
+                })?
+                .map(|c| c.trim().to_owned());
             // A record that exists but holds only whitespace is a broken state, not "no
             // context": say so rather than composing as if nothing was ever recorded.
             let recorded = match recorded {
@@ -254,10 +331,21 @@ pub fn compose_phase_brief(
              and do not widen your scope to the run.\n"
         });
     }
-    // No context renders no section: an empty heading reads as "the driver had nothing
-    // to say", which is worse than silence.
-    if let Some(c) = context.as_deref() {
-        sections.push_str(&format!("\n## Context from the driver\n\n{c}\n"));
+    // The section is ALWAYS emitted, even empty. Suppressing it looked tidier, but the
+    // templates refer to "the context section below" and those references then pointed at
+    // nothing — a critical finding in round 4, and the third round in a row to trip over
+    // an absent section. An explicit "none supplied" makes every reference true and tells
+    // the agent that the absence is deliberate rather than a delivery failure.
+    sections.push_str("\n## Context from the driver\n\n");
+    match context.as_deref() {
+        Some(c) => {
+            sections.push_str(c);
+            sections.push('\n');
+        }
+        None => sections.push_str(
+            "*(none supplied — the driver passed no `--context`. Do not wait for it; work from \
+             the task above and the artifacts named in this brief.)*\n",
+        ),
     }
 
     // Insert BEFORE the template's closing `## Done when`. Appending put the task and
@@ -330,6 +418,20 @@ mod tests {
     use super::*;
     use crate::run::RunState;
     use crate::test_util::ENV_LOCK;
+
+    /// Byte offset of the LINE that is exactly `heading`. The templates now mention
+    /// headings in prose (e.g. "the task brief in the `## Context from the driver`
+    /// section"), so `str::find` on the heading text matches the mention, not the section.
+    fn heading_pos(brief: &str, heading: &str) -> Option<usize> {
+        let mut at = 0usize;
+        for line in brief.split('\n') {
+            if line.trim_end() == heading {
+                return Some(at);
+            }
+            at += line.len() + 1;
+        }
+        None
+    }
 
     /// Composition now records/reads `<phase>-context.md`, so every test that composes
     /// needs its own data home. Caller holds ENV_LOCK.
@@ -458,11 +560,17 @@ mod tests {
         assert_eq!(with, again, "a re-brief must be byte-identical");
 
         // An explicitly EMPTY --context is a request for NO context, and must be able to
-        // un-say what was recorded.
+        // un-say what was recorded. The SECTION still appears — always emitted, so the
+        // templates' references to it are never false — but marked as unsupplied.
         let cleared = compose_phase_brief(&run, "plan", Some("   ")).unwrap();
         assert!(
-            !cleared.contains("## Context from the driver"),
+            !cleared.contains("the vendored dir is off limits"),
             "--context '' must drop the recorded context, not fall through to it: {cleared}"
+        );
+        assert!(
+            heading_pos(&cleared, "## Context from the driver").is_some()
+                && cleared.contains("none supplied"),
+            "the section stays, marked unsupplied: {cleared}"
         );
         assert!(cleared.contains("make the widget reentrant"));
     }
@@ -563,11 +671,73 @@ mod tests {
         // The advertised remedy must actually clear it.
         let brief = compose_phase_brief(&run, "plan", Some(""))
             .expect("--context '' must clear a directory record, as the error says it will");
-        assert!(!brief.contains("## Context from the driver"));
+        assert!(
+            brief.contains("none supplied"),
+            "no context, said explicitly"
+        );
         assert!(
             !context_record(&dir, "plan").exists(),
             "the bogus record must be gone"
         );
+    }
+
+    /// Round 4, security: the WRITE path was hardened and the READ path left following
+    /// symlinks, so a link planted at the record made drovr read an arbitrary file and
+    /// inject it into a brief.
+    #[test]
+    fn reading_a_symlinked_context_record_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("symlink-read");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("elsewhere.txt");
+        std::fs::write(&secret, "attacker-controlled text\n").unwrap();
+        std::os::unix::fs::symlink(&secret, context_record(&dir, "plan")).unwrap();
+
+        let err = compose_phase_brief(&run, "plan", None)
+            .expect_err("a symlinked record must not be read through");
+        assert!(err.to_string().contains("symlink"), "says why: {err}");
+
+        // And the contents must not have reached a brief by any path.
+        let cleared = compose_phase_brief(&run, "plan", Some("")).unwrap();
+        assert!(!cleared.contains("attacker-controlled"));
+    }
+
+    /// Round 4: a temp left behind by a crashed process (or a reused pid) must not block
+    /// recording forever with an opaque `AlreadyExists`.
+    #[test]
+    fn a_stale_temp_file_does_not_block_recording() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("stale-temp");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!(".plan-context.md.{}.tmp", std::process::id()));
+        std::fs::write(&stale, "leftover from a crash\n").unwrap();
+
+        let brief = compose_phase_brief(&run, "plan", Some("fresh context"))
+            .expect("a stale temp must be cleared, not fatal");
+        assert!(brief.contains("fresh context"));
+        assert!(!brief.contains("leftover from a crash"));
+        assert!(!stale.exists(), "the temp must not survive the write");
+    }
+
+    /// A record over the cap must be refused, or the limit applied to `--context`,
+    /// `--context-file` and stdin is bypassable by writing the record directly.
+    #[test]
+    fn an_oversized_context_record_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("oversized-record");
+        let run = make_run();
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = "x".repeat(MAX_CONTEXT as usize + 1);
+        std::fs::write(context_record(&dir, "plan"), &big).unwrap();
+
+        let err = compose_phase_brief(&run, "plan", None)
+            .expect_err("an oversized record must be refused");
+        assert!(err.to_string().contains("context limit"), "says why: {err}");
     }
 
     /// The implement-task scope pointer must not send an agent to a section that is not
@@ -631,6 +801,32 @@ mod tests {
         }
     }
 
+    /// Round 4 (critical): the templates refer to "the context section below", and
+    /// suppressing that section when no `--context` was passed made those references point
+    /// at nothing. The section is therefore unconditional.
+    #[test]
+    fn every_composed_brief_has_a_context_section() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        isolate("always-context-section");
+        let run = make_run();
+        for phase in ["brainstorm", "plan", "review", "implement-task-1"] {
+            for context in [None, Some("real context")] {
+                let brief = compose_phase_brief(&run, phase, context).unwrap();
+                assert!(
+                    heading_pos(&brief, "## Context from the driver").is_some(),
+                    "{phase} (context: {}) must carry the section: {brief}",
+                    context.is_some()
+                );
+                if context.is_none() {
+                    assert!(
+                        brief.contains("none supplied"),
+                        "{phase}: absence must be stated, not implied: {brief}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Context is per phase, never shared between them.
     #[test]
     fn recorded_context_does_not_leak_across_phases() {
@@ -643,6 +839,10 @@ mod tests {
             !other.contains("plan-only context"),
             "one phase's context must not reach another: {other}"
         );
+        assert!(
+            other.contains("none supplied"),
+            "and says so explicitly: {other}"
+        );
     }
 
     /// The template's closing `## Done when` states the completion criteria. Appending
@@ -653,13 +853,9 @@ mod tests {
         isolate("section-order");
         let run = make_run();
         let brief = compose_phase_brief(&run, "plan", Some("ctx here")).unwrap();
-        let task = brief.find("## The run's task").expect("task section");
-        let ctx = brief
-            .find("## Context from the driver")
-            .expect("context section");
-        let done = brief
-            .rfind("## Done when")
-            .expect("templates end with Done when");
+        let task = heading_pos(&brief, "## The run's task").expect("task section");
+        let ctx = heading_pos(&brief, "## Context from the driver").expect("context section");
+        let done = heading_pos(&brief, "## Done when").expect("templates end with Done when");
         assert!(
             task < done && ctx < done,
             "criteria must stay last:\n{brief}"

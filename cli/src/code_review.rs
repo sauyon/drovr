@@ -178,6 +178,10 @@ pub fn code_review_brief(
         )
     })?;
     let head = head_sha(&run.project_dir)?;
+    // `Err` here, where `code_review_run` returns `ReviewOutcome::Error` for the same class
+    // of failure. Not an oversight: this function's only job is to produce a brief, so it
+    // has no outcome to report — the CLI prints the error and exits 1, which is the same
+    // observable result the outcome path produces.
     let context = resolve_context(&dir, task, context)?;
     Ok(build_seed(
         task,
@@ -420,7 +424,10 @@ fn obtain_findings_json<H: Herdr>(
         })?;
     let transcript = h.agent_read(&pane)?;
     if let Some(json) = extract_findings_json(&transcript) {
-        std::fs::write(&path, &json)?;
+        // `write_no_follow`, not `fs::write`: a symlink planted at the findings path would
+        // otherwise be followed and its target clobbered (round 4, security — the same
+        // defect fixed at the context record, left behind at its siblings).
+        crate::brief::write_no_follow(&path, &json)?;
         return Ok(json);
     }
     // Compatibility path for reviewers that wrote the canonical file.
@@ -542,7 +549,7 @@ pub fn code_review_run<H: Herdr>(
     };
     let iter = resumed.unwrap_or_else(|| next_iter(run, task));
     if resumed.is_none() {
-        std::fs::write(iter_head_path(&dir, task, iter), format!("{head}\n"))?;
+        crate::brief::write_no_follow(&iter_head_path(&dir, task, iter), &format!("{head}\n"))?;
     }
 
     // Split the angles: what is already banked from an earlier pass of this same
@@ -615,7 +622,7 @@ pub fn code_review_run<H: Herdr>(
             &run.project_dir,
             context.as_deref(),
         );
-        std::fs::write(&seed_path, &seed_text)?;
+        crate::brief::write_no_follow(&seed_path, &seed_text)?;
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
@@ -726,9 +733,9 @@ pub fn code_review_run<H: Herdr>(
     }
     let merged = merge_reviews(per_angle);
     let out_path = dir.join(format!("{task}-review.json"));
-    std::fs::write(
+    crate::brief::write_no_follow(
         &out_path,
-        serde_json::to_string_pretty(&merged).map_err(io::Error::other)?,
+        &serde_json::to_string_pretty(&merged).map_err(io::Error::other)?,
     )?;
 
     Ok(if is_clean(&merged) {
