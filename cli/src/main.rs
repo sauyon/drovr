@@ -1745,7 +1745,11 @@ mod tests {
         }
 
         // No phase pane, but the workspace and its idle shell are still there.
-        let run = attach_run(vec![("brainstorm", Done, None)], Some("w:root"));
+        // Distinctive ids, so asserting they appear is not satisfied by the
+        // surrounding prose — the fixture's default `"w"` is a substring of
+        // "workspace" and would make the check vacuous.
+        let mut run = attach_run(vec![("brainstorm", Done, None)], Some("ws-77:root"));
+        run.workspace = Some("ws-77".into());
         let msg = match attach_plan(&run, "r") {
             AttachPlan::Refuse(msg) => msg,
             AttachPlan::AttachAgent { pane, .. } => {
@@ -1757,8 +1761,12 @@ mod tests {
             "must say plainly that there is no agent: {msg}"
         );
         assert!(
-            msg.contains('w') && msg.contains("workspace"),
-            "must name the workspace so the user can go there themselves: {msg}"
+            msg.contains("ws-77") && !msg.contains("(unknown)"),
+            "must name the REAL workspace so the user can go there themselves: {msg}"
+        );
+        assert!(
+            msg.contains("ws-77:root"),
+            "must name the idle shell it is refusing, not just describe one: {msg}"
         );
         assert!(
             msg.contains("drovr phase start"),
