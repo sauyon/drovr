@@ -2038,31 +2038,52 @@ mod tests {
         let dir = tmp.path().join("r");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("spec.md"), b"# Spec").unwrap();
-        // A run with an idle root shell and no phase panes at all — exactly the
-        // shape `drovr new` now leaves behind before the first `phase start`.
-        fs::write(
-            dir.join("state.json"),
-            r#"{"name":"r","task":"t","phases":[],"gate":"spec","cursor":0,
-                "project_dir":"","workspace":"w","root_pane":"w:root"}"#,
-        )
-        .unwrap();
+        // An idle root shell plus one phase pane. Both are needed: the phase
+        // pane is the POSITIVE CONTROL that keeps this test from passing
+        // vacuously. If the `state.json` below failed to parse, or `root_pane`
+        // were dropped, every request would 409 for the wrong reason — the
+        // phase pane's 500 is what proves the state loaded and the gate is
+        // discriminating rather than refusing everything.
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![crate::run::Phase::new("implement")],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.phases[0].status = crate::run::PhaseStatus::Running;
+        run.phases[0].set_pane("w:p1");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
 
-        let (s, _) = http_post(
-            &addr,
-            "/api/runs/r/send?pane=w%3Aroot",
-            "text/plain",
-            "ls -la",
-        );
-        assert_eq!(s, 409, "/send must refuse the idle root shell");
+        for (path, ctype, body) in [
+            ("send?pane=w%3Aroot", "text/plain", "ls -la"),
+            (
+                "keys?pane=w%3Aroot",
+                "application/json",
+                r#"{"keys":["enter"]}"#,
+            ),
+        ] {
+            let (s, _) = http_post(&addr, &format!("/api/runs/r/{path}"), ctype, body);
+            assert_eq!(s, 409, "{path} must refuse the idle root shell");
+        }
 
-        let (s, _) = http_post(
-            &addr,
-            "/api/runs/r/keys?pane=w%3Aroot",
-            "application/json",
-            r#"{"keys":["enter"]}"#,
+        // Positive control: the phase pane IS writable, so it gets past the gate
+        // and fails at herdr instead (no daemon in the test environment).
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(
+            s, 500,
+            "a phase pane must pass the gate and fail at herdr, not be refused"
         );
-        assert_eq!(s, 409, "/keys must refuse the idle root shell");
     }
 
     #[test]
