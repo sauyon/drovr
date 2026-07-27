@@ -311,8 +311,10 @@ impl Phase {
         self.is_reaped() || self.status != PhaseStatus::Pending
     }
 
-    /// Whether drovr has closed this phase's pane. Nothing reads it yet —
-    /// task 6 (reaping) and task 5 (rehydrate) do.
+    /// Whether drovr has closed this phase's pane. Read by [`Phase::has_run`],
+    /// by `phase_rehydrate` (a reaped phase is the thing it brings back), and by
+    /// `main::rehydrate_hint`. Still WRITTEN by nothing — [`Phase::mark_reaped`]
+    /// is task 6's.
     pub fn is_reaped(&self) -> bool {
         self.reaped.yes()
     }

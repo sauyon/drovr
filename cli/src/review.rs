@@ -759,9 +759,18 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
 ///   (reviewer names need it) and is a path check, **not an authorization
 ///   one** — and `phase_start` appends any name it is handed. Without the
 ///   membership test an unauthenticated caller could invent phases.
-/// * **409** — the phase still holds a pane. "Holds a pane" is the same single
-///   rule `phase_rehydrate` applies, read from the same `state.json`, so the
-///   status code and the CLI's refusal can never disagree.
+/// * **409** — the phase is not in a state to be brought back: it still holds a
+///   pane, or it has never run ([`crate::run::Phase::has_run`] — `drovr new`
+///   pre-seeds `Pending` placeholders, and starting one is `phase start`'s job).
+///   Both are the same rules `phase_rehydrate` applies, read from the same
+///   `state.json`, so the status code and the CLI's refusal cannot disagree.
+///
+/// And one non-refusal worth its own line:
+///
+/// * **200 with `complete: false`** — child exit 2. The pane IS back, but the
+///   agent in it was not confirmed to have the phase's context. Neither a 500
+///   (which would claim nothing happened) nor a plain `ok: true` (which would
+///   let a caller checking only the status treat it as fully recovered).
 fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
     let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
         respond_str(req, 400, "text/plain", "missing phase".into());
