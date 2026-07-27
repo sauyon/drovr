@@ -311,6 +311,42 @@ fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
     })
 }
 
+/// Dispose of a pane this call opened but never managed to launch into.
+///
+/// **Not reaping.** Reaping closes a pane that did its job; this cleans up after
+/// an operation that failed halfway. The pane is an orphan the instant the
+/// launch errors: `phase_start` returns before `set_pane`, so nothing in
+/// `state.json` names it, and a retry calls `tab_create` again — one dead tab
+/// per attempt.
+///
+/// **Record BEFORE closing, and record even if the close works.** `drovr
+/// cleanup` closes only the panes it can prove are drovr's, diffing
+/// `Herdr::workspace_panes` against `drovr_pane_ids`. A pane drovr opened and
+/// never recorded is therefore indistinguishable from one the human opened in
+/// the run's workspace: cleanup leaves it alone *forever*, and — because
+/// something foreign is present — refuses `workspace_close`, stranding the whole
+/// run's workspace. So the retirement is what makes the record true regardless
+/// of what the close does, and the close is a best-effort tidy on top. On
+/// success it costs nothing: cleanup skips panes `workspace_panes` no longer
+/// lists.
+///
+/// Both steps are best-effort and neither may mask the launch error the caller
+/// is about to return — that error is what the human needs to see. The `save`
+/// matters on its own: a retry runs in a fresh process, so a retirement that
+/// only ever existed in memory is a retirement that never happened.
+fn discard_unlaunched_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
+    run.retire_pane(pane);
+    if let Err(e) = run.save() {
+        eprintln!(
+            "drovr: warning: could not record pane {pane} as drovr's after a failed \
+             launch ({e}); `drovr cleanup` may leave it open"
+        );
+    }
+    if let Err(e) = h.pane_close(pane) {
+        eprintln!("drovr: warning: could not close pane {pane} after a failed launch: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -414,6 +450,8 @@ pub fn phase_start<H: Herdr>(
     }
     remove_stale_marker(&run.name, phase)?;
 
+    // (see `discard_unlaunched_pane` for what happens if the launch below fails)
+    //
     // Pick the pane this phase's `claude` will run in, WITHOUT splitting a new
     // pane beside an empty shell:
     //   * a restarting phase reuses its own recorded pane;
@@ -430,9 +468,14 @@ pub fn phase_start<H: Herdr>(
     // first) — just never an agent's.
     let existing_pane =
         find_phase_idx(run, phase).and_then(|i| run.phases[i].pane_id().map(str::to_owned));
+    // Whether THIS call opened the pane. A pane we did not create is not ours to
+    // discard when the launch fails — it is the phase's own, from a previous
+    // pass, and the retry wants it.
+    let mut created_pane = false;
     let target_pane = if let Some(pane) = existing_pane {
         pane
     } else if let Some(ws) = run.workspace.as_deref() {
+        created_pane = true;
         h.tab_create(ws, phase, &cwd)?
     } else {
         return Err(io::Error::new(
@@ -450,7 +493,12 @@ pub fn phase_start<H: Herdr>(
     let cfg = load_config()?;
     let agent = run.agent.as_deref().unwrap_or("claude");
     let launch = cfg.launch(agent, &cwd, false)?;
-    launch_in_pane(h, &run.name, phase, &target_pane, launch.command(), &pass)?;
+    if let Err(e) = launch_in_pane(h, &run.name, phase, &target_pane, launch.command(), &pass) {
+        if created_pane {
+            discard_unlaunched_pane(h, run, &target_pane);
+        }
+        return Err(e);
+    }
 
     // Find existing phase or append a new one
     let idx = match find_phase_idx(run, phase) {
@@ -4151,12 +4199,63 @@ mod tests {
             Some("ws-9:root"),
             "the root shell is never consumed, failure or not"
         );
+        let calls = h.calls();
         assert!(
-            !h.calls()
+            !calls.iter().any(|c| c.contains("pane_run pane=ws-9:root")),
+            "the launch must have targeted the phase's own tab: {calls:?}"
+        );
+
+        // The tab this call created must not be abandoned. Every phase now
+        // creates one, so a failed launch is the common path to an ORPHAN: a
+        // pane drovr opened and never recorded. `drovr cleanup` closes only
+        // panes it can prove are drovr's, so an unrecorded one is treated as
+        // the human's — left forever, AND blocking `workspace_close` for the
+        // whole run. Recording it is what keeps cleanup able to reclaim it.
+        let orphan = calls
+            .iter()
+            .find(|c| c.contains("tab_create"))
+            .and_then(|c| c.rsplit("-> ").next())
+            .expect("the failing phase created a tab")
+            .to_owned();
+        assert!(
+            run.retired_panes.contains(&orphan),
+            "a pane whose launch failed must be retired so cleanup still owns it: \
+             retired={:?} orphan={orphan}",
+            run.retired_panes
+        );
+        assert!(
+            calls
                 .iter()
-                .any(|c| c.contains("pane_run pane=ws-9:root")),
-            "the launch must have targeted the phase's own tab: {:?}",
-            h.calls()
+                .any(|c| c.contains(&format!("pane_close pane={orphan}"))),
+            "and closed best-effort, so it does not sit there dead: {calls:?}"
+        );
+        // Belt and braces: recording must survive the process, not just this
+        // `RunState`, or a retry loses it.
+        let reloaded = RunState::load("launch-fail-test").expect("state must be on disk");
+        assert!(
+            reloaded.retired_panes.contains(&orphan),
+            "the retirement must be PERSISTED before the error propagates: {:?}",
+            reloaded.retired_panes
+        );
+    }
+
+    /// A close that fails must still leave the pane recorded — that is the whole
+    /// reason the record comes first.
+    #[test]
+    fn an_orphan_tab_stays_recorded_when_it_cannot_be_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+        h.fail_pane_close();
+        let mut run = make_run_with_workspace("launch-fail-noclose", "ws-nc");
+
+        assert!(phase_start(&h, &mut run, "brainstorm", None).is_err());
+
+        assert_eq!(
+            run.retired_panes.len(),
+            1,
+            "the orphan is recorded even though the close failed: {:?}",
+            run.retired_panes
         );
     }
 

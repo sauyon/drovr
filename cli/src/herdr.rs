@@ -1098,6 +1098,9 @@ pub struct FakeHerdr {
     /// When true, every `workspace_focus` returns an error. Restoring focus is
     /// best-effort: a caller must report it and carry on, never abandon its work.
     fail_workspace_focus: RefCell<bool>,
+    /// When true, every `pane_close` returns an error. Disposing of a pane is
+    /// best-effort, so the caller's RECORD of it must survive the failed close.
+    fail_pane_close: RefCell<bool>,
     /// When true, every `pane_info` reads as unreadable (`None`).
     fail_pane_info: RefCell<bool>,
     /// When true, every `tab_close` returns an error — reaping is best-effort,
@@ -1136,6 +1139,7 @@ impl FakeHerdr {
             fail_pane_run: RefCell::new(false),
             fail_pane_rename: RefCell::new(false),
             fail_workspace_focus: RefCell::new(false),
+            fail_pane_close: RefCell::new(false),
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
@@ -1269,6 +1273,13 @@ impl FakeHerdr {
         *self.fail_workspace_focus.borrow_mut() = true;
     }
 
+    /// Make every `pane_close` fail. A caller disposing of a pane it could not
+    /// use must still leave it RECORDED, or `drovr cleanup` will mistake it for
+    /// the human's and never reclaim it.
+    pub fn fail_pane_close(&self) {
+        *self.fail_pane_close.borrow_mut() = true;
+    }
+
     /// Make every `pane_info` read as unreadable (`None`), whatever is queued.
     pub fn fail_pane_info(&self) {
         *self.fail_pane_info.borrow_mut() = true;
@@ -1332,6 +1343,9 @@ impl Herdr for FakeHerdr {
 
     fn pane_close(&self, pane_id: &str) -> io::Result<()> {
         self.record(format!("pane_close pane={pane_id}"));
+        if *self.fail_pane_close.borrow() {
+            return Err(io::Error::other("scripted pane_close failure"));
+        }
         Ok(())
     }
 

@@ -298,10 +298,13 @@ fn cmd_list() {
     }
 }
 
-/// Create the run's herdr workspace and label its root shell pane, returning
-/// `(workspace_id, root_pane_id)` — `(None, None)` if herdr could not create it,
-/// which is a warning rather than a failure (the run still exists; `phase start`
-/// is what needs the workspace).
+/// Create the run's herdr workspace and label its root shell pane. `None` if
+/// herdr could not create it, which is a warning rather than a failure (the run
+/// still exists; `phase start` is what needs the workspace).
+///
+/// Returns the [`herdr::Workspace`] it was handed rather than a pair of
+/// same-typed `Option<String>`s: two positional `Option<String>`s are a
+/// swap away from silently recording the pane id as the workspace id.
 ///
 /// The workspace is created in the project dir so the root shell and every phase
 /// tab start already `cd`'d into the project.
@@ -322,13 +325,13 @@ fn create_run_workspace<H: Herdr>(
     herdr: &H,
     name: &str,
     project_dir: &str,
-) -> (Option<String>, Option<String>) {
+) -> Option<herdr::Workspace> {
     let prev_focus = herdr.focused_workspace();
     let ws = match herdr.workspace_create(&format!("drovr:{name}"), project_dir) {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("drovr: warning: could not create herdr workspace: {e}");
-            return (None, None);
+            return None;
         }
     };
     if let Err(e) = herdr.pane_rename(&ws.root_pane, &format!("drovr:{name} (idle shell)")) {
@@ -343,7 +346,7 @@ fn create_run_workspace<H: Herdr>(
             eprintln!("drovr: warning: could not restore focus to workspace {prev}: {e}");
         }
     }
-    (Some(ws.id), Some(ws.root_pane))
+    Some(ws)
 }
 
 fn cmd_new(
@@ -416,7 +419,10 @@ fn cmd_new(
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    let (workspace, root_pane) = create_run_workspace(herdr, name, &project_dir);
+    let (workspace, root_pane) = match create_run_workspace(herdr, name, &project_dir) {
+        Some(ws) => (Some(ws.id), Some(ws.root_pane)),
+        None => (None, None),
+    };
 
     let run = RunState {
         name: name.to_owned(),
@@ -535,42 +541,22 @@ fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
     }
 }
 
-/// Pick what `drovr attach <run>` should connect to, in preference order:
+/// Pick what `drovr attach <run>` should connect to:
 ///
-/// 1. the phase currently being worked (`first_incomplete`), if it holds a pane;
-/// 2. otherwise the LAST phase that still holds one — a finished run, or one
-///    whose current phase has not been started yet;
-/// 3. otherwise the workspace's idle root shell, which no phase ever occupies
+/// 1. [`RunState::live_agent_pane`] — the run's current phase, if it holds one.
+///    **The same call the review UI's mirror makes**, so `drovr attach` and the
+///    UI can never point at different panes for the same run. There is no
+///    fallback to an earlier phase; the reason is on `live_agent_pane`.
+/// 2. otherwise the workspace's idle root shell, which no phase ever occupies
 ///    and which therefore outlives them all;
-/// 4. otherwise nothing — a run whose workspace creation failed at `drovr new`.
+/// 3. otherwise nothing — a run whose workspace creation failed at `drovr new`.
 ///
-/// Rung 2 matters more than it used to: phase panes are no longer permanent, and
-/// the point of this change is that a phase tab *can* be closed without taking
-/// the workspace with it, so "the current phase" and "a phase with a live pane"
-/// come apart.
-///
-/// **Rung 3 is not an attach target** — see [`attach_plan`], which refuses it.
+/// **Rung 2 is not an attach target** — see [`attach_plan`], which refuses it.
 /// It is reported rather than dropped because it distinguishes two refusals: a
 /// run whose workspace is still open and anchored, and one with no workspace at
 /// all. Those deserve different advice.
-///
-/// **Deliberately NOT shared with `review::active_pane`**, which walks the same
-/// list for the review UI's mirror target. They agree on rungs 1–2 today (no
-/// pipeline phase is ever `Failed`, so the sole `Running` phase always sits at
-/// `first_incomplete`) but they answer different questions: `active_pane` stops
-/// at rung 2 and returns `None`, because a mirror has nothing to say about a
-/// pane it cannot show, whereas an attach still wants to tell the human what IS
-/// there before refusing. Folding them together would cost one of them that.
 fn attach_target(run: &RunState) -> Option<AttachTarget<'_>> {
-    let phase_pane = run
-        .first_incomplete()
-        .and_then(|i| run.phases.get(i))
-        .filter(|p| p.pane_id().is_some())
-        .or_else(|| run.phases.iter().rev().find(|p| p.pane_id().is_some()))
-        // Carry the pane out of the same `Option` the phase came from, so there
-        // is no second lookup to get out of step with the filter above.
-        .and_then(|p| p.pane_id().map(|pane| (p.name.as_str(), pane)));
-    match phase_pane {
+    match run.live_agent_pane() {
         Some((phase, pane)) => Some(AttachTarget::Phase { phase, pane }),
         None => run
             .root_pane
@@ -1644,7 +1630,7 @@ mod tests {
     /// pane at all, and exiting 1 on the human's "show me this run" is a worse
     /// answer than the workspace's idle shell.
     #[test]
-    fn attach_prefers_the_incomplete_phase_then_the_last_pane_then_the_root_shell() {
+    fn attach_prefers_the_current_phase_then_reports_the_root_shell() {
         use PhaseStatus::{Done, Running};
 
         // The phase actually being worked wins, even though a later one has a pane.
@@ -1664,7 +1650,9 @@ mod tests {
             })
         ));
 
-        // All done → the last phase that still holds a pane.
+        // All done → no current phase, so no phase target. It must NOT offer
+        // the last pane it can find: under reaping those are the panes that get
+        // closed, and a finished run's stale pane is not its current state.
         let run = attach_run(
             vec![
                 ("brainstorm", Done, Some("w:p1")),
@@ -1674,14 +1662,11 @@ mod tests {
         );
         assert!(matches!(
             attach_target(&run),
-            Some(AttachTarget::Phase {
-                phase: "implement",
-                pane: "w:p2"
-            })
+            Some(AttachTarget::RootShell { pane: "w:root" })
         ));
 
-        // The incomplete phase has no pane (never started, or reaped) → still
-        // the last phase holding one, rather than nothing.
+        // Same when the current phase simply has no pane yet: an EARLIER
+        // phase's pane is not an answer to "attach me to this run".
         let run = attach_run(
             vec![
                 ("brainstorm", Done, Some("w:p1")),
@@ -1691,10 +1676,7 @@ mod tests {
         );
         assert!(matches!(
             attach_target(&run),
-            Some(AttachTarget::Phase {
-                phase: "brainstorm",
-                pane: "w:p1"
-            })
+            Some(AttachTarget::RootShell { pane: "w:root" })
         ));
 
         // No phase pane anywhere → the run's idle root shell, reported as such
@@ -1807,9 +1789,8 @@ mod tests {
         use crate::herdr::FakeHerdr;
 
         let h = FakeHerdr::new();
-        let (ws, root) = create_run_workspace(&h, "alpha", "/tmp/p");
-        let root = root.expect("workspace_create yields a root pane");
-        assert!(ws.is_some());
+        let ws = create_run_workspace(&h, "alpha", "/tmp/p").expect("workspace must be created");
+        let root = ws.root_pane.clone();
         let calls = h.calls();
         let rename = calls
             .iter()
@@ -1845,9 +1826,8 @@ mod tests {
 
         let h = FakeHerdr::new();
         h.fail_pane_rename();
-        let (ws, root) = create_run_workspace(&h, "beta", "/tmp/p");
         assert!(
-            ws.is_some() && root.is_some(),
+            create_run_workspace(&h, "beta", "/tmp/p").is_some(),
             "a cosmetic rename failure must not discard the workspace"
         );
 
@@ -1856,9 +1836,8 @@ mod tests {
         // happens to be looking.
         let h = FakeHerdr::new();
         h.fail_workspace_focus();
-        let (ws, root) = create_run_workspace(&h, "gamma", "/tmp/p");
         assert!(
-            ws.is_some() && root.is_some(),
+            create_run_workspace(&h, "gamma", "/tmp/p").is_some(),
             "a failed focus restore must not discard the workspace"
         );
     }

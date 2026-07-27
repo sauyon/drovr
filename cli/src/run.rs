@@ -729,6 +729,32 @@ impl RunState {
     /// Remember `pane_id` as drovr's even though no phase points at it any more —
     /// see [`RunState::retired_panes`]. Idempotent, so a caller may retire the
     /// same pane twice without growing the list.
+    /// The pane that represents this run right now: `(phase name, pane id)` for
+    /// the phase the run is currently on, if it holds one.
+    ///
+    /// **The single answer for every caller that asks "where is this run?"** —
+    /// `drovr attach` and the review UI's live mirror both call this. They used
+    /// to each walk `phases` themselves, with *different* predicates, so the two
+    /// could point at different panes for the same run; and two copies of a rule
+    /// this subtle drift apart.
+    ///
+    /// **There is no fallback to an earlier phase, deliberately.** A run whose
+    /// current phase holds no pane is honestly empty, and saying so beats
+    /// offering a pane from a phase the run has already moved past: that pane
+    /// makes a stalled run look alive at the wrong place. It gets worse once
+    /// finished phases are reaped, because earlier phases are exactly the ones
+    /// reaping closes — the fallback would hand back a pane id that is dead, or
+    /// worse, recycled by herdr for something else entirely.
+    ///
+    /// **"Current" is `first_incomplete`, not `status == Running`.** A phase
+    /// that failed or is blocked still holds the pane worth looking at — that is
+    /// precisely when a human attaches — and a `Pending` phase has no pane, so
+    /// it falls out as `None` on its own.
+    pub fn live_agent_pane(&self) -> Option<(&str, &str)> {
+        let phase = self.first_incomplete().and_then(|i| self.phases.get(i))?;
+        Some((phase.name.as_str(), phase.pane_id()?))
+    }
+
     pub fn retire_pane(&mut self, pane_id: impl Into<String>) {
         let id = pane_id.into();
         if !self.retired_panes.contains(&id) {
@@ -916,6 +942,87 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["alpha".to_string()]);
     }
+    /// The ONE answer to "which pane represents this run", shared by
+    /// `drovr attach` and the review UI's mirror.
+    ///
+    /// They had two copies with two different predicates, which is a bug on its
+    /// own — the two can point at different panes for the same run — and two
+    /// copies of this would keep drifting. There is no fallback to an EARLIER
+    /// phase: a run whose current phase has no pane is honestly empty. Under
+    /// reaping, earlier phases are precisely the ones that get closed, so such a
+    /// fallback would surface a dead or recycled pane as the run's current state.
+    #[test]
+    fn live_agent_pane_is_the_current_phases_pane_or_nothing() {
+        let mk = |name: &str, status: PhaseStatus, pane: Option<&str>| {
+            let mut p = Phase::new(name);
+            p.status = status;
+            if let Some(pane) = pane {
+                p.set_pane(pane);
+            }
+            p
+        };
+        let run = |phases: Vec<Phase>, root: Option<&str>| RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases,
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: root.map(str::to_owned),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+
+        // The phase the run is ON — not the first pane it can find.
+        let s = run(
+            vec![
+                mk("brainstorm", PhaseStatus::Done, Some("w:p1")),
+                mk("plan", PhaseStatus::Running, Some("w:p2")),
+            ],
+            Some("w:root"),
+        );
+        assert_eq!(s.live_agent_pane(), Some(("plan", "w:p2")));
+
+        // Current phase has NO pane (never started, or reaped) → None. It must
+        // NOT walk back to brainstorm's pane, even though that pane is right
+        // there and looks alive.
+        let s = run(
+            vec![
+                mk("brainstorm", PhaseStatus::Done, Some("w:p1")),
+                mk("plan", PhaseStatus::Pending, None),
+            ],
+            Some("w:root"),
+        );
+        assert_eq!(
+            s.live_agent_pane(),
+            None,
+            "an earlier phase's pane is not this run's current state"
+        );
+
+        // Every phase Done → the run is finished; there is no current phase.
+        let s = run(
+            vec![mk("brainstorm", PhaseStatus::Done, Some("w:p1"))],
+            Some("w:root"),
+        );
+        assert_eq!(s.live_agent_pane(), None);
+
+        // A phase that FAILED still holds the pane worth looking at — the
+        // predicate is "the phase the run is on", not "status == Running".
+        let s = run(
+            vec![mk("implement", PhaseStatus::Failed, Some("w:p9"))],
+            None,
+        );
+        assert_eq!(s.live_agent_pane(), Some(("implement", "w:p9")));
+
+        // The idle root shell is never it, and neither is an empty run.
+        assert_eq!(run(vec![], Some("w:root")).live_agent_pane(), None);
+    }
+
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {
         let _lock = ENV_LOCK.lock().unwrap();

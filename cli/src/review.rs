@@ -539,22 +539,19 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 // Live session mirror (herdr read / prompt)
 // ---------------------------------------------------------------------------
 
-/// The pane that is this run's live agent session: the first phase still
-/// `Running` (with a pane), else the last phase that still holds one. `None`
-/// when the run has no live agent pane to mirror.
+/// The pane this run's live mirror follows — [`RunState::live_agent_pane`], the
+/// same answer `drovr attach` gets. `None` when the run has no live agent pane,
+/// which the endpoints render as 204 / "no live pane".
 ///
-/// **The workspace root pane is deliberately not a fallback.** It once was, but
-/// only reachably so before the first `phase start`, because that phase then
-/// claimed the pane. Phases now leave the root shell alone for the whole run
-/// (see `phase_start`), so falling back to it would point the mirror at an idle
-/// `sh` prompt and present it as the run's agent. `None` — which the endpoints
-/// render as 204 / "no live pane" — is the honest answer.
+/// **Neither the workspace root pane nor an earlier phase's pane is a
+/// fallback.** The root pane once was, but only reachably so before the first
+/// `phase start`, because that phase then claimed it; phases now leave the idle
+/// shell alone for the whole run, so falling back would point the mirror at an
+/// `sh` prompt and present it as the run's agent. The earlier-phase fallback is
+/// refused for the reason spelled out on `live_agent_pane`. An empty mirror is
+/// honest; a stale one is not.
 fn active_pane(run: &RunState) -> Option<String> {
-    run.phases
-        .iter()
-        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id().is_some())
-        .or_else(|| run.phases.iter().rev().find(|ph| ph.pane_id().is_some()))
-        .and_then(|ph| ph.pane_id().map(str::to_owned))
+    run.live_agent_pane().map(|(_, pane)| pane.to_owned())
 }
 
 /// What a request wants to do with the pane it names, which decides which
@@ -1761,7 +1758,7 @@ mod tests {
     /// shell — so the honest answer when no phase has a pane is `None` (204 /
     /// "no live pane"), not a shell prompt dressed up as an agent.
     #[test]
-    fn active_pane_prefers_running_phase_then_last_pane_never_root() {
+    fn active_pane_is_the_current_phase_or_nothing() {
         let mkphase = |name: &str, status, pane: Option<&str>| {
             let mut p = {
                 let mut p = crate::run::Phase::new(name);
@@ -1792,16 +1789,17 @@ mod tests {
             archived: false,
             retired_panes: vec![],
         };
-        // Running phase wins.
+        // The phase the run is on.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
-        // No running phase → the LAST phase that still holds a pane, so the
-        // mirror follows the run forward rather than snapping back to the first.
+        // Every phase Done → nothing to mirror. It must NOT fall back to that
+        // phase's own pane once the run has moved past it, nor to an earlier
+        // phase's: under reaping those are exactly the panes that get closed,
+        // so a fallback would mirror a dead or recycled pane as if it were live.
         run.phases[1].status = crate::run::PhaseStatus::Done;
-        assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
-        // A phase whose pane is gone is skipped, not preferred for being last.
+        assert_eq!(active_pane(&run), None);
+        // Still nothing once the panes are actually gone — and still not the
+        // idle root shell, which outlives every phase.
         run.phases[1].mark_reaped();
-        assert_eq!(active_pane(&run).as_deref(), Some("w:p1"));
-        // No phase pane at all → None, even though the idle root shell is live.
         run.phases[0].mark_reaped();
         assert!(
             run.root_pane.is_some(),
