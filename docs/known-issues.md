@@ -626,6 +626,87 @@ keystroke is missing. Fixing "`drovr phase send` returns success with the prompt
 unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
 visible victim. Keep the self-spawned-reviewer workaround above until that lands.
 
+## A reviewer's `submit_findings` tool can be DEFERRED, so a tool-search outage loses the review
+
+**Severity:** medium (the panel's only findings channel becomes uncallable; every angle
+finishes having delivered nothing, and the pass fails).
+**Found:** 2026-07-26, probing the claude findings channel directly (`fix-review-json`):
+`claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config`, asked to call the
+tool.
+
+### Symptom
+
+The agent reports it cannot call the tool: `mcp__drovr-findings__submit_findings` is a
+*deferred* tool, its schema must be loaded through `ToolSearch` first, and `ToolSearch`
+answers `HTTP Error 502: Bad Gateway` (classifier unreachable). Nothing is written; the
+angle looks like a reviewer that simply produced nothing.
+
+### What the probe DID establish (both good)
+
+- claude accepts the server from `--mcp-config` **without** the "New MCP server found"
+  approval prompt (see that issue below — it applies to project-scoped `.mcp.json`, not to
+  a config passed on the command line), and registers it under `--permission-mode plan`.
+- The server itself is correct end-to-end: a hand-driven stdio JSON-RPC session
+  (`initialize` → `tools/list` → `tools/call`) returns the tool and writes
+  `<task>-review-<angle>.json` exactly where the panel reads it.
+
+### Mitigations
+
+- **Seed** (`code_review::build_seed`): names the fully qualified id, says the tool may be
+  deferred and must have its schema loaded first, and states that calling it is the
+  *sanctioned* way to deliver from read-only mode — the same probe showed a cautious agent
+  stopping to ask permission for a tool it read as "writing". Asserted by
+  `code_review::tests::seed_routes_findings_through_the_submit_tool`.
+- **Launch** (`config::default_agents`): claude's reviewer launch carries
+  `--allowedTools=mcp__drovr-findings__submit_findings`, so plan mode's tool gate cannot
+  refuse the one tool the panel depends on. Note the `=` form: `--allowedTools` is
+  **variadic**, and as two argv words it swallows whatever follows it — passing it as
+  `--allowedTools <tool>` before a positional prompt makes claude exit with "Input must be
+  provided either through stdin or as a prompt argument". Asserted by
+  `config::tests::the_claude_reviewer_launch_pre_allows_exactly_the_findings_tool`.
+
+### Still open
+
+If the tool-search service is down, no seed wording and no flag helps — the schema cannot be
+loaded at all. The LLM leg of the probe was never completed for that reason, so "a real
+**claude** reviewer calls the tool and the file lands" is verified only at the protocol level
+(hand-driven stdio JSON-RPC) plus flag-parsing; the full agent-level path is verified live
+for **cursor** only (during design). Re-run the probe when the service is back:
+
+```
+claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config \
+  --allowedTools=mcp__drovr-findings__submit_findings "call submit_findings …"
+```
+
+## One silent reviewer fails the whole `code-review run` (exit 1) instead of one angle
+
+**Severity:** low-medium (recoverable — a plain re-run respawns the angle — but the exit code
+tells the pipeline driver to STOP and diagnose, for something self-healing).
+**Found:** 2026-07-26, reviewing the findings-channel wiring (`fix-review-json`). Not a
+regression; the behaviour predates the MCP findings channel.
+
+### Symptom
+
+A reviewer that finishes without delivering anything — it never called `submit_findings`, so
+`<task>-review-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
+CLI maps to **exit 1** ("setup failure: STOP and diagnose"). The other three angles' findings
+are already banked on disk and no merged `<task>-review.json` is written.
+
+### Why it is arguably wrong
+
+The pass already knows how to recover from exactly this: the angle is marked
+`PhaseStatus::Failed`, and the next `drovr code-review run` replaces that reviewer in place
+(`cli/src/code_review.rs`, the respawn branch). So the state left behind is a *resumable* one,
+while the exit code says *unrecoverable*. Exit 2 (timeout — "resumable, re-run me") would
+describe it accurately, or the angle could simply be reported `Failed` and the pass continue.
+
+### Status: open, deliberately not changed
+
+Raised as an open question in the `fix-review-json` design and left alone on purpose — the exit
+code is a contract the pipeline skill reads, and changing it belongs in its own task with the
+driver's behaviour changed alongside. Re-running `drovr code-review run` is the workaround and
+it costs one reviewer, not a panel.
+
 ## `drovr phase send` returns success with the prompt left unsubmitted
 
 **Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as

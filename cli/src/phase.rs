@@ -427,7 +427,8 @@ pub fn phase_start<H: Herdr>(
     // caller's agent even when later commands run from a plain shell.
     let cfg = load_config()?;
     let agent = run.agent.as_deref().unwrap_or("claude");
-    let command = cfg.launch(agent, &cwd, false)?;
+    // No MCP config: the findings channel exists only for read-only reviewers.
+    let command = cfg.launch(agent, &cwd, false, None)?;
     launch_in_pane(h, &run.name, phase, &target_pane, &command, &pass)?;
     // The launch succeeded, so this phase has now claimed the root pane (if it
     // used it); clear it so later phases don't try to reuse the same pane.
