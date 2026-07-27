@@ -14,7 +14,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Body-size budget (bytes) for the methodology skills.
-const BODY_BUDGET: usize = 2200;
+///
+/// Re-baselined 2200 → 2600 when `code-review` gained the "never write a reviewer's
+/// prompt, pass `drovr code-review brief` output verbatim" rule. 2200 was set when that
+/// skill's body was 2197 — three bytes of headroom — so any new rule had to be paid for
+/// by degrading an existing one, and the cap had started editing the content rather than
+/// bounding it. The point is to keep these four skills scannable, not to hold a number:
+/// the largest body is now 2445, so 2600 leaves room for one more rule before the next
+/// deliberate look.
+const BODY_BUDGET: usize = 2600;
 
 /// Skills subject to the body-size budget.
 const METHODOLOGY_SKILLS: &[&str] = &[

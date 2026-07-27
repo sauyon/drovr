@@ -127,10 +127,12 @@ context stays clean — do not reuse one long-lived agent:
 
 ```
 for each task N in plan.md:
-    drovr phase start <run> implement-task-<N> --seed <run_dir>/plan-HANDOFF.md
-    drovr phase send  <run> implement-task-<N>  "<phase-prompts/implement-task.md>
-                                                 + task N brief
-                                                 + accumulated interfaces so far"
+    drovr phase start <run> implement-task-<N> --context-file <ctx>   # composes the
+                                                 # brief from phase-prompts/implement-task.md
+                                                 # and injects it. <ctx> = task N brief from
+                                                 # plan.md + accumulated interfaces so far.
+                                                 # You never write the frame; inspect it with
+                                                 # `drovr phase brief <run> implement-task-<N>`
     drovr phase wait  <run> implement-task-<N> --timeout-ms 3600000   # BACKGROUND it, then
                                                                       # end the turn
     # No separate compress step: the task agent authored implement-task-<N>-HANDOFF.md
@@ -146,7 +148,7 @@ harness wake you with the exit code. **Do no work of your own while it runs** �
 single-writer rule, and it is the reason to go idle rather than the reason to foreground.
 
 **Fold interfaces forward:** each task's handoff carries the interfaces it introduced;
-include those in the next task's injected briefing so later tasks bind to real signatures.
+pass those as the next task's `--context` so later tasks bind to real signatures.
 `drovr phase start` appends any unseen phase name, so `implement-task-<N>` phases are created
 on demand alongside the four seeded phases.
 
@@ -160,7 +162,8 @@ writing any code, so `HEAD` is the pre-task SHA. Then the driver runs the blocki
 branches on its exit code:
 
 ```
-drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle.
+drovr code-review run <run> task-<N> --context "<what this task changed>"
+                                              # blocking; spawns one reviewer per angle.
                                               # BACKGROUND it and end the turn — the panel
                                               # runs well past the 600 000 ms foreground cap.
 case $? in
