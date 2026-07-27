@@ -722,10 +722,15 @@ Neither creation site checked the other list.
 
 ### Fix
 
-`require_unclaimed_phase_name` (`cli/src/phase.rs`) refuses a name the other list already holds, at
-both creation sites, before any side effect. Pinned by
+`require_name_unclaimed` (`cli/src/phase.rs`) refuses a name the OTHER list already holds, at both
+creation sites, before any side effect. Pinned by
 `a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase` and
 `a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer`.
+
+**Cross-list only, deliberately.** A reviewer name already in `review_phases` is NOT refused: main's
+panel resume re-spawns a reviewer under the same `review:<task>:<iter>:<angle>` name, reusing the
+resumed iter rather than bumping it, and banning that would break the resume on merge. Pinned by
+`a_reviewer_name_may_be_re_spawned_within_review_phases`.
 
 Not reachable from drovr's own naming — reviewer names carry a `review:` prefix that pipeline names
 do not use — but the recovery commands drovr prints are bare `drovr phase start <run> <phase>`, so a

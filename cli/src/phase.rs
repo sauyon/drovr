@@ -159,11 +159,11 @@ fn require_new_phase_name(phase: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Refuse a name some OTHER phase in this run already answers to.
+/// Refuse a name the OTHER phase list already answers to.
 ///
 /// `run.phases` and `run.review_phases` are separate lists, and
 /// `RunState::find_phase` searches `phases` first and returns the first match.
-/// So the same name in both is not a harmless duplicate — it is a phase that
+/// So the same name in BOTH is not a harmless duplicate — it is a phase that
 /// resolves to the WRONG one, permanently. Every downstream lookup follows:
 /// `require_pane_id` sends to the impostor's pane, `phase_done` reads the
 /// impostor's pass token and applies the pipeline-only handoff contract to a
@@ -171,28 +171,36 @@ fn require_new_phase_name(phase: &str) -> io::Result<()> {
 /// sweeps `<phase>.done` on its way in, so the collision destroys the real
 /// phase's completion evidence before any of that.
 ///
+/// **CROSS-LIST ONLY — deliberately.** A reviewer name already present in
+/// `review_phases` is NOT a collision: main's panel resume re-spawns a reviewer
+/// under the same `review:<task>:<iter>:<angle>` name, reusing the resumed iter
+/// instead of bumping it. Banning that here would break the resume the moment
+/// task 6 merges main. `a_reviewer_name_may_be_re_spawned_within_review_phases`
+/// pins it. (Whether a same-list re-spawn should UPDATE rather than push a second
+/// entry is main's question to answer; see the handoff.)
+///
 /// Checked at the two CREATION sites, before any side effect. Not reachable from
 /// drovr's own naming (reviewer names carry a `review:` prefix pipeline names do
 /// not use) — but nothing stops a human or a driver typing
 /// `drovr phase start <run> <reviewer-name>`, and the recovery commands drovr
 /// prints are bare `drovr phase start <run> <phase>`.
-fn require_unclaimed_phase_name(run: &RunState, phase: &str) -> io::Result<()> {
-    let claimant = if run.phases.iter().any(|p| p.name == phase) {
-        "a pipeline phase"
-    } else if run.review_phases.iter().any(|p| p.name == phase) {
-        "a reviewer"
-    } else {
+fn require_name_unclaimed(
+    others: &[Phase],
+    phase: &str,
+    claimant: &str,
+    run_name: &str,
+) -> io::Result<()> {
+    if !others.iter().any(|p| p.name == phase) {
         return Ok(());
-    };
+    }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "phase name {phase:?} is already taken by {claimant} in run '{}'. \
-             A name must identify ONE phase: registering it twice makes every \
-             later lookup resolve to whichever list is searched first, and \
-             silently reroutes that phase's pane, pass token and completion \
-             marker.",
-            run.name
+            "phase name {phase:?} is already taken by {claimant} in run \
+             '{run_name}'. A name must identify ONE phase: registering it in both \
+             lists makes every later lookup resolve to whichever is searched \
+             first, silently rerouting that phase's pane, pass token and \
+             completion marker."
         ),
     ))
 }
@@ -326,7 +334,7 @@ pub fn phase_start<H: Herdr>(
         require_new_phase_name(phase)?;
         // A name a REVIEWER already answers to is not free, even though
         // `find_phase_idx` (which searches `phases` only) says it is.
-        require_unclaimed_phase_name(run, phase)?;
+        require_name_unclaimed(&run.review_phases, phase, "a reviewer", &run.name)?;
     } else {
         require_phase_name(phase)?;
     }
@@ -472,9 +480,9 @@ pub fn spawn_reviewer<H: Herdr>(
     launch_command: &str,
 ) -> io::Result<()> {
     require_new_phase_name(phase)?;
-    // Reviewers always APPEND — `next_iter` makes their names unique among
-    // themselves, but nothing makes them unique against `run.phases`.
-    require_unclaimed_phase_name(run, phase)?;
+    // Nothing makes a reviewer name unique against `run.phases`. A name already
+    // in `review_phases` is NOT checked — that is main's resume path.
+    require_name_unclaimed(&run.phases, phase, "a pipeline phase", &run.name)?;
     // Same guard as phase_start: a run with no project_dir can't anchor the
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
@@ -4281,6 +4289,23 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(run.review_phases.is_empty(), "no shadow reviewer");
         assert_eq!(run.phases.len(), 1, "and the pipeline phase is untouched");
+    }
+
+    #[test]
+    fn a_reviewer_name_may_be_re_spawned_within_review_phases() {
+        // ⚠️ MERGE GUARD for task 6. main's panel resume re-spawns a reviewer
+        // under the SAME `review:<task>:<iter>:<angle>` name — it reuses the
+        // resumed iter rather than bumping it (`code_review.rs`, main). So the
+        // "one name, one phase" guard must be CROSS-LIST only: a reviewer name
+        // already in `review_phases` is the resume path, not a collision.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("reviewer-respawn-test", "ws-rr");
+        let name = "review:t:1:correctness";
+
+        spawn_reviewer(&h, &mut run, name, None, "claude").unwrap();
+        spawn_reviewer(&h, &mut run, name, None, "claude")
+            .expect("re-spawning the same reviewer is the resume path, not a collision");
     }
 
     #[test]
