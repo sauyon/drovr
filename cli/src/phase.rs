@@ -1022,8 +1022,16 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         } else {
             format!("{}ms", ready_timeout.as_millis())
         };
+        // Three genuinely different things did not happen, and saying the wrong
+        // one is how a human debugs the wrong problem. The no-seed case is not
+        // hypothetical: `phase_start` takes `seed: Option<&Path>`, so a phase
+        // can legitimately have none — and moving this gate ahead of the
+        // seed-less early return (which is right: "launched" should not be
+        // claimed before the agent is confirmed up) put that case here.
         let why = if resuming {
             "Its recorded session may no longer resolve — the conversation was NOT restored"
+        } else if seed.is_none() {
+            "It has no recorded seed document either, so it has no context at all"
         } else {
             "Its seed was NOT re-sent"
         };
@@ -1050,9 +1058,10 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         return Ok(RehydrateOutcome::Incomplete {
             note: format!(
                 "phase '{phase}' has no recorded seed document, so the fresh agent was \
-                 launched with no context. Send it some: `drovr phase send {} {phase} \
-                 '<what to do>'`",
-                run.name
+                 launched with no context. Send it some: `drovr phase send {quoted_run} \
+                 {quoted_phase} '<what to do>'`",
+                quoted_run = shell_single_quote(&run.name),
+                quoted_phase = shell_single_quote(phase),
             ),
         });
     };
@@ -7035,6 +7044,65 @@ mod rehydrate_tests {
         // The pane is real and recorded either way — this is "came back but
         // unconfirmed", not "nothing happened".
         assert!(!run.find_phase("plan").unwrap().is_reaped());
+    }
+
+    #[test]
+    fn a_phase_with_no_recorded_seed_says_so_rather_than_blaming_a_send() {
+        // `phase_start` takes `seed: Option<&Path>`, so a phase legitimately has
+        // none — and this branch had NO coverage at all, which is how the note
+        // came to claim "its seed was NOT re-sent" for a phase that never had
+        // one to send.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-no-seed");
+        // No session (→ reseed) and no handoff_doc (→ nothing to reseed WITH).
+        run.phases.push(reaped_phase("plan", "claude", None, None));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        // (a) the agent comes up fine: the honest answer is "there was no seed".
+        let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
+        let RehydrateOutcome::Incomplete { note } = outcome else {
+            panic!("a fresh agent with no context is not a success: {outcome:?}");
+        };
+        assert!(note.contains("no recorded seed document"), "{note}");
+        assert!(
+            note.contains("drovr phase send 'rh-no-seed' 'plan'"),
+            "must name the way to give it context: {note}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send")),
+            "there was nothing to send: {:?}",
+            h.calls()
+        );
+
+        // (b) and when it ALSO never becomes ready, the note must not blame a
+        // send that never happened.
+        let (mut run, _cfg2) = rehydrate_run("rh-no-seed-stuck");
+        run.phases.push(reaped_phase("plan", "claude", None, None));
+        run.save().unwrap();
+        let h2 = FakeHerdr::new();
+        for _ in 0..40 {
+            h2.push_status(Some("blocked"));
+        }
+        let outcome = phase_rehydrate_with_timeout(
+            &h2,
+            &mut run,
+            "plan",
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let RehydrateOutcome::Incomplete { note } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            note.contains("no recorded seed document either"),
+            "must not claim a seed failed to send when there was none: {note}"
+        );
+        assert!(
+            !note.contains("seed was NOT re-sent"),
+            "that is a different failure: {note}"
+        );
     }
 
     #[test]
