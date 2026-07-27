@@ -452,7 +452,11 @@ pub fn code_review_run<H: Herdr>(
         let seed_path = dir.join(format!("{task}-review-{angle}-seed.md"));
         let seed_text = build_seed(&run.name, task, angle, &base, &head, &run.task, iter);
         std::fs::write(&seed_path, &seed_text)?;
-        spawn_reviewer(h, run, &phase, Some(&seed_path), "claude", &launch)?;
+        // `review_agent`, NOT `run.agent`: it is the backend `launch` was composed
+        // from, and it is what session capture checks this reviewer's session
+        // against. Passing the run's backend here would silently never capture a
+        // reviewer that `review_agent_for` put on a different agent.
+        spawn_reviewer(h, run, &phase, Some(&seed_path), &review_agent, &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
         // write findings or drop a marker, so pressing on would only guarantee a
@@ -1436,6 +1440,40 @@ mod tests {
         assert_eq!(outcome, ReviewOutcome::Error);
         // Nothing spawned.
         assert!(run.review_phases.is_empty());
+    }
+
+    #[test]
+    fn a_reviewer_records_the_backend_IT_was_launched_with() {
+        // A reviewer's backend is `review_agent_for`'s answer, NOT `run.agent`:
+        // config can pin it, and cursor can be auto-selected. Session capture
+        // checks a pane's session against the backend recorded on the phase, and
+        // herdr attributes a session to whichever agent actually created it — so
+        // handing `spawn_reviewer` the run's backend here would make capture ask
+        // the wrong question and silently never record a cross-backend
+        // reviewer's session. That is unrecoverable: herdr drops the session when
+        // the reviewer exits, and reviewers are told to exit.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-backend");
+        // Pin reviews to cursor while the RUN stays on claude — the divergence
+        // this test exists for. `make_run` wrote `review_agent = "claude"`.
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(&cfg, "review_agent = \"cursor\"\n").unwrap();
+        assert_eq!(run.agent.as_deref(), Some("claude"), "the run is claude");
+        write_base(&run, "task-1");
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Timeout);
+        assert!(!run.review_phases.is_empty());
+        for p in &run.review_phases {
+            assert_eq!(
+                p.agent_backend.as_deref(),
+                Some("cursor"),
+                "reviewer '{}' must record the backend it was launched with",
+                p.name
+            );
+        }
     }
 
     #[test]
