@@ -341,6 +341,44 @@ impl PaneInfo {
     }
 }
 
+/// Whether a prompt actually took — i.e. whether herdr OBSERVED the agent move
+/// after it was submitted.
+///
+/// This exists because `agent.prompt` returning success only means "herdr typed
+/// it", not "the agent received it". Two real failures hide behind that success:
+/// a payload typed into a modal that ignores it, and a payload that lands in the
+/// composer but is never submitted. Both leave the agent motionless, so herdr's
+/// own "did the status change" observation is the signal worth having.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PromptOutcome {
+    /// herdr saw the agent enter `working`/`done` — the payload was submitted and
+    /// the turn is under way.
+    Started,
+    /// herdr saw NO state change in the wait window. The payload did not take;
+    /// the caller must work out why before doing anything about it.
+    Stalled,
+}
+
+/// herdr error codes that mean "the prompt produced no movement" rather than
+/// "the call failed". `agent_prompt_stalled` is herdr's precise no-state-change
+/// verdict; `timeout` is what it degrades to when the caller's deadline expires
+/// before that verdict is reached. Neither is a transport or protocol failure,
+/// so both map to [`PromptOutcome::Stalled`] instead of an error.
+const STALL_CODES: &[&str] = &["agent_prompt_stalled", "timeout"];
+
+/// Map a herdr socket error code onto a [`PromptOutcome`], or `None` when the
+/// code is a genuine failure the caller should surface as an error.
+///
+/// A MISSING code is not a stall. The classification fails closed here, unlike
+/// [`herdr_error_kind`], which may fall back to the message: the answer to a
+/// stall is a keystroke at the pane, and guessing one from prose is exactly how
+/// a key gets pressed on a dialog nobody read.
+fn stall_outcome_for_code(code: Option<&str>) -> Option<PromptOutcome> {
+    STALL_CODES
+        .contains(&code?)
+        .then_some(PromptOutcome::Stalled)
+}
+
 pub trait Herdr {
     /// Create a new `--no-focus` herdr workspace (label + cwd); returns its id and
     /// its auto-created root shell pane id.
@@ -371,7 +409,30 @@ pub trait Herdr {
     /// Restore focus to a workspace (best-effort). `pane_run`/`pane_rename` have
     /// no `--no-focus` flag, so drovr captures focus before and restores it after.
     fn workspace_focus(&self, id: &str) -> io::Result<()>;
+    /// Type AND submit a prompt, without checking whether the agent received it.
+    /// Use [`Herdr::agent_prompt_confirm`] for anything whose delivery matters;
+    /// this raw form is for keystroke-ish sends (the blocked-prompt auto-answer)
+    /// and the browser mirror's fire-and-forget `/send`.
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
+    /// Submit `text` and have herdr CONFIRM the agent actually started, using
+    /// `agent.prompt`'s native `wait` (`until: [working, done]`). Returns
+    /// [`PromptOutcome::Stalled`] — not an error — when herdr observed no state
+    /// change within `timeout`, which is the only reliable way to learn that a
+    /// prompt was swallowed or left sitting unsubmitted.
+    ///
+    /// `timeout` should stay >= 5s: herdr only reports the precise
+    /// `agent_prompt_stalled` verdict once its own 5s no-state-change window has
+    /// elapsed, and degrades to a bare `timeout` below that.
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> io::Result<PromptOutcome>;
+    /// Wait for an agent already holding a payload to reach `working`/`done`
+    /// (socket `agent.wait`), without submitting anything new. Used to confirm a
+    /// follow-up keystroke actually got the pending prompt moving.
+    fn agent_wait_started(&self, target: &str, timeout: Duration) -> io::Result<PromptOutcome>;
     /// Press keys in an agent's pane (`herdr agent send-keys`). Unlike
     /// [`Herdr::agent_send`], which types a prompt, this drives the agent's
     /// *menus* — the "New MCP server" approval, the trust-dir prompt, the model
@@ -451,6 +512,24 @@ fn parse_workspace_ids(stdout: &str) -> Option<Vec<String>> {
 /// Read timeout for a single JSON-RPC request/response round-trip on the socket.
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Slack added to a *blocking* call's own deadline when setting the socket read
+/// timeout. `agent.prompt`/`agent.wait` carrying a `wait` option hold the response
+/// open for up to their `timeout_ms`, which is far longer than
+/// [`SOCKET_READ_TIMEOUT`]; without this the socket read would time out first and
+/// we would report a transport failure instead of herdr's real verdict.
+const SOCKET_WAIT_GRACE: Duration = Duration::from_secs(5);
+
+/// A socket response whose herdr-reported error `code` is load-bearing. Distinct
+/// from `io::Result`: [`CallResult::Failed`] means herdr ANSWERED, and answered
+/// with an error — which for the `wait` calls can still be a normal outcome.
+enum CallResult {
+    Ok(Value),
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
+}
+
 /// Claude auth env vars propagated to spawned agents so they use the caller's
 /// authenticated profile rather than the default `~/.claude` dir.
 const AGENT_ENV_VARS: &[&str] = &[
@@ -497,7 +576,53 @@ impl SystemHerdr {
     /// Perform one JSON-RPC call over the herdr Unix socket. Writes a single
     /// request line and reads a single response line; returns the `result`
     /// value on success, or an `io::Error` carrying the error message.
+    ///
+    /// Thin wrapper over [`SystemHerdr::socket_call_coded`] for the majority of
+    /// calls, where a herdr-reported error is just a failure and the only thing
+    /// its `code` decides is the [`io::ErrorKind`].
     fn socket_call(&self, method: &str, params: Value) -> io::Result<Value> {
+        match self.socket_call_coded(method, params, SOCKET_READ_TIMEOUT)? {
+            CallResult::Ok(value) => Ok(value),
+            CallResult::Failed { code, message } => Err(Self::classified_error(&code, &message)),
+        }
+    }
+
+    /// The `io::Error` a herdr-reported failure becomes. Split out so the wait
+    /// calls, which inspect the code themselves first, still produce the exact
+    /// same error as every other call once they decide it is a real failure.
+    fn classified_error(code: &Option<String>, message: &str) -> io::Error {
+        io::Error::new(
+            herdr_error_kind(code.as_deref(), message),
+            herdr_error_message(code.as_deref(), message),
+        )
+    }
+
+    /// Interpret a `wait`-bearing call's response: success means herdr observed
+    /// the agent start, a stall code means it observed nothing move, and anything
+    /// else is a real error worth surfacing.
+    fn outcome_from(result: CallResult) -> io::Result<PromptOutcome> {
+        match result {
+            CallResult::Ok(_) => Ok(PromptOutcome::Started),
+            CallResult::Failed { code, message } => stall_outcome_for_code(code.as_deref())
+                .ok_or_else(|| Self::classified_error(&code, &message)),
+        }
+    }
+
+    /// [`SystemHerdr::socket_call`] that PRESERVES herdr's machine-readable error
+    /// `code` instead of collapsing the response to an `io::Error`, and takes an
+    /// explicit socket read timeout for calls that block server-side.
+    ///
+    /// The nesting is deliberate: the outer `io::Result` is a transport/parse
+    /// failure (no socket, malformed line), while [`CallResult::Failed`] is herdr
+    /// answering normally with an error. Only the latter can mean "the prompt
+    /// stalled", so the two must not be conflated — a daemon that is down would
+    /// otherwise read as an agent that did not move, and get a key pressed at it.
+    fn socket_call_coded(
+        &self,
+        method: &str,
+        params: Value,
+        read_timeout: Duration,
+    ) -> io::Result<CallResult> {
         let path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| {
             io::Error::other("HERDR_SOCKET_PATH is not set; cannot reach herdr socket")
         })?;
@@ -507,7 +632,7 @@ impl SystemHerdr {
             .unwrap_or_else(|_| "0".to_string());
 
         let mut stream = UnixStream::connect(&path)?;
-        stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
+        stream.set_read_timeout(Some(read_timeout))?;
 
         let request = json!({ "id": id, "method": method, "params": params });
         let mut line = serde_json::to_string(&request)?;
@@ -528,22 +653,29 @@ impl SystemHerdr {
         if let Some(err) = value.get("error") {
             // A JSON-RPC error body carries a machine-readable `code` next to the
             // human `message` (both `required` per `herdr api schema --json`).
-            // Classify on the code rather than returning `Other` for every
-            // application-level failure: the transport kinds (connection refused,
-            // read timeout) already propagate from `?` above, and a caller that
-            // cannot tell "no such tab" from "socket down" has to match on prose.
-            // Reaping is best-effort and needs exactly that distinction.
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown herdr error");
-            let code = err.get("code").and_then(Value::as_str);
-            return Err(io::Error::new(
-                herdr_error_kind(code, msg),
-                herdr_error_message(code, msg),
-            ));
+            // The code is carried out of here rather than classified in place:
+            // most callers only want an `io::Error` (see `socket_call`, which
+            // classifies on the code rather than returning `Other` for every
+            // application-level failure — a caller that cannot tell "no such tab"
+            // from "socket down" has to match on prose, and reaping needs exactly
+            // that distinction), but the `wait` calls decide something else
+            // entirely from it: whether the agent merely failed to move.
+            return Ok(CallResult::Failed {
+                code: err
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|c| !c.trim().is_empty()),
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown herdr error")
+                    .to_string(),
+            });
         }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        Ok(CallResult::Ok(
+            value.get("result").cloned().unwrap_or(Value::Null),
+        ))
     }
 
     /// Build the `env` object for `workspace.create` from the claude auth vars
@@ -701,6 +833,44 @@ impl Herdr for SystemHerdr {
         // only wrote text into the input box) is gone.
         self.socket_call("agent.prompt", json!({ "target": target, "text": text }))?;
         Ok(())
+    }
+
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> io::Result<PromptOutcome> {
+        // `wait.until` is [working, done] rather than herdr's default
+        // (idle|done|blocked): the default waits for the turn to SETTLE, which for
+        // a phase briefing means blocking until the whole phase finishes. We only
+        // want "the agent picked it up and started".
+        let result = self.socket_call_coded(
+            "agent.prompt",
+            json!({
+                "target": target,
+                "text": text,
+                "wait": {
+                    "until": ["working", "done"],
+                    "timeout_ms": timeout.as_millis() as u64,
+                },
+            }),
+            timeout + SOCKET_WAIT_GRACE,
+        )?;
+        Self::outcome_from(result)
+    }
+
+    fn agent_wait_started(&self, target: &str, timeout: Duration) -> io::Result<PromptOutcome> {
+        let result = self.socket_call_coded(
+            "agent.wait",
+            json!({
+                "target": target,
+                "until": ["working", "done"],
+                "timeout_ms": timeout.as_millis() as u64,
+            }),
+            timeout + SOCKET_WAIT_GRACE,
+        )?;
+        Self::outcome_from(result)
     }
 
     fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
@@ -1099,6 +1269,10 @@ pub struct FakeHerdr {
     /// Queued whole `pane_info` results (FIFO). Takes precedence over
     /// `status_queue`, for tests that care about the tab id or the session.
     pane_info_queue: RefCell<VecDeque<Option<PaneInfo>>>,
+    /// Queued outcomes for `agent_prompt_confirm` / `agent_wait_started` (FIFO,
+    /// shared so a test scripts the delivery sequence in call order). An empty
+    /// queue yields `Started` — a healthy agent that took the prompt first try.
+    outcome_queue: RefCell<VecDeque<PromptOutcome>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
     /// What `workspace_list` reports. `None` models an unreachable herdr, which
@@ -1112,9 +1286,13 @@ pub struct FakeHerdr {
     /// When true, every `tab_close` returns an error — reaping is best-effort,
     /// so callers must survive it.
     fail_tab_close: RefCell<bool>,
-    /// When true, every `agent_send` returns an error (tests what a caller
-    /// reports about the state a failed send leaves behind).
+    /// When true, every prompt delivery — `agent_send` AND
+    /// `agent_prompt_confirm` — returns an error (tests what a caller reports
+    /// about the state a failed send leaves behind).
     fail_agent_send: RefCell<bool>,
+    /// When true, EVERY `agent_read` returns an error — models a pane drovr
+    /// cannot inspect, so callers that reason about pane contents must fail safe.
+    fail_agent_read: RefCell<bool>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
     /// Panes each workspace holds, as `workspace_panes` will report them. A
@@ -1145,12 +1323,14 @@ impl FakeHerdr {
             read_queue: RefCell::new(VecDeque::new()),
             status_queue: RefCell::new(VecDeque::new()),
             pane_info_queue: RefCell::new(VecDeque::new()),
+            outcome_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
             live_workspaces: RefCell::new(Some(Vec::new())),
             fail_workspace_close: RefCell::new(false),
             fail_pane_info: RefCell::new(false),
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
+            fail_agent_read: RefCell::new(false),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
@@ -1281,10 +1461,35 @@ impl FakeHerdr {
         *self.fail_tab_close.borrow_mut() = true;
     }
 
-    /// Make every `agent_send` fail. `phase_send` re-opens the phase BEFORE it
+    /// Make every prompt delivery fail, `agent_prompt_confirm` included — a
+    /// transport failure, distinct from a prompt that is delivered and does not
+    /// take (`push_outcome(Stalled)`). `phase_send` re-opens the phase BEFORE it
     /// sends, so this is how a test reaches the state a failed delivery leaves.
     pub fn fail_agent_send(&self) {
         *self.fail_agent_send.borrow_mut() = true;
+    }
+
+    /// Make every `agent_read` fail, modelling a pane whose contents drovr cannot
+    /// see. Callers that decide anything from pane contents must fail safe.
+    pub fn fail_agent_read(&self) {
+        *self.fail_agent_read.borrow_mut() = true;
+    }
+
+    /// Queue an outcome for the next delivery-confirming call
+    /// (`agent_prompt_confirm` or `agent_wait_started`, which share one queue so
+    /// a test can script "the prompt stalls, then the nudge takes").
+    pub fn push_outcome(&self, outcome: PromptOutcome) {
+        self.outcome_queue.borrow_mut().push_back(outcome);
+    }
+
+    /// Consume the next scripted delivery outcome, defaulting to `Started` so a
+    /// test that does not care about delivery (the common case) models a healthy
+    /// agent rather than tripping `phase_send`'s undelivered-seed error.
+    fn next_outcome(&self) -> PromptOutcome {
+        self.outcome_queue
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(PromptOutcome::Started)
     }
 
     fn record(&self, call: String) {
@@ -1397,6 +1602,24 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        _timeout: Duration,
+    ) -> io::Result<PromptOutcome> {
+        self.record(format!("agent_prompt_confirm target={target} text={text:?}"));
+        if *self.fail_agent_send.borrow() {
+            return Err(io::Error::other("scripted agent_send failure"));
+        }
+        Ok(self.next_outcome())
+    }
+
+    fn agent_wait_started(&self, target: &str, _timeout: Duration) -> io::Result<PromptOutcome> {
+        self.record(format!("agent_wait_started target={target}"));
+        Ok(self.next_outcome())
+    }
+
     fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
         self.record(format!("agent_send_keys target={target} keys={keys:?}"));
         Ok(())
@@ -1404,6 +1627,9 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
+        if *self.fail_agent_read.borrow() {
+            return Err(io::Error::other("scripted agent_read failure"));
+        }
         // A transcript queued for this exact pane wins; otherwise fall back to the
         // pane-agnostic queue most tests use.
         if let Some(text) = self
@@ -2010,6 +2236,112 @@ mod tests {
         assert!(msg.contains("tab_not_found"), "msg: {msg}");
         // No code, nothing to append.
         assert_eq!(herdr_error_message(None, "connection reset"), "connection reset");
+    }
+
+    // -- the delivery-confirming wait calls ------------------------------------
+
+    #[test]
+    fn a_wait_that_answers_normally_means_herdr_observed_the_start() {
+        // Success on an `agent.prompt`/`agent.wait` carrying a `wait` option is the
+        // ONLY positive proof drovr has that a seed arrived: herdr held the response
+        // open until it saw the agent enter `working`/`done`.
+        assert_eq!(
+            SystemHerdr::outcome_from(CallResult::Ok(Value::Null)).unwrap(),
+            PromptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn a_stall_verdict_is_an_outcome_not_an_error() {
+        // `agent_prompt_stalled` is herdr's precise no-state-change verdict, and
+        // `timeout` is what it degrades to when our deadline expires before that
+        // verdict is reached. Neither is a transport or protocol failure — they are
+        // the answer the caller asked for, so they must not surface as `Err` or the
+        // caller cannot tell "the seed did not take" from "herdr is down".
+        for code in ["agent_prompt_stalled", "timeout"] {
+            let result = CallResult::Failed {
+                code: Some(code.to_string()),
+                message: "no state change within 5000ms".to_string(),
+            };
+            assert_eq!(
+                SystemHerdr::outcome_from(result).unwrap(),
+                PromptOutcome::Stalled,
+                "code {code} must read as a stall"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_failure_on_a_wait_call_is_still_a_classified_error() {
+        // Everything that is NOT a stall stays an error, and keeps going through the
+        // same classification as every other call — so a caller can still match
+        // `NotFound` on a vanished pane rather than string-matching prose, and the
+        // code survives in the message for an unmapped one.
+        let err = SystemHerdr::outcome_from(CallResult::Failed {
+            code: Some("pane_not_found".to_string()),
+            message: "pane wC1:p2 not found".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("pane_not_found"), "err: {err}");
+    }
+
+    #[test]
+    fn a_code_less_failure_on_a_wait_call_is_not_mistaken_for_a_stall() {
+        // Fail CLOSED on a missing code: "we could not tell why" must never read as
+        // "the agent simply did not move", because the caller answers a stall by
+        // pressing a key at the pane.
+        let err = SystemHerdr::outcome_from(CallResult::Failed {
+            code: None,
+            message: "connection reset".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "connection reset");
+    }
+
+    #[test]
+    fn fake_outcome_queue_is_shared_and_defaults_to_started() {
+        // The queue is shared across `agent_prompt_confirm` and `agent_wait_started`
+        // so a test can script the real sequence — "the prompt stalls, then the
+        // nudge takes" — in call order.
+        let h = FakeHerdr::new();
+        assert_eq!(
+            h.agent_prompt_confirm("w1:p1", "hi", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Started,
+            "an empty queue models a healthy agent, so tests that do not care sail through"
+        );
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Started);
+        assert_eq!(
+            h.agent_prompt_confirm("w1:p1", "hi", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Stalled
+        );
+        assert_eq!(
+            h.agent_wait_started("w1:p1", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Started
+        );
+        let calls = h.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("agent_prompt_confirm") && c.contains("hi")),
+            "the confirming prompt must record its payload: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("agent_wait_started")),
+            "the post-nudge wait must be distinguishable from the prompt: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn fake_can_model_a_pane_that_cannot_be_read() {
+        // A caller that decides anything from pane CONTENTS has to have this branch
+        // driven: an unreadable pane is not an empty one.
+        let h = FakeHerdr::new();
+        h.push_read("composer");
+        h.fail_agent_read();
+        assert!(h.agent_read("w1:p1").is_err());
     }
 
     #[test]
