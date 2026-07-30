@@ -897,6 +897,58 @@ renderings.
    measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
    it gave up".
 
+### Status: the false SUCCESS is FIXED 2026-07-30 (branch `drovr/fix-phase-send`)
+
+`phase_send` no longer treats `agent.prompt` returning as proof of delivery. It uses that call's
+native `wait` option (`until: [working, done]`) and returns `Ok` only when herdr **observed the
+agent start**; `agent_prompt_stalled` / `timeout` mean the payload did not take. On a stall it
+reads the pane for positive evidence the payload is in the composer — a `[Pasted text …]`
+placeholder or a verbatim prefix of its first line, in the last 8 non-empty lines, and required
+to have APPEARED across the prompt. Evidence → one `enter`, then re-confirm. No evidence
+(including a pane that cannot be read) → raise, never guess. See `cli/src/phase.rs`
+(`phase_send`, `pane_shows_payload`) and `Herdr::agent_prompt_confirm`.
+
+This does not stop the underlying race — it stops the **silent** failure. A send that does not
+take now exits 2 with a message naming which failure it was, instead of exiting 0.
+
+Verified live 2026-07-30 on herdr 0.7.5, all four branches:
+
+| Branch | How it was reached | Result |
+|---|---|---|
+| Healthy self-submit | 8 fresh cursor panes + 7 fresh claude panes, ~4 KB seed; plus one 77 KB payload | exit 0 in 0–1s, every agent ran and answered |
+| Stall → nudge → OK | claude, 77 KB, confirm deadline shortened to 250 ms to force the stall | `herdr agent send-keys <pane> enter` issued, then exit 0 |
+| Swallowed → raise | a cursor pane that dropped the payload outright (composer empty) | exit 2, **no keystroke** |
+| Parked on a menu → raise | claude parked on the `/model` picker, `❯ 2.` highlighted, "Enter to set as default" | exit 2, **no keystroke** |
+
+The no-keystroke claims are not inferred from the message: `drovr` was run with a logging
+`herdr` wrapper first on `PATH`, which recorded every CLI invocation. `agent_send_keys` is the
+only thing that shells the CLI, so an empty log is proof. A positive control (`herdr agent
+send-keys <pane> esc`) confirmed the wrapper records what it is meant to.
+
+### Still open: `until` is a LEVEL, not an edge
+
+Measured 2026-07-30 against herdr 0.7.5, and there is no API option for the other behaviour
+(`AgentPromptWaitOptions` is only `{until, timeout_ms}`). `agent.wait` on a pane that is
+*already* in one of the `until` states returns in **0.0s** with success, without observing any
+transition. On a pane that is not, it blocks the full deadline and answers `timeout` — so the
+wait works; it just cannot distinguish "started because of my prompt" from "was already going".
+
+So the guarantee is exactly: **if the pane was `idle` when the prompt went out, `Ok` means herdr
+saw it start.** That is the normal case — a freshly-spawned agent, or a re-entry into one parked
+at its composer. Two narrow cases fall outside it:
+
+- pane already `working` — `wait_agent_ready` admits `working`, so this is reachable when a send
+  targets a busy agent. `Ok` there proves nothing about this payload.
+- pane already `done` — very narrow, because `done` is momentary (see the EDGE entry below): an
+  agent parked at its prompt reads `idle`, so the driver's post-`phase wait` re-entry send
+  almost always lands on `idle`.
+
+Deliberately NOT worked around. The fix would be to have the readiness gate release only on
+`idle`, which changes what `phase send` does to a busy agent, and the alternative — juggling the
+`until` set against the pre-prompt status — has its own failure mode (a turn short enough that
+the transition is missed reads as a stall, and raises on a send that worked). Documented rather
+than papered over.
+
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
 **Severity:** medium (every fresh agent in a project with an MCP server stalls at spawn until
@@ -934,6 +986,23 @@ The **answering** half is done: `POST /api/runs/<run>/keys` (`{"keys":["3","ente
 `Herdr::agent_send_keys` → `herdr agent send-keys`, wired to an Enter/Esc/↑/↓/1–5 key row in the
 Live-session panel, so a parked agent can be cleared from the browser without attaching.
 (Route: `cli/src/review.rs:524` → `handle_post_keys`.)
+
+### Worse than a stall: `agent.prompt` can ANSWER an unclassified menu
+
+**Re-measured 2026-07-30, herdr 0.7.5**, and this is the part drovr cannot fix. A prompt
+delivered into a menu herdr never classified as `blocked` does not merely get swallowed — it can
+dismiss the menu and **accept the highlighted option**, inside `agent.prompt`, before drovr sees
+anything.
+
+Reproduced deterministically on claude's `/model` picker (a stand-in for the MCP approval, and
+easier to arm): pane parked with `❯ 2. Opus (1M context)` highlighted and `Enter to set as
+default` on screen, reporting `agent_status: idle`. One `agent.prompt` of an ordinary briefing
+later, the menu was gone and the status line read the option that had been highlighted. No key
+was sent by drovr — verified with a logging `herdr` wrapper on `PATH`, empty log.
+
+`phase_send`'s refusal to nudge protects the keystroke it controls, and it correctly reports the
+seed as undelivered. It cannot protect the one herdr issues. Closing this needs pre-send blocker
+detection, i.e. the manifest rules below — it lives **outside** this repo.
 
 The **detection** half is still open, re-confirmed 2026-07-25: no file under
 `~/.local/state/herdr/agent-detection/remote/` — `claude.toml` included — matches "mcp", so

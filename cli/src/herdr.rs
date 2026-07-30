@@ -423,6 +423,15 @@ pub trait Herdr {
     /// `timeout` should stay >= 5s: herdr only reports the precise
     /// `agent_prompt_stalled` verdict once its own 5s no-state-change window has
     /// elapsed, and degrades to a bare `timeout` below that.
+    ///
+    /// CAVEAT, measured against 0.7.5: `until` is a LEVEL, not an edge. A pane
+    /// ALREADY in one of those states answers in 0.0s having observed nothing, so
+    /// [`PromptOutcome::Started`] means "herdr saw the agent start" only when the
+    /// pane was not already `working`/`done` when the prompt went out — which is
+    /// the normal case, since `phase_send` prompts a pane at its composer. herdr
+    /// exposes no edge-triggered form (`AgentPromptWaitOptions` is `{until,
+    /// timeout_ms}` and nothing else). See `docs/known-issues.md`, "`until` is a
+    /// LEVEL, not an edge", for why this is documented rather than worked around.
     fn agent_prompt_confirm(
         &self,
         target: &str,
