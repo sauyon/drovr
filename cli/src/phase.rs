@@ -669,6 +669,33 @@ const MAX_VERBATIM_EVIDENCE: usize = 40;
 /// painting seconds after launch. "Something changed" is therefore true even when
 /// the payload was swallowed whole by a modal, which made an earlier version of
 /// this check press Enter on claude's "New MCP server" approval and accept it.
+/// What one look at the composer region established about `text`.
+///
+/// Three states, not a `bool`, because the third one is a different FACT and it
+/// sends a human somewhere else: "I looked and the payload is not there" points
+/// at a dialog on the screen, while "I could not look" points at herdr. Both
+/// forbid the nudge — but a `bool` can only carry one of them, and whichever it
+/// borrows makes `phase_send` assert a cause it has no evidence for. That is the
+/// same confidently-wrong diagnosis this whole change exists to remove.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ComposerEvidence {
+    /// The payload's signature is in the composer region right now.
+    Present,
+    /// The pane was read, and the payload is not in the composer region.
+    Absent,
+    /// The pane could not be read at all, so nothing was established.
+    Unreadable,
+}
+
+/// Read `pane_id` once and classify what the composer region says about `text`.
+fn read_composer_evidence<H: Herdr>(h: &H, pane_id: &str, text: &str) -> ComposerEvidence {
+    match h.agent_read(pane_id) {
+        Ok(pane) if pane_shows_payload(&pane, text) => ComposerEvidence::Present,
+        Ok(_) => ComposerEvidence::Absent,
+        Err(_) => ComposerEvidence::Unreadable,
+    }
+}
+
 fn pane_shows_payload(pane: &str, text: &str) -> bool {
     let tail = tail_snippet(pane, COMPOSER_TAIL_LINES);
     if tail.to_lowercase().contains(PASTE_PLACEHOLDER) {
@@ -878,15 +905,10 @@ fn phase_send_with_timeout<H: Herdr>(
 
     // Snapshot FIRST, so evidence found afterwards can be attributed to THIS send.
     // A pane that already shows the payload's signature — a long-lived pane whose
-    // previous briefing is still in the composer region — cannot produce fresh
-    // evidence, and is treated as no-evidence below rather than nudged on the
-    // strength of someone else's paste. An unreadable pane reads as `true` here
-    // for the same fail-safe reason it reads as `false` after: both make
-    // `landed_in_composer` false, and no key is sent.
-    let evidence_before = h
-        .agent_read(&pane_id)
-        .map(|pane| pane_shows_payload(&pane, text))
-        .unwrap_or(true);
+    // previous briefing is still in the composer region, or one the browser
+    // mirror's fire-and-forget `/send` typed into — cannot produce fresh evidence,
+    // and must not be nudged on the strength of someone else's paste.
+    let evidence_before = read_composer_evidence(h, &pane_id, text);
 
     let outcome = h
         .agent_prompt_confirm(&pane_id, text, confirm_timeout)
@@ -906,19 +928,44 @@ fn phase_send_with_timeout<H: Herdr>(
     // The agent did not move. Only nudge if the payload is demonstrably sitting in
     // the composer NOW and was not there before — see `pane_shows_payload` for why
     // this must be positive evidence rather than "the pane changed".
-    let evidence_after = h
-        .agent_read(&pane_id)
-        .map(|pane| pane_shows_payload(&pane, text))
-        .unwrap_or(false);
-    let landed_in_composer = evidence_after && !evidence_before;
+    let evidence_after = read_composer_evidence(h, &pane_id, text);
+    // Exactly ONE pairing licenses the keystroke: the composer was looked at
+    // before and did NOT hold the payload, and holds it now. Spelled as a match on
+    // both values rather than `after == Present && before != Present`, because
+    // that shorthand quietly admits `Unreadable` before — a look that never
+    // happened cannot establish that the marker is new, and the payload may have
+    // been sitting there the whole time.
+    let landed_in_composer = matches!(
+        (evidence_before, evidence_after),
+        (ComposerEvidence::Absent, ComposerEvidence::Present)
+    );
 
     if !landed_in_composer {
-        return Err(send_failure(
-            run,
-            phase,
-            reopened,
-            io::ErrorKind::TimedOut,
-            &format!(
+        // Same refusal, three different reasons — and the reason is the whole
+        // value of the message, because it is what tells the human where to look.
+        // Do not collapse these: asserting "it was swallowed" for a pane drovr
+        // could not read, or for one visibly holding a paste marker, is a
+        // confident diagnosis with nothing behind it.
+        let why = match (evidence_before, evidence_after) {
+            (_, ComposerEvidence::Unreadable) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt, and \
+                 the pane could not be READ, so drovr cannot tell whether the payload is \
+                 sitting unsubmitted in the composer or was swallowed by a dialog. \
+                 Deliberately NOT pressing a key blind: on a dialog, Enter accepts its \
+                 highlighted option on your behalf. Check that herdr can see the pane, then \
+                 look at it: {attach}",
+                attach = attach_command(&run.name),
+            ),
+            (ComposerEvidence::Present, ComposerEvidence::Present) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt. The \
+                 composer does hold a payload signature, but it was ALREADY there before this \
+                 prompt, so it is someone else's paste (an earlier send, or the browser \
+                 mirror) and proves nothing about this one. Deliberately NOT pressing a key: \
+                 stale text in the composer cannot rule out a dialog now on top of it. Clear \
+                 the composer, then re-send: {attach}",
+                attach = attach_command(&run.name),
+            ),
+            _ => format!(
                 "the seed was NOT delivered — herdr saw no state change after the prompt, and \
                  the payload is nowhere in the agent's composer, so it was swallowed rather \
                  than left unsubmitted. Deliberately NOT pressing a key: with nothing visibly \
@@ -928,6 +975,13 @@ fn phase_send_with_timeout<H: Herdr>(
                  rule it out). Read the pane, clear whatever is on it, then re-send: {attach}",
                 attach = attach_command(&run.name),
             ),
+        };
+        return Err(send_failure(
+            run,
+            phase,
+            reopened,
+            io::ErrorKind::TimedOut,
+            &why,
         ));
     }
 
@@ -2793,6 +2847,18 @@ mod tests {
             err.to_string().contains("was NOT delivered"),
             "stale evidence must read as undelivered, not as a stuck composer: {err}"
         );
+        // And it must not tell the human the payload is "nowhere in the composer"
+        // while a paste marker is sitting there in plain sight — that is the same
+        // class of confidently-wrong diagnosis this change exists to remove.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "the swallow narrative is false when the composer visibly holds a \
+             payload signature; say it is stale instead: {err}"
+        );
+        assert!(
+            err.to_string().contains("before this prompt"),
+            "must explain that the evidence predates the send: {err}"
+        );
         assert!(
             !h.calls().iter().any(|c| c.contains("agent_send_keys")),
             "must not nudge on evidence that predates the prompt: {:?}",
@@ -2829,6 +2895,59 @@ mod tests {
         assert!(
             !h.calls().iter().any(|c| c.contains("agent_send_keys")),
             "must not nudge a pane it cannot read: {:?}",
+            h.calls()
+        );
+        // "Could not look" is a different fact from "looked, found nothing", and
+        // they send the human somewhere different: one is a herdr problem, the
+        // other is a dialog on the screen. Asserting the swallow narrative here
+        // would be a confident diagnosis drovr has no evidence for.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "must not claim the composer is empty when the pane could not be read: {err}"
+        );
+        assert!(
+            err.to_string().contains("could not be READ"),
+            "must name the unreadable pane as the reason it will not guess: {err}"
+        );
+    }
+
+    // The nudge needs evidence that APPEARED, and "appeared" is only knowable if
+    // the BEFORE look succeeded. A pane that could not be read before the prompt
+    // and shows a paste marker after might have been showing it all along, so the
+    // marker is not attributable to this send and must not license a keystroke.
+    //
+    // This is the fail-safe the earlier `unwrap_or(true)` encoded, and the exact
+    // one a three-state refactor can drop by writing `before != Present`.
+    #[test]
+    fn send_does_not_nudge_when_the_before_look_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-blind-before-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // The pre-prompt read fails; the post-stall read succeeds and shows a
+        // paste marker of unknown age.
+        h.fail_agent_read();
+        h.push_outcome(PromptOutcome::Stalled);
+        h.allow_agent_read_after(1);
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "evidence is only fresh if the BEFORE look succeeded: {:?}",
             h.calls()
         );
     }

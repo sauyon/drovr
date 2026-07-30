@@ -351,8 +351,21 @@ impl PaneInfo {
 /// own "did the status change" observation is the signal worth having.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PromptOutcome {
-    /// herdr saw the agent enter `working`/`done` — the payload was submitted and
-    /// the turn is under way.
+    /// The wait was SATISFIED: the agent is in `working`/`done`.
+    ///
+    /// Read that literally. herdr's `until` is a level, not an edge (see
+    /// [`Herdr::agent_prompt_confirm`]), so this means "herdr observed the agent
+    /// start" only when the pane was not ALREADY in one of those states when the
+    /// prompt went out — which is the caller's precondition to establish, not
+    /// something this value asserts. `phase_send` establishes it by prompting a
+    /// pane at its composer.
+    ///
+    /// There is deliberately no third variant for "was already active". herdr
+    /// cannot report it (the response is identical either way), so drovr could
+    /// only infer it from a separate status read — and having inferred it, there
+    /// is nothing different to DO: nudging is forbidden without composer
+    /// evidence, and raising would fail a send that most likely worked. A variant
+    /// that changes no decision is a worse lie than a documented precondition.
     Started,
     /// herdr saw NO state change in the wait window. The payload did not take;
     /// the caller must work out why before doing anything about it.
@@ -1302,6 +1315,11 @@ pub struct FakeHerdr {
     /// When true, EVERY `agent_read` returns an error — models a pane drovr
     /// cannot inspect, so callers that reason about pane contents must fail safe.
     fail_agent_read: RefCell<bool>,
+    /// `Some(n)`: only the next `n` `agent_read`s fail, and the rest succeed.
+    /// Bounds `fail_agent_read` so a test can model a caller whose FIRST look at a
+    /// pane failed and whose second succeeded — the two-look asymmetry a single
+    /// boolean cannot express.
+    agent_read_failures_left: RefCell<Option<u32>>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
     /// Panes each workspace holds, as `workspace_panes` will report them. A
@@ -1340,6 +1358,7 @@ impl FakeHerdr {
             fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
             fail_agent_read: RefCell::new(false),
+            agent_read_failures_left: RefCell::new(None),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
@@ -1482,6 +1501,13 @@ impl FakeHerdr {
     /// see. Callers that decide anything from pane contents must fail safe.
     pub fn fail_agent_read(&self) {
         *self.fail_agent_read.borrow_mut() = true;
+    }
+
+    /// Let `agent_read` start working again after `n` more failures — for the
+    /// case a single failure mode cannot express: a caller that looks TWICE and
+    /// gets a different answer each time.
+    pub fn allow_agent_read_after(&self, n: u32) {
+        *self.agent_read_failures_left.borrow_mut() = Some(n);
     }
 
     /// Queue an outcome for the next delivery-confirming call
@@ -1639,7 +1665,17 @@ impl Herdr for FakeHerdr {
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
         if *self.fail_agent_read.borrow() {
-            return Err(io::Error::other("scripted agent_read failure"));
+            // A bounded failure count disarms itself, so a test can script
+            // "the first look failed, the second succeeded".
+            let mut left = self.agent_read_failures_left.borrow_mut();
+            match left.as_mut() {
+                Some(0) => {}
+                Some(n) => {
+                    *n -= 1;
+                    return Err(io::Error::other("scripted agent_read failure"));
+                }
+                None => return Err(io::Error::other("scripted agent_read failure")),
+            }
         }
         // A transcript queued for this exact pane wins; otherwise fall back to the
         // pane-agnostic queue most tests use.
