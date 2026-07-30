@@ -716,7 +716,8 @@ that is simply working.)
 **Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
 binary carrying the phase-send agent-readiness fix.
 **Reproduced:** 2026-07-25 (`mcp-endpoint`), 2026-07-25 (`phase-reap`, three callers, 12 sends),
-2026-07-26 (`skill-stickiness`, three times). See "Occurrences".
+2026-07-26 (`skill-stickiness`, three times), 2026-07-30 (`land-review-json`, 3 of 4 reviewer
+seeds — the measurement that settles the shape). See "Occurrences".
 
 ### Symptom
 
@@ -734,17 +735,43 @@ Both fail the same way. There is also a rarer third mode where the send lands **
 and the composer stays empty (see Occurrences, `mcp-endpoint` case 1) — the payload is dropped
 outright while the command still reports success.
 
-### Root cause — not established
+### Root cause — not established, but its SHAPE is: a race
 
-Unknown. Two plausible-sounding explanations have been **ruled out** by evidence; do not fix
-against either.
+Unknown in mechanism. What is established is that it is **non-deterministic** — the same
+`phase send` code path, against four panes of the same backend, with payloads within **26 bytes**
+of each other, succeeded once and failed three times (2026-07-30, `land-review-json`; see
+Occurrences). Nothing about the *payload* predicts the outcome, so no fix may be predicated on
+one. That rules out an entire family of explanations at once, including the two below.
+
+Three plausible-sounding explanations have been **ruled out** by evidence; do not fix against
+any of them.
 
 - **Not payload size, and not a bracketed-paste commit failure.** Three sends of a few hundred
   bytes each failed on 2026-07-26, none rendering as a paste. Whatever fails, fails for inline
   text too. Independently confirmed from the other direction on run `phase-reap`: an **8-line**
   payload failed while rendering *as* a collapsed paste (`❯ [Pasted text #3 +8 lines]`), against
   the 6586-byte / 124-line payload previously recorded. Neither size nor rendering predicts it —
-  any fix predicated on "large bracketed paste" will miss this.
+  any fix predicated on "large bracketed paste" will miss this. The 2026-07-30 four-pane
+  measurement closes this off from the third direction: the pane that *worked* was neither the
+  largest nor the smallest of the four.
+- **Not cursor's "Workspace Trust Required" modal.** This is the most attractive wrong answer,
+  because the modal is real and it does swallow prompts — but it is not what happens here, and a
+  fix aimed at it makes things worse. Disproved three ways on 2026-07-30:
+  1. **`--trust` does not exist on the interactive path.** `cursor-agent --mode plan --trust
+     --workspace <dir>` exits immediately with `Error: --trust can only be used with
+     --print/headless mode`; in the bundle the flag is read only inside a headless-only branch.
+     Adding it to drovr's launch **breaks the launch outright**. Do not add `--trust` anywhere.
+  2. **Inherited trust makes the modal a non-event for drovr worktrees.** A fresh directory with
+     no trusted ancestor *does* show the modal, so the mechanism is genuine — but
+     `~/.cursor/projects/home-sauyon-devel/.workspace-trusted` is dated **2026-04-28**, months
+     before the first of these reports, and descendants inherit it. A launch into the real
+     worktree `.drovr/wt/land-mcp-findings` shows **no modal** and lands straight in the composer.
+  3. **No modal was present in any observed failure.** All four 2026-07-30 reviewer panes sat at
+     an ordinary composer with the text visibly pasted into it.
+
+  Related, and equally out of scope: drovr must **not** write cursor's `.workspace-trusted`
+  marker itself. That means reimplementing cursor's private directory-slug algorithm in order to
+  grant trust on the user's behalf — not obviously right, and not this bug.
 - **Not the `drovr phase send` CLI entry point.** Run `phase-reap` reproduced it from three
   different callers, including `code_review.rs`'s reviewer spawn, so the failure is in
   `phase::phase_send` itself (and therefore `agent_send` → socket `agent.prompt`). See
@@ -792,6 +819,30 @@ pane — that is the only thing that distinguishes them. This bug is invisible f
 it was caught both times only by reading the pane directly.
 
 ### Occurrences
+
+**2026-07-30, run `land-review-json`, workspace `wC1`** — one `code-review` panel spawning four
+cursor reviewers, i.e. four `phase_send` calls a few seconds apart into four freshly-spawned
+panes of the same backend. This is the measurement that establishes the shape:
+
+| Pane | Angle | Seed | Submitted itself? |
+|---|---|---|---|
+| `wC1:p2` | correctness | 2701 B / 61 lines | **No** — sat as `→ [Pasted text #1 +62 lines]` |
+| `wC1:p3` | security | 2677 B / 61 lines | **No** |
+| `wC1:p4` | error-handling | 2703 B / 61 lines | **Yes** |
+| `wC1:p5` | type-design | 2680 B / 61 lines | **No** |
+
+Same day, a **claude** pane took a ~1.2 KB `phase send` and **self-submitted** — `agent_status:
+working` within 4s.
+
+Read it carefully, because it constrains any fix:
+
+- The four seeds span **26 bytes**. The one that submitted was neither the largest nor the
+  smallest. So the failure is not a function of the payload — **it is a race**, and a single
+  green run proves nothing. Any change here has to be exercised repeatedly, on cursor, until
+  both branches have been seen.
+- It is not backend-determined either: claude self-submits, and has been observed to *not*
+  self-submit on a large paste (`phase-reap`, case 2). Cursor is merely the far worse offender.
+- None of the four panes showed a trust modal or any other dialog. See "Root cause".
 
 **2026-07-25, run `mcp-endpoint`, pane `wAC:p1`** — installed nix-profile binary, 6586-byte /
 124-line briefing:
