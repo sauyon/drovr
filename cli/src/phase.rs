@@ -941,11 +941,16 @@ fn phase_send_with_timeout<H: Herdr>(
     );
 
     if !landed_in_composer {
-        // Same refusal, three different reasons — and the reason is the whole
+        // Same refusal, four different reasons — and the reason is the whole
         // value of the message, because it is what tells the human where to look.
         // Do not collapse these: asserting "it was swallowed" for a pane drovr
         // could not read, or for one visibly holding a paste marker, is a
         // confident diagnosis with nothing behind it.
+        //
+        // Deliberately NO `_` arm. A catch-all is what let `(Unreadable, Present)`
+        // inherit the swallow narrative in the first place; matching every pair
+        // means a new [`ComposerEvidence`] variant fails to compile here instead
+        // of silently acquiring whichever story happens to be last.
         let why = match (evidence_before, evidence_after) {
             (_, ComposerEvidence::Unreadable) => format!(
                 "the seed was NOT delivered — herdr saw no state change after the prompt, and \
@@ -965,16 +970,32 @@ fn phase_send_with_timeout<H: Herdr>(
                  the composer, then re-send: {attach}",
                 attach = attach_command(&run.name),
             ),
-            _ => format!(
-                "the seed was NOT delivered — herdr saw no state change after the prompt, and \
-                 the payload is nowhere in the agent's composer, so it was swallowed rather \
-                 than left unsubmitted. Deliberately NOT pressing a key: with nothing visibly \
-                 in the composer, drovr cannot tell a cleared input from a dialog, and Enter \
-                 on a dialog accepts its highlighted option on your behalf (claude's \"New MCP \
-                 server\" approval reports `idle`, not `blocked`, so the readiness gate cannot \
-                 rule it out). Read the pane, clear whatever is on it, then re-send: {attach}",
+            (ComposerEvidence::Unreadable, ComposerEvidence::Present) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt. The \
+                 composer DOES hold a payload signature, but the pane could not be read before \
+                 the prompt, so drovr cannot tell whether it is this one or something that was \
+                 already sitting there. Deliberately NOT pressing a key on an undated payload: \
+                 if it is not yours, Enter goes to whatever is actually on screen. Look at the \
+                 pane — if that is your seed, submit it by hand: {attach}",
                 attach = attach_command(&run.name),
             ),
+            // Everything left has `after == Absent`: drovr looked, and the
+            // composer does not hold the payload. `(Absent, Present)` is the nudge
+            // path, returned above; it is named only to keep this match total.
+            (_, ComposerEvidence::Absent)
+            | (ComposerEvidence::Absent, ComposerEvidence::Present) => {
+                format!(
+                    "the seed was NOT delivered — herdr saw no state change after the prompt, \
+                     and the payload is nowhere in the agent's composer, so it was swallowed \
+                     rather than left unsubmitted. Deliberately NOT pressing a key: with \
+                     nothing visibly in the composer, drovr cannot tell a cleared input from a \
+                     dialog, and Enter on a dialog accepts its highlighted option on your \
+                     behalf (claude's \"New MCP server\" approval reports `idle`, not \
+                     `blocked`, so the readiness gate cannot rule it out). Read the pane, \
+                     clear whatever is on it, then re-send: {attach}",
+                    attach = attach_command(&run.name),
+                )
+            }
         };
         return Err(send_failure(
             run,
@@ -2949,6 +2970,18 @@ mod tests {
             !h.calls().iter().any(|c| c.contains("agent_send_keys")),
             "evidence is only fresh if the BEFORE look succeeded: {:?}",
             h.calls()
+        );
+        // Refusing is right; saying the composer is empty is not. drovr can SEE a
+        // payload signature — it just cannot date it — and telling the human to
+        // clear the pane sends them past text they could submit by hand.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "must not claim an empty composer while the after-read shows a payload: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot tell whether it is this one"),
+            "must say the visible payload cannot be dated, not that it is absent: {err}"
         );
     }
 
