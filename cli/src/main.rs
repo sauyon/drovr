@@ -792,10 +792,17 @@ fn cmd_phase(sub: PhaseCmd) {
                 // and a distinct exit code (2) so the driver can escalate rather
                 // than assume the seed landed.
                 if e.kind() == io::ErrorKind::TimedOut {
+                    // ALWAYS print the error itself. It names WHICH of the
+                    // failures happened — never attached, seed swallowed, would
+                    // not submit — and, for the swallowed one, why drovr refused
+                    // to press a key on the user's behalf. `diagnose_stuck_phase`
+                    // is additive context, a pane snapshot, not a replacement
+                    // diagnosis: it used to REPLACE this text, which both lost the
+                    // explanation and asserted the wrong cause, since it phrases
+                    // every verdict as a `phase wait` timeout.
+                    eprintln!("drovr: {e}");
                     if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
-                        eprintln!("drovr: {diag}");
-                    } else {
-                        eprintln!("drovr: {e}");
+                        eprintln!("drovr: pane context — {diag}");
                     }
                     process::exit(2);
                 }
