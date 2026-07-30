@@ -2599,9 +2599,21 @@ mod tests {
             err.to_string().contains("never called submit_findings"),
             "unexpected error: {err}"
         );
+        // "Never reads a pane to obtain findings" is the invariant, and it is
+        // about the HARVEST. `phase_send` does read each pane while seeding it, to
+        // prove the seed was delivered (a stalled prompt is indistinguishable from
+        // a swallowed one without looking) — those reads all happen before their
+        // own `agent_prompt_confirm`, and none of them can see findings, because
+        // no reviewer has run yet. So pin the position rather than the count: not
+        // one read after the last seed.
+        let calls = h.calls();
+        let last_seed = calls
+            .iter()
+            .rposition(|c| c.contains("agent_prompt_confirm"))
+            .expect("precondition: the reviewers were seeded");
         assert!(
-            !h.calls().iter().any(|c| c.contains("agent_read")),
-            "the panel must never read a pane transcript to obtain findings"
+            !calls[last_seed..].iter().any(|c| c.contains("agent_read")),
+            "the panel must never read a pane transcript to obtain findings: {calls:?}"
         );
     }
 

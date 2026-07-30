@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::load_config;
-use crate::herdr::{AgentStatus, Herdr};
+use crate::herdr::{AgentStatus, Herdr, PromptOutcome};
 use crate::run::{PassToken, Phase, PhaseStatus, RunState, run_dir};
 use crate::shell::shell_single_quote;
 
@@ -15,6 +15,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long `phase_send` waits for a freshly-spawned agent to reach its composer
 /// before delivering the prompt (see `wait_agent_ready`).
 const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `phase_send` gives herdr to confirm the agent actually started after
+/// a prompt (and again after the submit nudge).
+///
+/// Must stay >= 5s: herdr only returns its precise `agent_prompt_stalled` verdict
+/// once its own 5s no-state-change window has elapsed, and degrades to a bare
+/// `timeout` below that. The headroom above 5s absorbs a slow first turn on a
+/// cold agent without turning a healthy send into a spurious nudge.
+const SEND_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Path of the completion marker a phase agent drops via `drovr phase done`.
 /// `pub(crate)` so the code-review orchestrator can compute reviewer marker paths
@@ -622,17 +631,94 @@ fn wait_agent_ready<H: Herdr>(
     }
 }
 
-/// Send `text` to the running phase pane, first waiting for the agent to attach
-/// (see `wait_agent_ready`) so a prompt sent right after `phase_start` isn't lost
-/// to a still-booting agent.
+/// Number of trailing non-empty pane lines treated as "the composer region".
+/// Every agent TUI puts its input box at the bottom, just above the status bar.
+/// Bounding the search there stops a payload echoed into SCROLLBACK by an earlier
+/// send from reading as evidence that THIS one landed.
+const COMPOSER_TAIL_LINES: usize = 8;
+
+/// What `claude` and `cursor` both render in place of a large pasted payload
+/// (`[Pasted text #1 +124 lines]`) instead of echoing it. Matched
+/// case-insensitively.
+const PASTE_PLACEHOLDER: &str = "pasted text";
+
+/// Shortest payload prefix accepted as verbatim evidence. Below this, a fragment
+/// is too generic to tell the payload apart from ordinary pane chrome.
+const MIN_VERBATIM_EVIDENCE: usize = 12;
+
+/// Longest payload prefix compared. Capped so a composer that truncates or wraps
+/// a long first line still matches it.
+const MAX_VERBATIM_EVIDENCE: usize = 40;
+
+/// Does `pane` show POSITIVE evidence that `text` reached the agent's composer?
 ///
-/// If the agent does not become ready within [`SEND_READY_TIMEOUT`], this does NOT
-/// send — it returns a `TimedOut` error naming the run/phase and suggesting
-/// `drovr attach`. A never-ready agent is almost always parked on a first-run or
-/// permission prompt with no human at the pane; sending a prompt it can't receive
-/// would silently swallow the seed and leave the phase to hang until its `phase
-/// wait` times out. Raising instead surfaces the stuck agent to the driver (the
-/// CLI enriches this with a pane snapshot via `diagnose_stuck_phase`).
+/// The caller uses this to decide whether pressing Enter is safe, so the test is
+/// deliberately one-sided: "not sure" must read as "no". A missed nudge is an
+/// error a human resolves; a wrong nudge answers whatever dialog is on screen.
+///
+/// Two shapes count as evidence, because they are what the two agents actually
+/// render for a pending prompt:
+///   * a bracketed-paste placeholder — how both collapse a large payload, which
+///     is the normal case for a phase briefing; and
+///   * a verbatim prefix of the payload's first line, for a prompt short enough
+///     to be echoed as typed.
+///
+/// A before/after pane DIFF is deliberately NOT used, and that is the whole
+/// reason this function exists. Agent UIs mutate their own chrome between reads —
+/// status bars, token counters, spinner frames, and a welcome screen that finishes
+/// painting seconds after launch. "Something changed" is therefore true even when
+/// the payload was swallowed whole by a modal, which made an earlier version of
+/// this check press Enter on claude's "New MCP server" approval and accept it.
+fn pane_shows_payload(pane: &str, text: &str) -> bool {
+    let tail = tail_snippet(pane, COMPOSER_TAIL_LINES);
+    if tail.to_lowercase().contains(PASTE_PLACEHOLDER) {
+        return true;
+    }
+    let Some(first_line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return false;
+    };
+    let fragment: String = first_line.chars().take(MAX_VERBATIM_EVIDENCE).collect();
+    fragment.chars().count() >= MIN_VERBATIM_EVIDENCE && tail.contains(&fragment)
+}
+
+/// Deliver `text` to the running phase pane and CONFIRM the agent actually
+/// started on it. Returns `Ok` only when herdr observed the agent move; every
+/// other path raises rather than reporting a success the seed never had.
+///
+/// Four things can go wrong, and they need different answers:
+///
+/// 1. **The agent never attaches.** Gated up front by `wait_agent_ready`; raises
+///    [`io::ErrorKind::TimedOut`] without sending, and without re-opening.
+/// 2. **The prompt cannot be delivered at all** — herdr is unreachable, the pane
+///    is gone. The transport error propagates.
+/// 3. **The prompt is swallowed.** `agent_status` is not trustworthy evidence
+///    that a pane is at its composer: a pane parked on a dialog herdr's detection
+///    manifest does not classify reports `idle`, not `blocked` (claude's "New MCP
+///    server" approval is the proven case). The readiness gate waves that
+///    through, `agent.prompt` reports success, and the payload vanishes.
+/// 4. **The prompt lands but is never submitted.** The payload sits in the
+///    composer indefinitely and the agent never starts. This is the common case
+///    on `cursor` and it happens on `claude` too; it is a race, not a function of
+///    the payload (see `docs/known-issues.md`).
+///
+/// Cases 3 and 4 both look like "herdr saw no state change", so
+/// [`Herdr::agent_prompt_confirm`] detects them together — and
+/// [`pane_shows_payload`] is what tells them apart, by looking for the payload in
+/// the composer. It is evaluated BEFORE and after the prompt, and only evidence
+/// that *appeared* counts: a long-lived pane can be sent to repeatedly, and an
+/// earlier briefing still sitting in the composer region must not be mistaken for
+/// this one arriving.
+///
+/// That distinction is load-bearing, not cosmetic: case 4 is fixed by pressing
+/// Enter, and case 3 must NEVER be, because the keystroke would land on whatever
+/// dialog is up and accept its highlighted option. So the nudge requires positive
+/// evidence the payload is in the composer; no evidence (including a pane that
+/// cannot be read) means raise, never guess.
+///
+/// Keep the guard and the recovery distinct. The observed state transition is the
+/// one authoritative verdict on whether the seed arrived. The composer-evidence
+/// check is NOT a second opinion on that — it only decides whether nudging is
+/// safe. Never use evidence to conclude "it probably worked".
 ///
 /// Takes `&mut RunState` because sending to a FINISHED phase re-opens it. This is
 /// the pipeline's documented re-entry path — `skills/pipeline/SKILL.md`: "Re-entry
@@ -643,7 +729,15 @@ fn wait_agent_ready<H: Herdr>(
 /// microseconds while the agent has not yet read the prompt, and the driver
 /// advances (and, once task 6 lands, reaps a pane it just messaged).
 pub fn phase_send<H: Herdr>(h: &H, run: &mut RunState, phase: &str, text: &str) -> io::Result<()> {
-    phase_send_with_timeout(h, run, phase, text, SEND_READY_TIMEOUT, POLL_INTERVAL)
+    phase_send_with_timeout(
+        h,
+        run,
+        phase,
+        text,
+        SEND_READY_TIMEOUT,
+        POLL_INTERVAL,
+        SEND_CONFIRM_TIMEOUT,
+    )
 }
 
 /// Mark a PIPELINE phase live again for work being requested NOW: drop any
@@ -698,9 +792,53 @@ fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// [`phase_send`] with an injectable readiness timeout + poll interval (so tests
-/// can exercise the not-ready path, and the poll loop, without waiting out the
-/// full production timeout or real 500ms poll cadence).
+/// What a failed `phase_send` LEFT BEHIND, given whether `reopen_for_re_entry`
+/// acted. Every failure after the re-open has to say this, not just the transport
+/// one: the previous pass's completion marker is already deleted and the status is
+/// back to `Running`, so a caller told only "the seed did not arrive" reads that
+/// phase as work in progress forever — the phantom-incomplete-phase state. Name
+/// the way out too (re-send; the re-open is idempotent).
+///
+/// When the re-open did NOT act — a reviewer phase, which lives in
+/// `review_phases` — nothing was touched and the message must not say otherwise.
+/// A reviewer that has finished and exited is precisely the pane a send fails
+/// against, and its marker is intact: telling its human it had been reset would be
+/// a false report about a phase that is correctly complete.
+fn send_failure_aftermath(reopened: bool) -> &'static str {
+    if reopened {
+        "but this phase had ALREADY been re-opened for it — its completion marker is deleted \
+         and its status is back to Running, so it now looks like work in progress that nobody \
+         was asked to do. Re-send once the pane is reachable (re-opening again is harmless), \
+         or mark the phase failed."
+    } else {
+        "nothing was changed — this phase is not one `phase send` re-opens, so its status and \
+         any completion it already recorded are untouched. Re-send once the pane is reachable."
+    }
+}
+
+/// Assemble a post-re-open send failure: what went wrong, then what it left
+/// behind. Shared by every failure path after `reopen_for_re_entry` so none of
+/// them can quietly omit the aftermath.
+fn send_failure(
+    run: &RunState,
+    phase: &str,
+    reopened: bool,
+    kind: io::ErrorKind,
+    what: &str,
+) -> io::Error {
+    io::Error::new(
+        kind,
+        format!(
+            "phase '{phase}' of run '{run_name}': {what}, {aftermath}",
+            run_name = run.name,
+            aftermath = send_failure_aftermath(reopened),
+        ),
+    )
+}
+
+/// [`phase_send`] with injectable timeouts + poll interval (so tests can exercise
+/// the not-ready and undelivered paths, and the poll loop, without waiting out the
+/// full production timeouts or the real 500ms poll cadence).
 fn phase_send_with_timeout<H: Herdr>(
     h: &H,
     run: &mut RunState,
@@ -708,6 +846,7 @@ fn phase_send_with_timeout<H: Herdr>(
     text: &str,
     ready_timeout: Duration,
     poll_interval: Duration,
+    confirm_timeout: Duration,
 ) -> io::Result<()> {
     require_phase_name(phase)?;
     let pane_id = require_pane_id(run, phase)?;
@@ -736,37 +875,106 @@ fn phase_send_with_timeout<H: Herdr>(
     // completion on every failed send (a phase parked on a permission prompt
     // would lose its `Done` and its marker without any new work being requested).
     let reopened = reopen_for_re_entry(run, phase)?;
-    // When the re-open ACTED, a send failure is NOT "nothing happened": the
-    // previous pass's completion marker has been deleted and the status is back
-    // to `Running`. A caller told only "agent_send failed" will read that phase
-    // as work in progress forever — the phantom-incomplete-phase state. Say what
-    // was left behind, and name the way out (re-send; the re-open is idempotent).
-    //
-    // When it did NOT act — a reviewer phase, which lives in `review_phases` —
-    // nothing was touched and the message must not say otherwise. A reviewer that
-    // has finished and exited is precisely the pane whose `agent_send` fails, and
-    // its marker is intact: telling its human that it had been reset would be a
-    // false report about a phase that is correctly complete.
-    h.agent_send(&pane_id, text).map_err(|e| {
-        let aftermath = if reopened {
-            "but this phase had ALREADY been re-opened for it — its completion marker is \
-             deleted and its status is back to Running, so it now looks like work in progress \
-             that nobody was asked to do. Re-send once the pane is reachable (re-opening again \
-             is harmless), or mark the phase failed."
-        } else {
-            "nothing was changed — this phase is not one `phase send` re-opens, so its status \
-             and any completion it already recorded are untouched. Re-send once the pane is \
-             reachable."
-        };
-        io::Error::new(
-            e.kind(),
-            format!(
-                "phase '{phase}' of run '{run_name}': the prompt could not be delivered ({e}), \
-                 {aftermath}",
-                run_name = run.name,
+
+    // Snapshot FIRST, so evidence found afterwards can be attributed to THIS send.
+    // A pane that already shows the payload's signature — a long-lived pane whose
+    // previous briefing is still in the composer region — cannot produce fresh
+    // evidence, and is treated as no-evidence below rather than nudged on the
+    // strength of someone else's paste. An unreadable pane reads as `true` here
+    // for the same fail-safe reason it reads as `false` after: both make
+    // `landed_in_composer` false, and no key is sent.
+    let evidence_before = h
+        .agent_read(&pane_id)
+        .map(|pane| pane_shows_payload(&pane, text))
+        .unwrap_or(true);
+
+    let outcome = h
+        .agent_prompt_confirm(&pane_id, text, confirm_timeout)
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!("the prompt could not be delivered ({e})"),
+            )
+        })?;
+    if outcome == PromptOutcome::Started {
+        return Ok(());
+    }
+
+    // The agent did not move. Only nudge if the payload is demonstrably sitting in
+    // the composer NOW and was not there before — see `pane_shows_payload` for why
+    // this must be positive evidence rather than "the pane changed".
+    let evidence_after = h
+        .agent_read(&pane_id)
+        .map(|pane| pane_shows_payload(&pane, text))
+        .unwrap_or(false);
+    let landed_in_composer = evidence_after && !evidence_before;
+
+    if !landed_in_composer {
+        return Err(send_failure(
+            run,
+            phase,
+            reopened,
+            io::ErrorKind::TimedOut,
+            &format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt, and \
+                 the payload is nowhere in the agent's composer, so it was swallowed rather \
+                 than left unsubmitted. Deliberately NOT pressing a key: with nothing visibly \
+                 in the composer, drovr cannot tell a cleared input from a dialog, and Enter \
+                 on a dialog accepts its highlighted option on your behalf (claude's \"New MCP \
+                 server\" approval reports `idle`, not `blocked`, so the readiness gate cannot \
+                 rule it out). Read the pane, clear whatever is on it, then re-send: {attach}",
+                attach = attach_command(&run.name),
             ),
-        )
-    })
+        ));
+    }
+
+    // The payload is in the composer, not a menu, so Enter can only submit it.
+    h.agent_send_keys(&pane_id, &["enter".to_string()])
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!(
+                    "the seed landed in the agent's composer but the submit keystroke could \
+                     not be sent ({e})"
+                ),
+            )
+        })?;
+    let nudged = h
+        .agent_wait_started(&pane_id, confirm_timeout)
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!(
+                    "the seed landed in the agent's composer and was nudged, but herdr could \
+                     not be asked whether it took ({e})"
+                ),
+            )
+        })?;
+    if nudged == PromptOutcome::Started {
+        return Ok(());
+    }
+
+    Err(send_failure(
+        run,
+        phase,
+        reopened,
+        io::ErrorKind::TimedOut,
+        &format!(
+            "the seed landed in the agent's composer but would not submit — it was still \
+             unsent after a follow-up Enter and {secs}s. Submit it by hand: {attach}",
+            secs = confirm_timeout.as_secs(),
+            attach = attach_command(&run.name),
+        ),
+    ))
 }
 
 /// Mark a phase complete by dropping its completion marker. Run BY the phase
@@ -2304,7 +2512,10 @@ mod tests {
         h.push_status(Some("idle"));
         phase_send(&h, &mut run, "review:t:1:correctness", "seed text").unwrap();
         let calls = h.calls();
-        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        let send_call = calls
+            .iter()
+            .find(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         assert!(
             send_call.contains("review-pane-9"),
             "must route to the reviewer pane: {send_call}"
@@ -2323,13 +2534,384 @@ mod tests {
         h.push_status(Some("idle"));
         phase_send(&h, &mut run, "code", "hello agent").unwrap();
 
-        // Last call should be agent_send
+        // The delivery-confirming prompt carries the text and the pane.
         let calls = h.calls();
-        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        let send_call = calls
+            .iter()
+            .find(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         assert!(send_call.contains("hello agent"));
         // Target should match the pane_id recorded
         let pane_id = run.phases[0].pane_id.as_ref().unwrap();
         assert!(send_call.contains(pane_id.as_str()));
+    }
+
+    /// Confirm timeout for tests. `FakeHerdr` never actually waits, so this only
+    /// has to be a distinguishable value — it never costs wall-clock.
+    const CONFIRM: Duration = Duration::from_secs(15);
+
+    // -- pane_shows_payload: the swallowed-vs-unsubmitted discriminator ---------
+
+    // Captured verbatim from a real `cursor-agent` pane holding a briefing it had
+    // typed but not submitted.
+    const CURSOR_UNSUBMITTED_PANE: &str = "\
+  v2026.06.24-00-45-58-9f61de7
+  Tip: Try Cursor Grok 4.5 via /model.
+
+
+  → [Pasted text #1 +5 lines]
+
+
+  Composer 2.5                                        Run Everything
+  /tmp/scratchpad/e2e/proj";
+
+    // Captured verbatim from a real `claude` pane parked on the MCP approval menu
+    // that had just SWALLOWED a briefing whole.
+    const CLAUDE_MCP_MODAL_PANE: &str = "\
+  New MCP server found in this project: probe2
+
+  MCP servers may execute code or access system resources. All tool calls require approval.
+
+  ❯ 1. Use this MCP server
+    2. Use this and all future MCP servers in this project
+    3. Continue without using this MCP server
+
+  Enter to confirm · Esc to cancel";
+
+    #[test]
+    fn pane_shows_payload_accepts_a_collapsed_paste() {
+        assert!(pane_shows_payload(
+            CURSOR_UNSUBMITTED_PANE,
+            "# Briefing Alpha Marker\n\nlots of context"
+        ));
+    }
+
+    #[test]
+    fn pane_shows_payload_accepts_a_short_prompt_echoed_verbatim() {
+        let pane = "  → Reply with exactly: PONG\n\n  Composer 2.5";
+        assert!(pane_shows_payload(pane, "Reply with exactly: PONG"));
+    }
+
+    // The regression that matters most: a modal that swallowed the payload must
+    // NOT read as delivered, or `phase_send` presses Enter and accepts it. The
+    // pane here differs wildly from anything sent — which is exactly why a
+    // before/after DIFF cannot be the test.
+    #[test]
+    fn pane_shows_payload_rejects_a_modal_that_swallowed_the_seed() {
+        assert!(!pane_shows_payload(
+            CLAUDE_MCP_MODAL_PANE,
+            "# Briefing Alpha Marker\n\nlots of context"
+        ));
+    }
+
+    // A payload echoed by an EARLIER send, now scrolled up out of the composer,
+    // is not evidence that this one landed.
+    #[test]
+    fn pane_shows_payload_ignores_evidence_above_the_composer_region() {
+        let pane = format!(
+            "  ❯ [Pasted text #1 +99 lines]\n{}\n{}",
+            (0..COMPOSER_TAIL_LINES)
+                .map(|i| format!("  transcript line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "  Enter to confirm · Esc to cancel"
+        );
+        assert!(!pane_shows_payload(&pane, "# Briefing\n\nbody"));
+    }
+
+    // A first line too short to be distinctive must not count as evidence — it
+    // would match ordinary pane chrome by accident.
+    #[test]
+    fn pane_shows_payload_rejects_a_too_generic_fragment() {
+        let pane = "  Do you trust this?\n  ❯ [a] Trust\n  # Go";
+        assert!(!pane_shows_payload(pane, "# Go\n\nrest of the briefing"));
+    }
+
+    // -- delivery confirmation: the two ways a "successful" send loses the seed --
+
+    // The healthy path (a claude send that self-submits): the prompt takes on the
+    // first try, so no keystroke is sent and no second wait is needed.
+    #[test]
+    fn send_does_not_nudge_when_prompt_takes_first_try() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-healthy-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_send_keys")),
+            "a delivered prompt must not be nudged: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_wait_started")),
+            "no second wait is needed once the prompt took: {calls:?}"
+        );
+    }
+
+    // The failure that motivated all of this: `agent.prompt` types the payload but
+    // it is never submitted, so it sits in the composer and the agent never
+    // starts. The payload is VISIBLY there, which is what licenses the Enter nudge
+    // — and once nudged, the send is a success, not an error.
+    #[test]
+    fn send_nudges_enter_when_payload_lands_unsubmitted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-unsubmitted-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // Pane before the prompt (no payload), then after the stall: the payload
+        // is visibly sitting in the composer, so it landed — just unsubmitted.
+        h.push_read("> Plan, search, build anything\n  Composer 2.5");
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+        // The prompt stalls; the follow-up Enter gets it moving.
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let pane_id = run.phases[0].pane_id.clone().unwrap();
+        let keys = calls
+            .iter()
+            .find(|c| c.contains("agent_send_keys"))
+            .unwrap_or_else(|| panic!("must nudge the composer with Enter: {calls:?}"));
+        assert!(
+            keys.contains("enter") && keys.contains(&pane_id),
+            "the Enter must go to the phase pane: {keys}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("agent_wait_started")),
+            "must confirm the nudge actually got the agent moving: {calls:?}"
+        );
+    }
+
+    // THE SAFETY PROPERTY. The prompt was swallowed whole, so the pane is
+    // unchanged. `phase_send` must RAISE and must NOT press a key: Enter on
+    // whatever dialog is up accepts its highlighted option on the user's behalf.
+    // Assert the ABSENCE of the keystroke, not merely the error.
+    #[test]
+    fn send_raises_without_keystroke_when_payload_is_swallowed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-swallowed-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        // A pane parked on an unclassified modal still reports `idle`, so the
+        // readiness gate waves it through — this is reachable, not hypothetical.
+        h.push_status(Some("idle"));
+        // The modal ate the prompt: before and after, the composer region shows
+        // the dialog and no trace of the payload.
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("send-swallowed-test") && err.to_string().contains("code"),
+            "error must name the run and phase: {err}"
+        );
+        assert!(
+            err.to_string().contains("drovr attach"),
+            "error must suggest attach: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must NOT answer the dialog on the user's behalf: {:?}",
+            h.calls()
+        );
+    }
+
+    // Evidence must have APPEARED. A long-lived pane still showing the previous
+    // briefing's paste marker offers no proof that THIS send arrived, so it must
+    // not license a keystroke — otherwise stale scrollback could mask a fresh
+    // dialog and re-create the exact false-Enter failure this check exists to
+    // stop.
+    #[test]
+    fn send_does_not_nudge_on_evidence_that_predates_the_prompt() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-stale-evidence-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // The paste marker is already there BEFORE the prompt, and still there
+        // after — unchanged, so it proves nothing about this send.
+        let stale = "> [Pasted text #1 +40 lines]\n  Composer 2.5";
+        h.push_read(stale);
+        h.push_read(stale);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("was NOT delivered"),
+            "stale evidence must read as undelivered, not as a stuck composer: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must not nudge on evidence that predates the prompt: {:?}",
+            h.calls()
+        );
+    }
+
+    // A pane we cannot read is a pane we cannot reason about: with no evidence to
+    // weigh, `phase_send` must fail safe (raise, no keystroke) rather than nudging
+    // blind into an unknown screen.
+    #[test]
+    fn send_raises_without_keystroke_when_pane_is_unreadable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-unreadable-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.fail_agent_read();
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must not nudge a pane it cannot read: {:?}",
+            h.calls()
+        );
+    }
+
+    // A nudge that does not help must not be reported as a delivered seed.
+    #[test]
+    fn send_raises_when_nudge_does_not_submit() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-stuck-composer-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.push_read("> Plan, search, build anything\n  Composer 2.5");
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+        // The prompt stalls, and so does the wait after the Enter.
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("would not submit"),
+            "error must name the composer-stuck failure, not the swallow one: {err}"
+        );
+    }
+
+    // An undelivered seed leaves the SAME wreckage a transport failure does: the
+    // re-open already ran, so the phase is Running with its completion marker
+    // gone. Saying only "the seed did not arrive" leaves a phantom incomplete
+    // phase nobody knows to clean up.
+    #[test]
+    fn an_undelivered_seed_also_reports_the_re_open_it_left_behind() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-undelivered-reopen-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
+        run.phases[0].status = PhaseStatus::Done;
+        run.save().unwrap();
+
+        h.push_status(Some("idle"));
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            "next",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "precondition: the re-open really did clear the marker"
+        );
+        assert!(
+            err.contains("was NOT delivered"),
+            "it must still name the delivery failure: {err}"
+        );
+        assert!(
+            err.contains("completion marker"),
+            "and report the state the re-open left behind: {err}"
+        );
     }
 
     // -- agent_has_started: which statuses mean "attached AND at the composer" -
@@ -2377,13 +2959,17 @@ mod tests {
             "hello agent",
             Duration::from_secs(5),
             Duration::from_millis(1),
+            CONFIRM,
         )
         .unwrap();
 
         let calls = h.calls();
         // Polled through all three un-ready states (incl. blocked) before the send,
         // and every poll came before the send.
-        let first_send = calls.iter().position(|c| c.contains("agent_send")).unwrap();
+        let first_send = calls
+            .iter()
+            .position(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         let status_polls = calls
             .iter()
             .filter(|c| c.contains("agent_status"))
@@ -2456,6 +3042,7 @@ mod tests {
             "seed text",
             Duration::from_millis(50),
             POLL_INTERVAL,
+            CONFIRM,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "must be a TimedOut error");
@@ -2470,7 +3057,7 @@ mod tests {
         );
         // Crucially, no prompt was delivered.
         assert!(
-            !h.calls().iter().any(|c| c.contains("agent_send")),
+            !h.calls().iter().any(|c| c.contains("agent_prompt_confirm")),
             "must not send a prompt when the agent never became ready: {:?}",
             h.calls()
         );
@@ -3244,6 +3831,7 @@ mod tests {
             "text",
             Duration::from_millis(50),
             POLL_INTERVAL,
+            CONFIRM,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -3919,7 +4507,7 @@ mod tests {
             .calls()
             .into_iter()
             .rev()
-            .find(|c| c.contains("agent_send"))
+            .find(|c| c.contains("agent_prompt_confirm"))
             .unwrap();
         let reviewer_pane = run.review_phases[0].pane_id.clone().unwrap();
         assert!(

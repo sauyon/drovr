@@ -1608,7 +1608,9 @@ impl Herdr for FakeHerdr {
         text: &str,
         _timeout: Duration,
     ) -> io::Result<PromptOutcome> {
-        self.record(format!("agent_prompt_confirm target={target} text={text:?}"));
+        self.record(format!(
+            "agent_prompt_confirm target={target} text={text:?}"
+        ));
         if *self.fail_agent_send.borrow() {
             return Err(io::Error::other("scripted agent_send failure"));
         }
@@ -2325,7 +2327,9 @@ mod tests {
         );
         let calls = h.calls();
         assert!(
-            calls.iter().any(|c| c.contains("agent_prompt_confirm") && c.contains("hi")),
+            calls
+                .iter()
+                .any(|c| c.contains("agent_prompt_confirm") && c.contains("hi")),
             "the confirming prompt must record its payload: {calls:?}"
         );
         assert!(
