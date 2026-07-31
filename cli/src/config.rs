@@ -11,9 +11,68 @@ use std::collections::BTreeMap;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::shell::shell_single_quote;
+
+/// How a backend is handed an MCP server.
+///
+/// The two supported mechanisms are genuinely different, so they are separate
+/// variants rather than a pile of optional flags that could be combined into
+/// nonsense: claude takes the server config *file* on its command line, while
+/// cursor has no such flag at all and only reads a fixed path inside the project
+/// directory. A backend either names the file or it does not — never both.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "mechanism", rename_all = "kebab-case")]
+pub enum McpDelivery {
+    /// The config file is named on the command line: `<flag> <path>`, plus any
+    /// `extra_flags` (claude: `--mcp-config <path> --strict-mcp-config`, the
+    /// second flag confining the agent to exactly the servers drovr passed).
+    ConfigFlag {
+        flag: String,
+        #[serde(default)]
+        extra_flags: Vec<String>,
+    },
+    /// The backend reads servers only from a fixed project-relative path
+    /// (cursor: `.cursor/mcp.json`); `extra_flags` carries whatever makes it
+    /// trust that file without a prompt (`--approve-mcps`).
+    ProjectFile {
+        path: String,
+        #[serde(default)]
+        extra_flags: Vec<String>,
+    },
+}
+
+impl McpDelivery {
+    /// Where drovr must write the server config for this mechanism. A flag
+    /// backend reads it from drovr's own run directory, out of the project
+    /// entirely; a project-file backend only ever looks inside the project.
+    ///
+    /// `stem` names the file for a flag backend (the reviewers of one task share
+    /// one server, so it is the task name).
+    pub fn config_path(&self, run_dir: &Path, project_dir: &Path, stem: &str) -> PathBuf {
+        match self {
+            McpDelivery::ConfigFlag { .. } => run_dir.join(format!("{stem}-review-mcp.json")),
+            McpDelivery::ProjectFile { path, .. } => project_dir.join(path),
+        }
+    }
+
+    /// The project-relative path this mechanism writes into the user's checkout,
+    /// if any. `Some` means the file is visible to git and needs excluding.
+    pub fn project_relative_path(&self) -> Option<&str> {
+        match self {
+            McpDelivery::ConfigFlag { .. } => None,
+            McpDelivery::ProjectFile { path, .. } => Some(path),
+        }
+    }
+
+    fn extra_flags(&self) -> &[String] {
+        match self {
+            McpDelivery::ConfigFlag { extra_flags, .. }
+            | McpDelivery::ProjectFile { extra_flags, .. } => extra_flags,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct AgentSpec {
@@ -33,6 +92,11 @@ pub struct AgentSpec {
     /// Model selected for read-only reviews. Absent means backend default.
     #[serde(default)]
     pub review_model: Option<String>,
+    /// How this backend is given an MCP server. Absent → it cannot be handed
+    /// one, so it cannot serve on the review panel (whose findings channel is a
+    /// tool call).
+    #[serde(default)]
+    pub mcp: Option<McpDelivery>,
 }
 
 /// Controls the SessionStart reflex the `session-start` hook injects (see
@@ -134,6 +198,23 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: Some("--append-system-prompt".into()),
             model_flag: Some("--model".into()),
             review_model: None,
+            mcp: Some(McpDelivery::ConfigFlag {
+                flag: "--mcp-config".into(),
+                // `--strict-mcp-config`: exactly the servers drovr passed, none of
+                // the user's. `--allowedTools`: plan mode gates tool use, so the one
+                // tool the panel depends on is pre-allowed — and only that one, whose
+                // single effect is drovr writing the findings file.
+                // `--allowedTools` is VARIADIC: given as two argv words it swallows
+                // whatever follows, so it is passed in the `=` form, which closes the
+                // option and cannot consume the next flag.
+                extra_flags: vec![
+                    "--strict-mcp-config".into(),
+                    format!(
+                        "--allowedTools={}",
+                        crate::mcp_findings::qualified_tool_name()
+                    ),
+                ],
+            }),
         },
     );
     m.insert(
@@ -145,6 +226,20 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
+            // No per-launch scoping exists: servers come from the project's
+            // `.cursor/mcp.json`, so drovr writes that file instead.
+            //
+            // `--approve-mcps` approves EVERY server in that file — there is no
+            // per-server form. That is only safe because
+            // `code_review::write_mcp_config` makes drovr's findings server the sole
+            // entry, backing up anything it displaces. Preserving other servers here
+            // would auto-approve them for a read-only reviewer, and `.cursor/mcp.json`
+            // is a path the repository under review can simply commit. If that write
+            // is ever made to merge again, this flag has to go with it.
+            mcp: Some(McpDelivery::ProjectFile {
+                path: ".cursor/mcp.json".into(),
+                extra_flags: vec!["--approve-mcps".into()],
+            }),
         },
     );
     m.insert(
@@ -156,6 +251,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             system_prompt_flag: None,
             model_flag: Some("-m".into()),
             review_model: None,
+            mcp: None,
         },
     );
     m
@@ -232,6 +328,10 @@ pub fn load_config() -> io::Result<Config> {
     for (name, spec) in &config.agents {
         validate_command(&spec.command)
             .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+        if let Some(delivery) = &spec.mcp {
+            validate_delivery(delivery)
+                .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+        }
     }
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
@@ -243,6 +343,7 @@ pub fn load_config() -> io::Result<Config> {
                 .or(builtin.system_prompt_flag);
             spec.model_flag = spec.model_flag.take().or(builtin.model_flag);
             spec.review_model = spec.review_model.take().or(builtin.review_model);
+            spec.mcp = spec.mcp.take().or(builtin.mcp);
         } else {
             config.agents.insert(name, builtin);
         }
@@ -286,8 +387,27 @@ impl Config {
         Ok(name.to_owned())
     }
 
+    /// How `agent` is handed an MCP server, if it can be. The caller needs this
+    /// *before* [`Config::launch`]: the config file has to exist at
+    /// [`McpDelivery::config_path`] by the time the agent starts.
+    pub fn mcp_delivery(&self, agent: &str) -> io::Result<Option<&McpDelivery>> {
+        Ok(self.agent(agent)?.mcp.as_ref())
+    }
+
     /// Compose an agent launch command pinned to `project_dir`.
-    pub fn launch(&self, agent: &str, project_dir: &str, readonly: bool) -> io::Result<String> {
+    ///
+    /// `mcp_config` is the path drovr wrote the server config to (see
+    /// [`Config::mcp_delivery`]). How — or whether — that path reaches the agent
+    /// depends on its [`McpDelivery`]: a flag backend gets it on the command
+    /// line, a project-file backend only gets the flags that make it read the
+    /// file it already knows about.
+    pub fn launch(
+        &self,
+        agent: &str,
+        project_dir: &str,
+        readonly: bool,
+        mcp_config: Option<&Path>,
+    ) -> io::Result<String> {
         let spec = self.agent(agent)?;
         let mut command = spec.command.clone();
         if readonly {
@@ -315,6 +435,24 @@ impl Config {
             command.push_str(flag);
             command.push(' ');
             command.push_str(&shell_single_quote(project_dir));
+        }
+        if let Some(path) = mcp_config {
+            let delivery = spec.mcp.as_ref().ok_or_else(|| {
+                io::Error::other(format!(
+                    "agent '{agent}' has no `mcp` mechanism; it cannot be given an \
+                     MCP server (so it cannot serve on the review panel)"
+                ))
+            })?;
+            if let McpDelivery::ConfigFlag { flag, .. } = delivery {
+                command.push(' ');
+                command.push_str(flag);
+                command.push(' ');
+                command.push_str(&shell_single_quote(&path.display().to_string()));
+            }
+            for flag in delivery.extra_flags() {
+                command.push(' ');
+                command.push_str(flag);
+            }
         }
         if let Some(flag) = &spec.system_prompt_flag {
             let prompt = format!(
@@ -372,6 +510,29 @@ fn validate_command(command: &str) -> io::Result<()> {
         return Err(io::Error::other(format!(
             "agent command '{command}' is a relative path; use a bare name \
              (resolved via $PATH) or an absolute path"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an MCP mechanism whose file would land outside the directory it is
+/// meant to. A `ProjectFile` path is joined onto the project dir, so an absolute
+/// path or a `..` component would have drovr write the server config anywhere on
+/// disk — under a name a hostile config chooses.
+fn validate_delivery(delivery: &McpDelivery) -> io::Result<()> {
+    let Some(path) = delivery.project_relative_path() else {
+        return Ok(());
+    };
+    if path.trim().is_empty() {
+        return Err(io::Error::other("mcp `path` must not be empty"));
+    }
+    let p = Path::new(path);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::other(format!(
+            "mcp `path` '{path}' must be a relative path inside the project"
         )));
     }
     Ok(())
@@ -442,11 +603,13 @@ mod tests {
         );
         assert!(cfg.agents.contains_key("cursor"));
         assert_eq!(
-            cfg.launch("cursor", "/tmp/my worktree", false).unwrap(),
+            cfg.launch("cursor", "/tmp/my worktree", false, None)
+                .unwrap(),
             "agent --workspace '/tmp/my worktree'"
         );
         assert_eq!(
-            cfg.launch("cursor", "/tmp/my worktree", true).unwrap(),
+            cfg.launch("cursor", "/tmp/my worktree", true, None)
+                .unwrap(),
             "agent --mode plan --model 'composer-2.5' --workspace '/tmp/my worktree'"
         );
     }
@@ -473,6 +636,188 @@ mod tests {
         assert!(Config::default().agents.contains_key("codex"));
         unsafe {
             std::env::remove_var("CODEX_THREAD_ID");
+        }
+    }
+
+    /// claude carries the server config on its command line, so the path drovr
+    /// wrote must appear there — with `--strict-mcp-config`, so the reviewer gets
+    /// drovr's one tool and nothing the user happens to have configured globally.
+    #[test]
+    fn a_config_flag_backend_takes_the_path_on_its_command_line() {
+        let cfg = Config::default();
+        let path = std::path::Path::new("/data/runs/r/task-1-review-mcp.json");
+        let cmd = cfg.launch("claude", "/tmp/proj", true, Some(path)).unwrap();
+        assert!(
+            cmd.contains("--mcp-config '/data/runs/r/task-1-review-mcp.json'"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("--strict-mcp-config"), "{cmd}");
+    }
+
+    /// cursor has no such flag: it only reads `.cursor/mcp.json` inside the
+    /// project. Putting the path on its command line would be a flag it rejects,
+    /// so the launch carries only what makes it trust that file.
+    #[test]
+    fn a_project_file_backend_gets_flags_but_never_the_path() {
+        let cfg = Config::default();
+        let path = std::path::Path::new("/tmp/proj/.cursor/mcp.json");
+        let cmd = cfg.launch("cursor", "/tmp/proj", true, Some(path)).unwrap();
+        assert!(cmd.contains("--approve-mcps"), "{cmd}");
+        assert!(
+            !cmd.contains("mcp.json"),
+            "cursor has no flag that can carry the path: {cmd}"
+        );
+    }
+
+    /// claude's plan mode gates tool use, so the one tool the panel depends on is
+    /// pre-allowed by name — and only that one. The name is derived from the server
+    /// key drovr registers, so the allowlist cannot drift from what is served.
+    #[test]
+    fn the_claude_reviewer_launch_pre_allows_exactly_the_findings_tool() {
+        let cfg = Config::default();
+        let cmd = cfg
+            .launch(
+                "claude",
+                "/tmp/proj",
+                true,
+                Some(std::path::Path::new("/x.json")),
+            )
+            .unwrap();
+        let tool = crate::mcp_findings::qualified_tool_name();
+        assert!(cmd.contains(&format!("--allowedTools={tool}")), "{cmd}");
+        assert!(
+            !cmd.contains(&format!("--allowedTools {tool}")),
+            "the flag is variadic, so it must use the `=` form or it swallows the \
+             argument after it: {cmd}"
+        );
+        assert_eq!(
+            cmd.matches("--allowedTools").count(),
+            1,
+            "exactly one carve-out, not a list that could grow: {cmd}"
+        );
+    }
+
+    #[test]
+    fn no_mcp_config_leaves_the_launch_untouched() {
+        let cfg = Config::default();
+        let cmd = cfg.launch("claude", "/tmp/proj", true, None).unwrap();
+        assert!(!cmd.contains("--mcp-config"), "{cmd}");
+        assert!(!cmd.contains("--strict-mcp-config"), "{cmd}");
+    }
+
+    /// A backend with no MCP mechanism cannot be handed one. Failing here beats
+    /// launching a reviewer that has no way to deliver findings.
+    #[test]
+    fn a_backend_without_a_mechanism_refuses_an_mcp_config() {
+        let cfg = Config::default();
+        assert!(cfg.mcp_delivery("codex").unwrap().is_none());
+        let err = cfg
+            .launch(
+                "codex",
+                "/tmp/proj",
+                true,
+                Some(std::path::Path::new("/tmp/x.json")),
+            )
+            .expect_err("codex has no MCP mechanism");
+        assert!(err.to_string().contains("codex"), "{err}");
+    }
+
+    /// The two mechanisms put the file in different places: drovr's own run dir
+    /// for a flag backend, inside the project for one that only reads a fixed path.
+    #[test]
+    fn each_mechanism_places_its_config_where_that_backend_looks() {
+        let cfg = Config::default();
+        let run_dir = std::path::Path::new("/data/runs/r");
+        let project = std::path::Path::new("/tmp/proj");
+        assert_eq!(
+            cfg.mcp_delivery("claude")
+                .unwrap()
+                .unwrap()
+                .config_path(run_dir, project, "task-1"),
+            run_dir.join("task-1-review-mcp.json")
+        );
+        let cursor = cfg.mcp_delivery("cursor").unwrap().unwrap();
+        assert_eq!(
+            cursor.config_path(run_dir, project, "task-1"),
+            project.join(".cursor/mcp.json")
+        );
+        assert_eq!(cursor.project_relative_path(), Some(".cursor/mcp.json"));
+        assert_eq!(
+            cfg.mcp_delivery("claude")
+                .unwrap()
+                .unwrap()
+                .project_relative_path(),
+            None,
+            "a flag backend's config never lands in the project"
+        );
+    }
+
+    #[test]
+    fn mcp_mechanisms_parse_from_config_and_are_merged_per_agent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+[agents.mine]
+command = "mine"
+readonly_flag = "--ro"
+
+[agents.mine.mcp]
+mechanism = "config-flag"
+flag = "--servers"
+extra_flags = ["--only-these"]
+
+[agents.cursor]
+command = "agent"
+"#,
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        let cmd = cfg
+            .launch(
+                "mine",
+                "/tmp/p",
+                true,
+                Some(std::path::Path::new("/tmp/s.json")),
+            )
+            .unwrap();
+        assert!(cmd.contains("--servers '/tmp/s.json'"), "{cmd}");
+        assert!(cmd.contains("--only-these"), "{cmd}");
+        // An agent that overrides a built-in without restating `mcp` keeps it.
+        assert_eq!(
+            cfg.mcp_delivery("cursor")
+                .unwrap()
+                .unwrap()
+                .project_relative_path(),
+            Some(".cursor/mcp.json")
+        );
+    }
+
+    /// The project-relative path is joined onto the project dir, so an absolute
+    /// or traversing value would write outside the project. Reject it at load.
+    #[test]
+    fn a_project_file_path_that_escapes_the_project_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for bad in ["/etc/mcp.json", "../../.cursor/mcp.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("drovr");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                format!(
+                    "[agents.mine]\ncommand = \"mine\"\n\n[agents.mine.mcp]\n\
+                     mechanism = \"project-file\"\npath = {bad:?}\n"
+                ),
+            )
+            .unwrap();
+            set_config_home(tmp.path());
+            let err = load_config().expect_err("path '{bad}' must be rejected");
+            assert!(err.to_string().contains("mine"), "{err}");
         }
     }
 
@@ -600,7 +945,10 @@ readonly_flag = "--sandbox read-only"
 
         // Explicit opt-out is honored.
         std::fs::write(dir.join("config.toml"), "worktree = false\n").unwrap();
-        assert!(!load_config().unwrap().worktree, "worktree = false must win");
+        assert!(
+            !load_config().unwrap().worktree,
+            "worktree = false must win"
+        );
     }
 
     #[test]
@@ -621,7 +969,7 @@ readonly_flag = "--sandbox read-only"
         assert!(cfg.reviewer_launch(Some("claude")).is_ok());
         assert!(cfg.reviewer_launch(Some("cursor")).is_ok());
         assert_eq!(
-            cfg.launch("codex", "/tmp/project", false).unwrap(),
+            cfg.launch("codex", "/tmp/project", false, None).unwrap(),
             "codex -C '/tmp/project'"
         );
     }
@@ -645,7 +993,9 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        mcp: None,
+                    },
                 );
                 m
             },
@@ -673,7 +1023,9 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        mcp: None,
+                    },
                 );
                 m
             },
@@ -704,7 +1056,9 @@ readonly_flag = "--sandbox read-only"
                         workspace_flag: None,
                         system_prompt_flag: None,
                         model_flag: None,
-                        review_model: None,                    },
+                        review_model: None,
+                        mcp: None,
+                    },
                 );
                 m
             },
@@ -759,10 +1113,7 @@ escalation = true
 
         let cfg = load_config().unwrap();
         assert!(cfg.reflex.enabled);
-        assert_eq!(
-            cfg.reflex.preamble.as_deref(),
-            Some("only a preamble here")
-        );
+        assert_eq!(cfg.reflex.preamble.as_deref(), Some("only a preamble here"));
     }
 
     #[test]

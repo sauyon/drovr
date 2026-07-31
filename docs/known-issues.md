@@ -68,6 +68,172 @@ To accept the old completion as-is, re-signal it deliberately from the run dir:
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
 case.
 
+## Review UI presents one run's state as another's (spec, feedback, annotations, findings) — FIXED 2026-07-25
+
+**Status:** fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
+panel in the empty case, and `route()` no longer shows it. Regression checks: "a run with no
+spec shows no doc at all" / "...and does not claim to be showing a spec" in
+`cli/tests/web/nav.mjs`, against a new `epsilon-nospec` fixture run seeded with `state.json`
+but no `spec.md`.
+
+**Severity:** high (silent misattribution — the reviewer reads one run's plan believing it is
+another's, and every other element on the page corroborates the wrong run).
+**Found:** 2026-07-25, while reviewing run `phase-reap` and being shown run
+`skill-stickiness`'s plan.
+
+### Symptom
+
+Navigate to a run whose gate has never been opened (no `spec.md`) after viewing a run that
+has one, and the previous run's rendered spec stays on screen under the new run's name. The
+turn badge, summary banner and questions panel all correctly update to the new run, so the
+page reads as a coherent review of it — only the document body is wrong.
+
+Verified on the live server (`100.71.58.39:8795`):
+
+| run | `GET /doc` | `GET /state` | `spec.md` on disk |
+|---|---|---|---|
+| `phase-reap` | 200, **0 bytes** | `{"state":"idle","turn":0}` | absent (only `plan.md`) |
+| `skill-stickiness` | 200, 24833 bytes | `{"state":"ready","turn":0}` | present, 24833 bytes |
+
+### Root cause
+
+Not server-side run leakage — the run is resolved per-request from the URL path
+(`cli/src/review.rs:364-370`, `452`) and `spec.md` is read fresh every time, so there is no
+shared "current run" anywhere in the stack. The fault is purely client-side.
+
+`refresh()` in `cli/web/index.html` wrote `#doc-content` only when the fetched doc was
+non-empty, with no `else`:
+
+```js
+if (docText) {
+  docContentEl.innerHTML = renderMd(docText);
+  wireAnnotations(docContentEl, docText.split('\n'));
+}
+```
+
+Meanwhile `route()` unconditionally did `showEl('doc-panel')` on entering any run detail
+view. A run has no `spec.md` until its first `drovr review summary`, at which point `/doc`
+answers 200-with-an-empty-body (`cli/src/review.rs:467-470` deliberately prefers an empty
+200 over a 404) — so `docText` is `''`, the write is skipped, and the panel is shown still
+holding the last run's markup.
+
+Second-order hazard: `currentDocText` **was** assigned unconditionally, so the visible text
+and the annotation source line array were desynced — annotations anchored against an empty
+document while the reviewer selected lines of the stale one.
+
+### The same bug class, one layer down: annotations could submit against the wrong run
+
+Found by the review pass on the fix, and worse than the visible symptom. `loadAnnotations()`
+had two fall-through paths that left the **previous run's** annotation map in `annotations`:
+a swallowed `JSON.parse` failure (`catch (e) {}`), and a `stored.turn === turn` record whose
+`annotations` field was missing. Previously those stale line comments at least rendered as
+chips on the (stale) doc and could be deleted; with the doc correctly cleared, nothing renders
+them — but `collectAnnotations()` still ships them in the submit payload and the server writes
+them verbatim into `feedback.json` (`cli/src/review.rs:817-820`, `846-853`, which gates submit
+on `is_terminal()` only, not on `state == ready`). Run A's line comments would land silently in
+run B's `feedback.json`, invisible to the reviewer.
+
+Fixed by resetting `annotations = {}` at the top of `loadAnnotations()`, unconditionally,
+before reading localStorage. Safe because every mutation site calls `saveAnnotations()`
+immediately (`cli/web/index.html:1451`, `1475`), so localStorage is authoritative and no
+in-progress comment is lost.
+
+### Fix
+
+1. Give the empty case an explicit branch that clears `#doc-content` and hides `doc-panel`.
+2. Move panel visibility out of `route()` into `refresh()`, and have `route()` defensively
+   clear + hide on navigation, so the stale doc is neither briefly visible on the way in nor
+   left on screen if `refresh()` throws mid-flight.
+3. `#doc-panel` now carries inline `style="display:none"` like every other refresh-owned
+   panel, so it is not visible-and-empty on first paint.
+4. Reset `annotations` unconditionally in `loadAnnotations()` (above).
+
+### Three more instances of the same class, found by the review panel on the fix
+
+All pre-existing, all "run A's state presented or submitted as run B's", all fixed on the
+same branch. Listed because the pattern is the point: **any run-scoped state that is not
+reset synchronously in `route()` is a cross-run leak waiting to happen.**
+
+1. **The decision radio and feedback textarea were never reset** (`cli/web/index.html:908-915`).
+   The worst of the set, and worse than the doc panel: no race needed and completely silent.
+   Type feedback for run A, select a decision, navigate to run B (list, bookmark, or
+   back/forward), submit — and A's prose and A's decision are written into B's
+   `feedback.json`, which an autonomous agent then acts on. `submitDecision()` reads the live
+   DOM (`:1773`, `:1777`); nothing in `route()` or `refresh()` ever touched those values.
+   Fixed by resetting both to the markup default in `route()`'s synchronous block.
+
+2. **`annotations` was reset too late.** `loadAnnotations()` runs *after* `refresh()`'s
+   awaits, so between `route()`'s synchronous body and those fetches resolving,
+   `collectAnnotations()` still returned the outgoing run's line comments while
+   `api('submit')` already addressed the incoming one — and if `refresh()` rejects,
+   `loadAnnotations()` never runs at all and they stay submittable indefinitely with nothing
+   on screen to reveal them. Fixed by dropping them synchronously in `route()`;
+   `loadAnnotations()` still restores this run's own in-progress comments from localStorage.
+
+3. **`refreshReview()` had no `routeGen` guard** (`cli/web/index.html:1286-1317`). Every other
+   async flow in the file captures `routeGen` and bails if it moved; this one did not, and it
+   is called fire-and-forget from `refresh()`. Its two sequential awaits outlive a
+   navigation, so a late resolution painted the previous task's findings and diff and then
+   unconditionally re-showed the panel — **over the session list**, which had only hidden it
+   once on the way out. Strictly worse than the original symptom. Fixed with the standard
+   guard after each await.
+
+### A regression the fix itself introduced, caught by the final review round
+
+Worth recording because it is the natural failure mode of this kind of fix: **the cure for a
+cross-run leak is a reset, and a reset in the wrong place destroys the reviewer's work.**
+
+The resets above were added to `route()` ungated. But `route()` fires on every `hashchange`,
+and `#/runs/<run>?task=<t>` is a supported URL (`reviewTask()`, `cli/web/index.html:1119`, and
+the router comment at the top of the file documents it) — so browser back/forward, or opening
+a task link while already on that run, re-enters `route()` with the *same* run. That silently
+cleared the feedback textarea and reset the decision radio mid-edit. Feedback is persisted
+nowhere, so it was simply gone, with no warning.
+
+Note the pre-existing `if (h.run !== prevRun)` guard higher in `route()` covers only the
+nav-cursor bits — it is not a general run-change gate, which is easy to misread. The resets
+now sit in their own `h.run !== prevRun` block.
+
+Two reviewers disagreed on this: one reported it Critical with a live repro, the other cleared
+the same code as "reset is gated on navigation, not on poll" — true but not the point, since a
+same-run navigation is still a navigation. The repro decided it.
+
+**Two test traps hit while pinning it**, both of which made the check pass against broken code:
+- Waiting on `refreshSeq` was wrong — the background `pollState` → `refresh()` loop bumps it
+  for a `ready` run, so it advances before `route()` has touched the hashchange. The checks
+  now wait on `routeGen`, which only `route()` increments, in the same synchronous task as the
+  reset block.
+- The "annotations survive" check passes with the gate removed, because `loadAnnotations()`
+  restores them from localStorage. It is labelled in-place as not being what proves the gate
+  works.
+
+### Still open (follow-ups, not blocking)
+
+- `fetchText()` (`cli/web/index.html`) collapses 204, non-OK and a genuinely empty body all to
+  `''`, so a 500 on `/doc` is indistinguishable from "this run has no spec" and silently
+  renders as the latter. The reviewer is told "no spec yet" when the truth is "the server
+  broke".
+- `/doc` is the one maybe-absent-markdown endpoint that answers **200-with-empty-body**;
+  its siblings `/prior` (`cli/src/review.rs:472-478`) and `/review/diff` (`:791-797`) both
+  answer `204`, the latter with an explicit comment reading *"not a misleading empty 200."*
+  `/doc` should match. Given `fetchText`'s current collapsing this is a consistency fix, not
+  a behavioral one — but the conflation is the root design flaw behind this whole entry.
+- `agents-panel` / `session-panel` are shown by `route()` before their own poll lands. Their
+  catch blocks leave prior content untouched, so a persistently-failing endpoint leaves the
+  previous run's agent tree visible under the new run's header. Self-heals in ~1-2s on the
+  normal path.
+
+### Testing note
+
+The regression checks are deliberately split. "A run with no spec shows no doc" passes on
+`route()`'s defensive clear alone, so it does **not** pin the real invariant; the two
+`refresh() alone ...` checks plant a stale render and call `refresh()` directly, and those are
+the ones that fail if the `else` branch is removed. Both halves were verified to fail against
+the unfixed page before being kept. `refreshSeq` (`cli/web/index.html`) exists purely so the
+driver can tell "this run has rendered" from "nothing has rendered yet" — an empty
+`currentDocText` cannot distinguish the two, and waiting on it made the check vacuous under a
+real page reload.
+
 ## The agent's change summary is hidden on the first review — FIXED 2026-07-25
 
 **Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;
@@ -580,43 +746,37 @@ either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
 file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
 
-### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — the unsubmitted paste again
+### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — same unsubmitted seed
 
-**Root cause: the unsubmitted-prompt bug above.** Filed at the time as a third failure shape —
-"no reviewer processes at all, not panes-that-attach-but-don't-submit" — which was a
-mis-triage. Two passes, `0 of 4 angles finished` each time:
+Two more passes of the unsubmitted-paste mode, from a driver that was a plain `claude` session drovr
+had not started. `0 of 4 angles finished` on both (`--timeout-ms 540000`, then 1500000), all four
+`schema-dos-fix-review-<angle>-seed.md` written, zero findings files.
 
-- pass 1, `--timeout-ms 540000` → exit 2, `still waiting on correctness, security, error-handling,
-  type-design`;
-- pass 2, `--timeout-ms 1500000` (25 min) → exit 2, identical.
+**A misdiagnosis worth recording, because the obvious check lies.** `pgrep -af 'drovr|code-review'`
+returned nothing for this panel, which reads as "no reviewer was ever spawned" — and it is wrong.
+The reviewers are `cursor-agent` processes inside herdr panes, so neither pattern matches them; the
+panes were registered and `Running` in `state.json` the whole time (`wB8:p2`–`p9`, both iterations).
+Reading one settled it in a single command:
 
-After both, the run dir held all four `schema-dos-fix-review-<angle>-seed.md` files and
-`schema-dos-fix-review-{1,2}.head`, and **zero** findings files.
+```
+herdr pane read wB8:p6 --source recent --lines 14   # → [Pasted text #1 +46 lines]
+```
 
-**Why it looked like a new shape — the diagnostic was wrong.** `pgrep -af 'drovr|code-review'`
-cannot match a reviewer: reviewers run as `claude` / `agent` / `cursor-agent`, and neither string
-appears in those command lines. The `cursor-agent` processes that pattern *did* surface, and which
-were dismissed as "belonging to other worktrees", are the likeliest candidates for the parked
-reviewers themselves. Absence of a matching process was read as absence of a reviewer.
+So: diagnose a stalled panel by reading a pane, never by grepping the process table. Check
+`state.json` for the reviewer pane ids first — they are recorded per angle per iteration.
 
-**Triage this shape correctly:** check the pane, not the process table — `herdr pane get <pane>`
-for a reviewer pane, or `herdr agent read <pane>`. A pane sitting at `agent_status: idle` with
-`→ [Pasted text #1 +N lines]` in its composer is the unsubmitted paste, and
-`herdr agent send-keys <pane> enter` starts it.
-
-Not the caller's session, though it looked that way at first (this run's only recorded pane,
-`wB8:p1`, belonged to an earlier `verify-land` phase). `spawn_reviewer` requires `run.workspace`
-from that run's `state.json` and nothing else — `drovr new` records it whoever invokes it, and no
-code path consults the calling session.
+The plain-`claude` driver is circumstance, not cause: `spawn_reviewer` needs `run.workspace` from
+that run's `state.json` and nothing else, `drovr new` records it whoever invokes it, and no code
+path consults the calling session. A run with no workspace fails loudly instead.
 
 Credit where due: drovr handled the moving target correctly. HEAD changed between passes and pass
 2 reported `HEAD moved since review iteration 1 was seeded — starting a fresh panel instead of
 resuming it`, which is the right call — a resumed panel would have reviewed an abandoned design.
 
-**Workaround used:** the self-spawned read-only reviewer above (Claude Code Agent tool,
-`general-purpose`, read-only, blocking) over `git diff <base>..HEAD`. It worked well — two such
-reviewers found two Critical defects the author's own tests had missed, including a test that passed
-while allocating ~300 MB.
+**Workarounds, both used here:** send `Enter` to each reviewer pane after the panel spawns them (the
+documented fix below), or drive the review with a self-spawned read-only reviewer (Claude Code Agent
+tool, `general-purpose`, blocking). The latter found two Critical defects the author's own tests had
+missed, including a test that passed while allocating ~300 MB of grammar.
 
 ### Fix ideas (from the 2026-07-25 dogfood)
 
@@ -639,6 +799,87 @@ keystroke is missing. Fixing "`drovr phase send` returns success with the prompt
 unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
 visible victim. Keep the self-spawned-reviewer workaround above until that lands.
 
+## A reviewer's `submit_findings` tool can be DEFERRED, so a tool-search outage loses the review
+
+**Severity:** medium (the panel's only findings channel becomes uncallable; every angle
+finishes having delivered nothing, and the pass fails).
+**Found:** 2026-07-26, probing the claude findings channel directly (`fix-review-json`):
+`claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config`, asked to call the
+tool.
+
+### Symptom
+
+The agent reports it cannot call the tool: `mcp__drovr-findings__submit_findings` is a
+*deferred* tool, its schema must be loaded through `ToolSearch` first, and `ToolSearch`
+answers `HTTP Error 502: Bad Gateway` (classifier unreachable). Nothing is written; the
+angle looks like a reviewer that simply produced nothing.
+
+### What the probe DID establish (both good)
+
+- claude accepts the server from `--mcp-config` **without** the "New MCP server found"
+  approval prompt (see that issue below — it applies to project-scoped `.mcp.json`, not to
+  a config passed on the command line), and registers it under `--permission-mode plan`.
+- The server itself is correct end-to-end: a hand-driven stdio JSON-RPC session
+  (`initialize` → `tools/list` → `tools/call`) returns the tool and writes
+  `<task>-review-<iter>-<angle>.json` exactly where the panel reads it.
+
+### Mitigations
+
+- **Seed** (`code_review::build_seed`): names the fully qualified id, says the tool may be
+  deferred and must have its schema loaded first, and states that calling it is the
+  *sanctioned* way to deliver from read-only mode — the same probe showed a cautious agent
+  stopping to ask permission for a tool it read as "writing". Asserted by
+  `code_review::tests::seed_routes_findings_through_the_submit_tool`.
+- **Launch** (`config::default_agents`): claude's reviewer launch carries
+  `--allowedTools=mcp__drovr-findings__submit_findings`, so plan mode's tool gate cannot
+  refuse the one tool the panel depends on. Note the `=` form: `--allowedTools` is
+  **variadic**, and as two argv words it swallows whatever follows it — passing it as
+  `--allowedTools <tool>` before a positional prompt makes claude exit with "Input must be
+  provided either through stdin or as a prompt argument". Asserted by
+  `config::tests::the_claude_reviewer_launch_pre_allows_exactly_the_findings_tool`.
+
+### Still open
+
+If the tool-search service is down, no seed wording and no flag helps — the schema cannot be
+loaded at all. The LLM leg of the probe was never completed for that reason, so "a real
+**claude** reviewer calls the tool and the file lands" is verified only at the protocol level
+(hand-driven stdio JSON-RPC) plus flag-parsing; the full agent-level path is verified live
+for **cursor** only (during design). Re-run the probe when the service is back:
+
+```
+claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config \
+  --allowedTools=mcp__drovr-findings__submit_findings "call submit_findings …"
+```
+
+## One silent reviewer fails the whole `code-review run` (exit 1) instead of one angle
+
+**Severity:** low-medium (recoverable — a plain re-run respawns the angle — but the exit code
+tells the pipeline driver to STOP and diagnose, for something self-healing).
+**Found:** 2026-07-26, reviewing the findings-channel wiring (`fix-review-json`). Not a
+regression; the behaviour predates the MCP findings channel.
+
+### Symptom
+
+A reviewer that finishes without delivering anything — it never called `submit_findings`, so
+`<task>-review-<iter>-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
+CLI maps to **exit 1** ("setup failure: STOP and diagnose"). The other three angles' findings
+are already banked on disk and no merged `<task>-review.json` is written.
+
+### Why it is arguably wrong
+
+The pass already knows how to recover from exactly this: the angle is marked
+`PhaseStatus::Failed`, and the next `drovr code-review run` replaces that reviewer in place
+(`cli/src/code_review.rs`, the respawn branch). So the state left behind is a *resumable* one,
+while the exit code says *unrecoverable*. Exit 2 (timeout — "resumable, re-run me") would
+describe it accurately, or the angle could simply be reported `Failed` and the pass continue.
+
+### Status: open, deliberately not changed
+
+Raised as an open question in the `fix-review-json` design and left alone on purpose — the exit
+code is a contract the pipeline skill reads, and changing it belongs in its own task with the
+driver's behaviour changed alongside. Re-running `drovr code-review run` is the workaround and
+it costs one reviewer, not a panel.
+
 ## `drovr phase send` returns success with the prompt left unsubmitted
 
 **Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as
@@ -648,7 +889,8 @@ that is simply working.)
 **Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
 binary carrying the phase-send agent-readiness fix.
 **Reproduced:** 2026-07-25 (`mcp-endpoint`), 2026-07-25 (`phase-reap`, three callers, 12 sends),
-2026-07-26 (`skill-stickiness`, three times). See "Occurrences".
+2026-07-26 (`skill-stickiness`, three times), 2026-07-30 (`land-review-json`, 3 of 4 reviewer
+seeds — the measurement that settles the shape). See "Occurrences".
 
 ### Symptom
 
@@ -666,17 +908,43 @@ Both fail the same way. There is also a rarer third mode where the send lands **
 and the composer stays empty (see Occurrences, `mcp-endpoint` case 1) — the payload is dropped
 outright while the command still reports success.
 
-### Root cause — not established
+### Root cause — not established, but its SHAPE is: a race
 
-Unknown. Two plausible-sounding explanations have been **ruled out** by evidence; do not fix
-against either.
+Unknown in mechanism. What is established is that it is **non-deterministic** — the same
+`phase send` code path, against four panes of the same backend, with payloads within **26 bytes**
+of each other, succeeded once and failed three times (2026-07-30, `land-review-json`; see
+Occurrences). Nothing about the *payload* predicts the outcome, so no fix may be predicated on
+one. That rules out an entire family of explanations at once, including the two below.
+
+Three plausible-sounding explanations have been **ruled out** by evidence; do not fix against
+any of them.
 
 - **Not payload size, and not a bracketed-paste commit failure.** Three sends of a few hundred
   bytes each failed on 2026-07-26, none rendering as a paste. Whatever fails, fails for inline
   text too. Independently confirmed from the other direction on run `phase-reap`: an **8-line**
   payload failed while rendering *as* a collapsed paste (`❯ [Pasted text #3 +8 lines]`), against
   the 6586-byte / 124-line payload previously recorded. Neither size nor rendering predicts it —
-  any fix predicated on "large bracketed paste" will miss this.
+  any fix predicated on "large bracketed paste" will miss this. The 2026-07-30 four-pane
+  measurement closes this off from the third direction: the pane that *worked* was neither the
+  largest nor the smallest of the four.
+- **Not cursor's "Workspace Trust Required" modal.** This is the most attractive wrong answer,
+  because the modal is real and it does swallow prompts — but it is not what happens here, and a
+  fix aimed at it makes things worse. Disproved three ways on 2026-07-30:
+  1. **`--trust` does not exist on the interactive path.** `cursor-agent --mode plan --trust
+     --workspace <dir>` exits immediately with `Error: --trust can only be used with
+     --print/headless mode`; in the bundle the flag is read only inside a headless-only branch.
+     Adding it to drovr's launch **breaks the launch outright**. Do not add `--trust` anywhere.
+  2. **Inherited trust makes the modal a non-event for drovr worktrees.** A fresh directory with
+     no trusted ancestor *does* show the modal, so the mechanism is genuine — but
+     `~/.cursor/projects/home-sauyon-devel/.workspace-trusted` is dated **2026-04-28**, months
+     before the first of these reports, and descendants inherit it. A launch into the real
+     worktree `.drovr/wt/land-mcp-findings` shows **no modal** and lands straight in the composer.
+  3. **No modal was present in any observed failure.** All four 2026-07-30 reviewer panes sat at
+     an ordinary composer with the text visibly pasted into it.
+
+  Related, and equally out of scope: drovr must **not** write cursor's `.workspace-trusted`
+  marker itself. That means reimplementing cursor's private directory-slug algorithm in order to
+  grant trust on the user's behalf — not obviously right, and not this bug.
 - **Not the `drovr phase send` CLI entry point.** Run `phase-reap` reproduced it from three
   different callers, including `code_review.rs`'s reviewer spawn, so the failure is in
   `phase::phase_send` itself (and therefore `agent_send` → socket `agent.prompt`). See
@@ -724,6 +992,30 @@ pane — that is the only thing that distinguishes them. This bug is invisible f
 it was caught both times only by reading the pane directly.
 
 ### Occurrences
+
+**2026-07-30, run `land-review-json`, workspace `wC1`** — one `code-review` panel spawning four
+cursor reviewers, i.e. four `phase_send` calls a few seconds apart into four freshly-spawned
+panes of the same backend. This is the measurement that establishes the shape:
+
+| Pane | Angle | Seed | Submitted itself? |
+|---|---|---|---|
+| `wC1:p2` | correctness | 2701 B / 61 lines | **No** — sat as `→ [Pasted text #1 +62 lines]` |
+| `wC1:p3` | security | 2677 B / 61 lines | **No** |
+| `wC1:p4` | error-handling | 2703 B / 61 lines | **Yes** |
+| `wC1:p5` | type-design | 2680 B / 61 lines | **No** |
+
+Same day, a **claude** pane took a ~1.2 KB `phase send` and **self-submitted** — `agent_status:
+working` within 4s.
+
+Read it carefully, because it constrains any fix:
+
+- The four seeds span **26 bytes**. The one that submitted was neither the largest nor the
+  smallest. So the failure is not a function of the payload — **it is a race**, and a single
+  green run proves nothing. Any change here has to be exercised repeatedly, on cursor, until
+  both branches have been seen.
+- It is not backend-determined either: claude self-submits, and has been observed to *not*
+  self-submit on a large paste (`phase-reap`, case 2). Cursor is merely the far worse offender.
+- None of the four panes showed a trust modal or any other dialog. See "Root cause".
 
 **2026-07-25, run `mcp-endpoint`, pane `wAC:p1`** — installed nix-profile binary, 6586-byte /
 124-line briefing:
@@ -778,6 +1070,58 @@ renderings.
    measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
    it gave up".
 
+### Status: the false SUCCESS is FIXED 2026-07-30 (branch `drovr/fix-phase-send`)
+
+`phase_send` no longer treats `agent.prompt` returning as proof of delivery. It uses that call's
+native `wait` option (`until: [working, done]`) and returns `Ok` only when herdr **observed the
+agent start**; `agent_prompt_stalled` / `timeout` mean the payload did not take. On a stall it
+reads the pane for positive evidence the payload is in the composer — a `[Pasted text …]`
+placeholder or a verbatim prefix of its first line, in the last 8 non-empty lines, and required
+to have APPEARED across the prompt. Evidence → one `enter`, then re-confirm. No evidence
+(including a pane that cannot be read) → raise, never guess. See `cli/src/phase.rs`
+(`phase_send`, `pane_shows_payload`) and `Herdr::agent_prompt_confirm`.
+
+This does not stop the underlying race — it stops the **silent** failure. A send that does not
+take now exits 2 with a message naming which failure it was, instead of exiting 0.
+
+Verified live 2026-07-30 on herdr 0.7.5, all four branches:
+
+| Branch | How it was reached | Result |
+|---|---|---|
+| Healthy self-submit | 8 fresh cursor panes + 7 fresh claude panes, ~4 KB seed; plus one 77 KB payload | exit 0 in 0–1s, every agent ran and answered |
+| Stall → nudge → OK | claude, 77 KB, confirm deadline shortened to 250 ms to force the stall | `herdr agent send-keys <pane> enter` issued, then exit 0 |
+| Swallowed → raise | a cursor pane that dropped the payload outright (composer empty) | exit 2, **no keystroke** |
+| Parked on a menu → raise | claude parked on the `/model` picker, `❯ 2.` highlighted, "Enter to set as default" | exit 2, **no keystroke** |
+
+The no-keystroke claims are not inferred from the message: `drovr` was run with a logging
+`herdr` wrapper first on `PATH`, which recorded every CLI invocation. `agent_send_keys` is the
+only thing that shells the CLI, so an empty log is proof. A positive control (`herdr agent
+send-keys <pane> esc`) confirmed the wrapper records what it is meant to.
+
+### Still open: `until` is a LEVEL, not an edge
+
+Measured 2026-07-30 against herdr 0.7.5, and there is no API option for the other behaviour
+(`AgentPromptWaitOptions` is only `{until, timeout_ms}`). `agent.wait` on a pane that is
+*already* in one of the `until` states returns in **0.0s** with success, without observing any
+transition. On a pane that is not, it blocks the full deadline and answers `timeout` — so the
+wait works; it just cannot distinguish "started because of my prompt" from "was already going".
+
+So the guarantee is exactly: **if the pane was `idle` when the prompt went out, `Ok` means herdr
+saw it start.** That is the normal case — a freshly-spawned agent, or a re-entry into one parked
+at its composer. Two narrow cases fall outside it:
+
+- pane already `working` — `wait_agent_ready` admits `working`, so this is reachable when a send
+  targets a busy agent. `Ok` there proves nothing about this payload.
+- pane already `done` — very narrow, because `done` is momentary (see the EDGE entry below): an
+  agent parked at its prompt reads `idle`, so the driver's post-`phase wait` re-entry send
+  almost always lands on `idle`.
+
+Deliberately NOT worked around. The fix would be to have the readiness gate release only on
+`idle`, which changes what `phase send` does to a busy agent, and the alternative — juggling the
+`until` set against the pre-prompt status — has its own failure mode (a turn short enough that
+the transition is missed reads as a stall, and raises on a send that worked). Documented rather
+than papered over.
+
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
 **Severity:** medium (every fresh agent in a project with an MCP server stalls at spawn until
@@ -815,6 +1159,23 @@ The **answering** half is done: `POST /api/runs/<run>/keys` (`{"keys":["3","ente
 `Herdr::agent_send_keys` → `herdr agent send-keys`, wired to an Enter/Esc/↑/↓/1–5 key row in the
 Live-session panel, so a parked agent can be cleared from the browser without attaching.
 (Route: `cli/src/review.rs:524` → `handle_post_keys`.)
+
+### Worse than a stall: `agent.prompt` can ANSWER an unclassified menu
+
+**Re-measured 2026-07-30, herdr 0.7.5**, and this is the part drovr cannot fix. A prompt
+delivered into a menu herdr never classified as `blocked` does not merely get swallowed — it can
+dismiss the menu and **accept the highlighted option**, inside `agent.prompt`, before drovr sees
+anything.
+
+Reproduced deterministically on claude's `/model` picker (a stand-in for the MCP approval, and
+easier to arm): pane parked with `❯ 2. Opus (1M context)` highlighted and `Enter to set as
+default` on screen, reporting `agent_status: idle`. One `agent.prompt` of an ordinary briefing
+later, the menu was gone and the status line read the option that had been highlighted. No key
+was sent by drovr — verified with a logging `herdr` wrapper on `PATH`, empty log.
+
+`phase_send`'s refusal to nudge protects the keystroke it controls, and it correctly reports the
+seed as undelivered. It cannot protect the one herdr issues. Closing this needs pre-send blocker
+detection, i.e. the manifest rules below — it lives **outside** this repo.
 
 The **detection** half is still open, re-confirmed 2026-07-25: no file under
 `~/.local/state/herdr/agent-detection/remote/` — `claude.toml` included — matches "mcp", so
@@ -859,6 +1220,78 @@ Make `review wait` treat a transient connect failure as retryable (re-run `ensur
 resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
 exit.
 
+## herdr's `agent_status: done` is an EDGE, not a level — FIXED 2026-07-27
+
+**Severity:** was high — a reviewer that did everything right hung its panel forever.
+**Found:** 2026-07-27, running the round-2 review panel for `land-mcp-findings`.
+
+### Symptom
+
+Four cursor reviewers all delivered valid findings files. The panel reported *"3 of 4 angles
+finished; still waiting on error-handling"* and timed out (exit 2) on two consecutive runs,
+with `branch-review-2-error-handling.json` sitting complete and parseable on disk the whole
+time. `state.json` had that angle `Running`; the other three `Done`.
+
+### Cause
+
+herdr reports `agent_status: "done"` for only a moment as a turn ends; an agent parked at its
+prompt reports `"idle"`. All four finished panes read `idle` when inspected afterwards. The
+panel's completion test was `done_marker exists || agent_status == Done`, and the marker never
+fires for reviewers — their seed forbids `drovr phase done` (confirmed: zero `.done` files in
+the run dir). So the only signal was that momentary edge. Three angles were polled while it
+was showing; the fourth was not, and no later poll could ever recover it. On resume, the
+banking branch was gated on `status == Done`, so a stuck `Running` angle could not be rescued
+by its own file either. Two gates, both asking the pane, both unrecoverable once missed.
+
+### Fix
+
+Completion is the artifact. A parseable `<task>-review-<iter>-<angle>.json` finishes the
+angle at both gates, whatever the pane says (`code_review::delivered_review`). herdr is now
+consulted for exactly one question the artifact cannot answer: has a reviewer finished
+*without* delivering? The server's write is atomic (temp + rename) so a file in flight cannot
+be read as a delivery.
+
+### Not affected: ordinary phases
+
+`phase.rs` uses `agent_status` for readiness and blocked-detection, never for completion —
+a phase agent completes by running `drovr phase done`, which drops the marker the wait polls.
+Only the review panel depended on the edge, because only reviewers are told not to run it.
+
+## `main` is not `cargo fmt` clean, and formatting one file reformats the whole crate
+
+**Severity:** medium — the last branch that got this wrong had to be rebuilt from scratch
+(`land-mcp-findings` exists only because of it).
+**Found:** 2026-07-27, formatting three files during `land-mcp-findings`.
+
+### The trap
+
+`cargo fmt --check` is dirty on `main` itself — currently `cli/src/herdr.rs`, `phase.rs`,
+`reflex.rs`, `review.rs`, `run.rs` and `cli/tests/web_nav.rs`. So "run `cargo fmt` before
+committing" sweeps ~450 lines of unrelated churn into your branch, which then collides with
+whatever else lands on `main`. That is exactly what forced `drovr/fix-review-json` to be
+replayed rather than merged.
+
+**And the obvious workaround does not work.** `rustfmt cli/src/main.rs` does *not* format
+one file: rustfmt follows `mod` declarations from the crate root, so naming `main.rs`
+reformats every module it reaches. Naming a leaf module (`cli/src/code_review.rs`) is
+likewise a crate-root entry for rustfmt's purposes if it is reachable. The sweep is silent —
+the command prints nothing.
+
+### What to do
+
+1. Check whether the debt is yours before touching it:
+   `git show main:<file> > /tmp/c.rs && rustfmt --edition 2024 --check /tmp/c.rs`.
+   Clean → your edit introduced it, fix it. Dirty → it is main's; leave it.
+2. After any `rustfmt`/`cargo fmt`, **`git diff --stat` before staging** and
+   `git checkout --` every file you did not otherwise change.
+3. Never `git add -A` a tree you have just formatted.
+
+### Fix
+
+Land one formatting-only commit on `main` that makes the tree clean, so `cargo fmt` becomes
+a no-op for everyone and this whole hazard disappears. It has not been done because such a
+commit conflicts with every branch in flight — it needs a quiet moment, not a fix.
+
 ## Test suite flakes under parallel `cargo test`; needs `--test-threads=1`
 
 **Severity:** low (green when run serially; false failures otherwise).
@@ -886,6 +1319,36 @@ CI workflow at all, so nothing enforces it today.)
 
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
+
+### A second, distinct flake: `lock_records_our_pid_and_releases_on_drop` (2026-07-26)
+
+`review::tests::lock_records_our_pid_and_releases_on_drop` (`cli/src/review.rs:2311`) fails
+intermittently at `cli/src/review.rs:2326` with `released lock must be free` — `try_take_lock`
+returns `Ok(None)` (WouldBlock) for a lock the test just dropped.
+
+**It is NOT the env-pollution cause above**, despite also being parallelism-only. The test
+locks `tmp.path().join("server.pid")` under a `tempfile` root and never reads `XDG_DATA_HOME`,
+so no other test can name that path — its own doc comment (`cli/src/review.rs:2306-2309`)
+already claims immunity to the env flake, and that claim holds. Something else releases late.
+
+Measured 2026-07-26 on `52db1cd`:
+
+| how it was run | result |
+|---|---|
+| the `lock_*` tests alone, 25 consecutive runs | 25/25 green |
+| the whole `--bin drovr` suite, 12 consecutive runs | **1/12 red** |
+| nix sandbox build of `52db1cd` (`home-manager switch`) | red once, green on immediate retry |
+
+**Hypothesis, not yet confirmed:** an fd inheritance window. `flock(2)` locks belong to the
+open file description, which survives `fork`, so a concurrently-spawning test (several here
+start real servers) transiently holds an inherited copy of this fd between its `fork` and its
+`exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops it at `exec` — which is
+exactly why the window is narrow and the failure rare. Confirming it means tracing whether the
+red runs coincide with a process spawn; that has not been done.
+
+**Cost:** it fails the nix build, so it can break `home-manager switch` for an unrelated
+change. A retry is the workaround — the failure does not reproduce twice in a row. Note this
+means a *green* nix build is not evidence the test is sound.
 
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
@@ -1153,7 +1616,14 @@ the error names the whole phase name, which is where the offending angle is visi
 
 ### Symptom
 
-`cmd_cleanup` (`cli/src/main.rs`) now writes `state.json` to set `archived: true`. `RunState::save`
+Two writers now do load-modify-save on `state.json` without locking. `cmd_cleanup`
+(`cli/src/main.rs`) sets `archived: true`; so does `handle_archive`
+(`cli/src/review.rs`), the review server's archive endpoint. The endpoint's window is the
+more reachable of the two: the server is multi-threaded and the endpoint is a button a human
+can press mid-phase, whereas `cleanup` is a one-shot command. Both re-read immediately before
+writing to narrow the window; neither closes it.
+
+`cmd_cleanup` (`cli/src/main.rs`) writes `state.json` to set `archived: true`. `RunState::save`
 (`cli/src/run.rs`) is a whole-file `fs::write` with no locking, no read-modify-write and no
 version check, so a `drovr phase ...` running in a still-live pane can have its status write
 silently reverted.
@@ -1184,6 +1654,315 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
+## The session list rebuilds via `innerHTML` every 2s, which is what makes rows "vanish"
+
+**Severity:** low as shipped (the symptoms are fixed), but it is the root of a whole bug class.
+**Found:** 2026-07-25, design review after the archive button.
+
+`renderRunList` (`cli/web/index.html`) replaces `#run-list-items` wholesale on every 2s poll.
+Every row element is therefore destroyed and recreated constantly, so anything the user has
+"on" a row — the keyboard cursor, DOM focus — has to be re-derived from scratch each time.
+
+That is why the cursor needs `navCursorKey`, `knownRunNames` and `listFetchSeq` to tell "this
+row is hidden" from "this run is gone", and why five review rounds went into that one
+function. The archive button did not introduce the fragility; it made it reachable, by being
+the first thing that removes a row out from under the poll while the reviewer is looking at
+it (archive/restore, and liveness flapping a row into and out of the collapsed group).
+
+It is also why real Tab focus on a row control is destroyed on the next tick — pre-existing,
+and now slightly worse with a second focusable control per row.
+
+### Fix idea
+
+Diff and patch rows instead of rebuilding: keyed by run name, update in place, add/remove only
+what changed. The cursor's element then simply persists and the entire hidden-vs-gone question
+disappears, along with the state that answers it. This is a rewrite of `renderRunList` — it has
+to preserve `<details>` open state, filter state and the delegated button listener — so it
+wants to be done deliberately, not folded into a feature branch.
+
+## Zombie detection goes quiet while herdr is unreachable
+
+**Severity:** low (transient and self-healing), but it is a deliberate trade rather than a fix.
+**Found:** 2026-07-25, round-six review of the archive button.
+
+An archived run whose `workspace_close` failed is a *zombie*: filed away while an agent may
+still be running in panes we believe we shut. `list_runs_json` (`cli/src/review.rs`) keeps such
+a row out of the collapsed "Completed" group so it stays visible.
+
+That detection is `archived && live == Some(true)`. When `herdr workspace list` fails, `live`
+is `None` for every row, no run is judged a zombie, and a genuine one collapses into the group
+with no warning.
+
+### Why it is not `live != Some(false)`
+
+Treating unknown as live would stamp "panes still live" on **every** archived run on any herdr
+blip — false alarms on a claim we cannot support, which is how a warning stops being read.
+The archive *confirm* does treat unknown as live (`cli/web/index.html`), and that asymmetry is
+intentional: the confirm gates a destructive act, where being wrong means killing a live agent.
+
+The residual is bounded: the next successful poll surfaces the zombie again, and the list
+header shows a "could not reach herdr — liveness unknown" banner so the grouping is not read
+as verified.
+
+### Fix ideas
+
+1. Cache the last known-good `workspace_list` result and fall back to it, so a blip does not
+   erase liveness at all — with an age limit, since stale liveness is its own lie.
+2. Or have `handle_archive` record `workspace_closed: false` durably in `state.json`, making a
+   zombie a fact about the run rather than something re-derived from herdr on every poll.
+   (2) is the stronger fix: it survives herdr being down entirely.
+
+## Restoring an archived run does not make it runnable again
+
+**Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
+expectation.
+**Found:** 2026-07-25, re-reviewing the archive button.
+
+`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — clears the flag
+and moves the row back to the active list. It cannot bring the agent back: archiving closed
+the run's herdr workspace, and nothing recreates one. `phase_start` (`cli/src/phase.rs`) only
+reuses a recorded `pane_id`, then `root_pane`, then `tab_create` against the run's existing
+`workspace` id; all three are dead after a close, and the only code that creates a workspace
+is `cmd_new`. So `drovr phase start` on a restored run fails.
+
+One exception, and it is exactly the row the UI flags as anomalous: a ZOMBIE — archived while
+`workspace_close` failed — still has a live workspace and live panes recorded. Restoring one
+and running `drovr phase start` should reuse them and work. The blanket "restore does not make
+it runnable" is therefore wrong for the one case where the run was never really torn down.
+
+The run's artifacts survive (spec, handoffs, branch), so the work is not lost — but continuing
+it means a new run seeded from the handoff, not a restore.
+
+### Fix ideas
+
+1. Have `phase_start` create a fresh workspace when the recorded one is gone, and write the new
+   id back to `state.json` — makes Restore mean what it looks like it means.
+2. Or rename the control to something that does not imply resumability, and have it clear
+   `workspace`/`root_pane`/`pane_id` so the failure is a clean "no workspace" error rather than
+   a herdr rejection.
+
+## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
+
+**Severity:** low on loopback, medium once `serve_host` leaves it.
+**Found:** 2026-07-25, reviewing the archive button.
+
+### What IS guarded
+
+`handle` refuses any `POST` whose `Host` is not an address this server actually bound, and
+then any whose `Origin` is cross-origin or opaque (`write_allowed`, `cli/src/review.rs`). The
+`Host` check is the load-bearing one: comparing `Origin` to `Host` alone is defeated by DNS
+rebinding, since a browser derives both from the same attacker-controlled URL. That closes the drive-by case: a page the user happens to visit can no
+longer make their browser POST `/api/runs/<run>/archive` and close a live herdr workspace,
+nor `/send` into a live pane, nor `/submit` a spec decision. Browsers always attach `Origin`
+on a cross-origin request and script cannot suppress it; curl and drovr's own CLI send none
+and are unaffected.
+
+### What is NOT guarded
+
+There is still no authentication of any kind. Anything that can open a TCP connection to the
+port can do everything — the `Origin` check constrains *browsers*, and a non-browser client
+simply omits the header. This matters because `serve_host` is documented as configurable
+beyond loopback (`cli/src/config.rs`; the Tailscale/LAN case is called out in `display_addr`).
+On a shared or untrusted network that is a full remote-control surface: close workspaces,
+type into live agent panes, approve or cancel specs.
+
+### Fix ideas
+
+1. A bearer token in the data dir, required on every write and handed to the page at load.
+   Cheap, and makes a non-loopback bind honest.
+2. Refuse to bind a non-loopback host unless such a token is configured — the bind guard
+   already sketched in the `mcp-endpoint` run's spec.
+3. (2) is the smaller change and prevents the dangerous configuration outright; (1) is what
+   would make serving across a tailnet actually usable.
+
+## `serve --port 80` locks the reviewer out of every write button
+
+Found 2026-07-26 during review of the archive button. Not fixed — narrow, and it fails closed.
+
+`allowed_hosts_for` (`cli/src/review.rs`) always builds its candidates as `"{host}:{port}"`.
+Browsers omit the port from the `Host` header, and from `location.origin`, when it is the
+scheme's default — 80 for plain HTTP, which is all this server speaks. Bind with `--port 80`
+(needs root or `setcap`, so this is unusual but not impossible for a memorable local URL) and
+every browser request arrives as `Host: <host>` with no `:80`, matching no allowed host. Every
+POST 403s, including from the server's own same-origin page. `wildcard_ip_host` does not
+rescue it: a portless `Host` never matches there either.
+
+Fix shape: when the bound port is 80, also accept the bare host. Left undone because the
+failure is loud, immediate, and safe — nothing is exposed, the buttons simply stop working.
+
+## `save_preserving_archived` rescues one field, and only that field
+
+Found 2026-07-26. Working as designed; recorded so the limit is not mistaken for a guarantee.
+
+`RunState::save_preserving_archived` (`cli/src/run.rs`) re-reads `archived` from disk and
+carries it forward, so a command holding a long-stale state cannot un-archive a run. Every
+*other* field is still written from the snapshot the caller loaded, which for
+`code-review run` or `phase wait` can be the full timeout ago. A concurrent writer touching
+`phases`, `cursor`, `workspace` or `root_pane` in that window is still silently lost. Only
+`archived` is rescued because it is the one field a *different* process sets while we hold
+our copy; the general fix is the compare-and-swap or lockfile already proposed above for the
+`state.json` clobber window.
+
+Two consequences worth knowing:
+
+1. The `|=` merge (rescue false→true, never true→false) is deliberately defensive but
+   currently unreachable: every caller reaching it has `archived == false` in memory, because
+   `code_review_run` refuses archived runs up front. Changing it to `=` passes the whole
+   suite. It is kept as `|=` because a future writer that legitimately holds `true` should
+   not have it cleared, but no test defends that and none can until such a writer exists.
+2. The re-read swallows a load error (`if let Ok(disk)`), then `save` does `create_dir_all`.
+   If `drovr cleanup --purge` deletes the run directory while a review is blocked, the
+   eventual save recreates a `state.json` for a run the human explicitly deleted. This
+   predates the change — plain `save` always did this — but it is now reachable from two more
+   writers.
+
+## `GET /api/runs` now spawns a herdr subprocess on every poll
+
+Found 2026-07-26. Accepted, not fixed.
+
+The list endpoint calls `SystemHerdr::workspace_list()`, which shells `herdr workspace list`.
+The page polls that endpoint every 2s while the session list is open, so each open tab spawns
+a subprocess every 2 seconds for as long as it is open. Before this branch the endpoint was
+pure filesystem reads.
+
+It buys the liveness column, the zombie warning, and the archive confirm — all of which need a
+fresh answer, and one call answers for every run at once (the per-run alternative is a herdr
+round trip per row). Left as is because the cost is small and bounded per tab, but it is worth
+knowing before leaving a review page open for hours, and it mildly amplifies the documented
+"no authentication" surface: GETs are not covered by the write guard, so a page in the same
+browser can drive that spawn loop.
+
+## Archive/restore failures are reported only to the browser console
+
+Found 2026-07-26. Not fixed.
+
+`toggleArchive` (`cli/web/index.html`) returns silently on both failure paths — a non-OK
+response and a thrown fetch — logging only via `console.error`. The button is not disabled or
+spun while the request is in flight either, so "still working", "failed", and "nothing
+happened" are indistinguishable to the reviewer. Reachable today: archiving a run whose
+`state.json` does not parse answers 409, and a run deleted concurrently answers 404. The
+`workspace_closed: false` case is the one failure that does speak up, via an alert.
+
+Fix shape: an inline error on the row, or reuse of the alert path. Left undone because it is
+UI work with no failing behaviour behind it, and this branch was already several rounds deep
+in cursor correctness.
+
+## `code-review run` only checks `archived` at entry
+
+Found 2026-07-26. Deliberate, and narrow; recorded because it is not obvious.
+
+`code_review_run` refuses to start against an archived run, but never re-checks. If the human
+archives mid-review AND the workspace close fails (the zombie case, so the reviewer panes are
+still alive), the review keeps going: it harvests findings and flips `review_phases` to Done
+on a run the UI shows as filed away. Nothing is corrupted and `archived` itself survives (see
+the preserving-save entry), but work continues on a run the human believes they stopped.
+
+A mid-run re-check would need to decide what to do with reviewers already in flight, which is
+a bigger question than this branch should answer.
+
+## `cleanup --purge` can leave a run with a destroyed workspace and `archived: false`
+
+Found 2026-07-26. Pre-existing, not introduced here.
+
+`cmd_cleanup` sets `archived: true` only on the non-purge path. `--purge` closes the workspace
+and then deletes the run directory — so if that delete fails (permissions, a busy file), the
+run is left on disk with its workspace destroyed and `archived` still false. In `/api/runs`
+that is indistinguishable from a normal idle run: `live: false`, `archived: false`, and not a
+zombie, since zombie requires `archived == true`.
+
+Worth noting because the liveness/zombie machinery this branch added exists to surface exactly
+this class of mismatch, and this is the one shape it does not reach.
+
+## The `afterSeq` guard on the archive hand-off is defence in depth, not load-bearing
+
+Found 2026-07-26. Deliberate; recorded so the missing coverage is not read as an oversight.
+
+`renderRunList` resolves a pending archive hand-off only when `seq > pendingAdvance.afterSeq`,
+so that a render whose list was fetched *before* the archive committed cannot answer "did the
+row leave". Removing that condition does not fail any test, and cannot be made to: `seq` is
+bumped at render dispatch, and `toggleArchive` dispatches a render immediately after setting
+`pendingAdvance`. Every older in-flight render is therefore already stale and bails at the
+staleness guard without reaching the resolution point.
+
+It is kept because the redundancy depends on `toggleArchive` continuing to render right after
+setting the flag. If that call is ever moved or removed, the guard is the only thing stopping a
+pre-archive render from answering with stale rows — which strands the cursor exactly as the
+one-shot version did. Do not "simplify" it away, and do not add a test that pretends to cover
+it without first building a seam that can dispatch a paint from an older render.
+
+## `web_nav` has shown a rare, uncharacterised flake
+
+Observed 2026-07-26. NOT fixed, and not fully diagnosed — recorded so the next person to see
+it does not assume it is new.
+
+`cli/tests/web/nav.mjs` shares one page across sections, and several sections trigger actions
+(`press('a')`, clicking Archive) without awaiting the internal promise chain those actions
+start. A later section can therefore be measuring the cursor while an earlier action's render
+is still landing. One instance of this was found and fixed — a check asserting a row had left
+immediately after dispatching a render that can lose the staleness race to `toggleArchive`'s
+own; it now waits for the state it asserts.
+
+After that fix the suite ran 54 consecutive times green. But two failures were seen in the
+first 12-run batch after it, and their output was not captured, so they remain unexplained.
+Do not read a long green streak as proof the class is gone.
+
+A later audit found the most likely cause without reproducing it: three sections asserted a
+NEGATIVE ("the cursor stays on this row") immediately after a single `renderRunList` call.
+Waiting for the expected value is useless there — it is already the current value — so they
+implicitly depended on microtask ordering to have delivered the render, which CPU contention
+can break. All three now wait for the render's observable EFFECT first (the row showing as
+archived, or dropping out of the filtered list) before asserting the cursor. 125 consecutive
+runs green since, including batches under deliberate load. Still not proof.
+
+If it recurs: run with `-- --nocapture` to get the failing check name, and suspect a section
+asserting immediately after `evaluate('renderRunList(...)')` rather than waiting for the
+condition. The durable fix is to make every such section either `reload()` first or wait on
+the state it is about to assert, rather than trusting a render to have painted.
+
+## Only one of the six `save_preserving_archived` sites is redundant
+
+Found 2026-07-26; **corrected 2026-07-26** after a review showed the original analysis was
+wrong. The earlier version of this entry claimed three sites were redundant AND untestable,
+and told the reader not to add coverage. Two of those three were both reachable and testable.
+
+The false claim was that `code_review_run`'s poll loop makes no herdr calls. It does:
+`agent_status` is the fallback the loop consults whenever a reviewer's done-marker is absent,
+every iteration. On a RESUMED pass where every angle is still alive, `spawn_reviewer` is
+skipped entirely — so the poll loop's own calls are the only ones in the pass, and no
+spawn-time save exists to have rescued an in-flight archive first. A human archiving a run
+while a resumed review polls is ordinary use, not an adversarial construction.
+
+Both are now covered, and both fail if reverted to a plain `save`:
+
+- the deadline save — `archiving_during_a_resumed_poll_survives_the_deadline_save`
+- the final save — `archiving_during_a_resumed_pass_survives_the_final_save_too`
+
+That leaves one genuinely redundant site: `cmd_code_review`'s save in `main.rs`. By the time it
+runs, `code_review_run`'s own preserving saves have already re-read the flag into the in-memory
+`RunState`, so a plain `save` there would write the correct value anyway. It stays preserving
+for consistency, and because that redundancy depends on the callee's behaviour rather than on
+anything local.
+
+The lesson worth keeping: "this path cannot be reached" is a claim about code, and it needs
+checking against the code rather than reasoning from the shape of a call graph. The earlier
+entry deleted a real test on the strength of an unchecked one.
+
+## A panicking test can poison `ENV_LOCK` for the whole suite
+
+Found 2026-07-26. Pre-existing, not fixed.
+
+`test_util::ENV_LOCK` serialises tests that mutate process-global env. Almost every consumer
+takes it with `.lock().unwrap()`, so the *first* test that panics while holding it poisons the
+mutex and every later consumer panics on acquisition — one real failure becomes ~90
+misleading ones across unrelated modules, which makes root-causing nearly impossible.
+
+Fix shape: `.lock().unwrap_or_else(|e| e.into_inner())` at every consumer. The `herdr.rs`
+helpers already do this. Not done wholesale here because it is a sweep across five files
+unrelated to this change.
+
+Related: the `SystemHerdr::with_bin` seam exists precisely so herdr's own tests need no env
+mutation at all — injecting the binary path beats locking around a global. Prefer that shape
+for new tests rather than adding another `ENV_LOCK` consumer.
 ## Piping a `wait` command destroys its exit-code contract — a timeout reads as approval
 
 **Severity:** high (the failure is silent and points the wrong way: a *timeout* is

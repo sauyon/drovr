@@ -3,6 +3,7 @@ mod code_review;
 mod config;
 mod findings;
 mod herdr;
+mod mcp_findings;
 mod phase;
 mod reflex;
 mod review;
@@ -132,6 +133,24 @@ enum Commands {
         /// Path to the router skill markdown to inject.
         #[arg(long)]
         skill: PathBuf,
+    },
+
+    /// Serve the review panel's one-tool MCP findings channel on stdio.
+    ///
+    /// Spawned by `code-review run` for each reviewer, never by a human. Reviewers run
+    /// read-only and so cannot write their own findings file; this exposes a single
+    /// `submit_findings` tool and performs that one write for them. The reviewer names
+    /// its angle, which is validated against the configured angles — it can never name
+    /// a path, so its one write always lands inside the run dir.
+    #[command(hide = true)]
+    McpFindings {
+        /// Run whose findings are being collected.
+        run: String,
+        /// Task under review, e.g. `task-3`.
+        task: String,
+        /// Review iteration this panel is serving. Scopes the findings file, so one
+        /// pass can never harvest another's verdicts.
+        iter: u64,
     },
 }
 
@@ -954,10 +973,17 @@ fn cmd_phase(sub: PhaseCmd) {
                 // and a distinct exit code (2) so the driver can escalate rather
                 // than assume the seed landed.
                 if e.kind() == io::ErrorKind::TimedOut {
+                    // ALWAYS print the error itself. It names WHICH of the
+                    // failures happened — never attached, seed swallowed, would
+                    // not submit — and, for the swallowed one, why drovr refused
+                    // to press a key on the user's behalf. `diagnose_stuck_phase`
+                    // is additive context, a pane snapshot, not a replacement
+                    // diagnosis: it used to REPLACE this text, which both lost the
+                    // explanation and asserted the wrong cause, since it phrases
+                    // every verdict as a `phase wait` timeout.
+                    eprintln!("drovr: {e}");
                     if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
-                        eprintln!("drovr: {diag}");
-                    } else {
-                        eprintln!("drovr: {e}");
+                        eprintln!("drovr: pane context — {diag}");
                     }
                     process::exit(2);
                 }
@@ -1463,6 +1489,29 @@ fn main() {
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::McpFindings { run, task, iter } => {
+            // Both reach the filesystem as path components. The panel always supplies
+            // names it has already validated, but this is a write-capable entrypoint
+            // and nothing stops it being invoked directly — so it validates its own
+            // inputs rather than trusting its only intended caller.
+            for (kind, value) in [("run name", &run), ("task", &task)] {
+                if let Err(e) = validate_label(kind, value) {
+                    eprintln!("drovr: mcp-findings: {e}");
+                    process::exit(1);
+                }
+            }
+            let angles = match config::load_config() {
+                Ok(c) => c.angles,
+                Err(e) => {
+                    eprintln!("drovr: mcp-findings could not load config: {e}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, iter, &angles) {
+                eprintln!("drovr: mcp-findings failed: {e}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -2282,6 +2331,31 @@ mod tests {
         assert!(validate_label("task", "a/b").is_err());
         assert!(validate_label("task", "a\\b").is_err());
         assert!(validate_label("task", "").is_err());
+    }
+
+    /// `mcp-findings` turns `run` and `task` into path components, and it is the one
+    /// write-capable entrypoint drovr exposes. It is spawned by the panel with names
+    /// already validated, but nothing stops it being invoked directly, so it must
+    /// enforce the same rule rather than inherit it from its intended caller.
+    #[test]
+    fn mcp_findings_run_and_task_are_the_labels_the_dispatch_validates() {
+        let cmd = Cli::parse_from(["drovr", "mcp-findings", "../escape", "task-1", "2"]);
+        let Commands::McpFindings { run, task, iter } = cmd.command else {
+            panic!("expected McpFindings");
+        };
+        assert_eq!(iter, 2, "the iteration scopes the findings file");
+        // Exactly the checks the dispatch arm applies before serving.
+        assert!(
+            validate_label("run name", &run).is_err(),
+            "a traversing run name must be refused"
+        );
+        assert!(validate_label("task", &task).is_ok());
+        for bad in ["../escape", "a/b", ".."] {
+            assert!(
+                validate_label("task", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
     }
 
     // -- format_progress helper -------------------------------------------------
