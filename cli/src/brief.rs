@@ -427,6 +427,28 @@ pub fn compose_phase_brief(
 /// drift apart about what an unfilled section looks like.
 pub const SCAFFOLD_PLACEHOLDER: &str = "TODO";
 
+/// The seven headings `handoff_scaffold` writes, in order. The completion gate keys on
+/// these: a `## ` line that is not one of them is content, not structure, which is what lets
+/// the gate stop parsing markdown (see `phase::scan_handoff`).
+pub fn scaffold_headings() -> Vec<String> {
+    let body = format!("\n{}", strip_editorial_comment(HANDOFF_TEMPLATE));
+    body.split("\n## ")
+        .skip(1)
+        .map(|s| s.split_once('\n').map_or(s, |(h, _)| h).trim().to_string())
+        .take_while(|h| h != "Authoring rules")
+        .collect()
+}
+
+/// Every line `handoff_scaffold` emits — the header note, the per-section guidance comments,
+/// and the placeholder. A handoff section built only from these is one nobody has written.
+pub fn scaffold_lines() -> Vec<String> {
+    handoff_scaffold()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 /// The empty handoff for a finishing agent to fill in: the fixed seven headings, each
 /// with the template's own guidance as an HTML comment, and nothing else.
 ///
