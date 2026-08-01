@@ -579,7 +579,36 @@ enum HandoffShape {
     Unfilled(Vec<String>),
     /// A fenced block or HTML comment is still open at end of file, so structure and
     /// content cannot be told apart below it.
-    Unterminated(&'static str),
+    Unterminated(Unterminated),
+}
+
+/// Which construct was left open. A closed set rather than a message fragment, so a caller
+/// branches on the state instead of on prose.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Unterminated {
+    Fence,
+    Comment,
+}
+
+impl Unterminated {
+    fn describe(self) -> &'static str {
+        match self {
+            Unterminated::Fence => "fenced code block",
+            Unterminated::Comment => "HTML comment",
+        }
+    }
+}
+
+/// Whether a line outside a fence contributes a BODY.
+///
+/// Blank lines, the scaffold placeholder, and markdown headings are all excluded. Headings
+/// matter because of the column-0 rule: an indented `## Sub` is not a section, but it was
+/// still counted as prose, so a section holding nothing but an indented heading and a
+/// `TODO` read as filled (round 3: correctness, security, type-design).
+fn is_body_line(trimmed: &str) -> bool {
+    !trimmed.is_empty()
+        && trimmed != crate::brief::SCAFFOLD_PLACEHOLDER
+        && !trimmed.starts_with('#')
 }
 
 /// Scan a handoff for `## ` sections that carry no substantive body.
@@ -615,9 +644,14 @@ fn scan_handoff(contents: &str) -> HandoffShape {
                 in_fence = None;
                 continue;
             }
-            // INTERIOR lines are substance; the delimiters themselves are not.
+            // INTERIOR lines are substance; the delimiters themselves are not. The
+            // placeholder is excluded here too — wrapping `TODO` in a fence is not writing
+            // a handoff, and checking it only outside fences made that a bypass (round 3:
+            // correctness + security). Headings ARE content inside a fence, since a fenced
+            // block of markdown or shell comments is authored text.
             if let Some((_, has_body)) = current.as_mut()
                 && !trimmed.is_empty()
+                && trimmed != crate::brief::SCAFFOLD_PLACEHOLDER
             {
                 *has_body = true;
             }
@@ -639,8 +673,17 @@ fn scan_handoff(contents: &str) -> HandoffShape {
             continue;
         }
         if trimmed.starts_with("<!--") {
-            if !trimmed.contains("-->") {
-                in_comment = true;
+            match trimmed.split_once("-->") {
+                // `<!-- guidance --> Shipped it.` — the tail is real prose, and dropping it
+                // refused a section that plainly had content (round 3, nit).
+                Some((_, tail)) => {
+                    if let Some((_, has_body)) = current.as_mut()
+                        && is_body_line(tail.trim())
+                    {
+                        *has_body = true;
+                    }
+                }
+                None => in_comment = true,
             }
             continue;
         }
@@ -657,8 +700,7 @@ fn scan_handoff(contents: &str) -> HandoffShape {
         }
 
         if let Some((_, has_body)) = current.as_mut()
-            && !trimmed.is_empty()
-            && trimmed != crate::brief::SCAFFOLD_PLACEHOLDER
+            && is_body_line(trimmed)
         {
             *has_body = true;
         }
@@ -667,10 +709,10 @@ fn scan_handoff(contents: &str) -> HandoffShape {
     // Unterminated structure means everything below it was misread; say so instead of
     // reporting the sections that happened to be visible above it.
     if in_fence.is_some() {
-        return HandoffShape::Unterminated("fenced code block");
+        return HandoffShape::Unterminated(Unterminated::Fence);
     }
     if in_comment {
-        return HandoffShape::Unterminated("HTML comment");
+        return HandoffShape::Unterminated(Unterminated::Comment);
     }
     if let Some((heading, has_body)) = current
         && !has_body
@@ -1240,6 +1282,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                 ));
             }
             HandoffShape::Unterminated(what) => {
+                let what = what.describe();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -4400,6 +4443,60 @@ mod tests {
         );
 
         phase_done(&run, "plan").expect("prose without headings is a handoff too");
+    }
+
+    /// Round 3, correctness + security: the placeholder check ran only OUTSIDE fences, so
+    /// wrapping `TODO` in a code block passed the gate with zero substance.
+    #[test]
+    fn a_fenced_placeholder_is_still_a_placeholder() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-fenced-placeholder");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n## State\n\n```\nTODO\n```\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains("State"),
+            "quoting the placeholder is not writing a handoff: {err}"
+        );
+    }
+
+    /// Round 3, three angles: the column-0 heading rule made an indented `## ` prose, and
+    /// prose counted as a body — so a section holding only an indented heading and a
+    /// placeholder read as filled.
+    #[test]
+    fn an_indented_heading_is_not_a_body_either() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-indented-heading-body");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n## State\n\n  ## Decisions + rationale\n\nTODO\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains("State"),
+            "a heading is structure, not the section's content: {err}"
+        );
+    }
+
+    /// Round 3 (nit): a line that opened AND closed a comment had its trailing prose
+    /// discarded, refusing a section that visibly had content.
+    #[test]
+    fn prose_after_a_closed_comment_on_one_line_is_a_body() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-comment-tail");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\n<!-- One or two lines. --> Ported the parser; interfaces unchanged.\n",
+        );
+
+        phase_done(&run, "plan").expect("prose after a closed comment is content");
     }
 
     /// Round 2, three angles: opening a fence set `has_body` before any content existed,
