@@ -569,41 +569,53 @@ pub fn spawn_reviewer<H: Herdr>(
     Ok(())
 }
 
-/// Headings of `## ` sections that carry no substantive body, in document order.
+/// What a scan of a handoff found. An empty `Unfilled` list means every section has a
+/// body; it must NOT be the value returned when the scan could not see the sections at all,
+/// which is why `Unterminated` is a separate variant rather than an empty vec (review round
+/// 2: an unclosed fence swallowed every later heading and the gate passed vacuously).
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffShape {
+    /// Sections with no substantive body, in document order. Empty = complete.
+    Unfilled(Vec<String>),
+    /// A fenced block or HTML comment is still open at end of file, so structure and
+    /// content cannot be told apart below it.
+    Unterminated(&'static str),
+}
+
+/// Scan a handoff for `## ` sections that carry no substantive body.
 ///
-/// The first version of this gate asked "is there a line that is exactly `TODO`", which was
-/// the wrong shape twice over (review round 1 on this change):
+/// A body is any line that is not blank, not inside an HTML comment (the scaffold's own
+/// guidance to the author), and not the placeholder. Fenced blocks are tracked so quoted
+/// markdown is content rather than structure — but only their INTERIOR counts as a body:
+/// an empty pair of fences is not something an agent wrote (round 2, three angles: opening
+/// a fence set the flag before any content existed, so `TODO` plus a lone ``` passed).
 ///
-/// * an agent could DELETE the placeholders without writing anything and pass — the same
-///   shape-without-substance the gate exists to catch; and
-/// * a `TODO` line inside a fenced block, in a section full of real prose, was refused —
-///   the gate calling a finished handoff empty at the agent's last action.
+/// Headings must start at column 0. An indented `## ` is an example inside a list or code
+/// sample, not a section, and treating it as one let a phantom heading fracture the model
+/// and refuse a finished handoff (round 2, error-handling + security).
 ///
-/// So the question is now "does this section have a body", where a body is any line that is
-/// not blank, not part of an HTML comment (the scaffold's own guidance), and not the
-/// placeholder itself. Fenced blocks are tracked: their contents count as substance, and
-/// neither a `## ` line nor a `TODO` line inside one is read as structure.
+/// `###` and deeper belong to the enclosing `## ` section.
 ///
-/// `###` and deeper are NOT sections — their content belongs to the enclosing `## ` one.
-///
-/// **Known gap, deliberately not chased:** a section whose body is `TODO: fill this in` or
-/// `- TODO` passes. Separating that from prose that legitimately begins with "TODO" needs a
-/// heuristic, and a heuristic layered under an authoritative gate makes the hole look
-/// closed. The gate catches the shapes the scaffold actually produces.
-fn unfilled_scaffold_sections(contents: &str) -> Vec<String> {
+/// **Known gap, stated rather than patched:** a body of `TODO: fill this in` or `- TODO`
+/// passes. Separating those from prose that legitimately begins with "TODO" needs a
+/// heuristic, and a heuristic under an authoritative gate makes the hole look closed.
+/// Content left inside `<!-- -->` also does not count — the scaffold tells the author to
+/// delete those comments, and an unrendered comment is not a handoff.
+fn scan_handoff(contents: &str) -> HandoffShape {
     let mut unfilled = Vec::new();
     let mut current: Option<(String, bool)> = None;
-    let mut in_fence: Option<String> = None;
+    let mut in_fence: Option<&'static str> = None;
     let mut in_comment = false;
 
     for line in contents.lines() {
         let trimmed = line.trim();
 
-        // Inside a fence nothing is structure, and any non-blank line is substance.
-        if let Some(marker) = &in_fence {
-            if trimmed.starts_with(marker.as_str()) {
+        if let Some(marker) = in_fence {
+            if trimmed.starts_with(marker) {
                 in_fence = None;
+                continue;
             }
+            // INTERIOR lines are substance; the delimiters themselves are not.
             if let Some((_, has_body)) = current.as_mut()
                 && !trimmed.is_empty()
             {
@@ -611,23 +623,19 @@ fn unfilled_scaffold_sections(contents: &str) -> Vec<String> {
             }
             continue;
         }
+        if in_comment {
+            if trimmed.contains("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+
         if let Some(marker) = trimmed
             .starts_with("```")
             .then_some("```")
             .or_else(|| trimmed.starts_with("~~~").then_some("~~~"))
         {
-            in_fence = Some(marker.to_string());
-            if let Some((_, has_body)) = current.as_mut() {
-                *has_body = true;
-            }
-            continue;
-        }
-
-        // HTML comments are the scaffold's guidance to the author, never a body.
-        if in_comment {
-            if trimmed.contains("-->") {
-                in_comment = false;
-            }
+            in_fence = Some(marker);
             continue;
         }
         if trimmed.starts_with("<!--") {
@@ -637,7 +645,8 @@ fn unfilled_scaffold_sections(contents: &str) -> Vec<String> {
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("## ") {
+        // Column 0 only — see the doc comment.
+        if let Some(rest) = line.strip_prefix("## ") {
             if let Some((heading, has_body)) = current.take()
                 && !has_body
             {
@@ -654,12 +663,21 @@ fn unfilled_scaffold_sections(contents: &str) -> Vec<String> {
             *has_body = true;
         }
     }
+
+    // Unterminated structure means everything below it was misread; say so instead of
+    // reporting the sections that happened to be visible above it.
+    if in_fence.is_some() {
+        return HandoffShape::Unterminated("fenced code block");
+    }
+    if in_comment {
+        return HandoffShape::Unterminated("HTML comment");
+    }
     if let Some((heading, has_body)) = current
         && !has_body
     {
         unfilled.push(heading);
     }
-    unfilled
+    HandoffShape::Unfilled(unfilled)
 }
 
 /// Whether `status` (a pane's herdr `agent_status`) means the agent has STARTED
@@ -1195,30 +1213,45 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                 ),
             ));
         }
-        // A scaffolded handoff still holding its placeholders is the empty form wearing
-        // the shape of a handoff: it passes the non-empty check while carrying nothing the
-        // next phase can inherit. `drovr handoff-scaffold` writes one `TODO` per section,
-        // so an unfilled section is exactly that line, still there.
-        let unfilled = unfilled_scaffold_sections(&contents);
-        if !unfilled.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "phase '{phase}' cannot signal done: {} of its handoff {} {} empty — {}. \
-                     Write {} from your own context (nothing else will); if a section \
-                     genuinely has nothing, say so in it (\"None.\"). THEN run \
-                     `drovr phase done`.",
-                    unfilled.len(),
-                    handoff.display(),
-                    if unfilled.len() == 1 {
-                        "section is"
-                    } else {
-                        "sections are"
-                    },
-                    unfilled.join(", "),
-                    if unfilled.len() == 1 { "it" } else { "them" },
-                ),
-            ));
+        // A scaffolded handoff whose sections have no body is the empty form wearing the
+        // shape of a handoff: non-empty by every check, carrying nothing the next phase can
+        // inherit. `drovr handoff-scaffold` writes one placeholder per section; what the
+        // gate asks is whether each section has substance, not whether that word is gone.
+        match scan_handoff(&contents) {
+            HandoffShape::Unfilled(unfilled) if !unfilled.is_empty() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: {} of its handoff {} {} empty — \
+                         {}. Write {} from your own context (nothing else will); if a section \
+                         genuinely has nothing, say so in it (\"None.\"). Text left inside \
+                         `<!-- -->` does not count — delete those comments as you fill each \
+                         section. THEN run `drovr phase done`.",
+                        unfilled.len(),
+                        handoff.display(),
+                        if unfilled.len() == 1 {
+                            "section is"
+                        } else {
+                            "sections are"
+                        },
+                        unfilled.join(", "),
+                        if unfilled.len() == 1 { "it" } else { "them" },
+                    ),
+                ));
+            }
+            HandoffShape::Unterminated(what) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} has an unterminated \
+                         {what}, so everything below it reads as quoted text and drovr cannot \
+                         tell which sections you filled in. Close it, THEN run \
+                         `drovr phase done`.",
+                        handoff.display()
+                    ),
+                ));
+            }
+            HandoffShape::Unfilled(_) => {}
         }
     }
 
@@ -4367,6 +4400,76 @@ mod tests {
         );
 
         phase_done(&run, "plan").expect("prose without headings is a handoff too");
+    }
+
+    /// Round 2, three angles: opening a fence set `has_body` before any content existed,
+    /// so `TODO` plus a lone ``` — or an empty fence pair — passed the gate.
+    #[test]
+    fn an_empty_fence_is_not_a_body() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-empty-fence");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n## State\n\n```\n```\n\n## Next step\n\n```rust\n```\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("State"), "an empty fence pair is not prose: {err}");
+        assert!(err.contains("Next step"), "nor is one with an info string: {err}");
+    }
+
+    /// Round 2, correctness + security: an unclosed fence swallowed every later heading, so
+    /// sections below it never entered the model and the gate passed vacuously.
+    #[test]
+    fn an_unterminated_fence_is_refused_rather_than_passing_vacuously() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-unclosed-fence");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n```\nnever closed\n\n## Next step\n\nTODO\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains("unterminated") && err.contains("fenced code block"),
+            "must name the real problem, not the sections it could not see: {err}"
+        );
+        assert!(err.contains("Close it"), "must say how to escape: {err}");
+    }
+
+    /// The same hole via an unclosed HTML comment.
+    #[test]
+    fn an_unterminated_comment_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-unclosed-comment");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n<!-- note I forgot to close\n\n## Next step\n\nTODO\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("HTML comment"), "{err}");
+    }
+
+    /// Round 2, error-handling + security: an INDENTED `## ` — an example inside a list or
+    /// sample — was parsed as a real heading, fracturing the section model and refusing a
+    /// finished handoff at the agent's last action.
+    #[test]
+    fn an_indented_heading_is_an_example_not_a_section() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-indented-heading");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nship it\n\n## State\n\nThe scaffold emits:\n\n    ## Phantom\n\n\
+             and we fill it in.\n",
+        );
+
+        phase_done(&run, "plan")
+            .expect("an indented heading must not fracture a filled section");
     }
 
     /// Review round 1 (nit): an unreadable handoff was reported as "missing or empty",

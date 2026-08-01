@@ -419,9 +419,12 @@ pub fn compose_phase_brief(
     Ok(brief)
 }
 
-/// The placeholder `handoff_scaffold` writes as each section's body, and the exact string
-/// `phase_done`'s completion gate looks for. Shared so the writer and the checker cannot
-/// drift apart.
+/// The placeholder `handoff_scaffold` writes as each section's body.
+///
+/// `phase_done`'s gate does NOT ask whether this string is gone — it asks whether each
+/// section has a body, and this line is one of the things that does not count as one
+/// (alongside blank lines and HTML comments). Shared so the writer and that checker cannot
+/// drift apart about what an unfilled section looks like.
 pub const SCAFFOLD_PLACEHOLDER: &str = "TODO";
 
 /// The empty handoff for a finishing agent to fill in: the fixed seven headings, each

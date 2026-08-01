@@ -2,3 +2,5 @@ target/
 .superpowers/
 cli/config.json
 result
+# drovr run worktrees, including the ones the e2e tests create under cli/
+.drovr/
