@@ -474,6 +474,35 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## "Read-only" reviewers can still mutate repo state through drovr itself (2026-07-31)
+
+**Severity:** low, but it leaks into the repo and into `git worktree list`.
+
+Reviewers run under a read-only flag (`cursor --mode plan`, `claude --permission-mode plan`),
+which stops them EDITING files. It does not stop them running commands, and the seed explicitly
+invites them to "run the tests". A reviewer verifying `drovr phase done`'s handoff gate did the
+natural thing and exercised it end to end:
+
+```
+drovr new gate-test --worktree     # …and gate-test2 … gate-test5, across two rounds
+```
+
+Each of those created a real git worktree under the *driver's* checkout (`cli/.drovr/wt/gate-testN`,
+because the reviewer's cwd was `cli/`) plus a branch `drovr/gate-testN`, registered in the shared
+repo. They then showed up as embedded git repositories in the driver's next `git add -A`, and were
+nearly committed.
+
+**So:** read-only bounds the editor, not the process. Anything a reviewer can invoke — drovr
+included — runs with the driver's permissions.
+
+**Mitigations in place:** `.drovr/` is now in `.gitignore`, so a leaked worktree cannot be staged
+by accident. Check `git worktree list` after a review round and remove strays
+(`git worktree remove <path>` + `git branch -D drovr/<name>`); they are clean by construction, so
+removal is safe.
+
+**Worth considering:** the reviewer seed could tell reviewers to exercise drovr against a scratch
+directory (`--dir "$(mktemp -d)"`) rather than the checkout under review.
+
 ## A phase agent can plant its own `<phase>-context.md` (2026-07-27)
 
 **Severity:** medium — it is a back door around "drovr composes every brief", the whole point of
