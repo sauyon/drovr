@@ -419,6 +419,11 @@ pub fn compose_phase_brief(
     Ok(brief)
 }
 
+/// The placeholder `handoff_scaffold` writes as each section's body, and the exact string
+/// `phase_done`'s completion gate looks for. Shared so the writer and the checker cannot
+/// drift apart.
+pub const SCAFFOLD_PLACEHOLDER: &str = "TODO";
+
 /// The empty handoff for a finishing agent to fill in: the fixed seven headings, each
 /// with the template's own guidance as an HTML comment, and nothing else.
 ///
@@ -445,7 +450,7 @@ pub fn handoff_scaffold() -> String {
             break;
         }
         out.push_str(&format!(
-            "\n## {}\n\n<!-- {} -->\n\nTODO\n",
+            "\n## {}\n\n<!-- {} -->\n\n{SCAFFOLD_PLACEHOLDER}\n",
             heading.trim(),
             guidance.trim().replace("\n", " ")
         ));
