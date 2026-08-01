@@ -569,74 +569,79 @@ pub fn spawn_reviewer<H: Herdr>(
     Ok(())
 }
 
-/// Scan a handoff for scaffolded sections nobody wrote anything into.
+/// What a handoff scan concluded. Two rules, no markdown model.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffShape {
+    /// Nothing beyond what drovr itself wrote: the agent never touched the scaffold.
+    Untouched,
+    /// Sections still holding the placeholder, by heading (or an empty vec if none).
+    Placeholders(Vec<String>),
+}
+
+/// Decide whether a handoff was actually written, WITHOUT parsing markdown.
 ///
-/// Rounds 1-4 of review on this gate produced six bypasses and three false refusals, every
-/// one of them at the seams of a markdown parser that kept growing: fence state, comment
-/// state, chained comments, indented headings, `#`-led lines. The parser was the problem —
-/// each special case interacted with the last.
+/// Five rounds of review on a per-section body model produced seven bypasses and four false
+/// refusals — fence state, comment state, chained comments, indented headings, `#`-led
+/// lines, then verbatim guidance matching and heading-presence. Each fix's seams became the
+/// next round's findings. The lesson is that "did this section receive substance" is not
+/// decidable from markdown by any rule simple enough to be correct.
 ///
-/// So it does not parse markdown any more. drovr WRITES the scaffold, so it knows exactly
-/// what an unfilled section looks like, and the rule is stateless:
+/// So the gate stops trying, and asks two things it CAN answer exactly:
 ///
-/// * a `## ` line at column 0 opens a section **only if its text is one of the scaffold's
-///   own headings** — anything else is content, so a quoted or invented heading cannot
-///   fracture the model (no fence tracking needed to protect against it);
-/// * a section is unfilled when every line in it is one drovr itself emitted: blank, the
-///   placeholder, one of the scaffold's guidance comments verbatim, a bare fence delimiter,
-///   or a heading line repeating a scaffold heading at any indentation.
+/// 1. **Is the file nothing but what drovr wrote?** Every non-blank line appears in
+///    `handoff_scaffold()`'s output. That is the accident this gate exists for — scaffold,
+///    forget, signal done.
+/// 2. **Does any line still read exactly `TODO`, at column 0?** That is the placeholder
+///    drovr wrote, still sitting where a section's content belongs. An indented one is
+///    quoted text, which also makes indenting the escape from a false positive.
 ///
-/// Everything else counts as something the agent wrote.
+/// Both are cheap, neither can misread structure, and every refusal is escapable by editing
+/// the line the message names.
 ///
-/// **Known gaps, stated rather than patched:** a body of `TODO: fill this in`, or a lookalike
-/// with a non-ASCII character, is content by this rule. Separating those from prose needs a
-/// heuristic, and a heuristic under an authoritative gate makes the hole look closed.
-fn scan_handoff(contents: &str) -> Vec<String> {
+/// **What this deliberately does NOT catch**, because five rounds showed the cost of trying:
+/// an agent that fills one section and deletes the other six blocks; a body of
+/// `TODO: fill this in`, or a lookalike using non-ASCII characters. An agent set on evading
+/// the gate can; the gate is here for the one that forgot. `drovr collect` shows the next
+/// phase exactly what it inherited, which is the real check on a thin handoff.
+fn scan_handoff(contents: &str) -> HandoffShape {
+    let scaffold = crate::brief::scaffold_lines();
     let headings = crate::brief::scaffold_headings();
-    let scaffold: Vec<String> = crate::brief::scaffold_lines();
 
-    let is_scaffold_line = |trimmed: &str| -> bool {
-        trimmed.is_empty()
-            || trimmed == crate::brief::SCAFFOLD_PLACEHOLDER
-            || scaffold.iter().any(|s| s == trimmed)
-            || trimmed.starts_with("```")
-            || trimmed.starts_with("~~~")
-            // A heading line repeating a scaffold heading at any indentation is structure,
-            // not a body — that is the indented-`## Decisions` bypass, closed narrowly
-            // instead of by excluding every `#`-led line (which refused legitimate notes
-            // like `# 1. shipped the widget`; four angles in round 4).
-            || (trimmed.starts_with('#')
-                && headings
-                    .iter()
-                    .any(|h| h == trimmed.trim_start_matches('#').trim()))
-    };
+    let mut wrote_something = false;
+    let mut placeholders = Vec::new();
+    let mut section: Option<&str> = None;
 
-    let mut unfilled = Vec::new();
-    let mut current: Option<(String, bool)> = None;
     for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("## ")
-            && headings.iter().any(|h| h == rest.trim())
-        {
-            if let Some((heading, has_body)) = current.take()
-                && !has_body
-            {
-                unfilled.push(heading);
-            }
-            current = Some((rest.trim().to_string(), false));
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if let Some((_, has_body)) = current.as_mut()
-            && !is_scaffold_line(line.trim())
+        if let Some(rest) = line.strip_prefix("## ")
+            && let Some(h) = headings.iter().find(|h| *h == rest.trim())
         {
-            *has_body = true;
+            section = Some(h);
+        }
+        // Compared UNTRIMMED: the scaffold writes the placeholder at column 0, so an
+        // indented `TODO` is quoted text — and indenting is then a real escape from the
+        // refusal, which a trimmed comparison silently denied.
+        if line == crate::brief::SCAFFOLD_PLACEHOLDER {
+            let name = section.unwrap_or("(before the first section)").to_string();
+            if !placeholders.contains(&name) {
+                placeholders.push(name);
+            }
+            continue;
+        }
+        if !scaffold.iter().any(|s| s == trimmed) {
+            wrote_something = true;
         }
     }
-    if let Some((heading, has_body)) = current
-        && !has_body
-    {
-        unfilled.push(heading);
+
+    // Nothing outside drovr's own text — whether the placeholders are still there or the
+    // agent deleted them and wrote nothing, it is the same accident.
+    if !wrote_something {
+        return HandoffShape::Untouched;
     }
-    unfilled
+    HandoffShape::Placeholders(placeholders)
 }
 
 /// Whether `status` (a pane's herdr `agent_status`) means the agent has STARTED
@@ -1176,28 +1181,34 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
         // shape of a handoff: non-empty by every check, carrying nothing the next phase can
         // inherit. `drovr handoff-scaffold` writes one placeholder per section; what the
         // gate asks is whether each section has substance, not whether that word is gone.
-        let unfilled = scan_handoff(&contents);
-        if !unfilled.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "phase '{phase}' cannot signal done: {} of its handoff {} {} still exactly \
-                     as drovr scaffolded {} — {}. Write {} from your own context (nothing else \
-                     will); if a section genuinely has nothing, say so in it (\"None.\"). \
-                     Replace the `<!-- -->` guidance rather than writing around it. THEN run \
-                     `drovr phase done`.",
-                    unfilled.len(),
-                    handoff.display(),
-                    if unfilled.len() == 1 {
-                        "section is"
-                    } else {
-                        "sections are"
-                    },
-                    if unfilled.len() == 1 { "it" } else { "them" },
-                    unfilled.join(", "),
-                    if unfilled.len() == 1 { "it" } else { "them" },
-                ),
-            ));
+        match scan_handoff(&contents) {
+            HandoffShape::Untouched => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} contains nothing \
+                         you wrote — every line is still drovr's scaffold. Write the seven \
+                         sections from your own context (nothing else will); if one genuinely \
+                         has nothing, say so in it (\"None.\"). THEN run `drovr phase done`.",
+                        handoff.display()
+                    ),
+                ));
+            }
+            HandoffShape::Placeholders(sections) if !sections.is_empty() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} still has the \
+                         scaffold's `TODO` in {}. Replace {} with what you actually did; if a \
+                         section genuinely has nothing, say so in it (\"None.\"). THEN run \
+                         `drovr phase done`.",
+                        handoff.display(),
+                        sections.join(", "),
+                        if sections.len() == 1 { "it" } else { "them" },
+                    ),
+                ));
+            }
+            HandoffShape::Placeholders(_) => {}
         }
     }
 
@@ -4212,124 +4223,10 @@ mod tests {
         );
     }
 
-    /// A scaffolded handoff whose sections are still `TODO` is not a handoff — it is the
-    /// empty form, and the next phase inherits nothing from it. `phase done` must refuse
-    /// it for the same reason it refuses an empty file, and must name the sections so the
-    /// agent knows what is missing.
-    #[test]
-    fn phase_done_refuses_a_handoff_left_at_its_scaffold_todos() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("handoff-todo-test");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
-        run.save().unwrap();
 
-        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
-        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hp,
-            "## Objective\n\nship the widget\n\n## State\n\nTODO\n\n\
-             ## Decisions + rationale\n\nTODO\n",
-        )
-        .unwrap();
 
-        let err = phase_done(&run, "plan").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("State"), "must name the unfilled section: {msg}");
-        assert!(
-            msg.contains("Decisions + rationale"),
-            "must name every unfilled section, not just the first: {msg}"
-        );
-        assert!(
-            !msg.contains("Objective"),
-            "a section that WAS filled must not be reported: {msg}"
-        );
-        assert!(
-            !done_marker(&run.name, "plan").exists(),
-            "no marker may be dropped for a refused handoff"
-        );
-    }
 
-    /// Review round 1, correctness + type-design: deleting the placeholders without
-    /// writing anything passed the gate — shape without substance, which is exactly what
-    /// the gate exists to stop.
-    #[test]
-    fn phase_done_refuses_a_handoff_whose_sections_were_emptied_not_filled() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-emptied");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\n## Decisions + rationale\n\n",
-        );
 
-        let err = phase_done(&run, "plan").unwrap_err().to_string();
-        assert!(err.contains("State"), "an empty section is unfilled: {err}");
-        assert!(err.contains("Decisions + rationale"), "{err}");
-        assert!(!err.contains("Objective"), "a filled section is not: {err}");
-    }
-
-    /// Review round 1, correctness + error-handling: a `TODO` line inside a fenced block,
-    /// in a section full of real prose, was refused — the gate calling a finished handoff
-    /// empty at the agent's LAST action, with no explanation of how to escape.
-    #[test]
-    fn a_fenced_todo_is_content_not_a_placeholder() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-fenced-todo");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\nThe upstream stub still reads:\n\n\
-             ```rust\nfn f() {\n    TODO\n}\n```\n\nand we left it alone.\n",
-        );
-
-        phase_done(&run, "plan").expect("a quoted TODO must not read as an unfilled section");
-    }
-
-    /// Review round 1: a `## ` line inside a fence was treated as a heading, so the refusal
-    /// could name a section that does not exist while the real one went unmentioned.
-    #[test]
-    fn a_fenced_heading_does_not_become_a_section() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-fenced-heading");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\nThe template we emit looks like:\n\n\
-             ```markdown\n## Phantom\n\nTODO\n```\n\n## Next step\n\n",
-        );
-
-        let err = phase_done(&run, "plan").unwrap_err().to_string();
-        assert!(
-            !err.contains("Phantom"),
-            "a heading inside a fence is quoted text, not structure: {err}"
-        );
-        assert!(
-            !err.contains("State"),
-            "the enclosing section has a body: {err}"
-        );
-        assert!(err.contains("Next step"), "the real empty section: {err}");
-    }
-
-    /// The scaffold's own guidance comments are not a body — a section holding only them is
-    /// still unfilled, including when the comment spans lines.
-    #[test]
-    fn scaffold_guidance_comments_are_not_a_body() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-comments");
-        // The real scaffold, straight from the writer: this is the case that matters —
-        // an agent that ran `handoff-scaffold` and then signalled done.
-        let scaffolded = crate::brief::handoff_scaffold();
-        write_raw_handoff(&run, "plan", &scaffolded);
-
-        let err = phase_done(&run, "plan").unwrap_err().to_string();
-        assert!(err.contains("Objective"), "{err}");
-        assert!(err.contains("Artifact pointers"), "every section: {err}");
-    }
 
     /// A handoff written by hand, with no `## ` sections at all, is not scaffolded and must
     /// not be refused by a gate about scaffold sections.
@@ -4347,163 +4244,132 @@ mod tests {
         phase_done(&run, "plan").expect("prose without headings is a handoff too");
     }
 
-    /// Rounds 2-3 needed an `Unterminated` refusal because an unclosed fence hid every
-    /// heading below it from a stateful parser. Nothing tracks fence state now, so the
-    /// sections below one are still seen — a strictly better outcome than refusing, and the
-    /// whole class of "the scan could not see the sections" is gone.
+
+
+
+
+
+
+
+
+
+
+    /// The accident the gate exists for: run `handoff-scaffold`, forget, signal done.
     #[test]
-    fn an_unclosed_fence_no_longer_hides_the_sections_below_it() {
+    fn an_untouched_scaffold_is_refused() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-unclosed-fence");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n```\nnever closed\n\n## Next step\n\nTODO\n",
-        );
+        let run = registered_phase_run("handoff-untouched");
+        write_raw_handoff(&run, "plan", &crate::brief::handoff_scaffold());
 
         let err = phase_done(&run, "plan").unwrap_err().to_string();
         assert!(
-            err.contains("Next step"),
-            "the section below an unclosed fence is still evaluated: {err}"
+            err.contains("nothing you wrote"),
+            "must say the file is all scaffold: {err}"
         );
-        assert!(!err.contains("Objective"), "and a filled one is not: {err}");
     }
 
-    /// Round 4, correctness + security + type-design: chained same-line comments
-    /// (`<!-- a --> <!-- b -->`) and fenced guidance both counted as authored prose. Neither
-    /// is content drovr did not write, so neither fills a section now.
+    /// Deleting the placeholders is not writing a handoff either — every remaining line is
+    /// still drovr's.
     #[test]
-    fn scaffold_text_does_not_become_a_body_by_being_rearranged() {
+    fn a_scaffold_with_the_placeholders_deleted_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-placeholders-deleted");
+        let stripped: String = crate::brief::handoff_scaffold()
+            .lines()
+            .filter(|l| l.trim() != crate::brief::SCAFFOLD_PLACEHOLDER)
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_raw_handoff(&run, "plan", &stripped);
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("nothing you wrote"), "{err}");
+    }
+
+    /// Rearranging drovr's own text — fencing the guidance, repeating a heading — is not
+    /// writing either.
+    #[test]
+    fn rearranged_scaffold_text_is_not_writing() {
         let _lock = ENV_LOCK.lock().unwrap();
         let run = registered_phase_run("handoff-rearranged");
-        let guidance = crate::brief::scaffold_lines()
-            .into_iter()
-            .find(|l| l.starts_with("<!--") && l.contains("what this phase was for"))
-            .expect("the Objective guidance comment");
-        assert!(guidance.ends_with("-->"), "a single-line guidance comment: {guidance}");
-        write_raw_handoff(
-            &run,
-            "plan",
-            &format!(
-                "## Objective\n\n{guidance}\n\n## State\n\n```\n{guidance}\nTODO\n```\n\
-                 \n## Next step\n\n  ## Next step\n\nTODO\n"
-            ),
-        );
+        let lines = crate::brief::scaffold_lines();
+        let body = format!("{}\n```\n{}\n```\n", lines.join("\n"), lines[0]);
+        write_raw_handoff(&run, "plan", &body);
 
         let err = phase_done(&run, "plan").unwrap_err().to_string();
-        for section in ["Objective", "State", "Next step"] {
-            assert!(
-                err.contains(section),
-                "{section} holds only text drovr wrote: {err}"
-            );
-        }
+        assert!(err.contains("TODO") || err.contains("nothing you wrote"), "{err}");
     }
 
-    /// Round 4, four angles: excluding every `#`-led line refused a section whose only
-    /// content was a legitimate note. Only a heading REPEATING a scaffold heading is
-    /// structure now.
+    /// A partly-written handoff is refused, and the message names exactly the sections that
+    /// still hold the placeholder.
     #[test]
-    fn a_hash_led_note_is_a_body() {
+    fn a_partly_written_handoff_names_the_sections_still_holding_todo() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-hash-note");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\n# 1. shipped the widget\n\n## State\n\n# export FOO=bar\n",
+        let run = registered_phase_run("handoff-partly-written");
+        let filled = crate::brief::handoff_scaffold().replacen(
+            &format!("\n{}\n", crate::brief::SCAFFOLD_PLACEHOLDER),
+            "\nPorted the parser to the new lexer; interfaces unchanged.\n",
+            1,
         );
-
-        phase_done(&run, "plan").expect("a numbered or shell-style note is content");
-    }
-
-    /// Round 3, correctness + security: the placeholder check ran only OUTSIDE fences, so
-    /// wrapping `TODO` in a code block passed the gate with zero substance.
-    #[test]
-    fn a_fenced_placeholder_is_still_a_placeholder() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-fenced-placeholder");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\n```\nTODO\n```\n",
-        );
+        write_raw_handoff(&run, "plan", &filled);
 
         let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("State"), "names a section still at TODO: {err}");
         assert!(
-            err.contains("State"),
-            "quoting the placeholder is not writing a handoff: {err}"
+            !err.contains("in Objective") && !err.contains(", Objective"),
+            "and not the one that was written: {err}"
         );
     }
 
-    /// Round 3, three angles: the column-0 heading rule made an indented `## ` prose, and
-    /// prose counted as a body — so a section holding only an indented heading and a
-    /// placeholder read as filled.
+    /// A fully written handoff completes.
     #[test]
-    fn an_indented_heading_is_not_a_body_either() {
+    fn a_written_handoff_completes() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-indented-heading-body");
+        let run = registered_phase_run("handoff-written");
+        let written = crate::brief::handoff_scaffold()
+            .replace(crate::brief::SCAFFOLD_PLACEHOLDER, "Real content for this section.");
+        write_raw_handoff(&run, "plan", &written);
+
+        phase_done(&run, "plan").expect("a filled scaffold completes");
+    }
+
+    /// A hand-written handoff that never went through the scaffold is untouched by the gate.
+    #[test]
+    fn a_hand_written_handoff_still_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-hand-written");
         write_raw_handoff(
             &run,
             "plan",
-            "## Objective\n\nship it\n\n## State\n\n  ## Decisions + rationale\n\nTODO\n",
+            "Ported the parser to the new lexer; interfaces unchanged. Next agent: run the \
+             conformance suite before touching codegen.\n",
+        );
+
+        phase_done(&run, "plan").expect("prose without the scaffold is a handoff too");
+    }
+
+    /// The accepted false positive, pinned so it is a decision rather than a surprise: a
+    /// handoff QUOTING a bare `TODO` line is refused. Escapable — the message names the
+    /// section, and any edit to that line (indent it, add text) clears it — and preferred
+    /// over the silent bypasses that chasing this case produced across five review rounds.
+    #[test]
+    fn a_quoted_bare_todo_is_refused_and_that_is_the_trade() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-quoted-todo");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nShipped it. The upstream stub still reads:\n\n```rust\nTODO\n```\n",
         );
 
         let err = phase_done(&run, "plan").unwrap_err().to_string();
-        assert!(
-            err.contains("State"),
-            "a heading is structure, not the section's content: {err}"
-        );
-    }
-
-    /// Round 3 (nit): a line that opened AND closed a comment had its trailing prose
-    /// discarded, refusing a section that visibly had content.
-    #[test]
-    fn prose_after_a_closed_comment_on_one_line_is_a_body() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-comment-tail");
+        assert!(err.contains("Objective"), "names where to look: {err}");
+        // Indenting the quoted line is enough to get past it.
         write_raw_handoff(
             &run,
             "plan",
-            "## Objective\n\n<!-- One or two lines. --> Ported the parser; interfaces unchanged.\n",
+            "## Objective\n\nShipped it. The upstream stub still reads:\n\n```rust\n  TODO\n```\n",
         );
-
-        phase_done(&run, "plan").expect("prose after a closed comment is content");
-    }
-
-    /// Round 2, three angles: opening a fence set `has_body` before any content existed,
-    /// so `TODO` plus a lone ``` — or an empty fence pair — passed the gate.
-    #[test]
-    fn an_empty_fence_is_not_a_body() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-empty-fence");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\n```\n```\n\n## Next step\n\n```rust\n```\n",
-        );
-
-        let err = phase_done(&run, "plan").unwrap_err().to_string();
-        assert!(err.contains("State"), "an empty fence pair is not prose: {err}");
-        assert!(err.contains("Next step"), "nor is one with an info string: {err}");
-    }
-
-
-
-    /// Round 2, error-handling + security: an INDENTED `## ` — an example inside a list or
-    /// sample — was parsed as a real heading, fracturing the section model and refusing a
-    /// finished handoff at the agent's last action.
-    #[test]
-    fn an_indented_heading_is_an_example_not_a_section() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-indented-heading");
-        write_raw_handoff(
-            &run,
-            "plan",
-            "## Objective\n\nship it\n\n## State\n\nThe scaffold emits:\n\n    ## Phantom\n\n\
-             and we fill it in.\n",
-        );
-
-        phase_done(&run, "plan")
-            .expect("an indented heading must not fracture a filled section");
+        phase_done(&run, "plan").expect("the refusal is escapable by editing that line");
     }
 
     /// Review round 1 (nit): an unreadable handoff was reported as "missing or empty",
@@ -4523,32 +4389,6 @@ mod tests {
         );
     }
 
-    /// The check keys on the scaffold's own placeholder — a line that is exactly `TODO` —
-    /// so a handoff that merely discusses TODOs in prose still completes.
-    #[test]
-    fn phase_done_accepts_a_handoff_that_only_mentions_todo_in_prose() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("handoff-todo-prose");
-        run.phases.push(Phase {
-            name: "plan".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("p1".into()),
-            ..Default::default()
-        });
-        run.save().unwrap();
-
-        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
-        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hp,
-            "## Objective\n\nship it\n\n## Open questions\n\n\
-             The TODO in `parser.rs:88` is deliberate; leave it. TODO markers in the \
-             vendored dir are not ours.\n",
-        )
-        .unwrap();
-
-        phase_done(&run, "plan").expect("prose mentioning TODO is a filled section");
-    }
 
     #[test]
     fn phase_done_refuses_to_stamp_a_token_onto_an_untokened_phase() {
