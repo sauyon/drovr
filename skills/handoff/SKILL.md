@@ -59,8 +59,10 @@ Run name is `<run>`; the phase you are running is `<phase>`.
       **git pointers mandatory**. This is *your* job as the finishing agent; nothing compresses
       it for you.
    2. **Signal done:** run `drovr phase done <run> <phase>`. It **refuses with an error until
-      the handoff above exists and is non-empty** — the handoff and the done-marker are one
-      atomic completion step.
+      the handoff above exists, is non-empty, and has no section left at the scaffold's
+      `TODO`** — the handoff and the done-marker are one atomic completion step, and a form
+      still holding its placeholders carries nothing for the next phase to inherit. The
+      error names the unfilled sections.
 
    Also tell the agent that any review subagents it launches must run in the **foreground**
    (never `run_in_background`, never yield waiting on them), so step 3 can detect completion.
@@ -121,7 +123,7 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 | re-brief | `drovr phase brief … \| drovr phase send <run> <phase> -` | for a phase already running; `phase send "<text>"` is for free-form nudges only |
 | wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `5`=superseded by a newer pass → re-arm, not a stuck agent · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
-| scaffold | `drovr handoff-scaffold <run> <phase>` | writes the empty 7 sections for the AGENT to fill; refuses to overwrite an authored one. Structure only — drovr does not guess which commits are yours |
+| scaffold | `drovr handoff-scaffold <run> <phase>` | writes the empty 7 sections for the AGENT to fill; refuses to overwrite an authored one. Structure only — drovr does not guess which commits are yours. `phase done` refuses while any section is still `TODO` |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
 
 ## The HANDOFF doc shape
@@ -166,6 +168,7 @@ briefing is worse than a stopped run.
 | Ignoring exit 2 from `phase start` | The pane is up and UNBRIEFED. Re-deliver with `phase brief \| phase send -`; a `phase wait` on it never returns. |
 | Expecting a separate compress step | There isn't one. The finishing agent authors the handoff itself, as its final action, before `phase done`. |
 | `phase done` failing "handoff missing" | The agent must author `<phase>-HANDOFF.md` *before* running `phase done`; the marker won't drop without it. |
+| `phase done` naming sections "still at the scaffold's TODO" | A scaffolded handoff was never filled in. Write those sections from your own context — nothing else will — then re-run. |
 | Foregrounding `drovr phase wait` | Background it and end the turn. Foreground Bash is capped at 600 000 ms, so a long healthy phase reports a false exit `2`. |
 | Backgrounding the wait and then working | Background the wait *and go idle*. The single-writer rule is what forbids working here, not foreground-ness. |
 | Pasting file contents into the handoff | Use artifact pointers (paths + git refs); the successor re-reads. |

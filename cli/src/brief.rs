@@ -430,8 +430,9 @@ pub fn compose_phase_brief(
 pub fn handoff_scaffold() -> String {
     let mut out = String::from(
         "<!-- Scaffolded by `drovr handoff-scaffold`. Structure is fixed; fill in every\n\
-         section from your own context, then run `drovr phase done`. Delete these\n\
-         comments as you go. -->\n",
+         section from your own context, then run `drovr phase done` — which REFUSES while\n\
+         any section is still `TODO`, and names the ones left. Delete these comments as\n\
+         you go. -->\n",
     );
     // Leading newline so the FIRST heading splits like every other one (the stripped
     // body starts directly with `## Objective`).

@@ -569,6 +569,26 @@ pub fn spawn_reviewer<H: Herdr>(
     Ok(())
 }
 
+/// Headings whose body is still the scaffold's `TODO` placeholder, in document order.
+///
+/// Keyed on a line that is EXACTLY `TODO` — what `drovr handoff-scaffold` writes — so a
+/// handoff that merely discusses TODOs in prose ("the TODO in parser.rs:88 is deliberate")
+/// is not mistaken for an unfilled one. A `TODO` before any heading is reported under
+/// `(preamble)` rather than dropped, since it is still an unfilled placeholder.
+fn unfilled_scaffold_sections(contents: &str) -> Vec<String> {
+    let mut unfilled = Vec::new();
+    let mut heading = String::from("(preamble)");
+    for line in contents.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("## ") {
+            heading = rest.trim().to_string();
+        } else if t == "TODO" && !unfilled.contains(&heading) {
+            unfilled.push(heading.clone());
+        }
+    }
+    unfilled
+}
+
 /// Whether `status` (a pane's herdr `agent_status`) means the agent has STARTED
 /// AND is at its composer, so a prompt sent now will land. `idle`, `working`, and
 /// `done` qualify; `None` (unreadable), `"unknown"`, and `"blocked"` do not.
@@ -1074,10 +1094,8 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     // Reviewer phases (only in `review_phases`) author no handoff and are exempt.
     if run.phases.iter().any(|p| p.name == phase) {
         let handoff = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
-        let non_empty = std::fs::read_to_string(&handoff)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        if !non_empty {
+        let contents = std::fs::read_to_string(&handoff).unwrap_or_default();
+        if contents.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -1085,6 +1103,30 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                      As your final action, author {phase}-HANDOFF.md (the 7-section handoff, \
                      git pointers included) into the run dir, THEN run `drovr phase done`.",
                     handoff.display()
+                ),
+            ));
+        }
+        // A scaffolded handoff still holding its placeholders is the empty form wearing
+        // the shape of a handoff: it passes the non-empty check while carrying nothing the
+        // next phase can inherit. `drovr handoff-scaffold` writes one `TODO` per section,
+        // so an unfilled section is exactly that line, still there.
+        let unfilled = unfilled_scaffold_sections(&contents);
+        if !unfilled.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{phase}' cannot signal done: {} of its handoff {} {} still at the \
+                     scaffold's TODO — {}. Fill {} in from your own context (nothing else \
+                     will), THEN run `drovr phase done`.",
+                    unfilled.len(),
+                    handoff.display(),
+                    if unfilled.len() == 1 {
+                        "section is"
+                    } else {
+                        "sections are"
+                    },
+                    unfilled.join(", "),
+                    if unfilled.len() == 1 { "it" } else { "them" },
                 ),
             ));
         }
@@ -4079,6 +4121,75 @@ mod tests {
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
         );
+    }
+
+    /// A scaffolded handoff whose sections are still `TODO` is not a handoff — it is the
+    /// empty form, and the next phase inherits nothing from it. `phase done` must refuse
+    /// it for the same reason it refuses an empty file, and must name the sections so the
+    /// agent knows what is missing.
+    #[test]
+    fn phase_done_refuses_a_handoff_left_at_its_scaffold_todos() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("handoff-todo-test");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p1".into()),
+            ..Default::default()
+        });
+        run.save().unwrap();
+
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hp,
+            "## Objective\n\nship the widget\n\n## State\n\nTODO\n\n\
+             ## Decisions + rationale\n\nTODO\n",
+        )
+        .unwrap();
+
+        let err = phase_done(&run, "plan").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("State"), "must name the unfilled section: {msg}");
+        assert!(
+            msg.contains("Decisions + rationale"),
+            "must name every unfilled section, not just the first: {msg}"
+        );
+        assert!(
+            !msg.contains("Objective"),
+            "a section that WAS filled must not be reported: {msg}"
+        );
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "no marker may be dropped for a refused handoff"
+        );
+    }
+
+    /// The check keys on the scaffold's own placeholder — a line that is exactly `TODO` —
+    /// so a handoff that merely discusses TODOs in prose still completes.
+    #[test]
+    fn phase_done_accepts_a_handoff_that_only_mentions_todo_in_prose() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut run = make_run("handoff-todo-prose");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("p1".into()),
+            ..Default::default()
+        });
+        run.save().unwrap();
+
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hp,
+            "## Objective\n\nship it\n\n## Open questions\n\n\
+             The TODO in `parser.rs:88` is deliberate; leave it. TODO markers in the \
+             vendored dir are not ours.\n",
+        )
+        .unwrap();
+
+        phase_done(&run, "plan").expect("prose mentioning TODO is a filled section");
     }
 
     #[test]
