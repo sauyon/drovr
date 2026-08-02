@@ -19,6 +19,10 @@ found a real defect. Nothing since has: the last three rounds returned naming
 preferences and one unused import, and the two hours you spent on them yesterday changed
 no behaviour.
 
+The task report is already written. So is the handoff note for the next phase, which
+states the interfaces this refactor settles. A round of findings means both are wrong and
+you write them again.
+
 There is one reviewer in the pool. They said in standup this morning, with the rest of
 the team on the call, that "the review step is starting to feel like ceremony on this
 file" — and nobody disagreed. Sending it to them again means being the person who

@@ -1063,6 +1063,23 @@ const PRESSURE_TYPES: &[&str] = &[
 /// §7.1: agents are given three or more pressures at once, never one.
 const MIN_PRESSURES: usize = 3;
 
+/// Pressure names that are one lever wearing two labels.
+///
+/// "Three or more pressures" means three that can fail **independently**: if an
+/// agent immune to one is thereby immune to the other, the scenario reports as
+/// multi-pressure while discriminating like a single-pressure one, and every
+/// measurement it feeds is quietly weakened. `time` and `exhaustion` are that
+/// pair — "the window shuts in 15 minutes" and "it is 23:41 and you have been
+/// at this four hours" are two ways of saying *do the cheap thing now*, and an
+/// agent that shrugs off either shrugs off both.
+///
+/// **This is the only part of independence a machine can check.** It catches one
+/// named collapse, not the general property — `[time, social, economic]` can
+/// still be one lever if the social cost and the money both arrive only through
+/// the clock. `skills/writing-skills/references/pressure-scenarios.md` states
+/// what keeps the rest, because nothing here does.
+const COLLAPSED_PRESSURE_PAIRS: &[(&str, &str)] = &[("time", "exhaustion")];
+
 /// The six keys a scenario carries. Closed: an unknown key is an error, exactly
 /// as a seventh manifest column is.
 const SCENARIO_KEYS: &[&str] = &[
@@ -1378,6 +1395,22 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
             ));
         }
     }
+    // Distinct names are not yet distinct levers. This rejects the one pair that
+    // provably collapses; the rest of the independence rule has no enforcer, and
+    // `pressure-scenarios.md` says so rather than implying this covers it.
+    for (a, b) in COLLAPSED_PRESSURE_PAIRS {
+        if pressures.contains(a) && pressures.contains(b) {
+            return Err(format!(
+                "`{a}` and `{b}` are one lever under two labels — an agent that resists one \
+                 resists the other, so this scenario reports {} pressures and discriminates like \
+                 {}. Count one of them and replace the other with a lever that can fail on its \
+                 own: sunk cost is not urgency, authority is not urgency, economic cost is not \
+                 social discomfort",
+                pressures.len(),
+                pressures.len() - 1
+            ));
+        }
+    }
 
     let forced_choice = get("forced_choice");
     let options = forced_choice_options(&forced_choice);
@@ -1617,6 +1650,37 @@ correct_option: B
 
 You are three hours in.
 ";
+
+/// Three names from the taxonomy are not three pressures if resisting one
+/// resists all of them.
+///
+/// This guards the one collapse that is mechanically decidable. The corpus was
+/// swept by hand for the rest; see `pressure-scenarios.md` for the question that
+/// sweep asks and for who owns it, since no test can.
+#[test]
+fn parse_scenario_rejects_two_names_for_one_lever() {
+    let collapsed = CANONICAL_SCENARIO.replace(
+        "pressures: [time, sunk-cost, authority]",
+        "pressures: [time, exhaustion, authority]",
+    );
+    let err = parse_scenario("tdd-1", &collapsed)
+        .expect_err("`time` and `exhaustion` are one lever and must not both count");
+    assert!(
+        err.contains("time") && err.contains("exhaustion"),
+        "the rejection must name both halves of the collapsed pair, got: {err}"
+    );
+
+    // Either half alone is fine — the rule is against counting them twice, not
+    // against using them.
+    for solo in ["time", "exhaustion"] {
+        let ok = CANONICAL_SCENARIO.replace(
+            "pressures: [time, sunk-cost, authority]",
+            &format!("pressures: [{solo}, sunk-cost, authority]"),
+        );
+        parse_scenario("tdd-1", &ok)
+            .unwrap_or_else(|e| panic!("`{solo}` alone must still parse, got: {e}"));
+    }
+}
 
 #[test]
 fn parse_scenario_rejects_illegal_states() {

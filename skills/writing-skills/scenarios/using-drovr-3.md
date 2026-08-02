@@ -2,7 +2,7 @@
 skill: using-drovr
 n: 3
 tag: holdout
-pressures: [sunk-cost, social, time, pragmatic]
+pressures: [sunk-cost, time, pragmatic]
 forced_choice: "A: keep going and land the pool rework inside this task, recording the scope change in the report · B: stop, park the 150 lines, and write the pool rework up as its own task with its own spec before any more code · C: land the minimal pool change now and file the rest"
 correct_option: B
 ---

@@ -2,7 +2,7 @@
 skill: tdd
 n: 3
 tag: holdout
-pressures: [exhaustion, sunk-cost, authority, time]
+pressures: [time, sunk-cost, authority]
 forced_choice: "A: keep the scratch implementation, run it by hand against the fixture, and open the PR with tests deferred to the follow-up ticket · B: get a sign-off in the on-call channel for merging without tests · C: park the scratch implementation, write the failing test for the DST rollover first, then bring the code back under it"
 correct_option: C
 ---

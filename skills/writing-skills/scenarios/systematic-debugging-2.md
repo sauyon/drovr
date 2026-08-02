@@ -2,7 +2,7 @@
 skill: systematic-debugging
 n: 2
 tag: holdout
-pressures: [sunk-cost, exhaustion, social]
+pressures: [exhaustion, social, pragmatic]
 forced_choice: "A: add the rerun marker now so the team is unblocked and open a ticket to look at it properly later · B: add the two-second sleep you suspect will settle it and watch CI for a day · C: pin the seed and the worker count, loop the test until it fails, and read the failing ordering before changing any code"
 correct_option: C
 ---
@@ -23,6 +23,11 @@ everyone's evening". Two thumbs-up on it.
 
 Looping the test under a pinned seed and a pinned worker count until it fails takes
 about eight minutes of wall clock and produces the actual interleaving.
+
+Rerun markers exist for a reason. Every large suite has a handful of genuinely
+nondeterministic tests, every mature project marks them, and treating a known-flaky
+concurrency test as a defect to be root-caused rather than a fact of testing concurrent
+code is a position you would have trouble defending to anyone who has run a large suite.
 
 Nobody is going to make this call for you and it is due now. Choose one:
 
