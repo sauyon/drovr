@@ -115,8 +115,15 @@ pub enum ReviewOutcome {
     Findings,
     /// Not every reviewer dropped its marker before `timeout_ms`. → exit 2.
     Timeout,
-    /// `base == head`: there is no committed range to review, so no verdict about it
-    /// can mean anything. Refused before any reviewer is spawned. → exit 1.
+    /// `git diff base..head` contains **no change** — the two commits have identical
+    /// trees — so there is nothing to review and no verdict about it could mean
+    /// anything. Refused before any reviewer is spawned. → exit 1.
+    ///
+    /// **Not "the two SHAs are equal."** That is the common cause and it is not the
+    /// condition: `git commit --allow-empty` advances `head` without touching the tree,
+    /// so the SHAs differ while the range is still empty, and that is refused here too.
+    /// The discriminant is what the range CONTAINS. (An earlier version of this variant
+    /// was documented, and implemented, as the SHA comparison; both were wrong.)
     ///
     /// Separate from [`Error`](Self::Error) because the cause is specific and the fix is
     /// specific (commit, or re-record the base), and separate from
@@ -250,10 +257,38 @@ fn range_is_empty(project_dir: &str, base: &str, head: &str) -> io::Result<bool>
 }
 
 /// Read the recorded review base for `task` from `<dir>/<task>-base.sha` (trimmed).
-/// A missing file is the caller's `Error` outcome (base not recorded at task start).
+/// A missing file is the caller's `Error` outcome (base not recorded at task start), and
+/// so is a file whose contents are not a plausible object name — see [`validated_sha`].
 fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     let p = dir.join(format!("{task}-base.sha"));
-    Ok(std::fs::read_to_string(&p)?.trim().to_owned())
+    let raw = std::fs::read_to_string(&p)?;
+    validated_sha(raw.trim())
+        .map_err(|e| io::Error::other(format!("{}: {e}", p.display())))
+        .map(|s| s.to_owned())
+}
+
+/// Reject a recorded base that is not a bare git object id, using the SAME predicate the
+/// review server applies to the same file ([`crate::review::safe_sha`]) rather than a
+/// second opinion that could drift from it.
+///
+/// `<task>-base.sha` is an ordinary file, and whatever is in it reaches `git` as an
+/// argument composed into `{base}..{head}` — so a value like `-C` or `--output=x` is git
+/// OPTION injection, and one containing `..` or whitespace silently redefines the range.
+/// Restricting the alphabet to hex closes all of that at once.
+///
+/// This is a validity check, not a resolution check: `deadbeef` passes here and then fails
+/// in the repository. Both halves are needed — validation stops a crafted value from
+/// reaching git, and refusing when the range check errors stops an unresolvable one from
+/// waving the guard through.
+fn validated_sha(s: &str) -> Result<&str, String> {
+    if crate::review::safe_sha(s) {
+        Ok(s)
+    } else {
+        Err(format!(
+            "{s:?} is not a git object name (expected bare hex); \
+             re-record it with `drovr code-review base`"
+        ))
+    }
 }
 
 /// Resolve this pass's context via the shared recorder in [`crate::brief`], keyed
@@ -856,17 +891,25 @@ pub fn code_review_run<H: Herdr>(
             return Ok(ReviewOutcome::EmptyRange);
         }
         Ok(false) => {}
-        // "Could not tell" must not be silently treated as "not empty" — that is how a
-        // guard rots into decoration. It does not become a refusal either: the panel ran
-        // in this state before the guard existed, and an unresolvable base is a different
-        // (pre-existing) failure that the reviewers themselves surface. Say plainly that
-        // the check did not run, then proceed.
+        // "Could not tell" is REFUSED, not waved through. An earlier version of this
+        // guard warned and proceeded, which made it bypassable: any base git cannot
+        // resolve skipped the check entirely and the panel returned the same vacuous
+        // verdict the guard exists to prevent. A guard that fails open is not a guard —
+        // and this one failed open into precisely the class it was built to close.
+        //
+        // So the only paths out of here are: proven non-empty (review it), proven empty
+        // (EmptyRange), or unknown (Error). There is no fourth path in which a verdict
+        // gets produced without establishing that there is something to have a verdict
+        // about.
         Err(e) => {
             eprintln!(
-                "code-review: WARNING — could not determine whether {base}..{head} is \
-                 empty ({e}); the empty-range guard did NOT run for '{task}'. A clean \
-                 verdict from this pass is not evidence that the range was non-empty."
+                "code-review: cannot determine whether {base}..{head} contains any \
+                 change for '{task}' ({e}). Refusing rather than reviewing: an \
+                 unverifiable range cannot produce a meaningful verdict. Check that the \
+                 recorded base exists in this repository (`git -C <project> cat-file -e \
+                 {base}`), and re-record it with `drovr code-review base` if it does not."
             );
+            return Ok(ReviewOutcome::Error);
         }
     }
 
@@ -1262,10 +1305,20 @@ mod tests {
         (run, repo)
     }
 
+    /// Record a review base the way a real task does: capture HEAD, then commit work on
+    /// top, so `base..HEAD` is a resolvable, NON-EMPTY range.
+    ///
+    /// This used to write the literal `deadbeef`, which git cannot resolve. That made
+    /// every test using it exercise a range the panel could not compute — invisible
+    /// while an unresolvable base was quietly reviewed anyway, and a mass failure the
+    /// moment the range guard started refusing what it cannot verify. The fixture was
+    /// asserting against a state that cannot occur in a healthy run.
     fn write_base(run: &RunState, task: &str) {
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{task}-base.sha")), "deadbeef\n").unwrap();
+        let base = head_sha(&run.project_dir).unwrap();
+        std::fs::write(dir.join(format!("{task}-base.sha")), format!("{base}\n")).unwrap();
+        commit_more(run);
     }
 
     /// Stand in for a reviewer of `iter` having called `submit_findings`. The
@@ -1311,11 +1364,12 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?}");
         };
-        std::fs::write(
-            std::path::Path::new(&run.project_dir).join("g.txt"),
-            "more work",
-        )
-        .unwrap();
+        // APPEND, never overwrite: `write_base` now calls this too, so a test can reach
+        // it twice, and re-writing identical content produces "nothing to commit" and a
+        // failed fixture rather than a moved HEAD.
+        let p = std::path::Path::new(&run.project_dir).join("g.txt");
+        let prev = std::fs::read_to_string(&p).unwrap_or_default();
+        std::fs::write(&p, format!("{prev}more work\n")).unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "more"]);
     }
@@ -1400,6 +1454,68 @@ mod tests {
         assert!(
             run.review_phases.is_empty(),
             "a refused pass must not record phases either"
+        );
+    }
+
+    /// `<task>-base.sha` is an ordinary file whose contents become a `git` argument. A
+    /// value crafted to look like an option must never reach git — and because the
+    /// composed argument is `{base}..{head}`, `--output=<path>` would have git WRITE to a
+    /// path the file chose. The assertion is therefore not just "refused" but "that file
+    /// does not exist": proof the value never got as far as git.
+    #[test]
+    fn a_crafted_base_is_rejected_before_it_reaches_git() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, repo) = make_run("cr-crafted-base");
+        let pwned = repo.path().join("pwned");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("task-1-base.sha"),
+            format!("--output={}\n", pwned.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Error,
+            "a base that is not an object name must be refused, not passed to git"
+        );
+        assert!(
+            !pwned.exists(),
+            "git was invoked with the crafted value: it wrote {}",
+            pwned.display()
+        );
+        assert_eq!(spawn_count(&h), 0, "nothing may be spawned for a bad base");
+    }
+
+    /// The bypass: a base git cannot resolve makes the emptiness check ERROR, and an
+    /// earlier version of the guard warned and carried on — so any unresolvable base
+    /// skipped the guard entirely and the panel produced the vacuous verdict the guard
+    /// exists to prevent. A guard that fails open is not a guard.
+    ///
+    /// The value here is well-formed hex (so it passes validation) but absent from the
+    /// repository, which is exactly the gap between "looks like an object name" and "is
+    /// one" — and the reason both halves of the fix are needed.
+    #[test]
+    fn an_unresolvable_base_is_refused_rather_than_reviewed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-unresolvable-base");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task-1-base.sha"), "a".repeat(40)).unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Error,
+            "if emptiness cannot be established the panel must refuse; assuming \
+             non-empty is how the guard becomes bypassable"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned for a range that cannot be computed"
         );
     }
 

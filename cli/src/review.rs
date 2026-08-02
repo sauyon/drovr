@@ -364,7 +364,11 @@ fn safe_component(s: &str) -> bool {
 /// A recorded base is a bare git object id (hex, ≤64 chars for SHA-256). Reject
 /// anything else so it can never be interpreted as a git rev-arg or flag when
 /// interpolated into `git diff <base>..HEAD`.
-fn safe_sha(sha: &str) -> bool {
+///
+/// `pub(crate)` because the review panel interpolates the SAME recorded file into the
+/// same shape of git command (`code_review::base_sha`) and must not grow a second,
+/// drifting opinion about what a base may contain. One validator, both call sites.
+pub(crate) fn safe_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
