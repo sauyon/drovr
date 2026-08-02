@@ -245,9 +245,10 @@ pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String>
 /// *results* as `type: "user"` records too, and every `Skill` call is
 /// immediately followed by one — so stopping at the first `type == "user"` line
 /// would end the scan before reaching the call it is looking for, and this
-/// check would return `false` for every session that ever used a tool. A user
-/// record counts as the turn boundary only when its content is a bare string or
-/// carries at least one non-`tool_result` block.
+/// check would return `false` for every session that ever used a tool. It is
+/// not the only synthetic `user` record either — see [`is_turn_boundary`],
+/// which is the single authority on what ends a turn. Do not restate its rule
+/// here; a partial copy of it is how this comment went stale before.
 ///
 /// A line that will not parse **ends the turn** rather than being stepped over.
 /// It is never fatal, but it is also not nothing: it might have been this
