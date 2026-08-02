@@ -303,7 +303,14 @@ fn collect_successful_tool_ids(
         if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
             continue;
         }
-        if block.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+        // Success is `is_error` absent, or literally `false`. Anything else —
+        // `true`, a string, a number — counts as failure. Asking `as_bool() ==
+        // Some(true)` instead would read an unexpected type as "not an error"
+        // and credit a call that failed, which is the suppressing direction.
+        if block
+            .get("is_error")
+            .is_some_and(|e| e != &serde_json::Value::Bool(false))
+        {
             continue;
         }
         if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
@@ -894,6 +901,36 @@ mod tests {
         );
         assert!(!skill_invoked_last_turn(&t));
         assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+    }
+
+    #[test]
+    fn only_an_explicitly_unfailed_result_counts_as_success() {
+        // `is_error` is read as "success means absent or literally false".
+        // A shape this code does not expect must not be read as "not an error"
+        // — that would credit a call that failed, the suppressing direction.
+        let with_result = |fields: &str| {
+            let result = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1",{fields}}}]}}}}"#
+            );
+            format!(
+                "{}\n{}\n{}\n",
+                user_prompt("go"),
+                tool_use("Skill", r#"{"skill":"drovr:tdd"}"#),
+                result
+            )
+        };
+        for is_error in [r#""true""#, "1", "null", "{}", "true"] {
+            let t = with_result(&format!(r#""is_error":{is_error},"content":"x""#));
+            assert!(
+                !skill_invoked_last_turn(&t),
+                "is_error={is_error} must not count as a successful call"
+            );
+        }
+        // Absent and `false` are the two success shapes.
+        for tail in [r#""content":"ok""#, r#""is_error":false,"content":"ok""#] {
+            let t = with_result(tail);
+            assert!(skill_invoked_last_turn(&t), "{tail} must count as success");
+        }
     }
 
     #[test]
