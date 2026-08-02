@@ -49,11 +49,11 @@ makes you done — an empty finding list clears it vacuously.
 Yours to run anytime; the driver runs it per task as the gate (see `drovr:pipeline`).
 One read-only reviewer per configured angle, each given the brief above. Findings
 union-merge into `<task>-review.json`, tagged by angle. Exit: 0 clean, 3 findings,
-2 timeout, 1 error.
+2 timeout, 1 error or empty range.
 
 It needs a herdr workspace (`drovr new` records one) and a review agent with a herdr
 integration. If the panel is unavailable or wedged, use `code-review brief` and spawn
-the reviewer yourself — same brief either way.
+the reviewer yourself.
 
 **Exit 2 is slow, not broken.** Re-running the *same* command RESUMES: it keeps the
 angles already banked and waits only on stragglers. Loop on 2 as freely as on 3.

@@ -503,8 +503,11 @@ It is tempting to write this as "uncommitted work reviews as clean." That is wro
 version is more dangerous than no note at all, because it tells an agent that one commit makes it
 safe. The precise statement:
 
-- The committed scope is `git diff <base>..<head>`. It is empty **only when base == head** — i.e.
-  nothing was committed since `drovr code-review base` ran.
+- The committed scope is `git diff <base>..<head>`. It is empty when that range **contains no
+  change** — usually because nothing was committed since `drovr code-review base` ran, so
+  base == head. **But equal SHAs are not the property.** `git commit --allow-empty` advances HEAD
+  without touching the tree, so base != head while the diff is still empty. The first version of
+  the guard below compared the two SHAs and this case walked straight past it.
 - Commit some of the work and HEAD moves past base, so the range is real and the panel can return
   real findings. Whatever is *still* uncommitted is simply outside that range.
 - So the hazard has two shapes: the empty range (this entry), and the quieter one where a partial
@@ -540,10 +543,10 @@ Four of the five were defects the panel *caught*. The fifth is the panel committ
 `task2-report.md:116` puts it: it recurs "because a vacuous pass and a real one are
 indistinguishable from outside."
 
-### FIXED 2026-08-02 — `base == head` is refused, and cannot be spelled `Clean`
+### FIXED 2026-08-02 — an empty range is refused, and cannot be spelled `Clean`
 
-**Refuse to run when `base == head`, and say why.** An empty range is always a mistake, and there
-are only two ways to reach it:
+**Refuse to run when `base..head` contains no change, and say why.** An empty range is always a
+mistake, and there are only two ways to reach it:
 
 - the base was recorded *after* the work was committed (`drovr code-review base` run too late), or
 - nothing has been committed yet — the usual case, since the panel is reached at the end of a task
@@ -551,25 +554,37 @@ are only two ways to reach it:
 
 Neither is a state in which a clean verdict means anything, so neither produces one. What shipped:
 
-- **A new `ReviewOutcome::EmptyRange` variant**, not a special case at the call site. The fix the
-  reviewer asked for was type-level: vacuous and real clean shared one outcome, and one
-  `if` at one call site would have left the illegal state representable for the next caller. The
-  enum's own doc now carries why `Clean` must mean exactly one thing.
-- **Refused before any reviewer is spawned** (`code_review.rs`, immediately after base and head
-  resolve), so a vacuous panel costs nothing rather than four reviewer panes.
+- **A new `ReviewOutcome::EmptyRange` variant**, not a special case at the call site. The fix was
+  type-level: vacuous and real clean shared one outcome, and one `if` at one call site would have
+  left the illegal state representable for the next caller.
+- **The check asks what the range CONTAINS** (`range_is_empty`, via `git diff --quiet
+  base..head`: exit 0 = no differences, 1 = differences). **It deliberately does not compare the
+  two SHAs.** The first version did, and `git commit --allow-empty` defeats it — HEAD advances,
+  the tree does not, so `base != head` with an empty diff and the vacuous `Clean` returns
+  untouched. That near-miss is the entry's own lesson recurring inside its fix: *equal names* is
+  not *equal content*, and only one of them is the property worth checking.
+- **"Could not tell" is not "not empty".** If git cannot answer (an unresolvable base, say), the
+  guard prints a loud warning saying it did not run, and proceeds — it does not silently treat
+  the range as non-empty, and it does not refuse a pass that worked before the guard existed.
+- **Refused before any reviewer is spawned**, so a vacuous panel costs nothing rather than four
+  reviewer panes.
 - **Exit 1**, the setup-error channel the pipeline's failure model already routes to
-  STOP-and-diagnose. The message names both causes and what to do about each. It does **not**
-  warn and proceed: a warning on stderr next to a `clean` verdict and a 0 exit is read as the
-  verdict.
-- **Two tests**, `an_empty_review_range_is_refused_before_any_reviewer_is_spawned` (refuses,
-  spawns nothing, records no phases) and `a_non_empty_range_still_reaches_the_reviewers` (one
-  commit is the only difference; four reviewers, `Clean`). The guard was mutation-tested — broken,
-  watched go red, restored — because a checker that vacuously passes is precisely this entry's
-  subject.
+  STOP-and-diagnose. It does **not** warn and proceed: a warning on stderr next to a `clean`
+  verdict and a 0 exit is read as the verdict.
+- **Three tests.** `an_empty_review_range_is_refused_before_any_reviewer_is_spawned`,
+  `a_non_empty_range_still_reaches_the_reviewers`, and — the one that carries the property —
+  `an_empty_commit_is_refused_even_though_the_shas_differ`. Both guards were mutation-tested:
+  reverted to the SHA comparison, the empty-commit test failed with `left: Timeout, right:
+  EmptyRange` (the panel had spawned reviewers over nothing) while the other two still passed,
+  which is exactly why that third test earns its place.
 
-**Still open:** the second shape named above. A *partial* commit produces a real range whose
-verdict is silently narrower than the work, and nothing detects that. `implement-task.md` tells
-the task agent to keep committing; nothing enforces it.
+**Still open, deliberately:** the *partial* commit. It produces a real, non-empty range whose
+verdict is honest but silently narrower than the task's work, and nothing detects that — the
+panel cannot know what you meant to commit. `implement-task.md` tells the task agent to keep
+committing, and `ReviewOutcome::Clean`'s doc states in terms that a clean verdict covers the
+committed range and not the task. Both are documentation, not enforcement. Fixing it would mean
+redesigning what the panel's scope IS (e.g. refusing on a dirty tree), which is a larger question
+with real false-positive cost.
 
 ## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
 
