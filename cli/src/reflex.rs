@@ -263,18 +263,27 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
 
 /// True if this `user` record is a real prompt rather than a tool result.
 ///
-/// Only one shape is *not* a boundary: a content array whose every block is a
-/// `tool_result`. Everything else — a bare string prompt, an array carrying a
-/// `text` block, and any shape this function does not recognize — ends the
-/// turn. That default is the fail-open direction: walking *past* an
-/// unrecognized record would let a skill invoked in some earlier turn suppress
-/// this one, which is silent drift, the failure the gate exists to catch.
-/// Ending the turn early costs at worst one redundant 600-byte injection.
+/// Only one shape is *not* a boundary: a **non-empty** content array whose
+/// every block is a `tool_result`. Everything else — a bare string prompt, an
+/// array carrying a `text` block, an empty array, and any shape this function
+/// does not recognize — ends the turn. That default is the fail-open direction:
+/// walking *past* an unrecognized record would let a skill invoked in some
+/// earlier turn suppress this one, which is silent drift, the failure the gate
+/// exists to catch. Ending the turn early costs at worst one redundant
+/// 600-byte injection.
+///
+/// The emptiness test is load-bearing, not defensive noise: `[].iter().any(…)`
+/// is vacuously `false`, so without it an empty array would be classified as a
+/// tool-result record and walked past — the exact drift this whole function is
+/// shaped to prevent, arriving as a vacuous truth rather than a wrong branch.
 fn is_turn_boundary(record: &serde_json::Value) -> bool {
     match record["message"]["content"].as_array() {
-        Some(blocks) => blocks
-            .iter()
-            .any(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_result")),
+        Some(blocks) => {
+            blocks.is_empty()
+                || blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_result"))
+        }
         None => true,
     }
 }
@@ -858,6 +867,12 @@ mod tests {
             r#"{"type":"user"}"#,
             r#"{"type":"user","message":{"role":"user","content":42}}"#,
             r#"{"type":"user","message":{"role":"user","content":null}}"#,
+            // The EMPTY array. `[].iter().any(…)` is vacuously false, so a
+            // naive "does any block fail to be a tool_result" test reads this
+            // as a tool-result record and walks past it — into an older turn,
+            // whose skill call then suppresses a turn that never ran the
+            // discipline. Vacuous truth, in the drift direction.
+            r#"{"type":"user","message":{"role":"user","content":[]}}"#,
         ] {
             let t = format!(
                 "{}\n{}\n{}\n",
