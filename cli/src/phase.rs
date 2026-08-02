@@ -451,13 +451,27 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     // Checked after `workspace_exists`, so an archived run whose `workspace_close`
     // failed — a zombie, with live panes — still starts exactly as it does today.
     //
+    // EVERYTHING FROM HERE WORKS ON A COPY, and `*run` is overwritten only once
+    // the repair is safely on disk (see the commit point at the end).
+    //
+    // A half-repaired `RunState` — new workspace id, cleared pane ids, phases
+    // demoted — is a run that LOOKS repaired and is not one, and any `save`
+    // anywhere afterwards writes that fiction out. Returning `Err` beside a
+    // comment saying "drop this" does not prevent it: the caller who would get it
+    // wrong is exactly the one not reading the comment. Making the mutation
+    // unreachable until it is durable does. Pinned by
+    // `a_failed_repair_leaves_the_callers_run_state_untouched`.
+    //
+    // The clone costs one `RunState` per repair, and a repair only happens when a
+    // workspace has actually vanished.
+    let mut repaired = run.clone();
+
     // `refresh_archived` is THE way to consult this flag (see `RunState::archived`
-    // for why disk is the authority). It also leaves `run.archived` agreeing with
-    // disk, which matters here specifically: the `save_preserving_archived` at the
-    // end of this function writes the copy in hand, so a guard that read disk and
-    // left a stale `true` behind would re-archive, on its own success path, the
-    // run it had just decided was not archived.
-    if run.refresh_archived().map_err(|e| {
+    // for why disk is the authority). Adopting matters here specifically: the
+    // `save_preserving_archived` below writes the copy in hand, so a guard that
+    // read disk and left a stale `true` behind would re-archive, on its own
+    // success path, the run it had just decided was not archived.
+    if repaired.refresh_archived().map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -473,16 +487,20 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     // A workspace created without a cwd opens wherever herdr defaults to — the
     // near-miss that nearly had a phase agent editing an unrelated repo — so a
     // run with no project_dir gets no workspace at all.
-    if run.project_dir.is_empty() {
+    if repaired.project_dir.is_empty() {
         return Err(missing_project_dir_error(&run.name));
     }
-    let ws = h.workspace_create(&workspace_label(&run.name), &run.project_dir)?;
+    let ws = h.workspace_create(&workspace_label(&run.name), &repaired.project_dir)?;
 
     // Every pane id in `run` named a pane in the workspace that is gone, so all
     // of them are now dangling. Dropping them is not tidiness: a stale id is what
     // `phase_send` would aim at and what `cleanup` would try to close.
     let mut orphaned = Vec::new();
-    for phase in run.phases.iter_mut().chain(run.review_phases.iter_mut()) {
+    for phase in repaired
+        .phases
+        .iter_mut()
+        .chain(repaired.review_phases.iter_mut())
+    {
         phase.pane_id = None;
         phase.herdr_session = None;
         // A `Done` phase does not care — its work is in the handoff and in git.
@@ -497,13 +515,14 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
         }
     }
     // Retired panes are drovr's to reap, and there is nothing left to reap.
-    run.retired_panes.clear();
-    run.workspace = Some(ws.id.clone());
+    repaired.retired_panes.clear();
+    repaired.workspace = Some(ws.id.clone());
     // The replacement's root shell pane is handed to the next phase exactly as
     // `drovr new`'s is, so recovery leaves no idle shell behind either.
-    run.root_pane = Some(ws.root_pane);
+    repaired.root_pane = Some(ws.root_pane);
 
-    // ORDER: create, mutate, save — and hand the workspace BACK if the save fails.
+    // ORDER: create, mutate a copy, save — and hand the workspace BACK if the save
+    // fails.
     //
     // Persisting first is not available: the id to persist only exists once herdr
     // has created it. So the window between the two is real, and the question is
@@ -516,13 +535,16 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     //
     // Closing it is safe and exact: we created it microseconds ago, nothing has
     // been launched into it (`ensure_workspace` runs before any `pane_run`), and
-    // it is not the id anything has recorded. So the failure becomes atomic in the
-    // way that matters — nothing created, nothing written, retry from the same
-    // place. `run` itself is left mutated, which is why this returns `Err`: the
-    // caller must drop it, not save it.
-    if let Err(save_err) = run.save_preserving_archived() {
+    // it is not the id anything has recorded.
+    if let Err(save_err) = repaired.save_preserving_archived() {
         return Err(reclaim_unrecorded_workspace(h, &ws.id, &run.name, save_err));
     }
+
+    // THE COMMIT POINT. Everything above touched `repaired`, so until this line
+    // the caller's run is exactly what it handed in — including on every error
+    // path above, none of which can leave it looking repaired. Reached only once
+    // the repair is durable, which is what makes the two agree.
+    *run = repaired;
     Ok(WorkspaceHealing::Reprovisioned { orphaned })
 }
 
@@ -2519,6 +2541,111 @@ mod tests {
         );
     }
 
+    /// A failed repair hands back the run EXACTLY as it was given.
+    ///
+    /// The orphan-workspace problem one level in: a caller holding a `RunState`
+    /// that has been half-repaired — new workspace id, cleared pane ids, phases
+    /// demoted — holds something that looks like a repaired run and is not one,
+    /// and the next `save` anywhere writes that fiction to disk. Nothing about the
+    /// type stops it, and the caller who would get it wrong is precisely the one
+    /// not reading a "do not save this" comment. So the mutation happens on a copy
+    /// that is committed only once it is on disk, and this pins it: every failure
+    /// mode, compared field by field through serde.
+    #[test]
+    fn a_failed_repair_leaves_the_callers_run_state_untouched() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        // 1. Refused because the run is archived.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-archived-test", "wAG");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("wAG:p1".into()),
+            ..Default::default()
+        });
+        run.archived = true;
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("archived");
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            before,
+            "a refusal must not leave the caller holding a changed run"
+        );
+
+        // 2. Refused because there is no cwd to open a workspace in.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-nocwd-test", "wAG");
+        run.project_dir = String::new();
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("no project_dir");
+        assert_eq!(serde_json::to_string(&run).unwrap(), before);
+
+        // 3. herdr refused to make the workspace.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-create-test", "wAG");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("wAG:p1".into()),
+            ..Default::default()
+        });
+        run.retire_pane("wAG:p7");
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        h.fail_workspace_create();
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("workspace_create fails");
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            before,
+            "the demotions and pane clearing must not survive a failed create"
+        );
+
+        // 4. THE case the other three do not reach: the workspace was created and
+        //    the run mutated, and only the SAVE failed. Cases 1-3 return before any
+        //    mutation, so they would pass even against a version that leaves a
+        //    half-repaired run behind — this is the one that pins it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let h = FakeHerdr::new();
+            let mut run = make_run_with_workspace("untouched-save-test", "wAG");
+            run.phases.push(Phase {
+                name: "plan".into(),
+                status: PhaseStatus::Running,
+                pane_id: Some("wAG:p1".into()),
+                ..Default::default()
+            });
+            run.retire_pane("wAG:p7");
+            run.save().unwrap();
+            h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+            let dir = run_dir("untouched-save-test");
+            let original = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let writable_anyway = std::fs::write(dir.join(".probe"), b"x").is_ok();
+            let _ = std::fs::remove_file(dir.join(".probe"));
+            if !writable_anyway {
+                let before = serde_json::to_string(&run).unwrap();
+                let err = ensure_workspace(&h, &mut run).expect_err("the save cannot succeed");
+                std::fs::set_permissions(&dir, original).unwrap();
+                assert_eq!(
+                    serde_json::to_string(&run).unwrap(),
+                    before,
+                    "a repair that could not be persisted must not leave the caller \
+                     holding a run that looks repaired: {err}"
+                );
+            } else {
+                std::fs::set_permissions(&dir, original).unwrap();
+            }
+        }
+    }
+
     /// A workspace drovr creates but cannot RECORD is worse than one it never
     /// created: `state.json` still names the dead one, so the next attempt makes a
     /// second replacement, while the first sits in the human's switcher labelled
@@ -2561,12 +2688,27 @@ mod tests {
             .collect();
         assert_eq!(created.len(), 1, "one workspace was created: {calls:?}");
         // Whatever id the fake handed out, the SAME one must be closed again.
-        let new_id = run.workspace.clone().unwrap_or_default();
+        // Read it out of the create call, NOT out of `run`: a failed repair leaves
+        // the caller's run untouched (`a_failed_repair_leaves_the_callers_run_state_untouched`),
+        // so `run.workspace` still names the dead one — which is the point.
+        let new_id = created[0]
+            .rsplit(" -> ")
+            .next()
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("the create call records the id it handed out")
+            .to_string();
+        assert_ne!(new_id, "wAG", "the fake handed out a fresh id");
         assert!(
             calls
                 .iter()
                 .any(|c| c == &format!("workspace_close id={new_id}")),
             "the workspace it could not record must be handed back: {calls:?}"
+        );
+        assert_eq!(
+            run.workspace.as_deref(),
+            Some("wAG"),
+            "and the caller is left pointing at the dead workspace, not at one that \
+             no longer exists"
         );
         // And the error has to name the save failure, not the reclaim.
         assert!(

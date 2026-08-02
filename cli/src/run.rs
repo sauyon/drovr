@@ -196,6 +196,35 @@ pub struct RunState {
     /// while the save beside it merged with `|=` could refuse to repair a restored
     /// run, or silently re-archive one. Two sources of truth for one bit is enough
     /// to invert a human's decision.
+    ///
+    /// ## The rule is a CONVENTION — the type does not enforce it
+    ///
+    /// This field is `pub bool`, so nothing stops a new call site reading it
+    /// directly and acting on a stale value. Said plainly rather than left to be
+    /// inferred from the paragraphs above, which describe a discipline the
+    /// compiler knows nothing about.
+    ///
+    /// Not enforced because the obvious enforcement is worse than the gap. A
+    /// private field needs a constructor and rewrites at 17 struct literals across
+    /// 6 files (`RunState` has no `Default`), and an accessor that reads the
+    /// authority would put a `state.json` read behind every consultation —
+    /// including [`is_complete`](RunState::is_complete), which the review server
+    /// calls per row on a 2s poll. That trades a documented convention for a hot
+    /// disk read and a wide mechanical change.
+    ///
+    /// **Kept by these tests**, which fail if a site stops obeying it:
+    /// * `run::tests::refresh_archived_adopts_disk_in_both_directions`
+    /// * `run::tests::refresh_archived_fails_loudly_rather_than_picking_an_authority`
+    /// * `run::tests::a_save_never_re_archives_a_run_the_human_restored`
+    /// * `run::tests::a_stale_save_never_resurrects_an_archived_run`
+    /// * `run::tests::restore_can_still_clear_the_archived_flag`
+    /// * `phase::tests::repairing_a_restored_run_leaves_it_restored_on_disk`
+    /// * `phase::tests::a_restore_on_disk_beats_a_stale_archive_held_in_memory`
+    /// * `phase::tests::an_unreadable_state_json_refuses_the_repair_rather_than_guessing`
+    /// * `code_review::tests::archiving_mid_run_survives_every_save_the_review_makes`
+    ///
+    /// A reader added to that list is a reader that must go through
+    /// [`refresh_archived`](RunState::refresh_archived) first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
     /// Panes drovr opened that no longer belong to any phase, yet are still
