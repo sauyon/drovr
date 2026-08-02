@@ -51,6 +51,12 @@ pub struct ReflexConfig {
     /// defaults to enabled; `NAME = false` omits that section from the reflex.
     #[serde(default)]
     pub sections: BTreeMap<String, bool>,
+    /// Per-turn gate (the `UserPromptSubmit` hook). Default **true**: the gate
+    /// is the mechanism that keeps the discipline alive after turn one, so an
+    /// omitted key must not silently disable it. Named default fn for the same
+    /// reason as `enabled` — see the note above [`default_true`].
+    #[serde(default = "default_true")]
+    pub per_turn: bool,
 }
 
 impl Default for ReflexConfig {
@@ -59,6 +65,7 @@ impl Default for ReflexConfig {
             enabled: true,
             preamble: None,
             sections: BTreeMap::new(),
+            per_turn: true,
         }
     }
 }
@@ -765,6 +772,46 @@ escalation = true
             cfg.reflex.preamble.as_deref(),
             Some("only a preamble here")
         );
+    }
+
+    #[test]
+    fn per_turn_defaults_true_with_reflex_table_present() {
+        // Same trap as `enabled`, one key over: a `[reflex]` table that names
+        // `enabled` but omits `per_turn` must still gate every turn. A bare
+        // `#[serde(default)]` here would yield `false` and silently kill the
+        // per-turn gate for every user who has ever written a `[reflex]` table.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[reflex]\nenabled = true\n").unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert!(
+            cfg.reflex.per_turn,
+            "per_turn must default to true under a present [reflex] table"
+        );
+        // And the built-in default (no config file at all) agrees.
+        assert!(ReflexConfig::default().per_turn);
+    }
+
+    #[test]
+    fn per_turn_false_is_honored() {
+        // The key is suppressible: an explicit `false` must survive round-trip,
+        // or the "suppressible per-user" half of the contract is a claim with
+        // nothing keeping it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[reflex]\nper_turn = false\n").unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap();
+        assert!(!cfg.reflex.per_turn);
+        // Disabling the per-turn gate must not disable the SessionStart reflex.
+        assert!(cfg.reflex.enabled);
     }
 
     #[test]

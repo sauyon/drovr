@@ -139,11 +139,12 @@ pub fn wrap(body: &str, preamble: Option<&str>) -> String {
     format!("<EXTREMELY_IMPORTANT>\n{preamble}\n\n{body}\n</EXTREMELY_IMPORTANT>")
 }
 
-/// Package `context` as the JSON the Claude Code SessionStart hook consumes.
-pub fn envelope(context: &str) -> String {
+/// Package `context` as the JSON a Claude Code hook consumes for `event`
+/// (`SessionStart` for the full reflex, `UserPromptSubmit` for the gate).
+pub fn envelope(event: &str, context: &str) -> String {
     let value = serde_json::json!({
         "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
+            "hookEventName": event,
             "additionalContext": context,
         }
     });
@@ -158,7 +159,149 @@ pub fn reflex_json(skill_md: &str, cfg: &ReflexConfig) -> Option<String> {
     }
     let body = render_body(skill_md, &cfg.sections);
     let context = wrap(&body, cfg.preamble.as_deref());
-    Some(envelope(&context))
+    Some(envelope("SessionStart", &context))
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn gate (UserPromptSubmit)
+// ---------------------------------------------------------------------------
+
+/// The per-turn gate card, injected as `UserPromptSubmit` additional context.
+///
+/// **A `const`, not an extraction from `SKILL.md`** — extraction would need
+/// `reflex:section` markers inside the region the router deliberately places
+/// *outside* every marker (so `[reflex.sections]` cannot subtract the routing
+/// core). The cost is drift between card and router, which
+/// [`GATE_CARD_PHRASES`] and its two-sided test exist to catch.
+///
+/// The budget is on the **rendered** context: ≤600 bytes per injection, and the
+/// cost is cumulative — it is appended to the window every turn it fires and
+/// stays there. All six of the required items are therefore one terse clause
+/// each, not a paragraph.
+///
+/// The `<SUBAGENT-STOP>` line is **unconditional**, independent of whether
+/// `UserPromptSubmit` turns out to fire for Agent-tool subagents in this
+/// harness: the measurement probes and drovr's own read-only reviewers all
+/// launch from a gate-on session, and a card injected into them would
+/// contaminate what they measure.
+pub const GATE_CARD: &str = concat!(
+    "<SUBAGENT-STOP>Dispatched as a subagent for one task? Ignore this card — do your task.</SUBAGENT-STOP>\n",
+    "DROVR GATE — before every response, including clarifying questions and read-only exploration:\n",
+    "1% rule: even a 1% chance a drovr:* skill applies → invoke it. Wrong fit? Drop it; invoking costs almost nothing.\n",
+    "Announce it: \"Using drovr:<skill> — <purpose>.\"\n",
+    "Checklist in the skill → one tracked task per step, followed before you respond.\n",
+    "Single writer: one agent edits; reviews go to drovr:code-review. Unsure? Skill drovr:using-drovr.",
+);
+
+/// Phrases that must appear in **both** [`GATE_CARD`] and
+/// `skills/using-drovr/SKILL.md` — the drift guard between the two texts.
+///
+/// Seeded with phrases already present in the shipped router, so the guard is
+/// green the moment it lands; the task that writes the 1%-rule and per-turn
+/// phrases into the router adds them here.
+///
+/// `drovr:using-drovr` is deliberately **not** in this list: the shipped router
+/// does not contain that literal anywhere outside its own frontmatter `name:`,
+/// so a two-sided assertion on it would either be red or be satisfied by the
+/// file naming itself — a guard that cannot detect the drift it claims to.
+/// The card's obligation to carry the pointer is enforced one-sided, in
+/// `gate_card_carries_every_required_item`.
+const GATE_CARD_PHRASES: &[&str] = &["<SUBAGENT-STOP>", "Single writer", "drovr:code-review"];
+
+/// The gate JSON, or `None` when the gate is off or the previous turn already
+/// ran the discipline.
+///
+/// `transcript` is the transcript JSONL when it could be read. **`None` fails
+/// open toward emitting**: an absent or unreadable transcript path is not
+/// evidence that a skill was invoked, and silent drift costs more than a
+/// redundant 600-byte injection.
+pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String> {
+    if !cfg.enabled || !cfg.per_turn {
+        return None;
+    }
+    if transcript.is_some_and(skill_invoked_last_turn) {
+        return None;
+    }
+    Some(envelope("UserPromptSubmit", GATE_CARD))
+}
+
+/// True if the assistant turn since the last user message invoked a `drovr:*`
+/// skill.
+///
+/// Walks backwards from EOF and stops at the first record that is a **real user
+/// message**. That qualifier is the whole subtlety: Claude Code writes tool
+/// *results* as `type: "user"` records too, and every `Skill` call is
+/// immediately followed by one — so stopping at the first `type == "user"` line
+/// would end the scan before reaching the call it is looking for, and this
+/// check would return `false` for every session that ever used a tool. A user
+/// record counts as the turn boundary only when its content is a bare string or
+/// carries at least one non-`tool_result` block.
+///
+/// Malformed lines are skipped, not fatal: a truncated tail is normal for a
+/// file being appended to live.
+pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
+    for line in transcript_jsonl.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // malformed line: skip, keep walking
+        };
+        match record.get("type").and_then(|t| t.as_str()) {
+            Some("user") if is_turn_boundary(&record) => return false,
+            Some("assistant") if invokes_drovr_skill(&record) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if this `user` record is a real prompt rather than a tool result.
+fn is_turn_boundary(record: &serde_json::Value) -> bool {
+    let content = &record["message"]["content"];
+    if content.is_string() {
+        return true;
+    }
+    match content.as_array() {
+        // At least one block that is not a tool result → a real message.
+        Some(blocks) => blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_result")),
+        // No recognizable content: not evidence of a turn boundary. Failing
+        // this way keeps walking, which can only ever *suppress* a redundant
+        // injection — never hide drift.
+        None => false,
+    }
+}
+
+/// True if this `assistant` record carries a `Skill` tool_use for a `drovr:*`
+/// skill. The name must match exactly and the skill must have `drovr:` as a
+/// **prefix** — a skill merely containing the string does not count, and
+/// neither does naming one in prose.
+fn invokes_drovr_skill(record: &serde_json::Value) -> bool {
+    let Some(blocks) = record["message"]["content"].as_array() else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            && block.get("name").and_then(|n| n.as_str()) == Some("Skill")
+            && block["input"]["skill"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("drovr:"))
+    })
+}
+
+/// The `transcript_path` from a hook's stdin JSON, or `None` when stdin carries
+/// no usable path (absent, empty, wrong type, or not JSON at all). Every `None`
+/// path fails open toward emitting the card.
+pub fn transcript_path_from_hook_input(hook_json: &str) -> Option<std::path::PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(hook_json).ok()?;
+    let path = value.get("transcript_path")?.as_str()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 #[cfg(test)]
@@ -229,7 +372,7 @@ mod tests {
 
     #[test]
     fn envelope_is_valid_sessionstart_json() {
-        let json = envelope("HELLO <EXTREMELY_IMPORTANT> \"quoted\"");
+        let json = envelope("SessionStart", "HELLO <EXTREMELY_IMPORTANT> \"quoted\"");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"].as_str(),
@@ -314,5 +457,383 @@ mod tests {
             .unwrap();
         assert!(ctx.contains("Single writer rule."));
         assert!(ctx.contains("<EXTREMELY_IMPORTANT>"));
+    }
+
+    // -- per-turn gate ------------------------------------------------------
+    //
+    // Fixtures mirror the shape of a real Claude Code transcript, verified
+    // against `~/.claude/projects/<proj>/<id>.jsonl`. The load-bearing fact:
+    // **tool results are written as `type: "user"` records**, so "the assistant
+    // turn since the last user message" cannot be found by stopping at the
+    // first `type == "user"` line. Over 60 live transcripts, that naive rule
+    // detected 0 of 35 real `drovr:*` skill invocations; the rule implemented
+    // here detected 35 of 35.
+
+    /// A real user message — the record that ends the previous turn.
+    fn user_prompt(text: &str) -> String {
+        format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#)
+    }
+
+    /// A tool RESULT. Claude Code writes these as `type: "user"` too; they must
+    /// NOT be read as a turn boundary.
+    fn tool_result(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok"}}]}}}}"#
+        )
+    }
+
+    /// An assistant record carrying one `tool_use` block.
+    fn tool_use(name: &str, input: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"{name}","input":{input}}}]}}}}"#
+        )
+    }
+
+    /// An assistant record carrying one `text` block.
+    fn assistant_text(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// A `Skill` call for `skill`, plus the tool_result Claude Code records
+    /// right after it — the pair that defeats a naive turn-boundary scan.
+    fn skill_call(skill: &str) -> String {
+        format!(
+            "{}\n{}",
+            tool_use("Skill", &format!(r#"{{"skill":"{skill}"}}"#)),
+            tool_result("toolu_1")
+        )
+    }
+
+    /// The rendered `additionalContext` of a gate emission, or `None`.
+    fn gate_context(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String> {
+        let json = gate_json(cfg, transcript)?;
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("UserPromptSubmit"),
+            "the gate must announce itself as a UserPromptSubmit hook"
+        );
+        Some(
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .expect("additionalContext must be a string")
+                .to_string(),
+        )
+    }
+
+    #[test]
+    fn gate_card_within_600_bytes() {
+        // §4.2 budgets the RENDERED additionalContext, not the source const —
+        // asserting on `GATE_CARD.len()` would stop measuring the moment the
+        // card is wrapped or framed on its way out.
+        let ctx = gate_context(&ReflexConfig::default(), None).expect("default config must emit");
+        assert!(
+            ctx.len() <= 600,
+            "rendered gate card is {} bytes, budget is 600:\n{ctx}",
+            ctx.len()
+        );
+    }
+
+    #[test]
+    fn gate_card_carries_every_required_item() {
+        // §4.2's card-content bullet — all six, none optional. Checked on the
+        // rendered context so a future framing change cannot drop one.
+        let ctx = gate_context(&ReflexConfig::default(), None).expect("default config must emit");
+        for (item, needle) in [
+            ("the 1% rule", "1%"),
+            ("the per-turn check", "before every response"),
+            ("the announcement string", "Using drovr:"),
+            ("the checklist-binding line", "tracked task"),
+            ("the subagent-stop line", "<SUBAGENT-STOP>"),
+            ("the router pointer", "drovr:using-drovr"),
+        ] {
+            assert!(
+                ctx.contains(needle),
+                "gate card is missing {item} (no {needle:?}):\n{ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_carries_event_name() {
+        let json = envelope("UserPromptSubmit", "BODY");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("UserPromptSubmit")
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"].as_str(),
+            Some("BODY")
+        );
+    }
+
+    #[test]
+    fn gate_json_none_when_disabled() {
+        let cfg = ReflexConfig {
+            enabled: false,
+            ..ReflexConfig::default()
+        };
+        assert_eq!(gate_json(&cfg, None), None);
+        // The master switch outranks the per-turn key even when it is on.
+        let cfg = ReflexConfig {
+            enabled: false,
+            per_turn: true,
+            ..ReflexConfig::default()
+        };
+        assert_eq!(gate_json(&cfg, None), None);
+    }
+
+    #[test]
+    fn gate_json_none_when_per_turn_false() {
+        let cfg = ReflexConfig {
+            per_turn: false,
+            ..ReflexConfig::default()
+        };
+        assert!(cfg.enabled, "this test must isolate per_turn from enabled");
+        assert_eq!(gate_json(&cfg, None), None);
+    }
+
+    #[test]
+    fn gate_emitted_when_transcript_absent() {
+        // Fail-open toward EMITTING: an absent or unreadable transcript_path
+        // yields `None`, and drift is worse than a redundant injection.
+        assert!(gate_json(&ReflexConfig::default(), None).is_some());
+    }
+
+    #[test]
+    fn gate_suppressed_after_drovr_skill_invocation() {
+        let t = format!(
+            "{}\n{}\n{}\n",
+            user_prompt("please fix the parser"),
+            skill_call("drovr:tdd"),
+            assistant_text("wrote the failing test")
+        );
+        assert!(skill_invoked_last_turn(&t));
+        assert_eq!(gate_json(&ReflexConfig::default(), Some(&t)), None);
+    }
+
+    #[test]
+    fn gate_emitted_when_no_skill_last_turn() {
+        let t = format!(
+            "{}\n{}\n{}\n",
+            user_prompt("please fix the parser"),
+            tool_use("Read", r#"{"file_path":"/p/x.rs"}"#),
+            assistant_text("here is what I found")
+        );
+        assert!(!skill_invoked_last_turn(&t));
+        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+    }
+
+    #[test]
+    fn tool_results_do_not_end_the_turn() {
+        // THE defeat case. A `Skill` call is always followed by its
+        // tool_result, which Claude Code records as `type: "user"`. A scan that
+        // stops at the first `type == "user"` record therefore never sees the
+        // call it exists to detect — a check that passes while checking
+        // nothing, and the gate would inject on every single turn.
+        let t = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            user_prompt("please fix the parser"),
+            skill_call("drovr:tdd"),
+            tool_use("Edit", r#"{"file_path":"/p/x.rs"}"#),
+            tool_result("toolu_2"),
+            assistant_text("done")
+        );
+        assert!(
+            skill_invoked_last_turn(&t),
+            "tool_result records must not be read as a turn boundary"
+        );
+    }
+
+    #[test]
+    fn skill_before_the_last_user_message_does_not_suppress() {
+        // The turn is over. A skill invoked two turns ago says nothing about
+        // whether this turn is running the discipline.
+        let t = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            user_prompt("first request"),
+            skill_call("drovr:tdd"),
+            assistant_text("done"),
+            user_prompt("second request"),
+            assistant_text("sure")
+        );
+        assert!(!skill_invoked_last_turn(&t));
+        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+    }
+
+    #[test]
+    fn only_a_drovr_prefixed_skill_suppresses() {
+        // `drovr:` is a PREFIX, not a substring: a third-party skill whose name
+        // merely contains the string must not buy silence from the gate.
+        for skill in [
+            "claude-api",
+            "notdrovr:tdd",
+            "superpowers:drovr:tdd",
+            "drovrish",
+            "Drovr:tdd",
+            " drovr:tdd",
+        ] {
+            let t = format!("{}\n{}\n", user_prompt("go"), skill_call(skill));
+            assert!(
+                !skill_invoked_last_turn(&t),
+                "{skill:?} must not suppress the gate"
+            );
+        }
+        // ...and the real thing still does.
+        let t = format!("{}\n{}\n", user_prompt("go"), skill_call("drovr:code-review"));
+        assert!(skill_invoked_last_turn(&t));
+    }
+
+    #[test]
+    fn talking_about_a_skill_does_not_suppress() {
+        // Only an actual `Skill` tool_use counts. Naming one in prose, or
+        // passing it as an argument to some other tool, does not.
+        let mentions = format!(
+            "{}\n{}\n",
+            user_prompt("go"),
+            assistant_text("I could use drovr:tdd here but I will not")
+        );
+        assert!(!skill_invoked_last_turn(&mentions));
+
+        let other_tool = format!(
+            "{}\n{}\n",
+            user_prompt("go"),
+            tool_use("Bash", r#"{"command":"echo drovr:tdd","skill":"drovr:tdd"}"#)
+        );
+        assert!(!skill_invoked_last_turn(&other_tool));
+
+        // A `tool_use` block sitting in a USER record is not an invocation
+        // either — only the assistant invokes skills.
+        let user_side = format!(
+            "{}\n{}\n",
+            user_prompt("go"),
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_use","name":"Skill","input":{"skill":"drovr:tdd"}}]}}"#
+        );
+        assert!(!skill_invoked_last_turn(&user_side));
+    }
+
+    #[test]
+    fn malformed_transcript_lines_are_skipped_not_fatal() {
+        let t = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            "not json at all",
+            user_prompt("go"),
+            r#"{"type":"assistant","message":"truncated"#,
+            "",
+            skill_call("drovr:tdd")
+        );
+        assert!(
+            skill_invoked_last_turn(&t),
+            "a malformed line must be skipped, not abort the scan"
+        );
+        // An entirely unparseable transcript reads as "no skill" → emit.
+        assert!(!skill_invoked_last_turn("garbage\n{{{\n"));
+        assert!(!skill_invoked_last_turn(""));
+    }
+
+    #[test]
+    fn a_user_record_with_text_ends_the_turn() {
+        // The boundary rule must accept both shapes a real prompt takes: a bare
+        // string, and a content array carrying a `text` block (what a prompt
+        // with an attachment looks like).
+        let array_form = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Skill","input":{"skill":"drovr:tdd"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"next request"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+        );
+        assert!(
+            !skill_invoked_last_turn(array_form),
+            "a user record carrying a text block must end the turn"
+        );
+    }
+
+    #[test]
+    fn gate_card_phrases_present_in_router_skill() {
+        // The drift guard (§4.2, §9.2). TWO-SIDED on purpose: asserting only
+        // that the card contains a phrase lets the router drop it, and
+        // asserting only the router lets the card drop it. Either half alone is
+        // a guarantee with nothing keeping it.
+        assert!(
+            !GATE_CARD_PHRASES.is_empty(),
+            "an empty phrase list makes this test vacuous"
+        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../skills/using-drovr/SKILL.md");
+        let md =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        for phrase in GATE_CARD_PHRASES {
+            assert!(
+                GATE_CARD.contains(phrase),
+                "GATE_CARD is missing shared phrase {phrase:?}"
+            );
+            assert!(
+                md.contains(phrase),
+                "skills/using-drovr/SKILL.md is missing shared phrase {phrase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_core_survives_section_subtraction() {
+        // §9.2: `[reflex.sections]` may subtract advisory sections but must not
+        // be able to delete the routing core. The section list is READ FROM THE
+        // FILE rather than hardcoded, so a section added later that happens to
+        // wrap the core fails this test instead of slipping past it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../skills/using-drovr/SKILL.md");
+        let md =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let names: Vec<String> = md
+            .lines()
+            .filter_map(|l| parse_open_marker(l.trim()).map(str::to_string))
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "no reflex sections found — this test would subtract nothing"
+        );
+        let sections: BTreeMap<String, bool> = names.iter().map(|n| (n.clone(), false)).collect();
+        let body = render_body(&md, &sections);
+        // Non-vacuity: the subtraction must actually have removed something, or
+        // this test would pass on a render that ignored `sections` entirely.
+        assert!(
+            body.len() < render_body(&md, &BTreeMap::new()).len(),
+            "subtracting every section removed nothing — the test proves nothing"
+        );
+        for core in ["<SUBAGENT-STOP>", "# Using Drovr"] {
+            assert!(
+                body.contains(core),
+                "subtracting every section deleted the routing core {core:?}:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_path_is_read_from_hook_input() {
+        assert_eq!(
+            transcript_path_from_hook_input(
+                r#"{"session_id":"s","transcript_path":"/p/t.jsonl","hook_event_name":"UserPromptSubmit"}"#
+            ),
+            Some(std::path::PathBuf::from("/p/t.jsonl"))
+        );
+        // Every shape that cannot yield a path reads as "no transcript", which
+        // fails open toward emitting the card.
+        for bad in [
+            "",
+            "not json",
+            "{}",
+            r#"{"transcript_path":null}"#,
+            r#"{"transcript_path":42}"#,
+            r#"{"transcript_path":""}"#,
+            "[]",
+        ] {
+            assert_eq!(
+                transcript_path_from_hook_input(bad),
+                None,
+                "{bad:?} must not yield a transcript path"
+            );
+        }
     }
 }

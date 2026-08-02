@@ -106,15 +106,21 @@ enum Commands {
         sub: CodeReviewCmd,
     },
 
-    /// Emit the SessionStart reflex context as Claude Code hook JSON.
+    /// Emit reflex context as Claude Code hook JSON.
     ///
-    /// Run by the `session-start` hook. Reads `--skill`, shapes it per the
+    /// Two modes, exactly one of which must be selected. `--skill` is the
+    /// `SessionStart` reflex: read the router markdown, shape it per the
     /// `[reflex]` config (master switch, preamble override, section toggles),
-    /// and prints the hook JSON — or nothing when the reflex is disabled.
+    /// print the hook JSON. `--gate` is the per-turn `UserPromptSubmit` card:
+    /// read the hook payload from stdin and print the gate JSON — or nothing
+    /// when the gate is off or the previous turn already invoked a drovr skill.
     Reflex {
-        /// Path to the router skill markdown to inject.
-        #[arg(long)]
-        skill: PathBuf,
+        /// Path to the router skill markdown to inject (SessionStart reflex).
+        #[arg(long, required_unless_present = "gate")]
+        skill: Option<PathBuf>,
+        /// Emit the per-turn gate card instead (UserPromptSubmit).
+        #[arg(long, conflicts_with = "skill", required_unless_present = "skill")]
+        gate: bool,
     },
 }
 
@@ -908,17 +914,27 @@ fn cmd_code_review(sub: CodeReviewCmd) {
     }
 }
 
-/// Emit the SessionStart reflex context, or nothing when the reflex is disabled.
+/// Emit reflex context, or nothing when the relevant reflex is disabled.
 ///
-/// The `DROVR_PHASE` phase-suppression lives in the bash hook (it gates before
-/// this runs). Here we honor the config master switch and, when enabled, read
-/// the skill file — failing loudly on a read error rather than injecting a
-/// poisoned or partial context.
-fn cmd_reflex(skill: &std::path::Path) {
+/// The `DROVR_PHASE` phase-suppression lives in the `session-start` bash hook
+/// (it gates before this runs) and applies to the SessionStart reflex only —
+/// the per-turn gate deliberately does *not* suppress inside a phase, because a
+/// phase is exactly where the discipline has to hold.
+///
+/// Clap guarantees exactly one of `--skill` / `--gate`.
+fn cmd_reflex(skill: Option<&std::path::Path>, gate: bool) {
     let cfg = config::load_config().unwrap_or_else(|e| {
         eprintln!("drovr: failed to load config: {e}");
         process::exit(1);
     });
+
+    if gate {
+        cmd_reflex_gate(&cfg.reflex);
+        return;
+    }
+
+    // `required_unless_present = "gate"` makes this unreachable via the CLI.
+    let skill = skill.expect("clap requires --skill unless --gate is set");
     let skill_md = std::fs::read_to_string(skill).unwrap_or_else(|e| {
         eprintln!("drovr: cannot read reflex skill {}: {e}", skill.display());
         process::exit(1);
@@ -926,6 +942,26 @@ fn cmd_reflex(skill: &std::path::Path) {
     // `reflex_json` is the single authority on the `enabled` switch: it returns
     // `None` (emit nothing) when the reflex is disabled, `Some(json)` otherwise.
     if let Some(json) = reflex::reflex_json(&skill_md, &cfg.reflex) {
+        println!("{json}");
+    }
+}
+
+/// Emit the per-turn gate card, or nothing when it is off or already redundant.
+///
+/// **Every failure here falls through to `transcript = None`, which emits.**
+/// Unlike the SessionStart reflex — where a partial read would inject a poisoned
+/// context, so it exits loudly — the gate's only input is evidence that the card
+/// is *unnecessary*. Absent evidence is not evidence of absence: a hook that
+/// exited non-zero on an unreadable transcript would break the user's turn to
+/// avoid a redundant 600-byte injection.
+fn cmd_reflex_gate(cfg: &config::ReflexConfig) {
+    let mut stdin_json = String::new();
+    // A hook that is somehow run without a payload still gets a decision.
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_json);
+    let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
+        .and_then(|p| std::fs::read_to_string(p).ok());
+
+    if let Some(json) = reflex::gate_json(cfg, transcript.as_deref()) {
         println!("{json}");
     }
 }
@@ -956,7 +992,7 @@ fn main() {
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
-        Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::Reflex { skill, gate } => cmd_reflex(skill.as_deref(), gate),
     }
 }
 
@@ -1265,8 +1301,9 @@ mod tests {
     fn parse_reflex() {
         let cli = parse(&["drovr", "reflex", "--skill", "/p/SKILL.md"]).unwrap();
         match cli.command {
-            Commands::Reflex { skill } => {
-                assert_eq!(skill, std::path::PathBuf::from("/p/SKILL.md"));
+            Commands::Reflex { skill, gate } => {
+                assert_eq!(skill, Some(std::path::PathBuf::from("/p/SKILL.md")));
+                assert!(!gate);
             }
             _ => panic!("wrong variant"),
         }
@@ -1274,8 +1311,30 @@ mod tests {
 
     #[test]
     fn parse_reflex_requires_skill() {
-        // `--skill` is mandatory: the hook must always name the source markdown.
+        // Bare `drovr reflex` must still error — now because neither `--skill`
+        // nor `--gate` was given, so the command can never guess which hook it
+        // is serving.
         assert!(parse(&["drovr", "reflex"]).is_err());
+    }
+
+    #[test]
+    fn parse_reflex_gate() {
+        let cli = parse(&["drovr", "reflex", "--gate"]).unwrap();
+        match cli.command {
+            Commands::Reflex { skill, gate } => {
+                assert_eq!(skill, None);
+                assert!(gate);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_reflex_gate_conflicts_with_skill() {
+        // The two modes emit different hook events; asking for both is a
+        // wiring bug in hooks.json and must fail loudly rather than pick one.
+        assert!(parse(&["drovr", "reflex", "--gate", "--skill", "/p/SKILL.md"]).is_err());
+        assert!(parse(&["drovr", "reflex", "--skill", "/p/SKILL.md", "--gate"]).is_err());
     }
 
     #[test]
