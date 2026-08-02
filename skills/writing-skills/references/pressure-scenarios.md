@@ -209,6 +209,15 @@ enforced against fixtures in the same file.
 The body is the verbatim prompt handed to the probe subagent. Nothing else goes
 in it: no notes to yourself, no hints about which option the skill favours.
 
+**The body must restate every option exactly as `forced_choice` words it.** They
+are two copies of one fact and the probe only ever sees one of them: the body is
+what the agent answers, `forced_choice` is what the scorer is given as ground
+truth. Reword an option in one place and not the other and the run is scored as
+an answer to a question that was never asked — silently, with a confident
+verdict attached. Wrapping a clause across lines is fine; changing a word is not.
+`parse_scenario` compares them with whitespace flattened, so the check is on
+wording, not on layout.
+
 `forced_choice` and `correct_option` are copied into every transcript's
 `## Forced choice` block. They are identical across arms, so they leak nothing —
 and without them the scorer has no ground truth for the one field the pass bars

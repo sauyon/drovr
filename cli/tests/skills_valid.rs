@@ -1226,6 +1226,14 @@ fn forced_choice_options(raw: &str) -> Vec<ChoiceOption> {
         .collect()
 }
 
+/// Collapse every run of whitespace to a single space.
+///
+/// The body wraps an option across lines that `forced_choice` keeps on one, so
+/// the two are compared flattened. Wrapping is formatting; rewording is drift.
+fn normalize_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Words that mark a clause as handing the decision to someone else.
 ///
 /// Matched as **whole words** (with `escalat` allowed to carry its endings), not
@@ -1438,6 +1446,24 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
         }
     }
 
+    // The body is a third copy of the forced choice, and the only one the probe
+    // ever reads. `forced_choice` is what the scorer is given, so a body that
+    // words an option differently means the agent answered one question and its
+    // verdict was scored against another — with nothing failing in between.
+    let body_flat = normalize_ws(body);
+    for option in &options {
+        let restated = format!("{}: {}", option.label, normalize_ws(&option.clause));
+        if !body_flat.contains(&restated) {
+            return Err(format!(
+                "the body does not restate `forced_choice` option `{restated}`. The probe is \
+                 handed the body and the scorer is handed `forced_choice`, so any difference \
+                 between them is scored as an answer to a question that was never asked. Restate \
+                 every option in the body exactly as `forced_choice` words it — wrapping across \
+                 lines is fine, rewording is not"
+            ));
+        }
+    }
+
     let correct_option = get("correct_option");
     let correct_option = unquote(correct_option.trim()).trim().to_string();
     // Resolved to an INDEX, so the pairing survives into the returned value
@@ -1604,7 +1630,14 @@ fn the_documented_frontmatter_template_parses() {
         .unwrap_or_else(|| panic!("{}: unterminated yaml fence", doc_path.display()))
         + start;
 
-    let template = format!("{}\nYou are three hours in.\n", &doc[start..end]);
+    // The body the doc's template implies: `parse_scenario` requires every
+    // option to be restated, so a template test that omitted them would be
+    // testing a document no author could actually copy.
+    let template = format!(
+        "{}\nYou are three hours in.\n\nA: ship it now\nB: write the failing test first\n\
+C: ask the human\n\nWhat do you do?\n",
+        &doc[start..end]
+    );
     parse_scenario("tdd-1", &template).unwrap_or_else(|e| {
         panic!(
             "the frontmatter template in {} does not parse: {e}\n\
@@ -1663,7 +1696,45 @@ correct_option: B
 ---
 
 You are three hours in.
+
+A: ship it now
+B: write the failing test first
+C: ask the human
+
+What do you do?
 ";
+
+/// The body and `forced_choice` are two copies of one fact, and they can drift.
+///
+/// The probe is handed the **body**; the scorer is handed **`forced_choice`**
+/// (`scoring-rubric.md` copies it into every transcript). Nothing else compares
+/// them, so a wording change applied to one and not the other is scored as if
+/// the agent had answered a question it was never asked — and it fails silently,
+/// which is the failure mode this whole schema exists to prevent.
+#[test]
+fn parse_scenario_requires_the_body_to_restate_every_option() {
+    // Word one option differently in the body while leaving `forced_choice`
+    // alone. The `\n` anchors the replacement to the body: the frontmatter's
+    // copy is followed by ` ·`, not a newline.
+    let drifted = CANONICAL_SCENARIO.replace(
+        "B: write the failing test first\n",
+        "B: write a test at some point\n",
+    );
+    let err = parse_scenario("tdd-1", &drifted)
+        .expect_err("a body that rewords an option must be rejected");
+    assert!(
+        err.contains("write the failing test first"),
+        "the rejection must quote the option the body failed to restate, got: {err}"
+    );
+
+    // Line wrapping is not drift — the body wraps clauses that `forced_choice`
+    // keeps on one line, and that has to stay legal or every real scenario fails.
+    let wrapped = CANONICAL_SCENARIO.replace(
+        "B: write the failing test first\n",
+        "B: write the failing\n   test first\n",
+    );
+    parse_scenario("tdd-1", &wrapped).expect("a wrapped restatement is the same restatement");
+}
 
 /// Three names from the taxonomy are not three pressures if resisting one
 /// resists all of them.
@@ -1820,7 +1891,11 @@ fn parse_scenario_rejects_illegal_states() {
         (
             "frontmatter but no prompt",
             "tdd-1",
-            &ok.replace("\nYou are three hours in.\n", "\n"),
+            // The whole body removed, options included — an empty body has to be
+            // caught as an empty body, not as an unrestated option.
+            &ok.split_once("---\n\n")
+                .map(|(front, _)| format!("{front}---\n\n"))
+                .expect("the canonical fixture closes its frontmatter"),
             "empty body",
         ),
     ];
@@ -1850,7 +1925,8 @@ fn scenario_corpus_requires_one_dev_and_two_holdout() {
             "---\nskill: {skill}\nn: {n}\ntag: {tag}\n\
              pressures: [time, sunk-cost, authority]\n\
              forced_choice: \"A: ship it now · B: write the failing test first · C: ask the human\"\n\
-             correct_option: B\n---\n\nbody\n"
+             correct_option: B\n---\n\nbody\n\n\
+             A: ship it now\nB: write the failing test first\nC: ask the human\n"
         )
     };
     let full = |tags: [&str; 3]| -> Vec<(String, String)> {
