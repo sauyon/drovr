@@ -232,6 +232,14 @@ pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String>
 /// True if the assistant turn since the last user message invoked a `drovr:*`
 /// skill.
 ///
+/// **The governing invariant: exactly one path returns `true`** — an
+/// `assistant` record carrying a `Skill` tool_use whose `input.skill` starts
+/// with `drovr:`. Every other outcome, including every shape this function
+/// cannot make sense of, returns `false` and emits the card. `true` means the
+/// discipline demonstrably ran; `false` means anything else. Read any change to
+/// this function against that sentence: a new `true` path is a new way for the
+/// gate to go quiet on a turn that never ran a skill, which is silent drift.
+///
 /// Walks backwards from EOF and stops at the first record that is a **real user
 /// message**. That qualifier is the whole subtlety: Claude Code writes tool
 /// *results* as `type: "user"` records too, and every `Skill` call is
