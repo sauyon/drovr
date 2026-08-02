@@ -422,7 +422,8 @@ fn parse_manifest(contents: &str) -> Result<Vec<ManifestRow>, String> {
         if !source_path_belongs_to_skill(&source_path, &skill) {
             return Err(in_row(format!(
                 "source path `{source_path}` does not belong to skill `{skill}` \
-                 (expected the skill as the file stem or the parent directory)"
+                 (a `SKILL.md` file is owned by its parent directory; any other \
+                  filename is owned by its file stem)"
             )));
         }
         // `(arm, skill)` is the manifest's natural key — every matcher in the run
@@ -774,14 +775,15 @@ fn arm_a_snapshots_match_manifest() {
             matches.len()
         );
 
-        // The hash cell's 40-hex format is guaranteed by `BlobSha`, which
+        // The hash cell's 40-hex format is guaranteed by `GitObjectId`, which
         // `parse_manifest` validates for every row — a malformed cell already
         // failed above, with the offending line quoted.
         let expected = matches[0].hash.clone();
 
-        // `parse_manifest` already enforces the loose rule that fits every arm
-        // (the skill is the path's stem or its parent). Arm A's shape is known
-        // exactly, so it is held to the exact path.
+        // `parse_manifest` already enforces the rule that fits every arm: a
+        // `SKILL.md` file is owned by its parent directory, any other filename
+        // by its stem. That admits any `<dir>/<skill>/SKILL.md`; arm A's shape is
+        // known exactly, so here it is held to the one path it may have.
         let expected_source = format!("skills/{skill}/SKILL.md");
         assert_eq!(
             matches[0].source_path,
