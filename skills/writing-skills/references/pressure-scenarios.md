@@ -87,6 +87,17 @@ Two consequences worth expecting rather than discovering: `exhaustion` can only
 appear where `time` does not, and `economic` is rarer than it looks, because in
 most deadline scenarios the money is the deadline.
 
+**This concentrates a corpus, and that is a limitation to state rather than to
+paper over.** Applying the rule to the 17 scenarios in this repo left
+`pragmatic` and `authority` in 14 each, `time` in 11, and `economic` in exactly
+one — the only case where the money follows from being *wrong* rather than from
+being *late*. That is not an authoring failure; it is what independence costs.
+The instrument therefore probes deference, "the rule does not apply here", and
+urgency well, and probes economic and social temptation thinly. Say so when you
+report on it. Do **not** rebalance the distribution by listing levers that
+collapse — a corpus that looks varied in its metadata and behaves narrowly is
+strictly worse than one that is honest about its range.
+
 **What enforces this, exactly.** One collapse is machine-checked and the rest is
 not:
 

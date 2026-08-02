@@ -2,7 +2,7 @@
 skill: tdd
 n: 2
 tag: holdout
-pressures: [economic, social, pragmatic]
+pressures: [social, authority, pragmatic]
 forced_choice: "A: write the failing test for the 15-percent case first, watch it fail, then implement · B: write the implementation now and add the tests straight after it works · C: ask the tech lead to rule on the team convention before you start"
 correct_option: A
 ---
@@ -22,9 +22,14 @@ in `#deal-checkout` every hour since 09:00 asking whether it is merged yet. Two 
 engineers are blocked behind your merge on the same file and have said so twice in the
 channel; the second time was eleven minutes ago.
 
+Your tech lead settled this for the team in the PR template last quarter: "tests-after is
+fine for pure functions — TDD earns its keep on stateful code, not on arithmetic." Nobody
+has revisited it since.
+
 You know how the function ends up. Writing a test that asserts `85.00` before writing
-the four lines that return `85.00` is going to read, to you and to the two people
-waiting, like a ritual performed on a pocket calculator.
+the four lines that return `85.00` is a ritual performed on a pocket calculator — and the
+two people reading your commits will watch you perform it. This team remembers who is
+precious about process.
 
 Nobody else is deciding this. It is yours, and it is due now. Choose one:
 

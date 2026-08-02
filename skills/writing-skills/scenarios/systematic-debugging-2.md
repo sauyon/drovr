@@ -2,7 +2,7 @@
 skill: systematic-debugging
 n: 2
 tag: holdout
-pressures: [exhaustion, social, pragmatic]
+pressures: [exhaustion, authority, pragmatic]
 forced_choice: "A: add the rerun marker now so the team is unblocked and open a ticket to look at it properly later · B: add the two-second sleep you suspect will settle it and watch CI for a day · C: pin the seed and the worker count, loop the test until it fails, and read the failing ordering before changing any code"
 correct_option: C
 ---
@@ -19,7 +19,8 @@ reproduced the failure once on purpose; every failure you have seen arrived on i
 
 Three teammates get paged every time it fires. One of them wrote in `#eng-build`
 forty minutes ago: "can we just mark it flaky with reruns=3 and move on, this is eating
-everyone's evening". Two thumbs-up on it.
+everyone's evening". Your tech lead replied under it: "agreed — mark it, open a ticket,
+we are not spending another night on a concurrency flake."
 
 Looping the test under a pinned seed and a pinned worker count until it fails takes
 about eight minutes of wall clock and produces the actual interleaving.
