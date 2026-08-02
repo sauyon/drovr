@@ -656,26 +656,47 @@ failures, two of which passed in isolation.
 
 If a run reports N failures, re-run the first one alone before believing the other N-1.
 
-## `web_keyboard_navigation` flakes under machine load (2026-07-31, 2026-08-01)
+## `web_keyboard_navigation` fails: Chromium 150 headless will not navigate to any network URL (2026-08-01)
 
-**Severity:** low — passes on re-run, but it fails a full `cargo test` often enough to be mistaken
-for a real break (I twice reported it as "environmental" before capturing the cause).
+**Severity:** medium — it fails `cargo test` on this machine every run, and the cause is outside
+drovr entirely.
 
-The test drives a headless browser over CDP from `cli/tests/web/nav.mjs`, which gives each command
-a fixed 20-second budget:
+**It is not flaky and it is not load.** Two earlier versions of this entry said "environmental"
+and then "load sensitivity in a fixed 20s CDP deadline". Both were guesses; measured, both are
+wrong. Load average was 2.08 with 41 GB free and zero leaked browsers when it failed.
 
-```
-Error: Page.navigate: no CDP response within 20s
-    at Timeout._onTimeout (cli/tests/web/nav.mjs:52:11)
-```
+**What actually happens.** Nothing takes 20 seconds — 20s is just `nav.mjs`'s own per-command
+timeout. Chromium 150.0.7871.124 headless, launched exactly as `cli/tests/web_nav.rs` launches it,
+never answers `Page.navigate` for any network-scheme URL, and the DevTools session goes silent
+afterwards: a `Runtime.evaluate` sent four seconds later gets no reply either, and the socket
+never closes. Chromium logs nothing.
 
-That is a timeout, not a failed assertion — the browser never answered in time. Both sightings
-were on a machine running several agents' test suites and a live `drovr serve` at once. So it is
-load sensitivity in the driver's own deadline, not the code under test.
+Reproduced standalone (no cargo, no drovr):
 
-**If you hit it:** re-run it alone (`cargo test --test web_nav`). To fix it properly, make the CDP
-deadline in `nav.mjs` configurable (env var) or scale it, rather than a fixed 20s that a loaded
-machine cannot meet.
+| Navigation target | Result |
+|---|---|
+| `file:///tmp/probe.html` | responds in 31 ms |
+| `http://127.0.0.1:<live python http.server>` | **hangs forever** |
+| `http://localhost:<port>` | **hangs forever** |
+| `https://example.invalid/` | **hangs forever** |
+| `about:blank#x` (same document) | responds in ~15 ms |
+
+So the browser is fine until it is asked to use the network stack.
+
+**Ruled out:** the drovr server (hangs against a live `python -m http.server` and a dead port
+alike); the CDP socket topology (a browser-endpoint session with `Target.attachToTarget
+{flatten:true}` hangs identically); `--headless` vs `=old` vs `=new`; `--no-sandbox`;
+`--disable-dev-shm-usage`; `--enable-features=NetworkServiceInProcess`; `--no-proxy-server`;
+enterprise policy (no `/etc/chromium/policies`).
+
+**So this is a Chromium regression or a local Chromium/system problem, not a drovr one.** The
+suite passed on this machine earlier the same day, which points at a browser upgrade in between.
+
+**Until it is resolved,** `cargo test` on this machine is red for a reason unrelated to whatever
+you changed — check whether `web_keyboard_navigation` is the only failure before believing it.
+The reproduction above (`Page.navigate` to `file://` vs `http://`) tells you in ten seconds
+whether the browser is still affected.
+
 
 ## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky, cause UNKNOWN (2026-07-26, 2026-08-01)
 
