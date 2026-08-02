@@ -241,8 +241,15 @@ pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String>
 /// record counts as the turn boundary only when its content is a bare string or
 /// carries at least one non-`tool_result` block.
 ///
-/// Malformed lines are skipped, not fatal: a truncated tail is normal for a
-/// file being appended to live.
+/// A line that will not parse **ends the turn** rather than being stepped over.
+/// It is never fatal, but it is also not nothing: it might have been this
+/// turn's user message, and walking past it would reach an earlier turn's skill
+/// call and silence a turn that ran no skill at all. Treating it as a boundary
+/// costs at most one redundant injection, which is the direction every
+/// ambiguity in this scan resolves to. (The window boundary in
+/// [`read_transcript_tail`] can cut a record in half, but that half-line is the
+/// *last* one this walk reaches, where boundary and end-of-input mean the same
+/// thing.)
 pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
     for line in transcript_jsonl.lines().rev() {
         let line = line.trim();
@@ -250,7 +257,7 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
             continue;
         }
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue; // malformed line: skip, keep walking
+            return false; // unparseable: unknowable, so emit
         };
         match record.get("type").and_then(|t| t.as_str()) {
             Some("user") if is_turn_boundary(&record) => return false,
@@ -820,22 +827,52 @@ mod tests {
     }
 
     #[test]
-    fn malformed_transcript_lines_are_skipped_not_fatal() {
+    fn malformed_transcript_lines_are_never_fatal() {
+        // Garbage anywhere must produce a decision, never a panic. Blank lines
+        // are genuinely nothing and are stepped over; unparseable lines end the
+        // turn (see the test below).
+        //
+        // The walk runs BACKWARDS, so a line only tests anything if it sits
+        // between the call being detected and EOF. The blank line is placed
+        // there deliberately: behind the call it would never be reached and
+        // this assertion would hold no matter what blank lines did.
         let t = format!(
             "{}\n{}\n{}\n{}\n{}\n",
             "not json at all",
             user_prompt("go"),
-            r#"{"type":"assistant","message":"truncated"#,
-            "",
-            skill_call("drovr:tdd")
+            skill_call("drovr:tdd"),
+            "   ",
+            assistant_text("still inside the same turn")
         );
         assert!(
             skill_invoked_last_turn(&t),
-            "a malformed line must be skipped, not abort the scan"
+            "a blank line between records must not end the scan"
         );
         // An entirely unparseable transcript reads as "no skill" → emit.
         assert!(!skill_invoked_last_turn("garbage\n{{{\n"));
         assert!(!skill_invoked_last_turn(""));
+        assert!(!skill_invoked_last_turn("\n\n   \n"));
+    }
+
+    #[test]
+    fn an_unparseable_line_ends_the_turn_rather_than_being_walked_past() {
+        // The last remaining ambiguity that resolved toward SUPPRESSING. A line
+        // that will not parse might have been this turn's user message; walking
+        // past it reaches an earlier turn's skill call and silences a turn that
+        // ran nothing. Unknowable means emit, exactly as every other ambiguity
+        // in this scan is settled.
+        let t = format!(
+            "{}\n{}\n{}\n{}\n",
+            user_prompt("older request"),
+            skill_call("drovr:tdd"),
+            r#"{"type":"user","message":{"role":"user","conte"#, // truncated mid-write
+            assistant_text("this turn invoked nothing")
+        );
+        assert!(
+            !skill_invoked_last_turn(&t),
+            "an unparseable line must end the turn, not be stepped over"
+        );
+        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
     }
 
     #[test]
