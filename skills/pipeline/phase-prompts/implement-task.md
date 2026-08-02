@@ -38,11 +38,27 @@ tasks; later tasks run as their own fresh phases.
    cannot distinguish from completion and which stalls the run until a human nudges the pane;
    blocking keeps you working straight through to your final step. This is IN ADDITION to the
    pipeline's final review phase — catch it here, cheaply, before it cascades.
+
+   **Two roles, one gate.** Anyone may RUN the panel, as often as they like —
+   it is a test suite. Only the **driver's** run is the **gate**: a clean
+   verdict on a panel you ran yourself is evidence, never permission to
+   report done.
+
+   So `drovr code-review run <run> task-<N>` is yours to use, freely — but a clean verdict
+   from a panel *you* invoked buys you a fix list, not a finish. You are done when this task's
+   own verification passes (step 4) and you have resolved what review found; never *because* a
+   panel came back clean, and never with a panel standing in for step 4. Record every panel you
+   invoked in your report, marked author-run (step 6). The driver runs its own panel after you
+   report, and that verdict is the one that decides whether the task advances — it has already
+   caught an Important on the identical commit an author-run panel called clean.
 6. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
    - what changed (files + the interfaces you actually implemented, verbatim),
    - test/verification output proving it works,
    - the self-review: what the review subagents found and how you resolved each Critical/
      Important finding (and any you deferred, with why),
+   - **every `drovr code-review run` you invoked yourself, labelled author-run**, with its
+     verdict — including any that came back clean. The driver and the final review phase need
+     to see which verdicts were the author's; one line each is enough,
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.

@@ -474,6 +474,102 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
+
+**Severity:** medium — the author's own verdict silently becomes the release decision, so the
+defect ships and the review cost is paid twice.
+**Found:** run `skill-stickiness`, task 3 (authoring the 17-scenario pressure corpus), 2026-08-02.
+**Not a bug in `code_review.rs`** — the panel worked exactly as built. The defect was in the docs:
+nothing distinguished *running* the panel from *being gated by* it.
+
+### What happened
+
+The task agent ran `drovr code-review run` **five times** on its own work (four angles each:
+correctness, error-handling, security, type-design), fixing what it found — 7 Important and 1 nit
+across the five — and committed `b16dea0 fix(writing-skills): remove a self-contradiction and a
+collapsed pressure set`. Its fifth panel returned clean on all four angles. It declared the task
+done.
+
+The **driver** then ran a sixth panel. The `correctness` angle returned an Important:
+
+> `skills/writing-skills/scenarios/verification-before-completion-1.md`: "Pressure list still
+> collapses to two effective levers: time, social, and exhaustion are all hurry-up variants;
+> pragmatic is the only distinct one."
+
+That is the same defect class `b16dea0` had just claimed to fix. The agent had correctly
+identified it, fixed it incompletely, and then adjudicated its own fix as sufficient.
+
+### The sharp version
+
+Panels 5 and 6 reviewed the **identical tree**:
+
+```
+task-3-review-5.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   author-run  → 4/4 angles clean
+task-3-review-6.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   driver-run  → correctness: 1 Important
+```
+
+Same base, same HEAD, same four angles, same reviewer configuration. The only variable was who
+invoked it. (Artifacts: `~/.local/share/drovr/runs/skill-stickiness/task-3-review-{5,6}-*.json`.)
+
+### Root cause — and what it is *not*
+
+Running the panel on your own work is good practice, and the five self-runs found real defects:
+7 of their 8 findings were Important, and every Important was fixed. That is the panel working
+as a test suite, which is what it should be. The defect is that **nothing named the difference** between
+that use and the acceptance gate, so a clean author-run verdict was read as permission to report
+done — and `drovr code-review run` offers no signal to tell the two uses apart.
+
+`skills/pipeline/SKILL.md` said the driver runs the panel; it never said an author-run panel is
+*not* the gate. `phase-prompts/implement-task.md` step 5 told the task agent to self-review with
+`drovr:code-review`, which reads as licence to substitute the panel for the decision.
+
+Two nearby effects worth knowing:
+
+- **The first of the five was vacuous.** Panel 1's head equalled the recorded base (`5c8a7da`)
+  because nothing had been committed yet, so it reviewed an empty diff and reported clean from
+  all four angles. The agent caught this itself. That is a *different* defect class — the panel
+  diffs `base..HEAD`, so uncommitted work reviews as clean and says so — and it is not recorded
+  separately here yet.
+- **Cost.** Task 3 was reviewed 6×. Of the five author-run rounds, three (panels 2–4) returned
+  findings; panel 1 was the vacuous one and panel 5 was clean. The sixth is the one that decided
+  anything. An author-run panel is not wasted — three of them earned their keep — but it is
+  never the one that counts.
+
+### Why this is expected, not a fluke
+
+The panel is sampled and non-deterministic, so run 6 is not magic — it is one more independent
+draw. That is precisely the point: a single clean sample is evidence, not proof, and the party
+who wants to stop is the worst party to decide the sampling is finished.
+
+This repo already encodes the argument one level down. `spec.md` §7.3 of the `skill-stickiness`
+run mandates that arm B be scored by a read-only reviewer that is **not arm B's author**, with
+arm labels stripped, because "unblinded self-scoring by arm B's author is exactly what the
+replication literature this spec cites warns about." The panel gate is the same argument one
+level up. Consistent with, though not proof of, the published finding that intrinsic
+self-correction without external feedback can degrade output (Huang et al., *Large Language
+Models Cannot Self-Correct Reasoning Yet*, ICLR 2024, arXiv:2310.01798) and that self-correction
+depends on reliable external feedback (Kamoi et al., TACL 12 (2024) 1417–1440,
+arXiv:2406.01297). Panickssery et al. (*LLM Evaluators Recognize and Favor Their Own
+Generations*, NeurIPS 2024) is about an evaluator scoring its own generations, which is not quite
+this case — the reviewers here were independent agents — but it bears on the adjudication step,
+which is the one that failed.
+
+### Fix in place — documentation, deliberately
+
+The same paragraph now appears verbatim in `skills/code-review/SKILL.md`,
+`skills/pipeline/SKILL.md` and `skills/pipeline/phase-prompts/implement-task.md`: anyone may run
+the panel, only the driver's run is the gate, a clean author-run verdict is evidence and never
+permission. `implement-task.md` additionally requires the task report to list every panel the
+agent invoked itself, labelled author-run, so the distinction is visible downstream.
+
+**No mechanism was added, and this is the known gap.** `drovr code-review run` has no caller
+identity and cannot acquire one honestly: both roles run the same command on the same machine, so
+any "who ran it" field would be self-declared — a permission system agents route around, and
+worse, one that launders a self-declaration into the appearance of authority. The task report's
+author-run labels are self-reported *facts about the past*, which is a different thing from a
+self-declared *right*. What enforces the gate is the driver running its own panel after every
+task, unconditionally, regardless of what the report claims.
+
 ## `drovr cleanup` auto-commits whatever the worktree is holding (2026-08-02)
 
 **Severity:** low, but it puts junk — including large binaries — into your branch's history under

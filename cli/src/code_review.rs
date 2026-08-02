@@ -4,8 +4,15 @@
 //! `base..head` scope, load config, seed + spawn one read-only reviewer per angle,
 //! wait (bounded) for every reviewer to finish, read + union-merge the per-angle
 //! findings, write the merged `<task>-review.json`, and return a [`ReviewOutcome`]
-//! (→ exit 0 / 3 / 2 / 1). It is BLOCKING; the pipeline driver — never a skill — calls
-//! it and reacts to the outcome.
+//! (→ exit 0 / 3 / 2 / 1). It is BLOCKING.
+//!
+//! Two roles share this one entry point, and it cannot tell them apart — there is no
+//! caller identity here, by design. A task agent may run a pass on its own work as
+//! often as it likes, as iteration feedback. Only the pipeline driver's pass is the
+//! acceptance gate: the driver reacts to the outcome and decides whether the task
+//! advances. That separation lives in the skill docs (`drovr:pipeline`,
+//! `drovr:code-review`), not in this module — see `docs/known-issues.md` for the run
+//! that made the distinction necessary.
 //!
 //! # Resuming a slow panel
 //!
