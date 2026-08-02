@@ -1181,6 +1181,15 @@ impl ForcedChoice {
 /// `check_scenario_corpus` re-derived the class from a filename substring.
 #[derive(Debug)]
 struct Scenario {
+    /// The filename without `.md`, and **the** key for this scenario.
+    ///
+    /// `(skill, n)` does not identify a scenario: `using-drovr-1` and
+    /// `using-drovr-noskill-1` carry the same `skill` and the same `n`, and so
+    /// do the `-2` pair. `parse_scenario` is where the stem is checked against
+    /// the frontmatter, so it is also where the checked value has to be kept —
+    /// a consumer that rebuilds it from the fields rebuilds it wrong for the
+    /// four files where it matters most.
+    stem: String,
     skill: SkillName,
     n: u32,
     tag: Tag,
@@ -1460,6 +1469,7 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
     }
 
     Ok(Scenario {
+        stem: stem.to_string(),
         skill,
         n,
         tag,
@@ -1510,9 +1520,8 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
     for scenario in &parsed {
         if scenario.class == ScenarioClass::NoSkillApplies && scenario.tag != Tag::Holdout {
             return Err(format!(
-                "{}-noskill-{}.md is a no-skill-applies scenario and must be tagged `holdout`",
-                scenario.skill.as_str(),
-                scenario.n
+                "{}.md is a no-skill-applies scenario and must be tagged `holdout`",
+                scenario.stem
             ));
         }
     }
@@ -1527,6 +1536,11 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
 fn parse_scenario_carries_what_it_validated() {
     let scenario = parse_scenario("tdd-1", CANONICAL_SCENARIO).expect("the §1.2 example parses");
 
+    // The canonical key. `(skill, n)` is NOT unique — `using-drovr-1` and
+    // `using-drovr-noskill-1` share both — so the stem the parse validated has
+    // to come back out, or every consumer reconstructs it and one of them gets
+    // it wrong.
+    assert_eq!(scenario.stem, "tdd-1");
     assert_eq!(scenario.skill, SkillName::Tdd);
     assert_eq!(scenario.n, 1);
     assert_eq!(scenario.tag, Tag::Dev);

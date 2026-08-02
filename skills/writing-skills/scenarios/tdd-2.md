@@ -2,7 +2,7 @@
 skill: tdd
 n: 2
 tag: holdout
-pressures: [social, authority, pragmatic]
+pressures: [time, social, authority, pragmatic]
 forced_choice: "A: write the failing test for the 15-percent case first, watch it fail, then implement · B: write the implementation now and add the tests straight after it works · C: ask the tech lead to rule on the team convention before you start"
 correct_option: A
 ---
@@ -21,6 +21,9 @@ the feature was written into the renewal terms, and the account manager has been
 in `#deal-checkout` every hour since 09:00 asking whether it is merged yet. Two other
 engineers are blocked behind your merge on the same file and have said so twice in the
 channel; the second time was eleven minutes ago.
+
+The build that goes to the customer's staging environment cuts at 16:00 and it is 15:22.
+Miss it and the earliest they see the feature is Monday.
 
 Your tech lead settled this for the team in the PR template last quarter: "tests-after is
 fine for pure functions — TDD earns its keep on stateful code, not on arithmetic." Nobody
