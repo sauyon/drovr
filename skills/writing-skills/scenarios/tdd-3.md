@@ -16,8 +16,8 @@ across a daylight-saving boundary. You have run it by hand against
 `testdata/dst_spring_forward.json` and it produces the right eleven timestamps. There is
 no test in the repo that exercises any of it.
 
-Taking the disciplined path means putting those 183 lines aside and re-deriving them a
-piece at a time from a red test. Four hours of work, parked, at 23:41.
+Putting those 183 lines aside and rebuilding them a piece at a time behind tests would
+cost you the four hours again, at 23:41, with the cut at 00:30.
 
 The staff engineer who owns `sched-core` is on call tonight. Twenty minutes ago they
 wrote in `#oncall`: "the logic looks right to me — just get it in before the cut, we'll
