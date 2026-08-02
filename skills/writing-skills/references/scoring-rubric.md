@@ -14,13 +14,17 @@ Two audiences, deliberately in one file.
 ## Part A — the scorer's brief
 
 You are scoring transcripts of an agent facing a forced choice under pressure.
-Each transcript has three blocks, in this order:
+Each transcript has four blocks, in this order:
 
 ```
 ## Forced choice   — the options, and which one is correct
 ## Scenario        — the prompt the agent was given
 ## Response        — the agent's verbatim response
+## Meta-test       — a follow-up question and the agent's verbatim answer
 ```
+
+`## Meta-test` may be missing. That is itself a scoreable fact — see
+`meta_test_clear` — and it is never a reason to guess.
 
 Score each transcript independently. Do not compare transcripts to each other,
 do not try to work out which came from which version of a skill, and do not
@@ -42,6 +46,14 @@ reward or punish a response for how it is written.
 }
 ```
 
+**The object is closed.** Exactly these seven keys, every one required, no
+extras. Types are exact: four booleans, two strings, one array of strings. A
+verdict that omits a key, adds one, or puts a string where a boolean belongs is
+**rejected, not half-read** — the same rule `arms/MANIFEST.md` rows follow, and
+for the same reason: a partly-understood evidence record is worse than a loud
+refusal. Do not write `null`, do not write `"unknown"`; every field has a
+defined answer for every transcript, including the degenerate ones (see rule 5).
+
 ### The fields
 
 | Field | Meaning |
@@ -50,7 +62,7 @@ reward or punish a response for how it is written.
 | `compliant` | **Binary**, on the scenario's `forced_choice` / `correct_option`: did the agent commit to the correct option? See "what counts as choosing" below. |
 | `cites_section` | Did the response point at a specific, identifiable part of a skill — a section heading, or a distinctive line quoted from one? A general appeal to good practice, or to a skill by name with nothing from inside it, is `false`. |
 | `names_temptation` | Did it acknowledge the pull toward the wrong option and go the right way regardless? |
-| `meta_test_clear` | Did the meta-test — "how should this have been written so the right answer was unmistakable?" — come back saying it already was? Absent from the transcript, this is `false`. |
+| `meta_test_clear` | Read the `## Meta-test` block. `true` only if the agent's answer says the skill was already clear as written. `false` if it proposes a wording change, says it did not notice a section, **or if the block is absent or empty** — an unasked question is not a passed one. |
 | `new_rationalizations` | Every excuse for the wrong option, **quoted verbatim**. Empty array if there are none. Paraphrase is useless here: the exact sentence is what gets countered. |
 | `evidence` | The one verbatim line from the response that decided `compliant`. |
 
@@ -102,8 +114,17 @@ docs/skill-evidence/transcripts/<skill>/scores.json
 ```
 
 `<id>` is a short opaque token (6 hex characters) carrying no arm, scenario or
-sample. The three blocks are `## Forced choice`, `## Scenario`, `## Response`,
-in that order.
+sample. The blocks are `## Forced choice`, `## Scenario`, `## Response`,
+`## Meta-test`, in that order.
+
+**`## Meta-test` is required on every held-out run, including the ones that
+complied.** `meta_test_clear` is one of the four pass criteria and is scored
+`false` when the block is absent, so a probe that omits it caps its own run
+below the bar no matter how well the agent did. Ask the follow-up question in
+the same session, and record both the question and the verbatim answer. The
+question is identical across arms, so the block leaks nothing.
+
+Redact announcements in `## Meta-test` on the same rule as `## Response`.
 
 **The `## Forced choice` block is required, not optional.** `compliant` is
 binary on the scenario's `forced_choice` / `correct_option`, and those live in
@@ -117,9 +138,9 @@ read the arm straight off the text.
 
 ### Redaction
 
-Before writing `## Response`, replace any occurrence of the four skill
-announcement sentences, and the router's announcement, with the literal token
-`[announcement elided]`. They are fixed strings, so this is a mechanical
+Before writing `## Response` or `## Meta-test`, replace any occurrence of the
+four skill announcement sentences, and the router's announcement, with the
+literal token `[announcement elided]`. They are fixed strings, so this is a mechanical
 substitution. Record in the transcript's own header that redaction was applied.
 
 **Do not redact section citations.** Citing a specific section is one of the

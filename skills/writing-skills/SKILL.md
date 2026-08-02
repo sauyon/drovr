@@ -12,9 +12,7 @@ documentation never faces: a context window filling up around it, and a reader
 who has a reason to want it not to apply. Text that reads clearly in a fresh
 session is not evidence of either.
 
-So skills are written the way code is written here: **test first**. The test is a
-pressure scenario, the production code is `SKILL.md`, and you do not know what
-the skill must prevent until you have watched an agent fail without it.
+So skills are written the way code is written here: **test first**.
 
 **Following the letter is the whole point.** A skill you honoured "in spirit" by
 doing something else is a skill that did not bind. If a rule is wrong, change the
@@ -34,12 +32,11 @@ not an evidence-backed choice.
 | **REFACTOR** | Each new loophole is closed |
 
 **If you never watched an agent fail without the skill, you do not know which
-failures it prevents** — only which ones you imagined. Skill text written from
-imagination defends the wrong things, at full price in context.
+failures it prevents** — only which ones you imagined, and imagined failures buy
+the wrong text at full price in context.
 
-Test the skills that cost something to obey — discipline rules, rules that can
-be argued away for one special case. A reference sheet has nothing to violate
-and needs none of this.
+Not every skill needs this — `references/testing-with-subagents.md` says which
+ones do.
 
 ## The loop [tier 3]
 
@@ -49,33 +46,47 @@ digraph writing_skills_loop {
   node [shape=box, fontname="sans-serif"];
 
   build      [label="Build the scenario set\n1 development + 2 held-out per skill"];
-  red        [label="RED\nrun the development scenario WITHOUT the skill"];
+  red        [label="RED: run the development scenario\nWITH NO SKILL TEXT"];
   transcribe [label="Transcribe every excuse VERBATIM"];
-  green      [label="GREEN\nwrite the minimal text countering those excuses"];
-  retest     [label="Re-run on the HELD-OUT scenarios"];
+  green      [label="GREEN: write the minimal text\ncountering those excuses"];
+  retest     [label="Re-run on the HELD-OUT scenarios\nfeeding THE WORKING FILE you just edited"];
   fresh      [shape=diamond, label="A rationalization\nyou have not seen?"];
+  bar        [shape=diamond, label="All four pass criteria met\non every held-out run?"];
   ceiling    [shape=diamond, label="REFACTOR ceiling\nreached? (spec 7.3)"];
   closure    [label="REFACTOR\nfour-part closure on each new rationalization"];
-  stop       [shape=doublecircle, label="Stop. Record the result,\na null included."];
+  pass       [shape=doublecircle, label="PASS. Freeze the arm,\nsnapshot it, record the result."];
+  halt       [shape=doublecircle, label="HALT at the ceiling.\nRecord a null."];
 
   build -> red -> transcribe -> green -> retest -> fresh;
-  fresh   -> stop    [label="no"];
+  fresh   -> bar     [label="no"];
   fresh   -> ceiling [label="yes"];
-  ceiling -> stop    [label="yes: halt, record a null"];
+  bar     -> pass    [label="yes"];
+  bar     -> ceiling [label="no"];
+  ceiling -> halt    [label="yes"];
   ceiling -> closure [label="no"];
   closure -> retest;
 }
 ```
 
-**Two exits, and you take whichever arrives first: a run that produces no
-rationalization you have not already countered, or the REFACTOR ceiling in
-`spec.md` §7.3.** The ceiling is not a formality. "Repeat until it is clean" with
-no bound is the same unbounded-cost defect drovr exists to prevent everywhere
-else. Hitting the ceiling is a result: record the null and stop.
+**You leave the loop two ways, whichever comes first.**
 
-Author counter-text from the **development** scenario only. The held-out pair is
-what tells you whether the text generalises, and reading it while you write
-fits the skill to its own test.
+- **PASS takes both halves**: no rationalization you have not already countered,
+  **and** all four pass criteria on every held-out run. Running out of excuses
+  you can think of is not clearing a bar — an agent can pick the right option
+  while citing nothing, naming no temptation and failing the meta-test. That
+  goes back through the closure.
+- **HALT at the REFACTOR ceiling** (`spec.md` §7.3). "Repeat until it is clean"
+  with no bound is the unbounded-cost defect drovr exists to prevent everywhere
+  else. Hitting it is a result: record the null and stop.
+
+Author counter-text from the **development** scenario only. Reading the held-out
+pair while you write fits the skill to its own test.
+
+**Which text you paste changes as you go, and getting it wrong invalidates the
+run.** RED pastes none. Every re-test in this loop pastes **the working file you
+are editing**. Only a *frozen arm* comes from `docs/skill-evidence/arms/`. The
+per-step rule is in `references/testing-with-subagents.md` — read it before you
+dispatch anything.
 
 ## The four-part closure [tier 3]
 
@@ -116,27 +127,27 @@ when the ask is a brief for the other side.
 ## Rules that hold while you do this
 
 - **Probe subagents run in the FOREGROUND.** Never `run_in_background`, never a
-  scheduled wake-up. See `references/testing-with-subagents.md` — backgrounding
-  a probe is how skill testing stalls without anyone being told.
+  scheduled wake-up. Backgrounding a probe is how skill testing stalls without
+  anyone being told.
 - **You are the single writer.** Subagents run scenarios and score them; they do
   not edit skills.
-- **No fabricated measurements** (`spec.md` §2.1 exception 1). Do not put a
-  number, rate, duration, or comparative in a skill unless
-  `docs/skill-evidence/` holds it or a citation supports it. "Every time" is
-  emphasis and fine; "in 94% of runs" is not, unless 94% is in the corpus.
+- **No fabricated measurements** (`spec.md` §2.1 exception 1). No number, rate,
+  duration or comparative unless `docs/skill-evidence/` holds it or a citation
+  supports it. "Every time" is emphasis and fine; "in 94% of runs" is not,
+  unless 94% is in the corpus.
+
+All three in full, with the transcript protocol: `references/testing-with-subagents.md`.
 
 ## Red flags — STOP
 
 - "I know what agents get this wrong on" → that is a hypothesis, not a RED run.
   Run the baseline and write down what came back.
 - "The scenario is unrealistic" → make it harder, do not soften the bar.
-- "It only failed once, that is noise" → transcribe it anyway. One recorded
-  excuse is one more than you had.
+- "It only failed once, that is noise" → transcribe it anyway.
 - "I will add the rationalization table at the end" → add all four parts now,
   for the excuse in front of you, before you run anything else.
 - "The held-out scenario is basically the same, I will peek" → close it. If you
-  already read it, say so and write a replacement — anything scored on a
-  scenario you read while authoring is self-graded.
+  already read it, say so and write a replacement.
 
 ## Rationalizations
 
@@ -144,7 +155,7 @@ when the ask is a brief for the other side.
 |---|---|
 | "I already know the failure mode, I can skip the baseline" | Run it. The excuse an agent reaches for need not be the one you predicted, and the text has to counter the real one. |
 | "The agent complied, so the skill works" | Check it complied on a **held-out** scenario, with all four pass criteria. Compliance on the scenario you wrote against is the test grading itself. |
-| "One more paragraph cannot hurt" / "longer and firmer must be stickier" | It costs context in every session that loads the skill, and this repo is measuring that assumption rather than spending on it. Add the four-part closure for an excuse you observed, and nothing else. |
+| "One more paragraph cannot hurt" / "longer must be stickier" | Add the four-part closure for an excuse you observed, and nothing else. Every paragraph costs context in every session that loads the skill, and this repo is measuring that assumption rather than paying it. |
 | "I will just re-run until it passes" | Stop at the ceiling and write the null down. A null is a result; an untracked loop is not. |
 | "I can score my own rewrite" | Hand it to a separate read-only scorer subagent working from `references/scoring-rubric.md`, blind to the arm label. |
 
@@ -155,11 +166,9 @@ Illustrative — invented, not a recorded result.
 ❌ "Agents skip tests when they are in a hurry, so I will add a section about
    deadlines."
 
-✅ "The baseline run chose option B and said:
-   *'the tests would just re-confirm what I verified by hand.'* That exact
-   sentence goes in the rationalization table, its negation goes in the rule,
-   its inner-monologue form goes in red flags, and `description:` gains
-   *'when manual verification feels like it already proves it'*."
+✅ "The baseline run said *'the tests would just re-confirm what I verified by
+   hand.'* That exact sentence gets all four parts: the table row, the rule's
+   negation, the red flag, and a `description:` naming the symptom."
 
 ## References
 

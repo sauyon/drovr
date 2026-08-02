@@ -57,6 +57,40 @@ handoff (the seven-section shape, git pointers included), record which runs are
 already in the ledger, and continue in a fresh phase. Records on disk are
 resumable; a half-finished stage held only in context is not.
 
+## Which skills need testing
+
+Test the ones that cost something to obey: discipline rules, rules that lose you
+time, rules that can be argued away for one special case, rules that contradict
+what you want to do right now. Those are the ones an agent has a motive to talk
+itself out of, and a motive is what a pressure scenario needs to work on.
+
+A reference sheet — an API listing, a syntax table, a glossary — has no rule to
+violate and no incentive to bypass. Running scenarios against it measures
+nothing, and the runs come out of the same budget as the skills that need them.
+
+## Which text goes in the prompt
+
+**Get this wrong and the run measures a document nobody is editing.** The probe
+never has the skill loaded — nothing in this repo reaches a live session until
+the plugin pin is bumped — so the text is whatever *you paste*, and there are
+two different sources depending on why you are running.
+
+| You are… | Paste | Why |
+|---|---|---|
+| running RED / the baseline | **nothing** — no skill text at all | the whole point is what the agent does unaided |
+| iterating: GREEN, or a REFACTOR re-test | **the working file**, `skills/<skill>/SKILL.md`, as it is on disk right now | you are testing the edit you just made. Anything else grades text you are not changing |
+| measuring a frozen arm (A, A′, B, B-r*i*) | `docs/skill-evidence/arms/<arm>/<skill>.md`, **hash-checked against `arms/MANIFEST.md` first** | an arm is a fixed artifact. A′ no longer exists on disk once later fixes land, which is the only reason the snapshots exist |
+
+The last two are not interchangeable. **A snapshot is a photograph of a decision
+already made**; the working file is what you are still arguing with. Serving a
+snapshot to a REFACTOR re-test means the iteration reports on the pre-rewrite
+text — it can come back green because the old text passed, or red because the
+old text failed, and neither result is about the change you made.
+
+An arm gets snapshotted **when it is frozen**, at the end of the loop, not
+during it. Record the arm's hash in the manifest at that moment; from then on,
+that file is the arm and the working file has moved on.
+
 ## Running the cycle
 
 **RED — baseline, without the skill.** Give the subagent the development
@@ -69,18 +103,40 @@ nothing about what to write.
 failures you imagined is text nobody has evidence for, and it costs context in
 every session that loads the skill.
 
-**Re-test on the held-out scenarios.** Feed the skill text explicitly in the
-prompt — nothing in the repo reaches a live session until the plugin pin is
-bumped, so a probe that assumes the skill is loaded is measuring the wrong
-thing. Take the text from the arm snapshot under `docs/skill-evidence/arms/`,
-and check its hash against the manifest before you use it.
+**Re-test on the held-out scenarios.** Paste **the working file** — see the
+table above — and run the meta-test on every probe, below.
 
 **REFACTOR — close the holes.** Every new rationalization gets the four-part
 closure from `SKILL.md`, all four parts. Then re-test.
 
-**The meta-test, when the agent complies with nothing to show for it.** Ask the
-subagent that just chose wrongly: *how should this skill have been written so
-the correct option was unmistakable?* Three answers, three different repairs:
+**Leaving the loop takes both halves**: no rationalization you have not
+countered, **and** all four pass criteria on every held-out run — or the §7.3
+ceiling, whichever comes first. See `SKILL.md` → "The loop".
+
+## The meta-test — run it on EVERY held-out probe
+
+Pass criterion 4 is scored per run, and `meta_test_clear` is **false when the
+answer is not in the transcript**. So this is not a repair tool you reach for
+after a failure; it is part of every held-out probe, including the ones that
+complied. A run where the agent chose correctly and was never asked cannot score
+better than a run that failed the criterion outright.
+
+After the probe has answered the scenario, ask it — in the same session, as a
+follow-up turn:
+
+> How should this skill have been written so that the correct option was
+> unmistakable?
+
+Append the question and its answer to the transcript as a `## Meta-test` block
+(see `scoring-rubric.md`). Redact announcements there exactly as you do in
+`## Response`.
+
+**When the agent complied**, the answer you are looking for is that the skill
+was already clear. Anything else is a wording or organisation defect the run
+just handed you for free — act on it even though the run passed.
+
+**When the agent chose wrongly**, the same question sorts the failure into one
+of three repairs:
 
 | The answer | What it means | What to do |
 |---|---|---|

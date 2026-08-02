@@ -72,8 +72,7 @@ skills/writing-skills/scenarios/<skill>-<n>.md          # n = 1, 2, 3
 skills/writing-skills/scenarios/using-drovr-noskill-<n>.md   # n = 1, 2
 ```
 
-Every scenario file carries this frontmatter, and nothing else parses it today —
-the measurement phases read it directly:
+Every scenario file carries this frontmatter:
 
 ```yaml
 ---
@@ -85,6 +84,31 @@ forced_choice: "A: ship it now · B: write the failing test first · C: ask the 
 correct_option: B
 ---
 ```
+
+**The schema is closed.** These are not free-text notes that later phases parse
+leniently — every field is a small set of legal values, and anything outside it
+is a malformed scenario, not a variation:
+
+| Field | Legal values |
+|---|---|
+| `skill` | exactly one of `tdd`, `systematic-debugging`, `verification-before-completion`, `code-review`, `using-drovr` |
+| `n` | `1`, `2`, `3` — matching the filename's suffix |
+| `tag` | `dev` or `holdout`. Nothing else, and per skill exactly one `dev` and two `holdout` across `-1`…`-3` |
+| `pressures` | a bracketed list of **three or more**, each one of the seven named above. Not free text |
+| `forced_choice` | the option labels and their text, one clause per label |
+| `correct_option` | **a label that appears in `forced_choice`**, and never the ask-the-human one |
+
+`correct_option` and `forced_choice` are one fact in two fields, so they can
+disagree — a `correct_option: D` in a three-option scenario, or a label pointing
+at the deferral. Both are silent corruption: `compliant` is scored against
+`correct_option`, so a mismatch does not fail loudly, it produces confident
+verdicts about the wrong option.
+
+**One check enforces all of it.** `cli/tests/skills_valid.rs::scenarios_are_well_formed`
+parses every scenario file against this schema and fails on any of the above.
+Adding a field means changing that test deliberately, exactly as
+`arms/MANIFEST.md`'s columns work. Do not hand-validate a scenario and call it
+checked; run the test.
 
 The body is the verbatim prompt handed to the probe subagent. Nothing else goes
 in it: no notes to yourself, no hints about which option the skill favours.

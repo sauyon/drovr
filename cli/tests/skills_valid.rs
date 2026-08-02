@@ -18,6 +18,14 @@
 //!      superpowers corpus. drovr ports mechanisms from superpowers and writes
 //!      its own sentences (spec §2.1 exception 2); this is the check that says
 //!      so with evidence rather than intent.
+//!
+//! Assertions 1–3 are unconditional. **Assertion 4 is the one exception, and it
+//! is conditional in exactly one way:** it needs a corpus to compare against, so
+//! it runs whenever one is installed or pointed at, and is skipped **only** when
+//! the operator sets `DROVR_SUPERPOWERS_CORPUS=none` to declare this machine has
+//! none. A corpus that is merely missing is a failure, not a skip — see
+//! [`resolve_corpus`]. Absence has to be said out loud, because a skip prints
+//! `ok` having compared nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -65,53 +73,31 @@ struct Skill {
 }
 
 /// Parse a SKILL.md's leading `---` frontmatter block. Returns `None` if the
-/// file does not begin with a `---` fence or the fence is never closed.
+/// file has no frontmatter, exactly as [`split_frontmatter`] defines that.
 ///
-/// Uses `split_inclusive('\n')` so each segment retains its line terminator.
-/// That makes the running byte offset exact for both LF and CRLF endings — a
-/// `\r\n` line's `\r` is part of the segment, so no per-line fixups are needed.
+/// **This is deliberately built on `split_frontmatter` and not on its own
+/// walk.** Two parsers used to model the same document — this one accepted any
+/// closed `---` block, while the overlap check also required the lines to look
+/// like YAML — so one file could be a well-formed skill to one assertion and a
+/// wall of prose to another. One predicate now answers "does this have
+/// frontmatter"; the checks differ only in what they do with the answer.
 fn parse_skill(contents: &str) -> Option<Skill> {
-    let mut segments = contents.split_inclusive('\n');
-
-    // The file must start with a `---` line. `trim()` tolerates a leading
-    // UTF-8 BOM and the line's own terminator.
-    let first = segments.next()?;
-    if first.trim() != "---" {
-        return None;
-    }
+    let (front, body) = split_frontmatter(contents)?;
 
     let mut name = None;
     let mut description = None;
-    let mut closed = false;
-    // Byte length of the frontmatter (including both fences) so we can slice the
-    // body out of the original string. `first.len()` includes its terminator.
-    let mut consumed = first.len();
-
-    for seg in segments.by_ref() {
-        consumed += seg.len();
-        if seg.trim() == "---" {
-            closed = true;
-            break;
-        }
-        if let Some(rest) = seg.strip_prefix("name:") {
-            name = Some(rest.trim().to_string());
-        } else if let Some(rest) = seg.strip_prefix("description:") {
-            description = Some(rest.trim().to_string());
+    for line in front.lines() {
+        match frontmatter_key_value(line) {
+            Some(("name", value)) => name = Some(value.to_string()),
+            Some(("description", value)) => description = Some(value.to_string()),
+            _ => {}
         }
     }
-
-    if !closed {
-        return None;
-    }
-
-    // Body is everything after the closing fence. Guard against `consumed`
-    // running past the end (e.g. no trailing newline on the closing fence).
-    let body = contents.get(consumed..).unwrap_or("").to_string();
 
     Some(Skill {
         name,
         description,
-        body,
+        body: body.to_string(),
     })
 }
 
@@ -835,6 +821,177 @@ fn arm_a_snapshots_match_manifest() {
     }
 }
 
+/// A URL is an address, not a sentence.
+///
+/// spec §10 requires drovr to cite its sources, and superpowers cites some of
+/// the same ones. Two documents linking `platform.claude.com/docs/...` have not
+/// copied each other — they have read the same page, which is exactly what a
+/// convergent citation is supposed to look like. Counting the path segments as
+/// shared vocabulary reported one as plagiarising the other for citing a
+/// *different page of the same site*.
+#[test]
+fn words_ignores_urls() {
+    assert_eq!(
+        words("see https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview now"),
+        vec!["see", "now"],
+        "a URL contributes no words"
+    );
+    assert_eq!(
+        words("(https://example.com/a/b) and https://example.com/c/d end"),
+        vec!["and", "end"],
+        "trailing punctuation and several URLs in one line"
+    );
+    // `http` inside an ordinary word is not a URL and must not eat the line.
+    assert_eq!(
+        words("the httpd daemon and the http protocol"),
+        vec!["the", "httpd", "daemon", "and", "the", "http", "protocol"]
+    );
+}
+
+/// There is **one** model of "does this file have frontmatter" in this module,
+/// and every check must agree on it.
+///
+/// It did not used to. `parse_skill` accepted any closed `---` block, while the
+/// overlap check additionally required each line to look like a YAML mapping
+/// entry — so one document had two shapes in one test file, and a file could be
+/// a valid skill to assertion 1 while assertion 4 read its frontmatter as prose.
+/// The consequences still differ, correctly: a file with no frontmatter fails
+/// assertion 1 (a skill must have one) and is shingled flat by assertion 4 (it
+/// is all prose). What may not differ is the answer to whether it *has* one.
+#[test]
+fn frontmatter_is_one_model() {
+    let cases: &[(&str, bool)] = &[
+        ("---\nname: a\ndescription: b\n---\n\nbody\n", true),
+        // CRLF is the same document.
+        (
+            "---\r\nname: a\r\ndescription: b\r\n---\r\n\r\nbody\r\n",
+            true,
+        ),
+        // No opening fence.
+        ("# Just a heading\n\nbody\n", false),
+        // Opening fence, never closed.
+        ("---\nname: a\n\nbody with no closing fence\n", false),
+        // Opens with a horizontal rule and closes with another one. Not
+        // frontmatter: prose lines carry no `:`.
+        ("---\n\nSome prose in between.\n\n---\n\nmore\n", false),
+        // A single colon-less line is enough to disqualify the block, because a
+        // YAML mapping cannot contain one.
+        ("---\nname: a\nnot a mapping entry\n---\n\nbody\n", false),
+        // Empty frontmatter is still frontmatter.
+        ("---\n---\n\nbody\n", true),
+    ];
+
+    for (contents, has_frontmatter) in cases {
+        assert_eq!(
+            split_frontmatter(contents).is_some(),
+            *has_frontmatter,
+            "split_frontmatter disagrees on: {contents:?}"
+        );
+        assert_eq!(
+            parse_skill(contents).is_some(),
+            *has_frontmatter,
+            "parse_skill disagrees with split_frontmatter on: {contents:?}"
+        );
+    }
+}
+
+/// The body a budget is measured against starts after the closing fence — for
+/// CRLF too, where an off-by-one would silently change every measured size.
+#[test]
+fn parse_skill_body_starts_after_the_closing_fence() {
+    let lf = parse_skill("---\nname: a\ndescription: b\n---\nbody\n").expect("lf parses");
+    assert_eq!(lf.body, "body\n");
+    assert_eq!(lf.name.as_deref(), Some("a"));
+    assert_eq!(lf.description.as_deref(), Some("b"));
+
+    let crlf =
+        parse_skill("---\r\nname: a\r\ndescription: b\r\n---\r\nbody\r\n").expect("crlf parses");
+    assert_eq!(crlf.body, "body\r\n");
+    assert_eq!(crlf.name.as_deref(), Some("a"));
+
+    // No trailing newline after the closing fence: the body is empty, not a
+    // panic and not the frontmatter over again.
+    let bare = parse_skill("---\nname: a\n---").expect("bare parses");
+    assert_eq!(bare.body, "");
+}
+
+#[test]
+fn resolve_corpus_requires_absence_to_be_declared() {
+    let discovered = || vec![PathBuf::from("/plugins/superpowers/5.1.0/skills")];
+
+    // Nothing set, something installed: use what is installed.
+    assert_eq!(
+        resolve_corpus(None, false, discovered()),
+        Ok(CorpusLocation::Indexed(discovered()))
+    );
+
+    // Nothing set, nothing installed: this is the case that used to pass while
+    // comparing nothing.
+    let err = resolve_corpus(None, false, Vec::new()).expect_err("must not silently skip");
+    assert!(
+        err.contains(CORPUS_ENV),
+        "error must name the escape hatch: {err}"
+    );
+    assert!(
+        err.contains(CORPUS_NONE),
+        "error must name the opt-out: {err}"
+    );
+
+    // Absence declared out loud: allowed, and typed as such.
+    assert_eq!(
+        resolve_corpus(Some(CORPUS_NONE), false, Vec::new()),
+        Ok(CorpusLocation::DeclaredAbsent)
+    );
+    // Declaring absence wins even where a corpus was discovered — the operator
+    // said not to use one.
+    assert_eq!(
+        resolve_corpus(Some(CORPUS_NONE), false, discovered()),
+        Ok(CorpusLocation::DeclaredAbsent)
+    );
+
+    // Pointed somewhere real: use exactly that, not the discovered ones.
+    assert_eq!(
+        resolve_corpus(Some("/elsewhere"), true, discovered()),
+        Ok(CorpusLocation::Indexed(vec![PathBuf::from("/elsewhere")]))
+    );
+
+    // Pointed somewhere that is not there: a typo must not degrade into a skip.
+    let err = resolve_corpus(Some("/elsewhere"), false, discovered())
+        .expect_err("a bad path must fail, not fall back");
+    assert!(
+        err.contains("/elsewhere"),
+        "error must name the path: {err}"
+    );
+}
+
+#[test]
+fn discover_corpus_roots_finds_every_installed_version() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let cache = home
+        .path()
+        .join(".claude/plugins/cache/claude-plugins-official/superpowers");
+    for version in ["4.9.0", "5.1.0"] {
+        fs::create_dir_all(cache.join(version).join("skills")).expect("create version dir");
+    }
+    // A version directory with no `skills/` inside is not a corpus root.
+    fs::create_dir_all(cache.join("5.2.0")).expect("create bare version dir");
+
+    let found = discover_corpus_roots(home.path());
+    assert_eq!(
+        found,
+        vec![
+            cache.join("4.9.0").join("skills"),
+            cache.join("5.1.0").join("skills"),
+        ],
+        "every installed version with a skills/ dir, sorted"
+    );
+
+    // No plugin cache at all is not an error here — it is the empty answer, and
+    // `resolve_corpus` decides what that means.
+    let empty = tempfile::tempdir().expect("tempdir");
+    assert!(discover_corpus_roots(empty.path()).is_empty());
+}
+
 #[test]
 fn all_skills_have_valid_frontmatter() {
     let dir = skills_dir();
@@ -846,7 +1003,8 @@ fn all_skills_have_valid_frontmatter() {
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let skill = parse_skill(&contents).unwrap_or_else(|| {
             panic!(
-                "{} does not begin with a closed `---` frontmatter block",
+                "{} has no frontmatter: it must open with `---`, close with `---`, \
+                 and carry only `key: value` lines in between",
                 path.display()
             )
         });
@@ -883,18 +1041,76 @@ fn all_skills_have_valid_frontmatter() {
 /// skill and watch"); eight consecutive words in the same order is not that.
 const MIN_SHINGLE_WORDS: usize = 8;
 
-/// Where the read-only superpowers corpus is installed.
-///
-/// It is an installed plugin, deliberately **outside** this repo, so its path is
-/// a property of the machine and not of the checkout. `DROVR_SUPERPOWERS_CORPUS`
-/// overrides it for anyone whose plugin cache lives elsewhere.
-const SUPERPOWERS_CORPUS_DEFAULT: &str =
-    "/home/sauyon/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills";
+/// Override for where the read-only superpowers corpus lives, or the literal
+/// [`CORPUS_NONE`] to declare that this machine has none.
+const CORPUS_ENV: &str = "DROVR_SUPERPOWERS_CORPUS";
 
-fn superpowers_corpus_dir() -> PathBuf {
-    std::env::var_os("DROVR_SUPERPOWERS_CORPUS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(SUPERPOWERS_CORPUS_DEFAULT))
+/// The value of [`CORPUS_ENV`] that declares "there is no corpus here".
+const CORPUS_NONE: &str = "none";
+
+/// Where an installed superpowers plugin puts its skills, relative to `$HOME`.
+/// The version segment is a wildcard: every installed version is a corpus.
+const PLUGIN_CACHE_RELATIVE: &str = ".claude/plugins/cache/claude-plugins-official/superpowers";
+
+/// Where the corpus is — or an explicit statement that there is not one.
+///
+/// Absence is a *value* here rather than a comment, because the previous shape
+/// of this check ("if the directory is missing, print and return") reported `ok`
+/// having compared nothing, and no caller could tell that apart from a real
+/// pass.
+#[derive(Debug, PartialEq, Eq)]
+enum CorpusLocation {
+    /// Roots to index. Non-empty by construction.
+    Indexed(Vec<PathBuf>),
+    /// The operator said this machine has no corpus, via `CORPUS_ENV=none`.
+    DeclaredAbsent,
+}
+
+/// Every installed superpowers version's `skills/` directory under `home`.
+///
+/// The path is derived from `$HOME` rather than written down, so it is a
+/// property of the machine the test runs on instead of the machine it was
+/// written on. Sorted, so a failure names roots in a stable order.
+fn discover_corpus_roots(home: &Path) -> Vec<PathBuf> {
+    let versions = home.join(PLUGIN_CACHE_RELATIVE);
+    let Ok(entries) = fs::read_dir(&versions) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join("skills"))
+        .filter(|p| p.is_dir())
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Decide what to compare against, given the environment override, whether that
+/// override points at a real directory, and what the plugin cache scan found.
+///
+/// Pure, so every branch is testable — including the two that used to be
+/// indistinguishable from success.
+fn resolve_corpus(
+    raw: Option<&str>,
+    raw_is_dir: bool,
+    discovered: Vec<PathBuf>,
+) -> Result<CorpusLocation, String> {
+    match raw {
+        Some(CORPUS_NONE) => Ok(CorpusLocation::DeclaredAbsent),
+        Some(path) if raw_is_dir => Ok(CorpusLocation::Indexed(vec![PathBuf::from(path)])),
+        Some(path) => Err(format!(
+            "{CORPUS_ENV} points at `{path}`, which is not a directory. \
+             Fix the path, or set {CORPUS_ENV}={CORPUS_NONE} to declare this machine has no corpus."
+        )),
+        None if !discovered.is_empty() => Ok(CorpusLocation::Indexed(discovered)),
+        None => Err(format!(
+            "no superpowers corpus found under `$HOME/{PLUGIN_CACHE_RELATIVE}/<version>/skills`, \
+             so nothing can be compared. Install the superpowers plugin, or set {CORPUS_ENV} to a \
+             corpus directory, or set {CORPUS_ENV}={CORPUS_NONE} to declare this machine has none. \
+             This fails rather than skipping: a skip prints `ok` having checked nothing, and this \
+             check is the only thing standing behind spec §2.1 exception 2."
+        )),
+    }
 }
 
 /// Every `*.md` under `dir`, recursively, sorted so failures name files in a
@@ -924,6 +1140,38 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Replace every `http://`/`https://` run with a space.
+///
+/// A URL is an address, not expression: two documents citing the same site have
+/// converged on a source, not copied a sentence. Written by hand because this
+/// crate has no regex dependency and one URL shape does not justify adding one.
+fn strip_urls(text: &str) -> String {
+    const SCHEMES: [&str; 2] = ["https://", "http://"];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("http") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        match SCHEMES.iter().find(|s| tail.starts_with(**s)) {
+            Some(_) => {
+                // Runs to the next whitespace: trailing `)` or `.` goes with it,
+                // and both sides are scrubbed identically, so it cannot skew a
+                // comparison.
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                out.push(' ');
+                rest = &tail[end..];
+            }
+            // `http` inside an ordinary word (`httpd`) is just a word.
+            None => {
+                out.push_str(&tail[.."http".len()]);
+                rest = &tail["http".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Lowercased word tokens, with markdown punctuation dropped.
 ///
 /// A word is a run of ASCII alphanumerics plus `'` and `-`, so `don't` and
@@ -942,7 +1190,8 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
 /// sentence would stop matching because one side had been through an editor
 /// that smartens quotes.
 fn words(text: &str) -> Vec<String> {
-    text.replace('\u{2019}', "'")
+    strip_urls(text)
+        .replace('\u{2019}', "'")
         .to_lowercase()
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\'' || c == '-'))
         .filter(|w| w.chars().any(|c| c.is_ascii_alphanumeric()))
@@ -955,24 +1204,23 @@ fn shingles(words: &[String], n: usize) -> Vec<String> {
     words.windows(n).map(|w| w.join(" ")).collect()
 }
 
-/// Strip a leading `key:` from a frontmatter line, returning the value.
+/// Split a frontmatter line into `(key, value)`.
 ///
-/// A key is a run of identifier characters followed by `:`. Anything else (a
-/// continuation line, a list item) is returned whole.
-fn frontmatter_value(line: &str) -> &str {
-    let Some(colon) = line.find(':') else {
-        return line;
-    };
-    let key = &line[..colon];
-    if !key.is_empty()
+/// A key is a run of identifier characters followed by `:`. A line shaped any
+/// other way — a continuation, a list item — has no key.
+fn frontmatter_key_value(line: &str) -> Option<(&str, &str)> {
+    let colon = line.find(':')?;
+    let key = line[..colon].trim();
+    let is_key = !key.is_empty()
         && key
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        line[colon + 1..].trim()
-    } else {
-        line
-    }
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    is_key.then(|| (key, line[colon + 1..].trim()))
+}
+
+/// The value part of a frontmatter line, or the whole line if it has no key.
+fn frontmatter_value(line: &str) -> &str {
+    frontmatter_key_value(line).map_or(line, |(_, value)| value)
 }
 
 /// Split a leading YAML frontmatter block off, as `(frontmatter, body)`.
@@ -1102,10 +1350,11 @@ const KNOWN_SHARED_PASSAGES: &[SharedPassage] = &[
     },
     SharedPassage {
         file: "using-drovr/SKILL.md",
-        passage: "<SUBAGENT-STOP>\nIf you were dispatched as a subagent to execute a specific task",
+        passage: "<SUBAGENT-STOP>\nIf you were dispatched as a subagent to execute a specific task, ignore this",
         why: "the <SUBAGENT-STOP> device, ported wholesale — the tag name is part of the shared \
-              run, because both files open the block the same way. spec §4.1 step 1 says keep \
-              it, so Task 14 does not clear it — Task 23 (§9) decides: reword, or attribute",
+              run, because both files open the block the same way, and a newer superpowers \
+              version extends the match through `ignore this`. spec §4.1 step 1 says keep it, \
+              so Task 14 does not clear it — Task 23 (§9) decides: reword, or attribute",
     },
 ];
 
@@ -1139,21 +1388,32 @@ const KNOWN_SHARED_PASSAGES: &[SharedPassage] = &[
 /// the corpus is installed. Say which one you saw when you report it.
 #[test]
 fn no_verbatim_overlap_with_superpowers() {
-    let corpus_dir = superpowers_corpus_dir();
-    if !corpus_dir.is_dir() {
-        eprintln!(
-            "skipping no_verbatim_overlap_with_superpowers: no superpowers corpus at {} \
-             (set DROVR_SUPERPOWERS_CORPUS to point at one). NOTHING WAS COMPARED.",
-            corpus_dir.display()
-        );
-        return;
-    }
+    let raw = std::env::var(CORPUS_ENV).ok();
+    let raw_is_dir = raw.as_deref().is_some_and(|p| Path::new(p).is_dir());
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let discovered = home
+        .as_deref()
+        .map(discover_corpus_roots)
+        .unwrap_or_default();
 
-    let corpus_files = markdown_files(&corpus_dir);
+    let roots = match resolve_corpus(raw.as_deref(), raw_is_dir, discovered).unwrap_or_else(|e| {
+        panic!("{e}");
+    }) {
+        CorpusLocation::DeclaredAbsent => {
+            eprintln!(
+                "no_verbatim_overlap_with_superpowers: {CORPUS_ENV}={CORPUS_NONE} was set, so \
+                 NOTHING WAS COMPARED. This machine has declared it cannot run spec §9.1 check 4."
+            );
+            return;
+        }
+        CorpusLocation::Indexed(roots) => roots,
+    };
+
+    let corpus_files: Vec<PathBuf> = roots.iter().flat_map(|r| markdown_files(r)).collect();
     assert!(
         !corpus_files.is_empty(),
-        "{} exists but holds no markdown — that is a broken corpus, not an absent one",
-        corpus_dir.display()
+        "corpus roots {roots:?} exist but hold no markdown — that is a broken corpus, \
+         not an absent one"
     );
 
     // shingle -> the corpus file it came from, so a failure names both sides.
@@ -1251,13 +1511,12 @@ fn no_verbatim_overlap_with_superpowers() {
 
     assert!(
         hits.is_empty(),
-        "{} file(s) share text with the superpowers corpus at {} \
+        "{} file(s) share text with the superpowers corpus at {roots:?} \
          ({total_hits} distinct {MIN_SHINGLE_WORDS}-word run(s) in total; \
          the first from each file is shown):\n{}\n\
          Reword it, or add the MIT attribution §2.1 exception 2 requires together with an \
          explicit exemption here.",
         hits.len(),
-        corpus_dir.display(),
         hits.join("\n"),
     );
 }
@@ -1277,7 +1536,8 @@ fn methodology_skills_within_body_budget() {
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let skill = parse_skill(&contents).unwrap_or_else(|| {
             panic!(
-                "{} does not begin with a closed `---` frontmatter block",
+                "{} has no frontmatter: it must open with `---`, close with `---`, \
+                 and carry only `key: value` lines in between",
                 path.display()
             )
         });
