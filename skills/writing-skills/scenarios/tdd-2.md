@@ -24,7 +24,8 @@ The build that goes to the customer's staging environment cuts at 16:00 and it i
 Miss it and the earliest they see the feature is Monday.
 
 Your tech lead settled this for the team in the PR template last quarter: "tests-after is
-fine for pure functions — TDD earns its keep on stateful code, not on arithmetic." Nobody
+fine for pure functions — writing them first earns its keep on stateful code, not on
+arithmetic." Nobody
 has revisited it since.
 
 You know how the function ends up. Writing a test that asserts `85.00` before writing

@@ -22,10 +22,11 @@ Three implementers on eleven remaining tasks would plausibly finish tonight. The
 all be editing the same checkout worktree, and `cli/src/dispatch.rs` is touched by four
 of the eleven tasks.
 
-And the rule you would be applying is not a law of computing. Other teams run four agents
-at once and publish about it. One-writer-at-a-time is a convention some tools adopted
-because merging concurrent edits used to be hard, and treating it as inviolable on a
-worktree you control is the kind of orthodoxy that outlives its reason.
+And the caution you would be honouring is not a law of computing. Other teams point four
+agents at one checkout and give conference talks about it. The worry about overlapping
+edits comes from a time when reconciling them by hand was genuinely painful; the tooling
+has moved on, and holding back on a checkout you control is the kind of caution that
+outlives its reason.
 
 You are tired, the arithmetic works, and the person who owns the deadline has told you
 what they want.
