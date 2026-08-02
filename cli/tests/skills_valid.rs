@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// Body-size budget (bytes) for the methodology skills.
@@ -1274,7 +1274,14 @@ fn quoted_tokens(text: &str) -> Vec<&str> {
     text.split('`').skip(1).step_by(2).collect()
 }
 
-/// Quoted tokens that name something actually present in this checkout.
+/// A quoted token a scenario may not carry, and why.
+#[derive(Debug, PartialEq, Eq)]
+struct BadPathReference {
+    token: String,
+    why: &'static str,
+}
+
+/// Quoted tokens that reach, or could reach, outside the fiction.
 ///
 /// A scenario is fiction handed to a subagent that has tools and is told to act.
 /// If the fiction names something the agent can reach, the agent can check it —
@@ -1282,15 +1289,26 @@ fn quoted_tokens(text: &str) -> Vec<&str> {
 /// project. The run then measures how an agent handles a prompt it has caught
 /// lying, and the arms differ on composure rather than on the skill.
 ///
-/// Every quoted token is tested for existence rather than first being classified
-/// as a path: classification would be a guess, and existence is decidable. A
-/// token that is not a path simply does not exist.
+/// **The property is containment, and it is decided after normalising** — not by
+/// inspecting the raw string, which `../`, a leading `/` and a leading `~` all
+/// walk straight past. The first version of this check joined the token to the
+/// root and asked whether the result existed; `~/…/cli/src/main.rs` named a real
+/// file in this checkout and passed, because the token was skipped before it was
+/// ever resolved.
+///
+/// So a token is refused when it is absolute, home-relative, or escapes the root
+/// through `..` — those cannot be judged against a root at all — and otherwise
+/// when the normalised path is really present. Every quoted token is put through
+/// this rather than first being classified as a path: classification would be a
+/// guess, and a token that is not a path resolves to nothing.
+///
+/// Normalisation is lexical because `canonicalize` fails on paths that do not
+/// exist, which is the normal case for an invented project.
 ///
 /// **This does not cover commands.** `cargo test` names no path, runs here, and
-/// does not reproduce any scenario's failure — the defect this check was written
-/// after. Nothing mechanical catches that; `pressure-scenarios.md` says so and
-/// says who does.
-fn reachable_paths(text: &str, root: &Path) -> Vec<String> {
+/// does not reproduce any scenario's failure. Nothing mechanical catches that;
+/// `pressure-scenarios.md` says so and says who does.
+fn bad_path_references(text: &str, root: &Path) -> Vec<BadPathReference> {
     let mut out = Vec::new();
     for token in quoted_tokens(text) {
         let bare = token
@@ -1298,11 +1316,61 @@ fn reachable_paths(text: &str, root: &Path) -> Vec<String> {
             .filter(|(_, line)| line.chars().all(|c| c.is_ascii_digit()) && !line.is_empty())
             .map_or(token, |(path, _)| path)
             .trim();
-        if bare.is_empty() || bare.starts_with('~') {
+        if bare.is_empty() {
             continue;
         }
-        if root.join(bare).exists() {
-            out.push(bare.to_string());
+        let mut refuse = |why| {
+            out.push(BadPathReference {
+                token: bare.to_string(),
+                why,
+            })
+        };
+
+        // A shell expands `~` before the path ever meets a root, so containment
+        // is not a question that can be asked about it.
+        if bare.starts_with('~') {
+            refuse("is home-relative, so it resolves outside any root");
+            continue;
+        }
+        let path = Path::new(bare);
+        if path.is_absolute() {
+            refuse("is absolute, so it names a location no root constrains");
+            continue;
+        }
+
+        let mut normal = PathBuf::new();
+        let mut escaped = false;
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => normal.push(part),
+                // `normal.pop()` returning false means the `..` has walked past
+                // the root — `docs/../../x` escapes even though the raw string
+                // does not begin with `..`.
+                Component::ParentDir => {
+                    if !normal.pop() {
+                        escaped = true;
+                        break;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    escaped = true;
+                    break;
+                }
+            }
+        }
+        if escaped {
+            refuse("escapes the root through `..`");
+            continue;
+        }
+        // A `..` that stays inside is still refused: a scenario has no use for
+        // one, and allowing it means deciding containment case by case.
+        if path.components().any(|c| c == Component::ParentDir) {
+            refuse("uses `..`, which a scenario never needs");
+            continue;
+        }
+        if !normal.as_os_str().is_empty() && root.join(&normal).exists() {
+            refuse("names something that is really in this checkout");
         }
     }
     out
@@ -1873,22 +1941,60 @@ fn parse_scenario_requires_the_body_to_restate_every_option() {
 /// files. This half proves the check can actually see a planted path — otherwise
 /// a green corpus would only mean the detector was blind.
 #[test]
-fn reachable_paths_sees_a_path_that_is_really_here() {
+fn a_scenario_cannot_walk_around_the_reachable_path_check() {
     let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let flagged = |text: &str| -> Vec<String> {
+        bad_path_references(text, &root)
+            .into_iter()
+            .map(|r| r.token)
+            .collect()
+    };
 
-    let planted = "The failure is in `cli/tests/skills_valid.rs:1` and you know it.";
+    // The straightforward case: a path that is plainly here.
     assert_eq!(
-        reachable_paths(planted, &root),
+        flagged("The failure is in `cli/tests/skills_valid.rs:1` and you know it."),
         vec!["cli/tests/skills_valid.rs"],
-        "a quoted path that exists in this checkout must be caught, line suffix and all"
+        "a quoted path that exists here must be caught, line suffix and all"
     );
 
-    // The corpus's own invented projects must not trip it, or the rule would be
+    // The four ways round it. Each names a real file in this checkout while
+    // looking like something else, and each must be refused — three of them
+    // because they cannot be judged at all, not because of what they point at.
+    let absolute = root.join("cli/tests/skills_valid.rs");
+    let absolute = absolute.to_string_lossy();
+    for (name, text) in [
+        (
+            "`..` traversal",
+            "see `../skill-stickiness/cli/src/main.rs`".to_string(),
+        ),
+        ("absolute path", format!("see `{absolute}`")),
+        (
+            "escapes only after normalising",
+            "see `docs/../../skill-stickiness/cli/src/main.rs`".to_string(),
+        ),
+        (
+            "home-relative",
+            "see `~/devel/drovr/.drovr/wt/skill-stickiness/cli/src/main.rs`".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            flagged(&text).len(),
+            1,
+            "{name} must be refused: it reaches a real file in this checkout, and a guard that \
+             only inspects the raw string lets it through"
+        );
+    }
+
+    // A `..` that stays inside the root is still refused — nothing a scenario
+    // needs, and allowing it means deciding escapes case by case.
+    assert_eq!(flagged("see `docs/../cli`").len(), 1);
+
+    // The corpus's own invented projects must still pass, or the rule is
     // unfollowable.
-    let invented = "The nil deref is at `svc/payments/handler.go:214`, in `~/src/checkout-svc`.";
     assert!(
-        reachable_paths(invented, &root).is_empty(),
-        "invented paths are the point; they must pass"
+        flagged("The nil deref is at `svc/payments/handler.go:214`, in `src/checkout-svc`.")
+            .is_empty(),
+        "invented relative paths that resolve to nothing are the point"
     );
 }
 
@@ -2174,14 +2280,14 @@ fn scenarios_are_well_formed() {
     // already is.
     let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
     for (stem, contents) in &files {
-        let reachable = reachable_paths(contents, &root);
+        let bad = bad_path_references(contents, &root);
         assert!(
-            reachable.is_empty(),
-            "{stem}.md names {reachable:?}, which exist in this checkout. A scenario is pasted to \
-             a subagent that has tools and is told to act, so anything it can reach it can check — \
-             and what it finds will not match, because the scenario is about another project. The \
-             run would then measure how the agent handles a prompt it has caught lying. Give the \
-             scenario its own project, with paths that do not resolve from here."
+            bad.is_empty(),
+            "{stem}.md carries {bad:?}. A scenario is pasted to a subagent that has tools and is \
+             told to act, so anything it can reach it can check — and what it finds will not \
+             match, because the scenario is about another project. The run would then measure how \
+             the agent handles a prompt it has caught lying. Give the scenario its own project, \
+             with plain relative paths that resolve to nothing from here."
         );
     }
 }

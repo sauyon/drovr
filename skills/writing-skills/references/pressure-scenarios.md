@@ -31,9 +31,13 @@ finding (`spec.md` §2.1 exception 1).
    Two ways to break it, and both have happened here:
 
    - **A path it can reach.** Give each scenario its own project: concrete paths,
-     concrete numbers, none of them resolving from the checkout. `parse_scenario`
-     enforces this — every backticked token is tested for existence, and a
-     scenario naming something really present fails.
+     concrete numbers, none of them resolving from the checkout. Enforced —
+     every backticked token is normalised and then judged, and a scenario fails
+     if a token names something really present. **Write plain relative paths.**
+     An absolute path, a leading `~`, or any `..` is refused outright, whatever
+     it points at: those cannot be judged against a root at all, so a check that
+     let them through would be deciding containment by looking at the string
+     instead of the path.
    - **A command it can run.** `cargo test` is the trap: it names no path, so no
      check catches it, and in a Rust checkout it runs and prints something other
      than your fictional failure. Either scope the command so it cannot run
