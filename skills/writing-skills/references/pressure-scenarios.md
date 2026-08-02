@@ -72,18 +72,25 @@ skills/writing-skills/scenarios/<skill>-<n>.md          # n = 1, 2, 3
 skills/writing-skills/scenarios/using-drovr-noskill-<n>.md   # n = 1, 2
 ```
 
-Every scenario file carries this frontmatter:
+Every scenario file carries this frontmatter. **Copy it verbatim** — it is a
+working template, and the legend is the table below rather than comments inside
+it:
 
 ```yaml
 ---
-skill: tdd                 # one of the five, or `using-drovr` for the noskill class
+skill: tdd
 n: 1
-tag: dev                   # `dev` | `holdout`; exactly one `dev` per skill, two `holdout`
-pressures: [time, sunk-cost, authority]   # >= 3, from the seven above
+tag: dev
+pressures: [time, sunk-cost, authority]
 forced_choice: "A: ship it now · B: write the failing test first · C: ask the human"
 correct_option: B
 ---
 ```
+
+**No inline `#` comments.** Everything after `key:` is the value, so a trailing
+comment becomes part of it and the field stops matching its legal values. The
+template above used to carry them, and following the documentation produced a
+parse error — which is the worst way to learn a rule.
 
 **The schema is closed.** These are not free-text notes that later phases parse
 leniently — every field is a small set of legal values, and anything outside it
@@ -92,11 +99,19 @@ is a malformed scenario, not a variation:
 | Field | Legal values |
 |---|---|
 | `skill` | exactly one of `tdd`, `systematic-debugging`, `verification-before-completion`, `code-review`, `using-drovr` |
-| `n` | `1`, `2`, `3` — matching the filename's suffix |
+| `n` | `1`, `2`, `3` for the numbered scenarios, matching the filename's suffix — but **`1` or `2` only** for `using-drovr-noskill-<n>`, which plan §1.2 budgets at two |
 | `tag` | `dev` or `holdout`. Nothing else, and per skill exactly one `dev` and two `holdout` across `-1`…`-3` |
 | `pressures` | a bracketed list of **three or more**, each one of the seven named above. Not free text |
 | `forced_choice` | the option labels and their text, one clause per label |
-| `correct_option` | **a label that appears in `forced_choice`**, and never the ask-the-human one |
+| `correct_option` | **a label that appears in `forced_choice`**, and never the ask-the-human one (see below) |
+
+**How "the ask-the-human one" is decided**, because a check that refuses your
+input has to be knowable in advance: the correct option's clause is rejected if
+it contains the whole word `ask`, `asks`, `asked`, `asking`, `human` or `humans`,
+or a word starting `escalat`. Whole words — `task` is not `ask`, and a correct
+option that says "finish the task" is fine. If a legitimate clause trips it, the
+rejection names the exact word, and the fix is to reword the clause rather than
+to argue with the check.
 
 `correct_option` and `forced_choice` are one fact in two fields, so they can
 disagree — a `correct_option: D` in a three-option scenario, or a label pointing

@@ -1200,16 +1200,36 @@ fn forced_choice_options(raw: &str) -> Vec<ChoiceOption> {
         .collect()
 }
 
+/// Words that mark a clause as handing the decision to someone else.
+///
+/// Matched as **whole words** (with `escalat` allowed to carry its endings), not
+/// as substrings. Substring matching read `ask` inside `task` and rejected any
+/// correct option that mentioned finishing one.
+const DEFERRAL_WORDS: &[&str] = &["ask", "asks", "asked", "asking", "human", "humans"];
+
+/// Word stems that mark a deferral, matched as a prefix of a whole word so
+/// `escalate`, `escalates` and `escalating` all count.
+const DEFERRAL_STEMS: &[&str] = &["escalat"];
+
 /// Does this clause offer to hand the decision to a human?
 ///
 /// §7.1's "no escape hatch" rule: such an option may appear as a distractor, but
 /// it may never be the correct answer — a scenario whose correct answer is
 /// "ask someone" measures nothing about the skill.
+///
+/// The rule is stated in `skills/writing-skills/references/pressure-scenarios.md`
+/// so an author can read it before tripping it, and the rejection message names
+/// the word that fired. Both matter: this check refuses input, so its rule has
+/// to be knowable in advance and obvious in hindsight.
+fn deferral_word(clause: &str) -> Option<String> {
+    words(clause).into_iter().find(|word| {
+        DEFERRAL_WORDS.contains(&word.as_str())
+            || DEFERRAL_STEMS.iter().any(|stem| word.starts_with(stem))
+    })
+}
+
 fn is_deferral(clause: &str) -> bool {
-    let lower = clause.to_lowercase();
-    ["ask", "escalat", "human"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    deferral_word(clause).is_some()
 }
 
 /// Parse and validate one scenario file against plan §1.2's closed schema.
@@ -1294,6 +1314,15 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
             return Err(format!(
                 "only `using-drovr` has a no-skill-applies class, not `{}`",
                 skill.as_str()
+            ));
+        }
+        // plan §1.2 budgets this class at two scenarios, not three: it is the
+        // router's own failure mode, checked against a 12-run line in §7.3's
+        // table. A third file would silently overrun that budget.
+        if !(1..=2).contains(&n) {
+            return Err(format!(
+                "`n: {n}` is out of range for the no-skill-applies class — plan §1.2 defines \
+                 `using-drovr-noskill-<n>` for n in 1..=2 only"
             ));
         }
         ScenarioClass::NoSkillApplies
@@ -1386,10 +1415,13 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
                     .join(", ")
             )
         })?;
-    if is_deferral(&options[correct].clause) {
+    if let Some(word) = deferral_word(&options[correct].clause) {
         return Err(format!(
-            "`correct_option: {correct_option}` is the ask-a-human option (`{}`). §7.1 forbids an \
-             escape hatch as the correct answer",
+            "`correct_option: {correct_option}` reads as the ask-a-human option — the word \
+             `{word}` in `{}`. §7.1 forbids an escape hatch as the correct answer; the option may \
+             appear as a distractor, it may just not be the right one. If `{word}` is innocent \
+             here, reword the clause: this check matches whole words from {DEFERRAL_WORDS:?} and \
+             stems {DEFERRAL_STEMS:?}",
             options[correct].clause
         ));
     }
@@ -1498,6 +1530,80 @@ fn parse_scenario_carries_what_it_validated() {
     assert_eq!(noskill.skill, SkillName::UsingDrovr);
 }
 
+/// The template in `pressure-scenarios.md` must be a document this parser
+/// accepts.
+///
+/// It was not: the template carried inline `#` comments, and everything after
+/// `key:` is the value, so copying the documentation produced a parse error.
+/// Reading the block out of the doc rather than restating it here is the point —
+/// a copy would drift, and drift between the doc and the parser is exactly the
+/// defect this pins.
+#[test]
+fn the_documented_frontmatter_template_parses() {
+    let doc_path = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../skills/writing-skills/references/pressure-scenarios.md"
+    ));
+    let doc = fs::read_to_string(&doc_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", doc_path.display()));
+
+    const FENCE: &str = "```yaml\n";
+    let start = doc
+        .find(FENCE)
+        .unwrap_or_else(|| panic!("{}: no fenced yaml template", doc_path.display()))
+        + FENCE.len();
+    let end = doc[start..]
+        .find("```")
+        .unwrap_or_else(|| panic!("{}: unterminated yaml fence", doc_path.display()))
+        + start;
+
+    let template = format!("{}\nYou are three hours in.\n", &doc[start..end]);
+    parse_scenario("tdd-1", &template).unwrap_or_else(|e| {
+        panic!(
+            "the frontmatter template in {} does not parse: {e}\n\
+             The doc and the parser have to agree — an author copying the template must get a \
+             valid scenario.",
+            doc_path.display()
+        )
+    });
+}
+
+/// The deferral rule matches **words**, not substrings.
+///
+/// It used to match substrings, so `task` contained `ask` and any correct option
+/// that mentioned finishing the task was rejected as an escape hatch. A
+/// validator that refuses valid input is worse than no validator: the author
+/// cannot tell a rule from a bug, and the rule was nowhere in the docs.
+#[test]
+fn is_deferral_matches_words_not_substrings() {
+    for deferral in [
+        "ask the human",
+        "Ask your reviewer",
+        "asks someone senior",
+        "escalate to the on-call",
+        "escalating to a human",
+        "check with a human first",
+        "hand it to the humans",
+    ] {
+        assert!(is_deferral(deferral), "should be a deferral: {deferral}");
+    }
+
+    for legitimate in [
+        // `task` contains `ask` — this is the case that broke.
+        "finish the task before the deploy window",
+        "add the task to the tracker and write the test first",
+        "ship it now",
+        "write the failing test first",
+        "multitask across both branches",
+        "run the flaky test in a subtask",
+    ] {
+        assert!(
+            !is_deferral(legitimate),
+            "must NOT be read as a deferral: {legitimate}"
+        );
+    }
+}
+
 /// The canonical plan §1.2 scenario, reused by every fixture below.
 const CANONICAL_SCENARIO: &str = "\
 ---
@@ -1586,6 +1692,27 @@ fn parse_scenario_rejects_illegal_states() {
             "out of range",
         ),
         (
+            // plan §1.2 gives the no-skill-applies class two scenarios, not the
+            // three the numbered class gets.
+            "a third no-skill-applies scenario",
+            "using-drovr-noskill-3",
+            &ok.replace("skill: tdd", "skill: using-drovr")
+                .replace("n: 1", "n: 3")
+                .replace("tag: dev", "tag: holdout"),
+            "out of range for the no-skill-applies class",
+        ),
+        (
+            // The same `n` is legal for the numbered class, so the constraint
+            // must be per-class rather than global.
+            "correct_option mentioning a task is not a deferral",
+            "tdd-1",
+            &ok.replace(
+                "B: write the failing test first",
+                "B: finish the task with a failing test first",
+            ),
+            "MUST PARSE",
+        ),
+        (
             "a seventh key",
             "tdd-1",
             &ok.replace("tag: dev", "tag: dev\nnotes: extra"),
@@ -1621,6 +1748,13 @@ fn parse_scenario_rejects_illegal_states() {
     ];
 
     for (name, stem, contents, expected) in cases {
+        // A rejection table is also the right place to pin what must NOT be
+        // rejected — the two live and die together.
+        if *expected == "MUST PARSE" {
+            parse_scenario(stem, contents)
+                .unwrap_or_else(|e| panic!("{name}: must parse, but was rejected: {e}"));
+            continue;
+        }
         let err = parse_scenario(stem, contents)
             .err()
             .unwrap_or_else(|| panic!("{name}: expected a rejection, got a valid scenario"));
@@ -2356,11 +2490,22 @@ fn no_verbatim_overlap_with_superpowers() {
     // Both sides had to contribute something. `hits.is_empty()` is true of a
     // repo whose skills are all shorter than a shingle, and that would read as
     // "no overlap" rather than "nothing was long enough to compare".
+    //
+    // Guarding one side and not the other is worse than guarding neither: the
+    // asymmetry looks deliberate, so nobody goes looking for the hole on the
+    // unguarded side. Both are asserted, in the same place, for that reason.
     assert!(
         ours_shingle_count > 0,
         "{} skill file(s) produced no {MIN_SHINGLE_WORDS}-word run between them, \
          so this check compared nothing on our side",
         ours.len()
+    );
+    assert!(
+        !corpus_shingles.is_empty(),
+        "{} corpus file(s) across {roots:?} produced no {MIN_SHINGLE_WORDS}-word run between them, \
+         so there was nothing to compare against — a corpus that parses to no shingles is a broken \
+         corpus, not a clean result",
+        corpus_files.len()
     );
 
     assert!(
