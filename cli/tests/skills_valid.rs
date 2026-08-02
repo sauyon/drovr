@@ -238,20 +238,36 @@ struct ManifestRow {
     date: String,
 }
 
+/// The filename that marks the per-skill layout: in `skills/<skill>/SKILL.md`
+/// the name carries no identity, so the owner is the directory.
+const PER_SKILL_FILE_STEM: &str = "SKILL";
+
 /// Does `source_path` belong to `skill`?
 ///
 /// The arms are not all shaped alike: A/A′/B/B-r<i> snapshot per-skill files at
 /// `skills/<skill>/SKILL.md`, where the skill is the **parent directory**, while
 /// the voice arm (plan §1.1) is `voice/V<n>.md`, where it is the **file stem**.
-/// Accepting either is what lets one rule cover every arm in the run.
+///
+/// The layout **selects** which one owns the path; it is not "whichever
+/// matches". Accepting either let a row claim `SKILL` — the stem every
+/// methodology file shares — or claim `voice`, the directory the voice arm's
+/// files sit in. Both are identities this manifest is supposed to make
+/// impossible, so each layout gets exactly one owner and no fallback.
+/// An empty `skill` cell needs no special case: it cannot equal a stem or a
+/// directory name that exists, and `source_path_ownership_is_exact` pins that.
 fn source_path_belongs_to_skill(source_path: &str, skill: &str) -> bool {
     let path = Path::new(source_path);
-    let stem = path.file_stem().and_then(|s| s.to_str());
-    let parent = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str());
-    stem == Some(skill) || parent == Some(skill)
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if stem == PER_SKILL_FILE_STEM {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            == Some(skill)
+    } else {
+        stem == skill
+    }
 }
 
 /// The manifest's six columns, keyed by their normalized header text (see
@@ -511,6 +527,40 @@ Rows are matched on their `arm` and `skill` cells, like so:
     );
 }
 
+/// Ownership is exact, and it is decided by the path's **layout**, not by
+/// trying both shapes and taking whichever matches. Accepting "stem or parent"
+/// let a row claim `SKILL` (every methodology file's stem) or `voice` (the
+/// voice arm's directory) — identities the manifest prose says cannot exist.
+#[test]
+fn source_path_ownership_is_exact() {
+    let cases: &[(&str, &str, bool)] = &[
+        // Per-skill layout: the owner is the directory, and only the directory.
+        ("skills/tdd/SKILL.md", "tdd", true),
+        ("skills/tdd/SKILL.md", "SKILL", false),
+        ("skills/code-review/SKILL.md", "tdd", false),
+        // Flat layout (the voice arm): the owner is the file stem, and only it.
+        ("docs/skill-evidence/arms/voice/V0.md", "V0", true),
+        ("docs/skill-evidence/arms/voice/V0.md", "voice", false),
+        ("docs/skill-evidence/arms/voice/V0.md", "V1", false),
+        // Near misses: a segment must match whole, not as a substring or prefix.
+        ("skills/tdd-extra/SKILL.md", "tdd", false),
+        ("skills/xtdd/SKILL.md", "tdd", false),
+        ("docs/skill-evidence/arms/voice/V01.md", "V0", false),
+        ("skills/tdd/SKILL.md", "skills/tdd", false),
+        // Degenerate cells cannot own anything.
+        ("skills/tdd/SKILL.md", "", false),
+        ("", "tdd", false),
+    ];
+
+    for (path, skill, expected) in cases {
+        assert_eq!(
+            source_path_belongs_to_skill(path, skill),
+            *expected,
+            "source_path_belongs_to_skill({path:?}, {skill:?}) should be {expected}"
+        );
+    }
+}
+
 /// The `skill` cell must own its source path — but "own" cannot mean
 /// `skills/<skill>/SKILL.md`, because the voice arm (plan §1.1) is not
 /// per-skill: it is `voice/V<n>.md`. The rule that fits both is that the skill
@@ -643,6 +693,28 @@ fn parse_manifest_rejects_schema_drift() {
 | A | tdd | `skills/code-review/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
 ",
             "source path `skills/code-review/SKILL.md` does not belong to skill `tdd`",
+        ),
+        (
+            // `SKILL` is every methodology file's stem, so a stem-or-parent rule
+            // let one bogus skill name claim any of them.
+            "skill claims the filename rather than the directory",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | SKILL | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "source path `skills/tdd/SKILL.md` does not belong to skill `SKILL`",
+        ),
+        (
+            // The mirror image: the voice arm's key is the stem `V0`, not the
+            // directory it happens to sit in.
+            "skill claims the directory rather than the filename",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| voice | voice | `docs/skill-evidence/arms/voice/V0.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "does not belong to skill `voice`",
         ),
         (
             "hash cell is not an object id",
