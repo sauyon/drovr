@@ -656,19 +656,26 @@ failures, two of which passed in isolation.
 
 If a run reports N failures, re-run the first one alone before believing the other N-1.
 
-## `review::tests::lock_records_our_pid_and_releases_on_drop` flaked once (2026-07-26)
+## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky (2026-07-26, 2026-08-01)
 
-**Severity:** low (one observation, not reproducible on demand).
+**Severity:** low — it passes on re-run, but it costs a diagnosis every time.
 
-Seen once during the `structural-briefs` work: a full `cargo test` reported this single
-failure, and the same test passed alone and in two immediately following full runs
-(367/367 each). Conditions at the time: a live `drovr serve` from another session plus
-several sibling worktrees under `.drovr/wt/`, so more than one process could plausibly
-have been touching the serve lock.
+**Two sightings, five days apart, both on a full `cargo test`; both passed alone and on the
+immediate re-run of the whole suite.** The first was logged as a one-off; the second makes it a
+pattern rather than a fluke, so stop re-investigating it from scratch.
 
-Not yet diagnosed. Recorded so a second sighting is recognised as a pattern rather than
-re-investigated from scratch — if it recurs, suspect cross-process contention on the
-lock path rather than test-internal ordering.
+Conditions both times: a live `drovr serve` from another session, plus several sibling worktrees
+under `.drovr/wt/`. That points at cross-process contention on the serve lock path rather than
+anything test-internal — the test asserts on a lock file that another drovr process on the same
+machine can also be touching.
+
+**If you are here because it failed:** re-run it alone before believing it
+(`cargo test review::tests::lock_records_our_pid_and_releases_on_drop`). To actually fix it, give
+the test its own lock path via the env the rest of the suite already isolates (`XDG_*`), rather
+than sharing the developer's.
+
+Note also that a panic in an env-dependent test poisons `ENV_LOCK`, so ONE real failure reports as
+many — see the entry below before reading a long failure list as many bugs.
 
 ## `drovr code-review run` panel never completes (reviewer panes don't attach)
 

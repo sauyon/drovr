@@ -569,13 +569,22 @@ pub fn spawn_reviewer<H: Herdr>(
     Ok(())
 }
 
-/// What a handoff scan concluded. Two rules, no markdown model.
+/// What a handoff scan concluded. Two rules, no markdown model — and one variant per
+/// outcome, so "passes" is a state the type names rather than one a reader infers from an
+/// empty vec.
 #[derive(Debug, PartialEq, Eq)]
 enum HandoffShape {
     /// Nothing beyond what drovr itself wrote: the agent never touched the scaffold.
-    Untouched,
-    /// Sections still holding the placeholder, by heading (or an empty vec if none).
+    ///
+    /// Carries the sections still holding a placeholder, when there are any. They do not
+    /// change the refusal — "the whole file is scaffold" is the useful thing to say — but
+    /// discarding a fact already computed leaves the variant unable to answer a question a
+    /// caller may reasonably ask.
+    Untouched { placeholders: Vec<String> },
+    /// The agent wrote something, but left the placeholder in these sections.
     Placeholders(Vec<String>),
+    /// Written, with no placeholder left. Passes.
+    Complete,
 }
 
 /// Decide whether a handoff was actually written, WITHOUT parsing markdown.
@@ -604,8 +613,19 @@ enum HandoffShape {
 /// the gate can; the gate is here for the one that forgot. `drovr collect` shows the next
 /// phase exactly what it inherited, which is the real check on a thin handoff.
 fn scan_handoff(contents: &str) -> HandoffShape {
-    let scaffold = crate::brief::scaffold_lines();
-    let headings = crate::brief::scaffold_headings();
+    // ONE generation of the scaffold, borrowed twice — the two helpers each built it
+    // separately, which was wasteful and, worse, two chances for them to disagree about
+    // what the scaffold contains.
+    let scaffold = crate::brief::handoff_scaffold();
+    let scaffold_lines: Vec<&str> = scaffold
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let headings: Vec<&str> = scaffold
+        .lines()
+        .filter_map(|l| l.strip_prefix("## ").map(str::trim))
+        .collect();
 
     let mut wrote_something = false;
     let mut placeholders = Vec::new();
@@ -617,7 +637,7 @@ fn scan_handoff(contents: &str) -> HandoffShape {
             continue;
         }
         if let Some(rest) = line.strip_prefix("## ")
-            && let Some(h) = headings.iter().find(|h| *h == rest.trim())
+            && let Some(h) = headings.iter().find(|h| **h == rest.trim())
         {
             section = Some(h);
         }
@@ -631,7 +651,7 @@ fn scan_handoff(contents: &str) -> HandoffShape {
             }
             continue;
         }
-        if !scaffold.iter().any(|s| s == trimmed) {
+        if !scaffold_lines.contains(&trimmed) {
             wrote_something = true;
         }
     }
@@ -639,7 +659,10 @@ fn scan_handoff(contents: &str) -> HandoffShape {
     // Nothing outside drovr's own text — whether the placeholders are still there or the
     // agent deleted them and wrote nothing, it is the same accident.
     if !wrote_something {
-        return HandoffShape::Untouched;
+        return HandoffShape::Untouched { placeholders };
+    }
+    if placeholders.is_empty() {
+        return HandoffShape::Complete;
     }
     HandoffShape::Placeholders(placeholders)
 }
@@ -1182,7 +1205,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
         // inherit. `drovr handoff-scaffold` writes one placeholder per section; what the
         // gate asks is whether each section has substance, not whether that word is gone.
         match scan_handoff(&contents) {
-            HandoffShape::Untouched => {
+            HandoffShape::Untouched { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -1194,7 +1217,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                     ),
                 ));
             }
-            HandoffShape::Placeholders(sections) if !sections.is_empty() => {
+            HandoffShape::Placeholders(sections) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -1208,7 +1231,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                     ),
                 ));
             }
-            HandoffShape::Placeholders(_) => {}
+            HandoffShape::Complete => {}
         }
     }
 
@@ -4291,7 +4314,12 @@ mod tests {
     fn rearranged_scaffold_text_is_not_writing() {
         let _lock = ENV_LOCK.lock().unwrap();
         let run = registered_phase_run("handoff-rearranged");
-        let lines = crate::brief::scaffold_lines();
+        let scaffold = crate::brief::handoff_scaffold();
+        let lines: Vec<&str> = scaffold
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
         let body = format!("{}\n```\n{}\n```\n", lines.join("\n"), lines[0]);
         write_raw_handoff(&run, "plan", &body);
 
@@ -4325,8 +4353,10 @@ mod tests {
     fn a_written_handoff_completes() {
         let _lock = ENV_LOCK.lock().unwrap();
         let run = registered_phase_run("handoff-written");
-        let written = crate::brief::handoff_scaffold()
-            .replace(crate::brief::SCAFFOLD_PLACEHOLDER, "Real content for this section.");
+        let written = crate::brief::handoff_scaffold().replace(
+            crate::brief::SCAFFOLD_PLACEHOLDER,
+            "Real content for this section.",
+        );
         write_raw_handoff(&run, "plan", &written);
 
         phase_done(&run, "plan").expect("a filled scaffold completes");

@@ -427,31 +427,6 @@ pub fn compose_phase_brief(
 /// apart about what an unfilled section looks like.
 pub const SCAFFOLD_PLACEHOLDER: &str = "TODO";
 
-/// Every line `handoff_scaffold` writes, trimmed, blanks dropped — the header note, the
-/// per-section guidance comments, the headings, and the placeholder.
-///
-/// Derived from the scaffold's own OUTPUT rather than by re-parsing the template, so there
-/// is one place that decides what the scaffold contains (round 5: three independent splits
-/// of `HANDOFF_TEMPLATE`, each with its own `Authoring rules` sentinel, was a contract
-/// nobody owned).
-pub fn scaffold_lines() -> Vec<String> {
-    handoff_scaffold()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-/// The section headings the scaffold writes, in order — taken from the same output, and
-/// used only to say WHICH sections still hold a placeholder. A wrong attribution here is a
-/// cosmetic flaw in a message, never a refusal.
-pub fn scaffold_headings() -> Vec<String> {
-    handoff_scaffold()
-        .lines()
-        .filter_map(|l| l.strip_prefix("## ").map(|h| h.trim().to_string()))
-        .collect()
-}
-
 /// The empty handoff for a finishing agent to fill in:/// The empty handoff for a finishing agent to fill in: the fixed seven headings, each
 /// with the template's own guidance as an HTML comment, and nothing else.
 ///
