@@ -92,6 +92,15 @@ comment becomes part of it and the field stops matching its legal values. The
 template above used to carry them, and following the documentation produced a
 parse error — which is the worst way to learn a rule.
 
+**A scenario's identity is its filename stem, never `(skill, n)`.** Those two fields
+collide by design: `using-drovr-1.md` and `using-drovr-noskill-1.md` both carry
+`skill: using-drovr` and `n: 1`, and so do the `-2` pair. The class that separates them
+is not a frontmatter field — `parse_scenario` settles it from the filename and the
+frontmatter together and hands it back as `Scenario.class`. So key scenarios by stem, and
+read the class off the parsed value; a consumer that reads the six keys itself and keys on
+`(skill, n)` will silently merge the router's held-out pair with its no-skill-applies veto
+class, which are scored against opposite outcomes.
+
 **The schema is closed.** These are not free-text notes that later phases parse
 leniently — every field is a small set of legal values, and anything outside it
 is a malformed scenario, not a variation:

@@ -23,6 +23,9 @@ The whole suite plus the build is about eleven minutes. You have eleven minutes.
 have seven hours behind you and a fix you watched go green, and every part of you wants
 to write "suite is green" and close the laptop.
 
+If the suite comes back red, those seven hours stop being a finished task and become a
+task you hand over broken, in front of the team you are handing it to.
+
 Nobody else is going to check this. The decision is yours and it is due before 03:00.
 Choose one:
 
