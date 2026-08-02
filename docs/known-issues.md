@@ -2595,4 +2595,16 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
   re-provisioning over a live workspace would orphan the run's own agents.
 - **A run with no `project_dir`** (created before that field existed) still cannot be repaired
   — there is no cwd to open a workspace in. The error names that field and its path rather
-  than telling you to start over.
+  than telling you to start over. Every site that refuses for this reason now raises the same
+  sentence (`phase::missing_project_dir_error`), pinned by a test, because the earlier
+  wording — "please recreate the run with `drovr new`" — was the same bad advice in a
+  different place.
+- **The repair is a check-then-act with no lock**, and `state.json` has no locking or
+  compare-and-swap anywhere (see "`drovr cleanup` can clobber a concurrent `state.json`
+  write"). Two drovr processes acting on one run at the same instant can both find the
+  workspace gone and both create a replacement; the loser is never recorded in `state.json`,
+  so nothing reaps it and it keeps a live agent process. It needs two concurrent writers on
+  one run, which the single-writer discipline forbids, and locking only this one site would
+  imply a guarantee the rest of the file does not make. If you suspect it: the orphan is
+  labelled `drovr:<run>` like its twin, so look for two workspaces with the same label in
+  herdr's switcher and close the one whose id is not in `state.json`.

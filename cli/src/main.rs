@@ -799,17 +799,11 @@ fn resurrect_report<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<String> {
         orphaned,
     } = phase::ensure_workspace(h, run)?
     {
-        out.push_str(&format!(
-            "restored run '{}': its herdr workspace was gone; created {workspace} in {}\n",
-            run.name, run.project_dir
-        ));
-        if !orphaned.is_empty() {
-            out.push_str(&format!(
-                "  these phases were Running in it and their agents are gone with their \
-                 context — marked FAILED: {}\n",
-                orphaned.join(", ")
-            ));
-        }
+        // Shared wording, so a driver reading this and the stderr warning
+        // `phase_start` prints does not have to work out that they are the same
+        // event described twice.
+        out.push_str("restored: ");
+        out.push_str(&phase::healing_report(run, &workspace, &orphaned));
         out.push('\n');
     }
 
@@ -1362,10 +1356,7 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // record; mirror `phase_start`'s guidance rather than recording a
             // base from the wrong directory.
             if state.project_dir.is_empty() {
-                eprintln!(
-                    "drovr: run '{run}' has no project_dir (created before this fix); \
-                     please recreate the run with `drovr new`"
-                );
+                eprintln!("drovr: {}", phase::missing_project_dir_error(&run));
                 process::exit(1);
             }
             let sha = head_sha(&state.project_dir).unwrap_or_else(|e| {
@@ -1528,7 +1519,7 @@ fn main() {
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
-        Commands::Resurrect { name } => cmd_resurrect(&SystemHerdr::new(), &name),
+        Commands::Resurrect { name } => cmd_resurrect(&herdr, &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),

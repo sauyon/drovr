@@ -332,7 +332,45 @@ pub fn workspace_label(run_name: &str) -> String {
     format!("drovr:{run_name}")
 }
 
+/// The refusal for a run with no `project_dir` — the one piece of state drovr
+/// genuinely cannot rebuild, since without it there is no directory to launch an
+/// agent in and none to open a workspace in.
+///
+/// ONE function for every site that hits this, because the wording is the point.
+/// It used to read "please recreate the run with `drovr new`" — advice that would
+/// have discarded an approved spec, a plan and two tasks of committed work on the
+/// run that exposed all of this. A run is not disposable just because one field
+/// of it is missing, so this names the field and where to put it instead.
+pub fn missing_project_dir_error(run_name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "run '{run_name}' has no project_dir (created before that field was \
+             recorded), so drovr does not know which directory to work in. \
+             Everything else about the run is intact: add \"project_dir\": \
+             \"/path/to/checkout\" to {} and re-run this command.",
+            run_dir(run_name).join("state.json").display()
+        ),
+    )
+}
+
+/// The workspace [`ensure_workspace`] has just guaranteed.
+///
+/// Reachable only if that guarantee is broken, so it reports a bug in drovr
+/// rather than a state a user can be in — and specifically NOT the "recreate the
+/// run" advice this area exists to retire. Shared by the two launch paths so the
+/// one invariant is stated once.
+fn workspace_or_bug(run: &RunState) -> io::Result<String> {
+    run.workspace.clone().ok_or_else(|| {
+        io::Error::other(format!(
+            "internal: run '{}' still has no workspace after ensure_workspace",
+            run.name
+        ))
+    })
+}
+
 /// What [`ensure_workspace`] had to do.
+#[derive(Debug)]
 pub enum WorkspaceHealing {
     /// The recorded workspace answered — nothing was touched.
     Intact,
@@ -364,27 +402,28 @@ pub enum WorkspaceHealing {
 ///
 /// Saves `run` when it changes anything, so a caller that fails afterwards still
 /// leaves the repair on disk instead of re-creating a second workspace next time.
+///
+/// NOT ATOMIC, deliberately. The check and the create are two calls with no lock
+/// between them, and `state.json` has neither locking nor compare-and-swap (see
+/// [`RunState::save`]). Two drovr processes acting on the same run at the same
+/// moment can therefore both see the workspace as gone and both create one; the
+/// loser's is never recorded, so nothing reaps it and it holds a live agent. That
+/// needs two concurrent writers on one run, which drovr's single-writer
+/// discipline forbids — and a lock here would close one instance of a race the
+/// rest of the file has everywhere else, which is worse than an honest gap. It is
+/// written up in `docs/known-issues.md`; the loser is labelled `drovr:<run>` like
+/// any other, so a human can spot the duplicate in herdr's switcher.
 pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<WorkspaceHealing> {
     if let Some(ws) = run.workspace.as_deref()
         && h.workspace_exists(ws)
     {
         return Ok(WorkspaceHealing::Intact);
     }
-    // Not "recreate the run": name the one thing that genuinely cannot be
-    // rebuilt. Without a project_dir there is no cwd to open the workspace in,
-    // and a workspace created without one opens wherever herdr defaults to —
-    // the near-miss that nearly had a phase agent editing an unrelated repo.
+    // A workspace created without a cwd opens wherever herdr defaults to — the
+    // near-miss that nearly had a phase agent editing an unrelated repo — so a
+    // run with no project_dir gets no workspace at all.
     if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace and no project_dir to open one in \
-                 (created before project_dir was recorded). Everything else about the \
-                 run is intact: add \"project_dir\" to {} and re-run this command.",
-                run.name,
-                run_dir(&run.name).join("state.json").display()
-            ),
-        ));
+        return Err(missing_project_dir_error(&run.name));
     }
     let ws = h.workspace_create(&workspace_label(&run.name), &run.project_dir)?;
 
@@ -419,26 +458,41 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     })
 }
 
-/// Repair `run`'s workspace and report on stderr what the repair cost.
+/// What a repair cost, in the words every path reports it in.
+///
+/// One formatter rather than one per caller: `phase_start`/`spawn_reviewer` warn
+/// on stderr and `resurrect` returns a report on stdout, but a driver who reads
+/// both must not have to work out whether two differently-worded messages
+/// describe the same event. Lines are newline-terminated; the caller frames them.
+pub fn healing_report(run: &RunState, workspace: &str, orphaned: &[String]) -> String {
+    let mut out = format!(
+        "run '{}' had no live herdr workspace; created {workspace} in {}\n",
+        run.name, run.project_dir
+    );
+    if !orphaned.is_empty() {
+        out.push_str(&format!(
+            "these phases were Running in the old workspace and their agents are gone \
+             with their context — marked FAILED, restart the one you want: {}\n",
+            orphaned.join(", ")
+        ));
+    }
+    out
+}
+
+/// Repair `run`'s workspace and warn on stderr about what the repair cost.
 ///
 /// Split from [`ensure_workspace`] so the pure state transition stays testable
-/// without capturing output, and so all three launch paths say the same thing.
+/// without capturing output. `resurrect` does its own framing (the repair is its
+/// headline, not a warning beside a launch) but shares [`healing_report`], so the
+/// wording cannot drift between them.
 fn ensure_workspace_reporting<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<()> {
     if let WorkspaceHealing::Reprovisioned {
         workspace,
         orphaned,
     } = ensure_workspace(h, run)?
     {
-        eprintln!(
-            "drovr: run '{}' had no live herdr workspace; created {workspace} in {}",
-            run.name, run.project_dir
-        );
-        if !orphaned.is_empty() {
-            eprintln!(
-                "drovr: these phases were Running in the old workspace and their agents \
-                 are gone with their context — marked FAILED, restart the one you want: {}",
-                orphaned.join(", ")
-            );
+        for line in healing_report(run, &workspace, &orphaned).lines() {
+            eprintln!("drovr: {line}");
         }
     }
     Ok(())
@@ -472,15 +526,13 @@ pub fn phase_start<H: Herdr>(
     } else {
         require_phase_name(phase)?;
     }
+    // Checked here as well as inside `ensure_workspace`, and for a different
+    // reason: `project_dir` is this phase's cwd and its `--add-dir` guard, so it
+    // is required even when the recorded workspace is perfectly alive. Both sites
+    // raise the SAME error, so which one fires first is not something a reader has
+    // to know.
     if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
+        return Err(missing_project_dir_error(&run.name));
     }
     let cwd = run.project_dir.clone();
 
@@ -551,17 +603,8 @@ pub fn phase_start<H: Herdr>(
         used_root = true;
         root
     } else {
-        // `ensure_workspace` above either found a live workspace or created one,
-        // so this is an invariant rather than a state a user can be in — and the
-        // advice it used to carry ("recreate the run with `drovr new`") is exactly
-        // what must never be said about a lost workspace.
-        let ws = run.workspace.clone().ok_or_else(|| {
-            io::Error::other(format!(
-                "internal: run '{}' still has no workspace after ensure_workspace",
-                run.name
-            ))
-        })?;
-        h.tab_create(&ws, phase, &cwd)?
+        // `ensure_workspace` above either found a live workspace or created one.
+        h.tab_create(&workspace_or_bug(run)?, phase, &cwd)?
     };
 
     // Use the backend captured by `drovr new`, so every phase stays on the
@@ -642,14 +685,7 @@ pub fn spawn_reviewer<H: Herdr>(
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
     if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
+        return Err(missing_project_dir_error(&run.name));
     }
 
     // Reviewers can't reuse the pipeline root pane; they need their own tab, which
@@ -657,12 +693,7 @@ pub fn spawn_reviewer<H: Herdr>(
     // `code-review run` spawns several reviewers in a loop, which is precisely
     // when a workspace is most likely to have been emptied by pane-reaping.
     ensure_workspace_reporting(h, run)?;
-    let ws = run.workspace.clone().ok_or_else(|| {
-        io::Error::other(format!(
-            "internal: run '{}' still has no workspace after ensure_workspace",
-            run.name
-        ))
-    })?;
+    let ws = workspace_or_bug(run)?;
 
     // A fresh tab (with its auto shell pane) in the run workspace — never the root
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
@@ -2563,8 +2594,7 @@ mod tests {
         run.project_dir = String::new();
 
         let err = ensure_workspace(&h, &mut run)
-            .err()
-            .expect("no project_dir means no cwd for a workspace");
+            .expect_err("no project_dir means no cwd for a workspace");
         let msg = err.to_string();
         assert!(
             msg.contains("project_dir"),
@@ -5409,6 +5439,48 @@ mod tests {
             msg.contains("project_dir"),
             "error should mention project_dir: {msg}"
         );
+        // This guard fires BEFORE `ensure_workspace`, so it is the message a user
+        // actually sees for this cause — and it used to be the one telling a run
+        // with committed work to start over.
+        assert!(
+            !msg.contains("recreate the run"),
+            "no refusal may answer a repairable run with 'start over': {msg}"
+        );
+    }
+
+    /// Every refusal for a missing `project_dir` is one sentence, written once.
+    /// Pinned because the failure mode here is drift, not logic: three sites used
+    /// to say "please recreate the run with `drovr new`", and a fix that reworded
+    /// only the site it happened to touch would leave the other two contradicting
+    /// it — which is exactly what the first pass of this change did.
+    #[test]
+    fn every_missing_project_dir_refusal_names_the_field_instead_of_starting_over() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("proj-dir-wording-test");
+        run.project_dir = String::new();
+
+        let from_start = phase_start(&h, &mut run, "brainstorm", None).unwrap_err();
+        let from_reviewer = spawn_reviewer(&h, &mut run, "review:t:1:correctness", None, "claude")
+            .expect_err("a reviewer needs a project_dir too");
+        // `ensure_workspace` only needs a project_dir when it has to CREATE
+        // something — with a live workspace it never looks — so drop the
+        // workspace to reach its refusal.
+        run.workspace = None;
+        let from_ensure =
+            ensure_workspace(&h, &mut run).expect_err("no workspace and no cwd to open one in");
+        let canonical = missing_project_dir_error("proj-dir-wording-test").to_string();
+
+        for (site, msg) in [
+            ("phase_start", from_start.to_string()),
+            ("spawn_reviewer", from_reviewer.to_string()),
+            ("ensure_workspace", from_ensure.to_string()),
+        ] {
+            assert_eq!(msg, canonical, "{site} must raise the shared refusal");
+        }
+        // And the shared refusal says where to fix it, not to abandon the run.
+        assert!(canonical.contains("state.json"), "{canonical}");
+        assert!(!canonical.contains("recreate the run"), "{canonical}");
     }
 
     #[test]
