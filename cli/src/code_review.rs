@@ -58,7 +58,7 @@ use crate::config::load_config;
 use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
-use crate::phase::{done_marker, phase_send, spawn_reviewer};
+use crate::phase::{archived_run_error, done_marker, phase_send, spawn_reviewer};
 use crate::run::{PhaseStatus, RunState, run_dir};
 
 /// How often the private wait loop polls the filesystem for a reviewer's marker.
@@ -722,12 +722,28 @@ pub fn code_review_run<H: Herdr>(
     // `ensure_workspace` carries its own archived guard for the same reason. Both
     // are wanted: this one refuses BEFORE the panel does any work, and reports it
     // as a review outcome rather than an io error.
-    if run.archived {
-        eprintln!(
-            "code-review: run '{}' is archived — restore it before reviewing",
-            run.name
-        );
-        return Ok(ReviewOutcome::Error);
+    //
+    // `refresh_archived`, not `run.archived` — the flag's authority is `state.json`
+    // (see `RunState::archived`), and this function in particular is why: it holds
+    // one `RunState` across a 30-minute wait, so its copy is exactly the one most
+    // likely to be stale. Reading the field directly here while `ensure_workspace`
+    // re-read disk would make `RunState.archived` mean different things depending
+    // on which launch API you entered through. A read failure refuses too: an
+    // unreadable state.json is not permission to spawn a panel.
+    match run.refresh_archived() {
+        Ok(true) => {
+            eprintln!("code-review: {}", archived_run_error(&run.name));
+            return Ok(ReviewOutcome::Error);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "code-review: run '{}': cannot read state.json to check whether it was \
+                 archived, so no panel will be spawned: {e}",
+                run.name
+            );
+            return Ok(ReviewOutcome::Error);
+        }
     }
 
     // Scope first: without a recorded base or a readable HEAD there is nothing to

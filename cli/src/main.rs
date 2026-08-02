@@ -794,16 +794,12 @@ fn resurrect_report<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<String> {
     };
 
     let mut out = String::new();
-    if let phase::WorkspaceHealing::Reprovisioned {
-        workspace,
-        orphaned,
-    } = phase::ensure_workspace(h, run)?
-    {
+    if let phase::WorkspaceHealing::Reprovisioned { orphaned } = phase::ensure_workspace(h, run)? {
         // Shared wording, so a driver reading this and the stderr warning
         // `phase_start` prints does not have to work out that they are the same
         // event described twice.
         out.push_str("restored: ");
-        out.push_str(&phase::healing_report(run, &workspace, &orphaned));
+        out.push_str(&phase::healing_report(run, &orphaned));
         out.push('\n');
     }
 

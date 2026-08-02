@@ -354,6 +354,25 @@ pub fn missing_project_dir_error(run_name: &str) -> io::Error {
     )
 }
 
+/// The refusal for a run the human filed away.
+///
+/// A shared constructor for the same reason [`missing_project_dir_error`] is one:
+/// these are drovr's two hard refusals, both say "the run is fine, do this one
+/// thing first", and a second wording of either is a place for the guidance to
+/// drift. `code_review_run` reports it through its own outcome type but prints
+/// this text.
+pub fn archived_run_error(run_name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "run '{run_name}' is archived, and archiving destroyed its herdr \
+             workspace. drovr will not rebuild one for a run you filed away — \
+             nothing is lost, so Restore it (the Restore button in `drovr serve`'s \
+             run list) and re-run this command."
+        ),
+    )
+}
+
 /// The workspace [`ensure_workspace`] has just guaranteed.
 ///
 /// Reachable only if that guarantee is broken, so it reports a bug in drovr
@@ -370,18 +389,20 @@ fn workspace_or_bug(run: &RunState) -> io::Result<String> {
 }
 
 /// What [`ensure_workspace`] had to do.
+///
+/// `Reprovisioned` deliberately does NOT carry the new workspace id: it is in
+/// `run.workspace` by the time this is returned, and a copy beside it would be a
+/// second place for the same fact to live — one the caller could pass to
+/// [`healing_report`] mismatched with the run it is reporting on.
 #[derive(Debug)]
 pub enum WorkspaceHealing {
     /// The recorded workspace answered — nothing was touched.
     Intact,
-    /// There was no live workspace, so one was created. Carries the new id and
-    /// the names of the phases that were `Running` in the dead one, which the
-    /// caller reports: their agents are gone with their context, and that is a
-    /// fact about the run, not a detail of the repair.
-    Reprovisioned {
-        workspace: String,
-        orphaned: Vec<String>,
-    },
+    /// There was no live workspace, so one was created. Carries the names of the
+    /// phases that were `Running` in the dead one, which the caller reports: their
+    /// agents are gone with their context, and that is a fact about the run, not a
+    /// detail of the repair.
+    Reprovisioned { orphaned: Vec<String> },
 }
 
 /// Guarantee `run` has a live herdr workspace, creating one if it does not.
@@ -430,27 +451,24 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     // Checked after `workspace_exists`, so an archived run whose `workspace_close`
     // failed — a zombie, with live panes — still starts exactly as it does today.
     //
-    // DISK, not the caller's copy. Archive and Restore are both writes to
-    // `state.json` by another process, so disk holds the human's current decision
-    // while an in-memory flag can be stale in EITHER direction — and one of those
-    // directions is not rare: `save_preserving_archived` merges with `|=`, so a
-    // writer that once saw an Archive keeps `archived: true` in its own copy for
-    // the rest of its life (`code_review_run` does this when a panel is archived
-    // mid-flight). Trusting that copy would keep refusing to repair a run the
-    // human had already Restored. The in-memory flag is only the fallback, for
-    // when there is nothing on disk to read.
-    let archived_now = RunState::load(&run.name).map_or(run.archived, |disk| disk.archived);
-    if archived_now {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+    // `refresh_archived` is THE way to consult this flag (see `RunState::archived`
+    // for why disk is the authority). It also leaves `run.archived` agreeing with
+    // disk, which matters here specifically: the `save_preserving_archived` at the
+    // end of this function writes the copy in hand, so a guard that read disk and
+    // left a stale `true` behind would re-archive, on its own success path, the
+    // run it had just decided was not archived.
+    if run.refresh_archived().map_err(|e| {
+        io::Error::new(
+            e.kind(),
             format!(
-                "run '{}' is archived and its herdr workspace was destroyed when it \
-                 was filed away. Nothing is lost — Restore it (the Restore button in \
-                 `drovr serve`'s run list) and re-run this command, and drovr will \
-                 build it a new workspace.",
-                run.name
+                "run '{}': cannot read {} to check whether it was archived, so drovr \
+                 will not create a workspace for it: {e}",
+                run.name,
+                run_dir(&run.name).join("state.json").display()
             ),
-        ));
+        )
+    })? {
+        return Err(archived_run_error(&run.name));
     }
     // A workspace created without a cwd opens wherever herdr defaults to — the
     // near-miss that nearly had a phase agent editing an unrelated repo — so a
@@ -484,11 +502,59 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     // The replacement's root shell pane is handed to the next phase exactly as
     // `drovr new`'s is, so recovery leaves no idle shell behind either.
     run.root_pane = Some(ws.root_pane);
-    run.save_preserving_archived()?;
-    Ok(WorkspaceHealing::Reprovisioned {
-        workspace: ws.id,
-        orphaned,
-    })
+
+    // ORDER: create, mutate, save — and hand the workspace BACK if the save fails.
+    //
+    // Persisting first is not available: the id to persist only exists once herdr
+    // has created it. So the window between the two is real, and the question is
+    // only what a failure in it leaves behind. Without the reclaim it leaves the
+    // worst of both: `state.json` still names the DEAD workspace, so the next
+    // attempt creates a second replacement, while the first stands in the human's
+    // switcher labelled `drovr:<run>` with nothing pointing at it — the
+    // duplicate-workspace failure this file documents for concurrent writers, now
+    // reachable from a single one on a transient ENOSPC.
+    //
+    // Closing it is safe and exact: we created it microseconds ago, nothing has
+    // been launched into it (`ensure_workspace` runs before any `pane_run`), and
+    // it is not the id anything has recorded. So the failure becomes atomic in the
+    // way that matters — nothing created, nothing written, retry from the same
+    // place. `run` itself is left mutated, which is why this returns `Err`: the
+    // caller must drop it, not save it.
+    if let Err(save_err) = run.save_preserving_archived() {
+        return Err(reclaim_unrecorded_workspace(h, &ws.id, &run.name, save_err));
+    }
+    Ok(WorkspaceHealing::Reprovisioned { orphaned })
+}
+
+/// Give back a workspace drovr created but could not record, and describe what
+/// happened. Always returns an `Err` for the caller to propagate — this is a
+/// failure path, and the reclaim is cleanup, not recovery.
+///
+/// If the close ALSO fails there is nothing left to try, so the message names the
+/// id and the label so a human can close it by hand. Reporting the save failure as
+/// if nothing were left behind would be the lie this whole area exists to remove.
+fn reclaim_unrecorded_workspace<H: Herdr>(
+    h: &H,
+    workspace: &str,
+    run_name: &str,
+    cause: io::Error,
+) -> io::Error {
+    let stranded = match h.workspace_close(workspace) {
+        Ok(()) => String::new(),
+        Err(close_err) => format!(
+            " — and it could not be closed again either ({close_err}), so herdr still \
+             holds workspace {workspace} (labelled `{}`) with nothing pointing at it; \
+             close it by hand",
+            workspace_label(run_name)
+        ),
+    };
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "run '{run_name}': could not record the replacement herdr workspace \
+             ({cause}), so the repair did not stick and was rolled back{stranded}"
+        ),
+    )
 }
 
 /// What a repair cost, in the words every path reports it in.
@@ -497,10 +563,12 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
 /// on stderr and `resurrect` returns a report on stdout, but a driver who reads
 /// both must not have to work out whether two differently-worded messages
 /// describe the same event. Lines are newline-terminated; the caller frames them.
-pub fn healing_report(run: &RunState, workspace: &str, orphaned: &[String]) -> String {
+pub fn healing_report(run: &RunState, orphaned: &[String]) -> String {
     let mut out = format!(
-        "run '{}' had no live herdr workspace; created {workspace} in {}\n",
-        run.name, run.project_dir
+        "run '{}' had no live herdr workspace; created {} in {}\n",
+        run.name,
+        run.workspace.as_deref().unwrap_or("(unrecorded)"),
+        run.project_dir
     );
     if !orphaned.is_empty() {
         out.push_str(&format!(
@@ -519,12 +587,8 @@ pub fn healing_report(run: &RunState, workspace: &str, orphaned: &[String]) -> S
 /// headline, not a warning beside a launch) but shares [`healing_report`], so the
 /// wording cannot drift between them.
 fn ensure_workspace_reporting<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<()> {
-    if let WorkspaceHealing::Reprovisioned {
-        workspace,
-        orphaned,
-    } = ensure_workspace(h, run)?
-    {
-        for line in healing_report(run, &workspace, &orphaned).lines() {
+    if let WorkspaceHealing::Reprovisioned { orphaned } = ensure_workspace(h, run)? {
+        for line in healing_report(run, &orphaned).lines() {
             eprintln!("drovr: {line}");
         }
     }
@@ -2435,6 +2499,13 @@ mod tests {
 
         let err = phase_start(&h, &mut run, "implement", None)
             .expect_err("an archived run must not be resurrected by a repair");
+        // The shared constructor, byte for byte — drovr's two hard refusals
+        // (`archived_run_error`, `missing_project_dir_error`) are each written
+        // once, so the guidance cannot drift between the sites that raise them.
+        assert_eq!(
+            err.to_string(),
+            archived_run_error("archived-ws-test").to_string()
+        );
         let msg = err.to_string();
         assert!(msg.contains("archived"), "say why it refused: {msg}");
         assert!(
@@ -2446,6 +2517,128 @@ mod tests {
             "no workspace may be created for a run the human filed away: {:?}",
             h.calls()
         );
+    }
+
+    /// A workspace drovr creates but cannot RECORD is worse than one it never
+    /// created: `state.json` still names the dead one, so the next attempt makes a
+    /// second replacement, while the first sits in the human's switcher labelled
+    /// `drovr:<run>` with nothing pointing at it. The repair is only complete once
+    /// it is persisted, so a failed save gives the workspace back.
+    ///
+    /// Uses a read-only run directory to make the save fail — the failure this
+    /// models is a transient ENOSPC/EACCES, and there is no other deterministic
+    /// way to reach it. Skipped when the test user can write to a read-only
+    /// directory anyway (root), rather than asserting something untrue.
+    #[test]
+    #[cfg(unix)]
+    fn a_workspace_that_cannot_be_recorded_is_given_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-save-fails-test", "wAG");
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let dir = run_dir("ws-save-fails-test");
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the mode bits, so the premise would be false there.
+        let writable_anyway = std::fs::write(dir.join(".probe"), b"x").is_ok();
+        let _ = std::fs::remove_file(dir.join(".probe"));
+        if writable_anyway {
+            std::fs::set_permissions(&dir, original).unwrap();
+            return;
+        }
+
+        let err = ensure_workspace(&h, &mut run).expect_err("the save cannot succeed");
+        std::fs::set_permissions(&dir, original).unwrap();
+
+        let calls = h.calls();
+        let created: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.contains("workspace_create"))
+            .collect();
+        assert_eq!(created.len(), 1, "one workspace was created: {calls:?}");
+        // Whatever id the fake handed out, the SAME one must be closed again.
+        let new_id = run.workspace.clone().unwrap_or_default();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("workspace_close id={new_id}")),
+            "the workspace it could not record must be handed back: {calls:?}"
+        );
+        // And the error has to name the save failure, not the reclaim.
+        assert!(
+            err.to_string().contains("could not record"),
+            "the error must say the repair did not stick: {err}"
+        );
+        assert_eq!(
+            RunState::load("ws-save-fails-test")
+                .unwrap()
+                .workspace
+                .as_deref(),
+            Some("wAG"),
+            "nothing was persisted, so the next attempt starts from the same place"
+        );
+    }
+
+    /// Consulting `archived` means refreshing it, and refreshing means the copy in
+    /// hand now AGREES with disk. Reading disk for the guard while leaving the
+    /// stale flag in place is how a repair ends up re-archiving, on its success
+    /// path, the very run it just repaired: `save_preserving_archived` writes at
+    /// the end of `ensure_workspace`, and it writes what the copy holds.
+    #[test]
+    fn repairing_a_restored_run_leaves_it_restored_on_disk() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-writeback-test", "wAG");
+        run.archived = false;
+        run.save().unwrap();
+        // This caller's copy is latched `true` from an Archive it observed before
+        // the human changed their mind — exactly what `save_preserving_archived`
+        // used to leave behind.
+        run.archived = true;
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).expect("a restored run is repairable");
+
+        assert!(
+            !RunState::load("archived-writeback-test").unwrap().archived,
+            "the repair must not write a stale `archived: true` back over a Restore"
+        );
+        assert!(
+            !run.archived,
+            "and the copy in hand must agree with what it consulted"
+        );
+    }
+
+    /// The guard is load-bearing, so it fails CLOSED. An unreadable `state.json`
+    /// is not evidence that the run is un-archived, and quietly falling back to
+    /// the caller's copy would let a torn read re-provision a run the human filed
+    /// away — the guard skipped by an error nobody sees.
+    #[test]
+    fn an_unreadable_state_json_refuses_the_repair_rather_than_guessing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-unreadable-test", "wAG");
+        run.save().unwrap();
+        std::fs::write(
+            run_dir("archived-unreadable-test").join("state.json"),
+            b"{ torn",
+        )
+        .unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let err = phase_start(&h, &mut run, "implement", None)
+            .expect_err("an unreadable state.json must not be read as 'not archived'");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "and nothing may be created on that non-answer: {:?}",
+            h.calls()
+        );
+        // The message has to point at the file, since that is what must be fixed.
+        assert!(err.to_string().contains("state.json"), "{err}");
     }
 
     /// The archive flag a caller holds in memory can be STALE IN BOTH DIRECTIONS,
