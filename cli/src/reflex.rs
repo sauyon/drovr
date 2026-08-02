@@ -206,6 +206,10 @@ pub const GATE_CARD: &str = concat!(
 /// file naming itself — a guard that cannot detect the drift it claims to.
 /// The card's obligation to carry the pointer is enforced one-sided, in
 /// `gate_card_carries_every_required_item`.
+///
+/// Test-only, like [`validate_markers`]: it is a contract between two texts,
+/// checked at build time by the suite, with nothing to consume at runtime.
+#[cfg(test)]
 const GATE_CARD_PHRASES: &[&str] = &["<SUBAGENT-STOP>", "Single writer", "drovr:code-review"];
 
 /// The gate JSON, or `None` when the gate is off or the previous turn already
@@ -258,20 +262,20 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
 }
 
 /// True if this `user` record is a real prompt rather than a tool result.
+///
+/// Only one shape is *not* a boundary: a content array whose every block is a
+/// `tool_result`. Everything else — a bare string prompt, an array carrying a
+/// `text` block, and any shape this function does not recognize — ends the
+/// turn. That default is the fail-open direction: walking *past* an
+/// unrecognized record would let a skill invoked in some earlier turn suppress
+/// this one, which is silent drift, the failure the gate exists to catch.
+/// Ending the turn early costs at worst one redundant 600-byte injection.
 fn is_turn_boundary(record: &serde_json::Value) -> bool {
-    let content = &record["message"]["content"];
-    if content.is_string() {
-        return true;
-    }
-    match content.as_array() {
-        // At least one block that is not a tool result → a real message.
+    match record["message"]["content"].as_array() {
         Some(blocks) => blocks
             .iter()
             .any(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_result")),
-        // No recognizable content: not evidence of a turn boundary. Failing
-        // this way keeps walking, which can only ever *suppress* a redundant
-        // injection — never hide drift.
-        None => false,
+        None => true,
     }
 }
 
@@ -683,7 +687,11 @@ mod tests {
             );
         }
         // ...and the real thing still does.
-        let t = format!("{}\n{}\n", user_prompt("go"), skill_call("drovr:code-review"));
+        let t = format!(
+            "{}\n{}\n",
+            user_prompt("go"),
+            skill_call("drovr:code-review")
+        );
         assert!(skill_invoked_last_turn(&t));
     }
 
@@ -701,7 +709,10 @@ mod tests {
         let other_tool = format!(
             "{}\n{}\n",
             user_prompt("go"),
-            tool_use("Bash", r#"{"command":"echo drovr:tdd","skill":"drovr:tdd"}"#)
+            tool_use(
+                "Bash",
+                r#"{"command":"echo drovr:tdd","skill":"drovr:tdd"}"#
+            )
         );
         assert!(!skill_invoked_last_turn(&other_tool));
 
@@ -713,6 +724,21 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_use","name":"Skill","input":{"skill":"drovr:tdd"}}]}}"#
         );
         assert!(!skill_invoked_last_turn(&user_side));
+
+        // ...nor does one in a record of any other type. Only `assistant`
+        // records are searched: matching on the block alone would let a
+        // `system` record — which the transcript also carries, and which no
+        // agent authored as an invocation — buy silence from the gate.
+        for kind in ["system", "summary", "progress"] {
+            let record = format!(
+                r#"{{"type":"{kind}","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Skill","input":{{"skill":"drovr:tdd"}}}}]}}}}"#
+            );
+            let foreign = format!("{}\n{}\n", user_prompt("go"), record);
+            assert!(
+                !skill_invoked_last_turn(&foreign),
+                "a Skill tool_use in a {kind:?} record must not suppress the gate"
+            );
+        }
     }
 
     #[test]
@@ -753,6 +779,32 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_user_record_ends_the_turn() {
+        // A `user` record whose content is missing or an unexpected shape must
+        // end the turn, not be walked past. Walking past it would let a skill
+        // invoked in an EARLIER turn suppress this one — the drift direction.
+        // Every ambiguity in this scan resolves toward emitting the card.
+        for odd in [
+            r#"{"type":"user","message":{}}"#,
+            r#"{"type":"user"}"#,
+            r#"{"type":"user","message":{"role":"user","content":42}}"#,
+            r#"{"type":"user","message":{"role":"user","content":null}}"#,
+        ] {
+            let t = format!(
+                "{}\n{}\n{}\n",
+                user_prompt("older request"),
+                skill_call("drovr:tdd"),
+                odd
+            );
+            assert!(
+                !skill_invoked_last_turn(&t),
+                "an unreadable user record must end the turn, got suppression on {odd}"
+            );
+            assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+        }
+    }
+
+    #[test]
     fn gate_card_phrases_present_in_router_skill() {
         // The drift guard (§4.2, §9.2). TWO-SIDED on purpose: asserting only
         // that the card contains a phrase lets the router drop it, and
@@ -762,7 +814,10 @@ mod tests {
             !GATE_CARD_PHRASES.is_empty(),
             "an empty phrase list makes this test vacuous"
         );
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../skills/using-drovr/SKILL.md");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../skills/using-drovr/SKILL.md"
+        );
         let md =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
         for phrase in GATE_CARD_PHRASES {
@@ -783,7 +838,10 @@ mod tests {
         // be able to delete the routing core. The section list is READ FROM THE
         // FILE rather than hardcoded, so a section added later that happens to
         // wrap the core fails this test instead of slipping past it.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../skills/using-drovr/SKILL.md");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../skills/using-drovr/SKILL.md"
+        );
         let md =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
         let names: Vec<String> = md
