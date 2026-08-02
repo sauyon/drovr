@@ -190,64 +190,375 @@ fn git_hash_object(path: &Path) -> String {
         .to_string()
 }
 
-/// One data row of `arms/MANIFEST.md`'s table.
+/// A `git hash-object` blob SHA, validated at construction.
+///
+/// The 40-hex-character invariant lives here rather than in each caller: every
+/// later task re-checks its own arm against this manifest, and a newtype means
+/// none of them can forget to assert the format — a malformed cell is a parse
+/// error, not a mismatch that reads like arm corruption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlobSha(String);
+
+impl BlobSha {
+    fn parse(raw: &str) -> Result<Self, String> {
+        if raw.len() == 40 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            Ok(BlobSha(raw.to_string()))
+        } else {
+            Err(format!(
+                "`{raw}` is not a 40-character hex blob SHA (`git hash-object --no-filters`)"
+            ))
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One data row of `arms/MANIFEST.md`'s table — all six columns plan §1.1
+/// defines, so a caller never has to re-parse the line to reach a field.
+#[derive(Debug)]
 struct ManifestRow {
     arm: String,
     skill: String,
-    hash: String,
+    source_path: String,
+    hash: BlobSha,
+    commit: String,
+    date: String,
 }
 
-/// Parse `arms/MANIFEST.md`'s markdown table.
-///
-/// The manifest is append-only and gains a row per arm per skill as later tasks
-/// snapshot A′/B/B-r<i>/voice, so rows are matched on their `arm` and `skill`
-/// cells rather than by position. Header and `---` separator rows are skipped,
-/// and cells are trimmed of the backticks the table uses to typeset paths and
-/// hashes.
-///
-/// Only lines *after* the `| arm | …` header count as data, so prose in the
-/// preamble can never be mistaken for a row no matter what punctuation it grows.
-fn parse_manifest(contents: &str) -> Vec<ManifestRow> {
-    let mut rows = Vec::new();
-    let mut in_table = false;
+/// The manifest's six columns, keyed by their normalized header text (see
+/// [`normalize_header`]). Order in the file is irrelevant — these names are the
+/// schema, and the header row is what binds them to positions.
+const COL_ARM: &str = "arm";
+const COL_SKILL: &str = "skill";
+const COL_SOURCE_PATH: &str = "source path";
+const COL_HASH: &str = "git hash-object of the copy";
+const COL_COMMIT: &str = "commit head at copy time";
+const COL_DATE: &str = "date";
 
-    for line in contents.lines() {
-        let line = line.trim();
-        let Some(inner) = line.strip_prefix('|') else {
-            continue;
-        };
-        let cells: Vec<String> = inner
+const REQUIRED_COLUMNS: &[&str] = &[
+    COL_ARM,
+    COL_SKILL,
+    COL_SOURCE_PATH,
+    COL_HASH,
+    COL_COMMIT,
+    COL_DATE,
+];
+
+/// Fold a header cell to its schema key: lowercase, backticks dropped (the table
+/// typesets `` `git hash-object` `` and `` `HEAD` ``), whitespace collapsed.
+fn normalize_header(cell: &str) -> String {
+    cell.to_ascii_lowercase()
+        .replace('`', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split a `| a | b |` line into trimmed cells, dropping the backticks the table
+/// uses to typeset paths, hashes, and commit SHAs.
+fn split_row(line: &str) -> Option<Vec<String>> {
+    let inner = line.trim().strip_prefix('|')?;
+    Some(
+        inner
             .strip_suffix('|')
             .unwrap_or(inner)
             .split('|')
             .map(|c| c.trim().trim_matches('`').trim().to_string())
-            .collect();
-        if cells.len() < 4 {
+            .collect(),
+    )
+}
+
+/// Is this a `|---|---|…` separator row (alignment colons allowed)?
+fn is_separator_row(cells: &[String]) -> bool {
+    cells
+        .iter()
+        .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// Parse `arms/MANIFEST.md`'s markdown table.
+///
+/// **Columns are resolved by header name, never by position.** The manifest is
+/// append-only across the whole run and later tasks add rows for A′/B/B-r<i>/
+/// voice; if the column order ever changed, a positional parser would bind the
+/// wrong cell to `hash` and the arm A tripwire would compare a snapshot against,
+/// say, a date — while still passing. Header-anchored lookup makes any schema
+/// drift a parse error instead.
+///
+/// Errors — all loud, none silent:
+///   * no header row (a line whose cells include both `arm` and `skill`),
+///   * a required column missing or named something else,
+///   * a duplicate column name,
+///   * a data row whose cell count differs from the header's,
+///   * a hash cell that is not a 40-hex blob SHA.
+///
+/// Only lines *after* the header count as data, so preamble prose can never be
+/// mistaken for a row no matter what punctuation it grows.
+fn parse_manifest(contents: &str) -> Result<Vec<ManifestRow>, String> {
+    let mut header: Option<Vec<String>> = None;
+    let mut near_miss: Option<String> = None;
+    let mut rows = Vec::new();
+
+    for line in contents.lines() {
+        let Some(cells) = split_row(line) else {
+            continue;
+        };
+        if is_separator_row(&cells) {
             continue;
         }
-        // Separator row (`|---|---|…`), possibly with alignment colons.
-        if cells
-            .iter()
-            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
-        {
+
+        let Some(header) = header.as_ref() else {
+            // Not in the table yet. A row is the header only if it carries the
+            // COMPLETE schema — the preamble is prose about a table, and prose
+            // about a table grows examples of one, so locking onto the first
+            // `| arm | skill |`-ish line would let an illustration hard-fail a
+            // perfectly good manifest.
+            let names: Vec<String> = cells.iter().map(|c| normalize_header(c)).collect();
+            let missing: Vec<&str> = REQUIRED_COLUMNS
+                .iter()
+                .copied()
+                .filter(|r| !names.iter().any(|n| n == r))
+                .collect();
+            if let Some(first_missing) = missing.first() {
+                // Remember the closest near-miss: if no complete header ever
+                // turns up, "you are missing this column" beats "no table here".
+                if near_miss.is_none()
+                    && names.iter().any(|n| n == COL_ARM)
+                    && names.iter().any(|n| n == COL_SKILL)
+                {
+                    near_miss = Some(format!(
+                        "header row is missing the `{first_missing}` column (found: {})",
+                        names.join(", ")
+                    ));
+                }
+                continue;
+            }
+            for (i, name) in names.iter().enumerate() {
+                if names[..i].contains(name) {
+                    return Err(format!("duplicate column `{name}` in the header row"));
+                }
+            }
+            // The schema is closed: `ManifestRow` models exactly these six, so a
+            // seventh column would carry evidence no reader ever sees. Adding one
+            // is a deliberate change to this file, not something a manifest edit
+            // can do on its own.
+            for name in &names {
+                if !REQUIRED_COLUMNS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "unknown column `{name}` — the manifest schema is exactly: {}",
+                        REQUIRED_COLUMNS.join(", ")
+                    ));
+                }
+            }
+            header = Some(names);
             continue;
+        };
+
+        if cells.len() != header.len() {
+            return Err(format!(
+                "row has {} cells but the header declares {}: {}",
+                cells.len(),
+                header.len(),
+                line.trim()
+            ));
         }
-        // Header row — everything before it is preamble.
-        if cells[0].eq_ignore_ascii_case("arm") {
-            in_table = true;
-            continue;
-        }
-        if !in_table {
-            continue;
-        }
+        let cell = |name: &str| -> String {
+            let i = header
+                .iter()
+                .position(|n| n == name)
+                .expect("required column was validated present when the header was parsed");
+            cells[i].clone()
+        };
+
+        let hash = BlobSha::parse(&cell(COL_HASH))
+            .map_err(|e| format!("{e} — in row: {}", line.trim()))?;
         rows.push(ManifestRow {
-            arm: cells[0].clone(),
-            skill: cells[1].clone(),
-            hash: cells[3].clone(),
+            arm: cell(COL_ARM),
+            skill: cell(COL_SKILL),
+            source_path: cell(COL_SOURCE_PATH),
+            hash,
+            commit: cell(COL_COMMIT),
+            date: cell(COL_DATE),
         });
     }
 
-    rows
+    if header.is_none() {
+        return Err(near_miss.unwrap_or_else(|| {
+            "no table header row (expected one carrying all six columns)".to_string()
+        }));
+    }
+    Ok(rows)
+}
+
+#[test]
+fn parse_manifest_resolves_columns_by_header_name() {
+    // Same six columns as `MANIFEST.md`, deliberately in a different order.
+    let contents = "\
+| date | skill | `git hash-object` of the copy | arm | source path | commit `HEAD` at copy time |
+|---|---|---|---|---|---|
+| 2026-07-26 | tdd | `a1f889b57fa741e55b02da2397104f933d9878aa` | A | `skills/tdd/SKILL.md` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` |
+";
+    let rows = parse_manifest(contents).expect("reordered but complete header must parse");
+    assert_eq!(rows.len(), 1);
+    // Every column the manifest documents is modelled, so no caller has to go
+    // back to the raw line for one.
+    assert_eq!(rows[0].arm, "A");
+    assert_eq!(rows[0].skill, "tdd");
+    assert_eq!(rows[0].source_path, "skills/tdd/SKILL.md");
+    assert_eq!(
+        rows[0].hash.as_str(),
+        "a1f889b57fa741e55b02da2397104f933d9878aa"
+    );
+    assert_eq!(rows[0].commit, "99540bdcdb016ca3b74530957f55c0e5ef29f4f9");
+    assert_eq!(rows[0].date, "2026-07-26");
+}
+
+/// The dangerous variant of the above: `arm` is still the first column, so a
+/// positional parser still finds rows — it just binds the wrong cell to `hash`
+/// and then compares the snapshot against a date.
+#[test]
+fn parse_manifest_binds_hash_to_the_hash_column_not_a_position() {
+    let shuffled = "\
+| arm | skill | source path | date | `git hash-object` of the copy | commit `HEAD` at copy time |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | 2026-07-26 | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` |
+";
+    let rows = parse_manifest(shuffled).expect("reordered but complete header must parse");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].hash.as_str(),
+        "a1f889b57fa741e55b02da2397104f933d9878aa"
+    );
+    assert_eq!(rows[0].date, "2026-07-26");
+}
+
+/// The preamble is prose, and prose about a table tends to grow examples of the
+/// table. A row is only the header if it carries the *complete* schema, so a
+/// two-column illustration cannot be mistaken for one — the real header two
+/// lines below still wins.
+#[test]
+fn parse_manifest_skips_an_illustrative_table_in_the_preamble() {
+    let contents = "\
+Rows are matched on their `arm` and `skill` cells, like so:
+
+| arm | skill |
+| A | tdd |
+
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+";
+    let rows = parse_manifest(contents).expect("the real header must win over a prose example");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].skill, "tdd");
+    assert_eq!(
+        rows[0].hash.as_str(),
+        "a1f889b57fa741e55b02da2397104f933d9878aa"
+    );
+}
+
+/// Schema drift must be a parse failure, never a silent rebinding. Each case is
+/// a way `MANIFEST.md` could rot as later tasks append to it.
+#[test]
+fn parse_manifest_rejects_schema_drift() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "required column absent",
+            "\
+| arm | skill | source path | commit `HEAD` at copy time | date |
+|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "git hash-object of the copy",
+        ),
+        (
+            "column renamed out of the schema",
+            "\
+| arm | skill | source path | blob | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "git hash-object of the copy",
+        ),
+        (
+            // `ManifestRow` models exactly the six documented columns, so a
+            // seventh would carry evidence nothing reads. In an evidence record
+            // that is worse than a loud refusal.
+            "unknown extra column",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date | notes |
+|---|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 | re-snapshotted |
+",
+            "unknown column `notes`",
+        ),
+        (
+            "duplicate column",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date | date |
+|---|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 | 2026-07-26 |
+",
+            "duplicate column `date`",
+        ),
+        (
+            // Header matching folds case, so duplicate detection must too —
+            // otherwise `Date` and `date` are two columns feeding one field.
+            "duplicate column differing only in case",
+            "\
+| Arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date | ARM |
+|---|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 | A |
+",
+            "duplicate column `arm`",
+        ),
+        (
+            "row narrower than the header",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` |
+",
+            "4 cells but the header declares 6",
+        ),
+        (
+            // A row too short to look like a row at all must still be an error,
+            // not a silent drop: a dropped row for arm B would read as "that
+            // arm was never snapshotted" rather than "the manifest is corrupt".
+            "row truncated to a single cell",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A |
+",
+            "1 cells but the header declares 6",
+        ),
+        (
+            "hash cell is not a blob SHA",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `deadbeef` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "not a 40-character hex blob SHA",
+        ),
+        (
+            "no table at all",
+            "Just prose about the arms, no table yet.\n",
+            "no table header row",
+        ),
+    ];
+
+    for (name, contents, expected) in cases {
+        let err = parse_manifest(contents)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: expected a parse error, got a successful parse"));
+        assert!(
+            err.contains(expected),
+            "{name}: error should mention `{expected}`, got: {err}"
+        );
+    }
 }
 
 /// Arm A is the pre-fix baseline every later arm is measured against. It lives
@@ -260,7 +571,8 @@ fn arm_a_snapshots_match_manifest() {
     let manifest_path = arms.join("MANIFEST.md");
     let contents = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
-    let rows = parse_manifest(&contents);
+    let rows =
+        parse_manifest(&contents).unwrap_or_else(|e| panic!("{}: {e}", manifest_path.display()));
 
     // Everything that does not need git runs first, so a git-less environment
     // still reports a corrupt manifest rather than only "git is missing".
@@ -278,13 +590,19 @@ fn arm_a_snapshots_match_manifest() {
             matches.len()
         );
 
-        // A blank or malformed hash cell would otherwise only surface as a
-        // confusing mismatch against a real SHA.
+        // The hash cell's 40-hex format is guaranteed by `BlobSha`, which
+        // `parse_manifest` validates for every row — a malformed cell already
+        // failed above, with the offending line quoted.
         let expected = matches[0].hash.clone();
-        assert!(
-            expected.len() == 40 && expected.chars().all(|c| c.is_ascii_hexdigit()),
-            "{}: arm A row for `{skill}` records `{expected}`, which is not a 40-character hex blob SHA",
-            manifest_path.display()
+
+        // The row must also point at the file it claims to be a copy of.
+        let expected_source = format!("skills/{skill}/SKILL.md");
+        assert_eq!(
+            matches[0].source_path,
+            expected_source,
+            "{}: arm A row for `{skill}` records source path `{}`, expected `{expected_source}`",
+            manifest_path.display(),
+            matches[0].source_path
         );
 
         let snapshot = arms.join("A").join(format!("{skill}.md"));
@@ -315,9 +633,10 @@ fn arm_a_snapshots_match_manifest() {
         let actual = git_hash_object(&snapshot);
         assert_eq!(
             actual,
-            expected,
-            "{} has drifted: `git hash-object --no-filters` is {actual}, MANIFEST.md records {expected}",
+            expected.as_str(),
+            "{} has drifted: `git hash-object --no-filters` is {actual}, MANIFEST.md records {}",
             snapshot.display(),
+            expected.as_str(),
         );
     }
 }

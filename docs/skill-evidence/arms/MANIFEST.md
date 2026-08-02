@@ -20,8 +20,32 @@ what keeps them agreeing.
 
 `cli/tests/skills_valid.rs::arm_a_snapshots_match_manifest` re-checks the arm A rows on every test
 run; later tasks re-check their own arm before using its text. Rows are matched on their `arm` and
-`skill` cells (exact string equality — `A-prime` is not `A`), so **no cell may contain a literal
-`|`**, and only lines after the header row count as data.
+`skill` cells (exact string equality — `A-prime` is not `A`), and only lines after the header row
+count as data.
+
+**The header row is the schema, and the schema is closed.** `parse_manifest` resolves each column by
+its header text — never by position — so the columns may be reordered, but they may not be renamed,
+dropped, duplicated, **or added to**: any of those is a parse error, not a silently rebound or
+silently ignored field. A seventh column would carry evidence no reader ever sees, so adding one
+means editing `REQUIRED_COLUMNS` and `ManifestRow` in `cli/tests/skills_valid.rs` too — deliberately,
+not as a side effect of appending a row. Header cells are compared with
+backticks dropped, whitespace collapsed, and case folded, so `` `git hash-object` of the copy ``
+matches the key `git hash-object of the copy`. A row is recognized as the header only if it carries
+**all six** columns, so an illustrative fragment like `| arm | skill |` in this preamble is passed
+over rather than mistaken for the real thing — but a *complete* six-column table above the data
+table would be, so do not write one.
+
+Further rules follow from the parser being strict for the whole file at once:
+
+- **No cell may contain a literal `|`** — there is no escape handling.
+- **Every data row must have all six cells, and its hash cell must be 40 hex characters.** A
+  malformed row for *any* arm fails the parse, which fails the arm A tripwire too. Append carefully.
+- **Run `cargo test --test skills_valid` the moment you append a row**, not at the end of your task.
+  It is under a second, and it turns "the manifest is corrupt" into a one-line diagnosis naming your
+  row instead of a mystery failure inherited by whoever comes next.
+- **No line after the table may begin with `|`.** Once the header is seen, every such line is read
+  as a data row and is checked for the six cells. A short row is an error, never a silent drop —
+  a dropped row would read as "that arm was never snapshotted" instead of "this file is corrupt".
 
 | arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
 |---|---|---|---|---|---|

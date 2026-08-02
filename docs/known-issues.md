@@ -68,6 +68,42 @@ grep -ac '<a-string-you-just-added>' cli/target/debug/drovr    # -a: it's a bina
 `grep` without `-a` prints nothing useful here and reads as "not present" either way.
 `cli/tests/web_nav.rs` has the same exposure — it drives whatever HTML was compiled in.
 
+## `cli/tests/web_nav.rs` can fail with a CDP timeout even though nothing changed
+
+**Severity:** low (a flaky test, not a product bug — but it makes `cargo test` red and can be
+mistaken for a regression the current task introduced).
+**Found:** 2026-08-01, run `skill-stickiness`, task 1.
+
+### Symptom
+
+`cargo test` reports `web_keyboard_navigation ... FAILED`, with the driver's stderr showing:
+
+```
+Error: Page.navigate: no CDP response within 20s
+    at .../cli/tests/web/nav.mjs:52
+```
+
+The same test passed earlier in the same worktree with no intervening change to
+`cli/web/index.html`, `cli/src/review.rs`, or the test itself.
+
+### Root cause
+
+Not fully diagnosed. The test's own prerequisite checks (`node` and a chromium binary on PATH)
+both pass, so it does not take its skip path — it boots headless chromium, connects to the debug
+port, and then `Page.navigate` never answers. The 20s budget in `nav.mjs` is the only timeout,
+so a chromium that starts slowly or contends with an already-running browser instance fails the
+whole test rather than retrying.
+
+### Telling it apart from your own regression
+
+Do not assume it is yours, and do not assume it is not. A/B it against `HEAD` — copy your
+uncommitted files aside, `git checkout --` them, re-run `cargo test --test web_nav`, then copy
+them back. (Do **not** `git stash`: the stash stack is repo-global and will pick up other
+worktrees' parked work.) If it fails identically with your changes reverted, it is this issue.
+
+`web_nav` is the only browser-dependent test in the suite; the other four binaries
+(`e2e`, `reflex_hook`, `skills_valid`, and the unit tests) are hermetic.
+
 ## Review-server Submit button does nothing when `questions.json` is not a bare array
 
 **Severity:** high (the human spec gate is unusable — the reviewer's decision can never be recorded from the UI).
