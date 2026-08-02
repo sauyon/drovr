@@ -225,8 +225,16 @@ fn web_keyboard_navigation() {
                 // browser or network fault rather than a keyring one.
                 //
                 // `basic` uses a built-in key instead, which is what a throwaway profile
-                // wants anyway. See docs/known-issues.md.
+                // wants anyway. It changes where the cookie store's KEY comes from, not
+                // cookie behavior — verified: cookies still set and read with it on, and
+                // the UI's own state (localStorage) is not touched by either.
+                //
+                // The two flags are per-platform and each is ignored elsewhere:
+                // `--password-store` is Linux/BSD, `--use-mock-keychain` is the macOS
+                // equivalent for the same failure against Keychain. Windows needs neither
+                // (DPAPI does not prompt). See docs/known-issues.md.
                 "--password-store=basic",
+                "--use-mock-keychain",
                 &format!("--remote-debugging-port={cdp_port}"),
                 "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", tmp.path().join("chrome").display()),
