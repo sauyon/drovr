@@ -712,10 +712,16 @@ pub fn code_review_run<H: Herdr>(
     let dir = run_dir(&run.name);
 
     // Archived means the human filed this run away and `workspace_close` destroyed
-    // its panes. Refuse before anything is spawned: a *cleanly* archived run would
-    // fail later anyway (`tab_create` against a closed workspace), but one whose
-    // close failed still has live panes, and there we would happily resume, harvest
-    // findings and flip phases to Done on a run the UI shows as archived.
+    // its panes. Refuse before anything is spawned. This check is LOAD-BEARING, not
+    // defence in depth: `spawn_reviewer` re-provisions a destroyed workspace since
+    // 2026-08-02 (`phase::ensure_workspace`), so nothing downstream would stop a
+    // panel from running on an archived run — and a run whose close merely failed
+    // still has live panes, where we would happily resume, harvest findings and
+    // flip phases to Done on a run the UI shows as archived.
+    //
+    // `ensure_workspace` carries its own archived guard for the same reason. Both
+    // are wanted: this one refuses BEFORE the panel does any work, and reports it
+    // as a review outcome rather than an io error.
     if run.archived {
         eprintln!(
             "code-review: run '{}' is archived — restore it before reviewing",

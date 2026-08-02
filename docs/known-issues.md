@@ -1838,28 +1838,33 @@ archived run's *panes* are still gone: a phase that was `Running` when it was ar
 back `Failed` and has to be restarted. See "A run whose herdr workspace disappears is
 unrecoverable through drovr's own commands" at the end of this file.
 
-`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — clears the flag
-and moves the row back to the active list. It cannot bring the agent back: archiving closed
-the run's herdr workspace, and nothing recreates one. `phase_start` (`cli/src/phase.rs`) only
-reuses a recorded `pane_id`, then `root_pane`, then `tab_create` against the run's existing
-`workspace` id; all three are dead after a close, and the only code that creates a workspace
-is `cmd_new`. So `drovr phase start` on a restored run fails.
+### What it used to do (before 2026-08-02)
+
+`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — cleared the flag
+and moved the row back to the active list, but could not bring the run back: archiving closed
+the run's herdr workspace and nothing recreated one. `phase_start` only reused a recorded
+`pane_id`, then `root_pane`, then `tab_create` against the run's existing `workspace` id; all
+three are dead after a close, and the only code that created a workspace was `cmd_new`. So
+`drovr phase start` on a restored run failed. Continuing meant a new run seeded from the
+handoff.
 
 One exception, and it is exactly the row the UI flags as anomalous: a ZOMBIE — archived while
 `workspace_close` failed — still has a live workspace and live panes recorded. Restoring one
-and running `drovr phase start` should reuse them and work. The blanket "restore does not make
-it runnable" is therefore wrong for the one case where the run was never really torn down.
+and running `drovr phase start` reused them and worked, then as now.
 
-The run's artifacts survive (spec, handoffs, branch), so the work is not lost — but continuing
-it means a new run seeded from the handoff, not a restore.
+### What it does now
 
-### Fix ideas
+Restore clears the flag; the next `drovr phase start` finds no live workspace and builds one
+(`phase::ensure_workspace`), in the run's `project_dir`, writing the new ids back. The panes
+are still gone, so a phase that was `Running` when it was archived comes back `Failed` and has
+to be restarted — Restore recovers the run, not its agents.
 
-1. Have `phase_start` create a fresh workspace when the recorded one is gone, and write the new
-   id back to `state.json` — makes Restore mean what it looks like it means.
-2. Or rename the control to something that does not imply resumability, and have it clear
-   `workspace`/`root_pane`/`pane_id` so the failure is a clean "no workspace" error rather than
-   a herdr rejection.
+**Restore is required, not optional.** `ensure_workspace` refuses to re-provision a run that is
+still `archived`: the destroyed workspace used to be the only thing enforcing that decision,
+and a repair that silently overrode it would start a live agent on a run the UI shows as filed
+away. `drovr phase start` on an archived run therefore says so and names the Restore button.
+`code_review_run` has its own archived check, and that one is now load-bearing for the same
+reason.
 
 ## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
 

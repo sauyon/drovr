@@ -419,6 +419,32 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     {
         return Ok(WorkspaceHealing::Intact);
     }
+    // The human filed this run away, and `cleanup`/the Archive button destroyed
+    // its workspace on purpose. Repairing that would make the destruction the only
+    // thing that had been enforcing their decision — before re-provisioning
+    // existed, `phase start` on an archived run failed precisely because nothing
+    // recreated a closed workspace, and it would now succeed silently while the UI
+    // still shows the run archived. Recovering from an ACCIDENT is this function's
+    // job; overriding an intention is not.
+    //
+    // Checked after `workspace_exists`, so an archived run whose `workspace_close`
+    // failed — a zombie, with live panes — still starts exactly as it does today.
+    // Read from disk as well as from memory: a caller may have held this state
+    // since before the human clicked Archive, which is the same staleness
+    // `save_preserving_archived` exists for.
+    let archived_now = run.archived || RunState::load(&run.name).is_ok_and(|d| d.archived);
+    if archived_now {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' is archived and its herdr workspace was destroyed when it \
+                 was filed away. Nothing is lost — Restore it (the Restore button in \
+                 `drovr serve`'s run list) and re-run this command, and drovr will \
+                 build it a new workspace.",
+                run.name
+            ),
+        ));
+    }
     // A workspace created without a cwd opens wherever herdr defaults to — the
     // near-miss that nearly had a phase agent editing an unrelated repo — so a
     // run with no project_dir gets no workspace at all.
@@ -2383,6 +2409,60 @@ mod tests {
         );
     }
 
+    /// The regression this repair could quietly introduce, pinned.
+    ///
+    /// Before re-provisioning existed, `phase start` on an ARCHIVED run failed
+    /// because archiving destroys the workspace and nothing recreated one. That
+    /// accident was the only thing enforcing the human's decision to file the run
+    /// away — and repairing the workspace would remove it, so that `drovr phase
+    /// start <archived-run>` would launch a live agent while the UI still shows the
+    /// run as archived. Repair does not get to overrule the human.
+    #[test]
+    fn an_archived_run_is_not_quietly_brought_back_to_life() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-ws-test", "wAG");
+        run.archived = true;
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let err = phase_start(&h, &mut run, "implement", None)
+            .expect_err("an archived run must not be resurrected by a repair");
+        let msg = err.to_string();
+        assert!(msg.contains("archived"), "say why it refused: {msg}");
+        assert!(
+            msg.contains("Restore"),
+            "and how to undo it, since the run itself is fine: {msg}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "no workspace may be created for a run the human filed away: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The other side of that guard: an archived run whose `workspace_close`
+    /// FAILED still has live panes (drovr's "zombie"), and `phase_start` on one
+    /// has always been able to reuse them. The guard must not change that — it
+    /// exists to stop repair overruling the human, not to add a new refusal.
+    #[test]
+    fn an_archived_run_whose_workspace_survived_still_starts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-zombie-test", "wAG");
+        run.archived = true;
+        run.save().unwrap();
+        // workspace_close failed, so wAG is still there.
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a zombie's live panes are still usable, as before");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "nothing needed creating: {:?}",
+            h.calls()
+        );
+    }
+
     /// The other half of the same refusal: `drovr new` warns and records no
     /// workspace when creation fails, and `phase start` used to answer that with
     /// "please recreate the run" — for a run that may hold 23 tasks of work.
@@ -2668,9 +2748,12 @@ mod tests {
     //
     // Both hold a `RunState` loaded before they block, and the human can archive
     // from the web UI in between — which closes the run's herdr workspace. A
-    // plain `save` writes the stale `archived: false` back, leaving a run that
-    // looks active but whose workspace is gone and cannot be recreated. These
-    // drive the real call sites: mutating either back to `save()` fails here.
+    // plain `save` writes the stale `archived: false` back, so a run the human
+    // filed away comes back looking active while every one of its panes is gone.
+    // (Since 2026-08-02 the workspace itself is recoverable — `ensure_workspace`
+    // rebuilds one — but only after a Restore, which is exactly the decision this
+    // flag records.) These drive the real call sites: mutating either back to
+    // `save()` fails here.
 
     /// Model the reviewer archiving `run` from the web UI: a separate load,
     /// flag, save — exactly what the archive endpoint does — while `run`'s
