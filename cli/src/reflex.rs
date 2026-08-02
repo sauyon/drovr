@@ -313,6 +313,13 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
 /// both degrade to one unparseable line, which the scan skips.
 pub fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
+    // Check the file type BEFORE opening. Opening a FIFO blocks until a writer
+    // appears, and this runs in front of every reply — a hang here is the
+    // user's session. Only a regular file can be a transcript.
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len > TRANSCRIPT_TAIL_BYTES {
@@ -322,6 +329,24 @@ pub fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// How much of the hook's stdin payload is read.
+///
+/// The payload is a small JSON object from Claude Code's hook harness, but this
+/// is a pipe read on every turn and its length is not ours to trust. Truncation
+/// degrades to an unparseable payload, which is the fail-open path.
+const HOOK_STDIN_MAX_BYTES: u64 = 64 * 1024;
+
+/// Read the hook's stdin payload, capped at [`HOOK_STDIN_MAX_BYTES`]. Any read
+/// error or non-UTF-8 input yields whatever was decodable — the payload is only
+/// ever used to look up a transcript path, and failing to find one emits.
+pub fn read_hook_input<R: std::io::Read>(reader: R) -> String {
+    let mut bytes = Vec::new();
+    // Errors are deliberately ignored: a partial read is handled by the parse
+    // failing, and there is no better answer available at this point.
+    let _ = std::io::Read::read_to_end(&mut reader.take(HOOK_STDIN_MAX_BYTES), &mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The `transcript_path` from a hook's stdin JSON, or `None` when stdin carries
@@ -945,6 +970,51 @@ mod tests {
         assert_eq!(read_transcript_tail(&dir.path().join("nope.jsonl")), None);
         // A directory is not a transcript.
         assert_eq!(read_transcript_tail(dir.path()), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transcript_tail_refuses_a_non_regular_file() {
+        // A FIFO blocks on open until a writer appears. If the gate ever opened
+        // one it would hang the hook — and the hook sits in front of every
+        // reply, so a hang there is the user's session, not a background task.
+        // The guard has to be a metadata check BEFORE the open, which is why
+        // this test can exist at all: it would hang, not fail, without one.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.jsonl");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: mkfifo unavailable");
+            return;
+        }
+        assert_eq!(
+            read_transcript_tail(&fifo),
+            None,
+            "a FIFO is not a transcript and must not be opened"
+        );
+    }
+
+    #[test]
+    fn hook_stdin_is_capped() {
+        // The payload is a small JSON object from the hook harness, but this
+        // reads from a pipe on every turn; an unbounded read is a resource the
+        // caller controls. Truncation degrades to an unparseable payload, which
+        // is the fail-open path — no transcript, so the card is emitted.
+        let huge = "x".repeat(HOOK_STDIN_MAX_BYTES as usize * 2);
+        let got = read_hook_input(huge.as_bytes());
+        assert_eq!(got.len(), HOOK_STDIN_MAX_BYTES as usize);
+        assert_eq!(transcript_path_from_hook_input(&got), None);
+        assert!(gate_json(&ReflexConfig::default(), None).is_some());
+
+        // A normal payload is unaffected.
+        let payload = r#"{"transcript_path":"/p/t.jsonl"}"#;
+        assert_eq!(read_hook_input(payload.as_bytes()), payload);
+        // Non-UTF-8 on stdin degrades rather than failing the turn.
+        assert!(read_hook_input(&b"\xff\xfe"[..]).len() <= HOOK_STDIN_MAX_BYTES as usize);
     }
 
     #[test]

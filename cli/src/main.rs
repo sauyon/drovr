@@ -923,15 +923,30 @@ fn cmd_code_review(sub: CodeReviewCmd) {
 ///
 /// Clap guarantees exactly one of `--skill` / `--gate`.
 fn cmd_reflex(mode: ReflexMode<'_>) {
+    let skill = match mode {
+        ReflexMode::Gate => {
+            // The gate fails OPEN on a bad config, unlike the branch below.
+            // `load_config` fails for reasons that have nothing to do with
+            // `[reflex]` — a typo anywhere in `config.toml`, an `[agents]`
+            // entry with a relative command — and exiting here would disable
+            // the gate for the whole session on any of them. A gate that goes
+            // quiet because of an unrelated typo is exactly the silent drift
+            // the rest of this code is built to avoid, so it warns and runs on
+            // defaults instead.
+            let cfg = config::load_config().unwrap_or_else(|e| {
+                eprintln!("drovr: failed to load config ({e}); gating on reflex defaults");
+                config::Config::default()
+            });
+            return cmd_reflex_gate(&cfg.reflex);
+        }
+        ReflexMode::Session(path) => path,
+    };
+    // The SessionStart reflex fails LOUD: it injects a whole skill body, and a
+    // half-read config would frame it wrongly.
     let cfg = config::load_config().unwrap_or_else(|e| {
         eprintln!("drovr: failed to load config: {e}");
         process::exit(1);
     });
-
-    let skill = match mode {
-        ReflexMode::Gate => return cmd_reflex_gate(&cfg.reflex),
-        ReflexMode::Session(path) => path,
-    };
     let skill_md = std::fs::read_to_string(skill).unwrap_or_else(|e| {
         eprintln!("drovr: cannot read reflex skill {}: {e}", skill.display());
         process::exit(1);
@@ -971,16 +986,20 @@ impl<'a> ReflexMode<'a> {
 
 /// Emit the per-turn gate card, or nothing when it is off or already redundant.
 ///
-/// **Every failure here falls through to `transcript = None`, which emits.**
-/// Unlike the SessionStart reflex — where a partial read would inject a poisoned
-/// context, so it exits loudly — the gate's only input is evidence that the card
-/// is *unnecessary*. Absent evidence is not evidence of absence: a hook that
-/// exited non-zero on an unreadable transcript would break the user's turn to
-/// avoid a redundant 600-byte injection.
+/// **Every failure on this path falls through to emitting** — an unreadable
+/// stdin payload, an absent or unreadable transcript, and (in the caller) a
+/// config that will not load at all. Unlike the SessionStart reflex, where a
+/// partial read would inject a poisoned context and so exits loudly, the gate's
+/// only inputs are evidence that the card is *unnecessary*. Absent evidence is
+/// not evidence of absence: a hook that went quiet on a bad read would trade
+/// silent drift for a redundant 600-byte injection, which is the wrong way
+/// round.
+///
+/// The one thing that does silence it is an explicit decision — `enabled` or
+/// `per_turn` set to `false` in a config that loaded successfully.
 fn cmd_reflex_gate(cfg: &config::ReflexConfig) {
-    let mut stdin_json = String::new();
     // A hook that is somehow run without a payload still gets a decision.
-    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_json);
+    let stdin_json = reflex::read_hook_input(std::io::stdin());
     let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
         .and_then(|p| reflex::read_transcript_tail(&p));
 
