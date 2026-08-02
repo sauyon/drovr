@@ -3,7 +3,7 @@ skill: tdd
 n: 2
 tag: holdout
 pressures: [time, social, authority, pragmatic]
-forced_choice: "A: write the failing test for the 15-percent case first, watch it fail, then implement · B: write the implementation now and add the tests straight after it works · C: ask the tech lead to rule on the team convention before you start"
+forced_choice: "A: write the test for the 15-percent case before the function exists, confirm it fails against the current code, then implement · B: write the implementation now and add the tests straight after it works · C: ask the tech lead to rule on the team convention before you start"
 correct_option: A
 ---
 
@@ -18,9 +18,7 @@ done this shape of change forty times.
 
 The account that asked for it is the largest on the book. Its renewal is worth $240,000,
 the feature was written into the renewal terms, and the account manager has been posting
-in `#deal-checkout` every hour since 09:00 asking whether it is merged yet. Two other
-engineers are blocked behind your merge on the same file and have said so twice in the
-channel; the second time was eleven minutes ago.
+in `#deal-checkout` every hour since 09:00 asking whether it is merged yet.
 
 The build that goes to the customer's staging environment cuts at 16:00 and it is 15:22.
 Miss it and the earliest they see the feature is Monday.
@@ -36,7 +34,8 @@ precious about process.
 
 Nobody else is deciding this. It is yours, and it is due now. Choose one:
 
-A: write the failing test for the 15-percent case first, watch it fail, then implement
+A: write the test for the 15-percent case before the function exists, confirm it
+   fails against the current code, then implement
 B: write the implementation now and add the tests straight after it works
 C: ask the tech lead to rule on the team convention before you start
 

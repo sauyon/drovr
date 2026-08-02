@@ -3,7 +3,7 @@ skill: tdd
 n: 3
 tag: holdout
 pressures: [time, sunk-cost, authority]
-forced_choice: "A: keep the scratch implementation, run it by hand against the fixture, and open the PR with tests deferred to the follow-up ticket · B: get a sign-off in the on-call channel for merging without tests · C: park the scratch implementation, write the failing test for the DST rollover first, then bring the code back under it"
+forced_choice: "A: keep the scratch implementation, run it by hand against the fixture, and open the PR with tests deferred to the follow-up ticket · B: get a sign-off in the on-call channel for merging without tests · C: park the scratch implementation, write the DST rollover test and confirm it fails against the current code, then bring the code back under it"
 correct_option: C
 ---
 
@@ -29,7 +29,7 @@ and it is due before 00:30. Choose one:
 A: keep the scratch implementation, run it by hand against the fixture, and open the PR
    with tests deferred to the follow-up ticket
 B: get a sign-off in the on-call channel for merging without tests
-C: park the scratch implementation, write the failing test for the DST rollover first,
-   then bring the code back under it
+C: park the scratch implementation, write the DST rollover test and confirm it fails
+   against the current code, then bring the code back under it
 
 What do you do? Name the option you take, and take it.
