@@ -656,26 +656,53 @@ failures, two of which passed in isolation.
 
 If a run reports N failures, re-run the first one alone before believing the other N-1.
 
-## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky (2026-07-26, 2026-08-01)
+## `web_keyboard_navigation` flakes under machine load (2026-07-31, 2026-08-01)
 
-**Severity:** low — it passes on re-run, but it costs a diagnosis every time.
+**Severity:** low — passes on re-run, but it fails a full `cargo test` often enough to be mistaken
+for a real break (I twice reported it as "environmental" before capturing the cause).
 
-**Two sightings, five days apart, both on a full `cargo test`; both passed alone and on the
-immediate re-run of the whole suite.** The first was logged as a one-off; the second makes it a
-pattern rather than a fluke, so stop re-investigating it from scratch.
+The test drives a headless browser over CDP from `cli/tests/web/nav.mjs`, which gives each command
+a fixed 20-second budget:
 
-Conditions both times: a live `drovr serve` from another session, plus several sibling worktrees
-under `.drovr/wt/`. That points at cross-process contention on the serve lock path rather than
-anything test-internal — the test asserts on a lock file that another drovr process on the same
-machine can also be touching.
+```
+Error: Page.navigate: no CDP response within 20s
+    at Timeout._onTimeout (cli/tests/web/nav.mjs:52:11)
+```
 
-**If you are here because it failed:** re-run it alone before believing it
-(`cargo test review::tests::lock_records_our_pid_and_releases_on_drop`). To actually fix it, give
-the test its own lock path via the env the rest of the suite already isolates (`XDG_*`), rather
-than sharing the developer's.
+That is a timeout, not a failed assertion — the browser never answered in time. Both sightings
+were on a machine running several agents' test suites and a live `drovr serve` at once. So it is
+load sensitivity in the driver's own deadline, not the code under test.
 
-Note also that a panic in an env-dependent test poisons `ENV_LOCK`, so ONE real failure reports as
-many — see the entry below before reading a long failure list as many bugs.
+**If you hit it:** re-run it alone (`cargo test --test web_nav`). To fix it properly, make the CDP
+deadline in `nav.mjs` configurable (env var) or scale it, rather than a fixed 20s that a loaded
+machine cannot meet.
+
+## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky, cause UNKNOWN (2026-07-26, 2026-08-01)
+
+**Severity:** low — it passes on re-run. Recorded so nobody re-derives what has already been
+ruled out.
+
+Two sightings, five days apart, both on a full `cargo test`, both passing alone and on the
+immediate re-run of the whole suite. **Never reproduced on demand** — 14 full-suite runs and 8
+`review::tests`-only runs since.
+
+**A previous version of this entry blamed cross-process contention on a shared lock path, and
+that is wrong.** Ruled out since:
+
+- **Not a shared path.** `make_root` is `tempfile::Builder::…tempdir()`, so each test gets a
+  unique directory; no other process or worktree can be touching that `server.pid`.
+- **Not cross-file lock aliasing.** `try_take_lock` is `File::try_lock` (flock), which is scoped
+  to the open file description; distinct files cannot contend.
+- **Not the `ENV_LOCK` poison cascade** (see the entry below). This test never takes `ENV_LOCK` —
+  it passes an explicit path precisely so it does not depend on `XDG_DATA_HOME`.
+
+So the cause is genuinely unknown, and guessing again would only produce another wrong entry.
+
+**What was done instead:** the test now reports, on every failure path, the lock path, the file's
+contents, and this process's pid — and which step failed (claim / pid record / re-claim after
+drop). Neither sighting left enough evidence to diagnose; the third will.
+
+**If you hit it:** paste that message here rather than re-investigating from scratch.
 
 ## `drovr code-review run` panel never completes (reviewer panes don't attach)
 

@@ -3153,18 +3153,48 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        let held = try_take_lock(&path).expect("claim").expect("uncontended");
+        // Every failure here reports the path and what the file held, because this test
+        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
+        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
+        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
+        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
+        // If it fails again, the message below is the evidence to file.
+        let whats_there = |when: &str| -> String {
+            format!(
+                "{when}: {} contains {:?}; this pid is {}",
+                path.display(),
+                fs::read_to_string(&path).unwrap_or_else(|e| format!("<unreadable: {e}>")),
+                std::process::id()
+            )
+        };
+
+        let held = try_take_lock(&path)
+            .unwrap_or_else(|e| panic!("claim failed: {e}; {}", whats_there("at claim")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a freshly created tempdir path was already locked. {}",
+                    whats_there("at claim")
+                )
+            });
         assert_eq!(
-            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             Some(std::process::id()),
-            "the holder records its pid for humans to kill"
+            "the holder records its pid for humans to kill. {}",
+            whats_there("after claim")
         );
 
         // Nothing has to prove the holder died for the lock to be free again.
         drop(held);
         let _held = try_take_lock(&path)
-            .expect("claim after release")
-            .expect("released lock must be free");
+            .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a lock released by dropping its File was still held. {}",
+                    whats_there("after drop")
+                )
+            });
     }
 
     /// A server that was killed leaves the file behind with its pid in it. The
