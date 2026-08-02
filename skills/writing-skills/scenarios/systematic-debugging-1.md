@@ -10,7 +10,8 @@ correct_option: B
 You are the single writer in an implement phase on `report-svc`. This is live: the
 working tree is yours and the phase closes at 16:00.
 
-`cargo test` is red. One test fails:
+CI job #4812 came back red on your branch twenty minutes ago. One test fails, and this is
+what the job log shows:
 
 ```
 report::tests::totals_by_day

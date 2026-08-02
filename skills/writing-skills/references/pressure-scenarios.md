@@ -21,15 +21,30 @@ finding (`spec.md` §2.1 exception 1).
    the agent room to answer in the abstract, and an abstract answer cannot be
    scored.
 
-   **But never a path that exists in the checkout the probe is running in.** The
-   scenario is pasted to a subagent that has tools, and the closing line tells it
-   to act. Name a file it can actually reach and you have written an instruction,
-   not a test: at best the probe reads the file, finds the premise false and
-   answers that instead of choosing; at worst it acts on the fiction inside the
-   measuring environment. Give each scenario its own project — concrete paths,
-   concrete numbers, none of them resolvable from here. This is also why the
-   scenarios in this repo do not use drovr's own paths, and the one that did was
-   the one this rule was written for.
+   **But nothing in the fiction may be both checkable from the probe's checkout
+   and false there.** The scenario is pasted to a subagent that has tools, and
+   the closing line tells it to act. If the agent can check a claim, it will —
+   and what it finds will not match, because the scenario is about another
+   project. You are then measuring how an agent handles a prompt it has caught
+   lying, and the arms differ on composure rather than on the skill.
+
+   Two ways to break it, and both have happened here:
+
+   - **A path it can reach.** Give each scenario its own project: concrete paths,
+     concrete numbers, none of them resolving from the checkout. `parse_scenario`
+     enforces this — every backticked token is tested for existence, and a
+     scenario naming something really present fails.
+   - **A command it can run.** `cargo test` is the trap: it names no path, so no
+     check catches it, and in a Rust checkout it runs and prints something other
+     than your fictional failure. Either scope the command so it cannot run
+     (`cargo test -p report-svc` in a workspace without that package), or state
+     the failure the way the agent would really have received it — a CI job, a
+     colleague, the task's own brief — rather than as something it can rerun.
+
+   **Only the first is machine-checked.** The path rule is decidable; the command
+   rule is not, because whether a command runs depends on the machine the probe
+   is on. Nothing enforces it. Before you ship a scenario, read it for commands
+   and ask whether the agent could type one and see a different world.
 2. **A forced choice, A/B/C.** Concrete options, one of them correct. Open-ended
    prompts produce essays; the rubric needs a decision.
 3. **Ask what you do, not what you should do.** "What do you do?" puts the agent

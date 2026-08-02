@@ -1269,6 +1269,45 @@ fn body_options(body: &str, labels: &[String]) -> Vec<ChoiceOption> {
     out
 }
 
+/// The tokens a scenario quotes in backticks.
+fn quoted_tokens(text: &str) -> Vec<&str> {
+    text.split('`').skip(1).step_by(2).collect()
+}
+
+/// Quoted tokens that name something actually present in this checkout.
+///
+/// A scenario is fiction handed to a subagent that has tools and is told to act.
+/// If the fiction names something the agent can reach, the agent can check it —
+/// and what it finds will not match, because the scenario describes another
+/// project. The run then measures how an agent handles a prompt it has caught
+/// lying, and the arms differ on composure rather than on the skill.
+///
+/// Every quoted token is tested for existence rather than first being classified
+/// as a path: classification would be a guess, and existence is decidable. A
+/// token that is not a path simply does not exist.
+///
+/// **This does not cover commands.** `cargo test` names no path, runs here, and
+/// does not reproduce any scenario's failure — the defect this check was written
+/// after. Nothing mechanical catches that; `pressure-scenarios.md` says so and
+/// says who does.
+fn reachable_paths(text: &str, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in quoted_tokens(text) {
+        let bare = token
+            .rsplit_once(':')
+            .filter(|(_, line)| line.chars().all(|c| c.is_ascii_digit()) && !line.is_empty())
+            .map_or(token, |(path, _)| path)
+            .trim();
+        if bare.is_empty() || bare.starts_with('~') {
+            continue;
+        }
+        if root.join(bare).exists() {
+            out.push(bare.to_string());
+        }
+    }
+    out
+}
+
 /// Words that mark a clause as handing the decision to someone else.
 ///
 /// Matched as **whole words** (with `escalat` allowed to carry its endings), not
@@ -1488,17 +1527,29 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
     let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
     let restated = body_options(body, &labels);
     for option in &options {
-        let found = restated
-            .iter()
-            .find(|r| r.label == option.label)
-            .ok_or_else(|| {
-                format!(
-                    "the body never restates `forced_choice` option `{}`. The probe is handed the \
-                     body and the scorer is handed `forced_choice`, so any difference between them \
-                     is scored as an answer to a question that was never asked",
-                    option.label
-                )
-            })?;
+        let mut matches = restated.iter().filter(|r| r.label == option.label);
+        let found = matches.next().ok_or_else(|| {
+            format!(
+                "the body never restates `forced_choice` option `{}`. The probe is handed the \
+                 body and the scorer is handed `forced_choice`, so any difference between them \
+                 is scored as an answer to a question that was never asked",
+                option.label
+            )
+        })?;
+        // Taking the first match would resolve a double restatement silently, in
+        // favour of whichever copy came first — so which text the agent was
+        // offered would depend on file order rather than on anything anyone
+        // decided.
+        if let Some(again) = matches.next() {
+            return Err(format!(
+                "the body restates option `{}` twice — first as `{}`, then as `{}`. Which one the \
+                 agent was offered is then a question about file order, and the scorer grades a \
+                 single `forced_choice` clause either way",
+                option.label,
+                normalize_ws(&found.clause),
+                normalize_ws(&again.clause)
+            ));
+        }
         // Compared whole, not by containment: a body that appends to an option
         // offers the probe a different choice than the one being graded, and
         // that is the drift with the quietest failure.
@@ -1798,6 +1849,47 @@ fn parse_scenario_requires_the_body_to_restate_every_option() {
         err.contains("ship it now"),
         "the rejection must quote the option that drifted, got: {err}"
     );
+
+    // A body that restates one option twice, differently, is ambiguous about
+    // which text the agent was actually offered. Taking the first match would
+    // resolve that silently, and in favour of whichever copy happens to come
+    // first in the file.
+    let doubled = CANONICAL_SCENARIO.replace(
+        "\nWhat do you do?\n",
+        "\nB: write something else first\n\nWhat do you do?\n",
+    );
+    let err = parse_scenario("tdd-1", &doubled)
+        .expect_err("a body that restates an option twice must be rejected");
+    assert!(
+        err.contains('B'),
+        "the rejection must name the repeated label, got: {err}"
+    );
+}
+
+/// A scenario may not name anything the probe can reach from the checkout it
+/// runs in.
+///
+/// The corpus half of this runs in `scenarios_are_well_formed`, against the real
+/// files. This half proves the check can actually see a planted path — otherwise
+/// a green corpus would only mean the detector was blind.
+#[test]
+fn reachable_paths_sees_a_path_that_is_really_here() {
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+
+    let planted = "The failure is in `cli/tests/skills_valid.rs:1` and you know it.";
+    assert_eq!(
+        reachable_paths(planted, &root),
+        vec!["cli/tests/skills_valid.rs"],
+        "a quoted path that exists in this checkout must be caught, line suffix and all"
+    );
+
+    // The corpus's own invented projects must not trip it, or the rule would be
+    // unfollowable.
+    let invented = "The nil deref is at `svc/payments/handler.go:214`, in `~/src/checkout-svc`.";
+    assert!(
+        reachable_paths(invented, &root).is_empty(),
+        "invented paths are the point; they must pass"
+    );
 }
 
 /// Three names from the taxonomy are not three pressures if resisting one
@@ -2075,6 +2167,23 @@ fn scenarios_are_well_formed() {
         .collect();
 
     check_scenario_corpus(&files).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+
+    // Not in `check_scenario_corpus`: that function is pure over `(stem,
+    // contents)` on purpose, so every corpus rule stays provable by fixture. This
+    // one is a question about the filesystem, so it lives where the filesystem
+    // already is.
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    for (stem, contents) in &files {
+        let reachable = reachable_paths(contents, &root);
+        assert!(
+            reachable.is_empty(),
+            "{stem}.md names {reachable:?}, which exist in this checkout. A scenario is pasted to \
+             a subagent that has tools and is told to act, so anything it can reach it can check — \
+             and what it finds will not match, because the scenario is about another project. The \
+             run would then measure how the agent handles a prompt it has caught lying. Give the \
+             scenario its own project, with paths that do not resolve from here."
+        );
+    }
 }
 
 #[test]
