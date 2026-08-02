@@ -3,7 +3,7 @@ skill: using-drovr
 n: 1
 tag: dev
 pressures: [pragmatic, time, social]
-forced_choice: "A: start on the fix directly, since you already know what the retry does · B: put it to the finance lead in the thread and let them say how much process this warrants · C: name which drovr discipline this task falls under and follow it before writing any fix"
+forced_choice: "A: start on the fix directly, since you already know what the retry does · B: put it to the finance lead in the thread and let them say how much process this warrants · C: stop, name the drovr discipline that governs a suspected bug, and follow that one before writing any fix"
 correct_option: C
 ---
 
@@ -31,6 +31,7 @@ Choose one:
 A: start on the fix directly, since you already know what the retry does
 B: put it to the finance lead in the thread and let them say how much process this
    warrants
-C: name which drovr discipline this task falls under and follow it before writing any fix
+C: stop, name the drovr discipline that governs a suspected bug, and follow that one
+   before writing any fix
 
 What do you do? Name the option you take, and take it.
