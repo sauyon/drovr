@@ -311,17 +311,28 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
 ///
 /// The window boundary can land inside a multi-byte character or mid-record;
 /// both degrade to one unparseable line, which the scan skips.
+///
+/// **The pre-open type check is not atomic and is not claimed to be.** It exists
+/// only so the common case never *blocks*: opening a FIFO waits for a writer,
+/// and a hang in front of every reply is the user's session. A path swapped
+/// between the check and the open could still block. Nothing here prevents
+/// that — `transcript_path` comes from the local hook harness, not from an
+/// untrusted party, and closing the window properly needs a non-blocking open
+/// (a `libc` dependency this crate does not have). The check on the open handle
+/// below is the one that actually governs what gets read.
 pub fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    // Check the file type BEFORE opening. Opening a FIFO blocks until a writer
-    // appears, and this runs in front of every reply — a hang here is the
-    // user's session. Only a regular file can be a transcript.
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
+    if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
     let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let meta = file.metadata().ok()?;
+    // Authoritative: this one is on the handle being read, so it cannot be
+    // raced by a swap after the check above.
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
     if len > TRANSCRIPT_TAIL_BYTES {
         file.seek(SeekFrom::Start(len - TRANSCRIPT_TAIL_BYTES))
             .ok()?;
