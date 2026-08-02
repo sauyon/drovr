@@ -161,7 +161,7 @@ fn git_available() -> bool {
 /// `MANIFEST.md` claims to make "byte-exact" checkable across a whole multi-task
 /// run, and this flag is what makes that claim true. There is no `.gitattributes`
 /// in this repo today, so the recorded values are unchanged by it.
-fn git_hash_object(path: &Path) -> String {
+fn git_hash_object(path: &Path) -> GitObjectId {
     let out = Command::new("git")
         .arg("hash-object")
         .arg("--no-filters")
@@ -179,34 +179,41 @@ fn git_hash_object(path: &Path) -> String {
         path.display(),
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
-        .unwrap_or_else(|e| {
-            panic!(
-                "`git hash-object {}` output is not utf-8: {e}",
-                path.display()
-            )
-        })
-        .trim()
-        .to_string()
+    let stdout = String::from_utf8(out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`git hash-object {}` output is not utf-8: {e}",
+            path.display()
+        )
+    });
+    // Parsed, not returned raw: the comparison at the tripwire is then between
+    // two `GitObjectId`s, so the invariant holds across the whole verify path
+    // rather than being dropped on the computed side.
+    GitObjectId::parse(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "`git hash-object --no-filters {}` printed something unusable: {e}",
+            path.display()
+        )
+    })
 }
 
-/// A `git hash-object` blob SHA, validated at construction.
+/// A 40-hex git object id, validated at construction.
 ///
-/// The 40-hex-character invariant lives here rather than in each caller: every
-/// later task re-checks its own arm against this manifest, and a newtype means
-/// none of them can forget to assert the format — a malformed cell is a parse
-/// error, not a mismatch that reads like arm corruption.
+/// Two of the manifest's columns are object ids — the snapshot's
+/// `git hash-object` blob SHA and the `HEAD` commit it was taken at — and they
+/// share this type rather than each growing their own check. The invariant lives
+/// here rather than in each caller: every later task re-checks its own arm
+/// against this manifest, and a newtype means none of them can forget the
+/// format, so a malformed cell is a parse error instead of a mismatch that reads
+/// like arm corruption.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BlobSha(String);
+struct GitObjectId(String);
 
-impl BlobSha {
+impl GitObjectId {
     fn parse(raw: &str) -> Result<Self, String> {
         if raw.len() == 40 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            Ok(BlobSha(raw.to_string()))
+            Ok(GitObjectId(raw.to_string()))
         } else {
-            Err(format!(
-                "`{raw}` is not a 40-character hex blob SHA (`git hash-object --no-filters`)"
-            ))
+            Err(format!("`{raw}` is not a 40-character hex git object id"))
         }
     }
 
@@ -217,14 +224,34 @@ impl BlobSha {
 
 /// One data row of `arms/MANIFEST.md`'s table — all six columns plan §1.1
 /// defines, so a caller never has to re-parse the line to reach a field.
+///
+/// Every row that exists is a valid one: both object ids are parsed, the
+/// `skill` owns its `source path` (see [`source_path_belongs_to_skill`]), and
+/// `parse_manifest` rejects a second row for an `(arm, skill)` pair.
 #[derive(Debug)]
 struct ManifestRow {
     arm: String,
     skill: String,
     source_path: String,
-    hash: BlobSha,
-    commit: String,
+    hash: GitObjectId,
+    commit: GitObjectId,
     date: String,
+}
+
+/// Does `source_path` belong to `skill`?
+///
+/// The arms are not all shaped alike: A/A′/B/B-r<i> snapshot per-skill files at
+/// `skills/<skill>/SKILL.md`, where the skill is the **parent directory**, while
+/// the voice arm (plan §1.1) is `voice/V<n>.md`, where it is the **file stem**.
+/// Accepting either is what lets one rule cover every arm in the run.
+fn source_path_belongs_to_skill(source_path: &str, skill: &str) -> bool {
+    let path = Path::new(source_path);
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str());
+    stem == Some(skill) || parent == Some(skill)
 }
 
 /// The manifest's six columns, keyed by their normalized header text (see
@@ -371,14 +398,37 @@ fn parse_manifest(contents: &str) -> Result<Vec<ManifestRow>, String> {
             cells[i].clone()
         };
 
-        let hash = BlobSha::parse(&cell(COL_HASH))
-            .map_err(|e| format!("{e} — in row: {}", line.trim()))?;
+        let in_row = |e: String| format!("{e} — in row: {}", line.trim());
+        let hash = GitObjectId::parse(&cell(COL_HASH)).map_err(in_row)?;
+        let commit = GitObjectId::parse(&cell(COL_COMMIT)).map_err(in_row)?;
+        let (arm, skill, source_path) = (cell(COL_ARM), cell(COL_SKILL), cell(COL_SOURCE_PATH));
+
+        if !source_path_belongs_to_skill(&source_path, &skill) {
+            return Err(in_row(format!(
+                "source path `{source_path}` does not belong to skill `{skill}` \
+                 (expected the skill as the file stem or the parent directory)"
+            )));
+        }
+        // `(arm, skill)` is the manifest's natural key — every matcher in the run
+        // selects on that pair — so a second row for it is rejected here rather
+        // than left for each arm's own test to notice, or not.
+        if let Some(prior) = rows
+            .iter()
+            .find(|r: &&ManifestRow| r.arm == arm && r.skill == skill)
+        {
+            return Err(format!(
+                "duplicate row for (arm `{arm}`, skill `{skill}`): already recorded {} — in row: {}",
+                prior.hash.as_str(),
+                line.trim()
+            ));
+        }
+
         rows.push(ManifestRow {
-            arm: cell(COL_ARM),
-            skill: cell(COL_SKILL),
-            source_path: cell(COL_SOURCE_PATH),
+            arm,
+            skill,
+            source_path,
             hash,
-            commit: cell(COL_COMMIT),
+            commit,
             date: cell(COL_DATE),
         });
     }
@@ -410,7 +460,10 @@ fn parse_manifest_resolves_columns_by_header_name() {
         rows[0].hash.as_str(),
         "a1f889b57fa741e55b02da2397104f933d9878aa"
     );
-    assert_eq!(rows[0].commit, "99540bdcdb016ca3b74530957f55c0e5ef29f4f9");
+    assert_eq!(
+        rows[0].commit.as_str(),
+        "99540bdcdb016ca3b74530957f55c0e5ef29f4f9"
+    );
     assert_eq!(rows[0].date, "2026-07-26");
 }
 
@@ -456,6 +509,28 @@ Rows are matched on their `arm` and `skill` cells, like so:
         rows[0].hash.as_str(),
         "a1f889b57fa741e55b02da2397104f933d9878aa"
     );
+}
+
+/// The `skill` cell must own its source path — but "own" cannot mean
+/// `skills/<skill>/SKILL.md`, because the voice arm (plan §1.1) is not
+/// per-skill: it is `voice/V<n>.md`. The rule that fits both is that the skill
+/// name is the path's file stem *or* its parent directory. Task 15 must be able
+/// to append its rows without this parser refusing them.
+#[test]
+fn parse_manifest_accepts_the_voice_arm_layout() {
+    let contents = "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+| voice | V0 | `docs/skill-evidence/arms/voice/V0.md` | `d69a226c161d733f2238e74187237d2b77d5c196` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+";
+    let rows = parse_manifest(contents).expect("the voice arm's layout must parse");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].arm, "voice");
+    assert_eq!(rows[1].skill, "V0");
+    // Same (arm, skill) uniqueness rule, different arm — `voice`/`V0` does not
+    // collide with `A`/`tdd`.
+    assert_eq!(rows[1].source_path, "docs/skill-evidence/arms/voice/V0.md");
 }
 
 /// Schema drift must be a parse failure, never a silent rebinding. Each case is
@@ -535,13 +610,48 @@ fn parse_manifest_rejects_schema_drift() {
             "1 cells but the header declares 6",
         ),
         (
-            "hash cell is not a blob SHA",
+            // `arm` + `skill` is the manifest's natural key — every matcher in
+            // the run selects on that pair. Two rows for it is a representable
+            // illegal state that could hand a later arm the wrong hash.
+            "duplicate (arm, skill) pair",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+| A | tdd | `skills/tdd/SKILL.md` | `d69a226c161d733f2238e74187237d2b77d5c196` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-27 |
+",
+            "duplicate row for (arm `A`, skill `tdd`)",
+        ),
+        (
+            // The `commit` column is a git object ID exactly like the hash, so
+            // it gets the same validation rather than being a free-text field.
+            "commit cell is not an object ID",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/tdd/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bd` | 2026-07-26 |
+",
+            "not a 40-character hex git object id",
+        ),
+        (
+            // A row that records one skill's hash under another skill's name is
+            // exactly the corruption this manifest exists to make impossible.
+            "source path does not belong to the skill",
+            "\
+| arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
+|---|---|---|---|---|---|
+| A | tdd | `skills/code-review/SKILL.md` | `a1f889b57fa741e55b02da2397104f933d9878aa` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+",
+            "source path `skills/code-review/SKILL.md` does not belong to skill `tdd`",
+        ),
+        (
+            "hash cell is not an object id",
             "\
 | arm | skill | source path | `git hash-object` of the copy | commit `HEAD` at copy time | date |
 |---|---|---|---|---|---|
 | A | tdd | `skills/tdd/SKILL.md` | `deadbeef` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
 ",
-            "not a 40-character hex blob SHA",
+            "not a 40-character hex git object id",
         ),
         (
             "no table at all",
@@ -582,6 +692,8 @@ fn arm_a_snapshots_match_manifest() {
             .iter()
             .filter(|r| r.arm == "A" && r.skill == *skill)
             .collect();
+        // A second row for `(A, skill)` can no longer parse, so in practice this
+        // catches the *missing* row — a skill dropped from the manifest.
         assert_eq!(
             matches.len(),
             1,
@@ -595,7 +707,9 @@ fn arm_a_snapshots_match_manifest() {
         // failed above, with the offending line quoted.
         let expected = matches[0].hash.clone();
 
-        // The row must also point at the file it claims to be a copy of.
+        // `parse_manifest` already enforces the loose rule that fits every arm
+        // (the skill is the path's stem or its parent). Arm A's shape is known
+        // exactly, so it is held to the exact path.
         let expected_source = format!("skills/{skill}/SKILL.md");
         assert_eq!(
             matches[0].source_path,
@@ -633,9 +747,10 @@ fn arm_a_snapshots_match_manifest() {
         let actual = git_hash_object(&snapshot);
         assert_eq!(
             actual,
-            expected.as_str(),
-            "{} has drifted: `git hash-object --no-filters` is {actual}, MANIFEST.md records {}",
+            expected,
+            "{} has drifted: `git hash-object --no-filters` is {}, MANIFEST.md records {}",
             snapshot.display(),
+            actual.as_str(),
             expected.as_str(),
         );
     }

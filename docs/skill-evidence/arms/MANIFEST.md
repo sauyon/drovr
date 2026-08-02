@@ -38,8 +38,17 @@ table would be, so do not write one.
 Further rules follow from the parser being strict for the whole file at once:
 
 - **No cell may contain a literal `|`** — there is no escape handling.
-- **Every data row must have all six cells, and its hash cell must be 40 hex characters.** A
-  malformed row for *any* arm fails the parse, which fails the arm A tripwire too. Append carefully.
+- **Every data row must have all six cells; the hash and commit cells must each be a 40-hex git
+  object id.** Use the full SHA, not the short form. A malformed row for *any* arm fails the parse,
+  which fails the arm A tripwire too. Append carefully.
+- **`(arm, skill)` is the key — one row per pair.** A second row for a pair already present is
+  rejected, so re-snapshotting an arm means correcting its row, not appending another. (This is the
+  one place the append-only rule yields: a duplicate would leave two hashes claiming the same
+  identity, which is worse than an edit with a reason.)
+- **The `skill` cell must own the `source path`** — the skill name has to be either the path's file
+  stem or its parent directory. `skills/tdd/SKILL.md` qualifies for `tdd` (parent), and
+  `…/voice/V0.md` qualifies for `V0` (stem), so both the per-skill arms and the voice arm fit one
+  rule. A row recording one skill's file under another skill's name will not parse.
 - **Run `cargo test --test skills_valid` the moment you append a row**, not at the end of your task.
   It is under a second, and it turns "the manifest is corrupt" into a one-line diagnosis naming your
   row instead of a mystery failure inherited by whoever comes next.
