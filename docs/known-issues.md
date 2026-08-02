@@ -656,46 +656,44 @@ failures, two of which passed in isolation.
 
 If a run reports N failures, re-run the first one alone before believing the other N-1.
 
-## `web_keyboard_navigation` fails: Chromium 150 headless will not navigate to any network URL (2026-08-01)
+## `web_keyboard_navigation` hung on every run: Chromium's cookie store waits on the keyring (2026-08-01) — FIXED
 
-**Severity:** medium — it fails `cargo test` on this machine every run, and the cause is outside
-drovr entirely.
+**Cause: `--password-store=basic` was missing from the test's chromium launch.** Fixed in
+`cli/tests/web_nav.rs`; the suite went from failing every run to passing three for three in ~13s.
 
-**It is not flaky and it is not load.** Two earlier versions of this entry said "environmental"
-and then "load sensitivity in a fixed 20s CDP deadline". Both were guesses; measured, both are
-wrong. Load average was 2.08 with 41 GB free and zero leaked browsers when it failed.
+**The mechanism**, from a full NetLog (`--log-net-log --net-log-capture-mode=Everything`):
 
-**What actually happens.** Nothing takes 20 seconds — 20s is just `nav.mjs`'s own per-command
-timeout. Chromium 150.0.7871.124 headless, launched exactly as `cli/tests/web_nav.rs` launches it,
-never answers `Page.navigate` for any network-scheme URL, and the DevTools session goes silent
-afterwards: a `Runtime.evaluate` sent four seconds later gets no reply either, and the socket
-never closes. Chromium logs nothing.
+1. `COOKIE_PERSISTENT_STORE_LOAD` begins at startup and never ends.
+2. Every `URL_REQUEST` that needs cookies (`privacy_mode: disabled`) stalls at
+   `COMPUTED_PRIVACY_MODE` — where `URLRequestHttpJob` calls into the cookie store — and never
+   reaches `HTTP_TRANSACTION_SEND_REQUEST`.
+3. The cookie store is loading its encryption key through OSCrypt, which on Linux asks the Secret
+   Service over D-Bus. `ReadAlias("default")` on `org.freedesktop.secrets` returns `/`: there is
+   no unlocked default collection. `gnome-keyring-daemon` runs with `--components=secrets` but the
+   keyring was never unlocked or aliased, and with `XDG_CURRENT_DESKTOP`/`DESKTOP_SESSION` empty
+   there is no prompter to answer. **That call has no timeout.**
 
-Reproduced standalone (no cargo, no drovr):
+Every symptom follows, and each one is what made this look like something else:
 
-| Navigation target | Result |
+| Symptom | Why |
 |---|---|
-| `file:///tmp/probe.html` | responds in 31 ms |
-| `http://127.0.0.1:<live python http.server>` | **hangs forever** |
-| `http://localhost:<port>` | **hangs forever** |
-| `https://example.invalid/` | **hangs forever** |
-| `about:blank#x` (same document) | responds in ~15 ms |
+| `file://` and `about:blank#x` navigate instantly | they never touch the cookie store |
+| the target server logs **zero** requests | the TCP connection IS established — NetLog shows `TCP_CONNECT` completing — but no HTTP request is ever written to the socket |
+| `curl` to the same port works | different process, no keyring involved |
+| the DevTools session looks dead | it is not: `Page.navigate` never resolves and later commands queue behind it. `/json/list` still answers |
+| chromium's own background traffic succeeds | that traffic is `privacy_mode: enabled`, i.e. cookieless |
 
-So the browser is fine until it is asked to use the network stack.
+**Three wrong diagnoses were recorded here before this one** — "environmental", then "load
+sensitivity in a fixed 20s CDP deadline", then "a Chromium 150 regression". None had measurements
+behind them. Ruled out along the way and worth not re-testing: the drovr server, CDP socket
+topology (flattened browser-endpoint sessions behave identically), `--headless` vs `=old`/`=new`,
+`--no-sandbox`, `--disable-dev-shm-usage`, `NetworkServiceInProcess`, `--no-proxy-server`,
+enterprise policy, machine load, the agent tool sandbox, and any chromium wrapper or flag file
+(`/usr/bin/chromium` is Arch's launcher and injects nothing; no `chromium-flags.conf` exists).
 
-**Ruled out:** the drovr server (hangs against a live `python -m http.server` and a dead port
-alike); the CDP socket topology (a browser-endpoint session with `Target.attachToTarget
-{flatten:true}` hangs identically); `--headless` vs `=old` vs `=new`; `--no-sandbox`;
-`--disable-dev-shm-usage`; `--enable-features=NetworkServiceInProcess`; `--no-proxy-server`;
-enterprise policy (no `/etc/chromium/policies`).
-
-**So this is a Chromium regression or a local Chromium/system problem, not a drovr one.** The
-suite passed on this machine earlier the same day, which points at a browser upgrade in between.
-
-**Until it is resolved,** `cargo test` on this machine is red for a reason unrelated to whatever
-you changed — check whether `web_keyboard_navigation` is the only failure before believing it.
-The reproduction above (`Page.navigate` to `file://` vs `http://`) tells you in ten seconds
-whether the browser is still affected.
+**The general lesson for headless Chromium on Linux:** always pass `--password-store=basic`. A
+machine with no unlocked keyring turns every cookie-bearing request into an untimed wait, and the
+failure presents as a network or browser fault rather than a credential-store one.
 
 
 ## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky, cause UNKNOWN (2026-07-26, 2026-08-01)

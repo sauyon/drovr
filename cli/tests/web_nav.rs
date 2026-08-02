@@ -213,6 +213,20 @@ fn web_keyboard_navigation() {
                 "--disable-gpu",
                 "--no-first-run",
                 "--no-default-browser-check",
+                // Without this the suite hangs on the FIRST navigation and every run
+                // costs 20s to fail. Chromium's cookie store is loaded through OSCrypt,
+                // which on Linux fetches its key from the Secret Service over D-Bus; on a
+                // machine whose keyring has no unlocked default collection that call never
+                // returns and has no timeout. Every cookie-bearing request then queues
+                // behind it forever — the TCP connection is made, but no HTTP request is
+                // ever written, so the server logs nothing and `Page.navigate` never
+                // resolves. `file://` and same-document navigations are unaffected because
+                // they never touch the cookie store, which is what makes it look like a
+                // browser or network fault rather than a keyring one.
+                //
+                // `basic` uses a built-in key instead, which is what a throwaway profile
+                // wants anyway. See docs/known-issues.md.
+                "--password-store=basic",
                 &format!("--remote-debugging-port={cdp_port}"),
                 "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", tmp.path().join("chrome").display()),
