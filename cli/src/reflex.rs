@@ -949,6 +949,36 @@ mod tests {
     }
 
     #[test]
+    fn a_success_must_belong_to_this_call_and_follow_it() {
+        // Two ways a success can be present without belonging to the call.
+        // Both must emit — crediting either would silence a turn on someone
+        // else's evidence.
+        let other_id = format!(
+            "{}\n{}\n{}\n",
+            user_prompt("go"),
+            tool_use("Skill", r#"{"skill":"drovr:tdd"}"#),
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"some_other_call","is_error":false}]}}"#
+        );
+        assert!(
+            !skill_invoked_last_turn(&other_id),
+            "a result for a different tool call must not count"
+        );
+
+        // Result recorded BEFORE the call in file order — so the backward walk
+        // meets the call first, with nothing banked for it yet.
+        let wrong_order = format!(
+            "{}\n{}\n{}\n",
+            user_prompt("go"),
+            tool_result("toolu_1"),
+            tool_use("Skill", r#"{"skill":"drovr:tdd"}"#)
+        );
+        assert!(
+            !skill_invoked_last_turn(&wrong_order),
+            "a result that precedes its call is not evidence the call ran"
+        );
+    }
+
+    #[test]
     fn an_unresolved_skill_call_does_not_suppress() {
         // No tool_result at all — the call cannot be shown to have run, so it
         // does not count. Absence of evidence resolves toward emitting here as
