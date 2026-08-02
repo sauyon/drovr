@@ -327,7 +327,12 @@ pub fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
             .ok()?;
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
+    // `take`, not a bare `read_to_end`: the transcript is being appended to
+    // live, so the length measured a moment ago is a lower bound, not a
+    // ceiling. Without this the cap would be a claim rather than a limit.
+    file.take(TRANSCRIPT_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
