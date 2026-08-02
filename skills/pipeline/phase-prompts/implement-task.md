@@ -47,18 +47,31 @@ tasks; later tasks run as their own fresh phases.
    So `drovr code-review run <run> task-<N>` is yours to use, freely — but a clean verdict
    from a panel *you* invoked buys you a fix list, not a finish. You are done when this task's
    own verification passes (step 4) and you have resolved what review found; never *because* a
-   panel came back clean, and never with a panel standing in for step 4. Record every panel you
-   invoked in your report, marked author-run (step 6). The driver runs its own panel after you
+   panel came back clean, and never with a panel standing in for step 4. Record each one in your
+   report's `## Author-run panels` table (step 6). The driver runs its own panel after you
    report, and that verdict is the one that decides whether the task advances — it has already
    caught an Important on the identical commit an author-run panel called clean.
+
+   Two mechanics if you do run it. **Commit first:** the panel reviews `base..HEAD`, so
+   uncommitted work is an empty range and every angle returns clean — a green review of nothing
+   (see `docs/known-issues.md`). **Keep it in the foreground and loop on exit 2:** re-running the
+   same command resumes the panel in flight, so a slow one costs you a loop, not a stall. Do not
+   background it and do not yield waiting on it — the driver may background its waits because it
+   can end its turn; you cannot.
 6. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
    - what changed (files + the interfaces you actually implemented, verbatim),
    - test/verification output proving it works,
    - the self-review: what the review subagents found and how you resolved each Critical/
      Important finding (and any you deferred, with why),
-   - **every `drovr code-review run` you invoked yourself, labelled author-run**, with its
-     verdict — including any that came back clean. The driver and the final review phase need
-     to see which verdicts were the author's; one line each is enough,
+   - **an `## Author-run panels` section**, one table row per `drovr code-review run` you
+     invoked yourself, including the ones that came back clean. Three columns, so the claim can
+     be checked against the artifacts rather than taken on trust:
+
+     | Iteration `<i>` | Head SHA, from `<run_dir>/task-<N>-review-<i>.head` | Verdict |
+
+     The iteration is the panel's own number, not your round count — read it off the
+     `task-<N>-review-<i>-<angle>.json` files it wrote. Write "none" if you ran none; an absent
+     section is indistinguishable from an undisclosed one,
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.

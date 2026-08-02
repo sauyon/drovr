@@ -12,10 +12,10 @@ it is a test suite. Only the **driver's** run is the **gate**: a clean
 verdict on a panel you ran yourself is evidence, never permission to
 report done.
 
-**They find, you fix.** Do not declare work done on your own judgment. Launch one or
-more **read-only review subagents** to adversarially review the change, then address
-what they find — read-only keeps drovr's single-writer rule intact. This is in
-addition to the pipeline's final review phase, not instead of it.
+**They find, you fix.** Do not declare work done on your own judgment. Launch
+**read-only review subagents** to adversarially review the change, then address what
+they find — read-only keeps drovr's single-writer rule intact. In addition to the
+pipeline's final review phase, not instead of it.
 
 ## How to run it
 
@@ -46,9 +46,10 @@ any you chose not to fix, with the reason. Only then may you report done.
 
 ## Automatic panel — `drovr code-review run <run> <task> [--context …]`
 
-The pipeline runs this per task (see `drovr:pipeline`): one read-only reviewer per
-configured angle, each given the brief above. Findings union-merge into
-`<task>-review.json`, tagged by angle. Exit: 0 clean, 3 findings, 2 timeout, 1 error.
+Yours to run anytime; the driver runs it per task as the gate (see `drovr:pipeline`).
+One read-only reviewer per configured angle, each given the brief above. Findings
+union-merge into `<task>-review.json`, tagged by angle. Exit: 0 clean, 3 findings,
+2 timeout, 1 error.
 
 It needs a herdr workspace (`drovr new` records one) and a review agent with a herdr
 integration. If the panel is unavailable or wedged, use `code-review brief` and spawn

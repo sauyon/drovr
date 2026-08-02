@@ -215,10 +215,12 @@ without the diff improving) — then surface it rather than looping forever. The
 Important **and** nits on re-entry; only critical/important block the clean gate, but a clean
 task should not ship known nits it can cheaply fix.
 
-**Single-writer invariant:** the panel is the only reviewer activity in flight, and every
-reviewer exits (drops its `drovr phase done` marker) before the implementer re-enters to fix.
-Never have a reviewer pane alive while the implementer writes — that breaks the single-writer
-rule. `code-review run` blocks until all angles finish, so the driver naturally serializes them.
+**Single-writer invariant:** every reviewer exits (drops its `drovr phase done` marker) before
+the implementer re-enters to fix. Never have a reviewer pane alive while the implementer writes
+— that breaks the single-writer rule. What keeps it is that `code-review run` **blocks** until
+all angles finish, so panels serialize against writing whoever started them: yours, because you
+wait on it before re-entering implement; an author-run one, because the task agent is parked in
+that call and not editing while its reviewers are alive.
 
 ## Self-review before a phase reports done — REQUIRED
 
