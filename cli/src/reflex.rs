@@ -259,6 +259,10 @@ pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String>
 /// *last* one this walk reaches, where boundary and end-of-input mean the same
 /// thing.)
 pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
+    // Tool calls this turn whose result came back without `is_error`. The walk
+    // runs backwards, so a call's result is always seen before the call itself
+    // — which is what makes "did it actually run?" answerable in one pass.
+    let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in transcript_jsonl.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -268,12 +272,44 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
             return false; // unparseable: unknowable, so emit
         };
         match record.get("type").and_then(|t| t.as_str()) {
-            Some("user") if is_turn_boundary(&record) => return false,
-            Some("assistant") if invokes_drovr_skill(&record) => return true,
+            Some("user") => {
+                collect_successful_tool_ids(&record, &mut succeeded);
+                if is_turn_boundary(&record) {
+                    return false;
+                }
+            }
+            Some("assistant") if invokes_drovr_skill(&record, &succeeded) => return true,
             _ => {}
         }
     }
     false
+}
+
+/// Record every `tool_use_id` in this record whose `tool_result` is not an
+/// error.
+///
+/// Position relative to the boundary test does not matter and is not claimed
+/// to: a record that ends the turn returns immediately, so nothing banked from
+/// it is ever read. In practice the two are disjoint anyway — a record carrying
+/// only `tool_result` blocks is by definition not a boundary.
+fn collect_successful_tool_ids(
+    record: &serde_json::Value,
+    succeeded: &mut std::collections::HashSet<String>,
+) {
+    let Some(blocks) = record["message"]["content"].as_array() else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        if block.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+            continue;
+        }
+        if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+            succeeded.insert(id.to_string());
+        }
+    }
 }
 
 /// True if this `user` record is a real prompt rather than a tool result.
@@ -292,6 +328,21 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
 /// tool-result record and walked past — the exact drift this whole function is
 /// shaped to prevent, arriving as a vacuous truth rather than a wrong branch.
 fn is_turn_boundary(record: &serde_json::Value) -> bool {
+    // Claude Code injects a tool's follow-up content as an `isMeta` user record
+    // — for a `Skill` call, the skill's whole markdown body as a `text` block.
+    // It is output, not a turn, and `sourceToolUseID` is what says so. Without
+    // this the very next thing after every `Skill` call reads as a fresh prompt
+    // and the scan stops one record short of the call it exists to find.
+    //
+    // `isMeta` ALONE is deliberately not enough: a compaction's "Continue from
+    // where you left off." and a slash-command caveat are also `isMeta`, carry
+    // no source tool, and really do begin a turn. Walking past those would
+    // reach an earlier turn — the suppressing direction.
+    if record.get("isMeta").and_then(|m| m.as_bool()) == Some(true)
+        && record.get("sourceToolUseID").is_some()
+    {
+        return false;
+    }
     match record["message"]["content"].as_array() {
         Some(blocks) => {
             blocks.is_empty()
@@ -304,10 +355,20 @@ fn is_turn_boundary(record: &serde_json::Value) -> bool {
 }
 
 /// True if this `assistant` record carries a `Skill` tool_use for a `drovr:*`
-/// skill. The name must match exactly and the skill must have `drovr:` as a
-/// **prefix** — a skill merely containing the string does not count, and
-/// neither does naming one in prose.
-fn invokes_drovr_skill(record: &serde_json::Value) -> bool {
+/// skill **that actually ran**. The tool name must match exactly and the skill
+/// must have `drovr:` as a **prefix** — a skill merely containing the string
+/// does not count, and neither does naming one in prose.
+///
+/// `succeeded` holds the tool_use ids whose results came back without
+/// `is_error`. Membership is **required**, not merely "not known to have
+/// failed": a mistyped skill name emits a `tool_use` block indistinguishable
+/// from a successful one, and a call with no recorded result cannot be shown to
+/// have run at all. The invariant is that `true` means the discipline
+/// demonstrably ran, so anything short of a recorded success is a `false`.
+fn invokes_drovr_skill(
+    record: &serde_json::Value,
+    succeeded: &std::collections::HashSet<String>,
+) -> bool {
     let Some(blocks) = record["message"]["content"].as_array() else {
         return false;
     };
@@ -317,6 +378,10 @@ fn invokes_drovr_skill(record: &serde_json::Value) -> bool {
             && block["input"]["skill"]
                 .as_str()
                 .is_some_and(|s| s.starts_with("drovr:"))
+            && block
+                .get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|id| succeeded.contains(id))
     })
 }
 
@@ -334,7 +399,9 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
 /// when it cannot be read at all — which fails open toward emitting the card.
 ///
 /// The window boundary can land inside a multi-byte character or mid-record;
-/// both degrade to one unparseable line, which the scan skips.
+/// both degrade to one unparseable line at the *start* of the buffer, which the
+/// backward scan reaches last — where "ends the turn" and "ran out of input"
+/// mean the same thing, so both emit.
 ///
 /// **The pre-open type check is not atomic and is not claimed to be.** It exists
 /// only so the common case never *blocks*: opening a FIFO waits for a writer,
@@ -593,13 +660,36 @@ mod tests {
         )
     }
 
-    /// A `Skill` call for `skill`, plus the tool_result Claude Code records
-    /// right after it — the pair that defeats a naive turn-boundary scan.
+    /// The **real** three-record shape Claude Code writes for a `Skill` call,
+    /// verified against 78 live invocations: the assistant's `tool_use`, its
+    /// `tool_result`, and then an `isMeta` record carrying the skill's markdown
+    /// body, tagged with `sourceToolUseID`.
+    ///
+    /// That third record is the one that matters. It is `type: "user"` with a
+    /// `text` block, so a boundary rule that only knows about `tool_result`
+    /// reads it as a fresh prompt and stops one record short of the call — and
+    /// the suppression path never fires at all. A fixture that omitted it would
+    /// keep every test in this module green while the feature did nothing.
     fn skill_call(skill: &str) -> String {
         format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             tool_use("Skill", &format!(r#"{{"skill":"{skill}"}}"#)),
-            tool_result("toolu_1")
+            tool_result("toolu_1"),
+            skill_body_injection("toolu_1")
+        )
+    }
+
+    /// The `isMeta` record Claude Code injects after a successful `Skill` call.
+    fn skill_body_injection(source_tool_use_id: &str) -> String {
+        format!(
+            r#"{{"type":"user","isMeta":true,"sourceToolUseID":"{source_tool_use_id}","message":{{"role":"user","content":[{{"type":"text","text":"Base directory for this skill: /nix/store/x/skills/tdd\n\n# TDD\n"}}]}}}}"#
+        )
+    }
+
+    /// A tool_result that reports failure.
+    fn failed_tool_result(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":true,"content":"no such skill"}}]}}}}"#
         )
     }
 
@@ -743,6 +833,80 @@ mod tests {
             skill_invoked_last_turn(&t),
             "tool_result records must not be read as a turn boundary"
         );
+    }
+
+    #[test]
+    fn the_skill_body_injection_does_not_end_the_turn() {
+        // The shape that made the whole suppression path inert. Claude Code
+        // follows a `Skill` call with an `isMeta` record carrying the skill's
+        // markdown — `type: "user"`, one `text` block. Read as a prompt, it
+        // ends the turn one record before the call it exists to announce.
+        let t = format!(
+            "{}\n{}\n{}\n",
+            user_prompt("fix the parser"),
+            skill_call("drovr:tdd"),
+            assistant_text("wrote the failing test")
+        );
+        assert!(
+            skill_invoked_last_turn(&t),
+            "the skill-body injection must not be read as a fresh prompt"
+        );
+        assert_eq!(gate_json(&ReflexConfig::default(), Some(&t)), None);
+    }
+
+    #[test]
+    fn a_meta_record_that_is_not_tool_output_still_ends_the_turn() {
+        // Only tool-driven injections are transparent, and `sourceToolUseID` is
+        // what marks them. `isMeta` alone is not enough: a compaction's
+        // "Continue from where you left off." and a slash-command caveat are
+        // both `isMeta` with no source tool, and walking past those would reach
+        // an earlier turn — the suppressing direction.
+        for meta in [
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Continue from where you left off."}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"<local-command-caveat>…</local-command-caveat>"}]}}"#,
+        ] {
+            let t = format!(
+                "{}\n{}\n{}\n{}\n",
+                user_prompt("older request"),
+                skill_call("drovr:tdd"),
+                meta,
+                assistant_text("this turn invoked nothing")
+            );
+            assert!(
+                !skill_invoked_last_turn(&t),
+                "an isMeta record with no sourceToolUseID must end the turn: {meta}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_skill_call_does_not_suppress() {
+        // The invariant is "the discipline demonstrably ran". A `Skill` call
+        // that errored — a mistyped skill name, say — emits an identical
+        // tool_use block; only its tool_result says it never loaded. Crediting
+        // it would silence a turn in which no skill ever ran.
+        let t = format!(
+            "{}\n{}\n{}\n{}\n",
+            user_prompt("go"),
+            tool_use("Skill", r#"{"skill":"drovr:cod-review"}"#),
+            failed_tool_result("toolu_1"),
+            assistant_text("that skill does not exist, continuing without it")
+        );
+        assert!(!skill_invoked_last_turn(&t));
+        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+    }
+
+    #[test]
+    fn an_unresolved_skill_call_does_not_suppress() {
+        // No tool_result at all — the call cannot be shown to have run, so it
+        // does not count. Absence of evidence resolves toward emitting here as
+        // everywhere else in this scan.
+        let t = format!(
+            "{}\n{}\n",
+            user_prompt("go"),
+            tool_use("Skill", r#"{"skill":"drovr:tdd"}"#)
+        );
+        assert!(!skill_invoked_last_turn(&t));
     }
 
     #[test]
