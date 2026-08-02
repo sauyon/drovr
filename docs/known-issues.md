@@ -474,6 +474,39 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## `drovr cleanup` auto-commits whatever the worktree is holding (2026-08-02)
+
+**Severity:** low, but it puts junk — including large binaries — into your branch's history under
+a message that describes the RUN, not the content.
+
+`drovr cleanup <run>` commits the worktree before pruning it, which is the right default: it is
+how work in progress survives a teardown. What it does not do is distinguish work from litter. On
+run `fix-lock-flake` it produced:
+
+```
+2e23622 drovr(fix-lock-flake): the serve-lock test shares the developer's lock path, …
+ cli/rust_out | Bin 0 -> 4517008 bytes
+```
+
+A 4.5 MB binary — `rust_out` is what a bare `rustc foo.rs` writes when nobody passes `-o`, left
+behind by something probing in that checkout — committed under the run's task description, which
+made it read like a real change.
+
+**Consequences to expect:**
+
+- `git branch -d <run branch>` will REFUSE after cleanup, because that auto-commit is not in
+  `main`. If you force it without looking, you are discarding a commit you never read. Check what
+  it contains first (`git show --stat <branch>`); it may be litter, or it may be work.
+- The commit message names the run's task, so the diff is the only thing that tells you which it
+  is.
+
+**Mitigation in place:** `rust_out` is now in `.gitignore`, alongside `target/` and `.drovr/`.
+That closes the specific case; the general one — cleanup committing anything untracked — stands
+by design.
+
+**Before running cleanup on a worktree you have been probing in:** `git status --short` it, and
+remove or ignore what you do not want in the branch.
+
 ## "Read-only" reviewers can still mutate repo state through drovr itself (2026-07-31)
 
 **Severity:** low, but it leaks into the repo and into `git worktree list`.
