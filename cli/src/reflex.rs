@@ -346,8 +346,15 @@ fn is_turn_boundary(record: &serde_json::Value) -> bool {
     // where you left off." and a slash-command caveat are also `isMeta`, carry
     // no source tool, and really do begin a turn. Walking past those would
     // reach an earlier turn — the suppressing direction.
+    // `is_some()` would not do: `Value::get` returns `Some(&Value::Null)` for a
+    // key that is present and null, so an explicit `"sourceToolUseID": null`
+    // would read as a real source tool and this record would be walked past.
+    // The exemption requires an id that could actually name a tool call.
     if record.get("isMeta").and_then(|m| m.as_bool()) == Some(true)
-        && record.get("sourceToolUseID").is_some()
+        && record
+            .get("sourceToolUseID")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| !s.is_empty())
     {
         return false;
     }
@@ -872,6 +879,13 @@ mod tests {
         for meta in [
             r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Continue from where you left off."}}"#,
             r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"<local-command-caveat>…</local-command-caveat>"}]}}"#,
+            // The key PRESENT but carrying nothing usable. `Value::get` returns
+            // `Some(&Value::Null)` here, so an `is_some()` test reads it as a
+            // real source tool and walks past a record that begins a turn.
+            r#"{"type":"user","isMeta":true,"sourceToolUseID":null,"message":{"role":"user","content":"Continue from where you left off."}}"#,
+            r#"{"type":"user","isMeta":true,"sourceToolUseID":"","message":{"role":"user","content":"Continue from where you left off."}}"#,
+            r#"{"type":"user","isMeta":true,"sourceToolUseID":0,"message":{"role":"user","content":"Continue from where you left off."}}"#,
+            r#"{"type":"user","isMeta":true,"sourceToolUseID":{},"message":{"role":"user","content":"Continue from where you left off."}}"#,
         ] {
             let t = format!(
                 "{}\n{}\n{}\n{}\n",
