@@ -313,8 +313,12 @@ impl RunState {
     /// Archiving from the web UI or `drovr cleanup` flips `archived` on disk
     /// inside that window and destroys the run's workspace. A plain [`save`] would
     /// then write our stale `archived: false` over it, leaving a run that looks
-    /// active and un-zombied (its panes really are gone, so nothing flags it) but
-    /// can never run again: nothing recreates a closed workspace.
+    /// active and un-zombied while its panes are in fact all gone — so the row
+    /// misrepresents the run to anyone reading the list, and the human who filed
+    /// it away silently gets it back. (The run is no longer unrunnable: since
+    /// 2026-08-02 `phase::ensure_workspace` re-provisions a destroyed workspace on
+    /// the next `phase_start`. Preserving `archived` is now about not overriding a
+    /// human's decision, not about a state drovr cannot recover from.)
     ///
     /// Only `archived` is rescued, because it is the one field a *different*
     /// process sets while we hold our copy. Callers that mean to change it — the

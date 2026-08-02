@@ -797,13 +797,13 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// get a dead run out of the way; `drovr cleanup --purge` remains the way to
 /// reclaim the worktree.
 ///
-/// Restore is NOT an undo. It clears the flag and puts the row back in the
-/// active list, but the workspace is gone: `phase_start` only ever reuses a
-/// recorded `pane_id`/`root_pane` or calls `tab_create` against the run's
-/// existing `workspace` id, and nothing anywhere recreates a closed workspace
-/// (only `drovr new` makes one). So `drovr phase start` on a restored run errors
-/// out. Restore is for undoing a misclick before you rely on the run, not for
-/// resurrecting one. See docs/known-issues.md.
+/// Restore clears the flag, puts the row back in the active list, and the run is
+/// runnable again: archiving destroys the workspace, but `phase::ensure_workspace`
+/// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
+/// records the new ids. What it cannot restore is the *agents* — every pane died
+/// with the workspace, so a phase that was `Running` when it was archived comes
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
+/// archived run does not make it runnable again — FIXED 2026-08-02".
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
 /// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
