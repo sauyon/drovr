@@ -1,7 +1,7 @@
 //! Validates every `skills/*/SKILL.md` in the repo and enforces a body-size
 //! budget on the four `drovr:*` methodology skills.
 //!
-//! Three assertions:
+//! Four assertions:
 //!   1. **All** skills have valid frontmatter: a leading `---` block containing
 //!      non-empty `name:` and `description:`, and `name:` equals the directory
 //!      name.
@@ -14,7 +14,12 @@
 //!      whole measurement is compared against, and it is unrecoverable without a
 //!      checkout once fix 1 rewrites the live `description:` lines — so this is a
 //!      tripwire, not a formality.
+//!   4. No markdown file under `skills/` shares an 8-word run with the
+//!      superpowers corpus. drovr ports mechanisms from superpowers and writes
+//!      its own sentences (spec §2.1 exception 2); this is the check that says
+//!      so with evidence rather than intent.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -869,6 +874,392 @@ fn all_skills_have_valid_frontmatter() {
             path.display()
         );
     }
+}
+
+/// Length, in words, of the shortest run of text that counts as copied.
+///
+/// Spec §9.1 check 4 sets it at eight. Shorter runs are how two people writing
+/// about the same mechanism collide by accident ("run the scenario without the
+/// skill and watch"); eight consecutive words in the same order is not that.
+const MIN_SHINGLE_WORDS: usize = 8;
+
+/// Where the read-only superpowers corpus is installed.
+///
+/// It is an installed plugin, deliberately **outside** this repo, so its path is
+/// a property of the machine and not of the checkout. `DROVR_SUPERPOWERS_CORPUS`
+/// overrides it for anyone whose plugin cache lives elsewhere.
+const SUPERPOWERS_CORPUS_DEFAULT: &str =
+    "/home/sauyon/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills";
+
+fn superpowers_corpus_dir() -> PathBuf {
+    std::env::var_os("DROVR_SUPERPOWERS_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(SUPERPOWERS_CORPUS_DEFAULT))
+}
+
+/// Every `*.md` under `dir`, recursively, sorted so failures name files in a
+/// stable order.
+/// Directories are visited once, keyed by their canonical path, so a symlink
+/// loop is a finite walk rather than a test that never returns.
+fn markdown_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", current.display()));
+        for entry in entries {
+            let path = entry.expect("read_dir entry").path();
+            if path.is_dir() {
+                let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if visited.insert(key) {
+                    stack.push(path);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Lowercased word tokens, with markdown punctuation dropped.
+///
+/// A word is a run of ASCII alphanumerics plus `'` and `-`, so `don't` and
+/// `red-green-refactor` each stay one token. Everything else — table pipes,
+/// emphasis markers, list bullets, backticks — is a separator, because copied
+/// prose stays copied prose after someone bolds a word in it or moves it into a
+/// table cell.
+///
+/// A run with no alphanumeric in it is **not** a word: `---` opens every
+/// frontmatter block and rules off every section, and counting it as shared
+/// vocabulary turned two files that merely both have frontmatter into a
+/// plagiarism hit.
+///
+/// A typographic apostrophe is folded to the ASCII one first. Otherwise
+/// `don’t` tokenizes as `don` + `t` while `don't` stays one word, and a copied
+/// sentence would stop matching because one side had been through an editor
+/// that smartens quotes.
+fn words(text: &str) -> Vec<String> {
+    text.replace('\u{2019}', "'")
+        .to_lowercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\'' || c == '-'))
+        .filter(|w| w.chars().any(|c| c.is_ascii_alphanumeric()))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Every window of `n` consecutive words, joined by single spaces.
+fn shingles(words: &[String], n: usize) -> Vec<String> {
+    words.windows(n).map(|w| w.join(" ")).collect()
+}
+
+/// Strip a leading `key:` from a frontmatter line, returning the value.
+///
+/// A key is a run of identifier characters followed by `:`. Anything else (a
+/// continuation line, a list item) is returned whole.
+fn frontmatter_value(line: &str) -> &str {
+    let Some(colon) = line.find(':') else {
+        return line;
+    };
+    let key = &line[..colon];
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        line[colon + 1..].trim()
+    } else {
+        line
+    }
+}
+
+/// Split a leading YAML frontmatter block off, as `(frontmatter, body)`.
+///
+/// Returns `None` unless the file really opens with one: `---` on its own first
+/// line, a later line that is exactly `---`, and every non-empty line between
+/// them carrying a `:`. That last condition is the one that matters. A markdown
+/// file may open with a horizontal rule and carry another one further down, and
+/// without the check every paragraph in between would be shingled line by line —
+/// which is how a copied paragraph would slip through a test written to catch
+/// copied paragraphs.
+/// Both fences are matched as whole trimmed lines rather than by a literal
+/// `"---\n"` prefix, so a CRLF file is split like any other. That is not
+/// hypothetical tidiness: under a prefix match, one Windows-edited `SKILL.md`
+/// would fall back to flat shingling and report its own frontmatter as copied.
+fn split_frontmatter(contents: &str) -> Option<(&str, &str)> {
+    let mut segments = contents.split_inclusive('\n');
+    let open = segments.next()?;
+    if open.trim() != "---" {
+        return None;
+    }
+    let mut offset = open.len();
+    for line in segments {
+        if line.trim() == "---" {
+            let front = &contents[open.len()..offset];
+            let body = &contents[offset + line.len()..];
+            let looks_like_yaml = front
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .all(|l| l.contains(':'));
+            return looks_like_yaml.then_some((front, body));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Every shingle in one markdown file, treating YAML frontmatter as **structured
+/// data** rather than prose.
+///
+/// A skill's frontmatter is a fixed set of machine-read fields. Flattened into
+/// one word stream it manufactures runs nobody wrote: `name:` and `description:`
+/// are format, not vocabulary, and the two values sit adjacent only because the
+/// format puts them there. Under a flat stream, drovr's `tdd` and superpowers'
+/// `test-driven-development` "shared" the eight words
+/// `description use when implementing any feature or bugfix` — of which one is a
+/// key and seven are the trigger phrase two skills with the same job must both
+/// say. So each field's value is shingled on its own, and no shingle straddles a
+/// field boundary.
+///
+/// The values themselves stay checked. The `description:` is the highest-leverage
+/// line in a skill and the likeliest thing to be copied without thinking; it is
+/// exactly what this test must still see. (Multi-line YAML values are not
+/// handled — no skill in either corpus uses one, and a continuation line is
+/// shingled on its own, which is conservative in the safe direction.)
+fn file_shingles(contents: &str) -> Vec<String> {
+    let Some((front, body)) = split_frontmatter(contents) else {
+        return shingles(&words(contents), MIN_SHINGLE_WORDS);
+    };
+
+    let mut out = Vec::new();
+    for line in front.lines() {
+        out.extend(shingles(&words(frontmatter_value(line)), MIN_SHINGLE_WORDS));
+    }
+    out.extend(shingles(&words(body), MIN_SHINGLE_WORDS));
+    out
+}
+
+/// How the **corpus** side is indexed: both readings of every file, unioned.
+///
+/// Our side is indexed precisely, so that this repo's own frontmatter cannot
+/// manufacture a hit. The corpus side is indexed permissively for the mirror
+/// reason: a corpus file that [`split_frontmatter`] happens to read differently
+/// from how a human would must not be able to hide a shared run. A superset
+/// costs a little memory and can only ever make the check stricter.
+fn corpus_file_shingles(contents: &str) -> Vec<String> {
+    let mut out = file_shingles(contents);
+    if split_frontmatter(contents).is_some() {
+        out.extend(shingles(&words(contents), MIN_SHINGLE_WORDS));
+    }
+    out
+}
+
+/// A passage that is known to overlap the superpowers corpus and is allowed to,
+/// until the task that owns the text decides what to do about it.
+struct SharedPassage {
+    /// Path relative to `skills/`. An exemption excuses this passage **in this
+    /// file only** — the same sentence appearing anywhere else is still a hit.
+    file: &'static str,
+    /// The overlapping text, verbatim. If it is no longer in the file, the
+    /// exemption is stale and the test fails: an allowlist that outlives the text
+    /// it excuses quietly licenses the next copy of it.
+    passage: &'static str,
+    /// Why it is still here, and who decides.
+    why: &'static str,
+}
+
+/// The overlap that already existed when this check was written, enumerated.
+///
+/// **This is a conflict inside `spec.md`, not an oversight.** §9.1 check 4 wants
+/// no shared 8-word run; §3 and §4.1 freeze text that has one. Both entries below
+/// survive the fixes that rewrite their files, so no later task removes them by
+/// doing its own job:
+///
+///   * §3's replacement `description:` for `systematic-debugging` keeps the
+///     opening the current one shares with superpowers, so fix 1 (Task 7) does
+///     not clear it.
+///   * §4.1 step 1 says to **keep** `using-drovr`'s `<SUBAGENT-STOP>` block, so
+///     fix 2's doc layer (Task 14) does not clear it either.
+///
+/// So the run ends with two choices open, and §2.1 exception 2 already names
+/// them: reword the line, or add the MIT notice and credit. Recording them here
+/// keeps the check live for every *new* line while leaving that decision to §9
+/// (Task 23) and to a human — which is where a deviation from frozen spec text
+/// belongs. **Nothing here is a licence finding**; both projects are MIT.
+///
+/// Adding an entry is a deliberate act with a named owner. Do not add one to make
+/// a red test green.
+const KNOWN_SHARED_PASSAGES: &[SharedPassage] = &[
+    SharedPassage {
+        file: "systematic-debugging/SKILL.md",
+        passage: "Use when encountering any bug, test failure, or unexpected behavior",
+        why: "the trigger description. spec §3 freezes a replacement that keeps this opening, \
+              so Task 7 (fix 1) does not clear it — it lengthens the shared run instead, by \
+              deleting the `in a drovr phase` that currently interrupts it. \
+              Task 23 (§9) decides: reword, or attribute",
+    },
+    SharedPassage {
+        file: "using-drovr/SKILL.md",
+        passage: "<SUBAGENT-STOP>\nIf you were dispatched as a subagent to execute a specific task",
+        why: "the <SUBAGENT-STOP> device, ported wholesale — the tag name is part of the shared \
+              run, because both files open the block the same way. spec §4.1 step 1 says keep \
+              it, so Task 14 does not clear it — Task 23 (§9) decides: reword, or attribute",
+    },
+];
+
+/// §9.1 check 4: no ≥8-word run of text is shared with the superpowers corpus.
+///
+/// drovr ports superpowers' *mechanisms* under §2.1's tier-3 rule and writes its
+/// own sentences (§2.1 exception 2). Both projects are MIT, so copying with
+/// attribution would be legal — the rule is about drovr being a self-contained
+/// replacement, not about licensing. This test is what turns that from an
+/// intention into a checked property, and `skills/writing-skills/` is the file
+/// tree it exists for: that skill is assembled almost entirely from ported
+/// conventions, so it is the likeliest place in the repo for a sentence to
+/// survive intact.
+///
+/// It walks **every** `*.md` under `skills/`, not just `SKILL.md`, so reference
+/// files and scenario prompts are covered too, and later tasks re-run it for
+/// free by touching any skill.
+///
+/// **A hit is not a licence failure — it is a rewrite request.** Reword the line,
+/// or, if the text genuinely must be reproduced, add the MIT notice and credit
+/// §2.1 exception 2 requires *and* give this test an explicit, narrowly-scoped
+/// exemption for that one passage. There is no exemption mechanism today because
+/// no attributed passage exists; build it against the real text, not against a
+/// hypothetical one.
+///
+/// **The skip is real and it is invisible.** With the corpus absent this test
+/// prints and returns, and `cargo test` captures the print — so it reports `ok`
+/// having compared nothing. That is the plan's deliberate trade (the corpus is an
+/// installed plugin outside the repo and CI must not go red on its absence), and
+/// the cost is that "this test passed" only means "no overlap" on a machine where
+/// the corpus is installed. Say which one you saw when you report it.
+#[test]
+fn no_verbatim_overlap_with_superpowers() {
+    let corpus_dir = superpowers_corpus_dir();
+    if !corpus_dir.is_dir() {
+        eprintln!(
+            "skipping no_verbatim_overlap_with_superpowers: no superpowers corpus at {} \
+             (set DROVR_SUPERPOWERS_CORPUS to point at one). NOTHING WAS COMPARED.",
+            corpus_dir.display()
+        );
+        return;
+    }
+
+    let corpus_files = markdown_files(&corpus_dir);
+    assert!(
+        !corpus_files.is_empty(),
+        "{} exists but holds no markdown — that is a broken corpus, not an absent one",
+        corpus_dir.display()
+    );
+
+    // shingle -> the corpus file it came from, so a failure names both sides.
+    let mut corpus_shingles: HashMap<String, PathBuf> = HashMap::new();
+    for path in &corpus_files {
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for shingle in corpus_file_shingles(&contents) {
+            corpus_shingles
+                .entry(shingle)
+                .or_insert_with(|| path.clone());
+        }
+    }
+
+    let skills = skills_dir();
+    let ours = markdown_files(&skills);
+    assert!(
+        !ours.is_empty(),
+        "no markdown found under {}",
+        skills.display()
+    );
+
+    // Resolve the exemptions first, and fail on any that no longer matches the
+    // text it excuses. The list is only honest if it shrinks as the run rewords
+    // things; a stale entry would silently excuse a fresh copy of the same line.
+    let mut excused: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for known in KNOWN_SHARED_PASSAGES {
+        let path = skills.join(known.file);
+        let contents = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "KNOWN_SHARED_PASSAGES names {}, which cannot be read: {e}",
+                path.display()
+            )
+        });
+        let passage = words(known.passage);
+        assert!(
+            passage.len() >= MIN_SHINGLE_WORDS,
+            "KNOWN_SHARED_PASSAGES entry for {} is only {} words — shorter than a \
+             {MIN_SHINGLE_WORDS}-word shingle, so it excuses nothing",
+            known.file,
+            passage.len()
+        );
+        // Staleness is judged against the SAME shingle stream the comparison
+        // below uses, not against a flat read of the file. Against a flat read,
+        // an entry could be kept alive by the words happening to reappear
+        // somewhere the check never looks — an exemption validated by text it
+        // does not excuse.
+        let passage_shingles = shingles(&passage, MIN_SHINGLE_WORDS);
+        let in_file: HashSet<String> = file_shingles(&contents).into_iter().collect();
+        assert!(
+            passage_shingles.iter().all(|s| in_file.contains(s)),
+            "stale exemption: {} no longer contains \"{}\" where this check reads it. \
+             Delete the KNOWN_SHARED_PASSAGES entry ({}).",
+            known.file,
+            known.passage,
+            known.why
+        );
+        excused.entry(path).or_default().extend(passage_shingles);
+    }
+
+    // One hit per file: the first is enough to send the author back to the text,
+    // and a copied paragraph would otherwise report every window inside it.
+    let mut hits: Vec<String> = Vec::new();
+    let mut total_hits = 0usize;
+    for path in &ours {
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let excused_here = excused.get(path);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut first: Option<String> = None;
+        let ours_shingles = file_shingles(&contents);
+        for shingle in &ours_shingles {
+            let Some(source) = corpus_shingles.get(shingle) else {
+                continue;
+            };
+            if excused_here.is_some_and(|e| e.contains(shingle)) {
+                continue;
+            }
+            if !seen.insert(shingle.as_str()) {
+                continue;
+            }
+            total_hits += 1;
+            if first.is_none() {
+                first = Some(format!(
+                    "  {}\n    shares \"{shingle}\"\n    with {}",
+                    path.display(),
+                    source.display()
+                ));
+            }
+        }
+        if let Some(first) = first {
+            hits.push(first);
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "{} file(s) share text with the superpowers corpus at {} \
+         ({total_hits} distinct {MIN_SHINGLE_WORDS}-word run(s) in total; \
+         the first from each file is shown):\n{}\n\
+         Reword it, or add the MIT attribution §2.1 exception 2 requires together with an \
+         explicit exemption here.",
+        hits.len(),
+        corpus_dir.display(),
+        hits.join("\n"),
+    );
 }
 
 #[test]

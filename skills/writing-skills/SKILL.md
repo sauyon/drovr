@@ -1,0 +1,182 @@
+---
+name: writing-skills
+description: Use when writing or editing any drovr skill, and before shipping skill text no agent has ever tried to talk its way out of — including when you are about to write a rule from what you imagine agents get wrong instead of from a transcript of one getting it wrong
+---
+
+# Writing Skills
+
+## Overview
+
+A skill is not documentation. It is a prompt that has to survive two things
+documentation never faces: a context window filling up around it, and a reader
+who has a reason to want it not to apply. Text that reads clearly in a fresh
+session is not evidence of either.
+
+So skills are written the way code is written here: **test first**. The test is a
+pressure scenario, the production code is `SKILL.md`, and you do not know what
+the skill must prevent until you have watched an agent fail without it.
+
+**Following the letter is the whole point.** A skill you honoured "in spirit" by
+doing something else is a skill that did not bind. If a rule is wrong, change the
+rule and record why — do not route around it in the moment.
+
+## The mapping [tier 3]
+
+Ported from superpowers' convention, in drovr's own terms. A convention-follow,
+not an evidence-backed choice.
+
+| Testing a skill | The TDD it is |
+|---|---|
+| Pressure scenario | The test case |
+| `SKILL.md` | The production code |
+| **RED** | The agent violates the rule *without* the skill |
+| **GREEN** | The agent complies *with* it |
+| **REFACTOR** | Each new loophole is closed |
+
+**If you never watched an agent fail without the skill, you do not know which
+failures it prevents** — only which ones you imagined. Skill text written from
+imagination defends the wrong things, at full price in context.
+
+Test the skills that cost something to obey — discipline rules, rules that can
+be argued away for one special case. A reference sheet has nothing to violate
+and needs none of this.
+
+## The loop [tier 3]
+
+```dot
+digraph writing_skills_loop {
+  rankdir=TB;
+  node [shape=box, fontname="sans-serif"];
+
+  build      [label="Build the scenario set\n1 development + 2 held-out per skill"];
+  red        [label="RED\nrun the development scenario WITHOUT the skill"];
+  transcribe [label="Transcribe every excuse VERBATIM"];
+  green      [label="GREEN\nwrite the minimal text countering those excuses"];
+  retest     [label="Re-run on the HELD-OUT scenarios"];
+  fresh      [shape=diamond, label="A rationalization\nyou have not seen?"];
+  ceiling    [shape=diamond, label="REFACTOR ceiling\nreached? (spec 7.3)"];
+  closure    [label="REFACTOR\nfour-part closure on each new rationalization"];
+  stop       [shape=doublecircle, label="Stop. Record the result,\na null included."];
+
+  build -> red -> transcribe -> green -> retest -> fresh;
+  fresh   -> stop    [label="no"];
+  fresh   -> ceiling [label="yes"];
+  ceiling -> stop    [label="yes: halt, record a null"];
+  ceiling -> closure [label="no"];
+  closure -> retest;
+}
+```
+
+**Two exits, and you take whichever arrives first: a run that produces no
+rationalization you have not already countered, or the REFACTOR ceiling in
+`spec.md` §7.3.** The ceiling is not a formality. "Repeat until it is clean" with
+no bound is the same unbounded-cost defect drovr exists to prevent everywhere
+else. Hitting the ceiling is a result: record the null and stop.
+
+Author counter-text from the **development** scenario only. The held-out pair is
+what tells you whether the text generalises, and reading it while you write
+fits the skill to its own test.
+
+## The four-part closure [tier 3]
+
+Each new rationalization gets **all four of these, every time — never one**. One
+by itself leaves the same excuse reachable by a slightly different route, and
+the agent that finds the route is you, later, under pressure.
+
+1. **Negate it inside the rule.** Name the specific move in the rule's own text,
+   paired with what to do instead.
+2. **Add a row to the rationalization table.** Thought on the left; on the right
+   an *instruction*, not a rebuttal — "run the command", not "that is unproven".
+3. **Add a red-flag bullet.** Quote the inner monologue as the agent would think
+   it, so it is recognisable from the inside.
+4. **Update `description:`** to add the *symptom of being about to violate* —
+   not a summary of the skill. The description is the line that decides whether
+   the skill is loaded at all, so it must name the moment, not the topic.
+
+## Pass criteria [tier 3]
+
+All four, on the held-out scenarios:
+
+1. The agent picks the correct option **under maximum pressure**.
+2. It **cites a specific section** of the skill.
+3. It **names the temptation** and complies anyway.
+4. The meta-test comes back clear: asked "how should this have been written so
+   the right answer was unmistakable?", the agent answers that it already was.
+
+**Not bulletproof if** any of these appear:
+
+- a rationalization you have not countered,
+- the agent arguing the skill itself is wrong,
+- an invented hybrid that claims to satisfy both options,
+- the agent asking permission while arguing hard for the violation.
+
+The fourth is easy to score as compliance by mistake: asking is not complying
+when the ask is a brief for the other side.
+
+## Rules that hold while you do this
+
+- **Probe subagents run in the FOREGROUND.** Never `run_in_background`, never a
+  scheduled wake-up. See `references/testing-with-subagents.md` — backgrounding
+  a probe is how skill testing stalls without anyone being told.
+- **You are the single writer.** Subagents run scenarios and score them; they do
+  not edit skills.
+- **No fabricated measurements** (`spec.md` §2.1 exception 1). Do not put a
+  number, rate, duration, or comparative in a skill unless
+  `docs/skill-evidence/` holds it or a citation supports it. "Every time" is
+  emphasis and fine; "in 94% of runs" is not, unless 94% is in the corpus.
+
+## Red flags — STOP
+
+- "I know what agents get this wrong on" → that is a hypothesis, not a RED run.
+  Run the baseline and write down what came back.
+- "The scenario is unrealistic" → make it harder, do not soften the bar.
+- "It only failed once, that is noise" → transcribe it anyway. One recorded
+  excuse is one more than you had.
+- "I will add the rationalization table at the end" → add all four parts now,
+  for the excuse in front of you, before you run anything else.
+- "The held-out scenario is basically the same, I will peek" → close it. If you
+  already read it, say so and write a replacement — anything scored on a
+  scenario you read while authoring is self-graded.
+
+## Rationalizations
+
+| The thought | What to do instead |
+|---|---|
+| "I already know the failure mode, I can skip the baseline" | Run it. The excuse an agent reaches for need not be the one you predicted, and the text has to counter the real one. |
+| "The agent complied, so the skill works" | Check it complied on a **held-out** scenario, with all four pass criteria. Compliance on the scenario you wrote against is the test grading itself. |
+| "One more paragraph cannot hurt" / "longer and firmer must be stickier" | It costs context in every session that loads the skill, and this repo is measuring that assumption rather than spending on it. Add the four-part closure for an excuse you observed, and nothing else. |
+| "I will just re-run until it passes" | Stop at the ceiling and write the null down. A null is a result; an untracked loop is not. |
+| "I can score my own rewrite" | Hand it to a separate read-only scorer subagent working from `references/scoring-rubric.md`, blind to the arm label. |
+
+## Worked example
+
+Illustrative — invented, not a recorded result.
+
+❌ "Agents skip tests when they are in a hurry, so I will add a section about
+   deadlines."
+
+✅ "The baseline run chose option B and said:
+   *'the tests would just re-confirm what I verified by hand.'* That exact
+   sentence goes in the rationalization table, its negation goes in the rule,
+   its inner-monologue form goes in red flags, and `description:` gains
+   *'when manual verification feels like it already proves it'*."
+
+## References
+
+Load these when you reach the step that needs them.
+
+- `references/pressure-scenarios.md` — how to build a scenario that actually
+  applies pressure, and the frontmatter every scenario file carries.
+- `references/testing-with-subagents.md` — running the probes: foreground,
+  single-writer, transcripts.
+- `references/scoring-rubric.md` — the rubric, the verdict object, and the
+  blinding procedure. This is the file the scorer is handed.
+
+REQUIRED BACKGROUND: `drovr:tdd` defines the cycle this skill applies to prose.
+`drovr:verification-before-completion` governs the claim that a skill passed.
+
+Anthropic's skill-authoring guidance prescribes the same shape independently —
+build the evaluations first, take a baseline without the skill, write minimal
+instructions, iterate. Cited as convergent design advice, not as a measurement
+drovr has run:
+https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices
