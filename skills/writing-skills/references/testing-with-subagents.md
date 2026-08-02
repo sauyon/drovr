@@ -91,6 +91,13 @@ An arm gets snapshotted **when it is frozen**, at the end of the loop, not
 during it. Record the arm's hash in the manifest at that moment; from then on,
 that file is the arm and the working file has moved on.
 
+**Only arm A's snapshots are machine-checked.**
+`cli/tests/skills_valid.rs::arm_a_snapshots_match_manifest` re-hashes them on
+every `cargo test`. Every other arm — A′, B, B-r*i*, voice — is checked by *you*,
+by running `git hash-object --no-filters` against the row before you paste the
+text. Nothing does it for you, and a drifted snapshot produces a perfectly
+plausible result for a document you did not mean to measure.
+
 ## Running the cycle
 
 **RED — baseline, without the skill.** Give the subagent the development

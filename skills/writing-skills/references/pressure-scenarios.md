@@ -104,11 +104,19 @@ at the deferral. Both are silent corruption: `compliant` is scored against
 `correct_option`, so a mismatch does not fail loudly, it produces confident
 verdicts about the wrong option.
 
-**One check enforces all of it.** `cli/tests/skills_valid.rs::scenarios_are_well_formed`
-parses every scenario file against this schema and fails on any of the above.
-Adding a field means changing that test deliberately, exactly as
-`arms/MANIFEST.md`'s columns work. Do not hand-validate a scenario and call it
-checked; run the test.
+**One check enforces all of it**, and it exists:
+`cli/tests/skills_valid.rs::scenarios_are_well_formed`, with `parse_scenario` and
+`check_scenario_corpus` behind it. Adding a field means changing that test
+deliberately, exactly as `arms/MANIFEST.md`'s columns work. Do not hand-validate
+a scenario and call it checked; run `cargo test --test skills_valid`.
+
+One thing to know before you trust a green run: the corpus-level rules (17 files,
+the dev/held-out split) apply only once `SCENARIO_CORPUS_AUTHORED` is `true` in
+that file. **The task that writes the scenario files flips it.** Until then the
+test asserts the corpus is *absent*, so a half-written corpus fails rather than
+passing quietly — but a green run before the flip means "no scenarios yet", not
+"scenarios checked". The per-file schema rules are proven either way: they are
+enforced against fixtures in the same file.
 
 The body is the verbatim prompt handed to the probe subagent. Nothing else goes
 in it: no notes to yourself, no hints about which option the skill favours.

@@ -47,12 +47,18 @@ reward or punish a response for how it is written.
 ```
 
 **The object is closed.** Exactly these seven keys, every one required, no
-extras. Types are exact: four booleans, two strings, one array of strings. A
-verdict that omits a key, adds one, or puts a string where a boolean belongs is
-**rejected, not half-read** — the same rule `arms/MANIFEST.md` rows follow, and
-for the same reason: a partly-understood evidence record is worse than a loud
-refusal. Do not write `null`, do not write `"unknown"`; every field has a
-defined answer for every transcript, including the degenerate ones (see rule 5).
+extras. Types are exact: four booleans, two strings, one array of strings. Do not
+write `null`, do not write `"unknown"`; every field has a defined answer for
+every transcript, including the degenerate ones (see rule 5).
+
+**Who enforces that, precisely:** no test does. Verdicts are written by an agent
+and read by an agent, so the check is a step in the procedure, not a compiler.
+**The phase agent collecting verdicts rejects a malformed one and re-runs the
+scorer for that transcript** — it does not repair it, and it does not record a
+partial verdict. That is the same rule `arms/MANIFEST.md` rows follow, for the
+same reason: a partly-understood evidence record is worse than a loud refusal.
+If you are that phase agent, this sentence is your job, and nothing will remind
+you.
 
 ### The fields
 

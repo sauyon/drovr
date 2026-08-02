@@ -918,16 +918,26 @@ fn parse_skill_body_starts_after_the_closing_fence() {
 #[test]
 fn resolve_corpus_requires_absence_to_be_declared() {
     let discovered = || vec![PathBuf::from("/plugins/superpowers/5.1.0/skills")];
+    let indexed = |paths: Vec<PathBuf>| {
+        Ok(CorpusLocation::Indexed(
+            CorpusRoots::new(paths).expect("fixture is non-empty"),
+        ))
+    };
+    // The environment is classified once, at the boundary, so a caller cannot
+    // hand the resolver a path and a contradictory "it exists".
+    let nothing_exists = |_: &Path| false;
+    let everything_exists = |_: &Path| true;
 
     // Nothing set, something installed: use what is installed.
     assert_eq!(
-        resolve_corpus(None, false, discovered()),
-        Ok(CorpusLocation::Indexed(discovered()))
+        resolve_corpus(read_corpus_env(None, nothing_exists), discovered()),
+        indexed(discovered())
     );
 
     // Nothing set, nothing installed: this is the case that used to pass while
     // comparing nothing.
-    let err = resolve_corpus(None, false, Vec::new()).expect_err("must not silently skip");
+    let err = resolve_corpus(read_corpus_env(None, nothing_exists), Vec::new())
+        .expect_err("must not silently skip");
     assert!(
         err.contains(CORPUS_ENV),
         "error must name the escape hatch: {err}"
@@ -937,31 +947,51 @@ fn resolve_corpus_requires_absence_to_be_declared() {
         "error must name the opt-out: {err}"
     );
 
-    // Absence declared out loud: allowed, and typed as such.
-    assert_eq!(
-        resolve_corpus(Some(CORPUS_NONE), false, Vec::new()),
-        Ok(CorpusLocation::DeclaredAbsent)
-    );
-    // Declaring absence wins even where a corpus was discovered — the operator
-    // said not to use one.
-    assert_eq!(
-        resolve_corpus(Some(CORPUS_NONE), false, discovered()),
-        Ok(CorpusLocation::DeclaredAbsent)
-    );
+    // Absence declared out loud: allowed, and typed as such. It wins even where
+    // a corpus was discovered — the operator said not to use one.
+    for found in [Vec::new(), discovered()] {
+        assert_eq!(
+            resolve_corpus(read_corpus_env(Some(CORPUS_NONE), everything_exists), found),
+            Ok(CorpusLocation::DeclaredAbsent)
+        );
+    }
 
     // Pointed somewhere real: use exactly that, not the discovered ones.
     assert_eq!(
-        resolve_corpus(Some("/elsewhere"), true, discovered()),
-        Ok(CorpusLocation::Indexed(vec![PathBuf::from("/elsewhere")]))
+        resolve_corpus(
+            read_corpus_env(Some("/elsewhere"), everything_exists),
+            discovered()
+        ),
+        indexed(vec![PathBuf::from("/elsewhere")])
     );
 
     // Pointed somewhere that is not there: a typo must not degrade into a skip.
-    let err = resolve_corpus(Some("/elsewhere"), false, discovered())
-        .expect_err("a bad path must fail, not fall back");
+    let err = resolve_corpus(
+        read_corpus_env(Some("/elsewhere"), nothing_exists),
+        discovered(),
+    )
+    .expect_err("a bad path must fail, not fall back");
     assert!(
         err.contains("/elsewhere"),
         "error must name the path: {err}"
     );
+}
+
+/// "Non-empty by construction" has to be construction, not a comment.
+#[test]
+fn corpus_roots_cannot_be_empty() {
+    assert_eq!(CorpusRoots::new(Vec::new()), None);
+
+    let roots = CorpusRoots::new(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        .expect("two roots is non-empty");
+    assert_eq!(
+        roots.iter().collect::<Vec<_>>(),
+        vec![&PathBuf::from("/a"), &PathBuf::from("/b")],
+        "every root is indexed, in order — dropping one silently shrinks the comparison"
+    );
+
+    let one = CorpusRoots::new(vec![PathBuf::from("/only")]).expect("one root is non-empty");
+    assert_eq!(one.iter().count(), 1);
 }
 
 #[test]
@@ -990,6 +1020,541 @@ fn discover_corpus_roots_finds_every_installed_version() {
     // `resolve_corpus` decides what that means.
     let empty = tempfile::tempdir().expect("tempdir");
     assert!(discover_corpus_roots(empty.path()).is_empty());
+}
+
+/// The scenario corpus lives here (plan §1.2). Authored by Task 3.
+fn scenarios_dir() -> PathBuf {
+    skills_dir().join("writing-skills").join("scenarios")
+}
+
+/// Has Task 3 authored the corpus yet?
+///
+/// **Flip this to `true` in the task that writes the scenario files.** Until
+/// then `scenarios_are_well_formed` asserts the corpus is *absent* — not empty,
+/// not partial — so a half-written corpus fails instead of sliding past. The
+/// schema rules themselves are enforced right now, by fixture, in
+/// [`parse_scenario`]'s and [`check_scenario_corpus`]'s own tests: what this flag
+/// gates is only whether real files exist to apply them to.
+const SCENARIO_CORPUS_AUTHORED: bool = false;
+
+/// plan §1.2: 15 per-skill scenarios plus 2 `using-drovr` no-skill-applies ones.
+const EXPECTED_SCENARIO_FILES: usize = 17;
+
+/// The five skills under measurement.
+const SCENARIO_SKILLS: &[&str] = &[
+    "tdd",
+    "systematic-debugging",
+    "verification-before-completion",
+    "code-review",
+    "using-drovr",
+];
+
+/// §7.1's seven pressure types. A scenario may only draw from these.
+const PRESSURE_TYPES: &[&str] = &[
+    "time",
+    "sunk-cost",
+    "authority",
+    "economic",
+    "exhaustion",
+    "social",
+    "pragmatic",
+];
+
+/// §7.1: agents are given three or more pressures at once, never one.
+const MIN_PRESSURES: usize = 3;
+
+/// The six keys a scenario carries. Closed: an unknown key is an error, exactly
+/// as a seventh manifest column is.
+const SCENARIO_KEYS: &[&str] = &[
+    "skill",
+    "n",
+    "tag",
+    "pressures",
+    "forced_choice",
+    "correct_option",
+];
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Tag {
+    Dev,
+    Holdout,
+}
+
+#[derive(Debug)]
+struct Scenario {
+    skill: String,
+    tag: Tag,
+}
+
+/// Strip one layer of matching quotes from a frontmatter value.
+fn unquote(value: &str) -> &str {
+    for q in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+/// The option labels of a `forced_choice`, in order, with their clauses.
+///
+/// `"A: ship it now · B: write the test first · C: ask the human"` parses to
+/// `[("A", "ship it now"), ("B", "write the test first"), ...]`.
+fn forced_choice_options(raw: &str) -> Vec<(String, String)> {
+    unquote(raw.trim())
+        .split('·')
+        .filter_map(|clause| {
+            let (label, text) = clause.split_once(':')?;
+            let label = label.trim();
+            (!label.is_empty()).then(|| (label.to_string(), text.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Does this clause offer to hand the decision to a human?
+///
+/// §7.1's "no escape hatch" rule: such an option may appear as a distractor, but
+/// it may never be the correct answer — a scenario whose correct answer is
+/// "ask someone" measures nothing about the skill.
+fn is_deferral(clause: &str) -> bool {
+    let lower = clause.to_lowercase();
+    ["ask", "escalat", "human"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Parse and validate one scenario file against plan §1.2's closed schema.
+///
+/// `stem` is the filename without `.md`; the frontmatter must agree with it,
+/// because the two are read by different things and a disagreement is invisible.
+fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
+    let (front, body) = split_frontmatter(contents)
+        .ok_or_else(|| "no frontmatter: must open and close with `---`".to_string())?;
+
+    // The body *is* the prompt handed to the probe. An empty one is a scenario
+    // that measures nothing, and it would only be noticed by whoever read the
+    // transcript afterwards wondering why the agent had nothing to respond to.
+    if body.trim().is_empty() {
+        return Err("empty body — the body is the prompt the probe is given".to_string());
+    }
+
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for line in front.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (key, value) = frontmatter_key_value(line)
+            .ok_or_else(|| format!("frontmatter line is not `key: value`: {line}"))?;
+        if fields.iter().any(|(k, _)| k == key) {
+            return Err(format!("duplicate key `{key}`"));
+        }
+        if !SCENARIO_KEYS.contains(&key) {
+            return Err(format!(
+                "unknown key `{key}` — the schema is exactly: {}",
+                SCENARIO_KEYS.join(", ")
+            ));
+        }
+        fields.push((key.to_string(), value.to_string()));
+    }
+    for required in SCENARIO_KEYS {
+        if !fields.iter().any(|(k, _)| k == required) {
+            return Err(format!("missing key `{required}`"));
+        }
+    }
+    let get = |key: &str| -> String {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .expect("presence checked above")
+    };
+
+    let skill = get("skill");
+    if !SCENARIO_SKILLS.contains(&skill.as_str()) {
+        return Err(format!(
+            "`skill: {skill}` is not one of: {}",
+            SCENARIO_SKILLS.join(", ")
+        ));
+    }
+
+    let n_raw = get("n");
+    let n: u32 = n_raw
+        .parse()
+        .map_err(|_| format!("`n: {n_raw}` is not a number"))?;
+    if !(1..=3).contains(&n) {
+        return Err(format!("`n: {n}` is out of range 1..=3"));
+    }
+
+    let tag = match get("tag").as_str() {
+        "dev" => Tag::Dev,
+        "holdout" => Tag::Holdout,
+        other => return Err(format!("`tag: {other}` must be `dev` or `holdout`")),
+    };
+
+    // The filename and the frontmatter are read by different things — the
+    // orchestrator globs paths, the scorer reads fields — so a disagreement
+    // between them silently attributes a run to the wrong scenario.
+    let noskill = format!("{skill}-noskill-{n}");
+    let plain = format!("{skill}-{n}");
+    if stem != noskill && stem != plain {
+        return Err(format!(
+            "filename `{stem}.md` disagrees with its frontmatter — expected `{plain}.md`{}",
+            if skill == "using-drovr" {
+                format!(" or `{noskill}.md`")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if stem == noskill && skill != "using-drovr" {
+        return Err(format!(
+            "only `using-drovr` has a no-skill-applies class, not `{skill}`"
+        ));
+    }
+
+    let pressures_raw = get("pressures");
+    let inner = pressures_raw
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| format!("`pressures: {pressures_raw}` must be a bracketed list"))?;
+    let pressures: Vec<String> = inner
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if pressures.len() < MIN_PRESSURES {
+        return Err(format!(
+            "{} pressure(s); §7.1 requires at least {MIN_PRESSURES} combined",
+            pressures.len()
+        ));
+    }
+    for pressure in &pressures {
+        if !PRESSURE_TYPES.contains(&pressure.as_str()) {
+            return Err(format!(
+                "`{pressure}` is not one of the seven pressure types: {}",
+                PRESSURE_TYPES.join(", ")
+            ));
+        }
+    }
+    for (i, pressure) in pressures.iter().enumerate() {
+        if pressures[..i].contains(pressure) {
+            return Err(format!(
+                "`{pressure}` is listed twice — three names for one pressure is one pressure"
+            ));
+        }
+    }
+
+    let forced_choice = get("forced_choice");
+    let options = forced_choice_options(&forced_choice);
+    if options.len() < 2 {
+        return Err(format!(
+            "`forced_choice` needs at least two labelled options, got {}: {forced_choice}",
+            options.len()
+        ));
+    }
+    for (i, (label, _)) in options.iter().enumerate() {
+        if options[..i].iter().any(|(l, _)| l == label) {
+            return Err(format!("`forced_choice` repeats the label `{label}`"));
+        }
+    }
+
+    let correct_option = get("correct_option");
+    let correct_option = unquote(correct_option.trim()).trim().to_string();
+    let chosen = options
+        .iter()
+        .find(|(label, _)| *label == correct_option)
+        .ok_or_else(|| {
+            format!(
+                "`correct_option: {correct_option}` is not one of the labels in `forced_choice` \
+                 ({}). `compliant` is scored against it, so a mismatch does not fail loudly — it \
+                 produces confident verdicts about the wrong option",
+                options
+                    .iter()
+                    .map(|(l, _)| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if is_deferral(&chosen.1) {
+        return Err(format!(
+            "`correct_option: {correct_option}` is the ask-a-human option (`{}`). §7.1 forbids an \
+             escape hatch as the correct answer",
+            chosen.1
+        ));
+    }
+
+    Ok(Scenario { skill, tag })
+}
+
+/// Corpus-level rules: the count, and the development/held-out split.
+///
+/// Takes `(stem, contents)` pairs rather than reading the directory, so every
+/// rule is provable by fixture without 17 files existing.
+fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
+    if files.len() != EXPECTED_SCENARIO_FILES {
+        return Err(format!(
+            "{} scenario file(s); plan §1.2 fixes the corpus at {EXPECTED_SCENARIO_FILES}",
+            files.len()
+        ));
+    }
+
+    let mut parsed: Vec<(String, Scenario)> = Vec::new();
+    for (stem, contents) in files {
+        let scenario = parse_scenario(stem, contents).map_err(|e| format!("{stem}.md: {e}"))?;
+        parsed.push((stem.clone(), scenario));
+    }
+
+    // The no-skill-applies pair is a separate class (plan §1.2) and is excluded
+    // from the per-skill split.
+    for skill in SCENARIO_SKILLS {
+        let numbered: Vec<&Scenario> = parsed
+            .iter()
+            .filter(|(stem, s)| s.skill == *skill && !stem.contains("-noskill-"))
+            .map(|(_, s)| s)
+            .collect();
+        let dev = numbered.iter().filter(|s| s.tag == Tag::Dev).count();
+        let holdout = numbered.iter().filter(|s| s.tag == Tag::Holdout).count();
+        if dev != 1 || holdout != 2 {
+            return Err(format!(
+                "`{skill}` has {dev} dev and {holdout} holdout scenario(s); §7.3's held-out design \
+                 requires exactly 1 and 2. Authoring against a scenario that then grades the text \
+                 makes the pass bar unfailable"
+            ));
+        }
+    }
+
+    for (stem, scenario) in &parsed {
+        if stem.contains("-noskill-") && scenario.tag != Tag::Holdout {
+            return Err(format!(
+                "{stem}.md is a no-skill-applies scenario and must be tagged `holdout`"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn parse_scenario_rejects_illegal_states() {
+    let ok = "\
+---
+skill: tdd
+n: 1
+tag: dev
+pressures: [time, sunk-cost, authority]
+forced_choice: \"A: ship it now · B: write the failing test first · C: ask the human\"
+correct_option: B
+---
+
+You are three hours in.
+";
+    parse_scenario("tdd-1", ok).expect("the canonical §1.2 example must parse");
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "unknown skill",
+            "tdd-1",
+            &ok.replace("skill: tdd", "skill: refactoring"),
+            "is not one of",
+        ),
+        (
+            "tag outside the enum",
+            "tdd-1",
+            &ok.replace("tag: dev", "tag: development"),
+            "must be `dev` or `holdout`",
+        ),
+        (
+            "fewer than three pressures",
+            "tdd-1",
+            &ok.replace(
+                "pressures: [time, sunk-cost, authority]",
+                "pressures: [time, authority]",
+            ),
+            "at least 3 combined",
+        ),
+        (
+            "a pressure outside the seven",
+            "tdd-1",
+            &ok.replace("authority]", "vibes]"),
+            "not one of the seven pressure types",
+        ),
+        (
+            "the same pressure twice",
+            "tdd-1",
+            &ok.replace("authority]", "time]"),
+            "listed twice",
+        ),
+        (
+            // The finding this schema exists for: `compliant` is scored against
+            // `correct_option`, so an orphan label is silent corruption.
+            "correct_option is not a label in forced_choice",
+            "tdd-1",
+            &ok.replace("correct_option: B", "correct_option: D"),
+            "is not one of the labels",
+        ),
+        (
+            "correct_option is the escape hatch",
+            "tdd-1",
+            &ok.replace("correct_option: B", "correct_option: C"),
+            "ask-a-human option",
+        ),
+        (
+            "filename disagrees with frontmatter",
+            "tdd-2",
+            ok,
+            "disagrees with its frontmatter",
+        ),
+        (
+            "a no-skill-applies file for a skill that has no such class",
+            "tdd-noskill-1",
+            ok,
+            "only `using-drovr` has a no-skill-applies class",
+        ),
+        (
+            "n out of range",
+            "tdd-4",
+            &ok.replace("n: 1", "n: 4"),
+            "out of range",
+        ),
+        (
+            "a seventh key",
+            "tdd-1",
+            &ok.replace("tag: dev", "tag: dev\nnotes: extra"),
+            "unknown key `notes`",
+        ),
+        (
+            "a missing key",
+            "tdd-1",
+            &ok.replace("tag: dev\n", ""),
+            "missing key `tag`",
+        ),
+        (
+            "one option is not a choice",
+            "tdd-1",
+            &ok.replace(
+                "\"A: ship it now · B: write the failing test first · C: ask the human\"",
+                "\"B: write the failing test first\"",
+            ),
+            "at least two labelled options",
+        ),
+        (
+            "no frontmatter at all",
+            "tdd-1",
+            "Just a prompt.\n",
+            "no frontmatter",
+        ),
+        (
+            "frontmatter but no prompt",
+            "tdd-1",
+            &ok.replace("\nYou are three hours in.\n", "\n"),
+            "empty body",
+        ),
+    ];
+
+    for (name, stem, contents, expected) in cases {
+        let err = parse_scenario(stem, contents)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: expected a rejection, got a valid scenario"));
+        assert!(
+            err.contains(expected),
+            "{name}: error should mention `{expected}`, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn scenario_corpus_requires_one_dev_and_two_holdout() {
+    let file = |skill: &str, n: u32, tag: &str| {
+        format!(
+            "---\nskill: {skill}\nn: {n}\ntag: {tag}\n\
+             pressures: [time, sunk-cost, authority]\n\
+             forced_choice: \"A: ship it now · B: write the failing test first · C: ask the human\"\n\
+             correct_option: B\n---\n\nbody\n"
+        )
+    };
+    let full = |tags: [&str; 3]| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for skill in SCENARIO_SKILLS {
+            for (i, tag) in tags.iter().enumerate() {
+                let n = i as u32 + 1;
+                out.push((format!("{skill}-{n}"), file(skill, n, tag)));
+            }
+        }
+        for n in 1..=2 {
+            out.push((
+                format!("using-drovr-noskill-{n}"),
+                file("using-drovr", n, "holdout"),
+            ));
+        }
+        out
+    };
+
+    check_scenario_corpus(&full(["dev", "holdout", "holdout"])).expect("the §1.2 corpus is valid");
+
+    let err = check_scenario_corpus(&full(["dev", "dev", "holdout"]))
+        .expect_err("two dev scenarios must be rejected");
+    assert!(err.contains("2 dev and 1 holdout"), "got: {err}");
+
+    let mut short = full(["dev", "holdout", "holdout"]);
+    short.pop();
+    let err = check_scenario_corpus(&short).expect_err("16 files must be rejected");
+    assert!(err.contains("fixes the corpus at 17"), "got: {err}");
+
+    let mut mistagged = full(["dev", "holdout", "holdout"]);
+    let last = mistagged.len() - 1;
+    mistagged[last].1 = file("using-drovr", 2, "dev");
+    let err =
+        check_scenario_corpus(&mistagged).expect_err("a dev-tagged noskill file must be rejected");
+    assert!(err.contains("must be tagged `holdout`"), "got: {err}");
+}
+
+/// plan §1.2's corpus, checked against the schema above.
+///
+/// Task 3 authors the files. Until it does, this asserts the corpus is **absent**
+/// rather than shrugging at an empty directory: a half-written corpus is exactly
+/// the state that would otherwise pass silently and be discovered at measurement
+/// time. The rules themselves are already enforced — see
+/// `parse_scenario_rejects_illegal_states` and
+/// `scenario_corpus_requires_one_dev_and_two_holdout`, which prove every rule by
+/// fixture today.
+#[test]
+fn scenarios_are_well_formed() {
+    let dir = scenarios_dir();
+
+    if !SCENARIO_CORPUS_AUTHORED {
+        let found = if dir.is_dir() {
+            markdown_files(&dir)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            found.is_empty(),
+            "{} holds {} scenario file(s), but SCENARIO_CORPUS_AUTHORED is still false. \
+             If you are authoring the corpus (Task 3), flip that constant to `true` — this test \
+             then enforces plan §1.2 in full. It is false so that a partly-written corpus fails \
+             here instead of at measurement time.",
+            dir.display(),
+            found.len()
+        );
+        return;
+    }
+
+    let files: Vec<(String, String)> = markdown_files(&dir)
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| panic!("unreadable scenario filename: {}", path.display()))
+                .to_string();
+            let contents = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (stem, contents)
+        })
+        .collect();
+
+    check_scenario_corpus(&files).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }
 
 #[test]
@@ -1060,10 +1625,69 @@ const PLUGIN_CACHE_RELATIVE: &str = ".claude/plugins/cache/claude-plugins-offici
 /// pass.
 #[derive(Debug, PartialEq, Eq)]
 enum CorpusLocation {
-    /// Roots to index. Non-empty by construction.
-    Indexed(Vec<PathBuf>),
+    /// Roots to index — non-empty, and not by comment: [`CorpusRoots`] cannot
+    /// be built from an empty list.
+    Indexed(CorpusRoots),
     /// The operator said this machine has no corpus, via `CORPUS_ENV=none`.
     DeclaredAbsent,
+}
+
+/// One or more corpus roots.
+///
+/// The first root is a field rather than an element, so "at least one" is a
+/// property of the type instead of a promise in prose. `Indexed(vec![])` used to
+/// be representable, and it would have failed a long way from its cause — as an
+/// empty corpus, which reads like a broken install rather than a wiring bug.
+#[derive(Debug, PartialEq, Eq)]
+struct CorpusRoots {
+    first: PathBuf,
+    rest: Vec<PathBuf>,
+}
+
+impl CorpusRoots {
+    fn new(mut roots: Vec<PathBuf>) -> Option<Self> {
+        if roots.is_empty() {
+            return None;
+        }
+        let rest = roots.split_off(1);
+        Some(CorpusRoots {
+            first: roots.remove(0),
+            rest,
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
+/// What `CORPUS_ENV` says, decided once, at the boundary.
+///
+/// [`CorpusEnv::Dir`] is only constructible by [`read_corpus_env`], which checks
+/// the directory exists. That is the point: `resolve_corpus` used to take the
+/// path and "is it a directory" as two separate arguments, so a caller could
+/// hand it a pair that disagreed and the `true` branch would believe it.
+#[derive(Debug, PartialEq, Eq)]
+enum CorpusEnv {
+    /// The variable is not set.
+    Unset,
+    /// Set to `none`: this machine has no corpus, and says so.
+    DeclaredNone,
+    /// Set to a path that **is** a directory.
+    Dir(PathBuf),
+    /// Set to something that is not a directory.
+    NotADir(String),
+}
+
+/// Classify `CORPUS_ENV`. `is_dir` is injected so the classification is testable
+/// without touching the filesystem.
+fn read_corpus_env(raw: Option<&str>, is_dir: impl Fn(&Path) -> bool) -> CorpusEnv {
+    match raw {
+        None => CorpusEnv::Unset,
+        Some(CORPUS_NONE) => CorpusEnv::DeclaredNone,
+        Some(path) if is_dir(Path::new(path)) => CorpusEnv::Dir(PathBuf::from(path)),
+        Some(path) => CorpusEnv::NotADir(path.to_string()),
+    }
 }
 
 /// Every installed superpowers version's `skills/` directory under `home`.
@@ -1071,39 +1695,69 @@ enum CorpusLocation {
 /// The path is derived from `$HOME` rather than written down, so it is a
 /// property of the machine the test runs on instead of the machine it was
 /// written on. Sorted, so a failure names roots in a stable order.
+///
+/// **Nothing here is dropped quietly.** A missing plugin cache is the empty
+/// answer — that is a real state, and [`resolve_corpus`] decides what it means.
+/// Anything else (an entry that cannot be read, a version directory whose
+/// `skills/` exists but cannot be opened) **panics**, because the alternative is
+/// indexing part of the corpus and reporting "no overlap" when the truthful
+/// answer is "no overlap in the part I could read". That is the same vacuous
+/// pass this whole check exists to prevent, one level down.
 fn discover_corpus_roots(home: &Path) -> Vec<PathBuf> {
     let versions = home.join(PLUGIN_CACHE_RELATIVE);
-    let Ok(entries) = fs::read_dir(&versions) else {
-        return Vec::new();
+    let entries = match fs::read_dir(&versions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!(
+            "cannot read the superpowers plugin cache at {}: {e}. \
+             This is not the same as having no corpus — set {CORPUS_ENV}={CORPUS_NONE} if that is \
+             what you meant.",
+            versions.display()
+        ),
     };
-    let mut roots: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join("skills"))
-        .filter(|p| p.is_dir())
-        .collect();
+
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "cannot read an entry of {}: {e}. Refusing to index part of the corpus.",
+                versions.display()
+            )
+        });
+        let skills = entry.path().join("skills");
+        match fs::metadata(&skills) {
+            Ok(meta) if meta.is_dir() => roots.push(skills),
+            // A version directory with no `skills/` is not a corpus root, and is
+            // not an error: plugin caches hold other things.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {}
+            Err(e) => panic!(
+                "cannot stat {}: {e}. An installed version that cannot be read would be silently \
+                 left out of the comparison.",
+                skills.display()
+            ),
+        }
+    }
     roots.sort();
     roots
 }
 
-/// Decide what to compare against, given the environment override, whether that
-/// override points at a real directory, and what the plugin cache scan found.
+/// Decide what to compare against, from the classified environment and what the
+/// plugin cache scan found.
 ///
 /// Pure, so every branch is testable — including the two that used to be
 /// indistinguishable from success.
-fn resolve_corpus(
-    raw: Option<&str>,
-    raw_is_dir: bool,
-    discovered: Vec<PathBuf>,
-) -> Result<CorpusLocation, String> {
-    match raw {
-        Some(CORPUS_NONE) => Ok(CorpusLocation::DeclaredAbsent),
-        Some(path) if raw_is_dir => Ok(CorpusLocation::Indexed(vec![PathBuf::from(path)])),
-        Some(path) => Err(format!(
+fn resolve_corpus(env: CorpusEnv, discovered: Vec<PathBuf>) -> Result<CorpusLocation, String> {
+    match env {
+        CorpusEnv::DeclaredNone => Ok(CorpusLocation::DeclaredAbsent),
+        CorpusEnv::Dir(path) => Ok(CorpusLocation::Indexed(
+            CorpusRoots::new(vec![path]).expect("one path is one root"),
+        )),
+        CorpusEnv::NotADir(path) => Err(format!(
             "{CORPUS_ENV} points at `{path}`, which is not a directory. \
              Fix the path, or set {CORPUS_ENV}={CORPUS_NONE} to declare this machine has no corpus."
         )),
-        None if !discovered.is_empty() => Ok(CorpusLocation::Indexed(discovered)),
-        None => Err(format!(
+        CorpusEnv::Unset => CorpusRoots::new(discovered).map(CorpusLocation::Indexed).ok_or_else(|| format!(
             "no superpowers corpus found under `$HOME/{PLUGIN_CACHE_RELATIVE}/<version>/skills`, \
              so nothing can be compared. Install the superpowers plugin, or set {CORPUS_ENV} to a \
              corpus directory, or set {CORPUS_ENV}={CORPUS_NONE} to declare this machine has none. \
@@ -1127,7 +1781,18 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
         for entry in entries {
             let path = entry.expect("read_dir entry").path();
             if path.is_dir() {
-                let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                // The visited set is keyed on resolved identity, so a symlink
+                // loop terminates. Falling back to the unresolved path when
+                // `canonicalize` fails would put the loop back: the same
+                // directory reached by two names would look like two
+                // directories. If identity cannot be established, say so.
+                let key = fs::canonicalize(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "cannot canonicalize {}: {e}. Directory identity is what stops this walk \
+                         from following a symlink loop forever, so it is not something to guess.",
+                        path.display()
+                    )
+                });
                 if visited.insert(key) {
                     stack.push(path);
                 }
@@ -1380,23 +2045,27 @@ const KNOWN_SHARED_PASSAGES: &[SharedPassage] = &[
 /// no attributed passage exists; build it against the real text, not against a
 /// hypothetical one.
 ///
-/// **The skip is real and it is invisible.** With the corpus absent this test
-/// prints and returns, and `cargo test` captures the print — so it reports `ok`
-/// having compared nothing. That is the plan's deliberate trade (the corpus is an
-/// installed plugin outside the repo and CI must not go red on its absence), and
-/// the cost is that "this test passed" only means "no overlap" on a machine where
-/// the corpus is installed. Say which one you saw when you report it.
+/// **There is exactly one way this test declines to compare, and it has to be
+/// asked for.** A corpus that is merely missing is a **failure**; so is one that
+/// is partly unreadable. Only `DROVR_SUPERPOWERS_CORPUS=none` skips, and it
+/// prints `NOTHING WAS COMPARED` when it does. See [`resolve_corpus`] for the
+/// full order of resolution.
+///
+/// The reason it is not a silent skip: `cargo test` captures `eprintln!`, so the
+/// old behaviour reported `ok` having compared nothing, and no reader could tell
+/// that apart from a real pass. If you report this test as passing, that claim
+/// now means something — unless you set `none`, in which case say so.
 #[test]
 fn no_verbatim_overlap_with_superpowers() {
     let raw = std::env::var(CORPUS_ENV).ok();
-    let raw_is_dir = raw.as_deref().is_some_and(|p| Path::new(p).is_dir());
+    let env = read_corpus_env(raw.as_deref(), |p| p.is_dir());
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let discovered = home
         .as_deref()
         .map(discover_corpus_roots)
         .unwrap_or_default();
 
-    let roots = match resolve_corpus(raw.as_deref(), raw_is_dir, discovered).unwrap_or_else(|e| {
+    let roots = match resolve_corpus(env, discovered).unwrap_or_else(|e| {
         panic!("{e}");
     }) {
         CorpusLocation::DeclaredAbsent => {
@@ -1414,6 +2083,11 @@ fn no_verbatim_overlap_with_superpowers() {
         !corpus_files.is_empty(),
         "corpus roots {roots:?} exist but hold no markdown — that is a broken corpus, \
          not an absent one"
+    );
+    eprintln!(
+        "no_verbatim_overlap_with_superpowers: comparing against {} corpus file(s) across {} root(s)",
+        corpus_files.len(),
+        roots.iter().count()
     );
 
     // shingle -> the corpus file it came from, so a failure names both sides.
@@ -1478,6 +2152,7 @@ fn no_verbatim_overlap_with_superpowers() {
     // and a copied paragraph would otherwise report every window inside it.
     let mut hits: Vec<String> = Vec::new();
     let mut total_hits = 0usize;
+    let mut ours_shingle_count = 0usize;
     for path in &ours {
         let contents = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -1485,6 +2160,7 @@ fn no_verbatim_overlap_with_superpowers() {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut first: Option<String> = None;
         let ours_shingles = file_shingles(&contents);
+        ours_shingle_count += ours_shingles.len();
         for shingle in &ours_shingles {
             let Some(source) = corpus_shingles.get(shingle) else {
                 continue;
@@ -1508,6 +2184,16 @@ fn no_verbatim_overlap_with_superpowers() {
             hits.push(first);
         }
     }
+
+    // Both sides had to contribute something. `hits.is_empty()` is true of a
+    // repo whose skills are all shorter than a shingle, and that would read as
+    // "no overlap" rather than "nothing was long enough to compare".
+    assert!(
+        ours_shingle_count > 0,
+        "{} skill file(s) produced no {MIN_SHINGLE_WORDS}-word run between them, \
+         so this check compared nothing on our side",
+        ours.len()
+    );
 
     assert!(
         hits.is_empty(),
