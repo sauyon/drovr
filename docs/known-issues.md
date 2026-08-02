@@ -1930,11 +1930,22 @@ our copy; the general fix is the compare-and-swap or lockfile already proposed a
 
 Two consequences worth knowing:
 
-1. The `|=` merge (rescue false→true, never true→false) is deliberately defensive but
-   currently unreachable: every caller reaching it has `archived == false` in memory, because
-   `code_review_run` refuses archived runs up front. Changing it to `=` passes the whole
-   suite. It is kept as `|=` because a future writer that legitimately holds `true` should
-   not have it cleared, but no test defends that and none can until such a writer exists.
+1. **The `|=` merge (rescue false→true, never true→false) is REACHABLE, and it can undo a
+   Restore.** This paragraph used to say it was unreachable "because `code_review_run` refuses
+   archived runs up front" — that is only true of runs archived *before* the panel starts.
+   `archiving_mid_run_survives_every_save_the_review_makes` (`cli/src/code_review.rs`) pins the
+   case that gets past it: the human archives while the panel is in flight, `spawn_reviewer`'s
+   trailing `save_preserving_archived` reads `true` off disk, and the caller's copy is latched
+   `true` for the rest of its life. If the human then hits Restore, the panel's next
+   `save_preserving_archived` (its deadline save, or its final one) ORs the live `false` with
+   that stale `true` and writes `archived: true` back — silently re-archiving a run the human
+   just restored, with no further click from them. Not introduced by the 2026-08-02 workspace
+   work and not fixed by it; surfaced by reviewing it. See "A repair must not decide what the
+   human decided" below for why `phase::ensure_workspace` reads the flag from DISK rather than
+   from the caller's copy, which is the one place this branch could keep the staleness out of.
+   The real fix is for `save_preserving_archived` to distinguish "I did not touch this field"
+   from "I hold a value for it" — a change to a shared invariant with its own callers to
+   audit, so it is recorded here rather than bolted on.
 2. The re-read swallows a load error (`if let Ok(disk)`), then `save` does `create_dir_all`.
    If `drovr cleanup --purge` deletes the run directory while a review is blocked, the
    eventual save recreates a `state.json` for a run the human explicitly deleted. This
@@ -2598,6 +2609,13 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
 - **`workspace_exists` is biased toward alive**, like `pane_exists`: only a workspace listing
   herdr actually answered proves death. An unreachable daemon reads as "still there", because
   re-provisioning over a live workspace would orphan the run's own agents.
+- **A repair must not decide what the human decided.** `ensure_workspace` refuses to
+  re-provision a run that is `archived` — the destroyed workspace was, before this change, the
+  only thing enforcing that decision, and repairing it silently would start a live agent on a
+  run the UI shows as filed away. Restore first. The flag is read from `state.json`, NOT from
+  the caller's in-memory copy, because that copy can hold a stale `true` forever (see
+  "`save_preserving_archived` rescues one field", consequence 1) and would go on refusing to
+  repair a run the human had already restored.
 - **A run with no `project_dir`** (created before that field existed) still cannot be repaired
   — there is no cwd to open a workspace in. The error names that field and its path rather
   than telling you to start over. Every site that refuses for this reason now raises the same

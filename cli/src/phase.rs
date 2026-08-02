@@ -429,10 +429,17 @@ pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<Works
     //
     // Checked after `workspace_exists`, so an archived run whose `workspace_close`
     // failed — a zombie, with live panes — still starts exactly as it does today.
-    // Read from disk as well as from memory: a caller may have held this state
-    // since before the human clicked Archive, which is the same staleness
-    // `save_preserving_archived` exists for.
-    let archived_now = run.archived || RunState::load(&run.name).is_ok_and(|d| d.archived);
+    //
+    // DISK, not the caller's copy. Archive and Restore are both writes to
+    // `state.json` by another process, so disk holds the human's current decision
+    // while an in-memory flag can be stale in EITHER direction — and one of those
+    // directions is not rare: `save_preserving_archived` merges with `|=`, so a
+    // writer that once saw an Archive keeps `archived: true` in its own copy for
+    // the rest of its life (`code_review_run` does this when a panel is archived
+    // mid-flight). Trusting that copy would keep refusing to repair a run the
+    // human had already Restored. The in-memory flag is only the fallback, for
+    // when there is nothing on disk to read.
+    let archived_now = RunState::load(&run.name).map_or(run.archived, |disk| disk.archived);
     if archived_now {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2437,6 +2444,37 @@ mod tests {
         assert!(
             !h.calls().iter().any(|c| c.contains("workspace_create")),
             "no workspace may be created for a run the human filed away: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The archive flag a caller holds in memory can be STALE IN BOTH DIRECTIONS,
+    /// and only one of them is the human's current decision.
+    ///
+    /// `save_preserving_archived` merges with `|=`, so any writer that once
+    /// observed an Archive keeps `archived: true` in its own copy forever — a
+    /// `code-review run` whose panel was archived mid-flight does exactly this
+    /// (`archiving_mid_run_survives_every_save_the_review_makes`). If the human
+    /// then hits Restore, that stale `true` must not be what decides whether the
+    /// run may be repaired. Disk is where Archive and Restore both land, so disk
+    /// wins.
+    #[test]
+    fn a_restore_on_disk_beats_a_stale_archive_held_in_memory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-stale-test", "wAG");
+        // The human's current decision, as recorded by the Restore button.
+        run.archived = false;
+        run.save().unwrap();
+        // ...and this caller's copy, latched `true` by an Archive it saw earlier.
+        run.archived = true;
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a restored run must be repairable despite a caller's stale flag");
+        assert!(
+            h.calls().iter().any(|c| c.contains("workspace_create")),
+            "the workspace must be rebuilt: {:?}",
             h.calls()
         );
     }
