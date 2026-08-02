@@ -1827,11 +1827,16 @@ as verified.
    zombie a fact about the run rather than something re-derived from herdr on every poll.
    (2) is the stronger fix: it survives herdr being down entirely.
 
-## Restoring an archived run does not make it runnable again
+## Restoring an archived run does not make it runnable again — FIXED 2026-08-02
 
 **Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
 expectation.
 **Found:** 2026-07-25, re-reviewing the archive button.
+**Fixed:** 2026-08-02 by fix idea 1 below — `phase_start` now re-provisions a workspace that
+is gone (`phase::ensure_workspace`), so Restore does mean what it looks like it means. The
+archived run's *panes* are still gone: a phase that was `Running` when it was archived comes
+back `Failed` and has to be restarted. See "A run whose herdr workspace disappears is
+unrecoverable through drovr's own commands" at the end of this file.
 
 `POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — clears the flag
 and moves the row back to the active list. It cannot bring the agent back: archiving closed
@@ -2519,3 +2524,75 @@ That lock is the *only* check. `server.addr` is read solely to put a URL in the 
   hatch that could itself cause the split brain. Any second signal needs to identify *which*
   server answered (e.g. a per-server nonce in the response and in a discovery file), not just
   that something did.
+
+## A run whose herdr workspace disappears is unrecoverable through drovr's own commands (2026-08-02) — FIXED
+
+**Severity:** high — it made a live 23-task run at task 3 (approved spec, plan, two tasks of
+committed work) reachable only by hand-editing `state.json`, and the command built for
+recovery reported a resume it had not restored.
+**Found:** 2026-08-02, driving `skill-stickiness`.
+
+### What happened
+
+1. The driver closed the last remaining pane in workspace `wAG` while reaping finished
+   reviewer panes. herdr destroys a workspace when its final pane closes — reasonable of
+   herdr, and `drovr cleanup` does the same thing on purpose.
+2. `state.json` still read `"workspace": "wAG"`. Nothing validated it.
+3. `drovr phase start` failed with the raw daemon error:
+   `phase start failed: workspace wAG not found (herdr error code: workspace_not_found)`.
+4. `drovr resurrect skill-stickiness` printed the full phase list and
+   `To resume: drovr phase start 'skill-stickiness' 'implement'` — **an instruction that
+   could not work**, because `resurrect` never touched the workspace. This is the part worth
+   dwelling on: a recovery command that reports success it did not achieve is worse than one
+   that errors, because the next failure lands somewhere unrelated and you go looking there.
+5. Clearing `workspace` to `null` by hand produced a different refusal:
+   `run '…' has no herdr workspace (creation failed at drovr new); please recreate the run
+   with drovr new` — advice that would have discarded everything the run had produced.
+
+### The near-miss, if you are recovering by hand
+
+Recovery required calling `herdr workspace create` directly. **The first attempt omitted
+`--cwd`, so the new workspace's pane opened in an unrelated repository**
+(`~/devel/modular`, on someone else's branch). Nothing about the pane says so; it is a shell
+prompt like any other. It was caught only because the driver checked the pane's cwd before
+briefing an agent into it. One step later a phase agent would have been reading, editing and
+committing in the wrong repo, believing it was in the run's worktree.
+
+So: **always pass `--cwd <the run's project_dir>`**, and check `pwd` in the pane before you
+brief anything into it.
+
+### Digging out by hand (older binaries)
+
+```
+herdr workspace create --label 'drovr:<run>' --cwd "$(jq -r .project_dir ~/.local/share/drovr/runs/<run>/state.json)"
+```
+
+Then edit `~/.local/share/drovr/runs/<run>/state.json`: set `workspace` to the new id,
+`root_pane` to the new workspace's root pane id, drop every `pane_id` in `phases` and
+`review_phases` (they name panes that no longer exist), empty `retired_panes`, and change any
+`"status": "Running"` to `"Failed"` — those agents are gone with their context.
+
+### What changed
+
+`phase::ensure_workspace` (`cli/src/phase.rs`) now runs at the three points that actually
+need a workspace — `phase_start`, `spawn_reviewer` and `resurrect`. If `Herdr::workspace_exists`
+reports the recorded workspace gone (or none was ever recorded), it creates a replacement,
+**always with the run's `project_dir` as cwd**, and writes the new ids back. `resurrect` either
+restores the workspace or exits non-zero; it no longer prints a resume it cannot deliver.
+"Recreate the run" is no longer the advice for a lost workspace anywhere.
+
+### What is still true
+
+- **drovr does not stop a workspace from being emptied.** Holding the root pane open would
+  make this rarer, but it is a second, weaker mechanism beside the authoritative one and it
+  leaves an idle pane behind after `cleanup`. Re-provisioning is the guarantee; there is
+  deliberately no backstop.
+- **A phase that was `Running` becomes `Failed`, not respawned.** Its agent died with the
+  workspace, taking its context. Restart the one you want — silently respawning would present
+  work nobody is doing as still in flight, which is the same lie `resurrect` used to tell.
+- **`workspace_exists` is biased toward alive**, like `pane_exists`: only a workspace listing
+  herdr actually answered proves death. An unreachable daemon reads as "still there", because
+  re-provisioning over a live workspace would orphan the run's own agents.
+- **A run with no `project_dir`** (created before that field existed) still cannot be repaired
+  — there is no cwd to open a workspace in. The error names that field and its path rather
+  than telling you to start over.

@@ -464,7 +464,7 @@ fn cmd_new(
     // Create the workspace in the project dir so its root shell pane (reused by
     // the first phase) and every later tab start already `cd`'d into the project.
     let (workspace, root_pane) =
-        match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
+        match herdr.workspace_create(&phase::workspace_label(name), &project_dir) {
             Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
             Err(e) => {
                 eprintln!("drovr: warning: could not create herdr workspace: {e}");
@@ -773,31 +773,82 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
     }
 }
 
-fn cmd_resurrect(name: &str) {
+/// `drovr resurrect`, minus the process plumbing: RESTORE the run — which means
+/// making its herdr workspace real again — and then report where to resume.
+///
+/// The order is the whole point. This command's help says it "reloads a stopped
+/// run and reports the resume point", and it used to print
+/// `To resume: drovr phase start …` having restored nothing, so the resume it
+/// advertised died on the next command with a raw `workspace_not_found`. A
+/// recovery command that reports success it did not achieve is worse than one
+/// that errors: it sends you looking for the fault somewhere else entirely.
+/// Either the workspace is there when this returns `Ok`, or this returns `Err`.
+fn resurrect_report<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<String> {
+    let Some(idx) = run.first_incomplete() else {
+        // Nothing to resume into, so nothing to provision: a finished run does
+        // not need a workspace conjured up to be told it is finished.
+        return Ok(format!(
+            "run '{}' is fully complete — nothing to resurrect",
+            run.name
+        ));
+    };
+
+    let mut out = String::new();
+    if let phase::WorkspaceHealing::Reprovisioned {
+        workspace,
+        orphaned,
+    } = phase::ensure_workspace(h, run)?
+    {
+        out.push_str(&format!(
+            "restored run '{}': its herdr workspace was gone; created {workspace} in {}\n",
+            run.name, run.project_dir
+        ));
+        if !orphaned.is_empty() {
+            out.push_str(&format!(
+                "  these phases were Running in it and their agents are gone with their \
+                 context — marked FAILED: {}\n",
+                orphaned.join(", ")
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Re-read the resume point: the repair above may have demoted the phase that
+    // was `Running` to `Failed`, which does not move `first_incomplete` — but
+    // reading it again keeps this honest if that ever changes.
+    let idx = run.first_incomplete().unwrap_or(idx);
+    out.push_str(&format!(
+        "run '{}' — resume at phase {idx}: {}\n",
+        run.name, run.phases[idx].name
+    ));
+    // Print all phases for context
+    for (i, p) in run.phases.iter().enumerate() {
+        out.push_str(&format!(
+            "  [{i}] {} — {}\n",
+            p.name,
+            phase_status_str(&p.status)
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "To resume: drovr phase start {} {}",
+        shell_single_quote(&run.name),
+        shell_single_quote(&run.phases[idx].name)
+    ));
+    Ok(out)
+}
+
+fn cmd_resurrect<H: Herdr>(h: &H, name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
-    let run = load_run(name);
-    match run.first_incomplete() {
-        Some(idx) => {
-            println!(
-                "run '{name}' — resume at phase {idx}: {}",
-                run.phases[idx].name
-            );
-            // Print all phases for context
-            for (i, p) in run.phases.iter().enumerate() {
-                println!("  [{i}] {} — {}", p.name, phase_status_str(&p.status));
-            }
-            println!();
-            println!(
-                "To resume: drovr phase start {} {}",
-                shell_single_quote(name),
-                shell_single_quote(&run.phases[idx].name)
-            );
-        }
-        None => {
-            println!("run '{name}' is fully complete — nothing to resurrect");
+    let mut run = load_run(name);
+    match resurrect_report(h, &mut run) {
+        Ok(report) => println!("{report}"),
+        Err(e) => {
+            eprintln!("drovr: cannot resurrect run '{name}': {e}");
+            process::exit(1);
         }
     }
 }
@@ -1477,7 +1528,7 @@ fn main() {
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
-        Commands::Resurrect { name } => cmd_resurrect(&name),
+        Commands::Resurrect { name } => cmd_resurrect(&SystemHerdr::new(), &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
@@ -1585,6 +1636,134 @@ mod tests {
         };
         run.save().expect("seed run");
         run
+    }
+
+    // -- resurrect --------------------------------------------------------------
+
+    /// A run whose workspace is gone, mid-flight at `implement`.
+    #[cfg(test)]
+    fn seed_workspaceless_run(name: &str) -> RunState {
+        let run = RunState {
+            name: name.into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                run::Phase {
+                    name: "brainstorm".into(),
+                    status: PhaseStatus::Done,
+                    ..Default::default()
+                },
+                run::Phase {
+                    name: "implement".into(),
+                    status: PhaseStatus::Running,
+                    pane_id: Some("wAG:p1".into()),
+                    ..Default::default()
+                },
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("wAG".into()),
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.save().expect("seed run");
+        run
+    }
+
+    /// `resurrect`'s help says it "reloads a stopped run and reports the resume
+    /// point". It used to print `To resume: drovr phase start …` having restored
+    /// nothing at all, so the resume it advertised failed on the next command —
+    /// worse than an error, because it reads as success.
+    #[test]
+    fn resurrect_restores_the_workspace_it_advertises_a_resume_into() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-restores");
+        let mut run = seed_workspaceless_run("lost-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).expect("resurrect must restore or refuse");
+
+        assert!(
+            fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "resurrect must actually restore the workspace: {:?}",
+            fake.calls()
+        );
+        assert_ne!(
+            RunState::load("lost-ws").unwrap().workspace.as_deref(),
+            Some("wAG"),
+            "and persist the new one, or the next command hits the same dead id"
+        );
+        assert!(
+            report.contains("To resume: drovr phase start"),
+            "having restored it, it may say how to resume: {report}"
+        );
+        assert!(
+            report.contains("implement"),
+            "the phase whose agent died is where you resume: {report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The other half of "restore what you advertise, or refuse and say why".
+    #[test]
+    fn resurrect_that_cannot_restore_refuses_instead_of_advertising_a_resume() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-refuses");
+        let mut run = seed_workspaceless_run("unfixable-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+        fake.fail_workspace_create();
+
+        let err = resurrect_report(&fake, &mut run)
+            .expect_err("a resume it cannot deliver must be an error, not a printout");
+        assert!(
+            !err.to_string().contains("To resume"),
+            "it must not smuggle the resume instruction into the failure: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A finished run needs no workspace, and resurrect must not create one just
+    /// to tell you there is nothing to do.
+    #[test]
+    fn resurrect_of_a_finished_run_provisions_nothing() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-complete");
+        let mut run = seed_workspaceless_run("done-ws");
+        for p in run.phases.iter_mut() {
+            p.status = PhaseStatus::Done;
+        }
+        run.save().unwrap();
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).unwrap();
+
+        assert!(report.contains("fully complete"), "{report}");
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "no workspace is needed to say a run is finished: {:?}",
+            fake.calls()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The workspace drovr created for a run is still the human's to use — they

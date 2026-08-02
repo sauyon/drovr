@@ -321,6 +321,130 @@ fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace recovery
+// ---------------------------------------------------------------------------
+
+/// The herdr label drovr gives a run's workspace. One function so `drovr new`
+/// and the re-provisioning path here cannot drift — a replacement workspace
+/// under a different label would be indistinguishable from a human's own in the
+/// switcher, and in `cleanup`'s reasoning about whose panes are whose.
+pub fn workspace_label(run_name: &str) -> String {
+    format!("drovr:{run_name}")
+}
+
+/// What [`ensure_workspace`] had to do.
+pub enum WorkspaceHealing {
+    /// The recorded workspace answered — nothing was touched.
+    Intact,
+    /// There was no live workspace, so one was created. Carries the new id and
+    /// the names of the phases that were `Running` in the dead one, which the
+    /// caller reports: their agents are gone with their context, and that is a
+    /// fact about the run, not a detail of the repair.
+    Reprovisioned {
+        workspace: String,
+        orphaned: Vec<String>,
+    },
+}
+
+/// Guarantee `run` has a live herdr workspace, creating one if it does not.
+///
+/// A workspace is disposable infrastructure — herdr destroys one the moment its
+/// last pane closes, which `drovr cleanup` and ordinary pane-reaping both do —
+/// while a run's phases, handoffs, commits and approved spec are not. Tying the
+/// two together is what once made a 23-task run at task 3 unrecoverable through
+/// drovr's own commands. So a missing workspace is repaired here rather than
+/// reported as a terminal error, and "recreate the run" is never the advice.
+///
+/// HEALS AT THE POINT OF USE, not on load. `RunState::load` is a pure
+/// deserialize with no herdr in reach, and its callers include `drovr status`,
+/// `drovr list` and the always-on server's 2s list poll — none of which may
+/// create infrastructure as a side effect of being read. The launch paths
+/// (`phase_start`, `spawn_reviewer`, `resurrect`) are the ones that genuinely
+/// need a workspace, and they are few enough to enumerate.
+///
+/// Saves `run` when it changes anything, so a caller that fails afterwards still
+/// leaves the repair on disk instead of re-creating a second workspace next time.
+pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<WorkspaceHealing> {
+    if let Some(ws) = run.workspace.as_deref()
+        && h.workspace_exists(ws)
+    {
+        return Ok(WorkspaceHealing::Intact);
+    }
+    // Not "recreate the run": name the one thing that genuinely cannot be
+    // rebuilt. Without a project_dir there is no cwd to open the workspace in,
+    // and a workspace created without one opens wherever herdr defaults to —
+    // the near-miss that nearly had a phase agent editing an unrelated repo.
+    if run.project_dir.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "run '{}' has no herdr workspace and no project_dir to open one in \
+                 (created before project_dir was recorded). Everything else about the \
+                 run is intact: add \"project_dir\" to {} and re-run this command.",
+                run.name,
+                run_dir(&run.name).join("state.json").display()
+            ),
+        ));
+    }
+    let ws = h.workspace_create(&workspace_label(&run.name), &run.project_dir)?;
+
+    // Every pane id in `run` named a pane in the workspace that is gone, so all
+    // of them are now dangling. Dropping them is not tidiness: a stale id is what
+    // `phase_send` would aim at and what `cleanup` would try to close.
+    let mut orphaned = Vec::new();
+    for phase in run.phases.iter_mut().chain(run.review_phases.iter_mut()) {
+        phase.pane_id = None;
+        phase.herdr_session = None;
+        // A `Done` phase does not care — its work is in the handoff and in git.
+        // A `Running` one is the real question, and this is the answer: its agent
+        // died with the workspace, taking its context, so the phase is `Failed`
+        // and not `Running`. Silently respawning would present work nobody is
+        // doing as still in flight, which is the same class of lie as `resurrect`
+        // advertising a resume it never restored.
+        if phase.status == PhaseStatus::Running {
+            phase.status = PhaseStatus::Failed;
+            orphaned.push(phase.name.clone());
+        }
+    }
+    // Retired panes are drovr's to reap, and there is nothing left to reap.
+    run.retired_panes.clear();
+    run.workspace = Some(ws.id.clone());
+    // The replacement's root shell pane is handed to the next phase exactly as
+    // `drovr new`'s is, so recovery leaves no idle shell behind either.
+    run.root_pane = Some(ws.root_pane);
+    run.save_preserving_archived()?;
+    Ok(WorkspaceHealing::Reprovisioned {
+        workspace: ws.id,
+        orphaned,
+    })
+}
+
+/// Repair `run`'s workspace and report on stderr what the repair cost.
+///
+/// Split from [`ensure_workspace`] so the pure state transition stays testable
+/// without capturing output, and so all three launch paths say the same thing.
+fn ensure_workspace_reporting<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<()> {
+    if let WorkspaceHealing::Reprovisioned {
+        workspace,
+        orphaned,
+    } = ensure_workspace(h, run)?
+    {
+        eprintln!(
+            "drovr: run '{}' had no live herdr workspace; created {workspace} in {}",
+            run.name, run.project_dir
+        );
+        if !orphaned.is_empty() {
+            eprintln!(
+                "drovr: these phases were Running in the old workspace and their agents \
+                 are gone with their context — marked FAILED, restart the one you want: {}",
+                orphaned.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -359,6 +483,13 @@ pub fn phase_start<H: Herdr>(
         ));
     }
     let cwd = run.project_dir.clone();
+
+    // BEFORE the pass is minted and this phase is marked Running: a repair
+    // demotes every Running phase to Failed, and running it afterwards would
+    // demote the one we are starting. It also clears this phase's `pane_id`, so
+    // the pane selection below correctly falls through to the new root pane
+    // instead of aiming at a pane in the destroyed workspace.
+    ensure_workspace_reporting(h, run)?;
 
     // Re-entering a phase means: mint a new pass, record it, and drop the previous
     // pass's completion marker — in that order (see the ORDER MATTERS note below).
@@ -419,17 +550,18 @@ pub fn phase_start<H: Herdr>(
     } else if let Some(root) = run.root_pane.clone() {
         used_root = true;
         root
-    } else if let Some(ws) = run.workspace.as_deref() {
-        h.tab_create(ws, phase, &cwd)?
     } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace (creation failed at `drovr new`); \
-                 please recreate the run with `drovr new`",
+        // `ensure_workspace` above either found a live workspace or created one,
+        // so this is an invariant rather than a state a user can be in — and the
+        // advice it used to carry ("recreate the run with `drovr new`") is exactly
+        // what must never be said about a lost workspace.
+        let ws = run.workspace.clone().ok_or_else(|| {
+            io::Error::other(format!(
+                "internal: run '{}' still has no workspace after ensure_workspace",
                 run.name
-            ),
-        ));
+            ))
+        })?;
+        h.tab_create(&ws, phase, &cwd)?
     };
 
     // Use the backend captured by `drovr new`, so every phase stays on the
@@ -521,16 +653,15 @@ pub fn spawn_reviewer<H: Herdr>(
     }
 
     // Reviewers can't reuse the pipeline root pane; they need their own tab, which
-    // requires a workspace.
+    // requires a workspace — so a missing or destroyed one is repaired here too.
+    // `code-review run` spawns several reviewers in a loop, which is precisely
+    // when a workspace is most likely to have been emptied by pane-reaping.
+    ensure_workspace_reporting(h, run)?;
     let ws = run.workspace.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace; cannot spawn a reviewer \
-                 (reviewers need their own tab and never reuse the root pane)",
-                run.name
-            ),
-        )
+        io::Error::other(format!(
+            "internal: run '{}' still has no workspace after ensure_workspace",
+            run.name
+        ))
     })?;
 
     // A fresh tab (with its auto shell pane) in the run workspace — never the root
@@ -2101,6 +2232,196 @@ mod tests {
         run
     }
 
+    // -- workspace recovery ---------------------------------------------------
+
+    /// The live failure this whole area exists for: reaping the last pane in a
+    /// run's workspace makes herdr destroy the workspace, `state.json` goes on
+    /// naming it, and `phase start` used to die on the raw
+    /// `workspace_not_found`. A workspace is disposable infrastructure; the run's
+    /// phases, handoffs and commits are not.
+    #[test]
+    fn phase_start_reprovisions_a_workspace_that_vanished() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-gone-test", "wAG");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Done,
+            pane_id: Some("wAG:p1".into()),
+            ..Default::default()
+        });
+        // The driver closed the last pane; herdr took the workspace with it.
+        h.kill_workspace("wAG", ["wAG:root".to_string(), "wAG:p1".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).expect("a dead workspace must be recoverable");
+
+        let calls = h.calls();
+        let created = calls
+            .iter()
+            .find(|c| c.contains("workspace_create"))
+            .unwrap_or_else(|| panic!("a vanished workspace must be re-created: {calls:?}"));
+        // The near-miss from the manual recovery: a workspace created without the
+        // run's cwd opens in whatever directory herdr defaults to, and briefing an
+        // agent there is silent. If drovr owns creation, drovr owns the cwd.
+        assert!(
+            created.contains("cwd=/tmp/drovr-proj-test"),
+            "the replacement workspace must open in the run's project_dir: {created}"
+        );
+        assert!(
+            created.contains("label=drovr:ws-gone-test"),
+            "the replacement must be labelled for the run, like `drovr new`'s: {created}"
+        );
+
+        assert_ne!(
+            run.workspace.as_deref(),
+            Some("wAG"),
+            "the new workspace id must be recorded, not the dead one"
+        );
+        let ws = run.workspace.clone().expect("a workspace must be recorded");
+        // And the phase really launched into the NEW workspace — recording the id
+        // while spawning into the corpse would be the same bug one level down.
+        let pane = run.phases.iter().find(|p| p.name == "implement").unwrap();
+        let pane_id = pane.pane_id.clone().expect("the phase must have a pane");
+        assert!(
+            pane_id.starts_with(&ws),
+            "the phase pane must live in the new workspace {ws}: {pane_id}"
+        );
+        assert_eq!(pane.status, PhaseStatus::Running);
+        // Persisted, not just in memory: the next command loads from disk.
+        assert_eq!(RunState::load("ws-gone-test").unwrap().workspace, Some(ws));
+    }
+
+    /// Open question 2, pinned. Every pane recorded in the dead workspace is
+    /// dangling, and a `Running` phase's agent is gone with its context. Marking
+    /// it `Failed` says that out loud; leaving it `Running` would advertise work
+    /// nobody is doing.
+    #[test]
+    fn reprovisioning_fails_the_phases_whose_agents_died_with_the_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-orphan-test", "wAG");
+        run.phases.push(Phase {
+            name: "plan".into(),
+            status: PhaseStatus::Done,
+            pane_id: Some("wAG:p1".into()),
+            ..Default::default()
+        });
+        run.phases.push(Phase {
+            name: "brainstorm".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("wAG:p2".into()),
+            ..Default::default()
+        });
+        run.review_phases.push(Phase {
+            name: "review:plan:1:correctness".into(),
+            status: PhaseStatus::Running,
+            pane_id: Some("wAG:p3".into()),
+            ..Default::default()
+        });
+        run.retire_pane("wAG:p4");
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        let plan = run.phases.iter().find(|p| p.name == "plan").unwrap();
+        assert_eq!(
+            plan.status,
+            PhaseStatus::Done,
+            "a finished phase does not care that its pane is gone"
+        );
+        assert!(
+            plan.pane_id.is_none(),
+            "but its pane id names a pane that no longer exists and must be dropped"
+        );
+
+        let brainstorm = run.phases.iter().find(|p| p.name == "brainstorm").unwrap();
+        assert_eq!(
+            brainstorm.status,
+            PhaseStatus::Failed,
+            "a Running phase whose agent died with the workspace is Failed, not Running"
+        );
+        assert!(brainstorm.pane_id.is_none());
+        assert_eq!(
+            run.review_phases[0].status,
+            PhaseStatus::Failed,
+            "a reviewer is no more alive than a phase agent"
+        );
+        assert!(
+            run.retired_panes.is_empty(),
+            "retired panes died with the workspace too; cleanup must not chase them"
+        );
+    }
+
+    /// The other half of the same refusal: `drovr new` warns and records no
+    /// workspace when creation fails, and `phase start` used to answer that with
+    /// "please recreate the run" — for a run that may hold 23 tasks of work.
+    #[test]
+    fn phase_start_provisions_a_workspace_the_run_never_got() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("ws-null-test");
+        run.workspace = None;
+        run.root_pane = None;
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a run whose workspace creation failed must still be startable");
+
+        assert!(run.workspace.is_some(), "a workspace must have been created");
+        let calls = h.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("workspace_create")),
+            "must create the missing workspace rather than refuse: {calls:?}"
+        );
+    }
+
+    /// The guard on all of the above: re-provisioning over a LIVE workspace would
+    /// orphan the run's own agents, which is worse than the bug being fixed.
+    #[test]
+    fn a_live_workspace_is_never_reprovisioned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-live-test", "wAG");
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_create")),
+            "a live workspace must be left exactly as it is: {calls:?}"
+        );
+        assert_eq!(run.workspace.as_deref(), Some("wAG"));
+    }
+
+    /// Reviewers need their own tab, so they need a workspace just as much —
+    /// `code-review run` spawns several in a loop and must not be the one command
+    /// that still dies on a vanished one.
+    #[test]
+    fn spawn_reviewer_reprovisions_a_vanished_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-ws-gone-test", "wAG");
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            "claude --permission-mode plan",
+        )
+        .expect("a reviewer must survive a vanished workspace");
+
+        let ws = run.workspace.clone().unwrap();
+        assert_ne!(ws, "wAG");
+        let calls = h.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains(&format!("tab_create workspace={ws}"))),
+            "the reviewer tab must be created in the new workspace: {calls:?}"
+        );
+    }
+
     // -- RED: write failing test first, then implement -----------------------
 
     #[test]
@@ -2226,19 +2547,39 @@ mod tests {
     }
 
     #[test]
-    fn no_workspace_and_no_root_pane_errors() {
+    fn a_workspace_that_cannot_be_opened_anywhere_says_which_state_is_missing() {
+        // The successor to "phase_start must error when there is no workspace": a
+        // missing workspace is now repaired (see
+        // `phase_start_provisions_a_workspace_the_run_never_got`), so the only
+        // remaining hard failure is the one piece of state that genuinely cannot
+        // be rebuilt — a cwd to open the workspace in. Even then the run is not
+        // sent back to `drovr new`: it names the missing field and where to put
+        // it, because everything else about the run is still good.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
-        let mut run = make_run("no-ws-test");
+        let mut run = make_run("no-cwd-test");
         run.workspace = None;
         run.root_pane = None;
+        run.project_dir = String::new();
 
-        let res = phase_start(&h, &mut run, "plan", None);
+        let err = ensure_workspace(&h, &mut run)
+            .err()
+            .expect("no project_dir means no cwd for a workspace");
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "must error when there is no workspace or root pane"
+            msg.contains("project_dir"),
+            "must name what is missing: {msg}"
         );
-        assert!(res.unwrap_err().to_string().contains("workspace"));
+        assert!(
+            !msg.contains("recreate the run"),
+            "a lost workspace must never be answered with 'start over': {msg}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "must not create a workspace with no cwd — that is how a pane opens in \
+             an unrelated repo: {:?}",
+            h.calls()
+        );
     }
 
     #[test]
@@ -4942,21 +5283,32 @@ mod tests {
     }
 
     #[test]
-    fn spawn_reviewer_errors_without_workspace() {
+    fn spawn_reviewer_provisions_a_workspace_the_run_never_got() {
+        // Was `spawn_reviewer_errors_without_workspace`. A reviewer needs a tab,
+        // a tab needs a workspace, and a workspace is now something drovr makes
+        // rather than something it refuses over.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("rev-no-ws-test");
         run.workspace = None;
 
-        let res = spawn_reviewer(
+        spawn_reviewer(
             &h,
             &mut run,
             "review:t:1:correctness",
             None,
             "claude --permission-mode plan",
+        )
+        .expect("a reviewer must not be blocked by a missing workspace");
+
+        let ws = run.workspace.clone().expect("a workspace must be recorded");
+        assert!(
+            h.calls()
+                .iter()
+                .any(|c| c.contains(&format!("tab_create workspace={ws}"))),
+            "the reviewer tab belongs to the workspace just created: {:?}",
+            h.calls()
         );
-        assert!(res.is_err(), "must error when the run has no workspace");
-        assert!(res.unwrap_err().to_string().contains("workspace"));
     }
 
     #[test]

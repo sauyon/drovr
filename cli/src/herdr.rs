@@ -508,6 +508,16 @@ pub trait Herdr {
     /// answers about WORKSPACES, and its unknown case is `None` by construction
     /// rather than by collapsing two different answers into one.
     fn workspace_list(&self) -> Option<Vec<String>>;
+    /// Whether `workspace` still exists. The workspace-level twin of
+    /// [`Herdr::pane_exists`], and it carries the same bias: only an answer herdr
+    /// actually gave — a listing that does not contain `workspace` — proves death;
+    /// an unreachable daemon reports `true`.
+    ///
+    /// That bias is load-bearing. Its caller (`phase::ensure_workspace`) responds
+    /// to `false` by CREATING a replacement workspace and clearing every recorded
+    /// pane id, so a transient blip read as "gone" would orphan a run's live
+    /// agents — strictly worse than the failure this exists to fix.
+    fn workspace_exists(&self, workspace: &str) -> bool;
     fn pane_exists(&self, pane_id: &str) -> bool;
     fn integration_present(&self, agent: &str) -> bool;
 }
@@ -836,6 +846,17 @@ impl Herdr for SystemHerdr {
             return None;
         }
         parse_workspace_ids(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn workspace_exists(&self, workspace: &str) -> bool {
+        // Built on `workspace_list` rather than on a per-workspace herdr call
+        // because that method already encodes the unknown-vs-empty distinction
+        // this needs: `None` is "could not ask", and only `Some(ids)` is an answer
+        // worth acting on.
+        match self.workspace_list() {
+            Some(ids) => ids.iter().any(|id| id == workspace),
+            None => true,
+        }
     }
 
     fn workspace_focus(&self, id: &str) -> io::Result<()> {
@@ -1322,6 +1343,16 @@ pub struct FakeHerdr {
     agent_read_failures_left: RefCell<Option<u32>>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Workspace ids that `workspace_exists` reports as gone; every other
+    /// workspace exists. Separate from `live_workspaces` (which backs
+    /// `workspace_list`) so the default stays "the run's workspace is fine" —
+    /// `workspace_list`'s default is the empty list, and inferring existence from
+    /// it would make every pre-existing test look like a vanished workspace.
+    dead_workspaces: RefCell<std::collections::HashSet<String>>,
+    /// When true, `workspace_create` errors — herdr is there but will not give us
+    /// a workspace. The path on which recovery must refuse LOUDLY rather than
+    /// advertise a resume it cannot deliver.
+    fail_workspace_create: RefCell<bool>,
     /// Panes each workspace holds, as `workspace_panes` will report them. A
     /// workspace with no entry reports empty — the "nothing but drovr's own panes"
     /// case most tests want.
@@ -1360,6 +1391,8 @@ impl FakeHerdr {
             fail_agent_read: RefCell::new(false),
             agent_read_failures_left: RefCell::new(None),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
+            dead_workspaces: RefCell::new(std::collections::HashSet::new()),
+            fail_workspace_create: RefCell::new(false),
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
@@ -1389,6 +1422,25 @@ impl FakeHerdr {
     /// `pane_exists` reports `false` for it.
     pub fn kill_pane(&self, pane_id: impl Into<String>) {
         self.dead_panes.borrow_mut().insert(pane_id.into());
+    }
+
+    /// Model `workspace_id` having been destroyed — the live failure this fake
+    /// exists to reproduce: herdr destroys a workspace when its last pane closes,
+    /// and `state.json` goes on naming it. Every pane inside it dies with it, so
+    /// this kills those too.
+    pub fn kill_workspace(&self, workspace_id: &str, panes: impl IntoIterator<Item = String>) {
+        self.dead_workspaces
+            .borrow_mut()
+            .insert(workspace_id.to_owned());
+        for pane in panes {
+            self.kill_pane(pane);
+        }
+    }
+
+    /// Make every `workspace_create` fail — herdr is reachable but will not hand
+    /// out a workspace.
+    pub fn fail_workspace_create(&self) {
+        *self.fail_workspace_create.borrow_mut() = true;
     }
 
     /// Queue a transcript for one specific pane, taking priority over `push_read`.
@@ -1561,6 +1613,9 @@ impl Herdr for FakeHerdr {
         self.record(format!(
             "workspace_create label={label} cwd={cwd} -> {ws_id} root_pane={root_pane}"
         ));
+        if *self.fail_workspace_create.borrow() {
+            return Err(io::Error::other("scripted workspace_create failure"));
+        }
         Ok(Workspace {
             id: ws_id,
             root_pane,
@@ -1761,6 +1816,11 @@ impl Herdr for FakeHerdr {
         !self.dead_panes.borrow().contains(pane_id)
     }
 
+    fn workspace_exists(&self, workspace: &str) -> bool {
+        self.record(format!("workspace_exists target={workspace}"));
+        !self.dead_workspaces.borrow().contains(workspace)
+    }
+
     fn integration_present(&self, agent: &str) -> bool {
         self.record(format!("integration_present agent={agent}"));
         true
@@ -1893,6 +1953,34 @@ mod tests {
             live,
             Some(vec![]),
             "a successful empty answer must stay distinguishable from unreachable"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_exists_trusts_only_a_listing_herdr_actually_answered() {
+        // The workspace-recovery detection primitive. It has to carry the SAME
+        // bias as `pane_exists` — only a definitive answer proves death — because
+        // a false "gone" makes `phase_start` re-provision a workspace whose panes
+        // are alive and working, orphaning the run's own agents.
+        let listing = r#"{"id":"x","result":{"type":"workspace_list","workspaces":[
+            {"workspace_id":"w1"},{"workspace_id":"wAG"}
+        ]}}"#;
+        let (present, absent) = with_stub_herdr(listing, 0, |h| {
+            (h.workspace_exists("wAG"), h.workspace_exists("wZZ"))
+        });
+        assert!(present, "a workspace in the listing is live");
+        assert!(
+            !absent,
+            "a workspace absent from a listing herdr DID answer is genuinely gone — \
+             this is the case that must be detected instead of failing on the raw \
+             `workspace_not_found` from a later call"
+        );
+
+        let blip = with_stub_herdr("", 1, |h| h.workspace_exists("wAG"));
+        assert!(
+            blip,
+            "an unreachable herdr is unknown, and unknown must read as alive"
         );
     }
 
