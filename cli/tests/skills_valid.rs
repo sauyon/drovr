@@ -1035,7 +1035,7 @@ fn scenarios_dir() -> PathBuf {
 /// schema rules themselves are enforced right now, by fixture, in
 /// [`parse_scenario`]'s and [`check_scenario_corpus`]'s own tests: what this flag
 /// gates is only whether real files exist to apply them to.
-const SCENARIO_CORPUS_AUTHORED: bool = false;
+const SCENARIO_CORPUS_AUTHORED: bool = true;
 
 /// plan §1.2: 15 per-skill scenarios plus 2 `using-drovr` no-skill-applies ones.
 const EXPECTED_SCENARIO_FILES: usize = 17;
