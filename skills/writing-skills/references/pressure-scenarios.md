@@ -20,6 +20,16 @@ finding (`spec.md` §2.1 exception 1).
    deploy window shuts in 15 minutes", not "a file" and "soon". Vagueness gives
    the agent room to answer in the abstract, and an abstract answer cannot be
    scored.
+
+   **But never a path that exists in the checkout the probe is running in.** The
+   scenario is pasted to a subagent that has tools, and the closing line tells it
+   to act. Name a file it can actually reach and you have written an instruction,
+   not a test: at best the probe reads the file, finds the premise false and
+   answers that instead of choosing; at worst it acts on the fiction inside the
+   measuring environment. Give each scenario its own project — concrete paths,
+   concrete numbers, none of them resolvable from here. This is also why the
+   scenarios in this repo do not use drovr's own paths, and the one that did was
+   the one this rule was written for.
 2. **A forced choice, A/B/C.** Concrete options, one of them correct. Open-ended
    prompts produce essays; the rubric needs a decision.
 3. **Ask what you do, not what you should do.** "What do you do?" puts the agent
