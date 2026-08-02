@@ -2644,13 +2644,18 @@ mod tests {
     /// The archive flag a caller holds in memory can be STALE IN BOTH DIRECTIONS,
     /// and only one of them is the human's current decision.
     ///
-    /// `save_preserving_archived` merges with `|=`, so any writer that once
-    /// observed an Archive keeps `archived: true` in its own copy forever — a
-    /// `code-review run` whose panel was archived mid-flight does exactly this
-    /// (`archiving_mid_run_survives_every_save_the_review_makes`). If the human
-    /// then hits Restore, that stale `true` must not be what decides whether the
-    /// run may be repaired. Disk is where Archive and Restore both land, so disk
-    /// wins.
+    /// A caller acquires a stale `true` simply by observing an Archive: a
+    /// `code-review run` whose panel is archived mid-flight loads it from disk on
+    /// its next save (`archiving_mid_run_survives_every_save_the_review_makes`)
+    /// and then holds it for as long as it holds that `RunState`. If the human
+    /// then hits Restore, that copy must not be what decides whether the run may
+    /// be repaired. Disk is where Archive and Restore both land, so disk wins —
+    /// see `RunState::archived`, which states that rule for every site.
+    ///
+    /// (Until `4865d1d` `save_preserving_archived` also *merged* with `|=`, so
+    /// such a copy could additionally write its stale `true` back over the
+    /// Restore. That is fixed — it adopts disk's value now — but this test pins
+    /// the read side, which would still be wrong on its own.)
     #[test]
     fn a_restore_on_disk_beats_a_stale_archive_held_in_memory() {
         let _lock = ENV_LOCK.lock().unwrap();
