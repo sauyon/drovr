@@ -922,19 +922,16 @@ fn cmd_code_review(sub: CodeReviewCmd) {
 /// phase is exactly where the discipline has to hold.
 ///
 /// Clap guarantees exactly one of `--skill` / `--gate`.
-fn cmd_reflex(skill: Option<&std::path::Path>, gate: bool) {
+fn cmd_reflex(mode: ReflexMode<'_>) {
     let cfg = config::load_config().unwrap_or_else(|e| {
         eprintln!("drovr: failed to load config: {e}");
         process::exit(1);
     });
 
-    if gate {
-        cmd_reflex_gate(&cfg.reflex);
-        return;
-    }
-
-    // `required_unless_present = "gate"` makes this unreachable via the CLI.
-    let skill = skill.expect("clap requires --skill unless --gate is set");
+    let skill = match mode {
+        ReflexMode::Gate => return cmd_reflex_gate(&cfg.reflex),
+        ReflexMode::Session(path) => path,
+    };
     let skill_md = std::fs::read_to_string(skill).unwrap_or_else(|e| {
         eprintln!("drovr: cannot read reflex skill {}: {e}", skill.display());
         process::exit(1);
@@ -943,6 +940,32 @@ fn cmd_reflex(skill: Option<&std::path::Path>, gate: bool) {
     // `None` (emit nothing) when the reflex is disabled, `Some(json)` otherwise.
     if let Some(json) = reflex::reflex_json(&skill_md, &cfg.reflex) {
         println!("{json}");
+    }
+}
+
+/// Which hook `drovr reflex` is serving. The two modes are mutually exclusive
+/// and one is required; [`ReflexMode::from_flags`] is the single place that
+/// decides, so `cmd_reflex` itself is total over its input and has no
+/// impossible case to assert away.
+enum ReflexMode<'a> {
+    /// `SessionStart` — render the router skill at this path.
+    Session(&'a std::path::Path),
+    /// `UserPromptSubmit` — emit the per-turn gate card.
+    Gate,
+}
+
+impl<'a> ReflexMode<'a> {
+    /// `None` for the two flag combinations clap already rejects: neither flag
+    /// (`required_unless_present`) and both flags (`conflicts_with`). Returning
+    /// `None` rather than picking a winner keeps this function honest if that
+    /// wiring is ever loosened — the caller reports the usage error instead of
+    /// silently serving the wrong hook.
+    fn from_flags(skill: Option<&'a std::path::Path>, gate: bool) -> Option<Self> {
+        match (skill, gate) {
+            (Some(path), false) => Some(ReflexMode::Session(path)),
+            (None, true) => Some(ReflexMode::Gate),
+            _ => None,
+        }
     }
 }
 
@@ -959,7 +982,7 @@ fn cmd_reflex_gate(cfg: &config::ReflexConfig) {
     // A hook that is somehow run without a payload still gets a decision.
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_json);
     let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
-        .and_then(|p| std::fs::read_to_string(p).ok());
+        .and_then(|p| reflex::read_transcript_tail(&p));
 
     if let Some(json) = reflex::gate_json(cfg, transcript.as_deref()) {
         println!("{json}");
@@ -992,7 +1015,13 @@ fn main() {
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
-        Commands::Reflex { skill, gate } => cmd_reflex(skill.as_deref(), gate),
+        Commands::Reflex { skill, gate } => match ReflexMode::from_flags(skill.as_deref(), gate) {
+            Some(mode) => cmd_reflex(mode),
+            None => {
+                eprintln!("drovr: reflex needs exactly one of --skill <PATH> or --gate");
+                process::exit(2);
+            }
+        },
     }
 }
 
@@ -1327,6 +1356,25 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn reflex_mode_admits_only_the_two_legal_flag_combinations() {
+        // clap rejects the other two combinations, but this function must not
+        // depend on that: it is what keeps `cmd_reflex` total, and the clap
+        // wiring lives in an attribute far from either.
+        let p = std::path::Path::new("/p/SKILL.md");
+        assert!(matches!(
+            ReflexMode::from_flags(Some(p), false),
+            Some(ReflexMode::Session(_))
+        ));
+        assert!(matches!(
+            ReflexMode::from_flags(None, true),
+            Some(ReflexMode::Gate)
+        ));
+        // Neither flag, and both flags — no mode, no arbitrary winner.
+        assert!(ReflexMode::from_flags(None, false).is_none());
+        assert!(ReflexMode::from_flags(Some(p), true).is_none());
     }
 
     #[test]

@@ -296,6 +296,34 @@ fn invokes_drovr_skill(record: &serde_json::Value) -> bool {
     })
 }
 
+/// How much of the transcript's end the gate will read.
+///
+/// This hook runs on **every** user prompt, and live transcripts reach tens of
+/// megabytes; reading one whole would put that I/O in front of every prompt.
+/// Only the end can matter — [`skill_invoked_last_turn`] stops at the last real
+/// user message — and 1 MiB covers any plausible single turn with room to
+/// spare. A turn longer than the window simply isn't seen, which emits a
+/// redundant card: the same safe direction every other ambiguity resolves to.
+const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
+
+/// The last [`TRANSCRIPT_TAIL_BYTES`] of the transcript at `path`, or `None`
+/// when it cannot be read at all — which fails open toward emitting the card.
+///
+/// The window boundary can land inside a multi-byte character or mid-record;
+/// both degrade to one unparseable line, which the scan skips.
+pub fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > TRANSCRIPT_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - TRANSCRIPT_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The `transcript_path` from a hook's stdin JSON, or `None` when stdin carries
 /// no usable path (absent, empty, wrong type, or not JSON at all). Every `None`
 /// path fails open toward emitting the card.
@@ -866,6 +894,96 @@ mod tests {
                 "subtracting every section deleted the routing core {core:?}:\n{body}"
             );
         }
+    }
+
+    #[test]
+    fn transcript_tail_is_bounded() {
+        // This hook runs on EVERY user prompt, and live transcripts in
+        // `~/.claude/projects/` reach 29 MB. Reading one whole would put tens
+        // of megabytes of I/O directly in the path of every keystroke-to-first-
+        // token. Only the tail can possibly matter: the scan stops at the last
+        // real user message.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let filler = format!("{}\n", user_prompt("older"));
+        let mut big = filler.repeat(1 + (TRANSCRIPT_TAIL_BYTES as usize / filler.len()));
+        big.push_str(&format!("{}\n", user_prompt("the last line")));
+        assert!(
+            big.len() > TRANSCRIPT_TAIL_BYTES as usize,
+            "fixture must exceed the window"
+        );
+        std::fs::write(&path, &big).unwrap();
+
+        let tail = read_transcript_tail(&path).expect("a readable file must yield a tail");
+        assert!(
+            tail.len() <= TRANSCRIPT_TAIL_BYTES as usize,
+            "tail is {} bytes, window is {TRANSCRIPT_TAIL_BYTES}",
+            tail.len()
+        );
+        assert!(
+            tail.ends_with("the last line\"}}\n"),
+            "the tail must be the END of the file, not its start"
+        );
+    }
+
+    #[test]
+    fn transcript_tail_reads_a_short_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.jsonl");
+        let body = format!("{}\n{}\n", user_prompt("go"), skill_call("drovr:tdd"));
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(read_transcript_tail(&path).as_deref(), Some(body.as_str()));
+        // ...and the suppression decision is unchanged by going through the file.
+        assert!(skill_invoked_last_turn(
+            &read_transcript_tail(&path).unwrap()
+        ));
+    }
+
+    #[test]
+    fn transcript_tail_is_none_when_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_transcript_tail(&dir.path().join("nope.jsonl")), None);
+        // A directory is not a transcript.
+        assert_eq!(read_transcript_tail(dir.path()), None);
+    }
+
+    #[test]
+    fn a_tail_split_mid_character_does_not_panic() {
+        // The window boundary lands wherever it lands — including inside a
+        // multi-byte character. That must degrade to a skipped line, not a
+        // crash in a hook that sits in front of every user prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.jsonl");
+        let mut body = "é".repeat(TRANSCRIPT_TAIL_BYTES as usize); // 2 bytes each
+        body.push('\n');
+        body.push_str(&format!("{}\n", user_prompt("go")));
+        std::fs::write(&path, &body).unwrap();
+
+        let tail = read_transcript_tail(&path).expect("must not fail on split characters");
+        assert!(!skill_invoked_last_turn(&tail));
+    }
+
+    #[test]
+    fn a_skill_call_older_than_the_window_fails_open() {
+        // The documented cost of the bound: a `Skill` call further back than
+        // the window is invisible, so the gate emits a redundant card. That is
+        // the safe direction — the same one every other ambiguity resolves to.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long-turn.jsonl");
+        let mut body = format!("{}\n{}\n", user_prompt("go"), skill_call("drovr:tdd"));
+        let bulk = format!("{}\n", tool_use("Read", r#"{"file_path":"/p/x.rs"}"#));
+        body.push_str(&bulk.repeat(1 + (TRANSCRIPT_TAIL_BYTES as usize / bulk.len())));
+        std::fs::write(&path, &body).unwrap();
+
+        assert!(
+            skill_invoked_last_turn(&body),
+            "the whole file does contain the suppressing call"
+        );
+        let tail = read_transcript_tail(&path).unwrap();
+        assert!(
+            !skill_invoked_last_turn(&tail),
+            "beyond the window the call is invisible — and that must EMIT, not suppress"
+        );
     }
 
     #[test]
