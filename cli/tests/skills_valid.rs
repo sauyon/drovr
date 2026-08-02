@@ -1234,6 +1234,41 @@ fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The options as the **body** restates them, in order.
+///
+/// A restatement is a line that starts (unindented) with one of `labels`
+/// followed by `:`, plus any indented continuation lines beneath it. A blank
+/// line or an unindented prose line closes it.
+///
+/// This is deliberately a parse rather than a substring search. `contains` would
+/// accept a body that only *lengthens* an option — the probe offered "ship it
+/// now and move on" while the scorer grades against "ship it now" — which is the
+/// exact silent mis-scoring the comparison exists to prevent.
+fn body_options(body: &str, labels: &[String]) -> Vec<ChoiceOption> {
+    let mut out: Vec<ChoiceOption> = Vec::new();
+    let mut open = false;
+    for line in body.lines() {
+        let starts_option = line
+            .split_once(':')
+            .is_some_and(|(label, _)| labels.iter().any(|l| l == label));
+        if starts_option {
+            let (label, rest) = line.split_once(':').expect("checked above");
+            out.push(ChoiceOption {
+                label: label.to_string(),
+                clause: rest.trim().to_string(),
+            });
+            open = true;
+        } else if open && !line.trim().is_empty() && line.starts_with(char::is_whitespace) {
+            let last = out.last_mut().expect("open implies a pushed option");
+            last.clause.push(' ');
+            last.clause.push_str(line.trim());
+        } else {
+            open = false;
+        }
+    }
+    out
+}
+
 /// Words that mark a clause as handing the decision to someone else.
 ///
 /// Matched as **whole words** (with `escalat` allowed to carry its endings), not
@@ -1450,16 +1485,33 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
     // ever reads. `forced_choice` is what the scorer is given, so a body that
     // words an option differently means the agent answered one question and its
     // verdict was scored against another — with nothing failing in between.
-    let body_flat = normalize_ws(body);
+    let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+    let restated = body_options(body, &labels);
     for option in &options {
-        let restated = format!("{}: {}", option.label, normalize_ws(&option.clause));
-        if !body_flat.contains(&restated) {
+        let found = restated
+            .iter()
+            .find(|r| r.label == option.label)
+            .ok_or_else(|| {
+                format!(
+                    "the body never restates `forced_choice` option `{}`. The probe is handed the \
+                     body and the scorer is handed `forced_choice`, so any difference between them \
+                     is scored as an answer to a question that was never asked",
+                    option.label
+                )
+            })?;
+        // Compared whole, not by containment: a body that appends to an option
+        // offers the probe a different choice than the one being graded, and
+        // that is the drift with the quietest failure.
+        if normalize_ws(&found.clause) != normalize_ws(&option.clause) {
             return Err(format!(
-                "the body does not restate `forced_choice` option `{restated}`. The probe is \
-                 handed the body and the scorer is handed `forced_choice`, so any difference \
-                 between them is scored as an answer to a question that was never asked. Restate \
-                 every option in the body exactly as `forced_choice` words it — wrapping across \
-                 lines is fine, rewording is not"
+                "the body's option `{}` reads `{}` but `forced_choice` says `{}`. The probe \
+                 answers the body and the scorer grades `forced_choice`, so the run would be \
+                 scored against an option the agent was never offered. Restate every option \
+                 exactly as `forced_choice` words it — wrapping across lines is fine, changing a \
+                 word is not",
+                option.label,
+                normalize_ws(&found.clause),
+                normalize_ws(&option.clause)
             ));
         }
     }
@@ -1734,6 +1786,18 @@ fn parse_scenario_requires_the_body_to_restate_every_option() {
         "B: write the failing\n   test first\n",
     );
     parse_scenario("tdd-1", &wrapped).expect("a wrapped restatement is the same restatement");
+
+    // A body that only *extends* an option is the drift that matters most: the
+    // probe is offered "ship it now and move on" and the scorer grades against
+    // "ship it now". A containment check passes this; the contract says
+    // "exactly", so the check has to mean exactly.
+    let lengthened = CANONICAL_SCENARIO.replace("A: ship it now\n", "A: ship it now and move on\n");
+    let err = parse_scenario("tdd-1", &lengthened)
+        .expect_err("a body that lengthens an option must be rejected");
+    assert!(
+        err.contains("ship it now"),
+        "the rejection must quote the option that drifted, got: {err}"
+    );
 }
 
 /// Three names from the taxonomy are not three pressures if resisting one
