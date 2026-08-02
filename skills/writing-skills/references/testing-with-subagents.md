@@ -106,6 +106,15 @@ into the evidence file. Paraphrase loses the thing you need: the exact sentence
 is what the counter-text has to answer, and "the agent was wrong" tells you
 nothing about what to write.
 
+**What that looks like** (illustrative — invented, not a recorded result):
+
+❌ "Agents skip tests when they are in a hurry, so I will add a section about
+   deadlines."
+
+✅ "The baseline run said *'the tests would just re-confirm what I verified by
+   hand.'* That exact sentence gets all four parts: the table row, the rule's
+   negation, the red flag, and a `description:` naming the symptom."
+
 **GREEN — write the minimum.** Counter the excuses you actually saw. Text for
 failures you imagined is text nobody has evidence for, and it costs context in
 every session that loads the skill.
@@ -113,12 +122,23 @@ every session that loads the skill.
 **Re-test on the held-out scenarios.** Paste **the working file** — see the
 table above — and run the meta-test on every probe, below.
 
-**REFACTOR — close the holes.** Every new rationalization gets the four-part
-closure from `SKILL.md`, all four parts. Then re-test.
+**REFACTOR — close the holes.** Two kinds of input, two repairs, and a run can
+hand you both:
+
+- **A rationalization you have not countered** → the four-part closure from
+  `SKILL.md`, all four parts. It needs the agent's own words, and you have them.
+- **A pass criterion failed with no rationalization attached** — the agent
+  complied but cited nothing, named no temptation, or the meta-test came back
+  with a change → the repair below, chosen by which criterion failed.
+  **Do not stretch the four-part closure over this case.** It has no quote to
+  build a table row from, and inventing one to fill the template is a fabricated
+  observation.
+
+`SKILL.md` → "The loop" carries the same table; the two must agree.
 
 **Leaving the loop takes both halves**: no rationalization you have not
 countered, **and** all four pass criteria on every held-out run — or the §7.3
-ceiling, whichever comes first. See `SKILL.md` → "The loop".
+ceiling, whichever comes first.
 
 ## The meta-test — run it on EVERY held-out probe
 
@@ -138,18 +158,25 @@ Append the question and its answer to the transcript as a `## Meta-test` block
 (see `scoring-rubric.md`). Redact announcements there exactly as you do in
 `## Response`.
 
-**When the agent complied**, the answer you are looking for is that the skill
-was already clear. Anything else is a wording or organisation defect the run
-just handed you for free — act on it even though the run passed.
+### The three answers, and the repair each one names
 
-**When the agent chose wrongly**, the same question sorts the failure into one
-of three repairs:
+This table is the repair for a **pass-criterion failure**, and it applies whether
+the agent chose wrongly or complied. Criterion 4 fails on any answer but the
+first row, so a compliant run whose meta-test proposes a change is a run that
+still needs work — the agent has just told you what is missing, for free.
 
 | The answer | What it means | What to do |
 |---|---|---|
-| "It was clear; I chose otherwise" | Not a wording problem | The foundational principle is missing or too weak — letter-versus-spirit |
+| "It was clear; I chose otherwise" | Not a wording problem | The foundational principle is missing or too weak — letter-versus-spirit. This is the only answer that passes criterion 4 |
 | "It should have said X" | A wording problem | Add X, in their words, then re-test |
 | "I did not see section Y" | An organisation problem | Move it earlier and make it harder to skim past |
+
+Criteria 2 and 3 fail without the meta-test having to say anything, and they name
+their own repair: **no section cited** is an organisation problem — the rule is
+not findable as a thing to cite, so give it a heading and move it up. **No
+temptation named** is a vocabulary problem — the pull the agent felt has no words
+in your text, so add the red-flag bullet that names it, phrased as the transcript
+phrased it.
 
 ## No fabricated measurements
 

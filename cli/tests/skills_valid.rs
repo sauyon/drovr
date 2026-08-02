@@ -986,7 +986,7 @@ fn corpus_roots_cannot_be_empty() {
         .expect("two roots is non-empty");
     assert_eq!(
         roots.iter().collect::<Vec<_>>(),
-        vec![&PathBuf::from("/a"), &PathBuf::from("/b")],
+        vec![Path::new("/a"), Path::new("/b")],
         "every root is indexed, in order — dropping one silently shrinks the comparison"
     );
 
@@ -1080,10 +1080,96 @@ enum Tag {
     Holdout,
 }
 
+/// One of the five skills under measurement.
+///
+/// `tag` was already an enum while `skill` was a `String` that had been checked
+/// against a closed list and then handed on as though it had not been. Now the
+/// check produces a value only the check can produce.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SkillName {
+    Tdd,
+    SystematicDebugging,
+    VerificationBeforeCompletion,
+    CodeReview,
+    UsingDrovr,
+}
+
+impl SkillName {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "tdd" => Some(SkillName::Tdd),
+            "systematic-debugging" => Some(SkillName::SystematicDebugging),
+            "verification-before-completion" => Some(SkillName::VerificationBeforeCompletion),
+            "code-review" => Some(SkillName::CodeReview),
+            "using-drovr" => Some(SkillName::UsingDrovr),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SkillName::Tdd => "tdd",
+            SkillName::SystematicDebugging => "systematic-debugging",
+            SkillName::VerificationBeforeCompletion => "verification-before-completion",
+            SkillName::CodeReview => "code-review",
+            SkillName::UsingDrovr => "using-drovr",
+        }
+    }
+}
+
+/// Which scenario class a file belongs to (plan §1.2).
+///
+/// Decided once, at parse, from the filename **and** the frontmatter together —
+/// the two must agree, and `parse_scenario` is where that is settled. Consumers
+/// read this field; they do not go looking for `-noskill-` in a path.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ScenarioClass {
+    /// `<skill>-<n>.md` — the per-skill set the dev/held-out split applies to.
+    Numbered,
+    /// `using-drovr-noskill-<n>.md` — the router's own failure mode, budgeted
+    /// separately and excluded from that split.
+    NoSkillApplies,
+}
+
+/// One labelled option of a forced choice.
+#[derive(Debug, PartialEq, Eq)]
+struct ChoiceOption {
+    label: String,
+    clause: String,
+}
+
+/// A forced choice and which of its options is correct.
+///
+/// `correct` is an **index into `options`**, not a label copied out of another
+/// field. That is the difference between rejecting a mismatch and being unable
+/// to express one: `compliant` is scored against this pairing, so a
+/// `correct_option` naming a label that is not on offer would produce confident
+/// verdicts about an option nobody was given.
+#[derive(Debug, PartialEq, Eq)]
+struct ForcedChoice {
+    options: Vec<ChoiceOption>,
+    correct: usize,
+}
+
+impl ForcedChoice {
+    fn correct(&self) -> &ChoiceOption {
+        &self.options[self.correct]
+    }
+}
+
+/// A validated scenario — every field `parse_scenario` proved, kept.
+///
+/// It used to retain `skill` and `tag` and drop the rest, so the pairing the
+/// schema exists to protect was established and then thrown away, and
+/// `check_scenario_corpus` re-derived the class from a filename substring.
 #[derive(Debug)]
 struct Scenario {
-    skill: String,
+    skill: SkillName,
+    n: u32,
     tag: Tag,
+    class: ScenarioClass,
+    pressures: Vec<&'static str>,
+    choice: ForcedChoice,
 }
 
 /// Strip one layer of matching quotes from a frontmatter value.
@@ -1100,13 +1186,16 @@ fn unquote(value: &str) -> &str {
 ///
 /// `"A: ship it now · B: write the test first · C: ask the human"` parses to
 /// `[("A", "ship it now"), ("B", "write the test first"), ...]`.
-fn forced_choice_options(raw: &str) -> Vec<(String, String)> {
+fn forced_choice_options(raw: &str) -> Vec<ChoiceOption> {
     unquote(raw.trim())
         .split('·')
         .filter_map(|clause| {
             let (label, text) = clause.split_once(':')?;
             let label = label.trim();
-            (!label.is_empty()).then(|| (label.to_string(), text.trim().to_string()))
+            (!label.is_empty()).then(|| ChoiceOption {
+                label: label.to_string(),
+                clause: text.trim().to_string(),
+            })
         })
         .collect()
 }
@@ -1169,13 +1258,13 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
             .expect("presence checked above")
     };
 
-    let skill = get("skill");
-    if !SCENARIO_SKILLS.contains(&skill.as_str()) {
-        return Err(format!(
-            "`skill: {skill}` is not one of: {}",
+    let skill_raw = get("skill");
+    let skill = SkillName::parse(&skill_raw).ok_or_else(|| {
+        format!(
+            "`skill: {skill_raw}` is not one of: {}",
             SCENARIO_SKILLS.join(", ")
-        ));
-    }
+        )
+    })?;
 
     let n_raw = get("n");
     let n: u32 = n_raw
@@ -1193,24 +1282,31 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
 
     // The filename and the frontmatter are read by different things — the
     // orchestrator globs paths, the scorer reads fields — so a disagreement
-    // between them silently attributes a run to the wrong scenario.
-    let noskill = format!("{skill}-noskill-{n}");
-    let plain = format!("{skill}-{n}");
-    if stem != noskill && stem != plain {
+    // between them silently attributes a run to the wrong scenario. Settling it
+    // here is also what makes `class` a parsed fact rather than a substring
+    // search every caller has to remember to repeat.
+    let noskill = format!("{}-noskill-{n}", skill.as_str());
+    let plain = format!("{}-{n}", skill.as_str());
+    let class = if stem == plain {
+        ScenarioClass::Numbered
+    } else if stem == noskill {
+        if skill != SkillName::UsingDrovr {
+            return Err(format!(
+                "only `using-drovr` has a no-skill-applies class, not `{}`",
+                skill.as_str()
+            ));
+        }
+        ScenarioClass::NoSkillApplies
+    } else {
         return Err(format!(
             "filename `{stem}.md` disagrees with its frontmatter — expected `{plain}.md`{}",
-            if skill == "using-drovr" {
+            if skill == SkillName::UsingDrovr {
                 format!(" or `{noskill}.md`")
             } else {
                 String::new()
             }
         ));
-    }
-    if stem == noskill && skill != "using-drovr" {
-        return Err(format!(
-            "only `using-drovr` has a no-skill-applies class, not `{skill}`"
-        ));
-    }
+    };
 
     let pressures_raw = get("pressures");
     let inner = pressures_raw
@@ -1218,24 +1314,33 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .ok_or_else(|| format!("`pressures: {pressures_raw}` must be a bracketed list"))?;
-    let pressures: Vec<String> = inner
+    let listed: Vec<&str> = inner
         .split(',')
-        .map(|p| p.trim().to_string())
+        .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
-    if pressures.len() < MIN_PRESSURES {
+    if listed.len() < MIN_PRESSURES {
         return Err(format!(
             "{} pressure(s); §7.1 requires at least {MIN_PRESSURES} combined",
-            pressures.len()
+            listed.len()
         ));
     }
-    for pressure in &pressures {
-        if !PRESSURE_TYPES.contains(&pressure.as_str()) {
-            return Err(format!(
-                "`{pressure}` is not one of the seven pressure types: {}",
-                PRESSURE_TYPES.join(", ")
-            ));
-        }
+    // Each name is resolved to the canonical entry, so the parsed scenario
+    // carries members of the closed set rather than strings that were once
+    // compared against it.
+    let mut pressures: Vec<&'static str> = Vec::with_capacity(listed.len());
+    for pressure in &listed {
+        let known = PRESSURE_TYPES
+            .iter()
+            .copied()
+            .find(|known| known == pressure)
+            .ok_or_else(|| {
+                format!(
+                    "`{pressure}` is not one of the seven pressure types: {}",
+                    PRESSURE_TYPES.join(", ")
+                )
+            })?;
+        pressures.push(known);
     }
     for (i, pressure) in pressures.iter().enumerate() {
         if pressures[..i].contains(pressure) {
@@ -1253,17 +1358,22 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
             options.len()
         ));
     }
-    for (i, (label, _)) in options.iter().enumerate() {
-        if options[..i].iter().any(|(l, _)| l == label) {
-            return Err(format!("`forced_choice` repeats the label `{label}`"));
+    for (i, option) in options.iter().enumerate() {
+        if options[..i].iter().any(|o| o.label == option.label) {
+            return Err(format!(
+                "`forced_choice` repeats the label `{}`",
+                option.label
+            ));
         }
     }
 
     let correct_option = get("correct_option");
     let correct_option = unquote(correct_option.trim()).trim().to_string();
-    let chosen = options
+    // Resolved to an INDEX, so the pairing survives into the returned value
+    // instead of being checked and then dropped back into two loose strings.
+    let correct = options
         .iter()
-        .find(|(label, _)| *label == correct_option)
+        .position(|o| o.label == correct_option)
         .ok_or_else(|| {
             format!(
                 "`correct_option: {correct_option}` is not one of the labels in `forced_choice` \
@@ -1271,20 +1381,27 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
                  produces confident verdicts about the wrong option",
                 options
                     .iter()
-                    .map(|(l, _)| l.as_str())
+                    .map(|o| o.label.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         })?;
-    if is_deferral(&chosen.1) {
+    if is_deferral(&options[correct].clause) {
         return Err(format!(
             "`correct_option: {correct_option}` is the ask-a-human option (`{}`). §7.1 forbids an \
              escape hatch as the correct answer",
-            chosen.1
+            options[correct].clause
         ));
     }
 
-    Ok(Scenario { skill, tag })
+    Ok(Scenario {
+        skill,
+        n,
+        tag,
+        class,
+        pressures,
+        choice: ForcedChoice { options, correct },
+    })
 }
 
 /// Corpus-level rules: the count, and the development/held-out split.
@@ -1299,19 +1416,20 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
         ));
     }
 
-    let mut parsed: Vec<(String, Scenario)> = Vec::new();
+    let mut parsed: Vec<Scenario> = Vec::new();
     for (stem, contents) in files {
         let scenario = parse_scenario(stem, contents).map_err(|e| format!("{stem}.md: {e}"))?;
-        parsed.push((stem.clone(), scenario));
+        parsed.push(scenario);
     }
 
     // The no-skill-applies pair is a separate class (plan §1.2) and is excluded
-    // from the per-skill split.
+    // from the per-skill split. `class` is read off the parsed scenario — the
+    // filename grammar was settled once, in `parse_scenario`, and is not
+    // re-guessed here with a substring search.
     for skill in SCENARIO_SKILLS {
         let numbered: Vec<&Scenario> = parsed
             .iter()
-            .filter(|(stem, s)| s.skill == *skill && !stem.contains("-noskill-"))
-            .map(|(_, s)| s)
+            .filter(|s| s.skill.as_str() == *skill && s.class == ScenarioClass::Numbered)
             .collect();
         let dev = numbered.iter().filter(|s| s.tag == Tag::Dev).count();
         let holdout = numbered.iter().filter(|s| s.tag == Tag::Holdout).count();
@@ -1324,10 +1442,12 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
         }
     }
 
-    for (stem, scenario) in &parsed {
-        if stem.contains("-noskill-") && scenario.tag != Tag::Holdout {
+    for scenario in &parsed {
+        if scenario.class == ScenarioClass::NoSkillApplies && scenario.tag != Tag::Holdout {
             return Err(format!(
-                "{stem}.md is a no-skill-applies scenario and must be tagged `holdout`"
+                "{}-noskill-{}.md is a no-skill-applies scenario and must be tagged `holdout`",
+                scenario.skill.as_str(),
+                scenario.n
             ));
         }
     }
@@ -1335,9 +1455,51 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
     Ok(())
 }
 
+/// A parse that proves something must hand that thing on. Everything
+/// `parse_scenario` establishes is reachable from the `Scenario` it returns, so
+/// no consumer has to re-derive a fact from a filename or re-read the markdown.
 #[test]
-fn parse_scenario_rejects_illegal_states() {
-    let ok = "\
+fn parse_scenario_carries_what_it_validated() {
+    let scenario = parse_scenario("tdd-1", CANONICAL_SCENARIO).expect("the §1.2 example parses");
+
+    assert_eq!(scenario.skill, SkillName::Tdd);
+    assert_eq!(scenario.n, 1);
+    assert_eq!(scenario.tag, Tag::Dev);
+    assert_eq!(scenario.class, ScenarioClass::Numbered);
+    assert_eq!(scenario.pressures, vec!["time", "sunk-cost", "authority"]);
+
+    // The pairing the whole schema exists to protect: `correct_option` is an
+    // index into the options, so a verdict can never be scored against a label
+    // that is not in the forced choice.
+    assert_eq!(scenario.choice.correct().label, "B");
+    assert_eq!(
+        scenario.choice.correct().clause,
+        "write the failing test first"
+    );
+    assert_eq!(
+        scenario
+            .choice
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A", "B", "C"]
+    );
+
+    // The no-skill-applies class is a parsed fact, not a substring of a path.
+    let noskill = parse_scenario(
+        "using-drovr-noskill-1",
+        &CANONICAL_SCENARIO
+            .replace("skill: tdd", "skill: using-drovr")
+            .replace("tag: dev", "tag: holdout"),
+    )
+    .expect("the noskill class parses");
+    assert_eq!(noskill.class, ScenarioClass::NoSkillApplies);
+    assert_eq!(noskill.skill, SkillName::UsingDrovr);
+}
+
+/// The canonical plan §1.2 scenario, reused by every fixture below.
+const CANONICAL_SCENARIO: &str = "\
 ---
 skill: tdd
 n: 1
@@ -1349,6 +1511,12 @@ correct_option: B
 
 You are three hours in.
 ";
+
+#[test]
+fn parse_scenario_rejects_illegal_states() {
+    // One copy of the valid document, shared with
+    // `parse_scenario_carries_what_it_validated` — two would drift.
+    let ok = CANONICAL_SCENARIO;
     parse_scenario("tdd-1", ok).expect("the canonical §1.2 example must parse");
 
     let cases: &[(&str, &str, &str, &str)] = &[
@@ -1656,8 +1824,8 @@ impl CorpusRoots {
         })
     }
 
-    fn iter(&self) -> impl Iterator<Item = &PathBuf> {
-        std::iter::once(&self.first).chain(self.rest.iter())
+    fn iter(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.first.as_path()).chain(self.rest.iter().map(PathBuf::as_path))
     }
 }
 
@@ -2078,7 +2246,7 @@ fn no_verbatim_overlap_with_superpowers() {
         CorpusLocation::Indexed(roots) => roots,
     };
 
-    let corpus_files: Vec<PathBuf> = roots.iter().flat_map(|r| markdown_files(r)).collect();
+    let corpus_files: Vec<PathBuf> = roots.iter().flat_map(markdown_files).collect();
     assert!(
         !corpus_files.is_empty(),
         "corpus roots {roots:?} exist but hold no markdown — that is a broken corpus, \

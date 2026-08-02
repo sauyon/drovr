@@ -7,10 +7,10 @@ description: Use when writing or editing any drovr skill, and before shipping sk
 
 ## Overview
 
-A skill is not documentation. It is a prompt that has to survive two things
-documentation never faces: a context window filling up around it, and a reader
-who has a reason to want it not to apply. Text that reads clearly in a fresh
-session is not evidence of either.
+A skill is not documentation. It is a prompt that must survive two things
+documentation never faces: a context window filling around it, and a reader with
+a reason to want it not to apply. Text that reads clearly in a fresh session is
+evidence of neither.
 
 So skills are written the way code is written here: **test first**.
 
@@ -20,7 +20,7 @@ rule and record why — do not route around it in the moment.
 
 ## The mapping [tier 3]
 
-Ported from superpowers' convention, in drovr's own terms. A convention-follow,
+Ported from superpowers' convention in drovr's own terms: a convention-follow,
 not an evidence-backed choice.
 
 | Testing a skill | The TDD it is |
@@ -32,8 +32,8 @@ not an evidence-backed choice.
 | **REFACTOR** | Each new loophole is closed |
 
 **If you never watched an agent fail without the skill, you do not know which
-failures it prevents** — only which ones you imagined, and imagined failures buy
-the wrong text at full price in context.
+failures it prevents** — only which ones you imagined, and those buy the wrong
+text at full price in context.
 
 Not every skill needs this — `references/testing-with-subagents.md` says which
 ones do.
@@ -53,7 +53,7 @@ digraph writing_skills_loop {
   fresh      [shape=diamond, label="A rationalization\nyou have not seen?"];
   bar        [shape=diamond, label="All four pass criteria met\non every held-out run?"];
   ceiling    [shape=diamond, label="REFACTOR ceiling\nreached? (spec 7.3)"];
-  closure    [label="REFACTOR\nfour-part closure on each new rationalization"];
+  repair     [label="REFACTOR — repair by what failed:\nnew rationalization → four-part closure\ncriterion 2/3/4 → meta-test repair"];
   pass       [shape=doublecircle, label="PASS. Freeze the arm,\nsnapshot it, record the result."];
   halt       [shape=doublecircle, label="HALT at the ceiling.\nRecord a null."];
 
@@ -63,8 +63,8 @@ digraph writing_skills_loop {
   bar     -> pass    [label="yes"];
   bar     -> ceiling [label="no"];
   ceiling -> halt    [label="yes"];
-  ceiling -> closure [label="no"];
-  closure -> retest;
+  ceiling -> repair  [label="no"];
+  repair  -> retest;
 }
 ```
 
@@ -72,21 +72,30 @@ digraph writing_skills_loop {
 
 - **PASS takes both halves**: no rationalization you have not already countered,
   **and** all four pass criteria on every held-out run. Running out of excuses
-  you can think of is not clearing a bar — an agent can pick the right option
-  while citing nothing, naming no temptation and failing the meta-test. That
-  goes back through the closure.
+  you can think of is not clearing a bar.
 - **HALT at the REFACTOR ceiling** (`spec.md` §7.3). "Repeat until it is clean"
   with no bound is the unbounded-cost defect drovr exists to prevent everywhere
   else. Hitting it is a result: record the null and stop.
 
-Author counter-text from the **development** scenario only. Reading the held-out
-pair while you write fits the skill to its own test.
+**REFACTOR takes two kinds of input, and they get different repairs.** A run can
+produce both; apply each that fits.
+
+- **A rationalization you have not countered** → the **four-part closure** below.
+  It needs the agent's own words, and you have them.
+- **A criterion failed with no rationalization** — complied but cited no section,
+  named no temptation, or the meta-test asked for a change → the repair table in
+  `references/testing-with-subagents.md`, which pairs each failure with its fix.
+
+There is no third case. **Never stretch the four-part closure over a failure with
+no quote**: a table row invented to fill the template counters an excuse no agent
+made — a fabricated observation (§2.1 exception 1).
+
+Author counter-text from the **development** scenario only.
 
 **Which text you paste changes as you go, and getting it wrong invalidates the
-run.** RED pastes none. Every re-test in this loop pastes **the working file you
-are editing**. Only a *frozen arm* comes from `docs/skill-evidence/arms/`. The
-per-step rule is in `references/testing-with-subagents.md` — read it before you
-dispatch anything.
+run.** RED pastes none; every re-test in this loop pastes **the working file you
+are editing**; only a *frozen arm* comes from `docs/skill-evidence/arms/`. Read
+the per-step rule in `references/testing-with-subagents.md` before you dispatch.
 
 ## The four-part closure [tier 3]
 
@@ -127,14 +136,12 @@ when the ask is a brief for the other side.
 ## Rules that hold while you do this
 
 - **Probe subagents run in the FOREGROUND.** Never `run_in_background`, never a
-  scheduled wake-up. Backgrounding a probe is how skill testing stalls without
-  anyone being told.
+  scheduled wake-up. Backgrounding a probe stalls the run with nobody told.
 - **You are the single writer.** Subagents run scenarios and score them; they do
   not edit skills.
 - **No fabricated measurements** (`spec.md` §2.1 exception 1). No number, rate,
   duration or comparative unless `docs/skill-evidence/` holds it or a citation
-  supports it. "Every time" is emphasis and fine; "in 94% of runs" is not,
-  unless 94% is in the corpus.
+  supports it. "Every time" is emphasis and fine; "in 94% of runs" is not.
 
 All three in full, with the transcript protocol: `references/testing-with-subagents.md`.
 
@@ -159,27 +166,16 @@ All three in full, with the transcript protocol: `references/testing-with-subage
 | "I will just re-run until it passes" | Stop at the ceiling and write the null down. A null is a result; an untracked loop is not. |
 | "I can score my own rewrite" | Hand it to a separate read-only scorer subagent working from `references/scoring-rubric.md`, blind to the arm label. |
 
-## Worked example
-
-Illustrative — invented, not a recorded result.
-
-❌ "Agents skip tests when they are in a hurry, so I will add a section about
-   deadlines."
-
-✅ "The baseline run said *'the tests would just re-confirm what I verified by
-   hand.'* That exact sentence gets all four parts: the table row, the rule's
-   negation, the red flag, and a `description:` naming the symptom."
-
 ## References
 
 Load these when you reach the step that needs them.
 
-- `references/pressure-scenarios.md` — how to build a scenario that actually
-  applies pressure, and the frontmatter every scenario file carries.
-- `references/testing-with-subagents.md` — running the probes: foreground,
-  single-writer, transcripts.
-- `references/scoring-rubric.md` — the rubric, the verdict object, and the
-  blinding procedure. This is the file the scorer is handed.
+- `references/pressure-scenarios.md` — building a scenario that applies real
+  pressure, and the frontmatter every scenario file carries.
+- `references/testing-with-subagents.md` — running the probes: which text to
+  paste, foreground, transcripts, the meta-test and its repairs.
+- `references/scoring-rubric.md` — the rubric, verdict object and blinding.
+  This is the file the scorer is handed.
 
 REQUIRED BACKGROUND: `drovr:tdd` defines the cycle this skill applies to prose.
 `drovr:verification-before-completion` governs the claim that a skill passed.
