@@ -1135,6 +1135,64 @@ mod tests {
     }
 
     #[test]
+    fn suppression_always_implies_a_successful_drovr_skill_call() {
+        // The invariant, checked exhaustively against the shipped function
+        // rather than argued for: over every ordering of the record shapes that
+        // occur in real transcripts, `true` is returned ONLY when the sequence
+        // contains a `drovr:*` `Skill` call with a successful result recorded
+        // after it. Any other `true` is a turn silenced without the discipline
+        // having run — the one failure mode that hides drift.
+        //
+        // **This checks one direction only.** It cannot fail on a change that
+        // makes the gate suppress *less*; removing the `isMeta` transparency,
+        // for instance, leaves it green. That direction is only ever a
+        // redundant injection, and it is covered by the named tests above.
+        const CALL: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Skill","input":{"skill":"drovr:tdd"}}]}}"#;
+        const OK: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","is_error":false}]}}"#;
+        let shapes: [&str; 12] = [
+            CALL,
+            OK,
+            r#"{"type":"user","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"user","isMeta":true,"sourceToolUseID":"x","message":{"role":"user","content":[{"type":"text","text":"body"}]}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Continue"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","is_error":true}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","is_error":"true"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[]}}"#,
+            r#"{"type":"user","messa"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Read","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"drovr:tdd"}]}}"#,
+            r#"{"type":"system","message":{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Skill","input":{"skill":"drovr:tdd"}}]}}"#,
+        ];
+        let n = shapes.len();
+        let mut suppressed = 0usize;
+        for len in 2..=4 {
+            for mut code in 0..n.pow(len as u32) {
+                let mut seq: Vec<&str> = Vec::with_capacity(len);
+                for _ in 0..len {
+                    seq.push(shapes[code % n]);
+                    code /= n;
+                }
+                if !skill_invoked_last_turn(&seq.join("\n")) {
+                    continue;
+                }
+                suppressed += 1;
+                // Legitimate only if a call is followed later by its success.
+                let call_at = seq.iter().position(|r| *r == CALL);
+                let legit = call_at.is_some_and(|i| seq[i + 1..].contains(&OK));
+                assert!(
+                    legit,
+                    "suppressed with no successful drovr:* call:\n{}",
+                    seq.join("\n")
+                );
+            }
+        }
+        assert!(
+            suppressed > 0,
+            "no sequence suppressed at all — the check proves nothing"
+        );
+    }
+
+    #[test]
     fn gate_card_phrases_present_in_router_skill() {
         // The drift guard (§4.2, §9.2). TWO-SIDED on purpose: asserting only
         // that the card contains a phrase lets the router drop it, and
