@@ -405,9 +405,15 @@ fn invokes_drovr_skill(
 /// This hook runs on **every** user prompt, and live transcripts reach tens of
 /// megabytes; reading one whole would put that I/O in front of every prompt.
 /// Only the end can matter — [`skill_invoked_last_turn`] stops at the last real
-/// user message — and 1 MiB covers any plausible single turn with room to
-/// spare. A turn longer than the window simply isn't seen, which emits a
-/// redundant card: the same safe direction every other ambiguity resolves to.
+/// user message.
+///
+/// **1 MiB does not cover every turn, and the cost of that is measured, not
+/// assumed.** Over 4,470 turns in this machine's transcripts, **27 (0.6%)**
+/// exceed it; the largest single turn seen is 5.1 MiB. A turn longer than the
+/// window is not seen, which emits a redundant card — the same safe direction
+/// every other ambiguity resolves to. Widening the window would trade more I/O
+/// on *every* prompt against 0.6% fewer redundant cards, which is the wrong way
+/// round; the loss is bounded by the same fail-open rule as everything else.
 const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
 
 /// The last [`TRANSCRIPT_TAIL_BYTES`] of the transcript at `path`, or `None`
