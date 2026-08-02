@@ -12,10 +12,9 @@ it is a test suite. Only the **driver's** run is the **gate**: a clean
 verdict on a panel you ran yourself is evidence, never permission to
 report done.
 
-**They find, you fix.** Do not declare work done on your own judgment. Launch
-**read-only review subagents** to adversarially review the change, then address what
-they find — read-only keeps drovr's single-writer rule intact. In addition to the
-pipeline's final review phase, not instead of it.
+**They find, you fix.** Launch **read-only review subagents** to adversarially review
+the change, then address what they find — read-only keeps drovr's single-writer rule
+intact. In addition to the pipeline's final review phase, not instead of it.
 
 ## How to run it
 
@@ -42,7 +41,8 @@ Review as a skeptic, not the author.
 ## Resolving findings
 
 Address **every Critical and Important finding**, then re-run the tests. Record
-any you chose not to fix, with the reason. Only then may you report done.
+any you chose not to fix, with the reason. That clears review; it is not what
+makes you done — an empty finding list clears it vacuously.
 
 ## Automatic panel — `drovr code-review run <run> <task> [--context …]`
 
@@ -56,6 +56,5 @@ integration. If the panel is unavailable or wedged, use `code-review brief` and 
 the reviewer yourself — same brief either way.
 
 **Exit 2 is slow, not broken.** Re-running the *same* command RESUMES: it keeps the
-angles already banked and waits only on the stragglers. Loop on 2 as freely as on 3.
-`--fresh` throws that panel away and pays for a new one — never use it to unstick a
-timeout.
+angles already banked and waits only on stragglers. Loop on 2 as freely as on 3.
+`--fresh` throws it away and pays for a new one — never use it to unstick a timeout.

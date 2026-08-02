@@ -52,9 +52,14 @@ tasks; later tasks run as their own fresh phases.
    report, and that verdict is the one that decides whether the task advances — it has already
    caught an Important on the identical commit an author-run panel called clean.
 
-   Two mechanics if you do run it. **Commit first:** the panel reviews `base..HEAD`, so
-   uncommitted work is an empty range and every angle returns clean — a green review of nothing
-   (see `docs/known-issues.md`). **Keep it in the foreground and loop on exit 2:** re-running the
+   Two mechanics if you do run it. **Commit first, and keep committing:** the panel's committed
+   scope is `git diff base..HEAD`. Commit nothing and `base == HEAD`, so that range is empty —
+   `drovr code-review run` now refuses this outright (exit 1), because it used to return a clean
+   verdict on it (see `docs/known-issues.md`). Committing *once* is not enough either: whatever
+   you leave uncommitted after that is outside `base..HEAD`, and while the reviewer's brief does
+   put the working tree in scope alongside the diff, it does not reliably reach it — untracked
+   files never appear in a `git diff` at all. What you have not committed may not be reviewed.
+   **Keep it in the foreground and loop on exit 2:** re-running the
    same command resumes the panel in flight, so a slow one costs you a loop, not a stall. Do not
    background it and do not yield waiting on it — the driver may background its waits because it
    can end its turn; you cannot.
@@ -70,8 +75,12 @@ tasks; later tasks run as their own fresh phases.
      | Iteration `<i>` | Head SHA, from `<run_dir>/task-<N>-review-<i>.head` | Verdict |
 
      The iteration is the panel's own number, not your round count — read it off the
-     `task-<N>-review-<i>-<angle>.json` files it wrote. Write "none" if you ran none; an absent
-     section is indistinguishable from an undisclosed one,
+     `task-<N>-review-<i>-<angle>.json` files it wrote. **Verdict is `clean` or `changes`, and
+     nothing else** — derive it the way drovr does rather than from memory of an exit code:
+     `changes` if any finding in that iteration's per-angle files has severity `critical` or
+     `important`, otherwise `clean`. (`<task>-review.json` is overwritten each pass, so it is
+     not evidence about iteration `<i>`; the per-angle files are.) Write "none" if you ran none
+     — an absent section is indistinguishable from an undisclosed one,
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.

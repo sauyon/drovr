@@ -74,14 +74,35 @@ use crate::run::{PhaseStatus, RunState, run_dir};
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Outcome of one review pass. Maps to the CLI exit codes the driver reads.
+///
+/// `Clean` is the outcome the pipeline advances a task on, so it must mean exactly one
+/// thing: reviewers looked at a real range and found nothing blocking. It used to mean
+/// two — that, or nobody looked at anything, because the range was empty. Those are
+/// indistinguishable downstream and the vacuous one is the more dangerous, since it
+/// arrives faster and never disagrees with you. [`EmptyRange`](Self::EmptyRange) exists
+/// so that state cannot be spelled `Clean`.
+///
+/// What this type still does NOT carry is WHO ran the pass. An author-run pass and the
+/// driver's gate produce the same outcome, deliberately: caller identity here could only
+/// be self-declared, and a forgeable role is worse than an absent one. That separation is
+/// held by the skill docs (`drovr:pipeline`, `drovr:code-review`) and by the driver
+/// re-running the panel itself, unconditionally. See `docs/known-issues.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOutcome {
-    /// No blocking (Critical|Important) findings. → exit 0.
+    /// Reviewers examined a non-empty range and found no blocking
+    /// (Critical|Important) findings. → exit 0.
     Clean,
     /// At least one blocking finding; see `<task>-review.json`. → exit 3.
     Findings,
     /// Not every reviewer dropped its marker before `timeout_ms`. → exit 2.
     Timeout,
+    /// `base == head`: there is no committed range to review, so no verdict about it
+    /// can mean anything. Refused before any reviewer is spawned. → exit 1.
+    ///
+    /// Separate from [`Error`](Self::Error) because the cause is specific and the fix is
+    /// specific (commit, or re-record the base), and separate from
+    /// [`Clean`](Self::Clean) because that is the confusion it exists to prevent.
+    EmptyRange,
     /// Setup failure (e.g. base SHA not recorded, or HEAD unreadable). → exit 1.
     Error,
 }
@@ -755,6 +776,33 @@ pub fn code_review_run<H: Herdr>(
         }
     };
 
+    // An empty range is refused, not reviewed. `base == head` means nothing was
+    // committed between recording the base and now, so `git diff base..head` is empty
+    // and every angle would come back clean having examined no committed change —
+    // exit 0, the code the pipeline advances a task on. That vacuous pass is
+    // indistinguishable from a real one downstream, which is why it is refused here
+    // rather than annotated: a warning printed next to a `clean` verdict and a 0 exit
+    // is read as the verdict.
+    //
+    // The seed does put the working tree in scope alongside the diff, so "empty range"
+    // is not always "nothing exists to review" — but it is always a mistake worth
+    // stopping for, because the committed scope the panel is built around is empty and
+    // uncommitted work is not reliably reached (untracked files never appear in a
+    // `git diff`, and this is exactly how the observed vacuous pass happened).
+    //
+    // Refused BEFORE any reviewer is spawned: four panes that can only report on
+    // nothing are pure cost, and the caller needs the diagnosis, not a verdict.
+    if base == head {
+        eprintln!(
+            "code-review: empty review range for '{task}' (base == HEAD == {base}) — \
+             nothing was committed since the base was recorded, so there is no diff to \
+             review. Either commit this task's work (uncommitted changes are not \
+             reliably reviewed) or re-record the base with `drovr code-review base` if \
+             it was recorded after the work landed."
+        );
+        return Ok(ReviewOutcome::EmptyRange);
+    }
+
     // Resolved once per pass, so every angle in this panel — and every angle a later
     // resume respawns — is briefed identically.
     //
@@ -1240,6 +1288,80 @@ mod tests {
         assert!(
             run.review_phases.is_empty(),
             "a refused review must not record phases either"
+        );
+    }
+
+    /// Write the run's ACTUAL current HEAD as the review base, reproducing the state
+    /// that produced the vacuous pass: `drovr code-review base` recorded, then nothing
+    /// committed before the panel ran.
+    fn write_base_at_head(run: &RunState, task: &str) {
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = head_sha(&run.project_dir).unwrap();
+        std::fs::write(dir.join(format!("{task}-base.sha")), format!("{head}\n")).unwrap();
+    }
+
+    /// The defect this whole branch documents, in its sharpest form: on
+    /// `skill-stickiness` task 3, `task-3-base.sha` and `task-3-review-1.head` were both
+    /// `5c8a7da`, four angles returned `clean`, and the agent nearly shipped on it.
+    ///
+    /// A clean verdict is what the pipeline advances a task on, so a verdict about an
+    /// empty range must not be spellable as one.
+    #[test]
+    fn an_empty_review_range_is_refused_before_any_reviewer_is_spawned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-empty-range");
+        write_base_at_head(&run, "task-1");
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
+
+        // Deliberately NOT also asserting `outcome != Clean`: it cannot fail once the
+        // line above passes, and an assertion that cannot fail is the exact class of
+        // defect this test exists for.
+        assert_eq!(
+            outcome,
+            ReviewOutcome::EmptyRange,
+            "base == HEAD is an empty range; it must be refused, not reviewed — and \
+             never reported as Clean, the outcome the pipeline advances a task on"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned for a range that contains nothing"
+        );
+        assert!(
+            run.review_phases.is_empty(),
+            "a refused pass must not record phases either"
+        );
+    }
+
+    /// The guard must key on the SHAs, not on "did the caller commit recently" — and it
+    /// must let a real range through untouched. Mutation check: this is the test that
+    /// goes red if the `base == head` comparison is inverted or widened.
+    #[test]
+    fn a_non_empty_range_still_reaches_the_reviewers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-nonempty-range");
+        write_base_at_head(&run, "task-1");
+        // One commit is the entire difference between the refused case above and this
+        // one; nothing else about the fixture changes.
+        commit_more(&run);
+        drop_markers(&run, "task-1", 1);
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Clean,
+            "a real range with no blocking findings is still Clean"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            4,
+            "one reviewer per configured angle, as before the guard"
         );
     }
 

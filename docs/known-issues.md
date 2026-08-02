@@ -474,11 +474,12 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
-## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle (2026-08-02)
+## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle — FIXED 2026-08-02
 
-**Severity:** high — it manufactures the exact signal the pipeline uses to advance a task, and a
+**Severity:** high — it manufactured the exact signal the pipeline uses to advance a task, and a
 vacuous clean is indistinguishable from a real one.
-**Found:** run `skill-stickiness`, task 3, panel 1, 2026-08-02.
+**Found:** run `skill-stickiness`, task 3, panel 1, 2026-08-02. **Fixed** the same day, in run
+`panel-roles` — see the fix section at the end of this entry.
 
 ### Reproduction
 
@@ -491,19 +492,29 @@ Base equals head. The reviewed range `5c8a7da..5c8a7da` is empty. All four angle
 (`task-3-review-1-{correctness,error-handling,security,type-design}.json`) returned
 `"verdict": "clean"`, `"findings": []` — and nothing anywhere said the range was empty.
 
-The agent had authored 17 scenario files but not committed them. Untracked files never appear in
-a `git diff`, so there was nothing to review, and the panel said so in the one vocabulary that
-means the opposite.
+The agent had authored 17 scenario files and committed none of them, so nothing had moved HEAD
+since the base was recorded.
 
-**Anyone who runs the panel before committing gets a full green review of nothing.**
+**When `base == HEAD`, the panel returns a clean verdict having read no committed change.**
 
-### Why the working-tree clause does not save it
+### State the condition exactly
+
+It is tempting to write this as "uncommitted work reviews as clean." That is wrong, and the wrong
+version is more dangerous than no note at all, because it tells an agent that one commit makes it
+safe. The precise statement:
+
+- The committed scope is `git diff <base>..<head>`. It is empty **only when base == head** — i.e.
+  nothing was committed since `drovr code-review base` ran.
+- Commit some of the work and HEAD moves past base, so the range is real and the panel can return
+  real findings. Whatever is *still* uncommitted is simply outside that range.
+- So the hazard has two shapes: the empty range (this entry), and the quieter one where a partial
+  commit yields a real-looking review whose scope silently excludes the rest of the work.
 
 The seed does tell reviewers the scope is `git diff <base>..<head>` "**plus** the current working
-tree" (`cli/src/code_review.rs:326`). That clause is not a substitute for a real range: with
-base == head the diff is empty, untracked files are invisible to `git diff` and `git status`
-plumbing the reviewer is likely to reach for, and in the observed case all four angles concluded
-clean regardless. A prose instruction to also look around is not a scope.
+tree" (`cli/src/code_review.rs:326`), so uncommitted work is nominally in scope. That clause is
+not a substitute for a real range. Untracked files never appear in a `git diff`, and in the
+observed case there were 17 of them and all four angles still concluded clean. A prose
+instruction to also look around is not a scope, and it should not be relied on as one.
 
 ### Why it is dangerous, not merely useless
 
@@ -529,7 +540,7 @@ Four of the five were defects the panel *caught*. The fifth is the panel committ
 `task2-report.md:116` puts it: it recurs "because a vacuous pass and a real one are
 indistinguishable from outside."
 
-### Fix direction
+### FIXED 2026-08-02 — `base == head` is refused, and cannot be spelled `Clean`
 
 **Refuse to run when `base == head`, and say why.** An empty range is always a mistake, and there
 are only two ways to reach it:
@@ -538,15 +549,27 @@ are only two ways to reach it:
 - nothing has been committed yet — the usual case, since the panel is reached at the end of a task
   when uncommitted work is exactly what is on hand.
 
-Neither is a state in which a clean verdict means anything, so neither should produce one. Exit as
-a setup error naming both causes, in the same channel as "no review base recorded"
-(`code_review.rs:740-745`) — that path already exists and reads well from the driver. Do **not**
-warn and proceed: a warning on stderr next to a `clean` verdict and a 0 exit will be read as the
-verdict. Do not silently pass it.
+Neither is a state in which a clean verdict means anything, so neither produces one. What shipped:
 
-The check belongs before any reviewer is spawned (`code_review.rs:736-756`, where base and head
-are resolved and no comparison between them is made today), so a vacuous panel costs nothing
-rather than four reviewers.
+- **A new `ReviewOutcome::EmptyRange` variant**, not a special case at the call site. The fix the
+  reviewer asked for was type-level: vacuous and real clean shared one outcome, and one
+  `if` at one call site would have left the illegal state representable for the next caller. The
+  enum's own doc now carries why `Clean` must mean exactly one thing.
+- **Refused before any reviewer is spawned** (`code_review.rs`, immediately after base and head
+  resolve), so a vacuous panel costs nothing rather than four reviewer panes.
+- **Exit 1**, the setup-error channel the pipeline's failure model already routes to
+  STOP-and-diagnose. The message names both causes and what to do about each. It does **not**
+  warn and proceed: a warning on stderr next to a `clean` verdict and a 0 exit is read as the
+  verdict.
+- **Two tests**, `an_empty_review_range_is_refused_before_any_reviewer_is_spawned` (refuses,
+  spawns nothing, records no phases) and `a_non_empty_range_still_reaches_the_reviewers` (one
+  commit is the only difference; four reviewers, `Clean`). The guard was mutation-tested — broken,
+  watched go red, restored — because a checker that vacuously passes is precisely this entry's
+  subject.
+
+**Still open:** the second shape named above. A *partial* commit produces a real range whose
+verdict is silently narrower than the work, and nothing detects that. `implement-task.md` tells
+the task agent to keep committing; nothing enforces it.
 
 ## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
 

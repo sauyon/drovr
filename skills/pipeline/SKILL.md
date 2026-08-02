@@ -190,7 +190,11 @@ case $? in
   2)  # timeout — reviewers are slow, not broken. Re-run the SAME command: it resumes
       #   the panel in flight, banks the angles already in, waits only on stragglers.
       #   Loop on 2 as freely as on 3. Never add --fresh to "unstick" it.
-  1)  # error — STOP and diagnose (see Failure model)
+  1)  # error — STOP and diagnose (see Failure model). One cause is specific and the
+      #   message names it: base == HEAD, an EMPTY RANGE. The task committed nothing
+      #   since `code-review base`, so there is no diff. The panel refuses rather than
+      #   returning the clean verdict it used to. Do not re-run it — send the task agent
+      #   back to commit its work, or re-record the base if it was recorded too late.
 esac
 ```
 
