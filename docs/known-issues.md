@@ -591,6 +591,42 @@ below also closes this case.
    empty revision still occupies a turn. (1) is the stronger fix but changes the `review
    summary` contract, so a caller that treats any 200 as "published" needs updating too.
 
+## `code-review brief` tells a hand-spawned reviewer to call a tool it does not have
+
+**Severity:** medium (every hand-spawned reviewer burns turns hunting a missing tool, and one
+may silently drop its findings instead of reporting them in prose).
+**Found:** 2026-08-02, run `skill-stickiness` task 4.
+
+### Symptom
+
+All four reviewers spawned with `drovr code-review brief … --angle <angle>` output — pasted
+verbatim into an Agent-tool subagent, exactly as `drovr:code-review` instructs — reported the
+same thing: the brief directs them to deliver findings via `submit_findings`, and no such tool
+exists in their toolset. Each spent several turns searching (`ToolSearch` for `submit_findings`,
+`mcp__drovr-findings__submit_findings`, `findings`, `drovr`, `submit`) before giving up and
+reporting in prose. One opened its final message by saying it could not deliver the review
+through the sanctioned channel.
+
+### Root cause
+
+`submit_findings` is provided by the `drovr-findings` MCP server, which `drovr code-review run`
+wires into the reviewer panes it spawns. `code-review brief` emits the *same* brief text for
+both paths, so a reviewer spawned by hand — the path `drovr:code-review` documents as the
+fallback "when the panel is not available or is wedged" — is told to call a tool only the panel
+provides.
+
+### Workaround
+
+Tell the subagent in its spawn prompt that `submit_findings` is unavailable and to return the
+findings JSON as its final message. The reviewers still do the work correctly; only the delivery
+channel is missing.
+
+### Fix idea
+
+Have `code-review brief` take a flag (or detect the absence of the MCP server) and emit a
+prose-output instruction instead of the `submit_findings` one — the brief already owns the
+findings schema, so only the delivery sentence differs.
+
 ## Resolved
 
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**
