@@ -474,6 +474,80 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle (2026-08-02)
+
+**Severity:** high — it manufactures the exact signal the pipeline uses to advance a task, and a
+vacuous clean is indistinguishable from a real one.
+**Found:** run `skill-stickiness`, task 3, panel 1, 2026-08-02.
+
+### Reproduction
+
+```
+~/.local/share/drovr/runs/skill-stickiness/task-3-base.sha      5c8a7da
+~/.local/share/drovr/runs/skill-stickiness/task-3-review-1.head 5c8a7da   <- identical
+```
+
+Base equals head. The reviewed range `5c8a7da..5c8a7da` is empty. All four angles
+(`task-3-review-1-{correctness,error-handling,security,type-design}.json`) returned
+`"verdict": "clean"`, `"findings": []` — and nothing anywhere said the range was empty.
+
+The agent had authored 17 scenario files but not committed them. Untracked files never appear in
+a `git diff`, so there was nothing to review, and the panel said so in the one vocabulary that
+means the opposite.
+
+**Anyone who runs the panel before committing gets a full green review of nothing.**
+
+### Why the working-tree clause does not save it
+
+The seed does tell reviewers the scope is `git diff <base>..<head>` "**plus** the current working
+tree" (`cli/src/code_review.rs:326`). That clause is not a substitute for a real range: with
+base == head the diff is empty, untracked files are invisible to `git diff` and `git status`
+plumbing the reviewer is likely to reach for, and in the observed case all four angles concluded
+clean regardless. A prose instruction to also look around is not a scope.
+
+### Why it is dangerous, not merely useless
+
+A clean verdict is not decoration — it is the signal `drovr:pipeline` branches on to advance a
+task (exit 0 → proceed to task N+1). This one is byte-identical to a real pass: same schema, same
+four angles, same exit code. Nothing downstream can tell the two apart, so the vacuous pass
+inherits the authority of a genuine one.
+
+That makes it the **fifth appearance of the vacuous-pass class in a single run** — a check that
+reports success by not checking anything. Each was found and fixed in the run's own reports:
+
+1. **task 1** — a git-missing skip that printed ok.
+2. **task 1** — assertion 4 compared nothing and passed.
+3. **task 2** — `discover_corpus_roots` dropped `read_dir` entry errors and unreadable version
+   dirs, so the overlap test could pass having indexed only part of the corpus
+   (`task2-report.md`, panel round 2, finding 3).
+4. **task 2** — the overlap check guarded *our* side against producing no shingles but not the
+   *corpus* side; the report calls the asymmetry "worse than neither being guarded, because it
+   reads as deliberate" (`task2-report.md:17`).
+5. **this** — the panel's own empty range.
+
+Four of the five were defects the panel *caught*. The fifth is the panel committing it. As
+`task2-report.md:116` puts it: it recurs "because a vacuous pass and a real one are
+indistinguishable from outside."
+
+### Fix direction
+
+**Refuse to run when `base == head`, and say why.** An empty range is always a mistake, and there
+are only two ways to reach it:
+
+- the base was recorded *after* the work was committed (`drovr code-review base` run too late), or
+- nothing has been committed yet — the usual case, since the panel is reached at the end of a task
+  when uncommitted work is exactly what is on hand.
+
+Neither is a state in which a clean verdict means anything, so neither should produce one. Exit as
+a setup error naming both causes, in the same channel as "no review base recorded"
+(`code_review.rs:740-745`) — that path already exists and reads well from the driver. Do **not**
+warn and proceed: a warning on stderr next to a `clean` verdict and a 0 exit will be read as the
+verdict. Do not silently pass it.
+
+The check belongs before any reviewer is spawned (`code_review.rs:736-756`, where base and head
+are resolved and no comparison between them is made today), so a vacuous panel costs nothing
+rather than four reviewers.
+
 ## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
 
 **Severity:** medium — the author's own verdict silently becomes the release decision, so the
@@ -499,9 +573,11 @@ The **driver** then ran a sixth panel. The `correctness` angle returned an Impor
 That is the same defect class `b16dea0` had just claimed to fix. The agent had correctly
 identified it, fixed it incompletely, and then adjudicated its own fix as sufficient.
 
-### The sharp version
+### The sharp version — a controlled comparison, not a count
 
-Panels 5 and 6 reviewed the **identical tree**:
+The count of five is the weaker fact, and one of the five was vacuous (see the entry above), so
+only four were real passes. The evidence that carries this entry is the pair at the end, which is
+controlled: panels 5 and 6 reviewed the **identical tree**.
 
 ```
 task-3-review-5.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   author-run  → 4/4 angles clean
@@ -525,11 +601,11 @@ done — and `drovr code-review run` offers no signal to tell the two uses apart
 
 Two nearby effects worth knowing:
 
-- **The first of the five was vacuous.** Panel 1's head equalled the recorded base (`5c8a7da`)
-  because nothing had been committed yet, so it reviewed an empty diff and reported clean from
-  all four angles. The agent caught this itself. That is a *different* defect class — the panel
-  diffs `base..HEAD`, so uncommitted work reviews as clean and says so — and it is not recorded
-  separately here yet.
+- **The first of the five was vacuous, so only four were real passes.** Panel 1's head equalled
+  the recorded base (`5c8a7da`), so it reviewed an empty diff and reported clean from all four
+  angles. The agent caught this itself. It is a *different* defect class, recorded above — see
+  "The panel reviews `base..HEAD`". It does not weaken this entry, because this entry's evidence
+  is the controlled 5-vs-6 comparison, not the count.
 - **Cost.** Task 3 was reviewed 6×. Of the five author-run rounds, three (panels 2–4) returned
   findings; panel 1 was the vacuous one and panel 5 was clean. The sixth is the one that decided
   anything. An author-run panel is not wasted — three of them earned their keep — but it is
