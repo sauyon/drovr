@@ -72,10 +72,15 @@ what bounds the cumulative cost in the common case.
 that loaded successfully, and a previous turn that demonstrably invoked a `drovr:*` skill *and* whose
 `tool_result` says the call succeeded. Those are the only two `None` conditions in `gate_json`.
 
-**A third way produces no card without being a decision:** the hook cannot run at all — `drovr` not
-on `PATH`, a bad `$DROVR_BIN`, the script not executable. `exec` makes that exit non-zero, so it is
-loud rather than silent, but the turn is still cardless. "Fails loudly" is a claim about the exit
-code, not about the card.
+**A third way produces no card without being a decision:** the hook cannot run at all. It splits into
+two cases, and only one of them is loud.
+
+- **`drovr` is not installed** (not on `PATH`, or `$DROVR_BIN` names nothing resolvable) — the hook
+  exits **0 and says nothing**, by design (see *Deployment characteristics*). Silent and cardless.
+- **`drovr` resolves but fails**, or the script itself cannot be executed — non-zero, so stderr
+  reaches the user. Loud, and still cardless.
+
+"Fails loudly" is a claim about the exit code, never about the card: no exit code delivers one.
 
 A wrong emit costs 547 bytes; a wrong suppression is silent drift, which is the failure drovr exists
 to prevent. That asymmetry is the whole justification, and it is the property to preserve in any
@@ -165,8 +170,17 @@ verified by registering a stub hook with each exit code and observing whether th
 This is why `hooks/user-prompt` does **not** use `exec`. `clap` exits 2 on a usage error, and the
 `drovr` binary is installed by hand, independently of the plugin's `hooks/` — so a binary predating
 `--gate` is the *expected* skew, and `exec` would have erased every prompt the user typed, in every
-session, with only stderr as a clue. Every failure now maps to exit 1
-(`user_prompt_hook_never_exits_two`).
+session, with only stderr as a clue.
+
+**Every failure that reaches the CLI now maps to exit 1** — pinned as *exactly* 1 rather than merely
+"not 2" (`user_prompt_hook_never_exits_two`). The reason to pin the exact code: only three codes have
+actually been observed on this harness — **2 blocks the prompt, 127 does not, and 1 does not** (the
+last from the version-skew run below, where the hook exited 1 and the prompt was processed). Nothing
+establishes that an *arbitrary* code is non-blocking, so the mapping must land on one that was
+measured, and a `!= 2` assertion would have stayed green if it drifted to some untested code.
+
+The one non-zero-looking path that does *not* map to 1 is the "drovr not installed" guard, which
+exits 0 on purpose.
 
 **The fix was confirmed end to end, not just at the unit level:** a stub `drovr` reproducing clap's
 `error: unexpected argument '--gate' found` / exit 2 was put behind the real `hooks/user-prompt` in a

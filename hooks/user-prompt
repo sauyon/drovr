@@ -7,13 +7,13 @@
 # top of a session and scrolls out from under the agent as the context fills;
 # the gate is what keeps the discipline reachable at turn 200.
 #
-# This hook is deliberately thin: it resolves the plugin root and delegates every
-# decision to `drovr reflex --gate`, which reads the `[reflex]` config (`enabled`,
+# This hook is deliberately thin: it delegates every decision to
+# `drovr reflex --gate`, which reads the `[reflex]` config (`enabled`,
 # `per_turn`) and the transcript named on stdin, and prints the hook JSON or
 # nothing at all. Keeping the logic in the CLI keeps it unit-testable.
 #
-# TWO DELIBERATE DIFFERENCES FROM hooks/session-start. Both are load-bearing;
-# neither is an oversight to be tidied away.
+# FOUR DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is
+# load-bearing; none is an oversight to be tidied away.
 #
 #   1. NO DROVR_PHASE SUPPRESSION. The SessionStart reflex no-ops inside a
 #      drovr-spawned phase because the phase agent runs on its injected briefing.
@@ -27,10 +27,16 @@
 #   2. STDIN IS PASSED THROUGH. Claude Code writes the hook payload — including
 #      `transcript_path` — to stdin, and that path is the gate's only evidence
 #      that the previous turn already invoked a drovr:* skill and needs no card.
-#      `exec` hands this process's stdin to drovr unchanged. Nothing in this
-#      script may consume stdin (no `read`, no heredoc): a script that ate the
-#      payload would leave the gate emitting on every single turn, which looks
-#      exactly like a healthy hook.
+#      drovr runs as a child and inherits this process's stdin unchanged.
+#      Nothing in this script may consume stdin (no `read`, no heredoc): a
+#      script that ate the payload would leave the gate emitting on every single
+#      turn, which looks exactly like a healthy hook.
+#
+#   3. A MISSING BINARY DEGRADES SILENTLY, where session-start fails loudly.
+#      See the `command -v` guard below.
+#
+#   4. IT NEVER EXITS 2. See the mapping at the bottom — on this harness exit 2
+#      from a UserPromptSubmit hook discards the user's prompt.
 
 set -euo pipefail
 
@@ -54,6 +60,19 @@ DROVR="${DROVR_BIN:-drovr}"
 # complained here would complain before EVERY PROMPT OF EVERY SESSION, forever.
 # hooks/session-start still fails loudly in that case — once per session, which
 # is the right number of times to tell someone their CLI is missing.
+#
+# `command -v` is a resolvability check, NOT an executability check: for a bare
+# name found on PATH it returns 0 even when the file is mode 644. That case
+# falls through to bash's own 126, which the mapping below turns into 1 — safe,
+# just not silent.
+#
+# NOTE THE OTHER HALF OF THIS TRADE, which the argument above does not cover: a
+# `drovr` that IS installed but predates `--gate` — the more likely of the two
+# states — exits non-zero with clap's usage error on stderr, before every
+# prompt, forever. That noise is deliberate. It is recoverable by rebuilding;
+# an eaten prompt is not, and silence would hide a gate that had stopped
+# working. Loud-and-working beats quiet-and-broken; only "not installed at all"
+# is quiet, because there is no discipline to re-assert in that state.
 command -v "$DROVR" >/dev/null 2>&1 || exit 0
 
 # NEVER `exec`, and NEVER let a non-zero status through unmapped.
@@ -67,8 +86,10 @@ command -v "$DROVR" >/dev/null 2>&1 || exit 0
 # **2** on a usage error. The binary is installed by hand, independently of the
 # plugin's hooks/, so a `drovr` predating `--gate` is the expected skew — and it
 # would erase every prompt the user typed, in every session, with only stderr as
-# a clue. Mapping every failure to 1 keeps the failure loud and visible while
-# making it structurally impossible for this hook to eat a prompt.
+# a clue. Mapping every failure reached here to 1 keeps it loud and visible while
+# making it structurally impossible for this hook to eat a prompt. (The one
+# non-zero path that does NOT reach here is the `command -v` guard above, which
+# exits 0 on purpose.)
 #
 # stdin still reaches drovr: a child inherits the shell's stdin, so dropping
 # `exec` costs a fork, not the payload. `set -e` does not fire on the left of

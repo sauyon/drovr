@@ -538,6 +538,10 @@ fn run_gate_with_binary(bin: &Path, config_home: &Path) -> Output {
         .env("DROVR_BIN", bin)
         .env("XDG_CONFIG_HOME", config_home)
         .env_remove("DROVR_PHASE")
+        // Same scrubbing as `run_hook_with_stdin`, so a future caller of this
+        // helper cannot pick up an ambient sibling-platform marker.
+        .env_remove("CURSOR_PLUGIN_ROOT")
+        .env_remove("COPILOT_CLI")
         .stdin(Stdio::null())
         .output()
         .expect("failed to execute hooks/user-prompt")
@@ -627,20 +631,22 @@ fn user_prompt_hook_never_exits_two() {
     for code in [2, 1, 127] {
         let stub = write_stub(stub_dir.path(), &format!("drovr-exit-{code}"), code);
         let out = run_gate_with_binary(&stub, cfg.path());
-        assert_ne!(
+        // Exactly 1, not merely "not 2". The measurement behind this covers
+        // two codes only (2 blocks, 127 does not); nothing establishes that an
+        // arbitrary code is non-blocking on this harness, so the mapping must
+        // land on the one code that was actually observed to be safe. `!= 2`
+        // alone would stay green if the mapping drifted to `exit 3`.
+        assert_eq!(
             out.status.code(),
-            Some(2),
-            "a drovr exiting {code} must not surface as a prompt-blocking exit 2"
-        );
-        assert!(
-            !out.status.success(),
-            "a drovr exiting {code} must still be reported as a failure"
+            Some(1),
+            "a drovr exiting {code} must be mapped to exit 1, never to a \
+             prompt-blocking 2 and never to an unmeasured code"
         );
     }
 }
 
 #[test]
-fn user_prompt_hook_emits_when_transcript_path_is_unreadable() {
+fn user_prompt_hook_emits_when_transcript_path_is_absent() {
     if !bash_available() {
         eprintln!("skipping: bash not available");
         return;
@@ -710,6 +716,14 @@ fn hooks_json_user_prompt_entry_has_no_matcher() {
         Some(5),
         "the UserPromptSubmit hook must carry a timeout"
     );
+    // Same class as `type`: flipping this to true means the hook's stdout is no
+    // longer merged into the prompt, so the card silently stops reaching the
+    // model while every bash-driven test in this file stays green.
+    assert_eq!(
+        user_prompt[0]["hooks"][0]["async"].as_bool(),
+        Some(false),
+        "the UserPromptSubmit hook must be synchronous, or its stdout is dropped"
+    );
 
     // ...and the sibling keeps its matcher: this test exists to pin the
     // DIFFERENCE, so asserting only the new entry would stay green if someone
@@ -766,8 +780,9 @@ fn user_prompt_hook_needs_no_plugin_root() {
     }
     // The gate card is a const in the CLI, so unlike its sibling this hook needs
     // no plugin root — and must not acquire a resolution step that can fail.
-    // `hooks/session-start`'s fallback (`cd "$(dirname "$0")/.." && pwd`) aborts
-    // under `set -e` when that directory is unreachable, which would silence the
+    // `hooks/session-start`'s fallback (`SCRIPT_DIR="$(cd "$(dirname "$0")" &&
+    // pwd)"` then `PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"`) aborts under
+    // `set -e` when either directory is unreachable, which would silence the
     // gate for a reason unrelated to the gate.
     //
     // THE BEHAVIOURAL HALF CANNOT PIN THIS, and on its own it is a test that
@@ -782,7 +797,15 @@ fn user_prompt_hook_needs_no_plugin_root() {
         .filter(|l| !l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    for forbidden in ["CLAUDE_PLUGIN_ROOT", "dirname", "PLUGIN_ROOT"] {
+    for forbidden in [
+        "CLAUDE_PLUGIN_ROOT",
+        "PLUGIN_ROOT",
+        "dirname",
+        "BASH_SOURCE",
+        "realpath",
+        "readlink",
+        "${0%",
+    ] {
         assert!(
             !operative.contains(forbidden),
             "hooks/user-prompt must not resolve a plugin root, but its code \
@@ -847,5 +870,70 @@ fn session_start_hook_exits_nonzero_on_unloadable_config() {
         !out.status.success(),
         "the SessionStart reflex must exit non-zero on an unloadable config, got stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn user_prompt_hook_resolves_drovr_from_path() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // THE SHIPPING CONFIGURATION, which no other test in this file exercises:
+    // `DROVR_BIN` unset, `drovr` found on PATH. Every other case pins
+    // `DROVR_BIN` to an absolute path, so the whole `${DROVR_BIN:-drovr}`
+    // default and the PATH lookup were untested — and combined with the silent
+    // degrade, a break there is invisible. Two one-character mutations silence
+    // the gate for every real user while leaving the rest of the suite green:
+    //
+    //   DROVR="${DROVR_BIN:-drovr}"  ->  DROVR="${DROVR_BIN:-}"
+    //       `command -v ""` returns 1, so the guard exits 0. Forever, silently.
+    //   command -v "$DROVR" ...      ->  [ -x "$DROVR" ] ...
+    //       a bare name is not a path, so `-x` fails and the guard exits 0.
+    //
+    // This is the exact failure the design says it fears — a hook that looks
+    // healthy while being useless — and `exit 0` guarantees no diagnostics.
+    let cfg = tempfile::tempdir().unwrap();
+    let bin_dir = tempfile::tempdir().unwrap();
+
+    // A stub *named* `drovr`, reachable only via PATH.
+    let stub = bin_dir.path().join("drovr");
+    std::fs::copy(drovr_binary(), &stub).expect("failed to stage a drovr on PATH");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Prepended, not replaced: `bash` and its own helpers must stay reachable.
+    // Being first is what matters — it shadows any real `drovr` on the ambient
+    // PATH, so the stub is the one that answers.
+    let path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut dirs = vec![bin_dir.path().to_path_buf()];
+            dirs.extend(std::env::split_paths(&existing));
+            std::env::join_paths(dirs).expect("failed to build PATH")
+        }
+        None => bin_dir.path().as_os_str().to_owned(),
+    };
+
+    let out = Command::new("bash")
+        .arg(hook_script(USER_PROMPT))
+        .env("CLAUDE_PLUGIN_ROOT", repo_root())
+        // The point of the test: DROVR_BIN is NOT set.
+        .env_remove("DROVR_BIN")
+        .env("PATH", path)
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .env_remove("DROVR_PHASE")
+        .env_remove("CURSOR_PLUGIN_ROOT")
+        .env_remove("COPILOT_CLI")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute hooks/user-prompt");
+    let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+
+    assert!(
+        injected.contains("DROVR GATE"),
+        "the gate must emit when drovr is resolved from PATH, got:\n{injected}"
     );
 }
