@@ -168,6 +168,11 @@ This is why `hooks/user-prompt` does **not** use `exec`. `clap` exits 2 on a usa
 session, with only stderr as a clue. Every failure now maps to exit 1
 (`user_prompt_hook_never_exits_two`).
 
+**The fix was confirmed end to end, not just at the unit level:** a stub `drovr` reproducing clap's
+`error: unexpected argument '--gate' found` / exit 2 was put behind the real `hooks/user-prompt` in a
+real session. The hook exited **1**, the prompt was processed, and the model answered normally. With
+`exec` that same session would have lost the prompt.
+
 **A missing `drovr` degrades silently.** The plugin installs on its own while the CLI is a separate
 build-and-PATH step, so "plugin without binary" is a normal state. `hooks/session-start` still fails
 loudly there — once per session, which is the right number of times to tell someone their CLI is
