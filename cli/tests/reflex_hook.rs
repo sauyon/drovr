@@ -7,13 +7,23 @@
 //! `DROVR_PHASE`) the hook no-ops *before* spawning drovr, so the phase runs
 //! purely on its injected handoff.
 //!
-//! `hooks/user-prompt` is the per-turn gate: it execs `drovr reflex --gate` on
+//! `hooks/user-prompt` is the per-turn gate: it runs `drovr reflex --gate` on
 //! every `UserPromptSubmit`, passing the hook's stdin payload through so the CLI
-//! can read the transcript and suppress a card the session does not need. Its two
-//! deliberate differences from its sibling are both load-bearing and both tested
-//! here: it does **not** suppress on `DROVR_PHASE` (a phase is exactly where the
-//! discipline must hold), and stdin reaches the CLI (without it the suppression
-//! rule can never fire, and the hook would look healthy while being useless).
+//! can read the transcript and suppress a card the session does not need. Four
+//! deliberate differences from its sibling, each load-bearing and each tested
+//! here:
+//!
+//!   1. it does **not** suppress on `DROVR_PHASE` — a phase is exactly where the
+//!      discipline must hold;
+//!   2. stdin reaches the CLI — without it the suppression rule can never fire,
+//!      and the hook would look healthy while being useless;
+//!   3. a missing `drovr` degrades **silently**, where the SessionStart reflex
+//!      fails loudly. The plugin installs without the CLI, and complaining once
+//!      per session is right where complaining once per *prompt* is not;
+//!   4. it never exits **2**. Measured on Claude Code 2.1.220, exit 2 from a
+//!      `UserPromptSubmit` hook discards the user's prompt unprocessed, and clap
+//!      exits 2 on a usage error — so an `exec` plus a `drovr` predating
+//!      `--gate` would erase every prompt typed.
 //!
 //! The scripts are exercised standalone via `bash`, with `CLAUDE_PLUGIN_ROOT`
 //! pointed at the repo root (so it resolves the skill) and `DROVR_BIN` pointed at
@@ -335,16 +345,20 @@ fn hook_payload(transcript_path: &Path) -> String {
 /// the skill's body. All three are required — the shape is documented in
 /// `cli/src/reflex.rs`'s test module, and a fixture missing the third one tests
 /// a transcript that does not exist.
-fn skill_call_records(skill: &str) -> String {
+/// `id` is a parameter, not a constant: two calls sharing one id would let the
+/// second's `tool_result` credit the first's `tool_use` as having succeeded,
+/// quietly making a multi-call fixture assert something other than it reads.
+fn skill_call_records(skill: &str, id: &str) -> String {
     format!(
         concat!(
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Skill","input":{{"skill":"{skill}"}}}}]}}}}"#,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Skill","input":{{"skill":"{skill}"}}}}]}}}}"#,
             "\n",
-            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}}]}}}}"#,
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok"}}]}}}}"#,
             "\n",
-            r#"{{"type":"user","isMeta":true,"sourceToolUseID":"toolu_1","message":{{"role":"user","content":[{{"type":"text","text":"Base directory for this skill: /x\n\n# TDD\n"}}]}}}}"#,
+            r#"{{"type":"user","isMeta":true,"sourceToolUseID":"{id}","message":{{"role":"user","content":[{{"type":"text","text":"Base directory for this skill: /x\n\n# TDD\n"}}]}}}}"#,
         ),
-        skill = skill
+        skill = skill,
+        id = id
     )
 }
 
@@ -462,7 +476,7 @@ fn user_prompt_hook_passes_stdin_through_to_the_suppression_check() {
         &format!(
             "{}\n{}\n",
             user_prompt_record("fix the parser"),
-            skill_call_records("drovr:tdd")
+            skill_call_records("drovr:tdd", "toolu_1")
         ),
     );
     let out = run_hook_with_stdin(
@@ -498,7 +512,7 @@ fn user_prompt_hook_emits_when_last_turn_invoked_no_skill() {
         &format!(
             "{}\n{}\n{}\n",
             user_prompt_record("fix the parser"),
-            skill_call_records("drovr:tdd"),
+            skill_call_records("drovr:tdd", "toolu_1"),
             user_prompt_record("now ship it")
         ),
     );
@@ -516,29 +530,140 @@ fn user_prompt_hook_emits_when_last_turn_invoked_no_skill() {
     );
 }
 
+/// Run `hooks/user-prompt` with `DROVR_BIN` pointed at `bin`.
+fn run_gate_with_binary(bin: &Path, config_home: &Path) -> Output {
+    Command::new("bash")
+        .arg(hook_script(USER_PROMPT))
+        .env("CLAUDE_PLUGIN_ROOT", repo_root())
+        .env("DROVR_BIN", bin)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env_remove("DROVR_PHASE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute hooks/user-prompt")
+}
+
+/// Write an executable stub at `<dir>/<name>` that exits `code`.
+fn write_stub(dir: &Path, name: &str, code: i32) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/usr/bin/env bash\necho boom >&2\nexit {code}\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
 #[test]
-fn user_prompt_hook_missing_binary_fails_loudly() {
+fn user_prompt_hook_degrades_silently_without_drovr() {
     if !bash_available() {
         eprintln!("skipping: bash not available");
         return;
     }
-    // `exec` is what makes this true: a missing binary surfaces as a non-zero
-    // exit rather than an empty stdout that Claude Code would read as a
-    // legitimate "nothing to inject".
+    // The plugin installs on its own while the CLI is a separate build-and-PATH
+    // step, so "plugin without binary" is a normal state. There is no discipline
+    // to re-assert when drovr is not installed, and complaining here would
+    // complain before EVERY prompt of EVERY session. hooks/session-start still
+    // fails loudly — once per session, which is the right number of times.
+    let cfg = tempfile::tempdir().unwrap();
+    let out = run_gate_with_binary(Path::new("/nonexistent/definitely-not-drovr"), cfg.path());
+
+    assert!(
+        out.status.success(),
+        "a missing drovr must let the turn through cleanly, got status={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a missing drovr must inject nothing, got stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn session_start_hook_still_fails_loudly_without_drovr() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The asymmetry's other half, asserted so the silent-degrade above cannot be
+    // "harmonised" onto the hook that should stay loud.
     let cfg = tempfile::tempdir().unwrap();
     let out = Command::new("bash")
-        .arg(hook_script(USER_PROMPT))
+        .arg(hook_script(SESSION_START))
         .env("CLAUDE_PLUGIN_ROOT", repo_root())
         .env("DROVR_BIN", "/nonexistent/definitely-not-drovr")
         .env("XDG_CONFIG_HOME", cfg.path())
         .env_remove("DROVR_PHASE")
-        .stdin(Stdio::null())
         .output()
-        .expect("failed to execute hooks/user-prompt");
+        .expect("failed to execute hooks/session-start");
     assert!(
         !out.status.success(),
-        "a missing binary must make the gate hook exit non-zero, got stdout:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        "the SessionStart reflex must still fail loudly when drovr is missing"
+    );
+}
+
+#[test]
+fn user_prompt_hook_never_exits_two() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // MEASURED on Claude Code 2.1.220: exit 2 from a UserPromptSubmit hook is a
+    // BLOCKING error — the user's prompt is discarded unprocessed. clap exits 2
+    // on a usage error, and `drovr` is installed by hand independently of the
+    // plugin's hooks/, so a binary predating `--gate` is the expected skew. With
+    // `exec`, that skew would erase every prompt the user typed. Every failure
+    // must therefore map to a non-blocking code.
+    let cfg = tempfile::tempdir().unwrap();
+    let stub_dir = tempfile::tempdir().unwrap();
+
+    for code in [2, 1, 127] {
+        let stub = write_stub(stub_dir.path(), &format!("drovr-exit-{code}"), code);
+        let out = run_gate_with_binary(&stub, cfg.path());
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "a drovr exiting {code} must not surface as a prompt-blocking exit 2"
+        );
+        assert!(
+            !out.status.success(),
+            "a drovr exiting {code} must still be reported as a failure"
+        );
+    }
+}
+
+#[test]
+fn user_prompt_hook_emits_when_transcript_path_is_unreadable() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The fail-open bullet that had no end-to-end coverage: a payload naming a
+    // transcript that cannot be read must still emit. Approaching it from the
+    // `None` side inside the CLI misses it — a "defensive" early return in
+    // `cmd_reflex_gate` for an unreadable transcript would leave the whole suite
+    // green while the gate went permanently silent for those users.
+    let cfg = tempfile::tempdir().unwrap();
+    let out = run_hook_with_stdin(
+        USER_PROMPT,
+        None,
+        cfg.path(),
+        Some(&hook_payload(Path::new(
+            "/nonexistent/dir/transcript.jsonl",
+        ))),
+    );
+    let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+
+    assert!(
+        injected.contains("DROVR GATE"),
+        "an unreadable transcript path must not suppress the card, got:\n{injected}"
     );
 }
 
@@ -570,6 +695,21 @@ fn hooks_json_user_prompt_entry_has_no_matcher() {
         Some("\"${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt\""),
         "the UserPromptSubmit entry must run hooks/user-prompt"
     );
+    // Without this, mutating `type` to anything else makes Claude Code skip the
+    // hook entirely while the only guard on the wiring stays green.
+    assert_eq!(
+        user_prompt[0]["hooks"][0]["type"].as_str(),
+        Some("command"),
+        "the UserPromptSubmit hook must be a command hook"
+    );
+    // A hook that runs before every prompt must be bounded: the default is 60s,
+    // and a stalled filesystem under `transcript_path` would hold the user's
+    // prompt for all of it. Measured cost is 8-10 ms, so 5s is ample headroom.
+    assert_eq!(
+        user_prompt[0]["hooks"][0]["timeout"].as_u64(),
+        Some(5),
+        "the UserPromptSubmit hook must carry a timeout"
+    );
 
     // ...and the sibling keeps its matcher: this test exists to pin the
     // DIFFERENCE, so asserting only the new entry would stay green if someone
@@ -577,6 +717,10 @@ fn hooks_json_user_prompt_entry_has_no_matcher() {
     let session_start = parsed["hooks"]["SessionStart"]
         .as_array()
         .expect("hooks.json must still declare a SessionStart array");
+    assert!(
+        !session_start.is_empty(),
+        "hooks.json must still declare a SessionStart entry"
+    );
     assert_eq!(
         session_start[0]["matcher"].as_str(),
         Some("startup|clear|compact"),
@@ -585,22 +729,33 @@ fn hooks_json_user_prompt_entry_has_no_matcher() {
 }
 
 #[test]
-fn user_prompt_hook_is_executable() {
+fn user_prompt_hook_is_executable_in_the_index() {
     // hooks.json invokes the script directly, not via `bash <script>` as these
-    // tests do, so the mode bit is part of the contract and nothing else here
-    // would notice it missing.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(hook_script(USER_PROMPT))
-            .expect("hooks/user-prompt must exist")
-            .permissions()
-            .mode();
-        assert!(
-            mode & 0o111 != 0,
-            "hooks/user-prompt must be executable, mode is {mode:o}"
-        );
+    // tests do, so the mode bit is part of the contract.
+    //
+    // Assert on the INDEX, not the working tree. `git update-index --chmod=-x`
+    // ships a non-executable hook while leaving the checkout untouched: a
+    // working-tree assertion stays green in the very checkout where the mistake
+    // is made and breaks only for downstream users on a fresh clone. What is
+    // distributed is what must be checked.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["ls-files", "-s", "hooks/user-prompt"])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("skipping: git not available");
+        return;
+    };
+    if !out.status.success() {
+        eprintln!("skipping: git ls-files failed (not a repo?)");
+        return;
     }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listing.starts_with("100755 "),
+        "hooks/user-prompt must be mode 100755 in the index, got: {listing:?}"
+    );
 }
 
 #[test]
@@ -610,10 +765,31 @@ fn user_prompt_hook_needs_no_plugin_root() {
         return;
     }
     // The gate card is a const in the CLI, so unlike its sibling this hook needs
-    // no plugin root — and must not acquire a resolution step that could fail.
+    // no plugin root — and must not acquire a resolution step that can fail.
     // `hooks/session-start`'s fallback (`cd "$(dirname "$0")/.." && pwd`) aborts
     // under `set -e` when that directory is unreachable, which would silence the
-    // gate for a reason unrelated to the gate. This pins the absence.
+    // gate for a reason unrelated to the gate.
+    //
+    // THE BEHAVIOURAL HALF CANNOT PIN THIS, and on its own it is a test that
+    // passes while checking nothing: the resolution block SUCCEEDS with
+    // CLAUDE_PLUGIN_ROOT unset in any healthy checkout, so restoring it verbatim
+    // leaves this green. An absence is only expressible as an assertion about
+    // the source text, so assert both — the behaviour, and the absence itself.
+    let script = std::fs::read_to_string(hook_script(USER_PROMPT))
+        .expect("hooks/user-prompt must be readable");
+    let operative: String = script
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in ["CLAUDE_PLUGIN_ROOT", "dirname", "PLUGIN_ROOT"] {
+        assert!(
+            !operative.contains(forbidden),
+            "hooks/user-prompt must not resolve a plugin root, but its code \
+             contains {forbidden:?}:\n{operative}"
+        );
+    }
+
     let cfg = tempfile::tempdir().unwrap();
     let out = Command::new("bash")
         .arg(hook_script(USER_PROMPT))
