@@ -32,10 +32,15 @@ being wrong is a few hundred bytes per turn of noise the agent learns to skim pa
 ## Cost, stated both ways
 
 **Per injection: 547 bytes** of rendered `additionalContext`, against a chosen budget of **≤600**.
-(655 bytes for the whole JSON envelope; the budget and the test are on `additionalContext`, which is
-what enters the context window.) Measured by running the built binary and counting bytes — the
-assertion also lives in `cli/src/reflex.rs::gate_card_within_600_bytes` and in
-`cli/tests/reflex_hook.rs::user_prompt_hook_emits_gate_json`, so it cannot drift silently.
+(656 bytes for the whole pretty-printed JSON envelope, 657 with the trailing newline; the budget and
+the test are on `additionalContext`, which is what enters the context window.) Measured by running
+the built binary and counting the bytes it actually wrote.
+
+**What is pinned is the ≤600 budget, not the 547.** `cli/src/reflex.rs::gate_card_within_600_bytes`
+and `cli/tests/reflex_hook.rs::user_prompt_hook_emits_gate_json` both assert `<= 600` and nothing
+tighter, so a card edit landing anywhere between 548 and 600 bytes leaves the suite green and
+silently invalidates the 547, the 656, and the ~55 KB below. Re-measure them when the card changes;
+do not trust them because the tests are green.
 
 **Cumulative, not a rate.** This is the figure that matters and the one easy to state wrongly.
 `additionalContext` is appended to the conversation and *stays* there. A 100-turn session in which
@@ -63,18 +68,31 @@ what bounds the cumulative cost in the common case.
   body and a half-read config would frame it wrongly;
 - any transcript shape the scan does not recognise.
 
-**Only two things silence it:** an explicit `enabled = false` or `per_turn = false` in a config that
-loaded successfully, and a previous turn that demonstrably invoked a `drovr:*` skill *and* whose
-`tool_result` says the call succeeded. A wrong emit costs 547 bytes; a wrong suppression is silent
-drift, which is the failure drovr exists to prevent. That asymmetry is the whole justification, and
-it is the property to preserve in any future edit — a harness change can then only ever make the
-gate noisier, never silently quieter.
+**Two things silence it BY DESIGN:** an explicit `enabled = false` or `per_turn = false` in a config
+that loaded successfully, and a previous turn that demonstrably invoked a `drovr:*` skill *and* whose
+`tool_result` says the call succeeded. Those are the only two `None` conditions in `gate_json`.
+
+**A third way produces no card without being a decision:** the hook cannot run at all — `drovr` not
+on `PATH`, a bad `$DROVR_BIN`, the script not executable. `exec` makes that exit non-zero, so it is
+loud rather than silent, but the turn is still cardless. "Fails loudly" is a claim about the exit
+code, not about the card.
+
+A wrong emit costs 547 bytes; a wrong suppression is silent drift, which is the failure drovr exists
+to prevent. That asymmetry is the whole justification, and it is the property to preserve in any
+future edit. **Stated precisely, because the absolute version is false:** the emit/suppress *logic*
+resolves every ambiguity toward emitting, so no change to that logic can make the gate quieter by
+accident. A change to the transcript *schema* can. If Claude Code ever tagged real user prompts
+`isMeta` with a `sourceToolUseID`, or recorded a prompt as a content array of only `tool_result`
+blocks, the backward walk would step past this turn's prompt, reach an earlier turn's successful
+skill call, and suppress. That is exactly why "What is NOT known" item 4 exists.
 
 **The transcript read is bounded to a 1 MiB tail** (`TRANSCRIPT_TAIL_BYTES`), because live
-transcripts reach 29 MB and this runs before every prompt. Consequence, measured over 4,470 real
-turns on this machine: **27 (0.6%) have a turn longer than the window**, largest 5.1 MiB. Those emit
-a redundant card rather than suppressing wrongly — the fail-open direction again. Widening the
-window would cost I/O on every prompt to remove 0.6% of redundant cards.
+transcripts reach 29 MB and this runs before every prompt. Consequence — **inherited from task 4's
+measurement, recorded in `~/.local/share/drovr/runs/skill-stickiness/implement-task-4-HANDOFF.md`,
+and not re-measured here:** of 4,470 real turns on that machine, **27 (0.6%) have a turn longer than
+the window**, largest 5.1 MiB. Those emit a redundant card rather than suppressing wrongly — the
+fail-open direction again. Widening the window would cost I/O on every prompt to remove 0.6% of
+redundant cards.
 
 ## Asymmetric suppression: the gate does NOT no-op inside a drovr phase
 
@@ -131,18 +149,22 @@ or future versions. Re-run the probe before relying on it elsewhere.
 two reasons that outlive the measurement: the answer is a harness behaviour drovr does not own and
 cannot pin, and §7.3/§7.4's probe subagents plus drovr's own read-only reviewers all launch from a
 gate-on session — a card leaking into one of them would contaminate the very measurements this run
-depends on. The line costs ~100 of the 547 bytes and buys insurance against a harness change that
-would otherwise be invisible.
+depends on. The line costs 105 of the 547 bytes (104 plus its newline) and buys insurance against a
+harness change that would otherwise be invisible.
 
 ## What is NOT known
 
 1. **Whether the gate works.** No measurement here says the card changes agent behaviour. Its
-   *presence* is machine-checked (all six §4.2 content items, the byte budget, the suppression
-   paths); its *effect* is not, and §4.2 says so outright.
+   *presence* is machine-checked (all six §4.2 content items, the ≤600 budget, every fail-open and
+   both by-design silencing paths); its *effect* is not, and §4.2 says so outright.
 2. **Whether the wording is the right wording.** The card is a fixed `const` in `reflex.rs` rather
    than an extract of `using-drovr/SKILL.md`, so card and skill can drift. The mitigation is a
-   two-sided phrase test (`gate_card_phrases_present_in_router_skill`), and that test cannot defend
-   its own assertions — deleting one side leaves the suite green.
+   two-sided phrase test (`gate_card_phrases_present_in_router_skill`) and it is **thin in two
+   ways**: `GATE_CARD_PHRASES` is three strings (`<SUBAGENT-STOP>`, `Single writer`,
+   `drovr:code-review`), so none of the card's *novel* content — the 1% rule, the announcement
+   string, the checklist-binding line — is guarded at all until the task that writes those phrases
+   into the router adds them; and the test cannot defend its own assertions, since deleting one side
+   of the two-sided check leaves the suite green.
 3. **Whether 547 bytes × N turns is the right trade.** The suppression rule bounds it in the common
    case, but no one has measured how often a real session actually drifts.
 4. **The transcript JSONL schema is not drovr's to own.** The suppression scan is written against a

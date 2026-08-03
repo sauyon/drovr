@@ -630,3 +630,46 @@ fn user_prompt_hook_needs_no_plugin_root() {
         "the gate must emit with no CLAUDE_PLUGIN_ROOT set, got:\n{injected}"
     );
 }
+
+#[test]
+fn user_prompt_hook_emits_on_unloadable_config() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The fail-open bullet with no coverage until now. `load_config` fails for
+    // reasons that have nothing to do with `[reflex]` — a typo anywhere in
+    // config.toml — and the SessionStart reflex deliberately exits 1 there.
+    // The gate must do the opposite: warn and run on defaults, because going
+    // quiet for the rest of the session over an unrelated typo is exactly the
+    // silent drift it exists to prevent.
+    let cfg = tempfile::tempdir().unwrap();
+    write_config(cfg.path(), "[reflex\nenabled = = false\n");
+    let out = run_hook(USER_PROMPT, None, cfg.path());
+    let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+
+    assert!(
+        injected.contains("DROVR GATE"),
+        "an unloadable config must not silence the gate, got:\n{injected}"
+    );
+}
+
+#[test]
+fn session_start_hook_exits_nonzero_on_unloadable_config() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The other half of the asymmetry above, asserted so the two hooks cannot
+    // quietly converge: the SessionStart reflex injects a whole skill body, and
+    // a half-read config would frame it wrongly, so it fails LOUD.
+    let cfg = tempfile::tempdir().unwrap();
+    write_config(cfg.path(), "[reflex\nenabled = = false\n");
+    let out = run_hook(SESSION_START, None, cfg.path());
+
+    assert!(
+        !out.status.success(),
+        "the SessionStart reflex must exit non-zero on an unloadable config, got stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

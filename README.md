@@ -76,8 +76,9 @@ always-on reflex for human-facing sessions (it no-ops inside a drovr-spawned
 phase). The `user-prompt` hook injects a much smaller **per-turn gate card**
 before every prompt, because a `SessionStart` injection scrolls out from under
 the agent as the context fills and the discipline has to still be reachable at
-turn 200. Both delegate rendering to `drovr reflex`, so both are shaped by the
-`[reflex]` table — with no `[reflex]` table both are injected unchanged:
+turn 200. Both delegate to `drovr reflex`, so both are governed by the
+`[reflex]` table — the SessionStart reflex is *shaped* by it, the gate is only
+switched on and off. With no `[reflex]` table both are injected unchanged:
 
 ```toml
 [reflex]
