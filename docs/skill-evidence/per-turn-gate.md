@@ -152,6 +152,52 @@ gate-on session — a card leaking into one of them would contaminate the very m
 depends on. The line costs 105 of the 547 bytes (104 plus its newline) and buys insurance against a
 harness change that would otherwise be invisible.
 
+## Deployment characteristics, measured
+
+This hook runs synchronously in front of every prompt of every session of everyone who installs the
+plugin. Blast radius is the thing to get right, so it was measured rather than reasoned about.
+
+**Exit codes: 2 blocks the user's prompt.** On Claude Code 2.1.220, a `UserPromptSubmit` hook that
+exits **2** causes the prompt to be discarded unprocessed — the harness prints `Original prompt: …`
+and the model never answers. Exit **127** is non-blocking; the turn proceeded normally. Both
+verified by registering a stub hook with each exit code and observing whether the model replied.
+
+This is why `hooks/user-prompt` does **not** use `exec`. `clap` exits 2 on a usage error, and the
+`drovr` binary is installed by hand, independently of the plugin's `hooks/` — so a binary predating
+`--gate` is the *expected* skew, and `exec` would have erased every prompt the user typed, in every
+session, with only stderr as a clue. Every failure now maps to exit 1
+(`user_prompt_hook_never_exits_two`).
+
+**A missing `drovr` degrades silently.** The plugin installs on its own while the CLI is a separate
+build-and-PATH step, so "plugin without binary" is a normal state. `hooks/session-start` still fails
+loudly there — once per session, which is the right number of times to tell someone their CLI is
+missing; doing it once per *prompt* is not.
+
+**Latency: 8–10 ms** for the whole hook (bash + process start + a 1 MiB tail read of the largest
+transcript on this machine, 29.8 MB), against a 3 ms floor with no transcript. Debug binary, warm
+cache; a release build is lower. `hooks.json` sets `"timeout": 5` — the default is 60s, and a
+stalled mount under `transcript_path` would otherwise hold the prompt for all of it.
+
+**Prompts larger than the 64 KiB stdin cap are fine.** `read_hook_input` caps at 64 KiB and does not
+drain the rest, so the harness's write to the hook's stdin gets EPIPE. **Measured end to end with a
+200 KB prompt (3× the cap): the model answered normally and the card injected once.** Claude Code
+tolerates it. Recorded because the tolerance is the harness's, not drovr's — a different harness
+could surface it as a hook error, and the fix would be a `std::io::copy(&mut reader, &mut sink())`
+after the capped read.
+
+**Turn 1 injects twice.** A fresh session gets the full router skill (~5 KB) from `SessionStart`
+*and* the 547-byte card, because suppression recognises only a `drovr:*` **Skill tool call** in the
+transcript and a `SessionStart` injection is not one. ~10% overhead on top of an injection that just
+happened; judged acceptable rather than worth a second suppression mechanism.
+
+**The kill switch is global, not per-project.** Config resolves to exactly one path
+(`${XDG_CONFIG_HOME:-$HOME/.config}/drovr/config.toml`), so `per_turn = false` turns the gate off
+**everywhere**, and leaving it on injects the card in every repo, drovr project or not. Spec §4.2
+specifies "suppressible per-user", so this is the designed behaviour and not a defect — but it is
+the largest blast-radius property of the mechanism and it is all-or-nothing. A project-scoped
+override is the obvious future refinement; it is out of scope here because it changes
+`ReflexConfig`'s resolution, not the hook.
+
 ## What is NOT known
 
 1. **Whether the gate works.** No measurement here says the card changes agent behaviour. Its
@@ -170,6 +216,10 @@ harness change that would otherwise be invisible.
 4. **The transcript JSONL schema is not drovr's to own.** The suppression scan is written against a
    shape verified on live transcripts *today*; no contract covers it. The mitigation is direction,
    not detection (see above).
+5. **`transcript_path` is read without validating where it points.** The gate opens whatever path
+   the payload names and reads its last 1 MiB. Nothing is exfiltrated — the content collapses to a
+   boolean, the card is a `const`, and nothing read is ever echoed — but the read now happens on
+   every turn rather than never, and a `Path::starts_with` sanity check is not there.
 
 ## How to withdraw the bet
 

@@ -94,7 +94,11 @@ enabled = true
 # Cost is cumulative, not a rate: the card is 547 bytes (budgeted at <=600) and
 # each injection *stays* in the context window, so an unsuppressed 100-turn
 # session carries ~55 KB by the end. The suppression rule is what keeps the
-# common case to a handful of injections. Set false to turn it off.
+# common case to a handful of injections.
+#
+# This switch is GLOBAL, not per-project: config resolves to the single path
+# $XDG_CONFIG_HOME/drovr/config.toml, so `false` turns the gate off in every
+# repo and `true` injects the card in every repo, drovr project or not.
 per_turn = true
 # Optional: replace the framing text before the skill body inside the
 # <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing. Applies to the
