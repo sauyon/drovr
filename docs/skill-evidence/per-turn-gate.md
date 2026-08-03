@@ -87,6 +87,20 @@ got wrong. It is pinned by
 `cli/tests/reflex_hook.rs::user_prompt_hook_not_suppressed_in_phase`, whose sibling
 `suppressed_when_drovr_phase_set` pins the opposite behaviour for the other hook.
 
+## Measured: the hook actually injects, and injects every turn
+
+The integration tests drive `hooks/user-prompt` under `bash` directly. That proves the script and the
+CLI agree; it does not prove Claude Code delivers the result. So the wired hook was run by the real
+harness: `hooks/user-prompt` registered as the only `UserPromptSubmit` entry via `claude -p
+--settings`, `DROVR_BIN` pointed at the freshly built binary (hash checked — `cargo test` does not
+rebuild it, and validating against a stale binary has already cost this run a false result once).
+
+- **Turn 1** → the session transcript gained exactly one record containing the card, as an
+  `attachment` of type `hook_additional_context`. The card reaches the model.
+- **Turn 2** (`--resume` on the same session, no `drovr:*` skill invoked in between) → **two**
+  records. The gate is per-turn in the real harness, not once-per-session, and the no-skill-last-turn
+  path emits as designed.
+
 ## Measured: does `UserPromptSubmit` fire for Agent-tool subagents?
 
 **No.** Claude Code 2.1.220 on this machine fires `UserPromptSubmit` once per *session* user prompt
