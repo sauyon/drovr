@@ -1464,6 +1464,15 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                     );
                     process::exit(2);
                 }
+                // Exit 1 with `Error`: both are "stop and fix the setup", and the
+                // pipeline's failure model already routes 1 to STOP-and-diagnose. The
+                // variants stay distinct in the type so a caller reading the outcome
+                // (rather than the exit code) can tell an empty range from a broken one;
+                // the specific diagnosis is already on stderr.
+                ReviewOutcome::EmptyRange => {
+                    eprintln!("code-review: nothing to review for '{task}' (see message above)");
+                    process::exit(1);
+                }
                 ReviewOutcome::Error => {
                     eprintln!("code-review: could not run panel for '{task}' (see message above)");
                     process::exit(1);

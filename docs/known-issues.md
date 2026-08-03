@@ -474,6 +474,216 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle — FIXED 2026-08-02
+
+**Severity:** high — it manufactured the exact signal the pipeline uses to advance a task, and a
+vacuous clean is indistinguishable from a real one.
+**Found:** run `skill-stickiness`, task 3, panel 1, 2026-08-02. **Fixed** the same day, in run
+`panel-roles` — see the fix section at the end of this entry.
+
+### Reproduction
+
+```
+~/.local/share/drovr/runs/skill-stickiness/task-3-base.sha      5c8a7da
+~/.local/share/drovr/runs/skill-stickiness/task-3-review-1.head 5c8a7da   <- identical
+```
+
+Base equals head. The reviewed range `5c8a7da..5c8a7da` is empty. All four angles
+(`task-3-review-1-{correctness,error-handling,security,type-design}.json`) returned
+`"verdict": "clean"`, `"findings": []` — and nothing anywhere said the range was empty.
+
+The agent had authored 17 scenario files and committed none of them, so nothing had moved HEAD
+since the base was recorded.
+
+**When `base == HEAD`, the panel returns a clean verdict having read no committed change.**
+
+### State the condition exactly
+
+It is tempting to write this as "uncommitted work reviews as clean." That is wrong, and the wrong
+version is more dangerous than no note at all, because it tells an agent that one commit makes it
+safe. The precise statement:
+
+- The committed scope is `git diff <base>..<head>`. It is empty when that range **contains no
+  change** — usually because nothing was committed since `drovr code-review base` ran, so
+  base == head. **But equal SHAs are not the property.** `git commit --allow-empty` advances HEAD
+  without touching the tree, so base != head while the diff is still empty. The first version of
+  the guard below compared the two SHAs and this case walked straight past it.
+- Commit some of the work and HEAD moves past base, so the range is real and the panel can return
+  real findings. Whatever is *still* uncommitted is simply outside that range.
+- So the hazard has two shapes: the empty range (this entry), and the quieter one where a partial
+  commit yields a real-looking review whose scope silently excludes the rest of the work.
+
+The seed does tell reviewers the scope is `git diff <base>..<head>` "**plus** the current working
+tree" (`cli/src/code_review.rs:326`), so uncommitted work is nominally in scope. That clause is
+not a substitute for a real range. Untracked files never appear in a `git diff`, and in the
+observed case there were 17 of them and all four angles still concluded clean. A prose
+instruction to also look around is not a scope, and it should not be relied on as one.
+
+### Why it is dangerous, not merely useless
+
+A clean verdict is not decoration — it is the signal `drovr:pipeline` branches on to advance a
+task (exit 0 → proceed to task N+1). This one is byte-identical to a real pass: same schema, same
+four angles, same exit code. Nothing downstream can tell the two apart, so the vacuous pass
+inherits the authority of a genuine one.
+
+That makes it the **fifth appearance of the vacuous-pass class in a single run** — a check that
+reports success by not checking anything. Each was found and fixed in the run's own reports:
+
+1. **task 1** — a git-missing skip that printed ok.
+2. **task 1** — assertion 4 compared nothing and passed.
+3. **task 2** — `discover_corpus_roots` dropped `read_dir` entry errors and unreadable version
+   dirs, so the overlap test could pass having indexed only part of the corpus
+   (`task2-report.md`, panel round 2, finding 3).
+4. **task 2** — the overlap check guarded *our* side against producing no shingles but not the
+   *corpus* side; the report calls the asymmetry "worse than neither being guarded, because it
+   reads as deliberate" (`task2-report.md:17`).
+5. **this** — the panel's own empty range.
+
+Four of the five were defects the panel *caught*. The fifth is the panel committing it. As
+`task2-report.md:116` puts it: it recurs "because a vacuous pass and a real one are
+indistinguishable from outside."
+
+### FIXED 2026-08-02 — an empty range is refused, and cannot be spelled `Clean`
+
+**Refuse to run when `base..head` contains no change, and say why.** An empty range is always a
+mistake, and there are only two ways to reach it:
+
+- the base was recorded *after* the work was committed (`drovr code-review base` run too late), or
+- nothing has been committed yet — the usual case, since the panel is reached at the end of a task
+  when uncommitted work is exactly what is on hand.
+
+Neither is a state in which a clean verdict means anything, so neither produces one. What shipped:
+
+- **A new `ReviewOutcome::EmptyRange` variant**, not a special case at the call site. The fix was
+  type-level: vacuous and real clean shared one outcome, and one `if` at one call site would have
+  left the illegal state representable for the next caller.
+- **The check asks what the range CONTAINS** (`range_is_empty`, via `git diff --quiet
+  base..head`: exit 0 = no differences, 1 = differences). **It deliberately does not compare the
+  two SHAs.** The first version did, and `git commit --allow-empty` defeats it — HEAD advances,
+  the tree does not, so `base != head` with an empty diff and the vacuous `Clean` returns
+  untouched. That near-miss is the entry's own lesson recurring inside its fix: *equal names* is
+  not *equal content*, and only one of them is the property worth checking.
+- **"Could not tell" is not "not empty".** If git cannot answer (an unresolvable base, say), the
+  guard prints a loud warning saying it did not run, and proceeds — it does not silently treat
+  the range as non-empty, and it does not refuse a pass that worked before the guard existed.
+- **Refused before any reviewer is spawned**, so a vacuous panel costs nothing rather than four
+  reviewer panes.
+- **Exit 1**, the setup-error channel the pipeline's failure model already routes to
+  STOP-and-diagnose. It does **not** warn and proceed: a warning on stderr next to a `clean`
+  verdict and a 0 exit is read as the verdict.
+- **Three tests.** `an_empty_review_range_is_refused_before_any_reviewer_is_spawned`,
+  `a_non_empty_range_still_reaches_the_reviewers`, and — the one that carries the property —
+  `an_empty_commit_is_refused_even_though_the_shas_differ`. Both guards were mutation-tested:
+  reverted to the SHA comparison, the empty-commit test failed with `left: Timeout, right:
+  EmptyRange` (the panel had spawned reviewers over nothing) while the other two still passed,
+  which is exactly why that third test earns its place.
+
+**Still open, deliberately:** the *partial* commit. It produces a real, non-empty range whose
+verdict is honest but silently narrower than the task's work, and nothing detects that — the
+panel cannot know what you meant to commit. `implement-task.md` tells the task agent to keep
+committing, and `ReviewOutcome::Clean`'s doc states in terms that a clean verdict covers the
+committed range and not the task. Both are documentation, not enforcement. Fixing it would mean
+redesigning what the panel's scope IS (e.g. refusing on a dirty tree), which is a larger question
+with real false-positive cost.
+
+## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
+
+**Severity:** medium — the author's own verdict silently becomes the release decision, so the
+defect ships and the review cost is paid twice.
+**Found:** run `skill-stickiness`, task 3 (authoring the 17-scenario pressure corpus), 2026-08-02.
+**Not a bug in `code_review.rs`** — the panel worked exactly as built. The defect was in the docs:
+nothing distinguished *running* the panel from *being gated by* it.
+
+### What happened
+
+The task agent ran `drovr code-review run` **five times** on its own work (four angles each:
+correctness, error-handling, security, type-design), fixing what it found — 7 Important and 1 nit
+across the five — and committed `b16dea0 fix(writing-skills): remove a self-contradiction and a
+collapsed pressure set`. Its fifth panel returned clean on all four angles. It declared the task
+done.
+
+The **driver** then ran a sixth panel. The `correctness` angle returned an Important:
+
+> `skills/writing-skills/scenarios/verification-before-completion-1.md`: "Pressure list still
+> collapses to two effective levers: time, social, and exhaustion are all hurry-up variants;
+> pragmatic is the only distinct one."
+
+That is the same defect class `b16dea0` had just claimed to fix. The agent had correctly
+identified it, fixed it incompletely, and then adjudicated its own fix as sufficient.
+
+### The sharp version — a controlled comparison, not a count
+
+The count of five is the weaker fact, and one of the five was vacuous (see the entry above), so
+only four were real passes. The evidence that carries this entry is the pair at the end, which is
+controlled: panels 5 and 6 reviewed the **identical tree**.
+
+```
+task-3-review-5.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   author-run  → 4/4 angles clean
+task-3-review-6.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   driver-run  → correctness: 1 Important
+```
+
+Same base, same HEAD, same four angles, same reviewer configuration. The only variable was who
+invoked it. (Artifacts: `~/.local/share/drovr/runs/skill-stickiness/task-3-review-{5,6}-*.json`.)
+
+### Root cause — and what it is *not*
+
+Running the panel on your own work is good practice, and the five self-runs found real defects:
+7 of their 8 findings were Important, and every Important was fixed. That is the panel working
+as a test suite, which is what it should be. The defect is that **nothing named the difference** between
+that use and the acceptance gate, so a clean author-run verdict was read as permission to report
+done — and `drovr code-review run` offers no signal to tell the two uses apart.
+
+`skills/pipeline/SKILL.md` said the driver runs the panel; it never said an author-run panel is
+*not* the gate. `phase-prompts/implement-task.md` step 5 told the task agent to self-review with
+`drovr:code-review`, which reads as licence to substitute the panel for the decision.
+
+Two nearby effects worth knowing:
+
+- **The first of the five was vacuous, so only four were real passes.** Panel 1's head equalled
+  the recorded base (`5c8a7da`), so it reviewed an empty diff and reported clean from all four
+  angles. The agent caught this itself. It is a *different* defect class, recorded above — see
+  "The panel reviews `base..HEAD`". It does not weaken this entry, because this entry's evidence
+  is the controlled 5-vs-6 comparison, not the count.
+- **Cost.** Task 3 was reviewed 6×. Of the five author-run rounds, three (panels 2–4) returned
+  findings; panel 1 was the vacuous one and panel 5 was clean. The sixth is the one that decided
+  anything. An author-run panel is not wasted — three of them earned their keep — but it is
+  never the one that counts.
+
+### Why this is expected, not a fluke
+
+The panel is sampled and non-deterministic, so run 6 is not magic — it is one more independent
+draw. That is precisely the point: a single clean sample is evidence, not proof, and the party
+who wants to stop is the worst party to decide the sampling is finished.
+
+This repo already encodes the argument one level down. `spec.md` §7.3 of the `skill-stickiness`
+run mandates that arm B be scored by a read-only reviewer that is **not arm B's author**, with
+arm labels stripped, because "unblinded self-scoring by arm B's author is exactly what the
+replication literature this spec cites warns about." The panel gate is the same argument one
+level up. Consistent with, though not proof of, the published finding that intrinsic
+self-correction without external feedback can degrade output (Huang et al., *Large Language
+Models Cannot Self-Correct Reasoning Yet*, ICLR 2024, arXiv:2310.01798) and that self-correction
+depends on reliable external feedback (Kamoi et al., TACL 12 (2024) 1417–1440,
+arXiv:2406.01297). Panickssery et al. (*LLM Evaluators Recognize and Favor Their Own
+Generations*, NeurIPS 2024) is about an evaluator scoring its own generations, which is not quite
+this case — the reviewers here were independent agents — but it bears on the adjudication step,
+which is the one that failed.
+
+### Fix in place — documentation, deliberately
+
+The same paragraph now appears verbatim in `skills/code-review/SKILL.md`,
+`skills/pipeline/SKILL.md` and `skills/pipeline/phase-prompts/implement-task.md`: anyone may run
+the panel, only the driver's run is the gate, a clean author-run verdict is evidence and never
+permission. `implement-task.md` additionally requires the task report to list every panel the
+agent invoked itself, labelled author-run, so the distinction is visible downstream.
+
+**No mechanism was added, and this is the known gap.** `drovr code-review run` has no caller
+identity and cannot acquire one honestly: both roles run the same command on the same machine, so
+any "who ran it" field would be self-declared — a permission system agents route around, and
+worse, one that launders a self-declaration into the appearance of authority. The task report's
+author-run labels are self-reported *facts about the past*, which is a different thing from a
+self-declared *right*. What enforces the gate is the driver running its own panel after every
+task, unconditionally, regardless of what the report claims.
+
 ## `drovr cleanup` auto-commits whatever the worktree is holding (2026-08-02)
 
 **Severity:** low, but it puts junk — including large binaries — into your branch's history under

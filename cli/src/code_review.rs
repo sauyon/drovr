@@ -4,8 +4,15 @@
 //! `base..head` scope, load config, seed + spawn one read-only reviewer per angle,
 //! wait (bounded) for every reviewer to finish, read + union-merge the per-angle
 //! findings, write the merged `<task>-review.json`, and return a [`ReviewOutcome`]
-//! (→ exit 0 / 3 / 2 / 1). It is BLOCKING; the pipeline driver — never a skill — calls
-//! it and reacts to the outcome.
+//! (→ exit 0 / 3 / 2 / 1). It is BLOCKING.
+//!
+//! Two roles share this one entry point, and it cannot tell them apart — there is no
+//! caller identity here, by design. A task agent may run a pass on its own work as
+//! often as it likes, as iteration feedback. Only the pipeline driver's pass is the
+//! acceptance gate: the driver reacts to the outcome and decides whether the task
+//! advances. That separation lives in the skill docs (`drovr:pipeline`,
+//! `drovr:code-review`), not in this module — see `docs/known-issues.md` for the run
+//! that made the distinction necessary.
 //!
 //! # Resuming a slow panel
 //!
@@ -67,14 +74,61 @@ use crate::run::{PhaseStatus, RunState, run_dir};
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Outcome of one review pass. Maps to the CLI exit codes the driver reads.
+///
+/// `Clean` is the outcome the pipeline advances a task on, so it must mean exactly one
+/// thing: reviewers looked at a real range and found nothing blocking. It used to mean
+/// two — that, or nobody looked at anything, because the range was empty. Those are
+/// indistinguishable downstream and the vacuous one is the more dangerous, since it
+/// arrives faster and never disagrees with you. [`EmptyRange`](Self::EmptyRange) exists
+/// so that state cannot be spelled `Clean`.
+///
+/// What this type still does NOT carry is WHO ran the pass. An author-run pass and the
+/// driver's gate produce the same outcome, deliberately: caller identity here could only
+/// be self-declared, and a forgeable role is worse than an absent one. That separation is
+/// held by the skill docs (`drovr:pipeline`, `drovr:code-review`) and by the driver
+/// re-running the panel itself, unconditionally. See `docs/known-issues.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOutcome {
-    /// No blocking (Critical|Important) findings. → exit 0.
+    /// Reviewers examined a non-empty `base..head` and reported no blocking
+    /// (Critical|Important) findings. → exit 0.
+    ///
+    /// Read this narrowly. It is a statement about **the committed range at the moment
+    /// the panel ran**, and about nothing else. Specifically, `Clean` does NOT mean:
+    ///
+    /// - **that the range covers the task's work.** `base..head` is whatever was
+    ///   committed; anything left uncommitted is outside it. The reviewer's brief also
+    ///   names the working tree, but that is prose in a prompt, not scope this code
+    ///   computes or can vouch for — untracked files never appear in a `git diff`. A
+    ///   partial commit yields an honest verdict on a subset nobody declared.
+    /// - **that the work is done, or may be reported done.** `Clean` is one panel's
+    ///   result, not an adjudication. Who is entitled to treat it as a gate is a
+    ///   question this type deliberately cannot answer (see below).
+    /// - **that nothing is wrong.** Reviewers are sampled and non-deterministic; a
+    ///   second panel over the identical head has returned an Important where the first
+    ///   returned clean. `Clean` is evidence, and one draw of it.
+    ///
+    /// What it does mean is exact: a real range was looked at, and nothing blocking came
+    /// back. That narrow guarantee is worth more than a broad one, and callers must not
+    /// infer past it.
     Clean,
     /// At least one blocking finding; see `<task>-review.json`. → exit 3.
     Findings,
     /// Not every reviewer dropped its marker before `timeout_ms`. → exit 2.
     Timeout,
+    /// `git diff base..head` contains **no change** — the two commits have identical
+    /// trees — so there is nothing to review and no verdict about it could mean
+    /// anything. Refused before any reviewer is spawned. → exit 1.
+    ///
+    /// **Not "the two SHAs are equal."** That is the common cause and it is not the
+    /// condition: `git commit --allow-empty` advances `head` without touching the tree,
+    /// so the SHAs differ while the range is still empty, and that is refused here too.
+    /// The discriminant is what the range CONTAINS. (An earlier version of this variant
+    /// was documented, and implemented, as the SHA comparison; both were wrong.)
+    ///
+    /// Separate from [`Error`](Self::Error) because the cause is specific and the fix is
+    /// specific (commit, or re-record the base), and separate from
+    /// [`Clean`](Self::Clean) because that is the confusion it exists to prevent.
+    EmptyRange,
     /// Setup failure (e.g. base SHA not recorded, or HEAD unreadable). → exit 1.
     Error,
 }
@@ -172,11 +226,69 @@ pub(crate) fn head_sha(project_dir: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Does `base..head` contain any change at all?
+///
+/// `Ok(true)` = the range is EMPTY: the two commits have identical trees, so there is
+/// nothing for a reviewer to look at.
+///
+/// Comparing the two SHAs is NOT this property, which is the trap the first version of
+/// this guard fell into. `git commit --allow-empty` advances HEAD without changing the
+/// tree, so `base != head` while `git diff base..head` is empty — a vacuous review that
+/// a hash comparison waves straight through. Ask git what the range CONTAINS, never
+/// whether two names for it differ.
+///
+/// `git diff --quiet` is the direct question: exit 0 = no differences, exit 1 =
+/// differences found. Any other status means git could not answer (an unresolvable
+/// base, say), which is [`Err`] — "could not tell" is not "empty".
+fn range_is_empty(project_dir: &str, base: &str, head: &str) -> io::Result<bool> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(["diff", "--quiet", &format!("{base}..{head}")])
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        other => Err(io::Error::other(format!(
+            "git diff --quiet {base}..{head} in {project_dir} exited {other:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
+}
+
 /// Read the recorded review base for `task` from `<dir>/<task>-base.sha` (trimmed).
-/// A missing file is the caller's `Error` outcome (base not recorded at task start).
+/// A missing file is the caller's `Error` outcome (base not recorded at task start), and
+/// so is a file whose contents are not a plausible object name — see [`validated_sha`].
 fn base_sha(dir: &Path, task: &str) -> io::Result<String> {
     let p = dir.join(format!("{task}-base.sha"));
-    Ok(std::fs::read_to_string(&p)?.trim().to_owned())
+    let raw = std::fs::read_to_string(&p)?;
+    validated_sha(raw.trim())
+        .map_err(|e| io::Error::other(format!("{}: {e}", p.display())))
+        .map(|s| s.to_owned())
+}
+
+/// Reject a recorded base that is not a bare git object id, using the SAME predicate the
+/// review server applies to the same file ([`crate::review::safe_sha`]) rather than a
+/// second opinion that could drift from it.
+///
+/// `<task>-base.sha` is an ordinary file, and whatever is in it reaches `git` as an
+/// argument composed into `{base}..{head}` — so a value like `-C` or `--output=x` is git
+/// OPTION injection, and one containing `..` or whitespace silently redefines the range.
+/// Restricting the alphabet to hex closes all of that at once.
+///
+/// This is a validity check, not a resolution check: `deadbeef` passes here and then fails
+/// in the repository. Both halves are needed — validation stops a crafted value from
+/// reaching git, and refusing when the range check errors stops an unresolvable one from
+/// waving the guard through.
+fn validated_sha(s: &str) -> Result<&str, String> {
+    if crate::review::safe_sha(s) {
+        Ok(s)
+    } else {
+        Err(format!(
+            "{s:?} is not a git object name (expected bare hex); \
+             re-record it with `drovr code-review base`"
+        ))
+    }
 }
 
 /// Resolve this pass's context via the shared recorder in [`crate::brief`], keyed
@@ -770,6 +882,59 @@ pub fn code_review_run<H: Herdr>(
         }
     };
 
+    // An empty range is refused, not reviewed. Every angle would come back clean
+    // having examined no committed change — exit 0, the code the pipeline advances a
+    // task on. That vacuous pass is indistinguishable from a real one downstream, which
+    // is why it is refused here rather than annotated: a warning printed next to a
+    // `clean` verdict and a 0 exit is read as the verdict.
+    //
+    // The seed does put the working tree in scope alongside the diff, so "empty range"
+    // is not always "nothing exists to review" — but it is always a mistake worth
+    // stopping for, because the committed scope the panel is built around is empty and
+    // uncommitted work is not reliably reached (untracked files never appear in a
+    // `git diff`, and this is exactly how the observed vacuous pass happened).
+    //
+    // Refused BEFORE any reviewer is spawned: four panes that can only report on
+    // nothing are pure cost, and the caller needs the diagnosis, not a verdict.
+    match range_is_empty(&run.project_dir, &base, &head) {
+        Ok(true) => {
+            let same = if base == head {
+                " (base == HEAD)"
+            } else {
+                " (the commits differ but their trees do not — an empty commit)"
+            };
+            eprintln!(
+                "code-review: empty review range for '{task}': `git diff {base}..{head}` \
+                 contains no change{same}. There is nothing to review, so no verdict about \
+                 it would mean anything. Either commit this task's work (uncommitted \
+                 changes are not reliably reviewed) or re-record the base with \
+                 `drovr code-review base` if it was recorded after the work landed."
+            );
+            return Ok(ReviewOutcome::EmptyRange);
+        }
+        Ok(false) => {}
+        // "Could not tell" is REFUSED, not waved through. An earlier version of this
+        // guard warned and proceeded, which made it bypassable: any base git cannot
+        // resolve skipped the check entirely and the panel returned the same vacuous
+        // verdict the guard exists to prevent. A guard that fails open is not a guard —
+        // and this one failed open into precisely the class it was built to close.
+        //
+        // So the only paths out of here are: proven non-empty (review it), proven empty
+        // (EmptyRange), or unknown (Error). There is no fourth path in which a verdict
+        // gets produced without establishing that there is something to have a verdict
+        // about.
+        Err(e) => {
+            eprintln!(
+                "code-review: cannot determine whether {base}..{head} contains any \
+                 change for '{task}' ({e}). Refusing rather than reviewing: an \
+                 unverifiable range cannot produce a meaningful verdict. Check that the \
+                 recorded base exists in this repository (`git -C <project> cat-file -e \
+                 {base}`), and re-record it with `drovr code-review base` if it does not."
+            );
+            return Ok(ReviewOutcome::Error);
+        }
+    }
+
     // Resolved once per pass, so every angle in this panel — and every angle a later
     // resume respawns — is briefed identically.
     //
@@ -1162,10 +1327,20 @@ mod tests {
         (run, repo)
     }
 
+    /// Record a review base the way a real task does: capture HEAD, then commit work on
+    /// top, so `base..HEAD` is a resolvable, NON-EMPTY range.
+    ///
+    /// This used to write the literal `deadbeef`, which git cannot resolve. That made
+    /// every test using it exercise a range the panel could not compute — invisible
+    /// while an unresolvable base was quietly reviewed anyway, and a mass failure the
+    /// moment the range guard started refusing what it cannot verify. The fixture was
+    /// asserting against a state that cannot occur in a healthy run.
     fn write_base(run: &RunState, task: &str) {
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{task}-base.sha")), "deadbeef\n").unwrap();
+        let base = head_sha(&run.project_dir).unwrap();
+        std::fs::write(dir.join(format!("{task}-base.sha")), format!("{base}\n")).unwrap();
+        commit_more(run);
     }
 
     /// Stand in for a reviewer of `iter` having called `submit_findings`. The
@@ -1211,11 +1386,12 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?}");
         };
-        std::fs::write(
-            std::path::Path::new(&run.project_dir).join("g.txt"),
-            "more work",
-        )
-        .unwrap();
+        // APPEND, never overwrite: `write_base` now calls this too, so a test can reach
+        // it twice, and re-writing identical content produces "nothing to commit" and a
+        // failed fixture rather than a moved HEAD.
+        let p = std::path::Path::new(&run.project_dir).join("g.txt");
+        let prev = std::fs::read_to_string(&p).unwrap_or_default();
+        std::fs::write(&p, format!("{prev}more work\n")).unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "more"]);
     }
@@ -1255,6 +1431,194 @@ mod tests {
         assert!(
             run.review_phases.is_empty(),
             "a refused review must not record phases either"
+        );
+    }
+
+    /// Write the run's ACTUAL current HEAD as the review base, reproducing the state
+    /// that produced the vacuous pass: `drovr code-review base` recorded, then nothing
+    /// committed before the panel ran.
+    fn write_base_at_head(run: &RunState, task: &str) {
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = head_sha(&run.project_dir).unwrap();
+        std::fs::write(dir.join(format!("{task}-base.sha")), format!("{head}\n")).unwrap();
+    }
+
+    /// The defect this whole branch documents, in its sharpest form: on
+    /// `skill-stickiness` task 3, `task-3-base.sha` and `task-3-review-1.head` were both
+    /// `5c8a7da`, four angles returned `clean`, and the agent nearly shipped on it.
+    ///
+    /// A clean verdict is what the pipeline advances a task on, so a verdict about an
+    /// empty range must not be spellable as one.
+    #[test]
+    fn an_empty_review_range_is_refused_before_any_reviewer_is_spawned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-empty-range");
+        write_base_at_head(&run, "task-1");
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
+
+        // Deliberately NOT also asserting `outcome != Clean`: it cannot fail once the
+        // line above passes, and an assertion that cannot fail is the exact class of
+        // defect this test exists for.
+        assert_eq!(
+            outcome,
+            ReviewOutcome::EmptyRange,
+            "base == HEAD is an empty range; it must be refused, not reviewed — and \
+             never reported as Clean, the outcome the pipeline advances a task on"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned for a range that contains nothing"
+        );
+        assert!(
+            run.review_phases.is_empty(),
+            "a refused pass must not record phases either"
+        );
+    }
+
+    /// `<task>-base.sha` is an ordinary file whose contents become a `git` argument. A
+    /// value crafted to look like an option must never reach git — and because the
+    /// composed argument is `{base}..{head}`, `--output=<path>` would have git WRITE to a
+    /// path the file chose. The assertion is therefore not just "refused" but "that file
+    /// does not exist": proof the value never got as far as git.
+    #[test]
+    fn a_crafted_base_is_rejected_before_it_reaches_git() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, repo) = make_run("cr-crafted-base");
+        let pwned = repo.path().join("pwned");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("task-1-base.sha"),
+            format!("--output={}\n", pwned.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Error,
+            "a base that is not an object name must be refused, not passed to git"
+        );
+        assert!(
+            !pwned.exists(),
+            "git was invoked with the crafted value: it wrote {}",
+            pwned.display()
+        );
+        assert_eq!(spawn_count(&h), 0, "nothing may be spawned for a bad base");
+    }
+
+    /// The bypass: a base git cannot resolve makes the emptiness check ERROR, and an
+    /// earlier version of the guard warned and carried on — so any unresolvable base
+    /// skipped the guard entirely and the panel produced the vacuous verdict the guard
+    /// exists to prevent. A guard that fails open is not a guard.
+    ///
+    /// The value here is well-formed hex (so it passes validation) but absent from the
+    /// repository, which is exactly the gap between "looks like an object name" and "is
+    /// one" — and the reason both halves of the fix are needed.
+    #[test]
+    fn an_unresolvable_base_is_refused_rather_than_reviewed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-unresolvable-base");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task-1-base.sha"), "a".repeat(40)).unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Error,
+            "if emptiness cannot be established the panel must refuse; assuming \
+             non-empty is how the guard becomes bypassable"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned for a range that cannot be computed"
+        );
+    }
+
+    /// Advance HEAD without changing the tree. `git commit --allow-empty` is the case
+    /// that separates "the range contains nothing" from "the two SHAs are equal" — the
+    /// property the first version of this guard got wrong.
+    fn commit_empty(run: &RunState) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&run.project_dir)
+            .args(["commit", "-q", "--allow-empty", "-m", "empty"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git commit --allow-empty: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `base != head` and yet there is NOTHING to review. A guard that compares the two
+    /// SHAs waves this straight through and returns the same vacuous `Clean` the whole
+    /// entry is about; only a guard that asks what the range CONTAINS catches it.
+    ///
+    /// This is the test that proves the guard checks the right property, so it is worth
+    /// more than the equal-SHA case it generalises.
+    #[test]
+    fn an_empty_commit_is_refused_even_though_the_shas_differ() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-empty-commit");
+        write_base_at_head(&run, "task-1");
+        commit_empty(&run);
+
+        let base = std::fs::read_to_string(run_dir(&run.name).join("task-1-base.sha")).unwrap();
+        let head = head_sha(&run.project_dir).unwrap();
+        assert_ne!(
+            base.trim(),
+            head,
+            "fixture must actually move HEAD, or this test proves nothing"
+        );
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::EmptyRange,
+            "an empty commit advances HEAD without adding anything to review; \
+             differing SHAs are not a non-empty range"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            0,
+            "no reviewer may be spawned for a range that contains nothing"
+        );
+    }
+
+    /// The guard must key on what the range contains, not on "did the caller commit
+    /// recently" — and it must let a real range through untouched. Mutation check: this
+    /// is the test that goes red if the emptiness check is inverted or widened.
+    #[test]
+    fn a_non_empty_range_still_reaches_the_reviewers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-nonempty-range");
+        write_base_at_head(&run, "task-1");
+        // One commit is the entire difference between the refused case above and this
+        // one; nothing else about the fixture changes.
+        commit_more(&run);
+        drop_markers(&run, "task-1", 1);
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Clean,
+            "a real range with no blocking findings is still Clean"
+        );
+        assert_eq!(
+            spawn_count(&h),
+            4,
+            "one reviewer per configured angle, as before the guard"
         );
     }
 
