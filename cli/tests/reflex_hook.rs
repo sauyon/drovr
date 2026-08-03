@@ -345,6 +345,16 @@ fn hook_payload(transcript_path: &Path) -> String {
 /// the skill's body. All three are required — the shape is documented in
 /// `cli/src/reflex.rs`'s test module, and a fixture missing the third one tests
 /// a transcript that does not exist.
+/// These transcript fixtures deliberately duplicate the shapes in
+/// `cli/src/reflex.rs`'s test module rather than sharing a builder with it, and
+/// the duplication is structural, not an oversight: `cli/Cargo.toml` declares a
+/// `[[bin]]` target with no `[lib]`, so `cli/tests/*.rs` are separate
+/// compilation units with **no** path to `src/`. `skills_valid.rs` reimplements
+/// `parse_skill` for the same reason. Extracting a shared builder means adding a
+/// library target — a bigger call than a test helper should make. If these ever
+/// drift from the CLI's fixtures, the CLI's are authoritative: they are the ones
+/// verified against live transcripts.
+///
 /// `id` is a parameter, not a constant: two calls sharing one id would let the
 /// second's `tool_result` credit the first's `tool_use` as having succeeded,
 /// quietly making a multi-call fixture assert something other than it reads.

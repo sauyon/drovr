@@ -33,22 +33,34 @@ pub struct AgentSpec {
     pub review_model: Option<String>,
 }
 
-/// Controls the SessionStart reflex the `session-start` hook injects (see
-/// `drovr reflex`). All fields are optional; an absent `[reflex]` table yields
-/// the built-in reflex unchanged.
+/// Controls **both** reflexes (see `drovr reflex`): the `SessionStart` router
+/// injection from `hooks/session-start`, and the per-turn gate card from
+/// `hooks/user-prompt`. All fields are optional; an absent `[reflex]` table
+/// yields both unchanged.
+///
+/// Only `enabled` spans both. `preamble` and `sections` shape the SessionStart
+/// reflex alone, and `per_turn` governs the gate alone — a flat table over two
+/// consumers, which is worth knowing before adding a field here.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct ReflexConfig {
-    /// Master switch. `false` suppresses the reflex entirely for human sessions
-    /// (the `DROVR_PHASE` phase-suppression is separate and always applies).
+    /// Master switch over both reflexes. `false` suppresses the SessionStart
+    /// injection *and* the per-turn gate.
+    ///
+    /// `DROVR_PHASE` suppression is separate and **applies to the SessionStart
+    /// reflex only** — `hooks/user-prompt` deliberately does not check it,
+    /// because a phase is exactly where the discipline has to hold. See
+    /// `docs/skill-evidence/per-turn-gate.md`.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Overrides the framing text placed before the skill body inside the
     /// `<EXTREMELY_IMPORTANT>` wrapper. Absent → the built-in framing.
+    /// **SessionStart only**; the gate card is a `const` and takes no framing.
     #[serde(default)]
     pub preamble: Option<String>,
     /// Per-section overrides keyed by the section name tagged in the skill
     /// markdown (`<!-- reflex:section:NAME -->`). A section absent from this map
     /// defaults to enabled; `NAME = false` omits that section from the reflex.
+    /// **SessionStart only** — the gate card has no sections.
     #[serde(default)]
     pub sections: BTreeMap<String, bool>,
     /// Per-turn gate (the `UserPromptSubmit` hook). Default **true**: the gate
