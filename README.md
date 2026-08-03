@@ -69,23 +69,40 @@ review_model = "gpt-5.6-terra-medium"
 
 ### Reflex
 
+Two hooks, one `[reflex]` table.
+
 The `session-start` hook injects the `drovr:using-drovr` router skill as the
 always-on reflex for human-facing sessions (it no-ops inside a drovr-spawned
-phase). The hook delegates rendering to `drovr reflex`, so the reflex is shaped
-by the `[reflex]` table — with no `[reflex]` table the built-in reflex is
-injected unchanged:
+phase). The `user-prompt` hook injects a much smaller **per-turn gate card**
+before every prompt, because a `SessionStart` injection scrolls out from under
+the agent as the context fills and the discipline has to still be reachable at
+turn 200. Both delegate rendering to `drovr reflex`, so both are shaped by the
+`[reflex]` table — with no `[reflex]` table both are injected unchanged:
 
 ```toml
 [reflex]
-# Master switch. false suppresses the reflex entirely for human sessions.
+# Master switch. false suppresses both the SessionStart reflex and the
+# per-turn gate.
 enabled = true
+# The per-turn gate card (UserPromptSubmit). Defaults to TRUE. Unlike the
+# SessionStart reflex, it deliberately does NOT no-op inside a drovr-spawned
+# phase — a phase is exactly where the discipline has to hold. It is skipped
+# for one turn after the agent invokes any `drovr:*` skill, since a session
+# already running the discipline does not need re-telling.
+#
+# Cost is cumulative, not a rate: the card is 547 bytes (budgeted at <=600) and
+# each injection *stays* in the context window, so an unsuppressed 100-turn
+# session carries ~55 KB by the end. The suppression rule is what keeps the
+# common case to a handful of injections. Set false to turn it off.
+per_turn = true
 # Optional: replace the framing text before the skill body inside the
-# <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing.
+# <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing. Applies to the
+# SessionStart reflex only; the gate card is a fixed const.
 preamble = "You are running drovr. Apply the discipline below."
 
 # Per-discipline toggles, keyed by the section names tagged in the router skill
 # (skills/using-drovr/SKILL.md). A section omitted here stays enabled;
-# set one to false to drop it from the injected reflex.
+# set one to false to drop it from the injected reflex. SessionStart only.
 [reflex.sections]
 single-writer = true   # the single-writer / read-only-explorers principle
 always-review = true   # the "always review before done" rule
