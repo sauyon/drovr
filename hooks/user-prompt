@@ -34,22 +34,20 @@
 
 set -euo pipefail
 
-# 1. Resolve the plugin root. Claude Code sets CLAUDE_PLUGIN_ROOT; fall back to
-#    the script's parent dir so the hook is testable standalone.
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
-else
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-fi
-# The gate card is a `const` in the CLI, not a file under the plugin root, so
-# PLUGIN_ROOT is resolved only to keep the two hooks' contracts identical and to
-# leave a real root for a future card that does read from disk.
-export CLAUDE_PLUGIN_ROOT="${PLUGIN_ROOT}"
+# NO PLUGIN-ROOT RESOLUTION, deliberately. hooks/session-start resolves
+# CLAUDE_PLUGIN_ROOT because it must locate skills/using-drovr/SKILL.md on disk.
+# The gate card is a `const` compiled into the CLI, which reads
+# CLAUDE_PLUGIN_ROOT nowhere at all — so the same block here would be dead code
+# that still fails: `PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"` under
+# `set -e` aborts the hook if that directory is unreadable or the script is
+# reached through a broken symlink, silencing the gate for a reason that has
+# nothing to do with the gate. That is fail-CLOSED inside a fail-open design.
+# If a future card ever reads from disk, resolve the root then.
+# Pinned by `user_prompt_hook_needs_no_plugin_root`.
 
-# 2. Delegate to the drovr CLI. $DROVR_BIN overrides the binary — tests point it
-#    at the freshly built binary; in a real session `drovr` is on PATH. `exec`
-#    hands drovr's stdin, stdout and exit status to Claude Code directly, so a
-#    missing binary fails loudly (non-zero) rather than injecting nothing, which
-#    is indistinguishable from a legitimately suppressed turn.
+# Delegate to the drovr CLI. $DROVR_BIN overrides the binary — tests point it at
+# the freshly built binary; in a real session `drovr` is on PATH. `exec` hands
+# drovr's stdin, stdout and exit status to Claude Code directly, so a missing
+# binary fails loudly (non-zero) rather than injecting nothing, which is
+# indistinguishable from a legitimately suppressed turn.
 exec "${DROVR_BIN:-drovr}" reflex --gate

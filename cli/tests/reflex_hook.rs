@@ -602,3 +602,31 @@ fn user_prompt_hook_is_executable() {
         );
     }
 }
+
+#[test]
+fn user_prompt_hook_needs_no_plugin_root() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The gate card is a const in the CLI, so unlike its sibling this hook needs
+    // no plugin root — and must not acquire a resolution step that could fail.
+    // `hooks/session-start`'s fallback (`cd "$(dirname "$0")/.." && pwd`) aborts
+    // under `set -e` when that directory is unreachable, which would silence the
+    // gate for a reason unrelated to the gate. This pins the absence.
+    let cfg = tempfile::tempdir().unwrap();
+    let out = Command::new("bash")
+        .arg(hook_script(USER_PROMPT))
+        .env_remove("CLAUDE_PLUGIN_ROOT")
+        .env("DROVR_BIN", drovr_binary())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .env_remove("DROVR_PHASE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute hooks/user-prompt");
+    let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+    assert!(
+        injected.contains("DROVR GATE"),
+        "the gate must emit with no CLAUDE_PLUGIN_ROOT set, got:\n{injected}"
+    );
+}
