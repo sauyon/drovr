@@ -1504,10 +1504,12 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // marker was stamped with — so a retry starts from the same place.
     //
     // ⚠️ On disk, not in memory: if `run.save()` below fails, the in-memory
-    // `RunState` has already been mutated while `state.json` (written tmp+rename)
-    // has not. No caller is exposed to that today — the CLI exits the process on
-    // `Err` and the HTTP path shells out to a fresh one — but a caller that kept
-    // `run` alive across a failed rehydrate would be holding a lie.
+    // `RunState` has already been mutated while `state.json` (written
+    // tmp+rename) has not, so the caller's copy is left ahead of disk. That is
+    // now harmless from both ends — this function re-reads `state.json` under
+    // its lock before it decides anything, so a reused `RunState` cannot carry
+    // a stale claim into the next call, and `surrender_unrecordable_pane`
+    // deliberately writes onto a fresh read rather than onto that copy.
     let pass = new_pass_token();
 
     // A fresh tab, never `run.root_pane` — a rehydrated phase must be as
