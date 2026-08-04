@@ -2,7 +2,8 @@
 # UserPromptSubmit hook for the drovr plugin — the per-turn gate.
 #
 # Injects a small card (<=600 bytes) before a user turn — every turn except the
-# one right after the agent invoked a drovr:* skill — re-asserting the
+# one right after the agent SUCCESSFULLY invoked a drovr:* skill (a call that
+# failed to load still gets a card) — re-asserting the
 # routing rule the SessionStart reflex established: even a 1% chance a drovr:*
 # skill applies means invoking it. A SessionStart injection is one prompt at the
 # top of a session and scrolls out from under the agent as the context fills;
@@ -13,11 +14,19 @@
 # `per_turn`) and the transcript named on stdin, and prints the hook JSON or
 # nothing at all. Keeping the logic in the CLI keeps it unit-testable.
 #
-# SIX DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is
-# load-bearing; none is an oversight to be tidied away. Four are in this
-# script's own logic and are listed here; the remaining two live in the CLI and
-# are noted where they bite — no plugin-root resolution (below), and failing
-# OPEN on an unloadable config.toml where session-start exits 1.
+# DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is load-bearing;
+# none is an oversight to be tidied away.
+#
+# NO COUNT IS GIVEN HERE ON PURPOSE. Two successive attempts to state one ("two",
+# then "four", then "six") were each wrong, because the boundary between "a
+# difference in this script" and "a difference in the CLI path it reaches" is not
+# crisp, and the CLI half is long: the gate reads stdin and a transcript and owns
+# the whole suppression scan, session mode reads neither; session mode has a
+# mandatory skill-file read that exits 1, the gate has no mandatory read; config
+# SHAPES the session reflex (preamble, sections) but only SWITCHES the gate; the
+# envelope's hookEventName differs. A hard number invites the next editor to
+# defend the number instead of the behaviour. What follows is this script's own
+# logic; the CLI's differences are documented at their sites.
 #
 #   1. NO DROVR_PHASE SUPPRESSION. The SessionStart reflex no-ops inside a
 #      drovr-spawned phase because the phase agent runs on its injected briefing.

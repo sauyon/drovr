@@ -14,7 +14,8 @@ Implementation: `cli/src/reflex.rs` (`GATE_CARD`, `gate_json`, `skill_invoked_la
 
 ## What it is
 
-A `UserPromptSubmit` hook injects a small card before every user turn:
+A `UserPromptSubmit` hook injects a small card before a user turn (subject to the suppression rule
+below, which skips the turn after a `drovr:*` skill ran):
 
 ```
 <SUBAGENT-STOP>Dispatched as a subagent for one task? Ignore this card — do your task.</SUBAGENT-STOP>
@@ -73,16 +74,18 @@ that loaded successfully, and a previous turn that demonstrably invoked a `drovr
 `tool_result` says the call succeeded. Those are the only two `None` conditions in `gate_json`.
 
 **Three further ways produce no card without being a decision** — the hook cannot run, or does not
-finish. Only the middle one is loud:
+finish. All three are equally cardless; they differ in whether the user gets a clue:
 
 - **`drovr` is not installed** (not on `PATH`, or `$DROVR_BIN` names nothing resolvable) — the hook
   exits **0 and says nothing**, by design (see *Deployment characteristics*). Silent and cardless.
 - **`drovr` resolves but fails**, or the script itself cannot be executed — non-zero, so stderr
   reaches the user. Loud, and still cardless.
-- **The hook is killed at the 5s `timeout`.** This is the one genuinely **fail-CLOSED** path in an
-  otherwise fail-open design: a stall produces no card rather than a redundant one. It is bounded
-  and non-blocking (measured, below), and the alternative — no timeout — trades a missing card for a
-  hung prompt. Named here because a reader of this section would otherwise not find it.
+- **The hook is killed at the 5s `timeout`.** The one path where a **stall**, rather than a decision
+  or a broken install, costs the card — so it is the fail-CLOSED corner of an otherwise fail-open
+  design. It is bounded and non-blocking (measured, below); the alternative, no timeout, trades a
+  missing card for a hung prompt. **Whether the harness says anything when it kills a hook was not
+  measured** — the `sleep 30` run established only that the prompt was processed. Named here because
+  a reader of this section would otherwise not find it.
 
 "Fails loudly" is a claim about the exit code, never about the card: no exit code delivers one.
 

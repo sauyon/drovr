@@ -11,8 +11,10 @@
 //! every `UserPromptSubmit`, passing the hook's stdin payload through so the CLI
 //! can read the transcript and suppress a card the session does not need.
 //!
-//! **Six** deliberate differences from its sibling, each load-bearing and each
-//! tested here. Four live in the script's own logic:
+//! Several deliberate differences from its sibling, each load-bearing. No count
+//! is given: two earlier attempts at one were both wrong, because the split
+//! between the script and the CLI path it reaches is not crisp. These four live
+//! in the script's own logic:
 //!
 //!   1. it does **not** suppress on `DROVR_PHASE` — a phase is exactly where the
 //!      discipline must hold;
@@ -26,13 +28,19 @@
 //!      exits 2 on a usage error — so an `exec` plus a `drovr` predating
 //!      `--gate` would erase every prompt typed.
 //!
-//! …and two are inherited from how the CLI treats the gate:
+//! …and these are also pinned here, though they are not all script-level:
 //!
-//!   5. it resolves no plugin root, where session-start must
-//!      (`user_prompt_hook_needs_no_plugin_root`);
-//!   6. it fails OPEN on an unloadable `config.toml` and runs on defaults, where
-//!      session-start exits 1 (`user_prompt_hook_emits_on_unloadable_config` /
-//!      `session_start_hook_exits_nonzero_on_unloadable_config`).
+//!   - it resolves no plugin root, where session-start must
+//!     (`user_prompt_hook_needs_no_plugin_root` — a script difference);
+//!   - it fails OPEN on an unloadable `config.toml` and runs on defaults, where
+//!     session-start exits 1 (`user_prompt_hook_emits_on_unloadable_config` /
+//!     `session_start_hook_exits_nonzero_on_unloadable_config` — a CLI one).
+//!
+//! Other CLI-side differences are real but live in `cli/src/`: only the gate
+//! reads stdin and a transcript, only session mode has a mandatory file read
+//! that exits 1, and `preamble`/`[reflex.sections]` shape the session reflex
+//! while merely switching the gate. **That last one is not asserted anywhere** —
+//! nothing proves a `preamble` config leaves the gate card unchanged.
 //!
 //! The scripts are exercised standalone via `bash`, with `CLAUDE_PLUGIN_ROOT`
 //! pointed at the repo root (so it resolves the skill) and `DROVR_BIN` pointed at
@@ -644,10 +652,14 @@ fn session_start_hook_still_fails_loudly_without_drovr() {
         !out.status.success(),
         "the SessionStart reflex must still fail loudly when drovr is missing"
     );
+    // The diagnostic here is bash's own exec failure, not something the script
+    // prints — what this pins is that session-start does not SWALLOW it (an added
+    // `2>/dev/null` on the exec line is the mutation), where the gate
+    // deliberately produces nothing at all.
     assert!(
         !out.stderr.is_empty(),
-        "\"loudly\" means the user is told: session-start must write to stderr \
-         when drovr is missing, where the gate deliberately says nothing"
+        "\"loudly\" means the user is told: session-start must let the failure \
+         reach stderr when drovr is missing, where the gate says nothing"
     );
 }
 
@@ -1037,10 +1049,17 @@ fn user_prompt_hook_runs_as_hooks_json_invokes_it() {
 
     #[cfg(unix)]
     {
+        // Bound to a local, like every other test here: inlining the tempdir
+        // relies on the temporary outliving the statement. It does today, but
+        // splitting the builder across statements would silently point
+        // XDG_CONFIG_HOME at a deleted directory — and the failure mode (no
+        // config -> defaults -> still green) is exactly why that would go
+        // unnoticed.
+        let cfg = tempfile::tempdir().unwrap();
         let out = Command::new(hook_script(USER_PROMPT))
             .env("CLAUDE_PLUGIN_ROOT", repo_root())
             .env("DROVR_BIN", drovr_binary())
-            .env("XDG_CONFIG_HOME", tempfile::tempdir().unwrap().path())
+            .env("XDG_CONFIG_HOME", cfg.path())
             .env_remove("DROVR_PHASE")
             .stdin(Stdio::null())
             .output();
