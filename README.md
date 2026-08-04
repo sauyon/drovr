@@ -206,7 +206,7 @@ is hidden on macOS where it does not apply.
 | `drovr phase send <run> <phase> <text>` | Send text to a running phase pane. |
 | `drovr phase wait <run> <phase> [--timeout-ms N]` | Poll until the phase agent is done (default 30 s). |
 | `drovr phase done <run> <phase>` | Run by the phase agent as its final action; refuses until the agent has authored `<phase>-HANDOFF.md`, then drops the completion marker. Must run from inside the phase's own pane — the marker is stamped with the `$DROVR_PASS` token that pane was launched under. From anywhere else it refuses and prints the command that would work. |
-| `drovr phase rehydrate <run> <phase>` | Bring back a phase whose pane is gone, resuming its recorded agent session where the backend offers one. Exit 0 = the pane is back **and** the agent has this phase's context; 2 = the pane is back but the agent was **not** given its context (act on it, never read it as success); 1 = refused or failed. |
+| `drovr phase rehydrate <run> <phase>` | Bring back a phase whose pane is gone, resuming its recorded agent session where the backend offers one. Exit 0 = the pane is back **and** the agent has this phase's context; 2 = the pane is back but the agent was **not confirmed** to have this phase's context — the message names which of five states it was, and one of them is an agent that may be perfectly resumed and merely slow to surface its session id, so read it before you act; 1 = refused or failed. |
 | `drovr phase reap <run> <phase>` | Close a phase's pane and release the phase from it, on demand. Exit 0 = the pane is gone and the phase no longer records it (including when there was nothing to reap, so re-running is safe); 2 = the pane is still there and the phase still holds it — herdr would not close it, or could not be reached; 1 = refused or failed. |
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
@@ -284,13 +284,25 @@ Written on `drovr new`; updated by phase commands.
 }
 ```
 
+**That example is a freshly-created run, not the full schema** — it shows the
+keys a phase always carries and the run-level keys `drovr new` writes, and both
+sets grow. `cli/src/run.rs` (`RunState`, `Phase`) is the authority.
+
 Phase `status` values: `Pending`, `Running`, `Done`, `Failed`.
 
-Phases carry more than the four keys above once they have run — notably `pass`
-(the token identifying the current pass over the phase, exported to its agent as
-`$DROVR_PASS` and stamped into `<phase>.done`) and `reaped` (drovr closed this
-phase's pane; the status is untouched, so this says nothing about whether the
-work finished).
+`herdr_session` is **dead** — it is serialized for backwards compatibility and
+read by nothing. A phase's resumable session id lives in `pane_agent` below;
+do not reach for this one.
+
+The five keys in the example are the ones every phase always carries. Four more
+appear once a phase has run, and are omitted from `state.json` while absent:
+
+| Key | Meaning |
+|---|---|
+| `pass` | Token identifying the current pass over the phase, exported to its agent as `$DROVR_PASS` and stamped into `<phase>.done`. |
+| `tab_id` | The herdr tab holding `pane_id`, captured opportunistically. **Diagnostic only** — anything about to act on a tab resolves a fresh one first, since an id read minutes ago may name a tab that is gone or reused. |
+| `pane_agent` | The backend and profile this phase's agent was actually launched under, plus its session id once herdr reports one. A reviewer's backend legitimately differs from the run's, so this is not derivable from `agent`. |
+| `reaped` | drovr closed this phase's pane. The status is untouched, so this says nothing about whether the work finished. |
 
 Two run-level keys are worth knowing about:
 

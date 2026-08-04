@@ -232,10 +232,16 @@ drovr phase rehydrate <run> implement-task-<N>   # brings the pane back, then re
 ```
 
 Rehydrate resumes that agent's own session where the backend offers one. **Exit 0 = the agent
-has its context back. Exit 2 = the pane is back but the agent was NOT given its context** —
-treat that exactly like `phase send`'s exit 2 and act on it, never as success. When no session
-was recoverable it reseeds instead: the artifacts come back, the conversation does not. Ordering
-is the cheap fix; rehydrate is the expensive one.
+has its context back. Exit 2 = the pane is back but the agent was NOT CONFIRMED to have its
+context** — never read that as success, and never assume the context is gone either. Exit 2 is
+five different states, and **stderr names which one**: the agent never reported ready · it came
+up carrying a *different* session (that pane is surrendered) · herdr never reported *any*
+session id (the pane is still there, and the agent may be perfectly resumed and merely slow to
+surface it) · a fresh agent is up with no seed to give it · the seed would not send. Read the
+note, then act on the state it names — reseeding or retrying on the third one throws away a live
+agent that was fine. When no session was recoverable at all it reseeds instead, and says so
+(exit 0): the artifacts come back, the conversation does not. Ordering is the cheap fix;
+rehydrate is the expensive one.
 
 Loop with **impact-scaled judgement** — no hardcoded floor or ceiling on iterations. Stop when
 the panel is clean *and* converged for the change's impact (a small change may need one pass; a
@@ -307,7 +313,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |
 | Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task completes; loop on exit 3. |
-| Starting task N+1 while still iterating on task N | `phase start` **reaps** every other finished phase's pane, so the `phase send` back into task N then fails. Finish N's loop first; if you already started N+1, `drovr phase rehydrate <run> implement-task-<N>` brings the pane back (exit 2 = it came back WITHOUT its context — act on that). |
+| Starting task N+1 while still iterating on task N | `phase start` **reaps** every other finished phase's pane, so the `phase send` back into task N then fails. Finish N's loop first; if you already started N+1, `drovr phase rehydrate <run> implement-task-<N>` brings the pane back (exit 2 = the context is NOT CONFIRMED, not that it is gone — read stderr for which of the five states, then act). |
 | Accepting a task because ITS report says its own panel came back clean | Author-run panels are iteration feedback. Only your run is the gate — run it. |
 | Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
 | Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |

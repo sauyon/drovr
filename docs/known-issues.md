@@ -982,6 +982,19 @@ Two things follow, and both narrow it:
   8 runs put it back on the documented 5–8%. Before calling a red suite a regression, measure;
   three runs is not a sample.
 
+**A fourth sighting, 2026-08-04, reproduced the signature exactly** (run `phase-reap`, task 7's
+review round, on a docs-only tree):
+
+```
+a lock released by dropping its File was still held.
+after drop: /tmp/drovr-review-test-lock-claimbpQZgS/server.pid contains "2430561";
+this pid is 2430561
+```
+
+Same step (re-claim after `drop`), same own-pid evidence, on a tree whose only changes were
+markdown. That rules out this branch's code as a contributor and makes the signature stable
+rather than a one-off reading. It passed on the immediate re-run and on a second full suite.
+
 This is consistent with the `O_CLOEXEC` / fork-window hypothesis in the entry below (a concurrent
 `Command::spawn` elsewhere in the suite briefly duplicates the fd between fork and exec, and an
 inherited open file description holds the flock). It does not confirm it — confirming means
