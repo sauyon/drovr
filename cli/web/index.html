@@ -919,8 +919,11 @@
     <div id="agents-tree" class="agents-tree"></div>
     <!-- What a ⟳ actually did. A rehydrate has three outcomes the human must
          not have to guess between — the session came back, a fresh agent was
-         seeded from the handoff, or the seed was NOT delivered — and the last
-         one is a 200. Without this the tree just quietly stops showing the ⟳. -->
+         seeded from the handoff, or the agent was NOT CONFIRMED to have this
+         phase's context — and the last one is a 200, not an error. That last
+         one is five states rather than one (the seed is only two of them), so
+         the CLI's own note is rendered verbatim rather than summarised here.
+         Without this the tree just quietly stops showing the ⟳. -->
     <div id="agents-note" class="agents-note" style="display:none"></div>
   </div>
 

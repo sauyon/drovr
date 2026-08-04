@@ -202,8 +202,11 @@ enum PhaseCmd {
     ///
     /// Exit 0 = the pane is back AND the agent has this phase's context (its
     /// session was resumed, or its seed was re-sent). Exit 2 = the pane is back
-    /// but the agent was NOT given its context — treat it like `phase send`'s
-    /// exit 2 and act, never as success. Exit 1 = refused or failed.
+    /// but the agent was NOT CONFIRMED to have it — never success, and not proof
+    /// the context is gone either: it is five different states, and the note on
+    /// stderr says which. One of them (herdr never reported a session id) is an
+    /// agent that may be perfectly resumed and merely slow to surface it, so
+    /// read the note before acting on it. Exit 1 = refused or failed.
     ///
     /// A fresh tab in the run's project dir, launched under the profile the
     /// phase originally ran with. When no session was captured — or the backend
@@ -2596,11 +2599,12 @@ mod tests {
         use phase::RehydrateOutcome::*;
         // The failure class `docs/known-issues.md` keeps recording: a driver
         // reads an exit code as success and carries on. A rehydrate that
-        // brought the pane back but never gave the agent its context is NOT
-        // success — a `phase wait` after it would block on an agent nobody told
-        // what to do — and `phase send` already reserves exit 2 for exactly
-        // this. Assert the code AND the stream: a driver reads one, a human the
-        // other.
+        // brought the pane back without CONFIRMING the agent has its context is
+        // NOT success — a `phase wait` after it may block on an agent nobody
+        // told what to do. Not confirmed is deliberately weaker than "did not
+        // get it": `ResumeUnobserved` is an agent that may be perfectly resumed,
+        // which is why `Unfinished` is five variants and not a bool. Assert the
+        // code AND the stream: a driver reads one, a human the other.
         let done = rehydrate_report("r", "plan", &Resumed);
         assert_eq!(done.code, 0);
         assert!(!done.to_stderr);

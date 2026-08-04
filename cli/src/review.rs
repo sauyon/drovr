@@ -1168,12 +1168,14 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
             })
             .to_string(),
         ),
-        // ⚠️ Exit 2 is the CLI's "the pane is back, but the agent was NOT given
-        // this phase's context". It must NOT flatten into either bucket: a 500
-        // would claim nothing happened (a pane really was created and recorded),
-        // and a plain `ok: true` would let a caller checking only the status
-        // treat an agent that never received its seed as fully recovered. 200
-        // with `complete: false`, and the note on stderr says what to do.
+        // ⚠️ Exit 2 is the CLI's "the pane is back, but the agent was NOT
+        // CONFIRMED to have this phase's context". It must NOT flatten into
+        // either bucket: a 500 would claim nothing happened (a pane really was
+        // created and recorded), and a plain `ok: true` would let a caller
+        // checking only the status treat an unconfirmed agent as fully
+        // recovered. 200 with `complete: false`, and `detail` carries the CLI's
+        // stderr note — which is what says WHICH of the five states it was, a
+        // distinction this status code cannot make and must not appear to.
         Ok(o) if o.status.code() == Some(2) => respond_str(
             req,
             200,
