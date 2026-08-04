@@ -1,7 +1,7 @@
 //! Validates every `skills/*/SKILL.md` in the repo and enforces a per-skill
 //! body-size budget on the five measured `drovr:*` skills.
 //!
-//! Five assertions:
+//! Six assertions:
 //!   1. **All** skills have valid frontmatter: a leading `---` block containing
 //!      non-empty `name:` and `description:`, and `name:` equals the directory
 //!      name.
@@ -24,8 +24,12 @@
 //!      superpowers corpus. drovr ports mechanisms from superpowers and writes
 //!      its own sentences (spec §2.1 exception 2); this is the check that says
 //!      so with evidence rather than intent.
+//!   6. Every skill declares whether it carries spec §6's fix-4 armor, and the
+//!      ones that do carry §6's REQUIRED sections in §6's order — plus exactly
+//!      the CONDITIONAL sections §6 names them for, and no others. See
+//!      [`SKILL_ARMOR_STATES`].
 //!
-//! Assertions 1–4 are unconditional. **Assertion 5 is the one exception, and it
+//! Assertions 1–4 and 6 are unconditional. **Assertion 5 is the one exception, and it
 //! is conditional in exactly one way:** it needs a corpus to compare against, so
 //! it runs whenever one is installed or pointed at, and is skipped **only** when
 //! the operator sets `DROVR_SUPERPOWERS_CORPUS=none` to declare this machine has
@@ -3602,13 +3606,7 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("handoff", SiteState::Covered),
     ("pipeline", SiteState::Covered),
     ("worktrees", SiteState::Covered),
-    (
-        "tdd",
-        SiteState::Deferred {
-            task: "Task 10",
-            why: "§6 section 6 — lands inside the fix-4 rewrite",
-        },
-    ),
+    ("tdd", SiteState::Covered),
     (
         "systematic-debugging",
         SiteState::Deferred {
@@ -3934,4 +3932,935 @@ fn evidence_corpus_present() {
             path.display()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// spec §6 / §9.1 check 1 — the fix-4 armor
+// ---------------------------------------------------------------------------
+
+/// §6 section 3's unity line, carried verbatim by every armored skill.
+///
+/// It is the one sentence §6 quotes rather than describes, so it is a literal
+/// here rather than a shape. Folded before comparison (see [`FoldedBody`]), so a
+/// re-wrap is formatting and a rewording is drift — the rule fix 3's directive
+/// is already held to.
+const UNITY_LINE: &str = "the next phase agent is you, with your context gone";
+
+/// One of §6's sections, and what proves it is on the page.
+///
+/// **Matched on stable text, never on a line number.** These files are rewritten
+/// four times across this run and measured afterwards; a positional check would
+/// pass or fail on where a paragraph landed. Headings and fences are line-level
+/// constructs and are read as such; a prose literal is read out of the folded
+/// body, because prose gets re-wrapped.
+enum SectionMarker {
+    /// An ATX heading whose text is exactly this, at any level.
+    Heading(&'static str),
+    /// A sentence that must appear verbatim, up to wrapping.
+    ///
+    /// Unlike [`SectionMarker::Heading`], this deliberately **does** see inside
+    /// fenced blocks: §6 section 5's announcement sentence is fenced on purpose
+    /// (it is text the agent is meant to copy out), so a fence-blind matcher
+    /// would report the one section that is hardest to get wrong as missing.
+    Line(&'static str),
+    /// A fenced block whose info string names this language.
+    Fence(&'static str),
+}
+
+impl SectionMarker {
+    /// The 0-based body line this marker is found on, or `None`.
+    fn find(&self, body: &str, folded: &FoldedBody) -> Option<usize> {
+        match self {
+            SectionMarker::Heading(text) => headings(body)
+                .into_iter()
+                .find(|(_, found)| found == text)
+                .map(|(line, _)| line),
+            SectionMarker::Line(text) => folded.find(&normalize_ws(text)),
+            SectionMarker::Fence(lang) => fenced_blocks(body)
+                .ok()
+                .and_then(|blocks| blocks.into_iter().find(|b| b.lang() == *lang))
+                .map(|b| b.line),
+        }
+    }
+
+    /// How the failure text names what it looked for.
+    fn describe(&self) -> String {
+        match self {
+            SectionMarker::Heading(text) => format!("a heading `{text}`"),
+            SectionMarker::Line(text) => format!("the line \"{text}\""),
+            SectionMarker::Fence(info) => format!("a fenced `{info}` block"),
+        }
+    }
+}
+
+/// A body folded to single spaces, with a map from each byte back to the source
+/// line it came from.
+///
+/// §6 requires two sentences verbatim — the unity line and the announcement —
+/// and a sentence in a markdown file is wrapped to whatever column its author
+/// used. Folding compares wording; the line map is what still lets the result be
+/// ordered against the headings, which do not wrap.
+struct FoldedBody {
+    text: String,
+    /// `line_of[i]` is the source line of `text`'s `i`th byte. Same length as
+    /// `text`, by construction — every push to one pushes to the other.
+    line_of: Vec<usize>,
+}
+
+impl FoldedBody {
+    fn new(body: &str) -> Self {
+        let mut text = String::new();
+        let mut line_of = Vec::new();
+        for (idx, line) in body.lines().enumerate() {
+            for word in line.split_whitespace() {
+                if !text.is_empty() {
+                    text.push(' ');
+                    line_of.push(idx);
+                }
+                text.push_str(word);
+                line_of.extend(std::iter::repeat_n(idx, word.len()));
+            }
+        }
+        FoldedBody { text, line_of }
+    }
+
+    /// The source line `needle` starts on, or `None`. `needle` must already be
+    /// folded — [`normalize_ws`] is the one way to do that.
+    ///
+    /// **Folding spans block boundaries**, so a required sentence is found even
+    /// if it wraps across a blank line. That also means "verbatim" here is
+    /// slightly weaker than it reads: a sentence straddling a heading would
+    /// match. No required literal is short or generic enough for that to happen
+    /// by accident.
+    fn find(&self, needle: &str) -> Option<usize> {
+        // An empty needle matches at 0 while `line_of` may be empty, which would
+        // index out of range on an empty body. It is also never a real marker —
+        // it would report every section present, everywhere.
+        assert!(
+            !needle.is_empty(),
+            "a SectionMarker::Line that folds to nothing would match any file"
+        );
+        self.text.find(needle).map(|at| self.line_of[at])
+    }
+}
+
+/// A fenced code block: where it opens, its info string, and what is inside it.
+struct FencedBlock {
+    /// 0-based body line of the **opening** fence.
+    line: usize,
+    /// The info string — `dot` for §6 section 6b's flowchart, empty for the
+    /// Iron Law's plain fence.
+    info: String,
+    /// The lines between the fences, joined with newlines.
+    body: String,
+}
+
+impl FencedBlock {
+    /// The language the info string names, which is its first word.
+    ///
+    /// An info string is a language *plus arbitrary attributes*, so
+    /// ```` ```dot rankdir=LR ```` is a `dot` block. Comparing the whole string
+    /// made that one-token addition invisible to the section-6b check in both
+    /// directions — a required flowchart reported missing, and a forbidden one
+    /// waved through.
+    fn lang(&self) -> &str {
+        self.info.split_whitespace().next().unwrap_or("")
+    }
+}
+
+/// The greatest indentation a fence may carry. Four spaces is an indented code
+/// block in CommonMark, not a fence — so a `dot` graph shown as an *example*,
+/// indented into a surrounding list or quote, is not a section-6b flowchart.
+const MAX_FENCE_INDENT: usize = 3;
+
+/// A fence line: its indentation-stripped backtick run length and whatever
+/// follows it, or `None` if the line is not a fence at all.
+fn fence_marker(line: &str) -> Option<(usize, &str)> {
+    let indent = line.len() - line.trim_start().len();
+    if indent > MAX_FENCE_INDENT {
+        return None;
+    }
+    let rest = line.trim_start();
+    let ticks = rest.chars().take_while(|c| *c == '`').count();
+    (ticks >= 3).then(|| (ticks, rest[ticks..].trim()))
+}
+
+/// Every fenced block in `text`, or the line of a fence that never closes.
+///
+/// **An unterminated fence is an error, not a dropped block.** §6 puts two of
+/// its required sections inside fences, and a file whose fence never closes
+/// renders the entire remainder as code — which a checker that silently dropped
+/// the block would report as a missing section, sending the author to add a
+/// second copy of text that is already there.
+///
+/// **A block closes only on a bare fence at least as long as the one that
+/// opened it** — CommonMark's rule, and the reason a ```` ````markdown ```` block
+/// showing a ``` fence inside it parses as one block rather than desyncing every
+/// block after it. `skills/writing-skills/SKILL.md` is the authoring reference
+/// for §6's armor and is exactly the file that grows one of those.
+fn fenced_blocks(text: &str) -> Result<Vec<FencedBlock>, usize> {
+    let mut out = Vec::new();
+    let mut open: Option<(usize, usize, String, Vec<&str>)> = None;
+    for (idx, line) in text.lines().enumerate() {
+        match (fence_marker(line), open.as_mut()) {
+            // Inside a block: only a bare fence of at least the opening length
+            // closes it. Anything else — including a shorter fence, or one
+            // carrying an info string — is content.
+            (Some((ticks, rest)), Some((_, opened_with, _, lines))) => {
+                if ticks >= *opened_with && rest.is_empty() {
+                    let (line, _, info, lines) = open.take().expect("just matched Some");
+                    out.push(FencedBlock {
+                        line,
+                        info,
+                        body: lines.join("\n"),
+                    });
+                } else {
+                    lines.push(line);
+                }
+            }
+            (Some((ticks, rest)), None) => open = Some((idx, ticks, rest.to_string(), Vec::new())),
+            (None, Some((_, _, _, lines))) => lines.push(line),
+            (None, None) => {}
+        }
+    }
+    match open {
+        Some((line, _, _, _)) => Err(line),
+        None => Ok(out),
+    }
+}
+
+/// Every ATX heading in `text`, as (0-based body line, heading text).
+///
+/// **Fence-aware, and that is the whole reason it exists.** A line-by-line scan
+/// for `## …` matched headings *inside* code fences and indented examples, which
+/// broke the check in both directions: a skill that merely **documents** §6's
+/// armor read as armored, and — worse — a page that documented every section
+/// inside indented blocks while carrying none of them satisfied the whole
+/// structure check, in order. `skills/writing-skills/SKILL.md` is a real file
+/// that quotes these headings without carrying them.
+///
+/// Otherwise it is CommonMark's ATX rule and not an approximation of it: at most
+/// [`MAX_FENCE_INDENT`] spaces of indent, one to six `#`, a space required after
+/// them (`#Overview` is not a heading), and an optional closing run of `#`
+/// stripped (`## Overview ##` is the heading `Overview`). The strictness matters
+/// in the rejecting direction too — a heading this missed would be reported as a
+/// missing section, sending an author to add text that is already there.
+fn headings(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut fence: Option<usize> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if let Some((ticks, rest)) = fence_marker(line) {
+            match fence {
+                Some(opened_with) if ticks >= opened_with && rest.is_empty() => fence = None,
+                Some(_) => {}
+                None => fence = Some(ticks),
+            }
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent > MAX_FENCE_INDENT {
+            continue;
+        }
+        let rest = line.trim_start();
+        let hashes = rest.chars().take_while(|c| *c == '#').count();
+        if !(1..=6).contains(&hashes) {
+            continue;
+        }
+        let after = &rest[hashes..];
+        if !after.starts_with(' ') {
+            continue;
+        }
+        out.push((idx, after.trim().trim_end_matches('#').trim().to_string()));
+    }
+    out
+}
+
+/// A §6 section that applies to some armored skills and not others.
+///
+/// **Both states are asserted, and that is the point.** §6 marks sections 7 and
+/// 6b CONDITIONAL and names which skills carry them; a check that only looked
+/// for them where they are required would let one appear anywhere else
+/// unremarked, which is how §2.3's placement rule ("the device earns its place
+/// on one loop, not on every page") erodes — one well-meant flowchart at a time.
+/// So `Excluded` is asserted absent, and the reason is §6's own naming rather
+/// than a judgement, which is why this variant carries no `why` of its own.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Conditional {
+    Required,
+    Excluded,
+}
+
+/// A skill that carries §6's armor, and the per-skill strings §6 fixes for it.
+///
+/// The two verbatim strings live here rather than in a lookup beside the table
+/// because they are properties of the armored skill, not of the set of them:
+/// there is nowhere to write `tdd`'s announcement except on `tdd`'s entry, so no
+/// second spelling can drift from this one. This is the same reason the body
+/// budget rides in [`skill_names!`] instead of a table of its own.
+#[derive(Clone, Copy)]
+struct Armor {
+    /// §6 section 4's fenced line, verbatim. All-caps — asserted, not assumed.
+    iron_law: &'static str,
+    /// §6 section 5's exact announcement sentence. §6 lists all four; they are
+    /// commitment devices, so a paraphrase is a different device.
+    announce: &'static str,
+    /// §6 section 7 — the requirements table. Only `verification-before-completion`
+    /// and `code-review`.
+    requirements_table: Conditional,
+    /// §6 section 6b — the cycle as a fenced `dot` graph. Only `tdd` and
+    /// `systematic-debugging`.
+    cycle_flowchart: Conditional,
+}
+
+/// What a `skills/<name>/SKILL.md` is, with respect to fix 4.
+///
+/// Three states, and **no fourth state spelled as silence** — the same shape as
+/// [`SiteState`], for the same reason. plan.md asked for this as three parallel
+/// `&[&str]` lists (`ARMORED_SKILLS`, `REQUIREMENTS_TABLE_SKILLS`,
+/// `CYCLE_FLOWCHART_SKILLS`); it is one table instead, because parallel lists of
+/// skill names are the defect this file has already had to remove twice — four
+/// spellings of the measured set collapsed into [`skill_names!`], and `Deferred`
+/// vs "not mentioned" collapsed into [`SiteState`]. Under three lists, a skill
+/// absent from all three is indistinguishable from one nobody classified, and
+/// "carries the requirements table" would be expressible for a skill that is not
+/// armored at all.
+enum ArmorState {
+    /// Armored today. Asserted to carry §6's REQUIRED sections, in §6's order.
+    Armored(Armor),
+    /// One of §6's four whose rewrite lands in a **named** later task. Asserted
+    /// **not** armored until then, so the task that writes the text and forgets
+    /// to flip this entry fails, and so does the reverse.
+    Pending { task: &'static str },
+    /// Not one of §6's four. Asserted not armored. The reason is recorded
+    /// because this is the variant that is a reading of §6's scope rather than
+    /// of its text.
+    NotArmored { why: &'static str },
+}
+
+impl ArmorState {
+    fn describe(&self) -> String {
+        match self {
+            ArmorState::Armored(_) => "recorded as Armored".to_string(),
+            ArmorState::Pending { task } => format!("recorded as Pending on {task}"),
+            ArmorState::NotArmored { why } => format!("recorded as NotArmored ({why})"),
+        }
+    }
+}
+
+/// Every `skills/*/SKILL.md`, classified against fix 4. **Exhaustive by
+/// assertion, not by hope** — see [`ArmorState`].
+///
+/// **Tasks 11–13: your rewrite and your entry here are ONE edit.** `Pending`
+/// asserts the armor is absent and `Armored` asserts it is present, so either
+/// half alone is a red suite — and a red test handed across a task boundary
+/// halts the pipeline loop.
+const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
+    (
+        "tdd",
+        ArmorState::Armored(Armor {
+            iron_law: "NO IMPLEMENTATION CODE BEFORE A TEST YOU HAVE WATCHED FAIL.",
+            announce: "Using drovr:tdd — writing the failing test before the implementation.",
+            requirements_table: Conditional::Excluded,
+            cycle_flowchart: Conditional::Required,
+        }),
+    ),
+    (
+        "systematic-debugging",
+        ArmorState::Pending { task: "Task 11" },
+    ),
+    (
+        "verification-before-completion",
+        ArmorState::Pending { task: "Task 12" },
+    ),
+    ("code-review", ArmorState::Pending { task: "Task 13" }),
+    (
+        "using-drovr",
+        ArmorState::NotArmored {
+            why: "fix 2's per-turn router (§4.1), not one of the four discipline \
+                  skills §6 names. It gets the gate function, not the armor",
+        },
+    ),
+    (
+        "handoff",
+        ArmorState::NotArmored {
+            why: "process documentation for running drovr — §6 names four skills \
+                  and this is not one of them",
+        },
+    ),
+    (
+        "pipeline",
+        ArmorState::NotArmored {
+            why: "same as `handoff`",
+        },
+    ),
+    (
+        "worktrees",
+        ArmorState::NotArmored {
+            why: "same as `handoff`",
+        },
+    ),
+    (
+        "writing-skills",
+        ArmorState::NotArmored {
+            why: "the authoring reference that documents §6's armor; it is not \
+                  itself armored. Recorded rather than omitted because it does \
+                  carry `Red flags — STOP`, `Rationalizations` and a fenced `dot` \
+                  block of its own, so its absence from §6's four is a fact about \
+                  §6's scope and not something a heading scan could infer",
+        },
+    ),
+];
+
+/// §6's REQUIRED sections, in §6's order, for one armored skill.
+///
+/// Section 1 (`description:`) is **not** here: it is frontmatter, and
+/// [`all_skills_have_valid_frontmatter`] already owns it. Two checks on one
+/// field would be two contracts that can disagree.
+///
+/// Sections 6b and 7 are interleaved at their §6 positions when the skill
+/// declares them [`Conditional::Required`]. No skill declares both, so their
+/// order relative to each other is never exercised.
+fn required_sections(armor: &Armor) -> Vec<(&'static str, SectionMarker)> {
+    let mut out = vec![
+        ("2 Overview", SectionMarker::Heading("Overview")),
+        ("3 Unity line", SectionMarker::Line(UNITY_LINE)),
+        ("4 The Iron Law", SectionMarker::Heading("The Iron Law")),
+        ("4 Iron Law text", SectionMarker::Line(armor.iron_law)),
+        ("5 Announce", SectionMarker::Heading("Announce")),
+        (
+            "5 Announcement sentence",
+            SectionMarker::Line(armor.announce),
+        ),
+        ("6 The procedure", SectionMarker::Heading("The procedure")),
+    ];
+    if armor.cycle_flowchart == Conditional::Required {
+        out.push(("6b Cycle flowchart", SectionMarker::Fence("dot")));
+    }
+    if armor.requirements_table == Conditional::Required {
+        out.push(("7 Requirements", SectionMarker::Heading("Requirements")));
+    }
+    out.extend([
+        ("8 Red flags", SectionMarker::Heading("Red flags — STOP")),
+        (
+            "9 Rationalizations",
+            SectionMarker::Heading("Rationalizations"),
+        ),
+        (
+            "10 Worked example",
+            SectionMarker::Heading("Worked example"),
+        ),
+        ("11 Cross-refs", SectionMarker::Heading("Cross-refs")),
+    ]);
+    out
+}
+
+/// The heading that says a file carries §6's armor at all.
+///
+/// One marker, not the whole list: `Pending` and `NotArmored` are asserted
+/// against this, and `skills/writing-skills/SKILL.md` legitimately carries
+/// `Red flags — STOP`, `Rationalizations` and a fenced `dot` block while being
+/// no part of fix 4. The Iron Law is the section nothing else in this repo has.
+const ARMOR_MARKER: SectionMarker = SectionMarker::Heading("The Iron Law");
+
+/// spec §9.1 check 1: each armored skill carries §6's REQUIRED sections, in
+/// §6's order, plus exactly the CONDITIONAL sections §6 names it for.
+///
+/// **This is not "all 11 sections on every skill"** — §9.1 says so outright, and
+/// it would be unsatisfiable by construction: sections 7 and 6b are declared for
+/// disjoint pairs of skills.
+///
+/// Watched RED before it was trusted: run against `skills/tdd/SKILL.md` as arm
+/// A′ left it, it reports every §6 section missing. A structure check that has
+/// only ever been green is a check that a heading rename would not notice.
+#[test]
+fn armored_skills_have_required_sections() {
+    // Exhaustive in both directions, exactly as `task_binding_directive_present`
+    // is: an unclassified skill is the silence this table exists to break, and a
+    // phantom entry is a table asserting things about a file that is not there.
+    let present: HashSet<String> = skill_files(&skills_dir())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let classified: HashSet<String> = SKILL_ARMOR_STATES
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+
+    let mut unclassified: Vec<&String> = present.difference(&classified).collect();
+    unclassified.sort();
+    assert!(
+        unclassified.is_empty(),
+        "skill(s) with no SKILL_ARMOR_STATES entry: {unclassified:?}\n\
+         Every skill must say whether it carries §6's armor, is one of the four \
+         awaiting its rewrite, or is not a fix-4 skill at all.",
+    );
+    let mut phantom: Vec<&String> = classified.difference(&present).collect();
+    phantom.sort();
+    assert!(
+        phantom.is_empty(),
+        "SKILL_ARMOR_STATES entries naming no skill: {phantom:?}",
+    );
+
+    // Without this the check can go quietly vacuous: flip the one `Armored`
+    // entry back to `Pending` — which Task 22 is explicitly allowed to do for a
+    // skill whose arm B failed — and `check_armor` is no longer run against a
+    // real file at all, while the suite still prints `ok`. That is the same
+    // "no fourth state spelled as silence" failure this table's own doc comment
+    // argues against, one level up.
+    assert!(
+        SKILL_ARMOR_STATES
+            .iter()
+            .any(|(_, state)| matches!(state, ArmorState::Armored(_))),
+        "no skill is recorded Armored, so this check reads nine files and asserts \
+         nothing about any of them. If Task 22 reverted the last armored skill, \
+         delete this check with it rather than leaving it green and empty."
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, state) in SKILL_ARMOR_STATES {
+        let path = skills_dir()
+            .join(name)
+            .join(format!("{PER_SKILL_FILE_STEM}.md"));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let skill = parse_skill(&contents)
+            .unwrap_or_else(|| panic!("{} has no frontmatter", path.display()));
+        // Every line number below indexes the *body*, which starts after the
+        // frontmatter. Reported raw, they sent a reader to the wrong line of the
+        // file the message names.
+        let first_body_line = contents.lines().count() - skill.body.lines().count();
+        let folded = FoldedBody::new(&skill.body);
+        let armored = ARMOR_MARKER.find(&skill.body, &folded).is_some();
+
+        let ArmorState::Armored(armor) = state else {
+            if armored {
+                wrong.push(format!(
+                    "{} ({}): carries {}, so it is armored. If this is the task \
+                     that armors it, move the entry to ArmorState::Armored in the \
+                     SAME commit as the rewrite.",
+                    path.display(),
+                    state.describe(),
+                    ARMOR_MARKER.describe(),
+                ));
+            }
+            continue;
+        };
+
+        check_armor(
+            &path,
+            &skill.body,
+            &folded,
+            armor,
+            first_body_line,
+            &mut wrong,
+        );
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} skill(s) disagree with their recorded armor state:\n{}\n\n\
+         §6 fixes the section order for the four discipline skills; \
+         SKILL_ARMOR_STATES records which skill is at which stage of that \
+         rewrite. Both halves are asserted, so neither a missing section nor an \
+         unannounced one can pass as the other.",
+        wrong.len(),
+        wrong.join("\n"),
+    );
+}
+
+/// One armored skill's sections: present, in order, and the conditional ones
+/// exactly where §6 names them. Failures are pushed rather than asserted, so one
+/// run reports every section a rewrite is missing instead of the first.
+fn check_armor(
+    path: &Path,
+    body: &str,
+    folded: &FoldedBody,
+    armor: &Armor,
+    first_body_line: usize,
+    wrong: &mut Vec<String>,
+) {
+    // Body line -> the line of the file a reader will open.
+    let at = |line: usize| line + first_body_line + 1;
+
+    let blocks = match fenced_blocks(body) {
+        Ok(blocks) => blocks,
+        Err(line) => {
+            wrong.push(format!(
+                "{}: the fence opened on line {} never closes, so everything \
+                 below it renders as code",
+                path.display(),
+                at(line),
+            ));
+            return;
+        }
+    };
+
+    // §6 section 4: the Iron Law is *fenced*. Unfenced it is one more sentence
+    // of prose in a file made of them.
+    if !blocks
+        .iter()
+        .any(|b| normalize_ws(&b.body) == normalize_ws(armor.iron_law))
+    {
+        wrong.push(format!(
+            "{}: no fenced block holds exactly the Iron Law \"{}\"",
+            path.display(),
+            armor.iron_law,
+        ));
+    }
+
+    // §6's CONDITIONAL sections, both directions.
+    if (armor.cycle_flowchart == Conditional::Required) != blocks.iter().any(|b| b.lang() == "dot")
+    {
+        wrong.push(match armor.cycle_flowchart {
+            Conditional::Required => format!(
+                "{}: §6 section 6b requires a fenced `dot` cycle here and there is none",
+                path.display()
+            ),
+            Conditional::Excluded => format!(
+                "{}: carries a fenced `dot` block, but §6 marks section 6b \
+                 CONDITIONAL and does not name this skill for it (§2.3: the \
+                 device earns its place on one loop, not on every page)",
+                path.display()
+            ),
+        });
+    }
+    // Asymmetric on purpose: the *required* direction matches §6's heading text
+    // exactly, because that text is the contract. The *forbidden* direction
+    // matches any heading that opens with it, so a section 7 smuggled in as
+    // "Requirements table" or "Requirements — what must be true" cannot walk
+    // around §6's scope on a title variation.
+    if armor.requirements_table == Conditional::Excluded
+        && let Some((line, found)) = headings(body)
+            .into_iter()
+            .find(|(_, text)| text.starts_with("Requirements"))
+    {
+        wrong.push(format!(
+            "{}: line {} is a `{found}` heading, but §6 marks section 7 \
+             CONDITIONAL and names only `verification-before-completion` and \
+             `code-review` for it",
+            path.display(),
+            at(line),
+        ));
+    }
+
+    // Presence and order in one pass: §6 fixes an order, so a file with every
+    // section in the wrong sequence is not a file that satisfies §6.
+    let mut last: Option<(&str, usize)> = None;
+    for (label, marker) in required_sections(armor) {
+        let Some(line) = marker.find(body, folded) else {
+            wrong.push(format!(
+                "{}: §6 section `{label}` is missing — expected {}",
+                path.display(),
+                marker.describe(),
+            ));
+            continue;
+        };
+        if let Some((prev_label, prev_line)) = last
+            && line <= prev_line
+        {
+            wrong.push(format!(
+                "{}: §6 section `{label}` is on line {} but `{prev_label}` is \
+                 on line {} — §6 fixes the order",
+                path.display(),
+                at(line),
+                at(prev_line),
+            ));
+        }
+        last = Some((label, line));
+    }
+}
+
+/// The declared strings are well-formed — a property of [`SKILL_ARMOR_STATES`]
+/// itself, so it is checked here and not while walking files.
+///
+/// It used to be an `assert!` inside `check_armor`, which was wrong twice over:
+/// it aborted the whole run at the first bad entry, discarding every complaint
+/// already gathered for earlier skills, and it led its message with a
+/// `SKILL.md` path — blaming a skill file for a typo in this table.
+#[test]
+fn armor_table_declares_well_formed_strings() {
+    for (name, state) in SKILL_ARMOR_STATES {
+        let ArmorState::Armored(armor) = state else {
+            continue;
+        };
+        let letters: Vec<char> = armor
+            .iron_law
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .collect();
+        assert!(
+            !letters.is_empty() && letters.iter().all(|c| c.is_uppercase()),
+            "{name}: the declared Iron Law is not all-caps: {:?}. §6 section 4 is \
+             one fenced ALL-CAPS line — the format is what gives an agent a short \
+             string to cite back at itself.",
+            armor.iron_law,
+        );
+        assert!(
+            !armor.announce.trim().is_empty(),
+            "{name}: the declared announcement sentence is empty, so §6 section 5 \
+             would be satisfied by any file"
+        );
+    }
+}
+
+/// A minimal page carrying exactly what [`required_sections`] asks for, built
+/// **from** that list rather than pasted beside it — so the fixture below cannot
+/// drift away from the contract it is a fixture for.
+fn synthetic_body(armor: &Armor) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (_, marker) in required_sections(armor) {
+        match marker {
+            SectionMarker::Heading(text) => lines.push(format!("## {text}")),
+            // §6 section 4 is the one line that has to be *fenced*; the rest of
+            // the required literals are prose.
+            SectionMarker::Line(text) if text == armor.iron_law => {
+                lines.extend(["```".to_string(), text.to_string(), "```".to_string()]);
+            }
+            SectionMarker::Line(text) => lines.push(text.to_string()),
+            SectionMarker::Fence(info) => lines.extend([
+                format!("```{info}"),
+                "digraph g { a -> b; }".to_string(),
+                "```".to_string(),
+            ]),
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// [`armored_skills_have_required_sections`] was watched RED on the real file
+/// with every section missing. This pins the branches that failure did not
+/// exercise — order, the CONDITIONAL sections' *absent* direction, an
+/// unterminated fence, and the marker the unarmored states are asserted against.
+///
+/// Without it the check is only known to notice a wholly unwritten page, which
+/// is the one state nobody is going to ship by accident.
+#[test]
+fn armor_check_refuses_a_page_that_only_looks_armored() {
+    let armor = Armor {
+        iron_law: "NEVER SHIP WITHOUT A RED TEST.",
+        announce: "Using drovr:example — doing the thing before the other thing.",
+        requirements_table: Conditional::Excluded,
+        cycle_flowchart: Conditional::Required,
+    };
+    let path = Path::new("fixture/SKILL.md");
+    let complaints = |body: &str, armor: &Armor| -> Vec<String> {
+        let mut wrong = Vec::new();
+        check_armor(path, body, &FoldedBody::new(body), armor, 0, &mut wrong);
+        wrong
+    };
+
+    // Control. If this ever fails, every negative case below is meaningless.
+    let good = synthetic_body(&armor).join("\n");
+    assert!(
+        complaints(&good, &armor).is_empty(),
+        "a page built from required_sections must satisfy the check: {:?}",
+        complaints(&good, &armor)
+    );
+
+    // The marker the `Pending` and `NotArmored` states are asserted against.
+    let folded = FoldedBody::new(&good);
+    assert!(ARMOR_MARKER.find(&good, &folded).is_some());
+    let unarmored = "## Overview\n\nnothing to see here\n";
+    assert!(
+        ARMOR_MARKER
+            .find(unarmored, &FoldedBody::new(unarmored))
+            .is_none(),
+        "a page with no Iron Law must not read as armored — otherwise a Pending \
+         skill could never be told from an Armored one"
+    );
+
+    // Wrapping is formatting. A required sentence broken across lines is the
+    // same sentence, exactly as fix 3's directive is.
+    let wrapped = good.replace(armor.announce, &armor.announce.replace(' ', "\n  "));
+    assert_ne!(
+        wrapped, good,
+        "the fixture must actually have been re-wrapped"
+    );
+    assert!(
+        complaints(&wrapped, &armor).is_empty(),
+        "re-wrapping the announcement sentence must not read as a missing \
+         section: {:?}",
+        complaints(&wrapped, &armor)
+    );
+
+    // §6 fixes an *order*, so a page holding every section in the wrong sequence
+    // does not satisfy it.
+    //
+    // Two headings swapped, not the whole page reversed: reversing also inverts
+    // the `dot` fence's lines, so it trips the section-6b branch as well and the
+    // assertion would keep passing even if the order check regressed to a no-op.
+    let swapped = good
+        .replace("## Cross-refs", "@@LAST@@")
+        .replace("## Overview", "## Cross-refs")
+        .replace("@@LAST@@", "## Overview");
+    assert_ne!(swapped, good, "the fixture must actually have been swapped");
+    let complained = complaints(&swapped, &armor);
+    assert!(
+        complained.iter().any(|c| c.contains("§6 fixes the order")),
+        "sections out of order must be reported: {complained:?}"
+    );
+    assert!(
+        complained.iter().all(|c| c.contains("§6 fixes the order")),
+        "the swap must isolate the ORDER branch — anything else here means this \
+         case would keep passing with the order check disabled: {complained:?}"
+    );
+
+    // The CONDITIONAL sections' absent direction: the same page, against a skill
+    // §6 does not name for the flowchart.
+    let excluded = Armor {
+        cycle_flowchart: Conditional::Excluded,
+        ..armor
+    };
+    assert!(
+        complaints(&good, &excluded)
+            .iter()
+            .any(|c| c.contains("§6 marks section 6b")),
+        "a `dot` flowchart on a skill §6 did not name for one must be reported: \
+         {:?}",
+        complaints(&good, &excluded)
+    );
+    // A title variation must not walk around section 7's exclusion.
+    for title in ["## Requirements", "## Requirements table"] {
+        let with_table = format!("{good}\n{title}\n");
+        assert!(
+            complaints(&with_table, &armor)
+                .iter()
+                .any(|c| c.contains("§6 marks section 7")),
+            "`{title}` on a skill §6 did not name for one must be reported"
+        );
+    }
+
+    // An unterminated fence is an error, not a dropped block — see
+    // [`fenced_blocks`].
+    let truncated = "## Overview\n\n```dot\ndigraph g {\n";
+    assert!(matches!(fenced_blocks(truncated), Err(2)));
+    assert!(
+        complaints(truncated, &armor)
+            .iter()
+            .any(|c| c.contains("never closes")),
+        "an unterminated fence must be reported as itself"
+    );
+}
+
+/// The page this check exists to refuse: one that **documents** §6's armor
+/// without carrying it.
+///
+/// Every heading below sits inside an indented block or a code fence, so none of
+/// them is a heading at all — but a line-by-line scan for `## …` read all of
+/// them, in increasing order, and passed the whole structure check on a page
+/// carrying not one of the sections. `skills/writing-skills/SKILL.md` is a real
+/// file in this repo that quotes these headings without carrying them, so this
+/// is the shape the check meets in practice, not a contrived one.
+#[test]
+fn a_page_that_documents_the_armor_does_not_carry_it() {
+    let armor = Armor {
+        iron_law: "NEVER SHIP WITHOUT A RED TEST.",
+        announce: "Using drovr:example — doing the thing before the other thing.",
+        requirements_table: Conditional::Excluded,
+        cycle_flowchart: Conditional::Required,
+    };
+    let documented = "\
+## Overview
+
+Write for the agent who inherits this: the next phase agent is you, with your
+context gone.
+
+An armored skill looks like this. This one is not armored:
+
+    ## The Iron Law
+
+```
+NEVER SHIP WITHOUT A RED TEST.
+```
+
+    ## Announce
+    Using drovr:example — doing the thing before the other thing.
+    ## The procedure
+
+```dot
+digraph g { a -> b; }
+```
+
+    ## Red flags — STOP
+    ## Rationalizations
+    ## Worked example
+    ## Cross-refs
+";
+
+    let folded = FoldedBody::new(documented);
+    assert!(
+        ARMOR_MARKER.find(documented, &folded).is_none(),
+        "an indented `## The Iron Law` inside an example is not a heading — if it \
+         reads as one, every skill that documents the armor is reported as \
+         armored, and the advice attached to that message (\"move the entry to \
+         ArmorState::Armored\") is wrong"
+    );
+
+    let mut wrong = Vec::new();
+    check_armor(
+        Path::new("fixture/SKILL.md"),
+        documented,
+        &folded,
+        &armor,
+        0,
+        &mut wrong,
+    );
+    assert!(
+        wrong.iter().any(|c| c.contains("4 The Iron Law")),
+        "the documented-but-not-carried page must fail the structure check: {wrong:?}"
+    );
+}
+
+/// [`headings`] is CommonMark's ATX rule, not an approximation, in both
+/// directions: a false accept smuggles a section past the check, and a false
+/// reject sends an author to add a section that is already on the page.
+#[test]
+fn headings_are_atx_headings() {
+    let found =
+        |text: &str| -> Vec<String> { headings(text).into_iter().map(|(_, t)| t).collect() };
+
+    // Accepted, and normalized to the same text.
+    for line in [
+        "# Overview",
+        "###### Overview",
+        "   ## Overview",
+        "## Overview ##",
+    ] {
+        assert_eq!(
+            found(line),
+            vec!["Overview".to_string()],
+            "should accept {line:?}"
+        );
+    }
+
+    // Rejected: no space after the hashes, seven hashes, an indented code block,
+    // and a setext underline (which this check does not model, so a heading
+    // written that way must not be silently half-recognized).
+    for line in [
+        "#Overview",
+        "####### Overview",
+        "    ## Overview",
+        "Overview\n--------",
+    ] {
+        assert!(
+            found(line).is_empty(),
+            "should reject {line:?}, got {:?}",
+            found(line)
+        );
+    }
+
+    // Fenced content is not headings, and the fence's own info string is not one
+    // either.
+    assert!(found("```md\n## Overview\n```").is_empty());
+
+    // A longer fence is not closed by a shorter one, so a block showing a
+    // ``` fence inside it does not desync everything below.
+    assert_eq!(
+        found("````md\n```\n## Not a heading\n```\n````\n\n## Real"),
+        vec!["Real".to_string()],
+    );
 }

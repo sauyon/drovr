@@ -146,9 +146,55 @@ what tempted them — not rationalizations.**
 
 ## Counter-text written against the baseline
 
-**Not yet written.** Task 10 owns this. See the null above before writing any: there is no
-observed rationalization to counter for this skill, and the *compliance-with-modification*
-finding is the only measured input this stage produced.
+Written by Task 10 (2026-08-04) into `skills/tdd/SKILL.md`, snapshotted as arm B.
+
+**The baseline produced no rationalization, so no row of the shipped table claims to answer
+one.** Every row is sourced below. Rows 1–4 and 8 quote the RED transcripts; rows 5–7 close
+loopholes `spec.md` §6 names for this skill and are marked as what they are — *loopholes named
+in the design record*, not observed failures.
+
+**The provenance stays here and is deliberately NOT in the shipped skill.** A draft carried a
+two-sentence note above the shipped table saying the baseline had produced no rationalization
+of its own. Task 10's review pointed out that this hands a pressured agent its exit — *no
+agent actually made these excuses here, so the table is hypothetical* — which is the reverse
+of what the note was for. A skill is a prompt (§2.5), not a lab notebook; the record belongs
+in this file, row by row, where it is checkable and where no working agent reads it as
+permission.
+
+| # | Shipped row's *thought* column | Source |
+|---|---|---|
+| 1 | *"I already validated the behavior by hand and don't want to redo that work."* | `b370eb`, verbatim (compliance-with-modification, above) |
+| 2 | *"Set it aside — stash it rather than delete it, I don't want to lose it."* | `b370eb` + `287ead`, compressed from the two quotes above; **2 of 2 runs** |
+| 3 | *"Add the test in a follow-up."* | `287ead`, verbatim from *temptations named and rejected* |
+| 4 | *"The logic's right, just land it."* | `b370eb`, verbatim — the tech lead's line, which the run quoted in order to refuse it |
+| 5 | *"The test is obvious, so I'll write it after."* | `spec.md` §6 loophole 2 — **not observed** |
+| 6 | *"It's a refactor, so this doesn't apply."* | `spec.md` §6 loophole 3 — **not observed** |
+| 7 | *"The harness makes it hard to run one test."* | `spec.md` §6 loophole 4 — **not observed** |
+| 8 | *"There isn't time in this session for the full cycle."* | `287ead`, from the time-pressure temptation it named and rejected |
+
+**The strongest input this stage produced is row 2, and the Iron Law's first bullet is written
+against it.** Arm A said *"Wrote code before the test → delete it, start with the test."* Both
+runs declined to delete and parked the spike instead — the one rule the scenario's sunk-cost
+pressure targets, softened 2 of 2. The rewrite does **not** re-issue "delete it" louder. It
+adopts the runs' own repair: the prohibition moves from *possessing* the code to *reading* it
+(*"Do not keep the working code where you can **read** it… commit it on a scratch branch, or
+`git stash push`… and do not open it, diff it, or scroll back to it until the test is
+green"*), which is what `287ead` invented for itself — *"I'm not reading the spike diff while
+drafting the test."* Step 2 and step 6 of the procedure carry the same pairing, so the
+concession is in the numbered path and not only in the prose.
+
+**One drafting error worth recording, because it inverted the finding.** The first draft of
+that bullet read *"Delete it, or move it to a path outside the repository."* That is the
+opposite of what the transcripts show — it re-issued the instruction both runs refused, and
+"outside the repository" is *less* recoverable than the stash they chose, since nothing tracks
+it and `git status` cannot see it. Task 10's review caught it before the arm B snapshot. The
+lesson generalizes to Tasks 11–13: counter-text written *at* a finding can still contradict
+it, and the check is to re-read the transcript quote beside the finished bullet.
+
+**Rows 5–7 are the honest weak point of this stage.** They are counter-text for failures
+nobody observed, kept because §6 names them as required closures, and they cost roughly 15
+lines of a 172-line file. If the `ab-tdd` stage shows arm B no better than A′, these rows are
+the first thing to cut — they are the part of the armor this run has no evidence for.
 
 ## Scored results
 
