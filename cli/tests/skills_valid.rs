@@ -3082,9 +3082,23 @@ fn methodology_skills_within_body_budget() {
 /// not contain `in a drovr phase` at any casing. The restriction cost a real
 /// hole and bought nothing.
 ///
-/// The residue is a naming rule, not a lost capability: a demotion says
-/// *"Inside a drovr phase…"* or *"Within a drovr phase…"*, never *"In a drovr
-/// phase…"*. spec §9.1 check 3's grep is case-sensitive, so this is **stricter
+/// **The rule this imposes is a substring rule, and nothing more.** A demotion
+/// passes if its text does not *contain* one of the strings below, at any
+/// casing — that is the whole predicate. It cannot tell an *additional
+/// consequence* from a *precondition*, which is §3's actual distinction, so it
+/// does not try to: judging that is review's job, and
+/// [`no_phase_scoped_description_literals`] says so too.
+///
+/// Two consequences that are easy to get wrong, both pinned by
+/// [`documented_demotion_forms_behave_as_documented`] rather than asserted here:
+///
+///   * *"**Inside** a drovr phase…"* and *"**During** a drovr phase…"* pass —
+///     neither contains `in a drovr phase`.
+///   * *"**Within** a drovr phase…"* is **REJECTED**, because `with·in a drovr
+///     phase` contains the literal outright. It is a perfectly good demotion in
+///     English and this check still refuses it. Use *"Inside"*.
+///
+/// spec §9.1 check 3's grep is case-sensitive, so folding case is **stricter
 /// than the spec requires** — deliberately, and in the direction §3 wants.
 ///
 /// Keep every entry lowercase: [`phase_scoped_literals_in`] lowercases only the
@@ -3116,6 +3130,43 @@ fn phase_scoped_literals_in(contents: &str) -> Vec<&'static str> {
             haystack.contains(literal)
         })
         .collect()
+}
+
+/// The phrasings [`PHASE_SCOPED_LITERALS`]'s doc names as passing and failing
+/// actually pass and fail.
+///
+/// It exists because that doc comment got this wrong once. It claimed *"Within a
+/// drovr phase…"* was an allowed demotion form while the matcher rejected it —
+/// `with·in a drovr phase` contains the literal — so the next author to demote a
+/// phase reference in these five skills would have been sent at a phrasing that
+/// reddens the suite. A prose rule that nothing checks drifts from the code the
+/// moment the code changes, which is exactly how that claim survived the edit
+/// that invalidated it.
+#[test]
+fn documented_demotion_forms_behave_as_documented() {
+    // (text, is it expected to trip the matcher?)
+    let cases = [
+        ("Inside a drovr phase this also binds the next phase.", false),
+        ("During a drovr phase this also binds the next phase.", false),
+        ("If you are in a phase, this also gates `drovr phase done`.", false),
+        // Rejected: `with-in a drovr phase` contains the literal.
+        ("Within a drovr phase this also binds the next phase.", true),
+        // Rejected: the case-insensitivity fix (`9f2cbb8`) exists for this one.
+        ("In a drovr phase this also binds the next phase.", true),
+        ("Use when about to claim A Drovr Task is done.", true),
+    ];
+
+    for (text, should_trip) in cases {
+        let hits = phase_scoped_literals_in(text);
+        assert_eq!(
+            !hits.is_empty(),
+            should_trip,
+            "{text:?}: expected trip={should_trip}, matcher returned {hits:?}. \
+             Update PHASE_SCOPED_LITERALS' doc comment and this case together — \
+             they are one rule written twice, and the doc is what the next author \
+             editing a skill will read."
+        );
+    }
 }
 
 /// Fix 1 (spec §3): the **three literals** [`PHASE_SCOPED_LITERALS`] names are
