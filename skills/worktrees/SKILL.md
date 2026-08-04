@@ -48,6 +48,18 @@ any other branch, then `git merge drovr/<run>` (or open a PR).
 `drovr cleanup <run> --purge` force-removes the worktree, deletes the branch, and
 drops the run dir — use it to discard a run whose work you don't want.
 
+## Bind checklists to tracked task state
+
+Isolating a run and handing its branch back are both multi-step flows.
+
+> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+> before you start step 1. Mark each in-progress when you start it and complete when its
+> evidence is in hand. If the harness exposes no task tool, write the checklist to
+> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+> repo root otherwise, and tick items there. An untracked checklist decays with the context
+> window; that decay is the exact failure drovr exists to fight.
+
 ## Discipline
 
 - **One writer per worktree.** Fan-out investigation still goes to read-only

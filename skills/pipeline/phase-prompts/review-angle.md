@@ -19,6 +19,16 @@ Your one job: review this task's change through the **<angle>** lens and emit fi
 
 ## Do
 
+0. **Bind this checklist to tracked task state — before you start step 1.**
+
+   > When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+   > using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+   > before you start step 1. Mark each in-progress when you start it and complete when its
+   > evidence is in hand. If the harness exposes no task tool, write the checklist to
+   > `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+   > repo root otherwise, and tick items there. An untracked checklist decays with the context
+   > window; that decay is the exact failure drovr exists to fight.
+
 1. **Read the change.** Run `git diff <base>..<head>` and read the working tree. You may
    read **any file** for context and **run the tests** to check whether they actually
    exercise the behavior — read-only exploration is fine.

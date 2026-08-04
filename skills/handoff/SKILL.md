@@ -27,6 +27,18 @@ exists. Preserve decisions + interfaces, drop narration.
 > truth. Compaction is one of drovr's three context-engineering levers (with note-taking/git
 > and sub-agents — see `drovr:using-drovr`); this skill is the compaction lever.
 
+## Bind checklists to tracked task state
+
+The four steps below are a checklist, and so is the 7-section handoff they end in.
+
+> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+> before you start step 1. Mark each in-progress when you start it and complete when its
+> evidence is in hand. If the harness exposes no task tool, write the checklist to
+> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+> repo root otherwise, and tick items there. An untracked checklist decays with the context
+> window; that decay is the exact failure drovr exists to fight.
+
 ## The four steps
 
 Assume a run exists (`drovr new <run> --task "..."` — see `drovr:using-drovr` for setup).

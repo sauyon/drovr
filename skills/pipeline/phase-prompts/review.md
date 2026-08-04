@@ -10,6 +10,16 @@ You did not write this code — review it as a skeptic, not its author.
 
 ## Do
 
+0. **Bind this checklist to tracked task state — before you start step 1.**
+
+   > When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+   > using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+   > before you start step 1. Mark each in-progress when you start it and complete when its
+   > evidence is in hand. If the harness exposes no task tool, write the checklist to
+   > `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+   > repo root otherwise, and tick items there. An untracked checklist decays with the context
+   > window; that decay is the exact failure drovr exists to fight.
+
 1. **Read the ground truth**, in this order: the approved spec at
    `~/.local/share/drovr/runs/<run>/spec.md`, the task reports appended below, and then the
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the

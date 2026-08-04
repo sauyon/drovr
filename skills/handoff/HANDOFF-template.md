@@ -37,6 +37,16 @@ just trust this summary. Git is the durable cross-check against lossy compressio
 
 ## Authoring rules
 
+- **Bind these seven sections to tracked task state before you write the first one.**
+
+  > When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+  > using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+  > before you start step 1. Mark each in-progress when you start it and complete when its
+  > evidence is in hand. If the harness exposes no task tool, write the checklist to
+  > `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+  > repo root otherwise, and tick items there. An untracked checklist decays with the context
+  > window; that decay is the exact failure drovr exists to fight.
+
 - **Compress hard.** Drop process narration, tool logs, retries, restated instructions, and
   anything the next agent can re-read from an artifact pointer.
 - **Never drop a decision or an interface** to save space — drop narration instead.

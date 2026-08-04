@@ -3264,6 +3264,153 @@ fn no_phase_scoped_description_literals() {
     );
 }
 
+/// Fragments of spec §5's canonical task-binding directive that every site
+/// carrying it must reproduce.
+///
+/// §5's block quote is the **canonical text** — sites quote it, they do not
+/// rewrite it — so these are not a summary of the rule but the three parts of it
+/// that have already been argued over, pinned so the argument cannot be re-won
+/// silently in one file at a time:
+///
+///   * `one tracked item per step` — the requirement itself. Plan Task 8 names
+///     it as the marker phrase.
+///   * `TodoWrite` **and** `TaskCreate` — §5 is deliberately tool-agnostic
+///     because harnesses differ, and a brainstorm-round reviewer's claim that
+///     `TaskCreate` is unavailable was **refuted** (`plan-HANDOFF.md`, "Refuted
+///     finding, carried forward"). A site that named only one tool would read as
+///     "no task tool here" in the other harness.
+///   * `CHECKLIST.md` — the file-based fallback for a harness exposing neither.
+///     Without it the directive is unactionable exactly where it matters most.
+///
+/// Deliberately **not** an equality check against the whole block quote: the
+/// sites embed it in different surroundings (a numbered step 0, a section, an
+/// authoring-rules bullet) and one of them is a `<!-- -->`-free template, so a
+/// byte-equality contract would forbid the wrapping the spec asks for. What is
+/// pinned is that no site loses a load-bearing part of the rule.
+const TASK_BINDING_FRAGMENTS: &[&str] = &[
+    "one tracked item per step",
+    "TodoWrite",
+    "TaskCreate",
+    "CHECKLIST.md",
+];
+
+/// The sites that carry §5's directive, relative to `skills/`.
+///
+/// **This list is incomplete on purpose, and the missing entries are the point.**
+/// §5 names four sites; Task 8 lands the two that fix 4 does not rewrite (plus
+/// §8's `pipeline`/`worktrees` note). The other two — `using-drovr`'s gate
+/// function (§4.1, Task 14) and each discipline skill's numbered procedure (§6
+/// section 6, Tasks 10–13) — land **inside** their fix-4 rewrite, and must not
+/// land before it: arm A′ is defined as fix-1-only, so fix-3 text in those five
+/// files would make the shipped tree stop matching what the frozen arm claims to
+/// be. Each of Tasks 10–14 extends this list as its site lands.
+const TASK_BINDING_SITES: &[&str] = &[
+    "pipeline/phase-prompts/brainstorm.md",
+    "pipeline/phase-prompts/plan.md",
+    "pipeline/phase-prompts/implement-task.md",
+    "pipeline/phase-prompts/review.md",
+    "pipeline/phase-prompts/review-angle.md",
+    "handoff/SKILL.md",
+    "handoff/HANDOFF-template.md",
+    "pipeline/SKILL.md",
+    "worktrees/SKILL.md",
+];
+
+/// Fix 3 (spec §5): every site that hands an agent a numbered checklist also
+/// tells it to bind that checklist to tracked task state.
+///
+/// **This is a presence check over a list of files, which is this run's
+/// recurring defect class in its friendliest disguise** — a presence check whose
+/// walk finds nothing passes having read nothing. Three things stop it being
+/// vacuous:
+///
+///  1. **The corpus is an explicit list, not a glob**, and each entry is
+///     asserted to be a real file *before* it is searched. A renamed or deleted
+///     site fails here rather than silently dropping out of the check.
+///  2. **A negative control on frozen data.** The same fragments are asserted
+///     **absent** from `docs/skill-evidence/arms/A/` — the pre-fix snapshots,
+///     which by construction predate fix 3. If a fragment matched there, it
+///     would be text common to any skill file rather than a marker of the
+///     directive, and this check would be measuring nothing. Arm A is immutable
+///     and hash-checked (`arm_a_snapshots_match_manifest`), so the control
+///     cannot rot, and Tasks 10–13 adding the directive to the *live* discipline
+///     skills does not disturb it.
+///  3. It was watched RED — all nine sites failing, and the negative control
+///     passing — before any of the directive text was written.
+///
+/// What it does **not** check is that the quoted text is §5's verbatim; it
+/// checks that the parts of it that have already been argued over survive. See
+/// [`TASK_BINDING_FRAGMENTS`].
+#[test]
+fn task_binding_directive_present() {
+    let dir = skills_dir();
+
+    assert!(
+        !TASK_BINDING_SITES.is_empty() && !TASK_BINDING_FRAGMENTS.is_empty(),
+        "TASK_BINDING_SITES and TASK_BINDING_FRAGMENTS must both be non-empty; \
+         an empty either way makes every assertion below vacuously true"
+    );
+
+    let mut missing = Vec::new();
+    for site in TASK_BINDING_SITES {
+        let path = dir.join(site);
+        assert!(
+            path.is_file(),
+            "spec §5 site {} is not a file — a presence check cannot pass over a \
+             site that is not there. If the file moved, move this entry with it; \
+             do not drop it.",
+            path.display()
+        );
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for fragment in TASK_BINDING_FRAGMENTS {
+            if !contents.contains(fragment) {
+                missing.push(format!("{}: `{fragment}`", path.display()));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} site(s) are missing part of spec §5's task-binding directive:\n{}\n\
+         Quote §5's block quote — do not reword it, do not narrow it to one task \
+         tool, and do not drop the file-based fallback. An untracked checklist \
+         decays with the context window, which is the failure fix 3 exists to \
+         fight.",
+        missing.len(),
+        missing.join("\n"),
+    );
+
+    // The negative control. Arm A predates fix 3, so a fragment found there is a
+    // fragment that does not discriminate.
+    let arm_a = arms_dir().join("A");
+    let mut false_positives = Vec::new();
+    for skill in SkillName::ALL {
+        let path = arm_a.join(format!("{}.md", skill.as_str()));
+        let contents = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the arm A snapshot {}: {e} — it is this check's \
+                 negative control, not an optional extra",
+                path.display()
+            )
+        });
+        for fragment in TASK_BINDING_FRAGMENTS {
+            if contents.contains(fragment) {
+                false_positives.push(format!("{}: `{fragment}`", path.display()));
+            }
+        }
+    }
+    assert!(
+        false_positives.is_empty(),
+        "fragment(s) of the task-binding directive appear in the pre-fix arm A \
+         snapshots:\n{}\n\
+         Arm A predates fix 3, so this means the fragment is ordinary skill \
+         prose rather than a marker of the directive, and the presence check \
+         above would pass on files that never received it. Pick a fragment that \
+         discriminates.",
+        false_positives.join("\n"),
+    );
+}
+
 /// The evidence corpus is the only citable record behind every numeric or
 /// comparative claim drovr's skill text makes (spec §2.1 exception 1). It is
 /// prose, so nothing else in this suite would notice it going missing — a task
