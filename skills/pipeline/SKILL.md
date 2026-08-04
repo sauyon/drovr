@@ -208,10 +208,34 @@ drovr code-review run <run> task-<N>                             # re-run the pa
 ```
 
 Re-entry needs **no `drovr phase start`**: `drovr phase done` only writes a marker — it never
-closes the pane (panes live until `drovr cleanup`), so the task's agent is still alive and
-`drovr phase send` reaches it directly. The agent drops a fresh `drovr phase done` marker when
-it finishes the fix, which the following `phase wait` sees. `phase send` clears the previous
-iteration's completion first, so that wait really does wait.
+closes the pane, so the task's agent is still alive and `drovr phase send` reaches it directly.
+The agent drops a fresh `drovr phase done` marker when it finishes the fix, which the following
+`phase wait` sees. `phase send` clears the previous iteration's completion first, so that wait
+really does wait.
+
+**⚠️ The pane outlives `phase done` — it does NOT outlive the next `phase start`.** With
+`reap_finished_panes` on (the default), `drovr phase start <run> <anything>` closes the pane of
+every *other* `Done` phase once its own launch succeeds. Supersession is exactly what reaping is
+triggered by, and starting the next phase is what supersedes this one. So:
+
+> **While you still intend to `phase send` back into task N, do not start any other phase.**
+> Finish the implement↔review loop for task N — clean panel — *then* start task N+1.
+
+Running the panel is safe: `drovr code-review run` reaps its own reviewers, never the
+implementer. Only `drovr phase start` touches the task's pane.
+
+Get the order wrong and the send **fails** rather than landing somewhere wrong, and the message
+names the way back:
+
+```
+drovr phase rehydrate <run> implement-task-<N>   # brings the pane back, then re-send
+```
+
+Rehydrate resumes that agent's own session where the backend offers one. **Exit 0 = the agent
+has its context back. Exit 2 = the pane is back but the agent was NOT given its context** —
+treat that exactly like `phase send`'s exit 2 and act on it, never as success. When no session
+was recoverable it reseeds instead: the artifacts come back, the conversation does not. Ordering
+is the cheap fix; rehydrate is the expensive one.
 
 Loop with **impact-scaled judgement** — no hardcoded floor or ceiling on iterations. Stop when
 the panel is clean *and* converged for the change's impact (a small change may need one pass; a
@@ -256,6 +280,16 @@ a verdict you inherit — run your own panel over the same task regardless.
   live). Do not proceed.
 - `drovr phase done` keeps refusing (agent never authored the handoff), or `drovr collect`
   yields an empty or malformed handoff → **STOP**.
+  *One refusal is not a stop, though:* `phase done` run from a plain shell instead of from
+  inside the phase's own pane fails with `$DROVR_PASS is not set`, because the marker must
+  carry the pass token the agent was launched under. The refusal prints the exact command to
+  use; the general form is
+  ```
+  DROVR_PASS=$(jq -r '.phases[]|select(.name=="<phase>").pass' <run_dir>/state.json) \
+    drovr phase done <run> <phase>
+  ```
+  (`<run_dir>` = `~/.local/share/drovr/runs/<run>`; use `.review_phases[]` for a reviewer.)
+  The handoff must still exist — this bypasses the pane, not the contract.
 - A failed implement task **halts the loop** naming that task — later tasks depend on its
   interfaces.
 
@@ -273,6 +307,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |
 | Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task completes; loop on exit 3. |
+| Starting task N+1 while still iterating on task N | `phase start` **reaps** every other finished phase's pane, so the `phase send` back into task N then fails. Finish N's loop first; if you already started N+1, `drovr phase rehydrate <run> implement-task-<N>` brings the pane back (exit 2 = it came back WITHOUT its context — act on that). |
 | Accepting a task because ITS report says its own panel came back clean | Author-run panels are iteration feedback. Only your run is the gate — run it. |
 | Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
 | Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |

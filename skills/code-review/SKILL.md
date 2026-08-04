@@ -58,3 +58,18 @@ the reviewer yourself.
 **Exit 2 is slow, not broken.** Re-running the *same* command RESUMES: it keeps the
 angles already banked and waits only on stragglers. Loop on 2 as freely as on 3.
 `--fresh` throws it away and pays for a new one — never use it to unstick a timeout.
+
+**A panel is RE-RUN, never rehydrated.** `drovr phase rehydrate` refuses a reviewer phase
+outright, and the refusal is the design: a reviewer delivers through drovr's MCP findings
+server, which is handed over on the command line at launch and cannot be re-attached to a
+resumed session. A resumed reviewer would have no `submit_findings` tool, so it could wait
+forever and deliver nothing. Recovery for a lost reviewer is `drovr code-review run <run>
+<task>` again — which resumes the panel in flight, so it costs only the angles that were
+actually lost.
+
+**The panel closes its own panes.** Once the findings are merged, `code-review run` reaps every
+reviewer pane it opened (and any it orphaned by replacing an angle mid-run). The verdict in
+`<task>-review.json` is the record — file, line, angle and summary — but the reviewers'
+transcripts go with their panes, so if you want to see *how* a reviewer reasoned, read the pane
+before the panel returns. `reap_finished_panes = false` in config keeps them.
+It reaps only its own reviewers; the implementer's pane is untouched.
