@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # UserPromptSubmit hook for the drovr plugin — the per-turn gate.
 #
-# Injects a small card (<=600 bytes) before every user turn, re-asserting the
+# Injects a small card (<=600 bytes) before a user turn — every turn except the
+# one right after the agent invoked a drovr:* skill — re-asserting the
 # routing rule the SessionStart reflex established: even a 1% chance a drovr:*
 # skill applies means invoking it. A SessionStart injection is one prompt at the
 # top of a session and scrolls out from under the agent as the context fills;
@@ -12,8 +13,11 @@
 # `per_turn`) and the transcript named on stdin, and prints the hook JSON or
 # nothing at all. Keeping the logic in the CLI keeps it unit-testable.
 #
-# FOUR DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is
-# load-bearing; none is an oversight to be tidied away.
+# SIX DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is
+# load-bearing; none is an oversight to be tidied away. Four are in this
+# script's own logic and are listed here; the remaining two live in the CLI and
+# are noted where they bite — no plugin-root resolution (below), and failing
+# OPEN on an unloadable config.toml where session-start exits 1.
 #
 #   1. NO DROVR_PHASE SUPPRESSION. The SessionStart reflex no-ops inside a
 #      drovr-spawned phase because the phase agent runs on its injected briefing.

@@ -72,13 +72,17 @@ what bounds the cumulative cost in the common case.
 that loaded successfully, and a previous turn that demonstrably invoked a `drovr:*` skill *and* whose
 `tool_result` says the call succeeded. Those are the only two `None` conditions in `gate_json`.
 
-**A third way produces no card without being a decision:** the hook cannot run at all. It splits into
-two cases, and only one of them is loud.
+**Three further ways produce no card without being a decision** — the hook cannot run, or does not
+finish. Only the middle one is loud:
 
 - **`drovr` is not installed** (not on `PATH`, or `$DROVR_BIN` names nothing resolvable) — the hook
   exits **0 and says nothing**, by design (see *Deployment characteristics*). Silent and cardless.
 - **`drovr` resolves but fails**, or the script itself cannot be executed — non-zero, so stderr
   reaches the user. Loud, and still cardless.
+- **The hook is killed at the 5s `timeout`.** This is the one genuinely **fail-CLOSED** path in an
+  otherwise fail-open design: a stall produces no card rather than a redundant one. It is bounded
+  and non-blocking (measured, below), and the alternative — no timeout — trades a missing card for a
+  hung prompt. Named here because a reader of this section would otherwise not find it.
 
 "Fails loudly" is a claim about the exit code, never about the card: no exit code delivers one.
 

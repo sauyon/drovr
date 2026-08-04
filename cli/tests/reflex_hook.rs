@@ -9,9 +9,10 @@
 //!
 //! `hooks/user-prompt` is the per-turn gate: it runs `drovr reflex --gate` on
 //! every `UserPromptSubmit`, passing the hook's stdin payload through so the CLI
-//! can read the transcript and suppress a card the session does not need. Four
-//! deliberate differences from its sibling, each load-bearing and each tested
-//! here:
+//! can read the transcript and suppress a card the session does not need.
+//!
+//! **Six** deliberate differences from its sibling, each load-bearing and each
+//! tested here. Four live in the script's own logic:
 //!
 //!   1. it does **not** suppress on `DROVR_PHASE` — a phase is exactly where the
 //!      discipline must hold;
@@ -24,6 +25,14 @@
 //!      `UserPromptSubmit` hook discards the user's prompt unprocessed, and clap
 //!      exits 2 on a usage error — so an `exec` plus a `drovr` predating
 //!      `--gate` would erase every prompt typed.
+//!
+//! …and two are inherited from how the CLI treats the gate:
+//!
+//!   5. it resolves no plugin root, where session-start must
+//!      (`user_prompt_hook_needs_no_plugin_root`);
+//!   6. it fails OPEN on an unloadable `config.toml` and runs on defaults, where
+//!      session-start exits 1 (`user_prompt_hook_emits_on_unloadable_config` /
+//!      `session_start_hook_exits_nonzero_on_unloadable_config`).
 //!
 //! The scripts are exercised standalone via `bash`, with `CLAUDE_PLUGIN_ROOT`
 //! pointed at the repo root (so it resolves the skill) and `DROVR_BIN` pointed at
@@ -618,7 +627,10 @@ fn session_start_hook_still_fails_loudly_without_drovr() {
         return;
     }
     // The asymmetry's other half, asserted so the silent-degrade above cannot be
-    // "harmonised" onto the hook that should stay loud.
+    // "harmonised" onto the hook that should stay loud. `missing_binary_fails_
+    // loudly` already pins the exit code; what this adds is the LOUD half —
+    // stderr must actually reach the user, which is the whole reason
+    // session-start is allowed to be noisy where the gate is not.
     let cfg = tempfile::tempdir().unwrap();
     let out = Command::new("bash")
         .arg(hook_script(SESSION_START))
@@ -631,6 +643,11 @@ fn session_start_hook_still_fails_loudly_without_drovr() {
     assert!(
         !out.status.success(),
         "the SessionStart reflex must still fail loudly when drovr is missing"
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "\"loudly\" means the user is told: session-start must write to stderr \
+         when drovr is missing, where the gate deliberately says nothing"
     );
 }
 
@@ -667,9 +684,14 @@ fn user_prompt_hook_never_exits_two() {
         // on the version-skew path is that the user gets a clue; adding a
         // `2>/dev/null` to the invocation would leave this suite green and
         // produce exactly the quiet-and-broken state the design rejects.
+        // Pin whose stderr it is. `2>/dev/null || { echo "drovr failed" >&2; …}`
+        // would keep this non-empty while destroying clap's actual message —
+        // and clap's message is the version-skew clue the entire
+        // tolerate-the-noise argument rests on.
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !out.stderr.is_empty(),
-            "a drovr exiting {code} must let its stderr reach the user"
+            stderr.contains("boom"),
+            "a drovr exiting {code} must let ITS OWN stderr reach the user, got: {stderr:?}"
         );
     }
 }
@@ -894,8 +916,9 @@ fn user_prompt_hook_emits_on_unloadable_config() {
     // otherwise leave the gate quietly ignoring a typo forever.
     let stderr = String::from_utf8_lossy(&out_stderr);
     assert!(
-        !stderr.is_empty(),
-        "an unloadable config must warn on stderr, got nothing"
+        stderr.contains("failed to load config"),
+        "an unloadable config must warn on stderr with the CLI's own message, \
+         got: {stderr:?}"
     );
 }
 

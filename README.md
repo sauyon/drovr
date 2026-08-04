@@ -74,7 +74,8 @@ Two hooks, one `[reflex]` table.
 The `session-start` hook injects the `drovr:using-drovr` router skill as the
 always-on reflex for human-facing sessions (it no-ops inside a drovr-spawned
 phase). The `user-prompt` hook injects a much smaller **per-turn gate card**
-before every prompt, because a `SessionStart` injection scrolls out from under
+before a prompt — every one except the turn right after a `drovr:*` skill ran —
+because a `SessionStart` injection scrolls out from under
 the agent as the context fills and the discipline has to still be reachable at
 turn 200. Both delegate to `drovr reflex`, so both are governed by the
 `[reflex]` table — the SessionStart reflex is *shaped* by it, the gate is only

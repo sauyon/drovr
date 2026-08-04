@@ -2,12 +2,13 @@
 
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
-**Status:** open, pre-existing. Found 2026-08-03 while wiring the `UserPromptSubmit`
-per-turn gate (`hooks/user-prompt`); the gate inherits the gap rather than causing it.
+**Status:** open, pre-existing — the `UserPromptSubmit` per-turn gate inherits the gap
+rather than causing it.
 
 **Severity:** medium (silent — the plugin loads, its skills work, and both reflexes are
 simply absent with no error anywhere).
-**Found:** 2026-08-03, reviewing what a store-path install actually contains.
+**Found:** 2026-08-03, while wiring `hooks/user-prompt`: reviewing what a store-path
+install actually contains.
 
 ### Symptom
 
