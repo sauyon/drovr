@@ -67,6 +67,78 @@ command = "agent"
 review_model = "gpt-5.6-terra-medium"
 ```
 
+### Pane reaping
+
+```toml
+# Close a phase's herdr pane once the run has provably moved past it. ON by default.
+reap_finished_panes = true
+```
+
+Without this, every phase's pane lived until `drovr cleanup` and a long run
+accumulated a tab per phase plus one per reviewer.
+
+**Reaping is triggered by supersession, never by completion.** A pane outlives
+`drovr phase done` — the implement↔review loop re-enters the same pane with
+`drovr phase send` and no `phase start`, and reaping on completion would kill
+that loop on its first iteration. The three triggers are the moments a run has
+provably moved past a phase:
+
+| Trigger | Reaps |
+|---|---|
+| `drovr phase start <run> <phase>`, after its own launch succeeds | every **other** `Done` phase's pane (never a reviewer's — those belong to a panel that may still be in flight) |
+| `drovr code-review run`, after the findings are merged | the panel's own reviewer panes |
+| `drovr phase reap <run> <phase>` | the phase you named |
+
+All three also sweep the run's **retired** panes — ones drovr opened that no
+phase points at any more (see `retired_panes` below). For the first two that
+sweep is inside the config gate below; `drovr phase reap` sweeps either way.
+
+Reaping closes a **pane**, not a tab: a phase's tab may also hold a pane the
+human split into it, and drovr closes only what it can prove is its own. In the
+ordinary case — drovr's pane alone in its tab — the tab goes with it.
+
+`reap_finished_panes = false` restores the pre-reaping behaviour: every pane
+stays until `drovr cleanup`, and nothing else changes. It turns off the two
+**automatic** triggers (and the retired-pane sweep at those triggers). It does
+**not** turn off `drovr phase reap`, which is a command rather than a policy and
+stays available either way — including its sweep.
+
+Reaping a phase does not change its status; it says something about the pane,
+not about whether the work finished. Bring it back with `drovr phase rehydrate`.
+
+**At the two automatic triggers, reaping is best-effort throughout.** A pane that
+will not close, a herdr that cannot be reached, or a lost race for the run lock
+all produce a warning on stderr and leave the phase untouched — the command that
+triggered the reap still succeeds. `drovr phase start` exiting 0 therefore means
+the phase started, not that anything was reaped. See `run.lock` below.
+
+### Resuming an agent's session
+
+`drovr phase rehydrate` relaunches a phase and asks the backend to resume the
+agent's recorded session, so the conversation comes back rather than a fresh
+agent reading the notes. How a backend spells that is per-agent, and the two
+shapes are mutually exclusive:
+
+```toml
+[agents.claude]
+command = "claude"
+resume_flag = "--resume"          # <command> … --resume '<id>'   (where other flags go)
+
+[agents.codex]
+command = "codex"
+resume_subcommand = "resume"      # <command> resume '<id>' …     (immediately after)
+```
+
+Built-ins: `claude` and `cursor` get `resume_flag = "--resume"`. **codex gets
+neither** — `codex resume <id>` is the expected shape but its argument ordering
+was never verified, and an unverified guess composes a wrong command line where
+absence merely reseeds. Opt in explicitly as above. An empty value is rejected
+at config load: a bare `--resume` opens claude's interactive session picker and
+parks the pane forever.
+
+A backend with no resume surface is not an error — a rehydrate of a phase that
+ran under it degrades to a **reseed** (fresh agent, seed re-sent).
+
 ### Reflex
 
 The `session-start` hook injects the `drovr:using-drovr` router skill as the
@@ -105,7 +177,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
-| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
+| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, retired panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
 
 ### Review UI keyboard navigation
 
@@ -140,11 +212,72 @@ is hidden on macOS where it does not apply.
 | `drovr phase start <run> <phase> [--seed <path>]` | Spawn a claude agent pane for the phase. |
 | `drovr phase send <run> <phase> <text>` | Send text to a running phase pane. |
 | `drovr phase wait <run> <phase> [--timeout-ms N]` | Poll until the phase agent is done (default 30 s). |
-| `drovr phase done <run> <phase>` | Run by the phase agent as its final action; refuses until the agent has authored `<phase>-HANDOFF.md`, then drops the completion marker. |
+| `drovr phase done <run> <phase>` | Run by the phase agent as its final action; refuses until the agent has authored `<phase>-HANDOFF.md`, then drops the completion marker. Must run from inside the phase's own pane — the marker is stamped with the `$DROVR_PASS` token that pane was launched under. From anywhere else it refuses and prints the command that would work. |
+| `drovr phase rehydrate <run> <phase>` | Bring back a phase whose pane is gone, resuming its recorded agent session where the backend offers one. Exit 0 = the pane is back **and** the agent has this phase's context; 2 = the pane is back but the agent was **not confirmed** to have this phase's context — the message names which of five states it was, and one of them is an agent that may be perfectly resumed and merely slow to surface its session id, so read it before you act; 1 = refused or failed. |
+| `drovr phase reap <run> <phase>` | Close a phase's pane and release the phase from it, on demand. Exit 0 = the pane is gone and the phase no longer records it (including when there was nothing to reap, so re-running is safe); 2 = the pane is still there and the phase still holds it — herdr would not close it, or could not be reached; 1 = refused or failed. |
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
+
+### Reaping and rehydrating a pane
+
+`drovr phase reap` is the manual form of the automatic reaping above, and it is
+also the supported way to clear a phase that records a pane herdr no longer has
+— the state that otherwise makes `phase rehydrate` refuse with "still holds
+pane" forever, with nothing able to clear it.
+
+It additionally **sweeps the run's retired panes**: panes drovr opened that no
+phase points at any more, which a reviewer replaced mid-panel leaves behind. The
+sweep is best-effort and reports itself; **it does not affect the exit code**,
+which is about the phase you named.
+
+All three triggers sweep (see the table above), so on the default config an
+orphaned retired pane is already reclaimed by the next `phase start` or
+`code-review run` — you do not need this command for it. What this command adds
+is the sweep **on demand**: it runs regardless of `reap_finished_panes`, so with
+the automatic triggers off it is the only route to a retired pane short of
+`drovr cleanup`, and with them on it is how you avoid waiting for the next one.
+
+`drovr phase rehydrate` is the way back. It opens a fresh tab in the run's
+project directory, under the profile the phase originally ran with, and asks the
+backend to resume the recorded session:
+
+- **`Resumed`** means the *session came back* — herdr reported that session id
+  on the new pane. It is not a claim that an agent started working; it is the
+  claim the ⟳ button makes, and it is only made on positive evidence.
+- **`Reseeded`** means no session was recoverable, so a fresh agent was launched
+  and the phase's seed re-sent. The artifacts come back; the conversation does
+  not.
+- **`Incomplete`** (exit 2) is the only outcome that is not a success: the pane
+  is back, but the agent in it was not confirmed to have this phase's context.
+  It names which of five things went wrong — the agent never reported ready; the
+  resume came up carrying a *different* session (the pane is surrendered, since
+  a different session is positive evidence the record does not describe it);
+  herdr never reported *any* session id (the pane is kept — nothing seen is not
+  evidence); a fresh agent is up and the phase has no seed to give it; or the
+  seed could not be delivered.
+
+**Rehydrate restores the pane, never the instruction.** Even on exit 0 the agent
+is idle until you tell it something — `Resumed` gives it back its conversation,
+`Reseeded` gives a fresh agent the handoff, and neither is the thing you were
+about to send. Follow every successful rehydrate with the `drovr phase send` you
+were trying to make in the first place.
+
+It **refuses a reviewer phase**, and that refusal is the design: a reviewer
+delivers its findings through drovr's MCP findings server, which is handed over
+on the command line at launch and cannot be re-attached to a resumed session. A
+resumed reviewer would have no `submit_findings` tool, so it could never
+deliver. A panel is **re-run, not rehydrated** — `drovr code-review run` resumes
+a panel in flight, so it costs only the angles actually lost.
+
+In `drovr serve`, a reaped phase renders dimmed in the agent tree and carries a
+**⟳** button. Three independent predicates, deliberately: the dimming says the
+pane was *reaped*; the button appears wherever a phase is *rehydratable*, which
+is not only the reaped ones and is the same predicate the CLI refuses on, so a
+click can never hit a refusal; and its tooltip is decided by whether the phase is
+*resumable*, i.e. which of the two things a click promises — resume this phase's
+session, or launch a fresh agent and re-send the seed.
 
 ## Run directory and state contracts
 
@@ -170,7 +303,32 @@ Written on `drovr new`; updated by phase commands.
 }
 ```
 
+**That example is a freshly-created run, not the full schema** — it shows the
+keys a phase always carries and the run-level keys `drovr new` writes, and both
+sets grow. `cli/src/run.rs` (`RunState`, `Phase`) is the authority.
+
 Phase `status` values: `Pending`, `Running`, `Done`, `Failed`.
+
+`herdr_session` is **dead** — it is serialized for backwards compatibility and
+read by nothing. A phase's resumable session id lives in `pane_agent` below;
+do not reach for this one.
+
+The five keys in the example are the ones every phase always carries. Four more
+appear once a phase has run, and are omitted from `state.json` while absent:
+
+| Key | Meaning |
+|---|---|
+| `pass` | Token identifying the current pass over the phase, exported to its agent as `$DROVR_PASS` and stamped into `<phase>.done`. |
+| `tab_id` | The herdr tab holding `pane_id`, captured opportunistically. **Diagnostic only** — anything about to act on a tab resolves a fresh one first, since an id read minutes ago may name a tab that is gone or reused. |
+| `pane_agent` | The backend and profile this phase's agent was actually launched under, plus its session id once herdr reports one. A reviewer's backend legitimately differs from the run's, so this is not derivable from `agent`. |
+| `reaped` | drovr closed this phase's pane. The status is untouched, so this says nothing about whether the work finished. |
+
+Two run-level keys are worth knowing about:
+
+| Key | Meaning |
+|---|---|
+| `review_phases` | Reviewer phases (`review:<task>:<iter>:<angle>`), kept out of `phases` so they never pollute pipeline progress. |
+| `retired_panes` | Panes drovr opened that no longer belong to any phase — a reviewer replaced mid-panel leaves one. `drovr cleanup` closes exactly the panes drovr can prove are its own, and this is how a pane stays provably drovr's after its phase lets go of it. **The list shrinks as well as grows:** the retired-pane sweep drops an entry once the pane behind it is provably gone. It is not an append-only audit log — an entry that outlives its pane proves nothing, and herdr reissues pane ids. |
 
 ### `<phase>-HANDOFF.md`
 
@@ -202,6 +360,29 @@ The server reads and writes these files in each run dir:
 | `summary.txt` | server on POST summary | Agent summary text. |
 | `questions.json` | agent | MC questions for the reviewer (optional). |
 | `approved` | server on approve | Marker file written when the spec is approved. |
+
+### Other per-run files
+
+| File | Written by | Purpose |
+|---|---|---|
+| `<phase>.done` | `drovr phase done` | Completion marker, stamped with the pass token of the agent that wrote it. `drovr phase wait` accepts it only if that token matches the phase's current `pass`, which is what stops a previous pass's still-live agent from completing the current one. |
+| `<phase>-HANDOFF.md` | the finishing phase agent | See above; `drovr collect` reads it. |
+| `run.lock` | any command that reaps or rehydrates | The exclusive lock serializing the commands that move a run's panes around: `drovr phase rehydrate` and `drovr phase reap` directly, and `drovr phase start` / `drovr code-review run` through the reaping they trigger. Rehydrate and reap are the same read-modify-write over `pane_id` in opposite directions, so they share one lock — reaping a phase a rehydrate is bringing back would end with a live pane nothing records. Advisory and kernel-held, so a crashed holder leaves nothing stale. Contention **never queues**, but what it costs depends on who lost — see below. (Named `rehydrate.lock` while rehydrate was its only holder.) |
+
+**Losing the `run.lock` race is not an error for the commands that reap as a
+side effect.** Two different behaviours, and the difference is what a driver can
+conclude from an exit code:
+
+| Path | On contention |
+|---|---|
+| `drovr phase rehydrate` / `drovr phase reap` — the lock *is* the command | **Exit 1.** The refusal names the run and says another command is moving its panes. |
+| `drovr phase start` / `drovr code-review run` — the reap and the sweep are a side effect | **A warning on stderr, and exit 0 anyway.** The phase still started, or the panel still returned its verdict; only the reaping was skipped. |
+
+So **exit 0 from `phase start` does not mean the reap ran.** The stderr warning
+is the only signal you get, and nothing retries — the panes are picked up at the
+next trigger, or by `drovr phase reap` / `drovr cleanup`. This is deliberate: a
+reap that could fail a launch would make a bookkeeping step able to break the
+run it is tidying up after.
 
 ## Review loop flow
 
@@ -253,10 +434,42 @@ after **every** edit to `spec.md`, and the finishing phase agent authors exactly
 ## Running tests
 
 ```
-cargo test          # all 59 tests (unit + integration + e2e)
+cargo test              # unit + integration + e2e
 cargo test --test e2e   # e2e smoke only
 ```
 
 The e2e test requires `herdr`, `claude`, and the herdr claude integration hook.
 It creates an isolated run in a temp directory and removes it on completion. If
 prerequisites are absent it prints a skip message and exits cleanly.
+
+### The lint gate is PARITY, not zero
+
+`cargo clippy --all-targets -- -D warnings` does **not** pass on `main`, and
+`cargo fmt --check` does not either. Neither can be a pass/fail gate as written,
+and chasing them into the green is a separate, deliberate change — a
+formatting-only commit conflicts with every branch in flight, so it needs a quiet
+moment rather than a branch that happens to notice (see `docs/known-issues.md`).
+
+**The gate a branch is actually held to: introduce no new finding.** Measure
+before and after, and compare the *sets*, not just the counts — line numbers move
+as code does, so compare by file and lint, and treat a finding whose lint class
+already existed in that file as pre-existing.
+
+**Measuring is subtler than it looks.** Cargo only re-emits warnings for targets
+it actually recompiles, so a cached run silently under-reports — touching one
+module can take the count from 8 to 4. And the same source-level warning is
+reported once per compilation target (`src/*.rs` compiles as both `bin "drovr"`
+and `bin "drovr" test`), which is what the `generated 1 warning (1 duplicate)`
+summary lines are about. Force a full re-check and dedupe by source location:
+
+```
+cd cli
+touch src/*.rs tests/*.rs        # or: CARGO_TARGET_DIR=$(mktemp -d)
+cargo clippy --all-targets --message-format=short 2>&1 |
+  grep ': warning: ' | sort -u
+```
+
+`--message-format=short` prints one `file:line:col: warning: …` per finding, so
+`sort -u` collapses the per-target duplicates; the result is stable across cold
+and warm builds. `cargo fmt` has no equivalent trick — do not run it, and see the
+known-issues entry for why naming a single file reformats the whole crate.

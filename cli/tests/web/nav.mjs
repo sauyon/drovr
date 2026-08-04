@@ -190,6 +190,13 @@ async function reload(ready) {
 }
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
 const QUESTIONS_READY = { probe: cursorQuestion, ok: q => !!q, label: 'questions panel' };
+const agentNodes = () => evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-node')).map(function(e){
+    return { name: e.querySelector('.agent-name').textContent,
+             reaped: e.classList.contains('reaped'),
+             rehydrate: !!e.querySelector('.agent-rehydrate') };
+  });`);
+const AGENTS_READY = { probe: agentNodes, ok: n => n.length > 0, label: 'agent tree' };
 
 // ---------------------------------------------------------------------------
 console.log('\n== session list: motion ==');
@@ -1763,7 +1770,117 @@ check('the page can scroll clear of the fixed hint bar', await evaluate(`
   var bar = document.getElementById('keyhint').getBoundingClientRect().height;
   return pad >= bar * 2;`), true);
 
+console.log('\n== agent tree: a reaped phase ==');
+await goto('#/runs/delta-idle', AGENTS_READY);
+const tree = await agentNodes();
+check('a reaped phase is still listed — hiding it would look like it never ran',
+  tree.map(n => n.name), ['brainstorm', 'plan', 'implement']);
+check('reaped phases render dimmed', tree.map(n => n.reaped), [true, true, false]);
+// The ⟳ is gated on `rehydratable` — the same predicate the CLI refuses on — so
+// it appears on BOTH reaped phases (the second reseeds rather than resuming, and
+// its tooltip says so) and on neither the live one nor a phase that never ran.
+// Gating it on "has a session" instead would hide a recovery that works, and
+// gating it on `reaped` alone would offer one the CLI then rejects.
+check('⟳ appears exactly where a click will work',
+  tree.map(n => n.rehydrate), [true, true, false]);
+check('the ⟳ says which one you get', await evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-rehydrate'))
+    .map(function(b){ return b.title.indexOf('resume this') !== -1 ? 'session' : 'reseed'; });`),
+  ['session', 'reseed']);
+// The stub answers the way the server does, so the click handler's real
+// response path runs — including `r.json()`, which is where the outcome the
+// human needs lives.
+const stubbedClick = (ok, body) => evaluate(`
+  var seen = null, real = window.fetch;
+  window.fetch = function(u, o) {
+    seen = { url: u, method: (o || {}).method };
+    return Promise.resolve({ ok: ${ok}, status: ${ok ? 200 : 500},
+                             json: function(){ return Promise.resolve(${JSON.stringify(body)}); } });
+  };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  return seen;`);
+const agentsNoteText = () => evaluate(`
+  var e = document.getElementById('agents-note');
+  return { text: e.textContent, bad: e.classList.contains('bad'), shown: e.style.display !== 'none' };`);
+
+check('⟳ posts to the run-scoped rehydrate endpoint',
+  await stubbedClick(true, { ok: true, complete: false, phase: 'brainstorm',
+    detail: "phase 'brainstorm' relaunched INCOMPLETE — its seed was NOT re-sent" }),
+  { url: '/api/runs/delta-idle/rehydrate?phase=brainstorm', method: 'POST' });
+// A rehydrate that could not deliver the seed is an HTTP 200. If the page drops
+// the body, the user sees the ⟳ vanish and never learns the agent is blank.
+await waitFor(agentsNoteText, n => n.text.indexOf('NOT re-sent') !== -1, 8000,
+  'the outcome detail to be shown');
+// …and it must READ as a problem. `complete: false` means the pane came back
+// but the agent was never told what it is doing — not a success to scroll past.
+check('an incomplete rehydrate is flagged, not reported as plain success',
+  (await agentsNoteText()).bad, true);
+
+// The control: a rehydrate that DID everything must not be flagged, or "flag
+// everything" would pass the check above.
+const enabledButton = () => evaluate(`
+  var b = document.querySelector('#agents-tree .agent-rehydrate');
+  return !!b && !b.disabled;`);
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
+await stubbedClick(true, { ok: true, complete: true, phase: 'brainstorm',
+  detail: "phase 'brainstorm' resumed with its recorded session" });
+await waitFor(agentsNoteText, n => n.text.indexOf('resumed with') !== -1, 8000,
+  'the success detail');
+check('a complete rehydrate is NOT flagged', (await agentsNoteText()).bad, false);
+
+// Wait for a button that is ENABLED, not merely present: the click above left
+// the old element disabled on purpose, and clicking a disabled button is a
+// silent no-op — the next check would then assert against the previous note.
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
+check('a failed rehydrate reports the reason the server gave, not just a status code',
+  await (async () => {
+    await stubbedClick(false, { ok: false, error: 'run has no herdr workspace' });
+    await waitFor(agentsNoteText, n => n.bad, 8000, 'the failure note');
+    return await agentsNoteText();
+  })(),
+  { text: 'run has no herdr workspace', bad: true, shown: true });
+check('a failed rehydrate re-enables its button', await evaluate(`
+  var b = document.querySelector('#agents-tree .agent-rehydrate');
+  return b ? b.disabled : null;`), false);
+
+
+// A pane that leaves the tree must not stay selected: `?pane=<gone>` answers
+// 204 on the mirror and 409 on send, which reads as a wedged UI rather than as
+// a stale selection — and a reaped node is exactly how a pane leaves.
+check('a live pane can be selected', await evaluate(`
+  selectPane('w1:p3', 'implement'); return selectedPane;`), 'w1:p3');
+check('a pane outside the tree starts out selected too', await evaluate(`
+  selectPane('w1:gone', 'ghost'); return selectedPane;`), 'w1:gone');
+await waitFor(() => evaluate(`return selectedPane;`), v => v === null, 8000,
+  'the stale pane to be dropped');
+check('the mirror falls back to the run default once it is dropped',
+  await evaluate(`return document.getElementById('session-target').textContent;`), 'active');
+
+// A reseed waits for the fresh agent to attach — up to 30s — so the response can
+// easily land after the user has moved on. `#agents-note` is page-global, so an
+// unguarded write files run A's outcome under run B. Hold the response open,
+// navigate, THEN settle it: without the guard the note lands on the wrong run.
+// `location.hash` (not Page.navigate) so the in-flight promise survives.
+check('a rehydrate response can be held open across a navigation', await evaluate(`
+  window.__settle = null;
+  var real = window.fetch;
+  window.fetch = function() { return new Promise(function(res){ window.__settle = res; }); };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  location.hash = '#/runs/beta-cache';
+  return typeof window.__settle === 'function';`), true);
+await waitFor(hash, h => h === '#/runs/beta-cache', 8000, 'the other run');
+await evaluate(`
+  window.__settle({ ok: true, status: 200,
+                    json: function(){ return Promise.resolve({ detail: 'LEAKED FROM delta-idle' }); } });
+  return 1;`);
+await sleep(400);
+check('a response arriving after navigation is dropped, not filed under the new run',
+  await evaluate(`return document.getElementById('agents-note').textContent;`), '');
+
 console.log('\n== leaving a run ==');
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');

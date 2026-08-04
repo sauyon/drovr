@@ -65,7 +65,10 @@ use crate::config::load_config;
 use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
-use crate::phase::{archived_run_error, done_marker, phase_send, spawn_reviewer};
+use crate::phase::{
+    ReapOutcome, archived_run_error, marker_completes_current_pass, phase_reap, phase_send,
+    poll_phase_pane, reap_retired, spawn_reviewer,
+};
 use crate::run::{PhaseStatus, RunState, run_dir};
 
 /// How often the private wait loop polls the filesystem for a reviewer's marker.
@@ -354,7 +357,7 @@ pub fn code_review_brief(
 /// iterates configured angles), so counting it as "still running" would hold the
 /// iteration open forever and keep re-banking a finished pass's results.
 fn resumable_iter(run: &RunState, task: &str, angles: &[String]) -> Option<u64> {
-    let prefix = format!("review:{task}:");
+    let prefix = format!("{}{task}:", crate::run::REVIEWER_PREFIX);
     let newest = run
         .review_phases
         .iter()
@@ -383,7 +386,7 @@ fn iter_head_path(dir: &Path, task: &str, iter: u64) -> std::path::PathBuf {
 /// (`--fresh`, a moved HEAD, or a previous pass that ran to completion) so its
 /// markers/phase names never collide with an earlier iteration's leftovers.
 fn next_iter(run: &RunState, task: &str) -> u64 {
-    let prefix = format!("review:{task}:");
+    let prefix = format!("{}{task}:", crate::run::REVIEWER_PREFIX);
     run.review_phases
         .iter()
         .filter_map(|p| p.name.strip_prefix(&prefix))
@@ -1048,7 +1051,7 @@ pub fn code_review_run<H: Herdr>(
     let mut banked: Vec<(String, Review)> = Vec::new();
     let mut pending: Vec<(String, String)> = Vec::new();
     for angle in &cfg.angles {
-        let phase = format!("review:{task}:{iter}:{angle}");
+        let phase = crate::run::reviewer_phase_name(task, iter, angle);
         if resumed.is_some() {
             // A delivered verdict is banked on its own evidence — NOT gated on the
             // recorded status. Requiring `Done` here was half of a livelock: an angle
@@ -1074,7 +1077,7 @@ pub fn code_review_run<H: Herdr>(
             let existing = run.find_phase(&phase);
             let failed = existing.is_some_and(|p| p.status == PhaseStatus::Failed);
             let alive = existing
-                .and_then(|p| p.pane_id.as_deref())
+                .and_then(|p| p.pane_id())
                 .is_some_and(|pane| h.pane_exists(pane));
             if alive && !failed {
                 pending.push((angle.clone(), phase));
@@ -1093,7 +1096,7 @@ pub fn code_review_run<H: Herdr>(
             // pane died). Retire it so `drovr cleanup` still knows it is drovr's:
             // cleanup reaps only the panes this state file records, and treats
             // everything else in the workspace as the human's.
-            if let Some(pane) = existing.and_then(|p| p.pane_id.clone()) {
+            if let Some(pane) = existing.and_then(|p| p.pane_id().map(str::to_owned)) {
                 run.retire_pane(pane);
             }
             run.review_phases.retain(|p| p.name != phase);
@@ -1121,6 +1124,10 @@ pub fn code_review_run<H: Herdr>(
             context.as_deref(),
         );
         crate::brief::write_no_follow(&seed_path, &seed_text)?;
+        // `launch` carries its own backend, so the reviewer cannot be recorded
+        // as running an agent it was not launched with — that mismatch used to be
+        // expressible, and it silently defeated session capture for any reviewer
+        // `review_agent_for` put on a different agent than the run.
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
@@ -1138,6 +1145,19 @@ pub fn code_review_run<H: Herdr>(
         if let Err(e) = phase_send(h, run, &phase, &seed_text) {
             if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
                 run.review_phases[i].status = PhaseStatus::Failed;
+            }
+            // Give every reviewer already seeded this pass one last poll before
+            // abandoning the pass. They are live, working agents that this
+            // function is about to stop looking at: the wait loop below never
+            // runs, so without this their only capture was the readiness gate —
+            // which routinely returns before herdr publishes the session. They
+            // then exit, herdr drops it, and a later resume finds a reviewer it
+            // cannot rehydrate.
+            //
+            // Best-effort by construction: `poll_phase_pane` cannot fail, and the
+            // error being propagated is the one that matters.
+            for (_, seeded) in &pending {
+                poll_phase_pane(h, run, seeded);
             }
             return Err(e);
         }
@@ -1166,6 +1186,21 @@ pub fn code_review_run<H: Herdr>(
     loop {
         let mut still_pending: Vec<(String, String)> = Vec::new();
         for (angle, phase) in std::mem::take(&mut pending) {
+            // POLL FIRST, unconditionally — before any completion decision, and
+            // never as part of one. This loop is a REVIEWER's only long-lived poll,
+            // and `poll_phase_pane` captures the session on the way past. herdr
+            // publishes `agent_status` before `agent_session`, so `phase_send`'s
+            // readiness gate routinely returns before the session exists — this loop
+            // is where it shows up. Let any completion test run first and the capture
+            // becomes reachable only on the SLOW path: an angle that has already
+            // delivered, or that finished before this loop's first visit — entirely
+            // normal, since angles are spawned and seeded one at a time — `continue`s
+            // out with its one capture skipped, and herdr drops the session when the
+            // agent exits. A capture a fast agent can outrun is not a capture.
+            //
+            // This is a session capture, NOT a completion signal: the status it
+            // returns is consulted below for one question only (see there).
+            let status = poll_phase_pane(h, run, &phase).and_then(|info| info.agent_status);
             // DELIVERY FIRST, and on its own. A parseable findings file for this
             // iteration is complete evidence that the angle is done — it is the one
             // thing a reviewer is asked to produce, and drovr wrote it itself. Asking
@@ -1182,13 +1217,21 @@ pub fn code_review_run<H: Herdr>(
             // Nothing delivered. NOW the pane matters — but only to answer a different
             // question: has this reviewer finished WITHOUT delivering? That is the one
             // thing the artifact cannot tell us, and the only reason to consult herdr.
-            let finished = done_marker(&run.name, &phase).exists()
-                || run
-                    .find_phase(&phase)
-                    .and_then(|p| p.pane_id.as_deref())
-                    .and_then(|pane| h.pane_info(pane))
-                    .and_then(|info| info.agent_status)
-                    == Some(AgentStatus::Done);
+            //
+            // THE MARKER IS READ THROUGH ITS PASS TOKEN, not by existence. A
+            // reviewer name is reused when a resume respawns an angle in place, so
+            // `done_marker(..).exists()` answered a question about the FILE — and the
+            // file the replaced reviewer left would fail its replacement before that
+            // replacement had been asked anything. `spawn_reviewer` sweeps the marker
+            // at the respawn and this checks the token; the sweep is the first line of
+            // defence, the token is what stays true where the sweep is not reached — an
+            // angle that was NOT respawned, and a marker written by something other
+            // than this pass's agent (`drovr phase done` from a plain shell, or any
+            // agent launched by a pre-token build).
+            let marker_done = run
+                .find_phase(&phase)
+                .is_some_and(|p| marker_completes_current_pass(&run.name, p));
+            let finished = marker_done || status == Some(AgentStatus::Done);
             if !finished {
                 still_pending.push((angle, phase));
                 continue;
@@ -1244,6 +1287,46 @@ pub fn code_review_run<H: Herdr>(
         &serde_json::to_string_pretty(&merged).map_err(io::Error::other)?,
     )?;
 
+    // ⭐ REAP THE PANEL — and its position here is the whole design.
+    //
+    // AFTER every angle is harvested and the merged verdict is on disk. A
+    // reviewer's pane is not a data channel any more (findings arrive through
+    // the MCP server, not the transcript), but it is still the thing a resume
+    // waits on: every early return above — the timeout, the `harvest?` on an
+    // angle that finished without delivering, the abort when a seed cannot be
+    // delivered — leaves reviewers this pass may need again, and reaches none of
+    // this. Only a completed merge proves the panel is finished with.
+    //
+    // Every angle is `Done` by here, structurally: the loop exits only when
+    // nothing is pending, an angle that delivered is `Done`, and one that did
+    // not takes `harvest?` out of the function.
+    //
+    // Best-effort, per angle, and it never touches the verdict: this function
+    // has already produced its answer, so a pane that will not close is a
+    // warning and `drovr cleanup` reclaims it.
+    if cfg.reap_finished_panes {
+        // The panes THIS function orphaned, first. A resume that replaces an
+        // angle retires the predecessor's pane and drops its registration, so no
+        // per-phase reap can ever reach it again — `phase_reap` finds a pane
+        // through the phase that records it, and nothing records this one. It is
+        // swept before the loop below so it does not re-probe the retirements
+        // that loop is about to make.
+        reap_retired(h, run);
+        for angle in &cfg.angles {
+            let phase = crate::run::reviewer_phase_name(task, iter, angle);
+            match phase_reap(h, run, &phase) {
+                Ok(ReapOutcome::Closed { pane }) => {
+                    println!("code-review: closed reviewer pane {pane} for angle '{angle}'");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "code-review: warning: could not reap the '{angle}' reviewer ({e}); \
+                     `drovr cleanup` will reclaim its pane"
+                ),
+            }
+        }
+    }
+
     Ok(if is_clean(&merged) {
         ReviewOutcome::Clean
     } else {
@@ -1259,7 +1342,7 @@ pub fn code_review_run<H: Herdr>(
 mod tests {
     use super::*;
     use crate::findings::Verdict;
-    use crate::herdr::FakeHerdr;
+    use crate::herdr::{FakeHerdr, PaneInfo, SessionId};
     use crate::phase::done_marker;
     use crate::run::{Phase, PhaseStatus};
     use crate::test_util::ENV_LOCK;
@@ -1357,21 +1440,40 @@ mod tests {
         .unwrap();
     }
 
-    /// Pre-drop the done markers for iter=1's four default angles (the panel spawns
-    /// them, then the very first wait poll sees the markers and completes).
-    fn drop_markers(run: &RunState, task: &str, iter: u64) {
-        for a in ["correctness", "security", "error-handling", "type-design"] {
-            drop_marker(run, task, iter, a);
-        }
-    }
-
-    /// Drop the done marker for ONE angle — models a reviewer that finished while
-    /// its panel-mates are still working (the resume path's whole reason to exist).
-    fn drop_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
-        let name = format!("review:{task}:{iter}:{angle}");
+    /// Drop the done marker a reviewer's OWN agent would write: `<phase>.done`
+    /// carrying that reviewer's current pass token.
+    ///
+    /// Only possible once the reviewer has been SPAWNED, because the token is
+    /// minted at launch — which is why every test modelling "this reviewer
+    /// finished without delivering" now runs the panel once to spawn it and drops
+    /// the marker between passes. They used to pre-drop an untokenized marker
+    /// before the first pass; that marker is precisely what `spawn_reviewer`'s
+    /// sweep and the wait loop's token check exist to reject, so pre-dropping one
+    /// no longer models a finished reviewer (see
+    /// `a_marker_that_carries_no_pass_token_does_not_finish_a_reviewer`).
+    ///
+    /// Every other test that used to pre-drop markers also seeds a findings file,
+    /// and delivery is the only thing that completes an angle — so those calls
+    /// were decorative and are gone rather than converted.
+    fn drop_pass_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
+        let name = crate::run::reviewer_phase_name(task, iter, angle);
+        let token = run
+            .find_phase(&name)
+            .unwrap_or_else(|| panic!("reviewer '{name}' must be spawned before its marker"))
+            .pass
+            .as_ref()
+            .unwrap_or_else(|| panic!("a spawned reviewer '{name}' holds a pass token"))
+            .to_string();
         let m = done_marker(&run.name, &name);
         std::fs::create_dir_all(m.parent().unwrap()).unwrap();
-        std::fs::write(&m, b"").unwrap();
+        std::fs::write(&m, token.as_bytes()).unwrap();
+    }
+
+    /// [`drop_pass_marker`] for every configured angle of `iter`.
+    fn drop_pass_markers(run: &RunState, task: &str, iter: u64) {
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            drop_pass_marker(run, task, iter, a);
+        }
     }
 
     /// Advance HEAD in the run's project dir, so a resume must notice the diff it
@@ -1398,7 +1500,7 @@ mod tests {
 
     fn pane_of(run: &RunState, phase: &str) -> String {
         run.find_phase(phase)
-            .and_then(|p| p.pane_id.clone())
+            .and_then(|p| p.pane_id().map(str::to_owned))
             .unwrap_or_else(|| panic!("phase {phase} has no pane"))
     }
 
@@ -1605,7 +1707,6 @@ mod tests {
         // One commit is the entire difference between the refused case above and this
         // one; nothing else about the fixture changes.
         commit_more(&run);
-        drop_markers(&run, "task-1", 1);
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
@@ -1746,7 +1847,7 @@ mod tests {
         let panes: Vec<String> = run
             .review_phases
             .iter()
-            .map(|p| p.pane_id.clone().unwrap())
+            .map(|p| p.pane_id().map(str::to_owned).unwrap())
             .collect();
 
         // A plain re-run must RESUME iter 1 — not open a second panel on the same diff.
@@ -1777,7 +1878,7 @@ mod tests {
         let panes_after: Vec<String> = run
             .review_phases
             .iter()
-            .map(|p| p.pane_id.clone().unwrap())
+            .map(|p| p.pane_id().map(str::to_owned).unwrap())
             .collect();
         assert_eq!(panes, panes_after, "resume re-attaches to the same panes");
     }
@@ -1795,8 +1896,6 @@ mod tests {
         );
 
         // Two of the four reviewers have since finished.
-        drop_marker(&run, "task-1", 1, "correctness");
-        drop_marker(&run, "task-1", 1, "security");
         seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
         seed_angle_file(
             &run,
@@ -1860,8 +1959,6 @@ mod tests {
         );
 
         // First resume banks two angles, then times out on the other two.
-        drop_marker(&run, "task-1", 1, "correctness");
-        drop_marker(&run, "task-1", 1, "security");
         seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
         seed_angle_file(&run, "task-1", 1, "security", CLEAN);
         assert_eq!(
@@ -1871,8 +1968,6 @@ mod tests {
 
         // Second resume: the stragglers land. The merge must cover ALL FOUR angles,
         // including the two harvested during the earlier resume.
-        drop_marker(&run, "task-1", 1, "error-handling");
-        drop_marker(&run, "task-1", 1, "type-design");
         seed_angle_file(
             &run,
             "task-1",
@@ -1979,7 +2074,7 @@ mod tests {
         );
 
         // correctness finishes, but writes a file that is not a Review.
-        drop_marker(&run, "task-1", 1, "correctness");
+        drop_pass_marker(&run, "task-1", 1, "correctness");
         seed_angle_file(&run, "task-1", 1, "correctness", r#"{"not":"a review"}"#);
 
         let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
@@ -1992,6 +2087,49 @@ mod tests {
             PhaseStatus::Failed,
             "an angle whose output cannot be parsed must be Failed, so the next \
              resume respawns it rather than re-reading the same unusable file"
+        );
+    }
+
+    /// The token half of the marker fix, pinned where the sweep cannot mask it: an
+    /// angle that is NOT respawned (its pane is alive, so `spawn_reviewer` never
+    /// runs again and never sweeps) with a marker carrying no pass token at all.
+    ///
+    /// That marker is not hypothetical — it is what `drovr phase done` writes when
+    /// run from a plain shell instead of from inside the reviewer's own pane, and
+    /// what every agent launched by a pre-token build writes. It is evidence about
+    /// no pass in particular, so it must not answer "this reviewer finished without
+    /// delivering": doing so fails a live reviewer mid-review, and the next resume
+    /// then replaces it.
+    #[test]
+    fn a_marker_that_carries_no_pass_token_does_not_finish_a_reviewer() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-untokened-marker");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Three angles deliver; correctness gets an UNTOKENIZED marker and no
+        // findings. Its reviewer is alive, so the resume waits on it rather than
+        // respawning it — the sweep is out of the picture, and the token is all that
+        // stands between a live reviewer and a `Failed` verdict.
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
+        }
+        let name = crate::run::reviewer_phase_name("task-1", 1, "correctness");
+        std::fs::write(done_marker(&run.name, &name), b"").unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout,
+            "a marker that names no pass must leave the angle waiting, not finish it"
+        );
+        assert_eq!(
+            run.find_phase(&name).unwrap().status,
+            PhaseStatus::Running,
+            "and the live reviewer must not be marked Failed"
         );
     }
 
@@ -2042,6 +2180,73 @@ mod tests {
         );
     }
 
+    /// ⭐ THE LEAK, end to end. A replaced reviewer's pane is retired and its
+    /// registration dropped, so `phase_reap` can never reach it again — it looks
+    /// a pane up through the phase that records it, and nothing records this
+    /// one. Before the sweep it survived every trigger and waited for
+    /// `drovr cleanup`, which is exactly the accumulation reaping exists to
+    /// stop.
+    #[test]
+    fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-sweep-orphan");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Wedge one angle so the next resume replaces it in place: same task,
+        // same iteration, new pane. Its predecessor is the orphan.
+        let wedged = pane_of(&run, "review:task-1:1:security");
+        let i = run
+            .review_phases
+            .iter()
+            .position(|p| p.name == "review:task-1:1:security")
+            .unwrap();
+        run.review_phases[i].status = PhaseStatus::Failed;
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.retired_panes.contains(&wedged),
+            "precondition: the respawn orphaned it — retired, and recorded under \
+             no phase at all: {:?}",
+            run.retired_panes
+        );
+
+        // Now let the pass finish. Nothing else will ever look at `wedged`.
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        assert!(
+            closed_panes(&h).contains(&wedged),
+            "the orphaned pane must be closed, not left for `drovr cleanup`: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("cr-sweep-orphan").unwrap();
+        assert!(
+            !on_disk.retired_panes.contains(&wedged),
+            "and forgotten, so no claim outlives the pane: {:?}",
+            on_disk.retired_panes
+        );
+        // The panel's own reap is unaffected: every reviewer of the finished
+        // pass is still closed and still retired.
+        assert_eq!(
+            on_disk.retired_panes.len(),
+            4,
+            "one retirement per reviewer reaped by the panel: {:?}",
+            on_disk.retired_panes
+        );
+    }
+
     /// A leftover `Running` reviewer for an angle no longer in config must not make
     /// a finished iteration look resumable forever.
     #[test]
@@ -2053,7 +2258,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2061,12 +2265,14 @@ mod tests {
 
         // An angle that was dropped from config mid-run, still Running from an
         // earlier pass. The configured angles are all Done, so this pass is over.
-        run.review_phases.push(Phase {
-            name: "review:task-1:1:performance".into(),
-            status: PhaseStatus::Running,
-            pane_id: Some("pane-stale".into()),
-            ..Default::default()
-        });
+        run.review_phases.push(
+            {
+                let mut p = Phase::new("review:task-1:1:performance");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("pane-stale"),
+        );
 
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2224,7 +2430,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2257,8 +2462,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        // Simulate every reviewer having dropped its marker.
-        drop_markers(&run, "task-1", 1);
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
@@ -2286,7 +2489,134 @@ mod tests {
             run.review_phases
                 .iter()
                 .all(|p| p.status == PhaseStatus::Done),
-            "every reviewer whose marker landed must be marked Done"
+            "every reviewer that delivered must be marked Done"
+        );
+    }
+
+    fn closed_panes(h: &FakeHerdr) -> Vec<String> {
+        h.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("pane_close pane=").map(str::to_owned))
+            .collect()
+    }
+
+    /// A panel that reached a verdict is finished with its reviewers, and their
+    /// panes are the largest thing a run accumulates — four per iteration, and a
+    /// task can take several iterations.
+    #[test]
+    fn a_finished_panel_reaps_its_reviewers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-panel");
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        // Panes recorded before the pass, so the assertion below names the ones
+        // that actually existed rather than whatever is left afterwards.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        assert_eq!(
+            closed_panes(&h).len(),
+            4,
+            "one close per reviewer: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("cr-reap-panel").unwrap();
+        for p in &on_disk.review_phases {
+            assert!(p.is_reaped(), "{} must be reaped", p.name);
+            assert_eq!(p.pane_id(), None, "{}", p.name);
+            assert_eq!(
+                p.status,
+                PhaseStatus::Done,
+                "reaping says something about the pane, not about the verdict"
+            );
+        }
+        assert_eq!(
+            on_disk.retired_panes.len(),
+            4,
+            "every closed pane stays provably drovr's for `drovr cleanup`: {:?}",
+            on_disk.retired_panes
+        );
+        // The verdict itself is untouched — the merge ran before any of this.
+        let merged = parse_review(
+            &std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged.verdict, Verdict::Clean);
+    }
+
+    /// ⭐ Reaping is strictly AFTER the findings are in and merged. Every early
+    /// return — the timeout here, and the `harvest?` below — leaves reviewers a
+    /// resume may need to wait on again, and must reach no close at all.
+    ///
+    /// This is the load-bearing half of "reviewers are reaped after
+    /// `obtain_findings_json`": a reviewer whose pane is closed while it is
+    /// still working cannot deliver, and a resume would then respawn it — paying
+    /// for the whole review twice, having thrown away the one in progress.
+    #[test]
+    fn a_panel_that_does_not_reach_a_verdict_reaps_nothing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-timeout");
+        write_base(&run, "task-1");
+
+        // (a) timeout: nobody delivered, so every reviewer is still working.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            closed_panes(&h).is_empty(),
+            "a pending reviewer's pane must survive the pass that gave up on it: {:?}",
+            h.calls()
+        );
+        for p in &run.review_phases {
+            assert!(p.pane_id().is_some(), "{} must keep its pane", p.name);
+        }
+
+        // (b) an angle that finished having delivered nothing aborts the pass
+        // before the merge — and so before any reap.
+        drop_pass_marker(&run, "task-1", 1, "correctness");
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
+        }
+        code_review_run(&h, &mut run, "task-1", 40, false, None)
+            .expect_err("precondition: an angle delivered nothing usable");
+        assert!(
+            closed_panes(&h).is_empty(),
+            "a pass that never reached a verdict must close nothing: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The opt-out reaches the panel too.
+    #[test]
+    fn a_panel_keeps_its_panes_when_reaping_is_turned_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-off");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "reap_finished_panes = false\n").unwrap();
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+        assert!(closed_panes(&h).is_empty(), "{:?}", h.calls());
+        assert!(
+            run.review_phases.iter().all(|p| p.pane_id().is_some()),
+            "every reviewer keeps its pane until `drovr cleanup`"
         );
     }
 
@@ -2348,7 +2678,6 @@ mod tests {
         for a in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Findings);
@@ -2537,15 +2866,20 @@ mod tests {
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
         );
 
-        // Iteration 2 opens fresh (iteration 1 ran to completion). Its reviewers all
-        // finish, but not one of them calls `submit_findings`.
-        drop_markers(&run, "task-1", 2);
+        // Iteration 2 opens fresh (iteration 1 ran to completion) and times out with
+        // its reviewers live — which is what mints the pass tokens their markers have
+        // to carry.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        // They all finish, and not one of them calls `submit_findings`.
+        drop_pass_markers(&run, "task-1", 2);
         let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a pass where nobody submitted must fail, not inherit iter 1");
         assert!(
@@ -2572,14 +2906,19 @@ mod tests {
             ReviewOutcome::Timeout
         );
 
-        // The human forces a fresh panel. Iteration 2's reviewers finish having
-        // submitted nothing, while iteration 1's stragglers submit late.
-        drop_markers(&run, "task-1", 2);
+        // The human forces a fresh panel, which spawns iteration 2 and times out.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, true, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        // Iteration 2's reviewers finish having submitted nothing, while iteration
+        // 1's stragglers submit late.
+        drop_pass_markers(&run, "task-1", 2);
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
 
-        let err = code_review_run(&h, &mut run, "task-1", 5_000, true, None)
+        let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a late straggler's verdict must not complete a newer panel");
         assert!(
             err.to_string().contains("never called submit_findings"),
@@ -2603,7 +2942,6 @@ mod tests {
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Findings
@@ -2614,7 +2952,6 @@ mod tests {
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 2, &a, CLEAN);
         }
-        drop_markers(&run, "task-1", 2);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2638,6 +2975,238 @@ mod tests {
         assert_eq!(outcome, ReviewOutcome::Error);
         // Nothing spawned.
         assert!(run.review_phases.is_empty());
+    }
+
+    #[test]
+    fn an_aborted_pass_still_captures_the_reviewers_it_already_seeded() {
+        // The third instance of the same class, found by auditing "what else can
+        // skip this capture?" rather than by a bug report.
+        //
+        // Angles are spawned and seeded one at a time. If angle N's `phase_send`
+        // fails, the pass aborts — and the wait loop below, which is where a
+        // reviewer's session is normally captured, never runs at all. Reviewers
+        // 1..N-1 are live, working agents nobody will look at again this
+        // invocation; their only poll was the readiness gate, which routinely
+        // returns before herdr publishes the session. They exit, herdr drops it,
+        // and a later resume finds a reviewer it cannot rehydrate.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-aborted-pass");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\", \"security\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Angle 1's readiness gate: started, but no session published yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Angle 2's readiness gate — its send then fails, aborting the pass.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-2"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // The drain poll of angle 1, on the way out. Its session is up by now,
+        // and this is the last look anything will take at it.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+        // Angle 1 seeds fine; angle 2 fails, which aborts the pass.
+        h.fail_agent_send_after(1);
+
+        assert!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).is_err(),
+            "a failed seed aborts the pass"
+        );
+
+        let seeded = run
+            .review_phases
+            .iter()
+            .find(|p| p.name == "review:task-1:1:correctness")
+            .expect("angle 1 was registered");
+        assert_eq!(
+            seeded
+                .pane_agent()
+                .and_then(|a| a.session())
+                .map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a reviewer already seeded when the pass aborted must still be polled — \
+             nothing else will ever look at it"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_finished_before_the_first_visit_is_still_captured() {
+        // Round 2 of the same defect: the capture existed but a FAST reviewer
+        // outran it.
+        //
+        // Angles are spawned and seeded one at a time, so a reviewer can run and
+        // deliver its findings while later angles are still being launched. The
+        // wait loop's first visit to it then finds the angle already complete and
+        // `continue`s, skipping the only poll that reviewer would ever get. Its
+        // session was never recorded, and herdr drops it the moment the reviewer
+        // exits.
+        //
+        // The fix is ordering: poll, THEN decide. That survived main's switch to
+        // a findings-file completion signal — the short-circuit moved from
+        // `done_marker(..).exists() || <poll>` to `delivered_review(..)`, and the
+        // capture has to sit above BOTH. This test pins that ordering by arranging
+        // the exact losing sequence — the angle already delivered and its marker
+        // already on disk at the first visit, session published only on that
+        // visit's poll.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-fast-reviewer");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Poll 1 — `phase_send`'s readiness gate. Started, no session yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Poll 2 — the wait loop's FIRST visit, which happens with the marker
+        // already on disk (dropped below). This is the only remaining chance.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+
+        // The reviewer finishes before the loop ever looks at it: its verdict is
+        // already delivered and its marker already on disk when `code_review_run`
+        // starts waiting.
+        seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 5000, false, None).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Clean, "the reviewer completed");
+
+        let on_disk = RunState::load("cr-fast-reviewer").unwrap();
+        assert_eq!(
+            on_disk.review_phases[0]
+                .pane_agent()
+                .and_then(|a| a.session())
+                .map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a reviewer that finished before the first visit must still have been \
+             polled — the marker must not be allowed to skip the capture"
+        );
+    }
+
+    #[test]
+    fn a_reviewers_session_is_captured_when_it_appears_after_the_agent_starts() {
+        // THE failure this task exists to prevent, at the one pane where it is
+        // unrecoverable.
+        //
+        // `phase_send`'s readiness gate returns on the FIRST poll reporting a
+        // started agent — and herdr routinely publishes `agent_status` before it
+        // publishes `agent_session`, so that poll can carry no session at all.
+        // A pipeline phase survives that: `phase_wait` polls again every 500ms
+        // for the life of the phase. A reviewer has no such second chance unless
+        // ITS wait loop captures too — and reviewers are told to exit, at which
+        // point herdr drops the session for good, and reaping closes the pane.
+        //
+        // So: first poll started-but-session-less, later polls carrying one.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-late-session");
+        // One angle, so the poll queue below maps to one reviewer deterministically.
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(
+            &cfg,
+            "review_agent = \"claude\"\nangles = [\"correctness\"]\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Poll 1 — the readiness gate. Started, so the gate returns at once, but
+        // herdr has not published a session yet.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: None,
+        }));
+        // Poll 2+ — the reviewer wait loop. NOW the session is there. Status stays
+        // Idle so the reviewer never "finishes" and the pass times out.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("pane-1"),
+            agent_status: Some(AgentStatus::Idle),
+            agent_session: Some(FakeHerdr::session_for("pane-1")),
+        }));
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Timeout);
+        assert_eq!(run.review_phases.len(), 1);
+
+        let agent = run.review_phases[0]
+            .pane_agent()
+            .expect("the reviewer records its launch");
+        assert_eq!(
+            agent.session().map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str()),
+            "a session that appears after the agent reports started must still be \
+             captured — the reviewer wait loop is the only place left to see it"
+        );
+        // And on disk, which is the only place task 5 can read it from.
+        let on_disk = RunState::load("cr-late-session").unwrap();
+        assert!(
+            on_disk.review_phases[0]
+                .pane_agent()
+                .and_then(|a| a.session())
+                .is_some(),
+            "the capture must be persisted, not just held in memory"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_records_its_own_backend_not_the_runs() {
+        // A reviewer's backend is `review_agent_for`'s answer, NOT `run.agent`:
+        // config can pin it, and cursor can be auto-selected. Session capture
+        // checks a pane's session against the backend recorded on the phase, and
+        // herdr attributes a session to whichever agent actually created it — so
+        // handing `spawn_reviewer` the run's backend here would make capture ask
+        // the wrong question and silently never record a cross-backend
+        // reviewer's session. That is unrecoverable: herdr drops the session when
+        // the reviewer exits, and reviewers are told to exit.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-backend");
+        // Pin reviews to cursor while the RUN stays on claude — the divergence
+        // this test exists for. `make_run` wrote `review_agent = "claude"`.
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::write(&cfg, "review_agent = \"cursor\"\n").unwrap();
+        assert_eq!(run.agent.as_deref(), Some("claude"), "the run is claude");
+        write_base(&run, "task-1");
+
+        let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
+        assert_eq!(outcome, ReviewOutcome::Timeout);
+        assert!(!run.review_phases.is_empty());
+        for p in &run.review_phases {
+            assert_eq!(
+                p.pane_agent().map(|a| a.backend()),
+                Some("cursor"),
+                "reviewer '{}' must record the backend it was launched with",
+                p.name
+            );
+        }
     }
 
     #[test]
@@ -2687,7 +3256,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
 
         code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
 
@@ -3081,8 +3649,13 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-file-only");
         write_base(&run, "task-1");
+        // Spawn the panel — and mint the pass tokens its markers must carry.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
         // Every reviewer finishes (markers land) but none ever called the tool.
-        drop_markers(&run, "task-1", 1);
+        drop_pass_markers(&run, "task-1", 1);
 
         let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a missing findings file must be an error, not a scrape");
@@ -3127,21 +3700,30 @@ mod tests {
         // crediting the replacement with a file it never wrote.
         let leftover = findings_path(&run_dir(&run.name), "task-1", 1, "correctness");
         std::fs::write(&leftover, r#"{"verdict":"changes","findings":[{"fi"#).unwrap();
-        drop_markers(&run, "task-1", 1);
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
 
-        // correctness is respawned, so its leftover is cleared and the replacement
-        // has written nothing — the pass must fail rather than reuse it.
-        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
-            .expect_err("a respawned angle with no file of its own must not succeed");
-        assert!(err.to_string().contains("correctness"), "{err}");
+        // The resume respawns correctness (its pane is gone), clearing the file the
+        // dead reviewer left; the other three bank. The replacement has not finished
+        // yet, so this pass times out.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
         assert_ne!(
             pane_of(&run, "review:task-1:1:correctness"),
             dead,
             "the angle should have been respawned into a new pane"
         );
+
+        // Now the REPLACEMENT finishes — under its own pass token, the only marker
+        // its wait loop accepts — having written nothing of its own. The pass must
+        // fail rather than reuse what the dead reviewer left.
+        drop_pass_marker(&run, "task-1", 1, "correctness");
+        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
+            .expect_err("a respawned angle with no file of its own must not succeed");
+        assert!(err.to_string().contains("correctness"), "{err}");
         assert!(
             !leftover.exists(),
             "the respawn must clear the outgoing reviewer's file, or the replacement \
@@ -3220,10 +3802,10 @@ mod tests {
         assert_eq!(next_iter(&base, "task-1"), 1);
 
         let mut run = base.clone();
-        let mk = |name: &str| Phase {
-            name: name.into(),
-            status: PhaseStatus::Running,
-            ..Default::default()
+        let mk = |name: &str| {
+            let mut p = Phase::new(name);
+            p.status = PhaseStatus::Running;
+            p
         };
         run.review_phases = vec![
             mk("review:task-1:1:correctness"),
@@ -3253,10 +3835,10 @@ mod tests {
             archived: false,
             retired_panes: vec![],
         };
-        let mk = |name: &str, status: PhaseStatus| Phase {
-            name: name.into(),
-            status,
-            ..Default::default()
+        let mk = |name: &str, status: PhaseStatus| {
+            let mut p = Phase::new(name);
+            p.status = status;
+            p
         };
 
         let angles: Vec<String> = ["correctness", "security"]

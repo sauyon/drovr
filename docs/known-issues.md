@@ -62,7 +62,7 @@ stale status), and the live agent's next `drovr phase done` completes it normall
 To accept the old completion as-is, re-signal it deliberately from the run dir:
 
 ```
-: > "$(drovr path <run>)/<phase>.done"      # or: touch <run_dir>/<phase>.done
+touch ~/.local/share/drovr/runs/<run>/<phase>.done
 ```
 
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
@@ -962,7 +962,50 @@ So the cause is genuinely unknown, and guessing again would only produce another
 
 **What was done instead:** the test now reports, on every failure path, the lock path, the file's
 contents, and this process's pid — and which step failed (claim / pid record / re-claim after
-drop). Neither sighting left enough evidence to diagnose; the third will.
+drop).
+
+**The third sighting delivered that evidence (2026-08-02, run `phase-reap`, task 5's fixes).**
+The message was:
+
+```
+after drop: …/server.pid contains "1123224"; this pid is 1123224
+```
+
+Two things follow, and both narrow it:
+
+- **The pid file held OUR OWN pid.** So the step that failed is the re-claim after `drop(held)` —
+  `try_take_lock` returned `WouldBlock` on a path nothing but this test has ever named, against a
+  lock this very process had just released. It is not another writer and not a stale file from an
+  earlier run; there is no second claimant to find.
+- **The rate was measured at this branch's test count: 1 failure in 8 full `--bin drovr` runs.**
+  It fired twice in three consecutive runs at one point, which read as a regression and was not —
+  8 runs put it back on the documented 5–8%. Before calling a red suite a regression, measure;
+  three runs is not a sample.
+
+**A fourth sighting, 2026-08-04, reproduced the signature exactly** (run `phase-reap`, task 7's
+review round, on a docs-only tree):
+
+```
+a lock released by dropping its File was still held.
+after drop: /tmp/drovr-review-test-lock-claimbpQZgS/server.pid contains "2430561";
+this pid is 2430561
+```
+
+Same step (re-claim after `drop`), same own-pid evidence, on a tree whose only changes were
+markdown. That rules out this branch's code as a contributor and makes the signature stable
+rather than a one-off reading. It passed on the immediate re-run and on a second full suite.
+
+**The rate may be machine- or load-dependent, and the documented 5–8% may be low.** Across task
+7's review rounds it fired **3 times in ~8 full-suite runs** on one machine — the same binary,
+the same test count, only markdown changing between runs. That is too small a sample to restate
+the rate from, and it does not contradict the earlier 1-in-8 and 2-in-30 measurements so much as
+suggest they are not a single number. If you are measuring, record the machine and whether
+anything else was loading it.
+
+This is consistent with the `O_CLOEXEC` / fork-window hypothesis in the entry below (a concurrent
+`Command::spawn` elsewhere in the suite briefly duplicates the fd between fork and exec, and an
+inherited open file description holds the flock). It does not confirm it — confirming means
+correlating red runs with a spawn, which still has not been done.
 
 **If you hit it:** paste that message here rather than re-investigating from scratch.
 
@@ -1645,35 +1688,63 @@ CI workflow at all, so nothing enforces it today.)
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
 
-### A second, distinct flake: `lock_records_our_pid_and_releases_on_drop` (2026-07-26)
+## `lock_records_our_pid_and_releases_on_drop` flakes at ~5–8%, independent of test threads
 
-`review::tests::lock_records_our_pid_and_releases_on_drop` (`cli/src/review.rs:2311`) fails
-intermittently at `cli/src/review.rs:2326` with `released lock must be free` — `try_take_lock`
-returns `Ok(None)` (WouldBlock) for a lock the test just dropped.
+**Severity:** low as a bug, higher as a process hazard — it fails the nix build, so it can
+break `home-manager switch` for an unrelated change, and a *green* nix build is therefore not
+evidence the test is sound.
+**Found:** 2026-07-26, twice and independently: during task 3 of run `phase-reap`, and on
+`52db1cd`.
 
-**It is NOT the env-pollution cause above**, despite also being parallelism-only. The test
-locks `tmp.path().join("server.pid")` under a `tempfile` root and never reads `XDG_DATA_HOME`,
-so no other test can name that path — its own doc comment (`cli/src/review.rs:2306-2309`)
-already claims immunity to the env flake, and that claim holds. Something else releases late.
+### Symptom
 
-Measured 2026-07-26 on `52db1cd`:
+```
+---- review::tests::lock_records_our_pid_and_releases_on_drop stdout ----
+panicked at src/review.rs:2326:14: released lock must be free
+```
+
+The test (`cli/src/review.rs:2311`) claims the server lock on `tmp.path().join("server.pid")`
+in its own fresh `tempfile::tempdir()`, drops the `File`, and re-claims it. Intermittently the
+second `try_take_lock` comes back `Ok(None)` (`TryLockError::WouldBlock`) for a lock it just
+released.
+
+### Measured
 
 | how it was run | result |
 |---|---|
+| `cargo test lock_records_our_pid` alone | 100% green |
 | the `lock_*` tests alone, 25 consecutive runs | 25/25 green |
-| the whole `--bin drovr` suite, 12 consecutive runs | **1/12 red** |
+| the whole `--bin drovr` suite, 12 consecutive runs (`52db1cd`) | **1/12 red** |
+| `cargo test --bin drovr`, 30 consecutive runs (`8173f03` / `310fa7f`) | **2/30 red** |
+| the same tree with task 3's changes applied, 45 runs | ~3/45 red |
 | nix sandbox build of `52db1cd` (`home-manager switch`) | red once, green on immediate retry |
 
-**Hypothesis, not yet confirmed:** an fd inheritance window. `flock(2)` locks belong to the
-open file description, which survives `fork`, so a concurrently-spawning test (several here
-start real servers) transiently holds an inherited copy of this fd between its `fork` and its
-`exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops it at `exec` — which is
-exactly why the window is narrow and the failure rare. Confirming it means tracing whether the
-red runs coincide with a process spawn; that has not been done.
+The rate is the same with and without task 3's changes, so it is **not** caused by anything
+task 3 did. It passes 100% when run alone, so it is a whole-suite interaction, not a bug in
+`try_take_lock`'s logic.
 
-**Cost:** it fails the nix build, so it can break `home-manager switch` for an unrelated
-change. A retry is the workaround — the failure does not reproduce twice in a row. Note this
-means a *green* nix build is not evidence the test is sound.
+### It is NOT the env-pollution flake above
+
+That one is `XDG_DATA_HOME` pollution across parallel tests. This test touches no
+process-global env and locks a path under a `tempfile` root that no other test can name — its
+own doc comment (`cli/src/review.rs:2306-2309`) already claims immunity to the env flake, and
+that claim holds. Both are parallelism-only; they are different causes. Something else
+releases late.
+
+### Hypothesis, not yet confirmed
+
+An fd inheritance window. The lock is `std::fs::File::try_lock`, whose Unix release is per
+open-file-description, and an open file description survives `fork` — so a concurrently
+spawning test (several here start real servers) transiently holds an inherited copy of this fd
+between its `fork` and its `exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops
+it at `exec`, which is exactly why the window is narrow and the failure rare. Confirming it
+means tracing whether the red runs coincide with a process spawn; that has not been done.
+
+### Workaround
+
+Re-run — the failure does not reproduce twice in a row. Before believing a red `cargo test`,
+check whether the ONLY failure is this test. That habit is also how real regressions hide,
+which is why this is written down rather than tolerated.
 
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
@@ -1835,12 +1906,12 @@ main checkout for the rest of the run.
    path is already in hand.
 2. Add a `drovr path <run>` helper that emits the worktree path alone, so the instruction is
    copy-pasteable and scriptable rather than something the driver reconstructs from a sentence.
-   **The demand for this is already on the page, and so is the bug:** the pre-token `phase wait`
-   entry above offers `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in `5beb62f`),
-   but there is no `path` subcommand — `drovr path` exits with "unrecognized subcommand", and
-   `cli/src/main.rs`'s `Commands` enum has no `Path` variant — so that command does not run today.
-   Either add the helper or rewrite that line against `<run_dir>`. **Task 7's docs pass owns it**;
-   left unedited here because this change is scoped to the worktree gap.
+   **The demand for this was already on the page, and so was the bug:** the pre-token `phase wait`
+   entry above offered `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in
+   `5beb62f`), but there is no `path` subcommand — `drovr path` exits with "unrecognized
+   subcommand", and `cli/src/main.rs`'s `Commands` enum has no `Path` variant. **That line is now
+   written against the run dir directly**, so nothing on this page prescribes a command that does
+   not exist. The helper itself is still unbuilt, and still worth building.
 
 Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
 making the documented step harder to miss, not a substitute for it.
@@ -2851,3 +2922,204 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
   imply a guarantee the rest of the file does not make. If you suspect it: the orphan is
   labelled `drovr:<run>` like its twin, so look for two workspaces with the same label in
   herdr's switcher and close the one whose id is not in `state.json`.
+
+## A ONE-angle panel can reuse a review iteration, and inherit the dead reviewer's verdict
+
+**Severity:** low — unreachable with the default four angles, and it needs a failing
+`clear_findings_file` on top of that. Written down because it is a *decision* (not to widen the
+fix), not an oversight.
+**Found:** 2026-08-03, by analysis during task 6 of run `phase-reap`, while checking a claimed
+"`review_phases` is append-only" invariant. **The invariant is false**, which is the more useful
+half of the finding.
+
+### The claim that turned out to be wrong
+
+`next_iter` (`cli/src/code_review.rs`) is `max(existing iteration)+1` over `run.review_phases`,
+and it was believed safe because that list only grows. It does not: `code_review_run`'s resume
+path does `run.review_phases.retain(|p| p.name != phase)` before respawning an angle in place.
+
+What actually protects the counter is two other things.
+
+1. **Arity.** The retain removes ONE angle's entry immediately before its respawn. With ≥2
+   configured angles (the default is 4), the other entries of that iteration keep `max` where it
+   is even if the spawn then fails and `?` propagates.
+2. **Ordering.** `clear_findings_file` runs *before* `spawn_reviewer`, so on the one path that
+   prunes, that angle's findings file is already gone. Even where an iteration number were
+   reused, there would be no stale verdict left to harvest.
+
+### The residual hole
+
+With **exactly one** configured angle, a resume whose `clear_findings_file` **fails**:
+
+- `?` propagates with the entry already removed from `review_phases`;
+- the removal is persisted anyway — `main.rs`'s `merge_panel_progress` runs on every path
+  including the `Err` early-exit, and it *assigns* `review_phases` rather than merging it;
+- the old `<task>-review-<iter>-<angle>.json` is still on disk, because clearing it is what
+  failed.
+
+`next_iter` then returns that same iteration, and the replacement panel can be credited with the
+dead reviewer's verdict.
+
+### Working around it
+
+Configure more than one angle. `angles` defaults to four; a single-angle config is the only way
+in, and there is no reason to run a one-angle panel except to save tokens on a trivial change.
+
+### Why it was not fixed
+
+Both candidate fixes make the code worse than the hole. Retaining the entry until the respawn
+succeeds means a live pane no phase records if the respawn fails — the immortal-pane bug this
+branch spent three tasks closing. Deriving the iteration from something other than
+`review_phases` means a second source of truth for the counter. A test would either re-test
+`next_iter` (the multi-angle case) or enshrine the subtlety (the single-angle one). If it is ever
+worth closing, the shape to look at is making the counter monotonic on disk rather than derived.
+
+## herdr's "polling is degraded" diagnostic fires on a reap's EXPECTED path
+
+**Severity:** low (cosmetic, but it reads as a fault during a supported repair).
+**Found:** 2026-08-03, task 6 of run `phase-reap`.
+
+### Symptom
+
+Reaping a phase whose pane herdr has already lost — `drovr phase reap <run> <phase>`, or the
+retired-pane sweep re-probing a pane a previous sweep closed — prints:
+
+```
+drovr: herdr's pane.get failed for pane <id>: <err>. Agent status polling is degraded —
+phase sends and waits will run to their timeouts with no other explanation. (A pane that has
+been closed reports this too.)
+```
+
+Nothing is wrong. That is the `Gone` path, and `Gone` is exactly what authorises the reap to
+clear the registration. The command then succeeds.
+
+### Why
+
+`Herdr::pane_info` (`cli/src/herdr.rs`) reports a failed `pane.get` once per pane per process,
+because for its original caller — `phase_send`'s readiness gate and `phase_wait` — a silent
+`None` means an unexplained timeout on a healthy agent. Reaping asks the same question for the
+opposite reason: it *wants* to hear that the pane is gone. The diagnostic cannot tell the two
+callers apart, so it warns for both. The parenthetical was added for exactly this, and is not
+enough — the sentence before it still says "degraded".
+
+### What NOT to do
+
+Do not loosen the gate. It exists for a real failure (herdr unreachable, or a response shape
+drovr cannot read) that is otherwise invisible, and the reap path is the one place where its
+false positive is harmless. If it is worth fixing, the fix is a caller-supplied expectation —
+`pane_info` told that "gone" is an acceptable answer here — not a quieter diagnostic.
+
+## `cargo clippy -D warnings` is not a gate, and counting its findings is not straightforward
+
+**Severity:** medium as a process hazard — the task briefs on run `phase-reap` named
+`cargo clippy --all-targets -- -D warnings` as a per-task gate, and it has never passed on
+`main`, so every task either ignored the gate or would have had to fix unrelated code to meet it.
+**Found:** 2026-07-26 (task 1 of run `phase-reap`); decided 2026-08-04 (task 7).
+
+### The decision
+
+**The gate is PARITY, not zero: a branch must introduce no new finding.** Fixing the baseline is
+a separate, deliberate change and is not any task's to absorb — the same reasoning as the
+`cargo fmt` entry above, whose formatting-only commit conflicts with every branch in flight.
+`cargo fmt` is not run at all on this repo; clippy is run, and compared.
+
+Compare the **sets**, not the counts. Line numbers move as code does, so a finding is
+pre-existing if the same lint already fired in the same file at base. Measured for run
+`phase-reap`: base (`377dff0`) has **10**, the branch head has **8** — two fewer, because code
+carrying a `collapsible_if` and a dead-code warning was rewritten. Nothing new was added.
+
+### Measuring is subtler than it looks
+
+Two traps, and the naive count hits both.
+
+1. **Cargo does not re-emit warnings for targets it did not recompile.** A warm run silently
+   under-reports: on this branch, touching only `src/main.rs` reported **4** findings where a
+   cold run reports **8**. A number that changes with the cache is not a number.
+2. **One source-level warning is reported once per compilation target.** `cli/src/*.rs` compiles
+   as both `bin "drovr"` and `bin "drovr" test`, which is what the
+   `warning: drovr (bin "drovr") generated 1 warning (1 duplicate)` summary lines mean.
+
+Force a full re-check and dedupe by source location:
+
+```sh
+cd cli
+touch src/*.rs tests/*.rs        # or: CARGO_TARGET_DIR=$(mktemp -d)
+cargo clippy --all-targets --message-format=short 2>&1 |
+  grep ': warning: ' | sort -u
+```
+
+`--message-format=short` emits one `file:line:col: warning: …` line per finding, so `sort -u`
+collapses the per-target duplicates. Verified stable across a warm run and a cold one (fresh
+`CARGO_TARGET_DIR`), and against a scratch export of `main`.
+
+### Fix
+
+Land one clippy-only commit on `main`. Ten findings — four `manual_split_once`, two
+`chunks_exact`, two `collapsible_if`, one dead method, one `&PathBuf` — all mechanical, all with
+a suggested rewrite. Like the `cargo fmt` cleanup it wants a quiet moment rather than a branch
+that happens to notice, and until then the parity rule above is the gate.
+
+## A phase whose agent never took a turn records a session id that cannot be resumed (2026-08-04)
+
+**Severity:** low — hard to reach, nothing is lost, and the pane is kept. It costs the operator
+one confusing exit 2 during a repair.
+**Found:** 2026-08-04, the final live verification of run `phase-reap`, on a throwaway run
+`reapcheck` against the release build of that branch.
+
+### Symptom
+
+A reaped phase advertises `rehydratable: true, resumable: true` — the UI shows ⟳ — and
+`drovr phase rehydrate <run> <phase>` comes back `Incomplete(ResumeUnobserved)`, exit 2. Reading
+the restored pane shows claude answering the resume with:
+
+```
+No conversation found with session ID: a143f094-0973-48ae-98ff-46ceea6ecc69
+```
+
+Observed end to end: `drovr phase start reapcheck brainstorm --no-brief` spawned the pane, herdr
+reported `agent_session.value = a143f094-…` almost immediately, and `phase wait` captured it into
+`state.json` as `pane_agent.session` — correctly, by design. The agent was then **never
+prompted**. The phase was completed and superseded, the reap closed its pane (`reaped: true`), and
+the rehydrate relaunched with `claude … --resume 'a143f094-…'` against a session claude had no
+record of.
+
+The exit 2 and the kept pane are the *correct* behaviour — `ResumeUnobserved` surrenders nothing,
+precisely because a slow session id is indistinguishable from a failed resume. The gap is that
+here the resume really had failed, for a knowable reason, and the operator is told "that is not
+proof the resume failed".
+
+### Root cause
+
+herdr surfaces a session id as soon as the agent process is up; claude writes the conversation
+transcript (`<session-id>.jsonl`) only once the session has content. Confirmed both ways on the
+same run: no transcript existed for the never-prompted agent, and one did exist for a phase that
+had taken a single turn. So there is a window in which drovr records — truthfully — a session id
+that `--resume` cannot resolve.
+
+### How narrow it is
+
+Reaping only ever targets a phase that reached `Done`, and a phase does not normally reach `Done`
+without its agent doing work. The routes in are the unusual ones: a phase completed manually
+through the `DROVR_PASS` escape hatch, or an explicit `drovr phase reap` on a phase whose seed was
+never delivered — and `drovr phase send` now detects a swallowed seed, so that second case is
+visible rather than silent.
+
+**Rehydrate itself works.** The contrasting case was verified on the same run: a phase that had
+taken exactly one turn (session `04fa2210-0cfe-4b11-825e-299b3aa14bcd`) was reaped and rehydrated
+to exit 0, *"resumed with its recorded session"*, with the marker string from the original
+conversation still in the restored pane and herdr reporting the same session id afterwards. This
+entry is only about the never-had-a-conversation window.
+
+### What to do
+
+The pane is kept, so read it — `herdr pane read <pane>` shows the "No conversation found" line,
+which is what distinguishes this from a session id that is merely slow to surface. Then
+`drovr phase reap <run> <phase>` clears the registration, and the phase can be re-seeded from its
+handoff.
+
+### Why it is not fixed
+
+The honest fix would be for drovr to distinguish "session id known" from "session resumable", and
+it cannot check the second without reaching into claude's storage layout. Guessing instead — a
+heuristic under the authoritative flag — would make the ⟳ look trustworthy when it is not. The
+current message is truthful about what drovr observed; this entry supplies what it cannot.
