@@ -1,3 +1,4 @@
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -1188,6 +1189,47 @@ impl Unfinished {
     }
 }
 
+/// Take the exclusive lock that serializes rehydrates of `run_name`, held for
+/// as long as the returned file lives.
+///
+/// **Why a FILE lock.** The two racers are separate processes — the HTTP
+/// handler deliberately shells out to `current_exe()` so the CLI stays the sole
+/// writer of `state.json` — so nothing in this address space can serialize
+/// them. The kernel holds an advisory lock for a process and drops it however
+/// that process dies, so a crashed rehydrate never leaves a claim anyone has to
+/// judge stale.
+///
+/// **Why it fails rather than waits.** The holder may be inside a 30-second
+/// readiness wait, and a queued second rehydrate would then either duplicate
+/// the first (if it did not re-read) or refuse anyway (if it did). Refusing now
+/// says the true thing immediately and keeps the HTTP worker free.
+///
+/// The lock alone does not close the race — see `phase_rehydrate`, which
+/// re-reads `state.json` under it. Serializing two launches without that just
+/// makes them consecutive rather than simultaneous.
+fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
+    let path = run_dir(run_name).join("rehydrate.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "another rehydrate of run '{run_name}' is already in progress (it may be \
+                 waiting up to 30s for its agent to come up). Wait for it to finish and \
+                 look at the phase again — two rehydrates of one phase would leave two \
+                 live agents and record only one."
+            ),
+        )),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// The prompt a reseeded agent gets. It says the conversation is gone, because
 /// an agent that believes it is continuing its own work will confidently invent
 /// the parts it cannot remember.
@@ -1254,6 +1296,21 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     poll_interval: Duration,
 ) -> io::Result<RehydrateOutcome> {
     require_phase_name(phase)?;
+    // ⭐ Everything below reads `state.json`, decides on it, and then launches
+    // an agent — a read-modify-write across a 30-second wait, in a process that
+    // is not the only one that can be running it. Two rehydrates of one phase
+    // both saw `pane_id == None`, both passed the refusal, and both launched;
+    // whole-file last-write-wins then dropped one of two live agents from the
+    // record entirely.
+    //
+    // The lock serializes them and the RE-READ under it is what makes that
+    // enough: the loser has to see what the winner wrote, or being second is
+    // no different from being simultaneous. Held for the whole function.
+    let _lock = acquire_rehydrate_lock(&run.name)?;
+    // The caller's copy may predate the lock by any amount — the driver holds
+    // one across a whole run, and the winner of the race above wrote while this
+    // process was blocked. `state.json` under the lock is the only authority.
+    *run = RunState::load(&run.name)?;
     // ONE precondition, shared with the HTTP handler and the agent tree — see
     // `RunState::rehydratable`. Written as separate checks it drifted twice:
     // first the handler checked two of the CLI's three, then the tree's
@@ -9408,8 +9465,11 @@ mod rehydrate_tests {
         assert!(h.calls().is_empty(), "nothing launched: {:?}", h.calls());
 
         // …and the same phase becomes rehydratable the moment it has run.
+        // Saved, not merely mutated: `phase_rehydrate` re-reads `state.json`
+        // under its lock, so an in-memory-only change is not a change at all.
         run.phases[0].status = PhaseStatus::Running;
         run.phases[0].record_launch("claude", None);
+        run.save().unwrap();
         assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
     }
 
@@ -9753,6 +9813,61 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn two_rehydrates_of_one_run_cannot_both_launch() {
+        // Two clicks on ⟳ before the button disables (a reseed can take 30s),
+        // two browser tabs, or a retried POST: both processes load their own
+        // `RunState`, both see `pane_id == None`, both pass the refusal, both
+        // launch. `RunState::save` is whole-file last-write-wins, so one of two
+        // genuinely running agents is dropped from `state.json` — an
+        // unrecorded live pane, which is the immortal-pane bug arriving by a
+        // different road.
+        //
+        // The lock is what serializes them, and the RE-READ under it is what
+        // makes serializing enough: the loser must see what the winner wrote,
+        // or it simply launches second.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-concurrent");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-c")));
+        run.save().unwrap();
+
+        // (a) while another process holds the lock, nothing is launched at all.
+        let held = acquire_rehydrate_lock("rh-concurrent").expect("first holder");
+        let h = FakeHerdr::new();
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("a second rehydrate must not run beside the first");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert!(
+            h.calls().is_empty(),
+            "a refused rehydrate launches nothing: {:?}",
+            h.calls()
+        );
+        drop(held);
+
+        // (b) and once the holder is gone, the loser reads what the winner
+        // wrote rather than its own stale copy. Model the winner by writing a
+        // live pane to DISK only — the caller's `run` still says the phase is
+        // reaped, which is exactly the stale view the race exploits.
+        let mut winner = RunState::load("rh-concurrent").unwrap();
+        winner.find_phase_mut("plan").unwrap().set_pane("ws-rh:winner");
+        winner.save().unwrap();
+        assert!(
+            run.find_phase("plan").unwrap().is_reaped(),
+            "the caller's copy is deliberately stale"
+        );
+
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("the phase holds a pane on disk, so there is nothing to bring back");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("ws-rh:winner"), "{err}");
+        assert!(
+            h.calls().is_empty(),
+            "and still nothing launched: {:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
     fn a_rehydrate_that_cannot_record_its_pane_does_not_leave_it_live() {
         // ⚠️ THE IMMORTAL-PANE BUG, third sighting. `launch_in_pane` succeeded,
         // so an agent is RUNNING in `pane` — and then the save that would have
@@ -9773,8 +9888,17 @@ mod rehydrate_tests {
 
         // Make every later write to the run dir fail: tmp+rename cannot create
         // `state.json.tmp` in a directory it may not write.
+        //
+        // The rehydrate lock file is created FIRST, because O_CREAT needs write
+        // permission on the directory and the lock is taken before the launch —
+        // otherwise this test would model "rehydrate refused up front", which
+        // is a different (and much less interesting) failure. An existing file
+        // opens fine in a read-only directory, which is also what the real
+        // shapes of this failure look like: ENOSPC or EIO on a run dir whose
+        // lock file has been there since the first rehydrate.
         use std::os::unix::fs::PermissionsExt;
         let dir = run_dir("rh-unsaveable");
+        std::fs::File::create(dir.join("rehydrate.lock")).unwrap();
         let before = std::fs::metadata(&dir).unwrap().permissions();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = phase_rehydrate(&h, &mut run, "plan");
@@ -9922,6 +10046,9 @@ mod rehydrate_tests {
         // NOT the built-in default, or "falls back to run.agent" and "hardcodes
         // claude" are the same assertion.
         run.agent = Some("cursor".into());
+        // Saved: `phase_rehydrate` re-reads `state.json` under its lock, so an
+        // in-memory-only change is not a change at all.
+        run.save().unwrap();
         assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
         let launch = pane_run_call(&h);
         assert!(
