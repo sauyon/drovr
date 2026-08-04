@@ -21,7 +21,7 @@ use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
     PaneKept, PhaseWaitOutcome, ReapOutcome, RehydrateOutcome, collect, diagnose_stuck_phase,
-    phase_done, phase_reap, phase_rehydrate, phase_send, phase_start, phase_wait,
+    phase_done, phase_reap, phase_rehydrate, phase_send, phase_start, phase_wait, reap_retired,
     triage_blocked_phase,
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
@@ -224,6 +224,12 @@ enum PhaseCmd {
     /// when there was nothing to reap, so re-running is safe). Exit 2 = the pane
     /// is still there and the phase still holds it — herdr would not close it,
     /// or could not be reached. Exit 1 = refused or failed.
+    ///
+    /// It also sweeps the run's RETIRED panes — ones drovr opened that no phase
+    /// points at any more, which a replaced reviewer leaves behind. They belong
+    /// to no phase, so this is the only command that reaches them short of
+    /// `drovr cleanup`. That part is best-effort and reports itself; the exit
+    /// code is about the phase you named.
     ///
     /// The phase's status is NOT changed: reaping says something about the pane,
     /// not about whether the work was finished. Bring it back with
@@ -1447,6 +1453,12 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
+            // The run's retired panes go too, and BEFORE the phase's: they
+            // belong to no phase, so this command is the only route an operator
+            // has to them short of `drovr cleanup`. It is best-effort and says
+            // so itself — it cannot fail this command, and it does not enter
+            // `reap_report`, whose exit code is about the phase that was named.
+            reap_retired(&h, &mut state);
             match phase_reap(&h, &mut state, &phase_name) {
                 // The decision lives in `reap_report`; this is only the doing.
                 Ok(outcome) => {

@@ -841,6 +841,14 @@ pub struct RunState {
     /// therefore be both immortal and mistaken for the human's, keeping the
     /// workspace open forever. `#[serde(default)]` + skip-if-empty keeps
     /// pre-existing `state.json` files loading unchanged.
+    ///
+    /// **The list SHRINKS as well as grows**, and both directions matter.
+    /// `phase::reap_retired` closes these panes at the same triggers a phase's
+    /// is reaped at, and forgets an entry once the pane behind it is provably
+    /// gone: an entry that outlives its pane proves nothing, and herdr reissues
+    /// pane ids. See [`RunState::reapable_retired`] for which entries a close
+    /// may reach and [`RunState::forget_retired_panes`] for what authorises
+    /// dropping one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_panes: Vec<String>,
 }
@@ -1152,6 +1160,67 @@ impl RunState {
         if !self.retired_panes.contains(&id) {
             self.retired_panes.push(id);
         }
+    }
+
+    /// Drop `panes` from [`RunState::retired_panes`] — the inverse of
+    /// [`RunState::retire_pane`], for panes that no longer EXIST.
+    ///
+    /// A retirement is a claim: "this pane is drovr's, close it at `drovr
+    /// cleanup`". Once the pane is provably gone the claim has no subject left,
+    /// and keeping it is not merely tidy-vs-untidy — herdr hands pane ids back
+    /// out, so a permanent entry naming a dead pane is a standing claim on
+    /// whatever pane wears that id next. Forgetting it is the same reasoning
+    /// that makes [`Phase::mark_reaped`] clear `pane_id` rather than leave a
+    /// registration pointing at nothing.
+    ///
+    /// Establishing that a pane is gone is not something `RunState` can do —
+    /// only herdr can, and only the sweep in `phase::reap_retired` asks it. This
+    /// is the write-down of that answer, not the judgement.
+    pub fn forget_retired_panes(&mut self, panes: &[String]) {
+        self.retired_panes.retain(|p| !panes.contains(p));
+    }
+
+    /// ⭐ **THE sweep precondition: which retired panes a reap may close.**
+    ///
+    /// The counterpart of [`RunState::reapable`] for the panes no phase holds
+    /// any more. Membership in [`RunState::retired_panes`] is already most of
+    /// the permission — that list exists precisely to record "drovr made this
+    /// pane" after the phase that held it let go, and it is what `drovr cleanup`
+    /// acts on under main's `8173f03` (never close what you cannot prove is
+    /// yours). So closing one can never take a human's pane.
+    ///
+    /// Two entries are excluded, and they are the same two exclusions the
+    /// phase-level predicate makes, for the same reasons:
+    ///
+    /// * **the workspace's root shell.** herdr destroys a workspace when its
+    ///   last pane closes, so this one takes the run and every other phase in it.
+    ///   A retirement really can name it: a `state.json` from the build where the
+    ///   first phase claimed the root pane is retired by any release or surrender
+    ///   of that phase, which is the same provenance [`RunState::reapable`]'s
+    ///   [`NotReapable::RootShell`] arm documents.
+    /// * **a pane some phase still records.** The retirement and the
+    ///   registration disagree, and the registration is the one with a live
+    ///   phase behind it: closing that pane would leave the phase holding a
+    ///   pane that is gone, which is exactly the stuck `HoldsPane` this branch
+    ///   spent a task learning to repair. It is also the guard against herdr
+    ///   reissuing a closed pane's id — a stale retirement must not authorise
+    ///   closing a pane that now belongs to something else.
+    ///
+    /// Returns owned ids, not borrows: every caller closes panes and then writes
+    /// the run back, and a borrow of `self` would outlive the decision.
+    pub fn reapable_retired(&self) -> Vec<String> {
+        let held: Vec<&str> = self
+            .root_pane
+            .iter()
+            .map(String::as_str)
+            .chain(self.phases.iter().filter_map(|p| p.pane_id()))
+            .chain(self.review_phases.iter().filter_map(|p| p.pane_id()))
+            .collect();
+        self.retired_panes
+            .iter()
+            .filter(|p| !held.contains(&p.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// ⭐ **THE rehydrate precondition, in ONE place.**
@@ -1486,6 +1555,63 @@ mod tests {
         assert!(
             with_reviewer.superseded_by("plan").is_empty(),
             "a pipeline launch never reaps a panel that may still be in flight"
+        );
+    }
+
+    /// The sweep's whole rule, in the one place it is written — the retirement
+    /// list minus the two entries a close would hurt.
+    #[test]
+    fn the_sweep_gate_offers_every_retirement_nothing_else_points_at() {
+        let with_pane = |name: &str, status: PhaseStatus, pane: &str| {
+            let mut p = Phase::new(name);
+            p.status = status;
+            p.set_pane(pane);
+            p
+        };
+        let mut run = completion_run(vec![]);
+        assert!(
+            run.reapable_retired().is_empty(),
+            "nothing retired, nothing to sweep"
+        );
+
+        // The ordinary case: a pane drovr made, that no phase points at any
+        // more. `retired_panes` IS the proof it is drovr's, so membership is
+        // most of the permission.
+        run.retire_pane("w:p9");
+        assert_eq!(run.reapable_retired(), vec!["w:p9".to_string()]);
+
+        // ⚠️ Never the root shell. herdr destroys a workspace when its last
+        // pane closes; only a `state.json` from the build where the first phase
+        // claimed the root pane can retire this one.
+        run.retire_pane("w:root");
+        run.root_pane = Some("w:root".into());
+        assert_eq!(
+            run.reapable_retired(),
+            vec!["w:p9".to_string()],
+            "the pane that anchors the workspace is never swept"
+        );
+
+        // ⚠️ Never a pane a phase still records. The two disagree and the
+        // registration wins: closing it would leave that phase holding a pane
+        // that is gone. It is also what stops a stale retirement authorising
+        // the close of a pane herdr has since reissued.
+        run.retire_pane("w:p1");
+        run.phases.push(with_pane("plan", PhaseStatus::Running, "w:p1"));
+        run.retire_pane("w:r1");
+        run.review_phases
+            .push(with_pane("review:t:1:security", PhaseStatus::Done, "w:r1"));
+        assert_eq!(
+            run.reapable_retired(),
+            vec!["w:p9".to_string()],
+            "a registration outranks a retirement, in `phases` and `review_phases` alike"
+        );
+
+        // And forgetting is the write-down of an answer, not a judgement: it
+        // removes exactly what it is given.
+        run.forget_retired_panes(&["w:p9".to_string(), "w:nonexistent".to_string()]);
+        assert_eq!(
+            run.retired_panes,
+            vec!["w:root".to_string(), "w:p1".to_string(), "w:r1".to_string()]
         );
     }
 

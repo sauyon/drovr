@@ -1006,9 +1006,15 @@ pub fn phase_start<H: Herdr>(
     // send` and no `phase start`. Reaping when a phase finishes would kill
     // drovr's core quality loop on its first iteration.
     //
-    // Best-effort throughout: `reap_superseded` returns nothing, so no failure
-    // here can turn a started phase into a failed command.
+    // Best-effort throughout: neither call returns anything, so no failure here
+    // can turn a started phase into a failed command.
+    //
+    // The sweep runs FIRST, and that ordering is worth a line: `reap_superseded`
+    // retires every pane it closes, and sweeping afterwards would spend a herdr
+    // round trip re-establishing that a pane drovr closed a moment ago is
+    // indeed gone. Going first, it sees only the debris that was already there.
     if cfg.reap_finished_panes {
+        reap_retired(h, run);
         reap_superseded(h, run, phase);
     }
     Ok(())
@@ -2248,18 +2254,10 @@ pub fn phase_reap<H: Herdr>(h: &H, run: &mut RunState, phase: &str) -> io::Resul
             Ok(ReapOutcome::Cleared { pane })
         }
         PaneStanding::Live => {
-            // Focus is captured and restored around the close for the same
-            // reason `launch_in_pane` does it: closing a pane makes herdr
-            // reassign focus, and drovr must not move the user's view as a side
-            // effect of its own bookkeeping. Restoring is best-effort — a focus
-            // that could not be put back is not a reason to report a reap that
-            // happened as one that did not.
-            let prev_focus = h.focused_workspace();
-            let closed = h.pane_close(&pane);
-            if let Some(prev) = prev_focus {
-                let _ = h.workspace_focus(&prev);
-            }
-            match closed {
+            // Focus is captured and restored around the close — see
+            // `close_pane_preserving_focus`, shared with `reap_retired` so the
+            // rule is not written twice.
+            match close_pane_preserving_focus(h, &pane) {
                 // ⚠️ The registration STAYS. See the ordering note above: a
                 // pane that is still there and no longer recorded is immortal.
                 Err(e) => Ok(ReapOutcome::Kept {
@@ -2313,6 +2311,171 @@ fn unreaped_pane_error(
             q_phase = shell_single_quote(phase),
         ),
     )
+}
+
+/// Close the panes this run RETIRED — the ones drovr made, that no phase points
+/// at any more, and that nothing else will ever close before `drovr cleanup`.
+///
+/// # The leak this closes
+///
+/// [`phase_reap`] works per phase, through the phase's `pane_id`. A retired pane
+/// has no phase pointing at it — that is what retirement MEANS — so no reap can
+/// reach it. `code_review_run` makes one every time it replaces a reviewer: it
+/// retires the predecessor's pane and drops the registration, and nothing then
+/// closed it. Left alone, panels accumulate exactly the way this branch exists
+/// to stop.
+///
+/// # Why closing one is safe
+///
+/// [`RunState::retired_panes`] is the record that a pane is DROVR'S after the
+/// phase that held it let go — it exists so `drovr cleanup` can close it under
+/// main's `8173f03` (never close what you cannot prove is yours). A pane in that
+/// list is therefore provably not a human's, and closing it early is the same
+/// act `drovr cleanup` would perform later. WHICH entries qualify is
+/// [`RunState::reapable_retired`]'s rule, written once where it can be tested,
+/// rather than a filter with a comment above the close.
+///
+/// # What it does with a pane it cannot see
+///
+/// Classified by [`pane_standing`], the same three states a phase's pane gets,
+/// because it is the same question — and "I don't know" authorises nothing:
+///
+/// * [`PaneStanding::Live`] → close it, and forget the retirement only if that
+///   worked. A close that fails leaves the entry exactly where it is, because
+///   the entry is the ONLY thing that still says the pane is drovr's; dropping
+///   it would leave a live pane nothing records, which cleanup then reads as the
+///   human's and never closes.
+/// * [`PaneStanding::Gone`] → forget the retirement. There is nothing to close,
+///   and see [`RunState::forget_retired_panes`] for why an entry with no pane
+///   behind it is worse than no entry at all.
+/// * [`PaneStanding::Unknown`] → nothing. It is probed again at the next
+///   trigger.
+///
+/// The poll is `Herdr::pane_info`, NOT [`poll_phase_pane`] as [`phase_reap`]'s
+/// is. That one polls through the phase in order to bank the agent's session on
+/// the way past; here there is no phase to bank it against — the registration
+/// was cleared before the pane was ever retired — so the capturing poll has
+/// nothing to capture onto.
+///
+/// # Best-effort, with no `Err` at all
+///
+/// Returns `()`, unlike [`phase_reap`]: every caller is a trigger that has
+/// already done its real work (a launch that succeeded, a panel whose verdict is
+/// on disk, a reap the operator asked for), and this must never turn one of them
+/// into a failure. A pane it could not close is a warning, and `drovr cleanup`
+/// still reclaims it — which is exactly the state the run was in before this
+/// existed.
+///
+/// Takes the run lock for the same reason [`phase_reap`] does: it is a
+/// read-modify-write of the same file, racing a rehydrate in the other
+/// direction. So it must never be called from inside a lock holder — the lock is
+/// `flock`-shaped and not re-entrant. Every call site is outside
+/// [`phase_reap`]'s, deliberately.
+pub fn reap_retired<H: Herdr>(h: &H, run: &mut RunState) {
+    // A read WITHOUT the lock, whose only job is to decide whether there is any
+    // work at all — never what the work is; the authoritative read is the one
+    // under the lock below. It is here so the overwhelming majority of launches,
+    // which have retired nothing, neither take a lock nor warn about one a
+    // concurrent rehydrate is holding. An unreadable state.json answers "no
+    // work", the same thing every other unestablished fact here answers.
+    let worth_locking = RunState::load(&run.name).is_ok_and(|s| !s.reapable_retired().is_empty());
+    if !worth_locking {
+        return;
+    }
+    let _lock = match acquire_run_lock(&run.name) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "drovr: warning: could not sweep run '{}'s retired panes ({e}); \
+                 `drovr cleanup` will reclaim them",
+                run.name
+            );
+            return;
+        }
+    };
+    // Re-read under the lock, like `phase_reap`: a sweep decided on the caller's
+    // copy closes whatever panes that copy remembers, and a driver holds one
+    // `RunState` for a whole run while panels retire panes from another process.
+    let fresh = match RunState::load(&run.name) {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            eprintln!(
+                "drovr: warning: could not read run '{}' to sweep its retired panes ({e})",
+                run.name
+            );
+            return;
+        }
+    };
+    let targets = fresh.reapable_retired();
+    if targets.is_empty() {
+        return;
+    }
+    *run = fresh;
+
+    let mut gone: Vec<String> = Vec::new();
+    for pane in targets {
+        match pane_standing(h, h.pane_info(&pane).as_ref(), &pane) {
+            PaneStanding::Unknown => {}
+            PaneStanding::Gone => gone.push(pane),
+            PaneStanding::Live => match close_pane_preserving_focus(h, &pane) {
+                // Said out loud: a pane vanishing from the user's herdr is a
+                // visible event, and it belongs to no phase they could look up.
+                Ok(()) => {
+                    eprintln!("drovr: closed retired pane {pane} of run '{}'", run.name);
+                    gone.push(pane);
+                }
+                Err(e) => eprintln!(
+                    "drovr: warning: left retired pane {pane} open ({e}); \
+                     `drovr cleanup` will reclaim it"
+                ),
+            },
+        }
+    }
+    if gone.is_empty() {
+        return;
+    }
+    // One save onto a FRESH read, the same shape as `release_phase_from_pane`:
+    // the polls and closes above take herdr round trips, and the caller's copy
+    // is not the state to write back. A save that fails changes nothing — the
+    // entries stay, and the next sweep re-establishes that they are gone and
+    // tries again.
+    match RunState::load(&run.name) {
+        Ok(mut fresh) => {
+            fresh.forget_retired_panes(&gone);
+            match fresh.save() {
+                Ok(()) => *run = fresh,
+                Err(e) => eprintln!(
+                    "drovr: warning: closed {} retired pane(s) of run '{}' but could not \
+                     record it ({e}); the next sweep will notice they are gone",
+                    gone.len(),
+                    run.name
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "drovr: warning: could not record the sweep of run '{}'s retired panes ({e})",
+            run.name
+        ),
+    }
+}
+
+/// Close one pane and put the user's view back where it was.
+///
+/// Closing a pane makes herdr reassign focus, and drovr must not move the user's
+/// view as a side effect of its own bookkeeping — the same reason
+/// [`launch_in_pane`] captures and restores it. Restoring is best-effort: a
+/// focus that could not be put back is no reason to report a close that happened
+/// as one that did not, so what comes back is `pane_close`'s own result.
+///
+/// One function because [`phase_reap`] and [`reap_retired`] close panes for the
+/// same reason, and a focus rule written twice is a focus rule that drifts.
+fn close_pane_preserving_focus<H: Herdr>(h: &H, pane: &str) -> io::Result<()> {
+    let prev_focus = h.focused_workspace();
+    let closed = h.pane_close(pane);
+    if let Some(prev) = prev_focus {
+        let _ = h.workspace_focus(&prev);
+    }
+    closed
 }
 
 /// Reap every phase a launch of `starting` has superseded.
@@ -12252,6 +12415,327 @@ mod reap_tests {
         assert!(
             !msg.contains("pane_id") && !msg.contains("state.json"),
             "the hand-edit instruction is retired: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The retired-pane sweep
+    // -----------------------------------------------------------------------
+
+    /// The leak this sweep exists to close, end to end.
+    ///
+    /// `code_review_run` replaces a reviewer by retiring its pane and dropping
+    /// the registration. Nothing then closed that pane: `phase_reap` works per
+    /// phase and no phase points at it any more, so it survived every trigger
+    /// and waited for `drovr cleanup`. That is precisely the accumulation
+    /// reaping exists to stop.
+    #[test]
+    fn a_retired_pane_is_closed_by_the_sweep() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-closes");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        reap_retired(&h, &mut run);
+
+        assert_eq!(closed_panes(&h), vec!["ws-rp:p9".to_string()]);
+        for state in [&run, &RunState::load("sweep-closes").unwrap()] {
+            assert!(
+                state.retired_panes.is_empty(),
+                "a pane that is gone is not a pane cleanup has to be told about: {:?}",
+                state.retired_panes
+            );
+        }
+    }
+
+    /// ⭐ THE REQUIRED FAILURE TEST, for the sweep. A close that does not happen
+    /// leaves the retirement exactly where it was — it is the ONLY record that
+    /// the pane is drovr's, so forgetting it while the pane is still standing
+    /// makes it immortal: `drovr cleanup` would read it as the human's, never
+    /// close it, and refuse `workspace_close` for the whole run.
+    #[test]
+    fn a_retired_pane_that_cannot_be_closed_stays_recorded() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-close-fails");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_close();
+
+        reap_retired(&h, &mut run);
+
+        assert_eq!(
+            closed_panes(&h),
+            vec!["ws-rp:p9".to_string()],
+            "it was attempted: {:?}",
+            h.calls()
+        );
+        for state in [&run, &RunState::load("sweep-close-fails").unwrap()] {
+            assert_eq!(
+                state.retired_panes,
+                vec!["ws-rp:p9".to_string()],
+                "⚠️ the retirement is what keeps the pane inside `drovr_pane_ids`"
+            );
+        }
+    }
+
+    /// Idempotent: the second sweep emits no close at all. The FIRST sweep is
+    /// what makes that true — it forgets the pane it closed, so there is
+    /// nothing left to probe, let alone close.
+    #[test]
+    fn sweeping_twice_closes_one_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-twice");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        reap_retired(&h, &mut run);
+        let after_first = closed_panes(&h);
+        assert_eq!(after_first, vec!["ws-rp:p9".to_string()]);
+
+        let before = h.calls().len();
+        reap_retired(&h, &mut run);
+
+        assert_eq!(
+            closed_panes(&h),
+            after_first,
+            "a forgotten pane is not closed again: {:?}",
+            h.calls()
+        );
+        assert_eq!(
+            h.calls().len(),
+            before,
+            "and it is not even probed again: {:?}",
+            h.calls()
+        );
+    }
+
+    /// Never the pane that anchors the workspace — the same refusal
+    /// `RunState::reapable` makes for a phase, made by the same run for the
+    /// retirement list. herdr destroys a workspace when its last pane closes.
+    #[test]
+    fn the_sweep_never_closes_the_workspaces_root_shell() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-root");
+        // Only a `state.json` from the build where the first phase claimed the
+        // root pane reaches this: releasing or surrendering that phase retires
+        // the pane it was holding, which is the root shell.
+        run.retire_pane("ws-rp:root");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        reap_retired(&h, &mut run);
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "closing it would take the workspace and every phase in it: {:?}",
+            h.calls()
+        );
+        assert_eq!(
+            RunState::load("sweep-root").unwrap().retired_panes,
+            vec!["ws-rp:root".to_string()],
+            "and it is still recorded, because it is still there"
+        );
+    }
+
+    /// A retirement and a live registration naming the same pane disagree, and
+    /// the registration wins: closing it would leave that phase holding a pane
+    /// that is gone — the stuck `HoldsPane` this branch spent a task repairing.
+    /// It is also the guard against herdr reissuing a closed pane's id.
+    #[test]
+    fn the_sweep_leaves_a_pane_a_phase_still_records() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-still-held");
+        run.phases.push(finished_phase("implement", "ws-rp:p1"));
+        run.retire_pane("ws-rp:p1");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        reap_retired(&h, &mut run);
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "the phase still points at it: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("sweep-still-held").unwrap();
+        assert_eq!(
+            on_disk.find_phase("implement").unwrap().pane_id(),
+            Some("ws-rp:p1")
+        );
+        assert_eq!(on_disk.retired_panes, vec!["ws-rp:p1".to_string()]);
+    }
+
+    /// herdr has already lost the pane: nothing to close, and the entry is a
+    /// claim with no subject. Forget it — the same `PaneStanding::Gone` reading
+    /// that clears a phase's registration.
+    #[test]
+    fn a_retired_pane_herdr_has_lost_is_forgotten_without_a_close() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-lost");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_info();
+        h.kill_pane("ws-rp:p9");
+
+        reap_retired(&h, &mut run);
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "there was nothing to close: {:?}",
+            h.calls()
+        );
+        assert!(
+            RunState::load("sweep-lost").unwrap().retired_panes.is_empty(),
+            "a claim on a pane herdr does not have is a claim on whatever wears \
+             that id next"
+        );
+    }
+
+    /// The other half of that classification, and the one a `bool` would get
+    /// wrong: herdr could not be READ. Nothing was established, so nothing is
+    /// closed and nothing is forgotten — dropping the retirement here strands a
+    /// pane that may be perfectly alive.
+    #[test]
+    fn a_sweep_that_cannot_reach_herdr_forgets_nothing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-unreadable");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // The poll fails, and `pane_exists` is biased toward "alive": only an
+        // explicit `pane_not_found` proves death.
+        h.fail_pane_info();
+
+        reap_retired(&h, &mut run);
+
+        assert!(closed_panes(&h).is_empty(), "{:?}", h.calls());
+        assert_eq!(
+            RunState::load("sweep-unreadable").unwrap().retired_panes,
+            vec!["ws-rp:p9".to_string()]
+        );
+    }
+
+    /// Closing a retired pane disturbs focus exactly as closing a phase's does,
+    /// and drovr must not move the user's view as a side effect of its own
+    /// bookkeeping.
+    #[test]
+    fn a_sweep_restores_the_focus_its_close_disturbed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-focus");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        reap_retired(&h, &mut run);
+
+        let calls = h.calls();
+        let focused = calls.iter().position(|c| c == "focused_workspace");
+        let close = calls
+            .iter()
+            .position(|c| c == "pane_close pane=ws-rp:p9")
+            .expect("the pane was closed");
+        let restore = calls.iter().position(|c| c == "workspace_focus id=ws-focused");
+        assert!(
+            focused.is_some_and(|f| f < close) && restore.is_some_and(|r| r > close),
+            "focus must be captured before the close and restored after it: {calls:?}"
+        );
+    }
+
+    /// A sweep decided on the caller's copy is a sweep of whatever that copy
+    /// remembers. The driver holds one `RunState` across a whole run, and a
+    /// panel retires panes from its own stale snapshot.
+    #[test]
+    fn a_sweep_reads_the_run_from_disk_before_it_decides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-stale-copy");
+        run.save().unwrap();
+
+        // Another process retired a pane this copy has never heard of.
+        let mut other = RunState::load("sweep-stale-copy").unwrap();
+        other.retire_pane("ws-rp:p9");
+        other.save().unwrap();
+        assert!(
+            run.retired_panes.is_empty(),
+            "precondition: the caller's copy is stale"
+        );
+
+        let h = FakeHerdr::new();
+        reap_retired(&h, &mut run);
+
+        assert_eq!(
+            closed_panes(&h),
+            vec!["ws-rp:p9".to_string()],
+            "the retirements on disk are the ones that get swept"
+        );
+    }
+
+    /// The trigger, at the same moment and under the same config gate as the
+    /// supersession reap: a launch is the run provably moving on.
+    #[test]
+    fn a_launch_sweeps_the_runs_retired_panes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-on-launch");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        assert!(
+            closed_panes(&h).iter().any(|p| p == "ws-rp:p9"),
+            "the launch superseded nothing, but the debris is still debris: {:?}",
+            h.calls()
+        );
+    }
+
+    /// And it is best-effort in the same way: a sweep that cannot close
+    /// anything must not turn a started phase into a failed command.
+    #[test]
+    fn a_sweep_that_fails_never_fails_the_phase_that_triggered_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("sweep-best-effort");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_close();
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a sweep that cannot close a pane must not fail the launch");
+
+        let on_disk = RunState::load("sweep-best-effort").unwrap();
+        assert_eq!(
+            on_disk.find_phase("implement").unwrap().status,
+            PhaseStatus::Running
+        );
+        assert_eq!(on_disk.retired_panes, vec!["ws-rp:p9".to_string()]);
+    }
+
+    /// The opt-out covers the sweep too — it is the same policy, and a human who
+    /// turned reaping off did not ask for a different set of their panes to
+    /// close.
+    #[test]
+    fn sweeping_is_off_when_the_config_turns_reaping_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, cfg) = reap_run("sweep-opt-out");
+        write_config(&cfg, "reap_finished_panes = false\n");
+        run.retire_pane("ws-rp:p9");
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "reaping off means no pane is closed: {:?}",
+            h.calls()
+        );
+        assert_eq!(
+            RunState::load("sweep-opt-out").unwrap().retired_panes,
+            vec!["ws-rp:p9".to_string()]
         );
     }
 }

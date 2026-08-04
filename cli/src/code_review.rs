@@ -67,7 +67,7 @@ use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
 use crate::phase::{
     ReapOutcome, archived_run_error, marker_completes_current_pass, phase_reap, phase_send,
-    poll_phase_pane, spawn_reviewer,
+    poll_phase_pane, reap_retired, spawn_reviewer,
 };
 use crate::run::{PhaseStatus, RunState, run_dir};
 
@@ -1305,6 +1305,13 @@ pub fn code_review_run<H: Herdr>(
     // has already produced its answer, so a pane that will not close is a
     // warning and `drovr cleanup` reclaims it.
     if cfg.reap_finished_panes {
+        // The panes THIS function orphaned, first. A resume that replaces an
+        // angle retires the predecessor's pane and drops its registration, so no
+        // per-phase reap can ever reach it again — `phase_reap` finds a pane
+        // through the phase that records it, and nothing records this one. It is
+        // swept before the loop below so it does not re-probe the retirements
+        // that loop is about to make.
+        reap_retired(h, run);
         for angle in &cfg.angles {
             let phase = crate::run::reviewer_phase_name(task, iter, angle);
             match phase_reap(h, run, &phase) {
@@ -2170,6 +2177,73 @@ mod tests {
             run.retired_panes.contains(&wedged),
             "the replaced reviewer's pane must be retired for cleanup to reap: {:?}",
             run.retired_panes
+        );
+    }
+
+    /// ⭐ THE LEAK, end to end. A replaced reviewer's pane is retired and its
+    /// registration dropped, so `phase_reap` can never reach it again — it looks
+    /// a pane up through the phase that records it, and nothing records this
+    /// one. Before the sweep it survived every trigger and waited for
+    /// `drovr cleanup`, which is exactly the accumulation reaping exists to
+    /// stop.
+    #[test]
+    fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-sweep-orphan");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Wedge one angle so the next resume replaces it in place: same task,
+        // same iteration, new pane. Its predecessor is the orphan.
+        let wedged = pane_of(&run, "review:task-1:1:security");
+        let i = run
+            .review_phases
+            .iter()
+            .position(|p| p.name == "review:task-1:1:security")
+            .unwrap();
+        run.review_phases[i].status = PhaseStatus::Failed;
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            run.retired_panes.contains(&wedged),
+            "precondition: the respawn orphaned it — retired, and recorded under \
+             no phase at all: {:?}",
+            run.retired_panes
+        );
+
+        // Now let the pass finish. Nothing else will ever look at `wedged`.
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        assert!(
+            closed_panes(&h).contains(&wedged),
+            "the orphaned pane must be closed, not left for `drovr cleanup`: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("cr-sweep-orphan").unwrap();
+        assert!(
+            !on_disk.retired_panes.contains(&wedged),
+            "and forgotten, so no claim outlives the pane: {:?}",
+            on_disk.retired_panes
+        );
+        // The panel's own reap is unaffected: every reviewer of the finished
+        // pass is still closed and still retired.
+        assert_eq!(
+            on_disk.retired_panes.len(),
+            4,
+            "one retirement per reviewer reaped by the panel: {:?}",
+            on_disk.retired_panes
         );
     }
 
