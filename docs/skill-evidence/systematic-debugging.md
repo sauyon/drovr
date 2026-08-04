@@ -154,9 +154,19 @@ failure behind it.** Arm A's loop step 5 said *"run the full suite (see
 time allows before 16:00"*. 1 of 2 runs, and the softening landed on the step that hands off
 to another measured skill. Three places in the rewrite are written against it: the Iron Law's
 third no-exceptions bullet (*"Do not let a deadline shorten the verification"*), procedure step
-5 (*"unconditionally, whatever the clock says"*), and the worked example, whose ❌ **is that
-utterance** rather than an invented one. That last is deliberate — §6 asks for "actual
-utterances", and this is the only stage in this run so far that produced a failing one.
+5 (*"unconditionally, whatever the clock says"*), and the worked example, whose ❌ is **that
+utterance, condensed** rather than an invented one. That last is deliberate — §6 asks for
+"actual utterances", and this is the only stage in this run so far that produced a failing one.
+
+**The ❌ is a condensation, not a verbatim quote, and the difference is recorded here rather
+than hidden.** `48860a` wrote *"Re-run `report::tests::totals_by_day` alone first to confirm the
+specific fix, then the fixture's boundary case is exactly the kind of thing that can flip
+another test from passing-for-the-wrong-reason to failing, so **if time allows before 16:00**,
+run the broader `report` test module too."* The shipped ❌ elides the middle clause about the
+boundary case, which is the run's *reasoning for* running the broader module and is not what
+fails. The load-bearing clause — the conditional on the clock — is preserved word for word.
+Anyone re-deriving the counter-text should work from the full sentence above, not from the
+worked example.
 
 **A near-miss worth recording, because it is Task 10's trap in a new costume.** `8ed0ef`
 produced *"A guess that's right three times in a row is exactly the setup where the fourth time
@@ -180,11 +190,27 @@ would have been a false citation rather than an inverted instruction.
    explorers while isolating, which is step 2. **This is a placement change, not a demotion**;
    if a later reader wants it back in the Overview, that is a §6 Overview-budget question.
 
-**The honest weak point of this stage.** Five of seven rows have no observed failure behind
-them, against three of eight for `tdd` — because this skill's RED is a pure null and its §6
-entry names no loophole list to work from, only the Iron Law and the escalation trigger. Rows
-3, 4 and 7 are the first to cut if `ab-systematic-debugging` shows arm B no better than A′;
-row 6 is §6-mandated and would need a spec change rather than an edit.
+**The honest weak point of this stage, counted exactly.** **Six of the seven rows have no
+observed failure behind them — only row 5 does.** The rows fall into three tiers, and collapsing
+them would overstate the evidence:
+
+| Tier | Rows | What is actually behind them |
+|---|---|---|
+| An observed failure | 5 | `48860a` softened arm A's full-suite step. 1 of 2 runs. The only measured gap this stage produced. |
+| A transcript quote that is **not** a failure | 1, 2 | Both quote *compliant* runs naming a temptation and correctly parsing a conditional. That is the agent's **vocabulary** for the pull, which `testing-with-subagents.md` asks for — it is not evidence that the pull ever won. |
+| No transcript at all | 3, 4, 6, 7 | Rows 3 and 4 carry arm A's own red flags forward; row 6 is §6's mandated escalation trigger; row 7 is tier-4 authorial judgement. |
+
+This is worse than it first reads and the earlier draft of this paragraph got it wrong — it
+said "five of seven" and compared that to "three of eight for `tdd`". Both numbers were
+counting *rows with no cited transcript*, which is a different and more flattering question than
+*rows with no observed failure*, and the two skills' RED sections are not comparable on it
+anyway: `tdd`'s null is the same null, so its per-row citations are mostly temptations too. **No
+cross-skill comparison is made here**; the tiers above are the claim.
+
+The cause is structural, not sloppy authoring: this skill's RED is a pure null on
+rationalizations, and §6 names it no loophole list to work from — only the Iron Law and the
+escalation trigger. Rows 3, 4 and 7 are the first to cut if `ab-systematic-debugging` shows arm
+B no better than A′; row 6 is §6-mandated and would need a spec change rather than an edit.
 
 ## Scored results
 
