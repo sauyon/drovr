@@ -55,6 +55,19 @@ fn arms_dir() -> PathBuf {
     ))
 }
 
+/// Root of the evidence corpus (`docs/skill-evidence/`) — the per-skill records,
+/// the run ledger, and the arm snapshots beneath it.
+fn evidence_dir() -> PathBuf {
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/skill-evidence"
+    ))
+}
+
+/// The evidence files that are not per-skill. Kept as a list so adding one is a
+/// one-line change at the same site as the per-skill set.
+const EVIDENCE_LEDGER: &str = "run-ledger.md";
+
 /// The five skills snapshotted into every measurement arm.
 const ARM_SNAPSHOT_SKILLS: &[&str] = &[
     "tdd",
@@ -2978,6 +2991,57 @@ fn methodology_skills_within_body_budget() {
         assert!(
             body_len <= BODY_BUDGET,
             "{}: body is {body_len} bytes, exceeds budget of {BODY_BUDGET}",
+            path.display()
+        );
+    }
+}
+
+/// The evidence corpus is the only citable record behind every numeric or
+/// comparative claim drovr's skill text makes (spec §2.1 exception 1). It is
+/// prose, so nothing else in this suite would notice it going missing — a task
+/// that deleted `docs/skill-evidence/tdd.md` would leave the run's claims
+/// standing with their evidence gone and every test still green.
+///
+/// This is a tripwire, deliberately shallow: **presence and non-emptiness, not
+/// content.** Later tasks rewrite these files repeatedly — RED now, counter-text
+/// at fix 4, scored results at the A/B stages — so asserting anything about
+/// their shape here would be a second contract on files that are still being
+/// written. What it does refuse is the failure it exists for: a missing file, a
+/// directory in a file's place, an unreadable file, and a file that is empty or
+/// holds nothing but whitespace.
+#[test]
+fn evidence_corpus_present() {
+    let dir = evidence_dir();
+    assert!(
+        dir.is_dir(),
+        "expected the evidence corpus at {}",
+        dir.display()
+    );
+
+    // Per-skill records first, then the ledger, so the failure names the file.
+    // `ARM_SNAPSHOT_SKILLS` is reused rather than re-listed: the set of skills
+    // under measurement is one fact, and a skill added to an arm without an
+    // evidence record is exactly what should fail here.
+    let mut expected: Vec<String> = ARM_SNAPSHOT_SKILLS
+        .iter()
+        .map(|skill| format!("{skill}.md"))
+        .collect();
+    expected.push(EVIDENCE_LEDGER.to_string());
+
+    for name in &expected {
+        let path = dir.join(name);
+        assert!(
+            path.is_file(),
+            "{} is missing — the evidence corpus is what spec §2.1 exception 1 \
+             makes every measured claim citable against; do not delete it",
+            path.display()
+        );
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            !contents.trim().is_empty(),
+            "{} is empty — an empty evidence file passes a presence check while \
+             recording nothing, which is worse than a missing one",
             path.display()
         );
     }
