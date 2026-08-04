@@ -2858,6 +2858,12 @@ async function route() {
     // submittable indefinitely. loadAnnotations() then restores this run's own
     // in-progress comments from localStorage.
     annotations = {};
+    // ...and repaint the unanchored list from that now-empty map, in the same
+    // synchronous block. It renders only from refresh(), so on its own it would
+    // keep showing the PREVIOUS run's comment text — verbatim, under this run's
+    // name — until those fetches resolved, and forever if they rejected. Rendering
+    // rather than just hiding keeps one authority over what that panel says.
+    renderUnanchoredPanel();
     // Same class again, and the worst instance of it: the decision radio and the
     // feedback box are plain form fields that nothing ever reset, so prose typed
     // for one run stayed in the box — and the radio stayed on whatever was picked

@@ -1841,9 +1841,22 @@ await evaluate(`
   // nothing to leak.
   annotations = { 1: { quote: specSourceLines[0],
                        comments: [{ id: 1, text: 'alpha-only comment', quote: specSourceLines[0] }] } };
+  // A SECOND plant, deliberately unanchored, so #unanchored-annots is populated
+  // too. The anchored one above never reaches that panel, so on its own it leaves
+  // the panel's own leak untested — and that panel renders the comment's text
+  // verbatim, which is the reviewer's private prose about another run's spec.
+  // Line 999: a line the spec does not have, so no block renders for it and the
+  // comment lands in the panel rather than as an inline chip on a real block.
+  annotations[999] = { quote: 'a line alpha no longer has',
+                       comments: [{ id: 2, text: 'alpha-only stranded note',
+                                    quote: 'a line alpha no longer has' }] };
+  renderUnanchoredPanel();
   return JSON.stringify(collectAnnotations()).indexOf('alpha-only') !== -1;`);
 check('the planted annotation is really submittable on alpha',
   await evaluate(`return collectAnnotations().length;`), 1);
+check('...and the stranded one is really on screen to leak', await evaluate(`
+  var p = document.getElementById('unanchored-annots');
+  return p.style.display !== 'none' && /alpha-only stranded note/.test(p.textContent);`), true);
 await evaluate(`
   window.__origFetch = window.fetch;
   window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
@@ -1859,6 +1872,14 @@ check('...and no panel claiming to show one',
 // entirely and alpha's comment would still be in the payload POSTed for epsilon.
 check('...and no stale annotations to submit under this run',
   await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
+// The unanchored panel is a sibling of #doc-panel, so main's reset of that panel
+// does not reach it, and it only ever repaints from refresh() — which just
+// rejected. Left out of the synchronous reset it keeps displaying the previous
+// run's comment text, under this run's name, with nothing to correct it.
+check('...and no previous run\'s comments still displayed', await evaluate(`
+  var p = document.getElementById('unanchored-annots');
+  return { hidden: p.style.display === 'none', leaks: /alpha-only/.test(p.textContent) };`),
+  { hidden: true, leaks: false });
 await evaluate(`window.fetch = window.__origFetch; return 1;`);
 
 console.log('\n== the decision form does not carry across runs ==');
@@ -1896,9 +1917,11 @@ await evaluate(`
   document.getElementById('feedback').value = 'half-written feedback I am still editing';
   document.querySelector('input[name="decision"][value="approve"]').checked = true;
   // Anchored for the same reason: this pins annotation PERSISTENCE, so the plant
-  // has to be one that would actually survive to be submitted.
-  annotations = { 2: { quote: specSourceLines[1],
-                       comments: [{ id: 9, text: 'in-progress note', quote: specSourceLines[1] }] } };
+  // has to be one that would actually survive to be submitted. Line 3, not line 2:
+  // line 2 of the fixture spec is blank, and '' === '' anchors against any spec
+  // with a blank line there — a pin that holds without the real text matching.
+  annotations = { 3: { quote: specSourceLines[2],
+                       comments: [{ id: 9, text: 'in-progress note', quote: specSourceLines[2] }] } };
   saveAnnotations();   // every real mutation site does this, so match real usage
   return 1;`);
 const sameRunGen = await evaluate(`return routeGen;`);
