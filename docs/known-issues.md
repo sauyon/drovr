@@ -3058,3 +3058,68 @@ Land one clippy-only commit on `main`. Ten findings — four `manual_split_once`
 `chunks_exact`, two `collapsible_if`, one dead method, one `&PathBuf` — all mechanical, all with
 a suggested rewrite. Like the `cargo fmt` cleanup it wants a quiet moment rather than a branch
 that happens to notice, and until then the parity rule above is the gate.
+
+## A phase whose agent never took a turn records a session id that cannot be resumed (2026-08-04)
+
+**Severity:** low — hard to reach, nothing is lost, and the pane is kept. It costs the operator
+one confusing exit 2 during a repair.
+**Found:** 2026-08-04, the final live verification of run `phase-reap`, on a throwaway run
+`reapcheck` against the release build of that branch.
+
+### Symptom
+
+A reaped phase advertises `rehydratable: true, resumable: true` — the UI shows ⟳ — and
+`drovr phase rehydrate <run> <phase>` comes back `Incomplete(ResumeUnobserved)`, exit 2. Reading
+the restored pane shows claude answering the resume with:
+
+```
+No conversation found with session ID: a143f094-0973-48ae-98ff-46ceea6ecc69
+```
+
+Observed end to end: `drovr phase start reapcheck brainstorm --no-brief` spawned the pane, herdr
+reported `agent_session.value = a143f094-…` almost immediately, and `phase wait` captured it into
+`state.json` as `pane_agent.session` — correctly, by design. The agent was then **never
+prompted**. The phase was completed and superseded, the reap closed its pane (`reaped: true`), and
+the rehydrate relaunched with `claude … --resume 'a143f094-…'` against a session claude had no
+record of.
+
+The exit 2 and the kept pane are the *correct* behaviour — `ResumeUnobserved` surrenders nothing,
+precisely because a slow session id is indistinguishable from a failed resume. The gap is that
+here the resume really had failed, for a knowable reason, and the operator is told "that is not
+proof the resume failed".
+
+### Root cause
+
+herdr surfaces a session id as soon as the agent process is up; claude writes the conversation
+transcript (`<session-id>.jsonl`) only once the session has content. Confirmed both ways on the
+same run: no transcript existed for the never-prompted agent, and one did exist for a phase that
+had taken a single turn. So there is a window in which drovr records — truthfully — a session id
+that `--resume` cannot resolve.
+
+### How narrow it is
+
+Reaping only ever targets a phase that reached `Done`, and a phase does not normally reach `Done`
+without its agent doing work. The routes in are the unusual ones: a phase completed manually
+through the `DROVR_PASS` escape hatch, or an explicit `drovr phase reap` on a phase whose seed was
+never delivered — and `drovr phase send` now detects a swallowed seed, so that second case is
+visible rather than silent.
+
+**Rehydrate itself works.** The contrasting case was verified on the same run: a phase that had
+taken exactly one turn (session `04fa2210-0cfe-4b11-825e-299b3aa14bcd`) was reaped and rehydrated
+to exit 0, *"resumed with its recorded session"*, with the marker string from the original
+conversation still in the restored pane and herdr reporting the same session id afterwards. This
+entry is only about the never-had-a-conversation window.
+
+### What to do
+
+The pane is kept, so read it — `herdr pane read <pane>` shows the "No conversation found" line,
+which is what distinguishes this from a session id that is merely slow to surface. Then
+`drovr phase reap <run> <phase>` clears the registration, and the phase can be re-seeded from its
+handoff.
+
+### Why it is not fixed
+
+The honest fix would be for drovr to distinguish "session id known" from "session resumable", and
+it cannot check the second without reaching into claude's storage layout. Guessing instead — a
+heuristic under the authoritative flag — would make the ⟳ look trustworthy when it is not. The
+current message is truthful about what drovr observed; this entry supplies what it cannot.
