@@ -20,6 +20,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// before delivering the prompt (see `wait_agent_ready`).
 const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The time a rehydrate guarantees to CONFIRMING a resumed session, on top of
+/// whatever is left of the readiness budget.
+///
+/// The two waits share one deadline so a resume cannot hold the caller for
+/// twice `SEND_READY_TIMEOUT`. The cost of sharing alone is that a slow LAUNCH
+/// eats the budget and leaves confirmation a sliver — which makes "no session
+/// seen" most likely exactly when the machine is loaded and the agent is
+/// slowest to surface its id, i.e. it reports resumes that actually worked as
+/// unconfirmed. A floor keeps the total bounded (35s worst case) while making
+/// the step that decides whether the conversation came back impossible to
+/// starve. Ten polls at `POLL_INTERVAL`.
+const CONFIRM_FLOOR: Duration = Duration::from_secs(5);
+
 /// How long `phase_send` gives herdr to confirm the agent actually started after
 /// a prompt (and again after the submit nudge).
 ///
@@ -1129,16 +1142,30 @@ pub enum Unfinished {
         /// a delivery that was never attempted.
         had_seed: bool,
     },
-    /// The agent came up, but herdr never reported it carrying the session it
-    /// was told to resume. The conversation did not come back — a stale id
-    /// makes the backend start a FRESH one, which looks perfectly healthy from
-    /// the outside.
-    ResumeUnconfirmed {
+    /// The agent came up carrying a DIFFERENT session. The conversation did not
+    /// come back — a stale id makes the backend start a FRESH one, which looks
+    /// perfectly healthy from the outside.
+    ///
+    /// **The pane has been surrendered** ([`surrender_misattributed_pane`]),
+    /// because a different session is positive evidence that the phase's record
+    /// does not describe it. That fact is carried by the VARIANT rather than by
+    /// a flag beside it: the arm that decides to close the pane is the arm that
+    /// builds this, so the note cannot describe a pane that is still there.
+    ResumeContradicted {
         pane: String,
         expected: SessionId,
-        /// What herdr reported instead, when it reported anything.
-        observed: Option<SessionId>,
+        /// What herdr reported instead. Not an `Option` — a session that was
+        /// never seen is [`Unfinished::ResumeUnobserved`], a different state.
+        observed: SessionId,
     },
+    /// The agent came up, and herdr never reported which session it is in.
+    ///
+    /// **The pane is still there.** drovr saw nothing, and nothing is not
+    /// evidence — the agent may be perfectly resumed and merely slow to
+    /// surface its id. Epistemically the same state as
+    /// [`Unfinished::NeverReady`] with `resuming: true`, and it takes the same
+    /// branch: nothing is destroyed, and the operator is sent to the pane.
+    ResumeUnobserved { pane: String, expected: SessionId },
     /// A fresh agent is up, and this phase has no seed document to give it.
     NoSeed { pane: String },
     /// A fresh agent is up, and its seed could not be delivered.
@@ -1155,7 +1182,8 @@ impl Unfinished {
     pub fn pane(&self) -> &str {
         match self {
             Unfinished::NeverReady { pane, .. }
-            | Unfinished::ResumeUnconfirmed { pane, .. }
+            | Unfinished::ResumeContradicted { pane, .. }
+            | Unfinished::ResumeUnobserved { pane, .. }
             | Unfinished::NoSeed { pane }
             | Unfinished::SeedUndelivered { pane, .. } => pane,
         }
@@ -1213,25 +1241,36 @@ impl Unfinished {
                     p = self.pane(),
                 )
             }
-            Unfinished::ResumeUnconfirmed {
+            Unfinished::ResumeContradicted {
                 expected, observed, ..
-            } => {
-                let saw = match observed {
-                    Some(o) => format!("it reports session '{}' instead", o.as_str()),
-                    None => "it reports no session at all".to_string(),
-                };
+            } => format!(
+                "the agent for phase '{phase}' came up, but it is NOT the conversation you \
+                 asked for: drovr resumed session '{}' and it reports session '{}' instead. \
+                 A recorded id that no longer resolves makes the backend start a FRESH \
+                 conversation, which looks healthy from the outside. That agent was closed \
+                 again rather than left running under this phase's name, so the phase is \
+                 unchanged and still holds the session id — rehydrating again will retry \
+                 it. If it keeps failing the conversation is gone: `drovr phase start \
+                 {q_run} {q_phase} <seed>` starts the phase fresh from the written record.",
+                expected.as_str(),
+                observed.as_str(),
+                q_run = shell_single_quote(run_name),
+                q_phase = shell_single_quote(phase),
+            ),
+            // NOT the contradicted wording, and the difference is the pane.
+            // Nothing was observed, so nothing was destroyed — promising a
+            // retry here would promise one `HoldsPane` is about to refuse.
+            Unfinished::ResumeUnobserved { expected, .. } => {
                 format!(
-                    "the agent for phase '{phase}' came up, but it is NOT the conversation \
-                     you asked for: drovr resumed session '{}' and {saw}. A recorded id that \
-                     no longer resolves makes the backend start a FRESH conversation, which \
-                     looks healthy from the outside. That agent was closed again rather than \
-                     left running under this phase's name, so the phase is unchanged and \
-                     still holds the session id — rehydrating again will retry it. If it \
-                     keeps failing the conversation is gone: `drovr phase start {q_run} \
-                     {q_phase} <seed>` starts the phase fresh from the written record.",
+                    "the agent for phase '{phase}' came up on pane {p}, but drovr never saw \
+                     which session it is in — it asked for '{}' and herdr reported no \
+                     session at all before the wait ran out. That is not proof the resume \
+                     failed: the id can surface a moment after the agent does. The pane is \
+                     still there and still holds the phase — look with herdr pane read \
+                     {pane}. Until that pane is gone, rehydrating this phase again will \
+                     refuse with \"still holds pane {p}\".",
                     expected.as_str(),
-                    q_run = shell_single_quote(run_name),
-                    q_phase = shell_single_quote(phase),
+                    p = self.pane(),
                 )
             }
             Unfinished::NoSeed { .. } => format!(
@@ -1303,11 +1342,20 @@ fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
 ///
 /// # ⭐ The rule: POSITIVE EVIDENCE of misattribution, never mere doubt
 ///
-/// The one caller is `ResumeUnconfirmed`, where drovr **observed a different
-/// session**. That is evidence the record does not describe the pane, and it is
-/// what authorises destroying an agent.
+/// The one caller is `ResumeEvidence::Contradicted`, where drovr **observed a
+/// different session**. That is evidence the record does not describe the pane,
+/// and it is what authorises destroying an agent.
 ///
-/// Two neighbouring failures deliberately do NOT call this:
+/// Three neighbouring failures deliberately do NOT call this:
+///
+/// * **`ResumeEvidence::Unobserved`** — the agent came up and herdr never
+///   reported which session it is in. Seeing nothing is not seeing a
+///   contradiction: the id can surface a moment after the agent does (see
+///   `a_session_that_shows_up_a_poll_late_is_still_a_confirmed_resume`), so
+///   this is the same "I don't know" as the next bullet and takes the same
+///   branch. Expressing the rule in terms of outcome VARIANTS rather than
+///   evidence is how this arm was missed once already — hence
+///   [`ResumeEvidence`] being an exhaustive enum.
 ///
 /// * **`NeverReady { resuming: true }`** — drovr observed *nothing*. This
 ///   branch is built on "the marker is the evidence; absence of confirmation is
@@ -1461,7 +1509,14 @@ pub fn phase_rehydrate<H: Herdr>(
     run: &mut RunState,
     phase: &str,
 ) -> io::Result<RehydrateOutcome> {
-    phase_rehydrate_with_timeout(h, run, phase, SEND_READY_TIMEOUT, POLL_INTERVAL)
+    phase_rehydrate_with_timeout(
+        h,
+        run,
+        phase,
+        SEND_READY_TIMEOUT,
+        CONFIRM_FLOOR,
+        POLL_INTERVAL,
+    )
 }
 
 /// [`phase_rehydrate`] with an injectable readiness timeout + poll interval, so
@@ -1472,6 +1527,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     run: &mut RunState,
     phase: &str,
     ready_timeout: Duration,
+    confirm_floor: Duration,
     poll_interval: Duration,
 ) -> io::Result<RehydrateOutcome> {
     require_phase_name(phase)?;
@@ -1793,7 +1849,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     let polling = Polling::until(Instant::now() + ready_timeout, poll_interval);
     let Some(ready) = wait_agent_ready_until(h, run, phase, polling) else {
         // ⚠️ THE PANE IS KEPT HERE, on every path, and the asymmetry with
-        // `ResumeUnconfirmed` below is deliberate.
+        // `ResumeEvidence::Contradicted` below is deliberate.
         //
         // `NeverReady` means drovr observed NOTHING — no status at all. This
         // branch is built on "the marker is the evidence; absence of
@@ -1835,30 +1891,43 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
                 launch.backend(),
                 &expected,
                 Some(ready),
-                polling,
+                // Whatever is left of the shared budget, but never less than
+                // the floor: a launch that spent it all must not get to decide
+                // whether the conversation came back. See `CONFIRM_FLOOR`.
+                polling.with_floor(confirm_floor),
             ) {
-                Ok(()) => RehydrateOutcome::Resumed,
-                Err(observed) => {
-                    // Confirmed would have made the record true of the pane.
-                    // Unconfirmed means drovr POSITIVELY OBSERVED a different
-                    // session, so the phase is recording a pane running someone
-                    // else's conversation — see `surrender_misattributed_pane`.
+                // ⭐ THE RULE, AT THE POINT THE DECISION IS MADE: a pane is
+                // surrendered only on evidence that it is running a DIFFERENT
+                // conversation. An exhaustive match over
+                // [`ResumeEvidence`] rather than a test on an `Option`, because
+                // "and what if we saw nothing" is exactly the arm that got
+                // missed when this was expressed as "not confirmed".
+                ResumeEvidence::Confirmed => RehydrateOutcome::Resumed,
+                ResumeEvidence::Contradicted(observed) => {
+                    // The phase is recording a pane running someone else's
+                    // conversation — see `surrender_misattributed_pane`.
                     //
                     // ⚠️ The `?` is load-bearing. A release that did not land
-                    // leaves `HoldsPane` answering for a pane that is gone, and
-                    // `ResumeUnconfirmed`'s note tells the operator the phase is
-                    // unchanged and a retry will work. Reporting that outcome
-                    // over a stuck registration is guidance that can only
-                    // mislead, so the failure becomes an error that says what
-                    // actually clears it. (`io::Result` is `#[must_use]` and
-                    // clippy runs at `-D warnings`, so this cannot be quietly
-                    // dropped back to a warning.)
+                    // leaves `HoldsPane` answering for a pane that is gone,
+                    // while this outcome's note tells the operator the phase is
+                    // unchanged and a retry will work. Reporting that over a
+                    // stuck registration is guidance that can only mislead, so
+                    // the failure becomes an error that says what actually
+                    // clears it. (`io::Result` is `#[must_use]` and clippy runs
+                    // at `-D warnings`, so this cannot be quietly dropped back
+                    // to a warning.)
                     surrender_misattributed_pane(h, run, phase, &pane)?;
-                    RehydrateOutcome::Incomplete(Unfinished::ResumeUnconfirmed {
+                    RehydrateOutcome::Incomplete(Unfinished::ResumeContradicted {
                         pane,
                         expected,
                         observed,
                     })
+                }
+                // NOTHING was observed, so nothing is destroyed — the same
+                // branch `NeverReady { resuming: true }` takes, for the same
+                // reason. The pane stays and the note sends the operator to it.
+                ResumeEvidence::Unobserved => {
+                    RehydrateOutcome::Incomplete(Unfinished::ResumeUnobserved { pane, expected })
                 }
             },
         );
@@ -2511,6 +2580,17 @@ impl Polling {
         Polling { deadline, interval }
     }
 
+    /// The same budget, but never leaving less than `floor` from now.
+    ///
+    /// EXTENDS only — a budget with time left is returned unchanged, so this
+    /// cannot be used to cut a wait short.
+    fn with_floor(self, floor: Duration) -> Polling {
+        Polling {
+            deadline: self.deadline.max(Instant::now() + floor),
+            ..self
+        }
+    }
+
     /// Sleep until the next attempt, or return `false` when the budget is spent.
     /// Never sleeps past the deadline.
     fn sleep(&self) -> bool {
@@ -2521,6 +2601,41 @@ impl Polling {
         thread::sleep(self.interval.min(self.deadline - now));
         true
     }
+}
+
+/// ⭐ **What drovr LEARNED about the agent it launched onto the new pane — the
+/// three epistemic states, kept apart because they authorise different things.**
+///
+/// This is an enum rather than a `Result<(), Option<SessionId>>` because the
+/// decision that reads it is *whether to destroy a live pane*, and the rule is:
+///
+/// > **drovr surrenders a pane only when it has SEEN a session that is not the
+/// > one it expected. Not when it has seen nothing.**
+///
+/// Stated in terms of the outcome variants instead of in terms of the evidence,
+/// that rule was applied one gate too narrowly once already: `NeverReady` was
+/// correctly spared, and then every unconfirmed resume — including the one that
+/// observed nothing at all — was surrendered anyway. An `Option` invites
+/// `is_none()` to be forgotten; an exhaustive `match` on named states does not,
+/// and a fourth state could not be added without every reader handling it.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeEvidence {
+    /// herdr reported the session drovr asked it to resume. The conversation is
+    /// back.
+    Confirmed,
+    /// herdr reported a DIFFERENT session. **Positive evidence** that the pane
+    /// is running a conversation this phase's record does not describe — the
+    /// only thing that authorises closing it.
+    Contradicted(SessionId),
+    /// herdr never reported a session at all within the budget. The agent may
+    /// be perfectly resumed and merely slow to surface its id (herdr reports
+    /// `Idle` before `agent_session` appears — see
+    /// `a_session_that_shows_up_a_poll_late_is_still_a_confirmed_resume`), or
+    /// the pane may be in trouble. **drovr does not know**, and this branch is
+    /// built on "absence of confirmation is not evidence", so nothing is
+    /// destroyed. Epistemically identical to `NeverReady`, and it takes the
+    /// same branch.
+    Unobserved,
 }
 
 /// Poll until herdr reports the agent on this phase's pane carrying `expected`
@@ -2548,7 +2663,7 @@ fn confirm_resumed_session<H: Herdr>(
     expected: &SessionId,
     first: Option<PaneInfo>,
     polling: Polling,
-) -> Result<(), Option<SessionId>> {
+) -> ResumeEvidence {
     // `resumable_for` is the same chokepoint a capture goes through: a path
     // session, one herdr attributes to a different agent, or none at all are
     // all "not the id we asked for".
@@ -2561,10 +2676,13 @@ fn confirm_resumed_session<H: Herdr>(
     let mut last = observed_in(&first);
     loop {
         if last.as_ref() == Some(expected) {
-            return Ok(());
+            return ResumeEvidence::Confirmed;
         }
         if !polling.sleep() {
-            return Err(last);
+            return match last {
+                Some(other) => ResumeEvidence::Contradicted(other),
+                None => ResumeEvidence::Unobserved,
+            };
         }
         let info = poll_phase_pane(h, run, phase);
         // Never overwrite something seen with nothing: an unreadable poll says
@@ -9587,6 +9705,7 @@ mod rehydrate_tests {
             &mut run,
             "legacy-not-prefixed",
             Duration::from_millis(50),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -9829,6 +9948,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -9839,16 +9959,18 @@ mod rehydrate_tests {
         let RehydrateOutcome::Incomplete(why) = &outcome else {
             panic!("a session that did not come back is not a resume: {outcome:?}");
         };
-        let Unfinished::ResumeUnconfirmed {
+        let Unfinished::ResumeContradicted {
             expected, observed, ..
         } = why
         else {
             panic!("the reason must say WHICH failure this is: {why:?}");
         };
         assert_eq!(expected.as_str(), "sess-abc");
-        assert!(
-            observed.as_ref().is_some_and(|o| o.as_str() != "sess-abc"),
-            "the id herdr DID report is the diagnostic: {observed:?}"
+        assert_ne!(
+            observed.as_str(),
+            "sess-abc",
+            "the id herdr DID report is the diagnostic — and it being a SESSION \
+             rather than an Option is what makes this arm the one that surrenders"
         );
         let note = why.note("rh-other-session", "plan");
         assert!(
@@ -9884,11 +10006,12 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
         assert!(
-            matches!(outcome, RehydrateOutcome::Incomplete(Unfinished::ResumeUnconfirmed { .. })),
+            matches!(outcome, RehydrateOutcome::Incomplete(Unfinished::ResumeContradicted { .. })),
             "{outcome:?}"
         );
         let on_disk = RunState::load("rh-keep-unconfirmed").unwrap();
@@ -9917,6 +10040,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -9970,6 +10094,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10012,6 +10137,122 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn a_slow_launch_cannot_starve_the_step_that_confirms_the_session() {
+        // Readiness and confirmation shared ONE budget, so a slow start ate
+        // most of it and left confirmation a sliver — making "no session seen"
+        // most likely exactly when the machine is loaded, i.e. when the agent
+        // is slowest to surface its id. That reports a resume which actually
+        // worked as unconfirmed, exit 2.
+        //
+        // Driven with a spent readiness budget and an explicit floor, so the
+        // wiring is pinned deterministically rather than by racing a clock: the
+        // agent is up on the FIRST poll (readiness returns before it ever tests
+        // the deadline), which leaves the shared budget already gone.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-starved-confirm");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // Up, but no session yet — the one-poll lag that is the whole reason
+        // confirmation needs time of its own.
+        h.push_pane_info(Some(crate::herdr::PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("rehydrated"),
+            agent_status: Some(crate::herdr::AgentStatus::Idle),
+            agent_session: None,
+        }));
+        script_resumed_session(&h, "sess-abc", "claude", 8);
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(0), // the shared budget is spent on arrival
+            Duration::from_millis(200), // …and confirmation still gets its floor
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RehydrateOutcome::Resumed,
+            "a launch that used the whole budget must not decide the answer"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_never_reports_any_session_keeps_its_pane_too() {
+        // ⚠️ THE ROUND-4 RULE, APPLIED ONE GATE LATER. The surrender fired on
+        // every unconfirmed resume, including the one where herdr reported NO
+        // session at all within the budget. That is the same epistemic state
+        // `NeverReady` is in — drovr saw nothing — one readiness gate further
+        // on, and it was destroying a pane on exactly the evidence the rule
+        // says may not authorise it.
+        //
+        // The window is real, not theoretical: herdr can report `Idle` while
+        // `agent_session` is still absent, which is precisely what
+        // `a_session_that_shows_up_a_poll_late_is_still_a_confirmed_resume`
+        // covers from the other side — there the id eventually arrives; here
+        // the budget runs out first.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-no-session-seen");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // Up and healthy, but herdr never surfaces a session.
+        for _ in 0..80 {
+            h.push_pane_info(Some(crate::herdr::PaneInfo {
+                tab_id: FakeHerdr::tab_id_for("rehydrated"),
+                agent_status: Some(crate::herdr::AgentStatus::Idle),
+                agent_session: None,
+            }));
+        }
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
+            panic!("a resume drovr could not confirm is not a success: {outcome:?}");
+        };
+        assert!(
+            matches!(why, Unfinished::ResumeUnobserved { .. }),
+            "seeing NOTHING is its own answer, not a contradiction: {why:?}"
+        );
+        assert!(
+            !run.find_phase("plan").unwrap().is_reaped(),
+            "nothing was observed, so nothing may be destroyed: {:?}",
+            run.find_phase("plan")
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.starts_with("pane_close")),
+            "{:?}",
+            h.calls()
+        );
+        // …and the token is still there either way.
+        let on_disk = RunState::load("rh-no-session-seen").unwrap();
+        assert_eq!(
+            on_disk
+                .find_phase("plan")
+                .and_then(|p| p.resume_target())
+                .map(|t| t.session().as_str().to_owned()),
+            Some("sess-abc".to_string()),
+        );
+        // The note must send the operator to the pane that is still there, and
+        // say what a retry will run into.
+        let note = why.note("rh-no-session-seen", "plan");
+        let pane = run.find_phase("plan").unwrap().pane_id().unwrap();
+        assert!(note.contains(pane), "{note}");
+        assert!(note.contains("still holds pane"), "{note}");
+    }
+
+    #[test]
     fn a_reseed_that_is_incomplete_keeps_its_pane_because_the_record_fits_it() {
         // The control for the test above, and the reason the rule is stated as
         // "does the record describe the agent in the pane" rather than
@@ -10035,6 +10276,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10077,6 +10319,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(50),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10109,6 +10352,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(200),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10138,6 +10382,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10169,9 +10414,10 @@ mod rehydrate_tests {
         // (`phase wait` exit 4, `diagnose_stuck_phase`); closing the pane
         // throws it away and cannot be undone.
         //
-        // `ResumeUnconfirmed` is the opposite and DOES surrender: there drovr
+        // `ResumeContradicted` is the opposite and DOES surrender: there drovr
         // positively observed a DIFFERENT session, so the record demonstrably
-        // does not describe that pane. See
+        // does not describe that pane. `ResumeUnobserved` — up, but no session
+        // reported — sits on THIS side of the line with `NeverReady`. See
         // `an_unconfirmed_resume_gives_its_pane_back_so_the_phase_can_be_retried`.
         assert!(
             !run.find_phase("plan").unwrap().is_reaped(),
@@ -10238,6 +10484,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
@@ -10292,6 +10539,7 @@ mod rehydrate_tests {
             &mut run,
             "plan",
             Duration::from_millis(20),
+            Duration::from_millis(0), // no confirmation floor: keep the wait bounded in tests
             Duration::from_millis(1),
         )
         .unwrap();
