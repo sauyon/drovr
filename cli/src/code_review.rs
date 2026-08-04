@@ -356,7 +356,7 @@ pub fn code_review_brief(
 /// iterates configured angles), so counting it as "still running" would hold the
 /// iteration open forever and keep re-banking a finished pass's results.
 fn resumable_iter(run: &RunState, task: &str, angles: &[String]) -> Option<u64> {
-    let prefix = format!("review:{task}:");
+    let prefix = format!("{}{task}:", crate::run::REVIEWER_PREFIX);
     let newest = run
         .review_phases
         .iter()
@@ -385,7 +385,7 @@ fn iter_head_path(dir: &Path, task: &str, iter: u64) -> std::path::PathBuf {
 /// (`--fresh`, a moved HEAD, or a previous pass that ran to completion) so its
 /// markers/phase names never collide with an earlier iteration's leftovers.
 fn next_iter(run: &RunState, task: &str) -> u64 {
-    let prefix = format!("review:{task}:");
+    let prefix = format!("{}{task}:", crate::run::REVIEWER_PREFIX);
     run.review_phases
         .iter()
         .filter_map(|p| p.name.strip_prefix(&prefix))
@@ -1050,7 +1050,7 @@ pub fn code_review_run<H: Herdr>(
     let mut banked: Vec<(String, Review)> = Vec::new();
     let mut pending: Vec<(String, String)> = Vec::new();
     for angle in &cfg.angles {
-        let phase = format!("review:{task}:{iter}:{angle}");
+        let phase = crate::run::reviewer_phase_name(task, iter, angle);
         if resumed.is_some() {
             // A delivered verdict is banked on its own evidence — NOT gated on the
             // recorded status. Requiring `Done` here was half of a livelock: an angle
@@ -1397,7 +1397,7 @@ mod tests {
     /// Drop the done marker for ONE angle — models a reviewer that finished while
     /// its panel-mates are still working (the resume path's whole reason to exist).
     fn drop_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
-        let name = format!("review:{task}:{iter}:{angle}");
+        let name = crate::run::reviewer_phase_name(task, iter, angle);
         let m = done_marker(&run.name, &name);
         std::fs::create_dir_all(m.parent().unwrap()).unwrap();
         std::fs::write(&m, b"").unwrap();

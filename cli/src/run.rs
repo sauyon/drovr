@@ -386,6 +386,38 @@ impl Phase {
     }
 }
 
+/// The prefix every review-panel agent's phase name carries.
+///
+/// Spelled once so [`reviewer_phase_name`] and [`is_reviewer_phase_name`]
+/// cannot disagree about the shape, and so the per-task scans in
+/// `code_review.rs` build their prefixes from the same constant.
+pub const REVIEWER_PREFIX: &str = "review:";
+
+/// The name a review-panel agent runs under. **The only place this shape is
+/// constructed.**
+pub fn reviewer_phase_name(task: &str, iter: u64, angle: &str) -> String {
+    format!("{REVIEWER_PREFIX}{task}:{iter}:{angle}")
+}
+
+/// Whether `name` identifies a review-panel agent.
+///
+/// ⭐ **Identity, not list membership, and that distinction was a real bug.**
+/// The rehydrate refusal used to ask `review_phases.iter().any(|p| p.name ==
+/// name)` — but a reviewer-shaped name is a perfectly legal `phase_start` name,
+/// so `drovr phase start <run> review:t:1:security` registered one in `phases`,
+/// where that scan could not see it. The impostor then passed
+/// [`RunState::rehydratable`], rendered a ⟳, and was relaunched with
+/// `readonly = false` and no findings MCP — the exact two things
+/// [`NotRehydratable::Reviewer`] exists to prevent.
+///
+/// So there is ONE predicate and both gates ask it: the creation gate in
+/// `phase_start` (which now refuses to mint such a name at all — the panel
+/// mints them) and the rehydrate gate here. A name cannot drift from a list it
+/// is not consulted against.
+pub fn is_reviewer_phase_name(name: &str) -> bool {
+    name.starts_with(REVIEWER_PREFIX)
+}
+
 /// Why a phase cannot be rehydrated — see [`RunState::rehydratable`].
 ///
 /// An enum rather than a bool because each arm needs a *different* thing said
@@ -1031,7 +1063,12 @@ impl RunState {
         // `NotRehydratable::Reviewer`. Categorical, so it is answered before the
         // per-phase state: "attach to its pane instead" would be advice toward a
         // recovery that does not exist.
-        if self.review_phases.iter().any(|p| p.name == name) {
+        //
+        // Asked of the NAME, not of `review_phases` membership: a
+        // reviewer-shaped name in `phases` is still a reviewer, and asking the
+        // list let exactly that impostor through — see
+        // [`is_reviewer_phase_name`].
+        if is_reviewer_phase_name(name) {
             return Err(NotRehydratable::Reviewer);
         }
         phase.phase_level_rehydratable()?;

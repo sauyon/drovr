@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::config::{AgentLaunch, load_config};
 use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, PromptOutcome, SessionId};
-use crate::run::{NotRehydratable, PassToken, Phase, PhaseStatus, RunState, run_dir};
+use crate::run::{
+    NotRehydratable, PassToken, Phase, PhaseStatus, REVIEWER_PREFIX, RunState,
+    is_reviewer_phase_name, run_dir,
+};
 use crate::shell::shell_single_quote;
 
 /// How often `phase_wait` polls the filesystem for the completion marker, and
@@ -757,6 +760,25 @@ pub fn phase_start<H: Herdr>(
     // working, on the recovery drovr itself suggests.
     if find_phase_idx(run, phase).is_none() {
         require_new_phase_name(phase)?;
+        // A reviewer-shaped name is a REVIEWER's, whether or not one exists
+        // yet. The membership check below only sees reviewers already spawned,
+        // so without this a pipeline phase could be created under a panel name
+        // — and it then passed the rehydrate gate's reviewer refusal (which
+        // scanned `review_phases`), rendered a ⟳, and relaunched as a WRITER
+        // with no findings channel. One predicate, both gates: see
+        // `crate::run::is_reviewer_phase_name`.
+        if is_reviewer_phase_name(phase) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase name {phase:?} is reserved for review-panel agents (anything \
+                     starting with {REVIEWER_PREFIX:?}), which only `drovr code-review run` \
+                     spawns — it writes them into the run's reviewer list and gives them a \
+                     findings channel, neither of which `phase start` can do. Pick another \
+                     name."
+                ),
+            ));
+        }
         // A name a REVIEWER already answers to is not free, even though
         // `find_phase_idx` (which searches `phases` only) says it is.
         require_name_unclaimed(&run.review_phases, phase, "a reviewer", &run.name)?;
@@ -9425,6 +9447,69 @@ mod rehydrate_tests {
             "a phase that recorded no profile is launched under the DEFAULT one, \
              not under whatever this process happens to hold: {relaunch}"
         );
+    }
+
+    #[test]
+    fn a_reviewer_named_phase_cannot_smuggle_itself_past_the_reviewer_refusal() {
+        // The reviewer refusal was answered by LIST MEMBERSHIP
+        // (`review_phases.iter().any(…)`), not by identity. But
+        // `review:<task>:<iter>:<angle>` is a legal `phase_start` name —
+        // `require_name_unclaimed` checked `review_phases` only — so
+        // `drovr phase start <run> review:…` registered one in `phases`, where
+        // the membership test could not see it. Such a phase passed
+        // `rehydratable`, showed the ⟳, and was relaunched with
+        // `readonly=false` and no findings MCP: exactly the two things #9's
+        // refusal exists to make impossible.
+        //
+        // Same class as #4 — two answers to one question — so it is fixed with
+        // ONE predicate at both gates, not a third check.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-impostor");
+
+        // (a) the creation gate refuses to mint one in the first place.
+        let h = FakeHerdr::new();
+        let err = phase_start(&h, &mut run, "review:task-1:1:security", None)
+            .expect_err("a reviewer name belongs to the panel, not to phase start");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("code-review"),
+            "must name what does spawn reviewers: {err}"
+        );
+        assert!(
+            run.phases.iter().all(|p| p.name != "review:task-1:1:security"),
+            "and nothing was registered: {:?}",
+            run.phases.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        // (b) and one that got in by an older build is still refused, because
+        //     the rehydrate gate asks the NAME, not which list it landed in.
+        run.phases
+            .push(reaped_phase("review:task-1:1:security", "claude", None, Some("s")));
+        run.save().unwrap();
+        assert_eq!(
+            run.rehydratable("review:task-1:1:security"),
+            Err(crate::run::NotRehydratable::Reviewer),
+            "identity, not membership: {:?}",
+            run.find_phase("review:task-1:1:security")
+        );
+        let err = phase_rehydrate(&h, &mut run, "review:task-1:1:security")
+            .expect_err("an impostor reviewer must be refused too");
+        assert!(err.to_string().contains("review-panel agent"), "{err}");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("tab_create")),
+            "nothing launched: {:?}",
+            h.calls()
+        );
+
+        // (c) ⚠️ and the prefix must not swallow the PIPELINE phase `drovr new`
+        //     seeds under the name "review". It is not `review:`-prefixed, it
+        //     is an ordinary phase, and it stays rehydratable — a prefix test
+        //     that got this wrong would silently remove the ⟳ from a real
+        //     phase of every run.
+        assert!(!crate::run::is_reviewer_phase_name("review"));
+        run.phases.push(reaped_phase("review", "claude", None, Some("s2")));
+        run.save().unwrap();
+        assert_eq!(run.rehydratable("review"), Ok(()));
     }
 
     #[test]
