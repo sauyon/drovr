@@ -82,6 +82,62 @@ impl Default for ReflexConfig {
     }
 }
 
+/// What the `SessionStart` reflex is allowed to see of `[reflex]`.
+///
+/// `per_turn` is deliberately absent: it governs the gate, and a renderer that
+/// cannot name it cannot accidentally branch on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionReflex<'a> {
+    pub enabled: bool,
+    pub preamble: Option<&'a str>,
+    pub sections: &'a BTreeMap<String, bool>,
+}
+
+/// What the per-turn gate is allowed to see of `[reflex]`.
+///
+/// `preamble` and `sections` are deliberately absent: the gate card is a `const`
+/// with no framing and no sections, so a gate that *could* read them would be a
+/// gate someone could plausibly expect to honour them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateReflex {
+    pub enabled: bool,
+    pub per_turn: bool,
+}
+
+impl ReflexConfig {
+    /// The `SessionStart` reflex's view.
+    ///
+    /// **One deserialized surface, two narrow views — deliberately not two
+    /// tables.** `ReflexConfig` is parsed straight out of the user's
+    /// `config.toml`, so its *shape* is a public schema: splitting it into
+    /// `[reflex.session]` / `[reflex.gate]` would silently stop reading every
+    /// `config.toml` already written. The confusion worth fixing is that
+    /// `preamble`/`sections` and `per_turn` drive disjoint code paths, and that
+    /// is a property of the *consumers*, not of the file. So the file keeps one
+    /// flat `[reflex]` table and each consumer is handed only its own fields —
+    /// which makes applying the wrong field unrepresentable at the boundary
+    /// where it would actually be wrong.
+    ///
+    /// `reflex_config_keeps_its_flat_toml_schema` pins the file half of that
+    /// bargain.
+    pub fn session(&self) -> SessionReflex<'_> {
+        SessionReflex {
+            enabled: self.enabled,
+            preamble: self.preamble.as_deref(),
+            sections: &self.sections,
+        }
+    }
+
+    /// The per-turn gate's view. See [`ReflexConfig::session`] for why this is a
+    /// view rather than a nested table.
+    pub fn gate(&self) -> GateReflex {
+        GateReflex {
+            enabled: self.enabled,
+            per_turn: self.per_turn,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
     #[serde(default = "default_agent")]
@@ -783,6 +839,90 @@ escalation = true
         assert_eq!(
             cfg.reflex.preamble.as_deref(),
             Some("only a preamble here")
+        );
+    }
+
+    #[test]
+    fn reflex_config_keeps_its_flat_toml_schema() {
+        // THE POINT OF THIS TEST: `ReflexConfig` is deserialized straight out of
+        // the user's config.toml, so its shape is a PUBLIC SCHEMA. The
+        // consumer-facing split into `session()` / `gate()` views is allowed
+        // precisely because it leaves this file format untouched — and a
+        // refactor of a config type that nobody proved still reads old configs
+        // is exactly the failure class this repo keeps hitting.
+        //
+        // So: one flat `[reflex]` table naming ALL FOUR keys plus a
+        // `[reflex.sections]` subtable — i.e. everything a user could already
+        // have written — must still parse, and parse to these values.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[reflex]\n\
+             enabled = true\n\
+             per_turn = false\n\
+             preamble = \"BESPOKE FRAMING\"\n\
+             \n\
+             [reflex.sections]\n\
+             escalation = false\n\
+             methodology = true\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap().reflex;
+        assert!(cfg.enabled);
+        assert!(!cfg.per_turn);
+        assert_eq!(cfg.preamble.as_deref(), Some("BESPOKE FRAMING"));
+        assert_eq!(cfg.sections.get("escalation"), Some(&false));
+        assert_eq!(cfg.sections.get("methodology"), Some(&true));
+
+        // Each view carries its own fields and no others — the whole reason the
+        // split exists. Asserted on the SAME parsed config, so this cannot pass
+        // by testing a hand-built value that no config.toml produces.
+        let session = cfg.session();
+        assert_eq!(session.enabled, cfg.enabled);
+        assert_eq!(session.preamble, Some("BESPOKE FRAMING"));
+        assert_eq!(session.sections, &cfg.sections);
+
+        let gate = cfg.gate();
+        assert_eq!(
+            gate,
+            GateReflex {
+                enabled: true,
+                per_turn: false
+            },
+            "the gate view must carry enabled and per_turn, and nothing else"
+        );
+    }
+
+    #[test]
+    fn nested_reflex_tables_are_not_the_schema() {
+        // The guard on the other direction: if someone later "fixes" the flat
+        // struct by moving to `[reflex.session]` / `[reflex.gate]`, every
+        // config.toml already on disk keeps parsing (unknown tables are
+        // ignored) while silently reverting to defaults — a change that is
+        // invisible to every other test in this file. Pinning the flat spelling
+        // here makes that migration fail loudly instead.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[reflex.gate]\nper_turn = false\n",
+        )
+        .unwrap();
+        set_config_home(tmp.path());
+
+        let cfg = load_config().unwrap().reflex;
+        assert!(
+            cfg.per_turn,
+            "`per_turn` lives at the top of [reflex], not under [reflex.gate]; \
+             if this ever starts passing, the schema moved and every existing \
+             config.toml silently lost its setting"
         );
     }
 

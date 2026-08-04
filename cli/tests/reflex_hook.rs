@@ -1084,3 +1084,60 @@ fn user_prompt_hook_runs_as_hooks_json_invokes_it() {
         );
     }
 }
+
+#[test]
+fn session_only_config_keys_do_not_reach_the_gate_card() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The reviewer's exact gap: `preamble` and `[reflex.sections]` shape the
+    // SessionStart reflex and must not touch the gate card, and nothing
+    // asserted it. The `session()` / `gate()` split now makes reading them
+    // from the gate a compile error — but a type cannot prove the END-TO-END
+    // behaviour, only that one function cannot name one field. So drive both
+    // hooks through the SAME config and assert the split holds where a user
+    // would see it.
+    let cfg = tempfile::tempdir().unwrap();
+    write_config(
+        cfg.path(),
+        "[reflex]\npreamble = \"BESPOKE REFLEX FRAMING LINE\"\n\n\
+         [reflex.sections]\nescalation = false\n",
+    );
+
+    let gate = injected_context(
+        &ok_stdout(run_hook(USER_PROMPT, None, cfg.path())),
+        "UserPromptSubmit",
+    );
+    let baseline = {
+        let plain = tempfile::tempdir().unwrap();
+        injected_context(
+            &ok_stdout(run_hook(USER_PROMPT, None, plain.path())),
+            "UserPromptSubmit",
+        )
+    };
+    assert_eq!(
+        gate, baseline,
+        "session-only keys must leave the gate card byte-identical"
+    );
+    assert!(
+        !gate.contains("BESPOKE REFLEX FRAMING LINE"),
+        "the preamble must not reach the gate card, got:\n{gate}"
+    );
+
+    // ...and the same config demonstrably DOES reach the SessionStart reflex,
+    // so this is a test about routing rather than a test that the config file
+    // was ignored altogether.
+    let session = injected_context(
+        &ok_stdout(run_hook(SESSION_START, None, cfg.path())),
+        "SessionStart",
+    );
+    assert!(
+        session.contains("BESPOKE REFLEX FRAMING LINE"),
+        "the preamble must still reach the SessionStart reflex, got:\n{session}"
+    );
+    assert!(
+        !session.contains("Escalation contract"),
+        "the disabled section must still be subtracted from the SessionStart reflex"
+    );
+}

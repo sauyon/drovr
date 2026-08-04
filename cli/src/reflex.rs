@@ -11,7 +11,7 @@
 //!
 //! [`reflex_json`] threads them together and honors the master `enabled` switch.
 
-use crate::config::ReflexConfig;
+use crate::config::{GateReflex, SessionReflex};
 use std::collections::BTreeMap;
 
 /// Built-in framing placed before the skill body when config sets no `preamble`.
@@ -139,12 +139,36 @@ pub fn wrap(body: &str, preamble: Option<&str>) -> String {
     format!("<EXTREMELY_IMPORTANT>\n{preamble}\n\n{body}\n</EXTREMELY_IMPORTANT>")
 }
 
-/// Package `context` as the JSON a Claude Code hook consumes for `event`
-/// (`SessionStart` for the full reflex, `UserPromptSubmit` for the gate).
-pub fn envelope(event: &str, context: &str) -> String {
+/// The Claude Code hook events drovr emits for.
+///
+/// Claude Code ROUTES on `hookEventName`, so a misspelled literal does not fail
+/// — it produces well-formed JSON that is delivered to the wrong place or not at
+/// all. Two legal values, confined to the type system, so no call site can spell
+/// them at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// The full router-skill injection, from `hooks/session-start`.
+    SessionStart,
+    /// The per-turn gate card, from `hooks/user-prompt`.
+    UserPromptSubmit,
+}
+
+impl HookEvent {
+    /// The wire name Claude Code matches on. These strings are the harness's,
+    /// not drovr's — do not "tidy" them.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+        }
+    }
+}
+
+/// Package `context` as the JSON a Claude Code hook consumes for `event`.
+pub fn envelope(event: HookEvent, context: &str) -> String {
     let value = serde_json::json!({
         "hookSpecificOutput": {
-            "hookEventName": event,
+            "hookEventName": event.as_str(),
             "additionalContext": context,
         }
     });
@@ -153,13 +177,16 @@ pub fn envelope(event: &str, context: &str) -> String {
 }
 
 /// The full JSON to emit for the reflex, or `None` when the reflex is disabled.
-pub fn reflex_json(skill_md: &str, cfg: &ReflexConfig) -> Option<String> {
+///
+/// Takes the [`SessionReflex`] view rather than the whole `[reflex]` table, so
+/// this function cannot read — or be believed to honour — `per_turn`.
+pub fn reflex_json(skill_md: &str, cfg: SessionReflex<'_>) -> Option<String> {
     if !cfg.enabled {
         return None;
     }
-    let body = render_body(skill_md, &cfg.sections);
-    let context = wrap(&body, cfg.preamble.as_deref());
-    Some(envelope("SessionStart", &context))
+    let body = render_body(skill_md, cfg.sections);
+    let context = wrap(&body, cfg.preamble);
+    Some(envelope(HookEvent::SessionStart, &context))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,14 +246,14 @@ const GATE_CARD_PHRASES: &[&str] = &["<SUBAGENT-STOP>", "Single writer", "drovr:
 /// open toward emitting**: an absent or unreadable transcript path is not
 /// evidence that a skill was invoked, and silent drift costs more than a
 /// redundant 600-byte injection.
-pub fn gate_json(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String> {
+pub fn gate_json(cfg: GateReflex, transcript: Option<&str>) -> Option<String> {
     if !cfg.enabled || !cfg.per_turn {
         return None;
     }
     if transcript.is_some_and(skill_invoked_last_turn) {
         return None;
     }
-    Some(envelope("UserPromptSubmit", GATE_CARD))
+    Some(envelope(HookEvent::UserPromptSubmit, GATE_CARD))
 }
 
 /// True if the assistant turn since the last user message invoked a `drovr:*`
@@ -492,6 +519,7 @@ pub fn transcript_path_from_hook_input(hook_json: &str) -> Option<std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReflexConfig;
 
     /// A compact synthetic skill body with two tagged sections and an untagged
     /// header, so section-toggling is exercised without depending on SKILL.md.
@@ -557,7 +585,7 @@ mod tests {
 
     #[test]
     fn envelope_is_valid_sessionstart_json() {
-        let json = envelope("SessionStart", "HELLO <EXTREMELY_IMPORTANT> \"quoted\"");
+        let json = envelope(HookEvent::SessionStart, "HELLO <EXTREMELY_IMPORTANT> \"quoted\"");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"].as_str(),
@@ -629,13 +657,13 @@ mod tests {
             enabled: false,
             ..ReflexConfig::default()
         };
-        assert_eq!(reflex_json(SAMPLE, &cfg), None);
+        assert_eq!(reflex_json(SAMPLE, cfg.session()), None);
     }
 
     #[test]
     fn reflex_json_some_when_enabled_carries_body() {
         let cfg = ReflexConfig::default();
-        let json = reflex_json(SAMPLE, &cfg).expect("enabled reflex must emit");
+        let json = reflex_json(SAMPLE, cfg.session()).expect("enabled reflex must emit");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let ctx = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -716,7 +744,7 @@ mod tests {
 
     /// The rendered `additionalContext` of a gate emission, or `None`.
     fn gate_context(cfg: &ReflexConfig, transcript: Option<&str>) -> Option<String> {
-        let json = gate_json(cfg, transcript)?;
+        let json = gate_json(cfg.gate(), transcript)?;
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"].as_str(),
@@ -765,8 +793,25 @@ mod tests {
     }
 
     #[test]
+    fn hook_event_wire_names_are_the_harness_spelling() {
+        // The enum stops a call site MISSPELLING the event; it cannot stop the
+        // enum itself carrying the wrong string. Claude Code routes on these
+        // exact names, and a wrong one produces well-formed JSON that is
+        // delivered nowhere — so the two spellings are pinned literally, here,
+        // once. They are the harness's names, not drovr's.
+        assert_eq!(HookEvent::SessionStart.as_str(), "SessionStart");
+        assert_eq!(HookEvent::UserPromptSubmit.as_str(), "UserPromptSubmit");
+        // And the two are distinct, so a copy-paste collapse of the match arms
+        // cannot pass by making both variants render the same name.
+        assert_ne!(
+            HookEvent::SessionStart.as_str(),
+            HookEvent::UserPromptSubmit.as_str()
+        );
+    }
+
+    #[test]
     fn envelope_carries_event_name() {
-        let json = envelope("UserPromptSubmit", "BODY");
+        let json = envelope(HookEvent::UserPromptSubmit, "BODY");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"].as_str(),
@@ -784,14 +829,14 @@ mod tests {
             enabled: false,
             ..ReflexConfig::default()
         };
-        assert_eq!(gate_json(&cfg, None), None);
+        assert_eq!(gate_json(cfg.gate(), None), None);
         // The master switch outranks the per-turn key even when it is on.
         let cfg = ReflexConfig {
             enabled: false,
             per_turn: true,
             ..ReflexConfig::default()
         };
-        assert_eq!(gate_json(&cfg, None), None);
+        assert_eq!(gate_json(cfg.gate(), None), None);
     }
 
     #[test]
@@ -801,14 +846,14 @@ mod tests {
             ..ReflexConfig::default()
         };
         assert!(cfg.enabled, "this test must isolate per_turn from enabled");
-        assert_eq!(gate_json(&cfg, None), None);
+        assert_eq!(gate_json(cfg.gate(), None), None);
     }
 
     #[test]
     fn gate_emitted_when_transcript_absent() {
         // Fail-open toward EMITTING: an absent or unreadable transcript_path
         // yields `None`, and drift is worse than a redundant injection.
-        assert!(gate_json(&ReflexConfig::default(), None).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), None).is_some());
     }
 
     #[test]
@@ -820,7 +865,7 @@ mod tests {
             assistant_text("wrote the failing test")
         );
         assert!(skill_invoked_last_turn(&t));
-        assert_eq!(gate_json(&ReflexConfig::default(), Some(&t)), None);
+        assert_eq!(gate_json(ReflexConfig::default().gate(), Some(&t)), None);
     }
 
     #[test]
@@ -832,7 +877,7 @@ mod tests {
             assistant_text("here is what I found")
         );
         assert!(!skill_invoked_last_turn(&t));
-        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), Some(&t)).is_some());
     }
 
     #[test]
@@ -872,7 +917,7 @@ mod tests {
             skill_invoked_last_turn(&t),
             "the skill-body injection must not be read as a fresh prompt"
         );
-        assert_eq!(gate_json(&ReflexConfig::default(), Some(&t)), None);
+        assert_eq!(gate_json(ReflexConfig::default().gate(), Some(&t)), None);
     }
 
     #[test]
@@ -921,7 +966,7 @@ mod tests {
             assistant_text("that skill does not exist, continuing without it")
         );
         assert!(!skill_invoked_last_turn(&t));
-        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), Some(&t)).is_some());
     }
 
     #[test]
@@ -1010,7 +1055,7 @@ mod tests {
             assistant_text("sure")
         );
         assert!(!skill_invoked_last_turn(&t));
-        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), Some(&t)).is_some());
     }
 
     #[test]
@@ -1132,7 +1177,7 @@ mod tests {
             !skill_invoked_last_turn(&t),
             "an unparseable line must end the turn, not be stepped over"
         );
-        assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), Some(&t)).is_some());
     }
 
     #[test]
@@ -1181,7 +1226,7 @@ mod tests {
                 !skill_invoked_last_turn(&t),
                 "an unreadable user record must end the turn, got suppression on {odd}"
             );
-            assert!(gate_json(&ReflexConfig::default(), Some(&t)).is_some());
+            assert!(gate_json(ReflexConfig::default().gate(), Some(&t)).is_some());
         }
     }
 
@@ -1394,7 +1439,7 @@ mod tests {
         let got = read_hook_input(huge.as_bytes());
         assert_eq!(got.len(), HOOK_STDIN_MAX_BYTES as usize);
         assert_eq!(transcript_path_from_hook_input(&got), None);
-        assert!(gate_json(&ReflexConfig::default(), None).is_some());
+        assert!(gate_json(ReflexConfig::default().gate(), None).is_some());
 
         // A normal payload is unaffected.
         let payload = r#"{"transcript_path":"/p/t.jsonl"}"#;

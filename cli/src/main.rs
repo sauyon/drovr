@@ -953,7 +953,7 @@ fn cmd_reflex(mode: ReflexMode<'_>) {
     });
     // `reflex_json` is the single authority on the `enabled` switch: it returns
     // `None` (emit nothing) when the reflex is disabled, `Some(json)` otherwise.
-    if let Some(json) = reflex::reflex_json(&skill_md, &cfg.reflex) {
+    if let Some(json) = reflex::reflex_json(&skill_md, cfg.reflex.session()) {
         println!("{json}");
     }
 }
@@ -1003,7 +1003,7 @@ fn cmd_reflex_gate(cfg: &config::ReflexConfig) {
     let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
         .and_then(|p| reflex::read_transcript_tail(&p));
 
-    if let Some(json) = reflex::gate_json(cfg, transcript.as_deref()) {
+    if let Some(json) = reflex::gate_json(cfg.gate(), transcript.as_deref()) {
         println!("{json}");
     }
 }
