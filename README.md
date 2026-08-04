@@ -106,6 +106,12 @@ stays available either way — including its sweep.
 Reaping a phase does not change its status; it says something about the pane,
 not about whether the work finished. Bring it back with `drovr phase rehydrate`.
 
+**At the two automatic triggers, reaping is best-effort throughout.** A pane that
+will not close, a herdr that cannot be reached, or a lost race for the run lock
+all produce a warning on stderr and leave the phase untouched — the command that
+triggered the reap still succeeds. `drovr phase start` exiting 0 therefore means
+the phase started, not that anything was reaped. See `run.lock` below.
+
 ### Resuming an agent's session
 
 `drovr phase rehydrate` relaunches a phase and asks the backend to resume the
@@ -252,6 +258,12 @@ backend to resume the recorded session:
   evidence); a fresh agent is up and the phase has no seed to give it; or the
   seed could not be delivered.
 
+**Rehydrate restores the pane, never the instruction.** Even on exit 0 the agent
+is idle until you tell it something — `Resumed` gives it back its conversation,
+`Reseeded` gives a fresh agent the handoff, and neither is the thing you were
+about to send. Follow every successful rehydrate with the `drovr phase send` you
+were trying to make in the first place.
+
 It **refuses a reviewer phase**, and that refusal is the design: a reviewer
 delivers its findings through drovr's MCP findings server, which is handed over
 on the command line at launch and cannot be re-attached to a resumed session. A
@@ -355,7 +367,22 @@ The server reads and writes these files in each run dir:
 |---|---|---|
 | `<phase>.done` | `drovr phase done` | Completion marker, stamped with the pass token of the agent that wrote it. `drovr phase wait` accepts it only if that token matches the phase's current `pass`, which is what stops a previous pass's still-live agent from completing the current one. |
 | `<phase>-HANDOFF.md` | the finishing phase agent | See above; `drovr collect` reads it. |
-| `run.lock` | any command that reaps or rehydrates | The exclusive lock serializing the commands that move a run's panes around: `drovr phase rehydrate` and `drovr phase reap` directly, and `drovr phase start` / `drovr code-review run` through the reaping they trigger. Rehydrate and reap are the same read-modify-write over `pane_id` in opposite directions, so they share one lock — reaping a phase a rehydrate is bringing back would end with a live pane nothing records. Advisory and kernel-held, so a crashed holder leaves nothing stale; a second command **fails rather than queues**, since the holder may be inside a 30 s readiness wait. (Named `rehydrate.lock` while rehydrate was its only holder.) |
+| `run.lock` | any command that reaps or rehydrates | The exclusive lock serializing the commands that move a run's panes around: `drovr phase rehydrate` and `drovr phase reap` directly, and `drovr phase start` / `drovr code-review run` through the reaping they trigger. Rehydrate and reap are the same read-modify-write over `pane_id` in opposite directions, so they share one lock — reaping a phase a rehydrate is bringing back would end with a live pane nothing records. Advisory and kernel-held, so a crashed holder leaves nothing stale. Contention **never queues**, but what it costs depends on who lost — see below. (Named `rehydrate.lock` while rehydrate was its only holder.) |
+
+**Losing the `run.lock` race is not an error for the commands that reap as a
+side effect.** Two different behaviours, and the difference is what a driver can
+conclude from an exit code:
+
+| Path | On contention |
+|---|---|
+| `drovr phase rehydrate` / `drovr phase reap` — the lock *is* the command | **Exit 1.** The refusal names the run and says another command is moving its panes. |
+| `drovr phase start` / `drovr code-review run` — the reap and the sweep are a side effect | **A warning on stderr, and exit 0 anyway.** The phase still started, or the panel still returned its verdict; only the reaping was skipped. |
+
+So **exit 0 from `phase start` does not mean the reap ran.** The stderr warning
+is the only signal you get, and nothing retries — the panes are picked up at the
+next trigger, or by `drovr phase reap` / `drovr cleanup`. This is deliberate: a
+reap that could fail a launch would make a bookkeeping step able to break the
+run it is tidying up after.
 
 ## Review loop flow
 
