@@ -1,7 +1,7 @@
 //! Validates every `skills/*/SKILL.md` in the repo and enforces a body-size
 //! budget on the four `drovr:*` methodology skills.
 //!
-//! Four assertions:
+//! Five assertions:
 //!   1. **All** skills have valid frontmatter: a leading `---` block containing
 //!      non-empty `name:` and `description:`, and `name:` equals the directory
 //!      name.
@@ -12,15 +12,18 @@
 //!   3. The arm snapshots under `docs/skill-evidence/arms/<arm>/` still hash to
 //!      the values `arms/MANIFEST.md` records — arm A (pre-fix) and arm A′ (fix 1
 //!      alone). Each existed on disk for one moment and is unrecoverable without
-//!      a checkout afterwards, so these are tripwires, not formalities. Fix 1 is
-//!      also asserted directly: no shipped skill scopes its trigger to a drovr
-//!      phase.
-//!   4. No markdown file under `skills/` shares an 8-word run with the
+//!      a checkout afterwards, so these are tripwires, not formalities.
+//!   4. The three phase-scoping literals fix 1 removed do not reappear in any
+//!      `skills/*/SKILL.md` (spec §9.1 check 3). Exactly those three literals,
+//!      case-insensitively — **not** the general property "no skill scopes its
+//!      trigger to a phase", which no test here checks. See
+//!      [`no_phase_scoped_description_literals`].
+//!   5. No markdown file under `skills/` shares an 8-word run with the
 //!      superpowers corpus. drovr ports mechanisms from superpowers and writes
 //!      its own sentences (spec §2.1 exception 2); this is the check that says
 //!      so with evidence rather than intent.
 //!
-//! Assertions 1–3 are unconditional. **Assertion 4 is the one exception, and it
+//! Assertions 1–4 are unconditional. **Assertion 5 is the one exception, and it
 //! is conditional in exactly one way:** it needs a corpus to compare against, so
 //! it runs whenever one is installed or pointed at, and is skipped **only** when
 //! the operator sets `DROVR_SUPERPOWERS_CORPUS=none` to declare this machine has
@@ -3066,10 +3069,26 @@ fn methodology_skills_within_body_budget() {
 /// `using-drovr` makes working inline the default — so an agent working inline
 /// read the trigger and correctly concluded the skill did not apply.
 ///
-/// **Case-sensitive, deliberately.** The defect is the scoping in a
-/// `description:`; a body sentence like *"In a drovr phase this also binds the
-/// next phase's contract"* is the demoted form fix 1 asks for, and banning it
-/// case-insensitively would forbid the repair along with the defect.
+/// **Matched case-INSENSITIVELY**, so a sentence-initial *"In a drovr phase you
+/// must…"* cannot reintroduce the defect past this check.
+///
+/// An earlier version of this const matched case-sensitively and defended it on
+/// the grounds that a case-insensitive ban would forbid the demoted form fix 1
+/// prescribes. **That was wrong, and checking it was what showed it.** The
+/// shipped demotions read *"**Inside** a drovr phase this also binds the next
+/// phase's contract"* (`skills/tdd/SKILL.md`) and *"**Inside** a drovr phase
+/// this is also what keeps the single-writer rule intact"*
+/// (`skills/systematic-debugging/SKILL.md`) — and `inside a drovr phase` does
+/// not contain `in a drovr phase` at any casing. The restriction cost a real
+/// hole and bought nothing.
+///
+/// The residue is a naming rule, not a lost capability: a demotion says
+/// *"Inside a drovr phase…"* or *"Within a drovr phase…"*, never *"In a drovr
+/// phase…"*. spec §9.1 check 3's grep is case-sensitive, so this is **stricter
+/// than the spec requires** — deliberately, and in the direction §3 wants.
+///
+/// Keep every entry lowercase: [`phase_scoped_literals_in`] lowercases only the
+/// text it is searching, not the needles.
 const PHASE_SCOPED_LITERALS: &[&str] = &[
     "in a drovr phase",
     "a drovr task",
@@ -3084,10 +3103,18 @@ const PHASE_SCOPED_LITERALS: &[&str] = &[
 /// everything. One matcher, so the negative assertion cannot drift away from
 /// the positive control that proves the matcher works.
 fn phase_scoped_literals_in(contents: &str) -> Vec<&'static str> {
+    let haystack = contents.to_lowercase();
     PHASE_SCOPED_LITERALS
         .iter()
         .copied()
-        .filter(|literal| contents.contains(literal))
+        .filter(|literal| {
+            debug_assert_eq!(
+                **literal,
+                literal.to_lowercase(),
+                "PHASE_SCOPED_LITERALS entries must be lowercase; only the haystack is folded"
+            );
+            haystack.contains(literal)
+        })
         .collect()
 }
 
@@ -3097,12 +3124,10 @@ fn phase_scoped_literals_in(contents: &str) -> Vec<&'static str> {
 /// **Read that scope literally — it is narrower than "no skill scopes its
 /// trigger to a phase", and saying the broader thing would be this run's own
 /// defect class.** What it catches is the regression of the exact wording fix 1
-/// removed. What it does **not** catch: a fresh phrasing of the same mistake
-/// (*"during a drovr phase"*, *"once a phase has started"*), or a sentence-initial
-/// *"In a drovr phase…"* that reintroduces a precondition rather than an
-/// additional consequence (see [`PHASE_SCOPED_LITERALS`] on why the match is
-/// case-sensitive). Those are caught by review, not by this test. Nothing here
-/// pretends otherwise.
+/// removed, at any casing. What it does **not** catch is a *fresh* phrasing of
+/// the same mistake — *"during a drovr phase"*, *"once a phase has started"*,
+/// *"when running under drovr"*. Those are caught by review, not by this test.
+/// Nothing here pretends otherwise.
 ///
 /// **This is an absence test, and an absence test is this run's recurring
 /// defect class wearing its most convincing costume** — it passes just as
