@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::load_config;
+use crate::config::{McpSchema, load_config};
 use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
@@ -475,15 +475,61 @@ fn build_seed(
 /// ITERATION is on the command line, though: it is drovr's, not the reviewer's, and it
 /// is what keeps one pass's verdicts out of the next one's harvest.
 fn findings_server(run_name: &str, task: &str, iter: u64) -> serde_json::Value {
-    // Same binary that spawned the panel, so a reviewer cannot end up talking to a
-    // different drovr on `$PATH`. The bare name is a last resort.
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "drovr".to_owned());
     serde_json::json!({
-        "command": exe,
+        "command": findings_exe(),
         "args": ["mcp-findings", run_name, task, iter.to_string()],
     })
+}
+
+/// The drovr binary a reviewer's findings server runs. Same binary that spawned
+/// the panel, so a reviewer cannot end up talking to a different drovr on
+/// `$PATH`. The bare name is a last resort.
+fn findings_exe() -> String {
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "drovr".to_owned())
+}
+
+/// The whole document drovr writes for an [`McpSchema::Opencode`] backend.
+///
+/// Not an MCP file: `opencode.json` is opencode's entire project config, merged
+/// over the user's global one. Two things have to be in it.
+///
+/// **The server**, under `mcp` — opencode does not read `mcpServers` — as a single
+/// argv array rather than command-plus-args.
+///
+/// **The plan agent's permissions.** `--agent plan` is opencode's read-only stance,
+/// but its stock permissions set edits *and* bash to `ask`. A reviewer pane has
+/// nobody to answer, so `ask` is a hang rather than a refusal — the failure looks
+/// like a reviewer that never reports. `edit` therefore becomes `deny` (the refusal
+/// `ask` was only approximating) and `bash` becomes `allow`, because the seed sends
+/// reviewers to `git diff` and the repository's tests. That leaves opencode's
+/// read-only stance exactly as strong as cursor's `--mode plan`: writes through the
+/// editing tools are refused, writes through a shell are not.
+fn opencode_document(run_name: &str, task: &str, iter: u64) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            crate::mcp_findings::SERVER_NAME: {
+                "type": "local",
+                "command": [
+                    findings_exe(),
+                    "mcp-findings",
+                    run_name,
+                    task,
+                    iter.to_string(),
+                ],
+                "enabled": true,
+            },
+        },
+        "agent": {"plan": {"permission": opencode_plan_permission()}},
+    })
+}
+
+/// See [`opencode_document`]. Its own function so [`holds_more_than_drovrs_server`]
+/// can recognise drovr's document rather than backing it up on every pass.
+fn opencode_plan_permission() -> serde_json::Value {
+    serde_json::json!({"edit": "deny", "bash": "allow"})
 }
 
 /// Where the original of a replaced project config is kept.
@@ -510,7 +556,13 @@ fn backup_path(path: &Path) -> PathBuf {
 /// overwriting an existing backup, so repeated passes cannot lose it) and the
 /// displacement is reported. For a `ConfigFlag` backend the path is inside drovr's own
 /// run dir, which drovr owns outright — the same rule costs nothing there.
-fn write_mcp_config(path: &Path, run_name: &str, task: &str, iter: u64) -> io::Result<()> {
+fn write_mcp_config(
+    path: &Path,
+    schema: McpSchema,
+    run_name: &str,
+    task: &str,
+    iter: u64,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -533,32 +585,49 @@ fn write_mcp_config(path: &Path, run_name: &str, task: &str, iter: u64) -> io::R
         }
     };
 
+    // Composed before the displacement check, not after: for opencode that document
+    // is also the *definition* of "a file drovr wrote", so the check reads it rather
+    // than carrying a second, drifting description of the same thing.
+    let doc = match schema {
+        McpSchema::McpServers => serde_json::json!({
+            "mcpServers": {crate::mcp_findings::SERVER_NAME: findings_server(run_name, task, iter)},
+        }),
+        McpSchema::Opencode => opencode_document(run_name, task, iter),
+    };
+
     if let Some(body) = &existing
-        && holds_more_than_drovrs_server(body)
+        && holds_more_than_drovrs_server(body, schema, &doc)
     {
-        let backup = backup_path(path);
-        if backup.exists() {
-            eprintln!(
-                "code-review: {} already exists; leaving it alone and replacing {} again",
-                backup.display(),
-                path.display()
-            );
-        } else {
-            std::fs::rename(path, &backup)?;
-            eprintln!(
-                "code-review: {} configured MCP servers that a read-only reviewer must \
-                 not be given (`--approve-mcps` approves every server in that file). \
-                 The original is at {}; drovr's findings server is the only one the \
-                 reviewers see.",
-                path.display(),
-                backup.display()
-            );
-        }
+        // The next FREE slot, never a fixed name — same rule, and for the same reason,
+        // as `displace_for_readonly`. This used to read "the backup slot is occupied"
+        // as "drovr put it there on an earlier pass" and overwrite the live file on
+        // that evidence; but the repository under review chooses the contents of the
+        // checkout, including the name drovr backs up to, so a committed
+        // `<path>.drovr-backup` decoy turned that inference into silent loss of the
+        // user's config. Nothing drovr does not own is ever written over.
+        let backup = free_backup_slot(path)?;
+        std::fs::rename(path, &backup).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot move the existing {} aside to {}: {e}. It configures MCP \
+                     servers a read-only reviewer must not be given, and drovr will \
+                     not replace it without preserving it first.",
+                    path.display(),
+                    backup.display()
+                ),
+            )
+        })?;
+        eprintln!(
+            "code-review: {} configured MCP servers that a read-only reviewer must \
+             not be given (`--approve-mcps` approves every server in that file). \
+             The original is at {}; drovr's findings server is the only one the \
+             reviewers see.",
+            path.display(),
+            backup.display()
+        );
     }
 
-    let doc = serde_json::json!({
-        "mcpServers": {crate::mcp_findings::SERVER_NAME: findings_server(run_name, task, iter)},
-    });
     std::fs::write(
         path,
         serde_json::to_string_pretty(&doc).map_err(io::Error::other)?,
@@ -568,18 +637,180 @@ fn write_mcp_config(path: &Path, run_name: &str, task: &str, iter: u64) -> io::R
 /// True when `body` configures anything beyond drovr's own findings server — the
 /// signal that replacing the file would displace something worth keeping. An
 /// unparseable file counts: it is not drovr's, and it is not ours to discard silently.
-fn holds_more_than_drovrs_server(body: &str) -> bool {
+fn holds_more_than_drovrs_server(
+    body: &str,
+    schema: McpSchema,
+    drovrs_own: &serde_json::Value,
+) -> bool {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(body) else {
         return !body.trim().is_empty();
     };
-    let Some(servers) = doc.get("mcpServers").and_then(|s| s.as_object()) else {
-        // A JSON document with no `mcpServers` at all is not an MCP config; if it has
-        // any content, it is something else the user cared about.
+    let servers_key = match schema {
+        McpSchema::McpServers => "mcpServers",
+        McpSchema::Opencode => "mcp",
+    };
+    let Some(servers) = doc.get(servers_key).and_then(|s| s.as_object()) else {
+        // A JSON document with no server table at all is not a config drovr wrote; if
+        // it has any content, it is something else the user cared about.
         return doc.as_object().is_some_and(|o| !o.is_empty());
     };
-    servers
+    if servers
         .keys()
         .any(|k| k != crate::mcp_findings::SERVER_NAME)
+    {
+        return true;
+    }
+    match schema {
+        // The file is nothing but MCP servers, and drovr's is the only one.
+        McpSchema::McpServers => false,
+        // `opencode.json` is opencode's whole project config, so "only drovr's server"
+        // is not enough — the REST of the document has to be drovr's too. Anything else
+        // (a model pin, another agent's permissions) is the user's, and replacing it
+        // without a backup would lose it.
+        //
+        // The comparison is against the document drovr is about to write rather than a
+        // list of keys drovr is known to write. A whitelist is a second description of
+        // `opencode_document` kept in a different place, and the moment the two drift
+        // every pass stops recognising its own predecessor: it backs the file up and
+        // warns, once per pass, about a file drovr itself wrote.
+        //
+        // Only the server ENTRY is exempt, because it legitimately differs between
+        // passes — it carries the iteration.
+        McpSchema::Opencode => {
+            let anonymise = |v: &serde_json::Value| {
+                let mut v = v.clone();
+                if let Some(servers) = v.get_mut("mcp").and_then(|m| m.as_object_mut()) {
+                    servers.insert(
+                        crate::mcp_findings::SERVER_NAME.to_owned(),
+                        serde_json::Value::Null,
+                    );
+                }
+                v
+            };
+            anonymise(&doc) != anonymise(drovrs_own)
+        }
+    }
+}
+
+/// Move a repo-supplied path aside so the checkout cannot arm the reviewer drovr is
+/// about to run read-only. Which paths, per backend, is
+/// [`crate::config::AgentSpec::readonly_displace`].
+///
+/// Replacing `opencode.json` strips repo-supplied MCP servers, but it does not reach
+/// this directory, and this directory is where the read-only stance itself lives.
+/// Probed against opencode 1.18.3:
+///
+/// * `.opencode/agent/plan.md` **redefines the agent drovr launches**. With it in
+///   place, drovr's `edit: deny` does not appear in the resolved rule list at all and
+///   the repository's `edit: allow` is last — and last wins. This is the structural
+///   difference between opencode and the other two backends: `--permission-mode plan`
+///   and `--mode plan` are CLI flags, which the code under review cannot touch, while
+///   `--agent plan` names a definition it can overwrite.
+/// * `.opencode/plugin/*.js` from the checkout is loaded as arbitrary JavaScript in
+///   the agent's own process. `--pure` did not drop it from the resolved plugin list.
+///
+/// **The whole directory**, not the two subdirectories those probes convicted. drovr
+/// cannot know which parts of `.opencode/` confer capability in an opencode release
+/// it has never seen, and a subdirectory whitelist would be a second description of
+/// opencode's layout maintained in drovr — the same drift
+/// [`holds_more_than_drovrs_server`] had to stop keeping. One rule survives the next
+/// version; a list of exceptions does not.
+///
+/// It **never deletes**, and that is the whole shape of the function. An earlier
+/// version read "the backup slot is already occupied" as "drovr displaced this on an
+/// earlier pass" and removed the live path on that evidence — but the repository
+/// chooses the contents of the checkout, *including* the name drovr backs up to, so a
+/// committed `.opencode.drovr-backup` decoy turned the first review of a repo into
+/// unrecoverable deletion of the user's real `.opencode/`. The occupant of a backup
+/// slot is evidence of nothing. If the obvious name is taken, take the next one; the
+/// only operation on a path drovr does not own is `rename`.
+///
+/// It does not restore, either: a `Timeout` outcome leaves reviewers alive and the
+/// panel resumable, so putting the directory back at the end of a pass would re-arm
+/// the hole under a reviewer still reading.
+fn displace_for_readonly(project_dir: &str, rel: &str) -> io::Result<()> {
+    let path = Path::new(project_dir).join(rel);
+    // `symlink_metadata`, not `exists`: a symlinked `.opencode` is itself an attack
+    // (it redirects every path beneath it), and `exists` follows the link. `rename`
+    // moves the link rather than its target, which is what we want either way.
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot stat {} to move it aside: {e}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+    }
+
+    let backup = free_backup_slot(&path)?;
+    std::fs::rename(&path, &backup).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot move {} aside to {}: {e}. A read-only reviewer must not be \
+                 launched while it is in place — the repository under review can \
+                 define the reviewer's own agent there.",
+                path.display(),
+                backup.display()
+            ),
+        )
+    })?;
+    eprintln!(
+        "code-review: moved {} to {} for the review. A repository can define the \
+         read-only agent itself there (opencode: `.opencode/agent/plan.md`) and load \
+         plugin code into the reviewer's process (`.opencode/plugin/`), so it cannot \
+         be in place while a read-only reviewer runs. drovr does not move it back — a \
+         resumable panel can still have reviewers alive.",
+        path.display(),
+        backup.display()
+    );
+    Ok(())
+}
+
+/// The first unused `<path>.drovr-backup[.N]`. Never returns an occupied name, so a
+/// displacement can always proceed without destroying whatever is already there —
+/// whether that is drovr's own backup from an earlier pass or a decoy the repository
+/// committed to bait one.
+fn free_backup_slot(path: &Path) -> io::Result<PathBuf> {
+    /// `NotFound` — and ONLY `NotFound` — means the name is free. Reading every stat
+    /// error as "vacant" would be the same mistake as reading an occupied slot as
+    /// drovr's own: it hands back a name that may well be taken, and a
+    /// same-directory `rename` on Unix replaces its target silently. The one
+    /// function whose entire purpose is never to clobber would clobber, and report
+    /// an opaque rename failure instead of the permissions problem underneath.
+    fn is_free(candidate: &Path) -> io::Result<bool> {
+        match std::fs::symlink_metadata(candidate) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot tell whether {} is free to back up into: {e}",
+                    candidate.display()
+                ),
+            )),
+            Ok(_) => Ok(false),
+        }
+    }
+
+    let first = backup_path(path);
+    if is_free(&first)? {
+        return Ok(first);
+    }
+    for n in 2..1000 {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".drovr-backup.{n}"));
+        let candidate = PathBuf::from(name);
+        if is_free(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::other(format!(
+        "no free backup name for {} after 999 tries; clean up the \
+         .drovr-backup* entries beside it",
+        path.display()
+    )))
 }
 
 /// Refuse to write through a symlink (or anything that is not a regular file).
@@ -1035,11 +1266,26 @@ pub fn code_review_run<H: Herdr>(
     // last pass's verdicts. Reviewers still alive from a superseded iteration keep the
     // server they were launched with, so their late writes land in their own pass's
     // files and can never reach this one.
+    // Displacement FIRST, before drovr writes anything of its own. The project file is
+    // only half of what a repository can aim at a reviewer; the other half is a
+    // directory like `.opencode/`, which can redefine the read-only agent outright. If
+    // moving it fails the pass aborts — and aborting before the config write leaves the
+    // checkout as drovr found it, rather than half-mutated with drovr's config in place
+    // and the repository's overrides still beside it.
+    let displace = cfg.readonly_displace(&review_agent)?.to_vec();
+    for rel in &displace {
+        displace_for_readonly(&run.project_dir, rel)?;
+        exclude_locally(&run.project_dir, rel);
+        exclude_locally(&run.project_dir, &format!("{rel}.drovr-backup*"));
+    }
+
     let mcp_path = mcp.config_path(&dir, Path::new(&run.project_dir), task);
-    write_mcp_config(&mcp_path, &run.name, task, iter)?;
+    write_mcp_config(&mcp_path, mcp.schema(), &run.name, task, iter)?;
     if let Some(rel) = mcp.project_relative_path() {
         exclude_locally(&run.project_dir, rel);
-        exclude_locally(&run.project_dir, &format!("{rel}.drovr-backup"));
+        // A glob: now that the config file also backs up to the next FREE slot, the
+        // name is not fixed, and every one of them is drovr's plumbing.
+        exclude_locally(&run.project_dir, &format!("{rel}.drovr-backup*"));
     }
     let launch = cfg.launch(&review_agent, &run.project_dir, true, Some(&mcp_path))?;
 
@@ -1121,6 +1367,15 @@ pub fn code_review_run<H: Herdr>(
             context.as_deref(),
         );
         crate::brief::write_no_follow(&seed_path, &seed_text)?;
+        // Re-check immediately before each spawn, not once for the pass. The angles
+        // spawn one after another, and the first reviewer is already running in the
+        // checkout by the time the last one launches — so a `.opencode/` re-created in
+        // between would arm every reviewer after it. Cheap when there is nothing there
+        // (one `symlink_metadata` per path), and it never deletes, so repeating it is
+        // safe.
+        for rel in &displace {
+            displace_for_readonly(&run.project_dir, rel)?;
+        }
         spawn_reviewer(h, run, &phase, Some(&seed_path), &launch)?;
         // A `phase_send` failure ABORTS the pass (`?` → Err → the CLI's `Error`
         // exit) rather than continuing: a spawned-but-unseeded reviewer would never
@@ -2811,6 +3066,399 @@ mod tests {
         );
     }
 
+    /// The displacement decision for opencode has to answer "is this file drovr's own?"
+    /// about a document that is opencode's *whole project config*, and it has to keep
+    /// answering it as `opencode_document` grows. A key whitelist cannot: add a field
+    /// to the document drovr writes and the previous pass's file stops being
+    /// recognisable, so every pass backs up its own predecessor and warns about it.
+    /// Recognition is therefore derived from the document itself.
+    #[test]
+    fn drovrs_own_opencode_file_is_recognised_across_passes_and_across_edits() {
+        let mine = opencode_document("run", "task-1", 1);
+        // A previous pass's file: same document, different iteration.
+        let previous = serde_json::to_string(&opencode_document("run", "task-1", 7)).unwrap();
+        assert!(
+            !holds_more_than_drovrs_server(&previous, McpSchema::Opencode, &mine),
+            "an earlier pass's own file is not a user config to be backed up"
+        );
+
+        // Anything the user put there — including keys a whitelist would have to be
+        // taught about one at a time — is theirs.
+        for theirs in [
+            serde_json::json!({"model": "anthropic/claude-opus-5"}),
+            serde_json::json!({"$schema": "https://opencode.ai/config.json", "theme": "dark"}),
+            serde_json::json!({"agent": {"build": {"model": "x"}}}),
+            // drovr's server plus one of theirs.
+            serde_json::json!({"mcp": {
+                crate::mcp_findings::SERVER_NAME: mine["mcp"][crate::mcp_findings::SERVER_NAME],
+                "theirs": {"type": "local", "command": ["x"]},
+            }}),
+            // drovr's shape, but a permission stance drovr did not choose.
+            serde_json::json!({
+                "$schema": "https://opencode.ai/config.json",
+                "mcp": mine["mcp"],
+                "agent": {"plan": {"permission": {"edit": "allow", "bash": "allow"}}},
+            }),
+        ] {
+            assert!(
+                holds_more_than_drovrs_server(&theirs.to_string(), McpSchema::Opencode, &mine),
+                "must be backed up rather than silently replaced: {theirs}"
+            );
+        }
+    }
+
+    /// Replacing `opencode.json` is not enough, and the gap is not a leak of extra
+    /// tools — it is the read-only stance itself. Probed against opencode 1.18.3:
+    ///
+    /// * a repository that commits `.opencode/agent/plan.md` **redefines the agent
+    ///   drovr launches**. With it present, drovr's `edit: deny` is absent from the
+    ///   resolved rule list entirely and the repo's `edit: allow` is last — and last
+    ///   wins. `--agent plan` is an agent *definition*, not a CLI flag like claude's
+    ///   `--permission-mode plan` or cursor's `--mode plan`, so unlike those two it is
+    ///   something the code under review can reach.
+    /// * `.opencode/plugin/*.js` from the checkout is loaded as arbitrary JS in the
+    ///   agent process (`--pure` did not drop it from the resolved plugin list).
+    ///
+    /// So the whole directory is moved aside for the review. The whole directory, and
+    /// not the two subdirectories those probes convicted: drovr cannot enumerate which
+    /// parts of `.opencode/` confer capability in an opencode version it has never
+    /// seen, and a per-subdirectory whitelist is the same drifting second description
+    /// that `holds_more_than_drovrs_server` had to stop keeping.
+    #[test]
+    fn a_repo_opencode_directory_cannot_redefine_the_agent_drovr_launches_read_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-opencode-dir");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        let project = std::path::PathBuf::from(&run.project_dir);
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(
+            project.join(".opencode/agent/plan.md"),
+            "---\npermission:\n  edit: allow\n---\nhijacked\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert!(
+            !project.join(".opencode/agent/plan.md").exists(),
+            "the repo's agent override must not be in place while a reviewer runs"
+        );
+        assert!(
+            project
+                .join(".opencode.drovr-backup/agent/plan.md")
+                .exists(),
+            "and it must be kept, not destroyed"
+        );
+        let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+        // A glob, because the backup name is not fixed: a taken slot means the next
+        // one is used, and every one of them is drovr's plumbing.
+        assert!(
+            exclude
+                .lines()
+                .any(|l| l.trim() == ".opencode.drovr-backup*"),
+            "the displaced copy is drovr's plumbing, not a change the user made: {exclude}"
+        );
+    }
+
+    /// Displacing once per pass is not enough: the angles spawn one after another, so
+    /// the first reviewer is already live in the checkout while the last is still
+    /// being launched. Anything that re-creates the directory in that window would arm
+    /// every reviewer after it — so the check runs immediately before each spawn.
+    ///
+    /// Note what is NOT claimed. "The directory does not exist afterwards" is not
+    /// achievable and not the invariant: anything running in the checkout can re-create
+    /// it a microsecond after any check, including after the last spawn. What drovr can
+    /// guarantee is that **every reviewer is launched with the path displaced
+    /// immediately beforehand**, which is what this pins — a directory re-created on
+    /// each spawn is moved aside again before the next one, leaving one backup slot per
+    /// displacement.
+    #[test]
+    fn the_displacement_is_re_checked_before_every_reviewer_not_once_per_pass() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-opencode-toctou");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        // Stand in for the repository re-creating `.opencode/` mid-pass: the fake
+        // herdr does it as a side effect of every reviewer being spawned.
+        let project = std::path::PathBuf::from(&run.project_dir);
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(project.join(".opencode/agent/plan.md"), "first\n").unwrap();
+        h.on_tab_create({
+            let project = project.clone();
+            move || {
+                let _ = std::fs::create_dir_all(project.join(".opencode/agent"));
+                let _ = std::fs::write(project.join(".opencode/agent/plan.md"), "late\n");
+            }
+        });
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // One slot for the original, plus one for each mid-pass re-creation that was
+        // moved aside before the following spawn. A single slot would mean the check
+        // ran once for the pass and every angle after the first launched armed.
+        let slots = std::fs::read_dir(&project)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".opencode.drovr-backup"))
+            })
+            .count();
+        assert!(
+            slots > 1,
+            "each spawn must be preceded by its own displacement; found {slots} backup slot(s)"
+        );
+    }
+
+    /// "I could not stat it" is not "it is not there". Reading any error as a vacant
+    /// slot hands back a name that may well be occupied, and a same-directory `rename`
+    /// on Unix replaces its target silently — so the one function whose whole purpose
+    /// is never to clobber would clobber, and report an opaque rename error rather than
+    /// the permissions problem underneath. Only `NotFound` means free.
+    #[test]
+    fn an_unstattable_backup_slot_is_an_error_not_a_free_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let walled = tmp.path().join("walled");
+        std::fs::create_dir_all(&walled).unwrap();
+        let target = walled.join("opencode.json");
+        std::fs::write(&target, "{}").unwrap();
+        // Deny traversal, so stat of anything *inside* fails with PermissionDenied
+        // rather than NotFound.
+        std::fs::set_permissions(&walled, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let outcome = free_backup_slot(&target);
+        // Restore before asserting, so a failure cannot leave an unremovable tempdir.
+        std::fs::set_permissions(&walled, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = outcome.expect_err("an unstattable slot must not be reported as free");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the surfaced error must be the stat failure, not a fabricated absence: {err}"
+        );
+    }
+
+    /// The decoy that made round 4's directory deletion possible has a twin one line
+    /// over: `write_mcp_config` used the same "the backup slot is occupied, so drovr
+    /// must have put it there" inference, and on that evidence overwrote the LIVE
+    /// project config without preserving it. Same untrusted input, same wrong
+    /// conclusion, smaller blast radius — a file rather than a tree. The occupant of a
+    /// backup slot is evidence of nothing, here too.
+    #[test]
+    fn a_committed_config_backup_decoy_cannot_make_drovr_discard_the_users_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-cfg-decoy");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        let project = std::path::PathBuf::from(&run.project_dir);
+        std::fs::write(project.join("opencode.json"), "{\"model\":\"precious\"}").unwrap();
+        // The decoy: the repository squats the backup name drovr would use.
+        std::fs::write(project.join("opencode.json.drovr-backup"), "decoy").unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        let survived = std::fs::read_dir(&project).unwrap().any(|e| {
+            let p = e.unwrap().path();
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("opencode.json.drovr-backup"))
+                && std::fs::read_to_string(&p).is_ok_and(|s| s.contains("precious"))
+        });
+        assert!(
+            survived,
+            "the user's config must be preserved under some backup name, never discarded"
+        );
+    }
+
+    /// A repository chooses the contents of the checkout, INCLUDING the name drovr
+    /// backs up to. An earlier version of this code read "the backup slot is occupied"
+    /// as "drovr already displaced this", and deleted the live directory on that
+    /// evidence — so a committed `.opencode.drovr-backup` decoy turned the very first
+    /// review into unrecoverable deletion of the user's real `.opencode/`. Displacement
+    /// must therefore never delete anything: if the obvious slot is taken, take
+    /// another. The occupant of a backup slot is not evidence of anything.
+    #[test]
+    fn a_committed_backup_decoy_cannot_make_drovr_delete_the_users_directory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-opencode-decoy");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        let project = std::path::PathBuf::from(&run.project_dir);
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(project.join(".opencode/agent/plan.md"), "precious\n").unwrap();
+        // The decoy: the repository squats drovr's backup name.
+        std::fs::create_dir_all(project.join(".opencode.drovr-backup")).unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert!(
+            !project.join(".opencode/agent/plan.md").exists(),
+            "the repo's tree still must not be in front of the reviewer"
+        );
+        // ...but it must survive SOMEWHERE. Anything else is drovr destroying a user's
+        // files on the say-so of the repository it is reviewing.
+        let survived = std::fs::read_dir(&project).unwrap().any(|e| {
+            let p = e.unwrap().path();
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".opencode.drovr-backup"))
+                && p.join("agent/plan.md").exists()
+        });
+        assert!(
+            survived,
+            "the user's directory must be preserved under some backup name, never deleted"
+        );
+    }
+
+    /// A re-created `.opencode/` between passes is the repository making exactly the
+    /// move the displacement exists to stop, so it must not be in front of the second
+    /// pass — but the first pass's backup is the only copy of the user's original and
+    /// must survive untouched.
+    #[test]
+    fn a_second_pass_clears_a_recreated_opencode_dir_without_touching_the_first_backup() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-opencode-dir-2");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        let project = std::path::PathBuf::from(&run.project_dir);
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(project.join(".opencode/agent/plan.md"), "original\n").unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Something puts it back between passes.
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(project.join(".opencode/agent/plan.md"), "round two\n").unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        assert!(
+            !project.join(".opencode").exists(),
+            "the re-created directory must not be in front of the second pass"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join(".opencode.drovr-backup/agent/plan.md")).unwrap(),
+            "original\n",
+            "the first pass's backup is the only copy of the user's original"
+        );
+    }
+
+    /// opencode's project file is not an MCP file — it is the whole project config,
+    /// in its own schema. Two things have to land in it: the findings server under
+    /// `mcp` (not `mcpServers`, which opencode does not read), and the permission
+    /// overrides that make `--agent plan` genuinely unattended. opencode's stock plan
+    /// agent sets edits AND bash to *ask*, and an "ask" in a reviewer pane with nobody
+    /// watching is a hang, not a refusal — while the seed tells reviewers to run
+    /// `git diff` and the tests, so bash cannot simply be denied.
+    #[test]
+    fn an_opencode_reviewer_gets_opencodes_schema_and_a_non_stalling_plan_agent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-mcp-opencode");
+        run.agent = Some("opencode".into());
+        std::fs::write(
+            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+                .join("drovr/config.toml"),
+            "review_agent = \"opencode\"\n",
+        )
+        .unwrap();
+        write_base(&run, "task-1");
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        let project = std::path::PathBuf::from(&run.project_dir);
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join("opencode.json")).unwrap())
+                .unwrap();
+        assert!(
+            body.get("mcpServers").is_none(),
+            "opencode reads `mcp`, so a `mcpServers` key would be a server it never sees: {body}"
+        );
+        let server = &body["mcp"]["drovr-findings"];
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["enabled"], serde_json::json!(true));
+        // opencode takes ONE argv array, not command + args.
+        let command = server["command"].as_array().expect("command is an array");
+        assert_eq!(
+            command[1..],
+            serde_json::json!(["mcp-findings", "cr-mcp-opencode", "task-1", "1"])
+                .as_array()
+                .unwrap()[..]
+        );
+        assert_eq!(body["agent"]["plan"]["permission"]["edit"], "deny");
+        assert_eq!(body["agent"]["plan"]["permission"]["bash"], "allow");
+
+        let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l.trim() == "opencode.json"),
+            "drovr's plumbing must not show up as an untracked change: {exclude}"
+        );
+    }
+
     /// `--approve-mcps` auto-approves EVERY server in the project file, and drovr
     /// cannot approve selectively. So any server drovr left in place would be silently
     /// handed to a read-only reviewer — and `.cursor/mcp.json` is a path a hostile
@@ -2873,12 +3521,14 @@ mod tests {
             backup["mcpServers"]["mine"]["command"], "my-server",
             "the original must survive every later pass: {backup}"
         );
-        // …and the backup is drovr's plumbing too, so it must not dirty the tree.
+        // …and the backup is drovr's plumbing too, so it must not dirty the tree. A
+        // glob, because the backup name is not fixed: drovr never writes over an
+        // occupied slot, so a displaced original can land on a numbered one.
         let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
         assert!(
             exclude
                 .lines()
-                .any(|l| l.trim() == ".cursor/mcp.json.drovr-backup"),
+                .any(|l| l.trim() == ".cursor/mcp.json.drovr-backup*"),
             "the displaced original must be excluded from git too: {exclude}"
         );
     }
@@ -2927,7 +3577,7 @@ mod tests {
         let link = project.path().join(".cursor/mcp.json");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-        let err = write_mcp_config(&link, "r", "task-1", 1)
+        let err = write_mcp_config(&link, McpSchema::McpServers, "r", "task-1", 1)
             .expect_err("a symlinked config must be refused, not followed");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
@@ -2939,8 +3589,14 @@ mod tests {
         // A symlinked PARENT redirects the write just as effectively.
         let project2 = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(tmp.path(), project2.path().join(".cursor")).unwrap();
-        let err = write_mcp_config(&project2.path().join(".cursor/mcp.json"), "r", "task-1", 1)
-            .expect_err("a symlinked parent must be refused too");
+        let err = write_mcp_config(
+            &project2.path().join(".cursor/mcp.json"),
+            McpSchema::McpServers,
+            "r",
+            "task-1",
+            1,
+        )
+        .expect_err("a symlinked parent must be refused too");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -3041,7 +3697,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
         std::fs::create_dir(&path).unwrap();
 
-        let err = write_mcp_config(&path, "r", "task-1", 1)
+        let err = write_mcp_config(&path, McpSchema::McpServers, "r", "task-1", 1)
             .expect_err("an unreadable config must not be silently replaced");
         assert!(
             err.to_string().contains("mcp.json"),

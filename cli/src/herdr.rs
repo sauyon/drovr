@@ -1370,6 +1370,11 @@ pub struct FakeHerdr {
     /// long-running command holds its own copy of that state — the only way to
     /// drive that race deterministically from a test.
     archive_on_call: RefCell<Option<(String, String)>>,
+    /// Runs on every `tab_create`. The one way a test can make something happen in
+    /// the checkout *between* two reviewer spawns — which is the window a
+    /// re-created config directory would exploit.
+    #[allow(clippy::type_complexity)]
+    on_tab_create: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 #[cfg(test)]
@@ -1397,6 +1402,7 @@ impl FakeHerdr {
             fail_workspace_panes: RefCell::new(false),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
             archive_on_call: RefCell::new(None),
+            on_tab_create: RefCell::new(None),
         }
     }
 
@@ -1439,6 +1445,12 @@ impl FakeHerdr {
 
     /// Make every `workspace_create` fail — herdr is reachable but will not hand
     /// out a workspace.
+    /// Run `f` on every `tab_create`, modelling something else touching the checkout
+    /// while the panel is mid-spawn.
+    pub fn on_tab_create(&self, f: impl Fn() + 'static) {
+        *self.on_tab_create.borrow_mut() = Some(Box::new(f));
+    }
+
     pub fn fail_workspace_create(&self) {
         *self.fail_workspace_create.borrow_mut() = true;
     }
@@ -1654,6 +1666,9 @@ impl Herdr for FakeHerdr {
     }
 
     fn tab_create(&self, workspace: &str, label: &str, cwd: &str) -> io::Result<String> {
+        if let Some(f) = self.on_tab_create.borrow().as_ref() {
+            f();
+        }
         let id = self.next_id();
         self.record(format!(
             "tab_create workspace={workspace} label={label} cwd={cwd} -> {id}"

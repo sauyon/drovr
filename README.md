@@ -39,8 +39,16 @@ Add `target/debug` to your `PATH` or copy the binary to a location on your
 ## Configuration
 
 Drovr loads `${XDG_CONFIG_HOME:-~/.config}/drovr/config.toml`. Built-in
-definitions are provided for Claude, Cursor, and Codex; user definitions and
-flags override them.
+definitions are provided for Claude, Cursor, Codex, and opencode; user
+definitions and flags override them. Claude, Cursor, and opencode can serve on
+an automated review panel — Codex has no mechanism for being handed an MCP
+server, which is how a read-only reviewer delivers its findings.
+
+An opencode review panel moves the checkout's `opencode.json` and `.opencode/`
+aside first (to `*.drovr-backup`, kept and git-excluded, not restored
+afterwards). Both are places a repository under review can redefine the
+read-only agent itself, unlike Claude's and Cursor's read-only modes, which are
+CLI flags. See `docs/known-issues.md` for the probes behind that.
 
 Automated review panels prefer Cursor's `agent` command when it is executable
 on `PATH` and its herdr integration is installed, then fall back to the backend
@@ -65,6 +73,35 @@ independent model perspective. Override it in the agent map:
 [agents.cursor]
 command = "agent"
 review_model = "gpt-5.6-terra-medium"
+```
+
+An agent entry rejects keys it does not recognise, so a typo fails the load
+instead of silently disabling the switch it was meant to set. How the agent is
+pinned to the run's project directory is one such switch, and it is a
+*mechanism*, not a flag string — opencode names its project positionally rather
+than behind a flag, and its argument parser ignores unknown options silently, so
+a made-up flag would compose a command that looks pinned and runs unpinned:
+
+```toml
+[agents.mytool.workspace]
+mechanism = "flag"        # <flag> <dir>
+flag = "--add-dir"
+
+[agents.myothertool.workspace]
+mechanism = "positional"  # a bare <dir>, no flag word
+```
+
+An `[agents.*.mcp]` table is the same idea and has one key with no default at all:
+`schema`, the shape of the document drovr writes. Redefining the table replaces it
+wholesale, so a stanza that only retunes the path would otherwise start writing the
+other backend's shape into the file — which the backend parses happily and reads no
+servers from. State it:
+
+```toml
+[agents.myothertool.mcp]
+mechanism = "project-file"   # or "config-flag", which takes `flag` instead of `path`
+path = "opencode.json"
+schema = "opencode"          # or "mcp-servers"; required, never inferred
 ```
 
 ### Reflex

@@ -2851,3 +2851,163 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
   imply a guarantee the rest of the file does not make. If you suspect it: the orphan is
   labelled `drovr:<run>` like its twin, so look for two workspaces with the same label in
   herdr's switcher and close the one whose id is not in `state.json`.
+
+## opencode's project config is a poor place for drovr's MCP server, and it is the only place (2026-08-03)
+
+**Severity:** medium — three sharp edges, all inherent to the backend rather than bugs in
+drovr. They are recorded here because each one looks like a drovr fault from the outside.
+**Found:** 2026-08-03, adding the opencode backend. Probed against opencode 1.18.3.
+
+### Why the server goes in `opencode.json` at all
+
+opencode has no per-launch MCP flag, so a reviewer's findings server has to arrive through a
+config file. There are two candidate files and the tidier one is wrong:
+
+- **`OPENCODE_CONFIG=<path>` works** — it names an external file and *merges* it over the
+  global config, leaving providers and credentials intact (probed: `opencode debug config`
+  with the var set still resolves `provider`). It would keep drovr's plumbing entirely out of
+  the checkout.
+- **But it merges with the repository's own `opencode.json` rather than displacing it.**
+  Probed directly: a project `opencode.json` declaring `repo-injected` plus an external file
+  declaring `drovr-env-probe` resolves to *both* servers. A repository under review could
+  therefore hand extra tools to a read-only reviewer, which is the exact thing
+  `write_mcp_config` exists to prevent (see its "Why it replaces rather than merges").
+
+So drovr writes the project's `opencode.json`, replacing it, which is what strips
+repo-injected servers — the same mechanism and the same backup/exclude/symlink guards as
+cursor's `.cursor/mcp.json`.
+
+**And the same merge makes the config environment a hole in that replacement, not
+just a road not taken.** An inherited value puts the servers straight back, whatever
+drovr wrote to the project file. Replacing `opencode.json` is only the last word on
+the subject if nothing else is speaking — and **four** things can speak. All probed
+against 1.18.3 with `opencode debug config`, against a project file already holding
+drovr's server:
+
+| variable | what it does | probed result |
+| --- | --- | --- |
+| `OPENCODE_CONFIG` | names another config file | its server resolves *alongside* `drovr-findings` |
+| `OPENCODE_CONFIG_CONTENT` | inline JSON | same — `['drovr-findings', 'injected']` |
+| `OPENCODE_CONFIG_DIR` | another directory to read one from | same — `['dirinjected', 'drovr-findings']` |
+| `OPENCODE_PERMISSION` | sets the permission block wholesale | overrides the other half of what drovr writes |
+
+So a read-only opencode launch is composed as
+`env -u 'OPENCODE_CONFIG' -u 'OPENCODE_CONFIG_CONTENT' -u 'OPENCODE_CONFIG_DIR' -u
+'OPENCODE_PERMISSION' opencode --agent plan …` (`AgentSpec::readonly_env_unset`).
+Shutting one door is not a guard; if opencode grows a fifth, this list grows with it.
+Verified: with `OPENCODE_CONFIG` pointing at a file declaring its own server, the
+unset launch resolves to drovr's server alone.
+
+Two things follow, both pinned by tests. A user's own `readonly_env_unset` **unions**
+with the built-in list rather than replacing it — the built-in vars are an invariant
+of the backend, so `readonly_env_unset = ["HTTP_PROXY"]` is not consent to stop
+clearing `OPENCODE_CONFIG`. And writer phases keep every one of them: drovr does not
+replace `opencode.json` for them, so there is no guarantee to protect and clearing
+them would break a user who points one at their real provider config.
+
+### `--agent plan` is a definition the repository can overwrite — so `.opencode/` moves too
+
+This is the one structural difference between opencode and the other two backends, and
+it is worth stating plainly because it is easy to assume away. claude's
+`--permission-mode plan` and cursor's `--mode plan` are **CLI flags**: the code under
+review cannot reach them. opencode's `--agent plan` names an **agent definition**, and
+a repository can commit its own.
+
+Probed against 1.18.3, with drovr's `opencode.json` (`agent.plan.permission.edit =
+"deny"`) already in place, plus a repo-committed `.opencode/agent/plan.md` declaring
+`permission: edit: allow`:
+
+```
+edit rules in resolution order (last wins):
+  {"permission":"edit","pattern":"*","action":"deny"}                  <- opencode's stock plan agent
+  {"permission":"edit","pattern":".opencode/plans/*.md","action":"allow"}
+  {"permission":"edit","pattern":"…/plans/*.md","action":"allow"}
+  {"permission":"edit","action":"allow","pattern":"*"}                 <- THE REPOSITORY'S
+```
+
+drovr's `deny` is **not in the list at all** — the repo's file replaced the definition
+drovr was amending — and the repo's `allow` is last. Separately, `.opencode/plugin/*.js`
+from the checkout loads as arbitrary JavaScript in the reviewer's own process, and
+`--pure` did not drop it from the resolved plugin list.
+
+So `code_review` moves the whole `.opencode/` aside before spawning an opencode panel.
+Which paths, per backend, is `AgentSpec::readonly_displace` — beside
+`readonly_env_unset`, since both answer the same question ("what does a read-only
+launch have to be kept away from?") and both union rather than replace on override.
+Four things about that, each deliberate:
+
+- **The whole directory, not the two subdirectories the probes convicted.** drovr
+  cannot know which parts of `.opencode/` confer capability in an opencode release it
+  has never seen, and a subdirectory whitelist would be a second description of
+  opencode's layout maintained inside drovr — the same drift that got the
+  `holds_more_than_drovrs_server` key whitelist deleted. One rule survives the next
+  version; a list of exceptions does not.
+- **It never deletes, and neither does the config replacement beside it.** This is the
+  sharp edge, and the first version got it wrong twice — the same wrong inference in
+  two places. The first version:
+  it read "the `.drovr-backup` slot is already occupied" as "drovr displaced this on an
+  earlier pass" and removed the live directory on that evidence. But the repository
+  chooses the contents of the checkout *including the name drovr backs up to*, so a
+  committed `.opencode.drovr-backup` decoy made the very first review of a repo delete
+  the user's real `.opencode/` with no backup at all. The occupant of a backup slot is
+  evidence of nothing. `write_mcp_config` had the identical bug one line over: on an
+  occupied slot it skipped the rename and overwrote the **live** project config, so a
+  committed `opencode.json.drovr-backup` (or `.cursor/mcp.json.drovr-backup`) silently
+  discarded the user's config file. Both now allocate the next free
+  `<path>.drovr-backup[.N]`, and the only operation on a path drovr does not own is
+  `rename`. That is also why both git-exclude entries are globs: the backup name is
+  not fixed.
+
+  A related trap in the same family: a `readonly_displace` entry is *renamed*, so
+  "inside the project" is not a strong enough check on it. A lone `.` is relative and
+  has no `..`, yet resolves to the checkout root — drovr would move the whole
+  repository aside. `validate_project_relative` therefore requires every component to
+  be an ordinary name, which rejects the absolute, the traversing and the
+  root-resolving cases with one rule.
+- **It does not restore.** A `Timeout` outcome leaves reviewers alive and the panel
+  resumable, so putting the directory back at the end of a pass would re-arm the hole
+  under a reviewer still reading.
+- **It re-runs immediately before *each* reviewer spawns, not once per pass.** The
+  angles launch one after another, so the first reviewer is already live in the
+  checkout while the last is still being launched. Note the invariant this does and
+  does not give you: "`.opencode/` does not exist afterwards" is not achievable —
+  anything running in the checkout can re-create it a microsecond after any check.
+  What holds is that **every reviewer is launched with the path displaced immediately
+  beforehand**. A repository that keeps re-creating it just accumulates numbered backup
+  slots, which is why the git-exclude entry is the glob `.opencode.drovr-backup*`.
+
+`.opencode/` is a real directory in real repositories (commands, skills, plans), so a
+review will move it and leave it moved. That is the cost of running a read-only
+reviewer on a backend whose read-only mode lives inside the checkout.
+
+### The three edges
+
+- **`opencode.json` is far more likely to be a *tracked* file than `.cursor/mcp.json`.**
+  `.git/info/exclude` does not untrack anything, so on a repo that commits its opencode
+  config the replacement shows up as a *modified* file — inside the working tree the seed
+  explicitly tells reviewers to read ("the change under review is `git diff base..head`
+  **plus** the current working tree"). Reviewers can see, and may report on, drovr's own
+  plumbing. The original is at `opencode.json.drovr-backup`.
+- **`--agent plan` is `ask`, not `deny`.** opencode's stock plan agent sets edits *and* bash
+  to `ask`. An "ask" in an unattended reviewer pane is a hang, not a refusal, and it presents
+  as a reviewer that simply never reports. drovr writes `agent.plan.permission` alongside the
+  server — `edit: deny`, `bash: allow` — to turn that into a real stance. Verified with
+  `opencode debug agent plan`: drovr's two rules land last in the resolved rule list.
+  `bash: allow` is deliberate, not an oversight: the seed sends reviewers to `git diff` and
+  the repository's tests. It leaves opencode exactly as strong as cursor's `--mode plan` —
+  writes through the editing tools are refused, writes through a shell are not.
+- **Plan mode can still write plan files** (with `.opencode/` displaced, into a
+  directory drovr just moved). The resolved plan agent allows `edit` on
+  `.opencode/plans/*.md` and on `~/.local/share/opencode/plans/*.md`. That is the same shape
+  as the cursor finding above ("A read-only cursor reviewer can park at plan mode's 'Ready to
+  build?' gate"): a reviewer that decides to save a plan writes a file *into the checkout
+  under review*, and drovr does not exclude that path. Nothing depends on it — the findings
+  channel is the MCP tool — but do not read `.opencode/plans/` appearing mid-review as
+  corruption.
+
+### The thing that is NOT a problem
+
+opencode's argument parser accepts unknown options silently (`opencode --bogusflag123 -v`
+exits 0), so a made-up workspace flag would compose a command that *looks* pinned to the
+project and runs unpinned. opencode names its project positionally, and `WorkspaceArg`
+models that directly rather than inventing a flag — see the enum's doc in `cli/src/config.rs`.

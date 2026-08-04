@@ -15,15 +15,42 @@ use std::path::{Path, PathBuf};
 
 use crate::shell::shell_single_quote;
 
+/// The document shape a backend expects its MCP servers written in.
+///
+/// Orthogonal to *how* the file reaches the backend ([`McpDelivery`]): the
+/// mechanism decides where the file goes, the schema decides what is in it.
+///
+/// Deliberately has NO default. `load_config` replaces an overridden `mcp` table
+/// wholesale, so a default would mean an `[agents.opencode.mcp]` stanza that only
+/// retunes the path quietly starts writing cursor's schema into `opencode.json` —
+/// which opencode parses without complaint and reads no servers from, leaving a
+/// review panel with no findings channel and no error to explain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpSchema {
+    /// `{"mcpServers": {"<name>": {"command": …, "args": […]}}}` — claude, cursor.
+    McpServers,
+    /// `{"mcp": {"<name>": {"type": "local", "command": […], "enabled": true}}}` —
+    /// opencode, whose file is its whole project config rather than an MCP file.
+    Opencode,
+}
+
 /// How a backend is handed an MCP server.
 ///
 /// The two supported mechanisms are genuinely different, so they are separate
 /// variants rather than a pile of optional flags that could be combined into
 /// nonsense: claude takes the server config *file* on its command line, while
-/// cursor has no such flag at all and only reads a fixed path inside the project
-/// directory. A backend either names the file or it does not — never both.
+/// cursor and opencode have no such flag at all and only read a fixed path
+/// inside the project directory. A backend either names the file or it does not
+/// — never both.
+///
+/// `deny_unknown_fields` for the same reason [`AgentSpec`] carries it: a typo in
+/// a key that decides what drovr writes into someone's project is a config error,
+/// not a comment. It works with [`McpSchema`]'s absent default rather than around
+/// it — `deny_unknown_fields` catches `schemas = "opencode"`, and the missing
+/// default catches the stanza that never mentions a schema at all.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(tag = "mechanism", rename_all = "kebab-case")]
+#[serde(tag = "mechanism", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum McpDelivery {
     /// The config file is named on the command line: `<flag> <path>`, plus any
     /// `extra_flags` (claude: `--mcp-config <path> --strict-mcp-config`, the
@@ -32,14 +59,17 @@ pub enum McpDelivery {
         flag: String,
         #[serde(default)]
         extra_flags: Vec<String>,
+        schema: McpSchema,
     },
     /// The backend reads servers only from a fixed project-relative path
-    /// (cursor: `.cursor/mcp.json`); `extra_flags` carries whatever makes it
-    /// trust that file without a prompt (`--approve-mcps`).
+    /// (cursor: `.cursor/mcp.json`, opencode: `opencode.json`); `extra_flags`
+    /// carries whatever makes it trust that file without a prompt
+    /// (`--approve-mcps`).
     ProjectFile {
         path: String,
         #[serde(default)]
         extra_flags: Vec<String>,
+        schema: McpSchema,
     },
 }
 
@@ -72,17 +102,74 @@ impl McpDelivery {
             | McpDelivery::ProjectFile { extra_flags, .. } => extra_flags,
         }
     }
+
+    /// The document shape to write at [`McpDelivery::config_path`].
+    pub fn schema(&self) -> McpSchema {
+        match self {
+            McpDelivery::ConfigFlag { schema, .. } | McpDelivery::ProjectFile { schema, .. } => {
+                *schema
+            }
+        }
+    }
 }
 
+/// How a backend is told which directory the run's project is.
+///
+/// Two genuinely different shapes, so — like [`McpDelivery`] — an enum rather
+/// than optional fields that could be set into nonsense: a backend either names
+/// the directory behind a flag or takes it as a bare positional, never both.
+///
+/// The distinction is not cosmetic. opencode's argument parser accepts unknown
+/// options silently, so inventing a flag for it would compose a command that
+/// *looks* pinned to the project and runs unpinned.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "mechanism", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WorkspaceArg {
+    /// `<flag> <dir>` (claude: `--add-dir`, cursor: `--workspace`, codex: `-C`).
+    Flag { flag: String },
+    /// A bare `<dir>` with no flag word (opencode: `opencode <project>`).
+    Positional,
+}
+
+/// `deny_unknown_fields` is load-bearing, not tidiness: every field here is a
+/// switch that changes what drovr spawns, and serde's default is to ignore keys
+/// it does not recognise. A config carrying the pre-[`WorkspaceArg`] spelling
+/// (`workspace_flag = "--add-dir"`) would otherwise load clean and leave the
+/// agent silently *unpinned* from the project. Fail the load instead.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub command: String,
     /// Read-only flag; absent → this agent cannot serve as a reviewer.
     #[serde(default)]
     pub readonly_flag: Option<String>,
-    /// Flag used to pin the agent to the run's project directory.
+    /// Environment variables cleared from a **read-only** launch because they
+    /// redirect the backend's config discovery, and drovr's control of that file
+    /// is what confines a reviewer to the one tool it is meant to have.
+    ///
+    /// Read-only only, and deliberately so. drovr replaces the project config for a
+    /// reviewer and for nobody else, so there is no guarantee to protect on a writer
+    /// phase — and clearing the var there would break a user who points it at their
+    /// real provider config for no gain.
     #[serde(default)]
-    pub workspace_flag: Option<String>,
+    pub readonly_env_unset: Vec<String>,
+    /// Project-relative paths moved aside for a **read-only** launch because the
+    /// backend reads agent, plugin or tool definitions from them — which means the
+    /// repository under review can define the read-only agent itself.
+    ///
+    /// opencode's `.opencode/` is the case this exists for: `--agent plan` names a
+    /// *definition*, not a CLI flag, and a committed `.opencode/agent/plan.md`
+    /// replaces the one drovr configured. claude and cursor need nothing here because
+    /// their read-only modes are flags the checkout cannot reach.
+    ///
+    /// The same read-only-only rule as [`AgentSpec::readonly_env_unset`], and the same
+    /// union merge: these are invariants of the backend, not defaults to choose
+    /// between.
+    #[serde(default)]
+    pub readonly_displace: Vec<String>,
+    /// How the agent is pinned to the run's project directory.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceArg>,
     /// Flag used to append the workspace-root guard prompt.
     #[serde(default)]
     pub system_prompt_flag: Option<String>,
@@ -194,7 +281,11 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
         AgentSpec {
             command: "claude".into(),
             readonly_flag: Some("--permission-mode plan".into()),
-            workspace_flag: Some("--add-dir".into()),
+            readonly_env_unset: Vec::new(),
+            readonly_displace: Vec::new(),
+            workspace: Some(WorkspaceArg::Flag {
+                flag: "--add-dir".into(),
+            }),
             system_prompt_flag: Some("--append-system-prompt".into()),
             model_flag: Some("--model".into()),
             review_model: None,
@@ -214,6 +305,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
                         crate::mcp_findings::qualified_tool_name()
                     ),
                 ],
+                schema: McpSchema::McpServers,
             }),
         },
     );
@@ -222,7 +314,11 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
         AgentSpec {
             command: "agent".into(),
             readonly_flag: Some("--mode plan".into()),
-            workspace_flag: Some("--workspace".into()),
+            readonly_env_unset: Vec::new(),
+            readonly_displace: Vec::new(),
+            workspace: Some(WorkspaceArg::Flag {
+                flag: "--workspace".into(),
+            }),
             system_prompt_flag: None,
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
@@ -239,6 +335,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             mcp: Some(McpDelivery::ProjectFile {
                 path: ".cursor/mcp.json".into(),
                 extra_flags: vec!["--approve-mcps".into()],
+                schema: McpSchema::McpServers,
             }),
         },
     );
@@ -247,11 +344,73 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
         AgentSpec {
             command: "codex".into(),
             readonly_flag: Some("--sandbox read-only".into()),
-            workspace_flag: Some("-C".into()),
+            readonly_env_unset: Vec::new(),
+            readonly_displace: Vec::new(),
+            workspace: Some(WorkspaceArg::Flag { flag: "-C".into() }),
             system_prompt_flag: None,
             model_flag: Some("-m".into()),
             review_model: None,
             mcp: None,
+        },
+    );
+    m.insert(
+        "opencode".to_string(),
+        AgentSpec {
+            command: "opencode".into(),
+            // opencode's read-only stance is its built-in `plan` agent. That agent
+            // only sets edits and bash to *ask*, which stalls an unattended reviewer
+            // pane rather than refusing — so drovr writes the permission overrides
+            // that turn it into a real read-only stance alongside the MCP server
+            // (see `code_review::opencode_document`).
+            readonly_flag: Some("--agent plan".into()),
+            // Replacing the project `opencode.json` is what strips a repository's own
+            // servers — but opencode takes config from the environment too, and every
+            // one of these MERGES over the project file rather than deferring to it,
+            // so an inherited value puts those servers straight back. Clearing them is
+            // part of the same guard, not a backstop for it.
+            //
+            // All four probed against opencode 1.18.3 with `opencode debug config`,
+            // against a project file holding drovr's server:
+            //   * OPENCODE_CONFIG         — names another config file
+            //   * OPENCODE_CONFIG_CONTENT — inline JSON
+            //   * OPENCODE_CONFIG_DIR     — another directory to read one from
+            // each resolve to their own server ALONGSIDE `drovr-findings`, and
+            //   * OPENCODE_PERMISSION     — sets the permission block wholesale,
+            // which is the other half of what drovr writes (see
+            // `code_review::opencode_document`). Shutting one door is not a guard.
+            readonly_env_unset: vec![
+                "OPENCODE_CONFIG".into(),
+                "OPENCODE_CONFIG_CONTENT".into(),
+                "OPENCODE_CONFIG_DIR".into(),
+                "OPENCODE_PERMISSION".into(),
+            ],
+            // `--agent plan` names a definition the checkout can replace: a committed
+            // `.opencode/agent/plan.md` takes drovr's `edit: deny` out of the resolved
+            // rules entirely (probed, 1.18.3), and `.opencode/plugin/*.js` loads as
+            // arbitrary JS in the reviewer's process. The WHOLE directory, because
+            // drovr cannot know which parts of it confer capability in an opencode
+            // release it has never seen — and a subdirectory whitelist is a second
+            // description of opencode's layout that would drift out of date here.
+            readonly_displace: vec![".opencode".into()],
+            workspace: Some(WorkspaceArg::Positional),
+            system_prompt_flag: None,
+            model_flag: Some("--model".into()),
+            review_model: None,
+            // No per-launch scoping and no config flag: opencode merges a project
+            // `opencode.json` over its global config, so that file is the only place
+            // drovr can put a server. `OPENCODE_CONFIG` names an external file and is
+            // the tidier mechanism, but it *merges* with the repository's own
+            // `opencode.json` rather than displacing it — a repository under review
+            // could then hand its own servers to a read-only reviewer. Replacing the
+            // project file (with the backup that `write_mcp_config` performs) is what
+            // strips them, exactly as for cursor.
+            mcp: Some(McpDelivery::ProjectFile {
+                path: "opencode.json".into(),
+                // Nothing to approve: opencode takes servers from the config it has
+                // merged, without a trust prompt.
+                extra_flags: Vec::new(),
+                schema: McpSchema::Opencode,
+            }),
         },
     );
     m
@@ -276,6 +435,9 @@ pub fn invoking_agent(config: &Config) -> String {
     }
     if std::env::var_os("CODEX_THREAD_ID").is_some() {
         return "codex".into();
+    }
+    if std::env::var_os("OPENCODE").is_some() {
+        return "opencode".into();
     }
     config.default_agent.clone()
 }
@@ -328,6 +490,10 @@ pub fn load_config() -> io::Result<Config> {
     for (name, spec) in &config.agents {
         validate_command(&spec.command)
             .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+        for path in &spec.readonly_displace {
+            validate_project_relative(path, "`readonly_displace` entry")
+                .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
+        }
         if let Some(delivery) = &spec.mcp {
             validate_delivery(delivery)
                 .map_err(|e| io::Error::other(format!("agent '{name}': {e}")))?;
@@ -336,7 +502,26 @@ pub fn load_config() -> io::Result<Config> {
     for (name, builtin) in default_agents() {
         if let Some(spec) = config.agents.get_mut(&name) {
             spec.readonly_flag = spec.readonly_flag.take().or(builtin.readonly_flag);
-            spec.workspace_flag = spec.workspace_flag.take().or(builtin.workspace_flag);
+            // UNION, not "or" — the only field here that merges rather than defers.
+            // The built-in vars are an invariant of the backend, not a default the
+            // user is picking between: they are the difference between a reviewer
+            // confined to one tool and a reviewer handed whatever the environment
+            // offers. A user listing a var of their own is ADDING to them, so
+            // `readonly_env_unset = ["HTTP_PROXY"]` must not be read as consent to
+            // stop clearing `OPENCODE_CONFIG`.
+            for var in builtin.readonly_env_unset {
+                if !spec.readonly_env_unset.contains(&var) {
+                    spec.readonly_env_unset.push(var);
+                }
+            }
+            // Union for the same reason, and with more at stake: dropping one of these
+            // hands the repository under review the definition of the read-only agent.
+            for path in builtin.readonly_displace {
+                if !spec.readonly_displace.contains(&path) {
+                    spec.readonly_displace.push(path);
+                }
+            }
+            spec.workspace = spec.workspace.take().or(builtin.workspace);
             spec.system_prompt_flag = spec
                 .system_prompt_flag
                 .take()
@@ -387,6 +572,13 @@ impl Config {
         Ok(name.to_owned())
     }
 
+    /// Project-relative paths to move aside before `agent` runs read-only. See
+    /// [`AgentSpec::readonly_displace`] — validated at load, so every entry is
+    /// relative and free of `..`.
+    pub fn readonly_displace(&self, agent: &str) -> io::Result<&[String]> {
+        Ok(&self.agent(agent)?.readonly_displace)
+    }
+
     /// How `agent` is handed an MCP server, if it can be. The caller needs this
     /// *before* [`Config::launch`]: the config file has to exist at
     /// [`McpDelivery::config_path`] by the time the agent starts.
@@ -409,7 +601,16 @@ impl Config {
         mcp_config: Option<&Path>,
     ) -> io::Result<String> {
         let spec = self.agent(agent)?;
-        let mut command = spec.command.clone();
+        let mut command = String::new();
+        if readonly && !spec.readonly_env_unset.is_empty() {
+            command.push_str("env");
+            for var in &spec.readonly_env_unset {
+                command.push_str(" -u ");
+                command.push_str(&shell_single_quote(var));
+            }
+            command.push(' ');
+        }
+        command.push_str(&spec.command);
         if readonly {
             let flag = spec.readonly_flag.as_ref().ok_or_else(|| {
                 io::Error::other(format!(
@@ -430,9 +631,11 @@ impl Config {
                 command.push_str(&shell_single_quote(model));
             }
         }
-        if let Some(flag) = &spec.workspace_flag {
-            command.push(' ');
-            command.push_str(flag);
+        if let Some(workspace) = &spec.workspace {
+            if let WorkspaceArg::Flag { flag } = workspace {
+                command.push(' ');
+                command.push_str(flag);
+            }
             command.push(' ');
             command.push_str(&shell_single_quote(project_dir));
         }
@@ -523,16 +726,33 @@ fn validate_delivery(delivery: &McpDelivery) -> io::Result<()> {
     let Some(path) = delivery.project_relative_path() else {
         return Ok(());
     };
+    validate_project_relative(path, "mcp `path`")
+}
+
+/// Reject a project-relative path that would land outside the project. Shared by
+/// every config key naming one, because they are all joined onto the project dir and
+/// an absolute or `..`-bearing value would send drovr's write — or, for
+/// [`AgentSpec::readonly_displace`], drovr's **rename** — anywhere on disk under a
+/// name a hostile config chooses. Displacement makes this sharper than it was: the
+/// mcp path only ever writes a file drovr owns, while a displace path MOVES whatever
+/// it names.
+/// Every component must be a plain name. Rejecting only absolute paths and `..`
+/// leaves `.` — which is relative, contains no `..`, and resolves to the project
+/// *root*. For an mcp `path` that merely fails later when drovr tries to write a file
+/// over a directory; for a displace entry it means `rename`-ing the entire checkout
+/// aside before a reviewer spawns. One rule ("a path made of names") covers the
+/// absolute, the traversing and the root-resolving cases at once.
+fn validate_project_relative(path: &str, what: &str) -> io::Result<()> {
     if path.trim().is_empty() {
-        return Err(io::Error::other("mcp `path` must not be empty"));
+        return Err(io::Error::other(format!("{what} must not be empty")));
     }
-    let p = Path::new(path);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+    let mut components = Path::new(path).components().peekable();
+    if components.peek().is_none()
+        || components.any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
         return Err(io::Error::other(format!(
-            "mcp `path` '{path}' must be a relative path inside the project"
+            "{what} '{path}' must be a relative path inside the project, \
+             made only of ordinary path names"
         )));
     }
     Ok(())
@@ -612,6 +832,235 @@ mod tests {
                 .unwrap(),
             "agent --mode plan --model 'composer-2.5' --workspace '/tmp/my worktree'"
         );
+    }
+
+    /// Replacing `opencode.json` is what keeps a repository under review from handing
+    /// its own MCP servers to a read-only reviewer — but only if that file is the last
+    /// word on the subject. `OPENCODE_CONFIG` names another config file and *merges*
+    /// it (probed: a project file and an `OPENCODE_CONFIG` file resolve to BOTH their
+    /// servers), so a value inherited from the launching environment reopens exactly
+    /// the hole the replacement closes. The reviewer launch has to clear it.
+    #[test]
+    fn a_readonly_opencode_launch_clears_the_config_var_that_would_merge_more_servers() {
+        let cfg = Config::default();
+        let readonly = cfg.launch("opencode", "/tmp/proj", true, None).unwrap();
+        assert!(
+            readonly.starts_with("env -u ") && readonly.contains(" opencode --agent plan "),
+            "a read-only reviewer must not inherit a second config file: {readonly}"
+        );
+        // Writer phases keep it: drovr does not replace `opencode.json` for them, so
+        // clearing the var would buy no guarantee and would break a user who points
+        // it at their real provider config.
+        assert_eq!(
+            cfg.launch("opencode", "/tmp/proj", false, None).unwrap(),
+            "opencode '/tmp/proj'"
+        );
+    }
+
+    /// `OPENCODE_CONFIG` is not the only way in. Probed against opencode 1.18.3, each
+    /// of these loads config *on top of* the project `opencode.json` drovr replaced:
+    /// `OPENCODE_CONFIG_CONTENT` (inline JSON) and `OPENCODE_CONFIG_DIR` both resolve
+    /// to their server ALONGSIDE `drovr-findings`, and `OPENCODE_PERMISSION` sets the
+    /// permission block wholesale. Clearing one of four doors is not a guard.
+    #[test]
+    fn every_opencode_config_door_is_shut_for_a_reviewer_not_just_the_first_one() {
+        let cfg = Config::default();
+        let readonly = cfg.launch("opencode", "/tmp/proj", true, None).unwrap();
+        for var in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_DIR",
+            "OPENCODE_PERMISSION",
+        ] {
+            assert!(
+                readonly.contains(&format!("-u '{var}'")),
+                "{var} still reaches the reviewer: {readonly}"
+            );
+        }
+    }
+
+    /// The built-in vars are an invariant of the opencode backend, not a default the
+    /// user is choosing between. Redefining the agent to clear a var of their own must
+    /// ADD to them — taking the override as the complete set silently reopens the hole
+    /// the field exists to close.
+    #[test]
+    fn a_user_env_unset_list_adds_to_the_built_in_one_rather_than_replacing_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        set_config_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        std::fs::write(
+            dir.path().join("drovr/config.toml"),
+            "[agents.opencode]\ncommand = \"opencode\"\n\
+             readonly_env_unset = [\"HTTP_PROXY\"]\n",
+        )
+        .unwrap();
+
+        let cfg = load_config().unwrap();
+        let spec = &cfg.agents["opencode"];
+        assert!(
+            spec.readonly_env_unset.iter().any(|v| v == "HTTP_PROXY"),
+            "the user's own var must survive: {:?}",
+            spec.readonly_env_unset
+        );
+        assert!(
+            spec.readonly_env_unset
+                .iter()
+                .any(|v| v == "OPENCODE_CONFIG"),
+            "the built-in guard must survive a partial override: {:?}",
+            spec.readonly_env_unset
+        );
+    }
+
+    /// `schema` decides the shape of a document written into someone's project, and
+    /// `load_config` replaces an overridden `mcp` table wholesale. A default therefore
+    /// means an `[agents.opencode.mcp]` stanza that only retunes the path quietly
+    /// starts writing cursor's schema into `opencode.json` — a file opencode parses
+    /// without error and reads no servers from. It has to be stated.
+    #[test]
+    fn an_mcp_override_must_state_its_schema_rather_than_inherit_a_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        set_config_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        std::fs::write(
+            dir.path().join("drovr/config.toml"),
+            "[agents.opencode]\ncommand = \"opencode\"\n\
+             [agents.opencode.mcp]\nmechanism = \"project-file\"\npath = \"custom.json\"\n",
+        )
+        .unwrap();
+
+        load_config().expect_err("an mcp table without a schema must fail the load");
+    }
+
+    /// opencode names the project as a POSITIONAL (`opencode <dir>`), not behind a
+    /// flag — and its argument parser ignores unknown options silently, so a
+    /// made-up `--dir` would compose a command that looks pinned and is not.
+    /// The dir therefore has to arrive as a bare quoted word.
+    #[test]
+    fn the_opencode_workspace_is_a_positional_not_a_flag() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.launch("opencode", "/tmp/my worktree", false, None)
+                .unwrap(),
+            "opencode '/tmp/my worktree'"
+        );
+        // Read-only adds the config-discovery unsets in front (see
+        // `every_opencode_config_door_is_shut_for_a_reviewer_not_just_the_first_one`);
+        // what matters here is that the dir stays a bare trailing word either way.
+        let readonly = cfg
+            .launch("opencode", "/tmp/my worktree", true, None)
+            .unwrap();
+        assert!(
+            readonly.ends_with("opencode --agent plan '/tmp/my worktree'"),
+            "{readonly}"
+        );
+    }
+
+    /// `readonly_displace` entries are *renamed*, so the check that they stay inside
+    /// the project is not enough — they must also name something *within* it. A lone
+    /// `.` is relative and has no `..`, yet `project_dir.join(".")` is the checkout
+    /// root: drovr would move the entire repository aside before spawning a reviewer.
+    #[test]
+    fn a_displace_entry_that_resolves_to_the_project_root_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for bad in [".", "./.", "./"] {
+            let dir = tempfile::tempdir().unwrap();
+            set_config_home(dir.path());
+            std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+            std::fs::write(
+                dir.path().join("drovr/config.toml"),
+                format!("[agents.tool]\ncommand = \"tool\"\nreadonly_displace = [{bad:?}]\n"),
+            )
+            .unwrap();
+
+            let err = load_config()
+                .expect_err(&format!("'{bad}' resolves to the project root"))
+                .to_string();
+            assert!(err.contains("tool"), "the error must name the agent: {err}");
+        }
+    }
+
+    /// The spelling README documents, both arms of it. A user-defined backend has
+    /// to be able to say "positional" — that is the whole reason the flag string
+    /// became a mechanism — and the doc is only worth as much as this test.
+    #[test]
+    fn both_workspace_mechanisms_round_trip_through_the_config_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        set_config_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        std::fs::write(
+            dir.path().join("drovr/config.toml"),
+            "[agents.flagtool]\ncommand = \"flagtool\"\n\
+             [agents.flagtool.workspace]\nmechanism = \"flag\"\nflag = \"--root\"\n\
+             [agents.postool]\ncommand = \"postool\"\n\
+             [agents.postool.workspace]\nmechanism = \"positional\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_config().unwrap();
+        assert_eq!(
+            cfg.launch("flagtool", "/tmp/proj", false, None).unwrap(),
+            "flagtool --root '/tmp/proj'"
+        );
+        assert_eq!(
+            cfg.launch("postool", "/tmp/proj", false, None).unwrap(),
+            "postool '/tmp/proj'"
+        );
+    }
+
+    /// The failure mode `deny_unknown_fields` exists for: a config written against
+    /// the old `workspace_flag = "…"` spelling must not load clean and leave the
+    /// agent unpinned. Every key here changes what drovr spawns, so an unrecognised
+    /// one is a config error, not a comment.
+    #[test]
+    fn a_stale_agent_key_fails_the_load_instead_of_being_ignored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        set_config_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        std::fs::write(
+            dir.path().join("drovr/config.toml"),
+            "[agents.claude]\ncommand = \"claude\"\nworkspace_flag = \"--add-dir\"\n",
+        )
+        .unwrap();
+
+        let err = load_config().expect_err("an unknown agent key must fail the load");
+        assert!(
+            err.to_string().contains("workspace_flag"),
+            "the error must name the offending key: {err}"
+        );
+    }
+
+    /// The same rule has to hold one level down. `schema` is what decides the *shape*
+    /// of the document drovr writes for a backend, and it has a default — so a typo
+    /// there does not fail, it silently selects the other backend's schema and the
+    /// reviewer is handed a config it cannot read.
+    #[test]
+    fn a_stale_key_inside_a_mechanism_table_fails_the_load_too() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for (table, body) in [
+            (
+                "mcp",
+                "[agents.tool.mcp]\nmechanism = \"project-file\"\npath = \"x.json\"\nschemas = \"opencode\"\n",
+            ),
+            (
+                "workspace",
+                "[agents.tool.workspace]\nmechanism = \"flag\"\nflagg = \"--root\"\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            set_config_home(dir.path());
+            std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+            std::fs::write(
+                dir.path().join("drovr/config.toml"),
+                format!("[agents.tool]\ncommand = \"tool\"\n{body}"),
+            )
+            .unwrap();
+
+            load_config().expect_err(&format!("an unknown key in [{table}] must fail the load"));
+        }
     }
 
     #[test]
@@ -769,6 +1218,7 @@ readonly_flag = "--ro"
 mechanism = "config-flag"
 flag = "--servers"
 extra_flags = ["--only-these"]
+schema = "mcp-servers"
 
 [agents.cursor]
 command = "agent"
@@ -811,7 +1261,8 @@ command = "agent"
                 dir.join("config.toml"),
                 format!(
                     "[agents.mine]\ncommand = \"mine\"\n\n[agents.mine.mcp]\n\
-                     mechanism = \"project-file\"\npath = {bad:?}\n"
+                     mechanism = \"project-file\"\npath = {bad:?}\n\
+                     schema = \"mcp-servers\"\n"
                 ),
             )
             .unwrap();
@@ -990,7 +1441,9 @@ readonly_flag = "--sandbox read-only"
                     AgentSpec {
                         command: "noflag".into(),
                         readonly_flag: None,
-                        workspace_flag: None,
+                        readonly_env_unset: Vec::new(),
+                        readonly_displace: Vec::new(),
+                        workspace: None,
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
@@ -1019,8 +1472,10 @@ readonly_flag = "--sandbox read-only"
                     "codex".to_string(),
                     AgentSpec {
                         command: "codex".into(),
+                        readonly_env_unset: Vec::new(),
+                        readonly_displace: Vec::new(),
                         readonly_flag: Some("--sandbox read-only".into()),
-                        workspace_flag: None,
+                        workspace: None,
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
@@ -1053,7 +1508,9 @@ readonly_flag = "--sandbox read-only"
                     AgentSpec {
                         command: "noflag".into(),
                         readonly_flag: None,
-                        workspace_flag: None,
+                        readonly_env_unset: Vec::new(),
+                        readonly_displace: Vec::new(),
+                        workspace: None,
                         system_prompt_flag: None,
                         model_flag: None,
                         review_model: None,
