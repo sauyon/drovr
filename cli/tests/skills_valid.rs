@@ -3264,159 +3264,270 @@ fn no_phase_scoped_description_literals() {
     );
 }
 
-/// Fragments of spec §5's canonical task-binding directive that every site
-/// carrying it must reproduce.
+/// Spec §5's task-binding directive — **the canonical text, spelled once**.
 ///
-/// §5's block quote is the **canonical text** — sites quote it, they do not
-/// rewrite it — so these are not a summary of the rule but the three parts of it
-/// that have already been argued over, pinned so the argument cannot be re-won
-/// silently in one file at a time:
+/// §5's block quote is the canonical directive: sites quote it, they do not
+/// rewrite it. That is a property about the *whole text*, so it is enforced
+/// against the whole text, from this one const. Tasks 10–14 add the remaining
+/// §5 sites and compare against this same string — if they quoted a variant,
+/// the five skills would disagree about their own rule, which this run has
+/// already shipped once.
 ///
-///   * `one tracked item per step` — the requirement itself. Plan Task 8 names
-///     it as the marker phrase.
-///   * `TodoWrite` **and** `TaskCreate` — §5 is deliberately tool-agnostic
-///     because harnesses differ, and a brainstorm-round reviewer's claim that
-///     `TaskCreate` is unavailable was **refuted** (`plan-HANDOFF.md`, "Refuted
-///     finding, carried forward"). A site that named only one tool would read as
-///     "no task tool here" in the other harness.
-///   * `CHECKLIST.md` — the file-based fallback for a harness exposing neither.
-///     Without it the directive is unactionable exactly where it matters most.
+/// **Wrapping and indentation are not part of the contract; wording is.** The
+/// nine sites embed the quote differently — indented three spaces inside a
+/// numbered step, two inside an authoring-rules bullet, flush inside a section —
+/// and each re-wraps it to its own column. Comparison therefore runs through
+/// [`normalize_ws`], which collapses every whitespace run to one space, exactly
+/// as the scenario checks use it: *wrapping is formatting; rewording is drift.*
 ///
-/// Deliberately **not** an equality check against the whole block quote: the
-/// sites embed it in different surroundings (a numbered step 0, a section, an
-/// authoring-rules bullet) and one of them is a `<!-- -->`-free template, so a
-/// byte-equality contract would forbid the wrapping the spec asks for. What is
-/// pinned is that no site loses a load-bearing part of the rule.
-const TASK_BINDING_FRAGMENTS: &[&str] = &[
-    "one tracked item per step",
-    "TodoWrite",
-    "TaskCreate",
-    "CHECKLIST.md",
-];
+/// Reproduce this exactly if you ever need to restore it. Do not improve it.
+/// Two things in it that reviewers have already tried to narrow, both of which
+/// must survive: it names `TodoWrite` **or** `TaskCreate`/`TaskUpdate` because
+/// harnesses differ (the brainstorm-round claim that `TaskCreate` is
+/// unavailable was **REFUTED** — see `plan-HANDOFF.md`), and it carries the
+/// file-based fallback for a harness exposing neither.
+const TASK_BINDING_DIRECTIVE: &str = "
+When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+before you start step 1. Mark each in-progress when you start it and complete when its
+evidence is in hand. If the harness exposes no task tool, write the checklist to
+`~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+repo root otherwise, and tick items there. An untracked checklist decays with the context
+window; that decay is the exact failure drovr exists to fight.
+";
 
-/// The sites that carry §5's directive, relative to `skills/`.
+/// Every contiguous block quote in `contents`, whitespace-normalised.
 ///
-/// **This list is incomplete on purpose, and the missing entries are the point.**
+/// A block ends at the first line that is not a `>` line — so a file may carry
+/// several, and they are kept apart rather than concatenated. That separation is
+/// the whole point: `skills/handoff/SKILL.md` has a pre-existing block quote (the
+/// "fresh reader, never self-summary" design note) as well as the directive, and
+/// a scraper that joined every `>` line in the file reported that file as
+/// divergent when it was correct. The bug was in the checker, not the file.
+fn block_quotes(contents: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in contents.lines() {
+        match line.trim_start().strip_prefix('>') {
+            Some(rest) => current.push(rest),
+            None => {
+                if !current.is_empty() {
+                    out.push(normalize_ws(&current.join(" ")));
+                    current.clear();
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(normalize_ws(&current.join(" ")));
+    }
+    out
+}
+
+/// The directory whose every `.md` file is a §5 site, **derived rather than
+/// listed**.
+///
+/// Every phase-prompt hands an agent a numbered `## Do` list, so membership is a
+/// property of the directory, not a curated opinion about it. Deriving means a
+/// phase-prompt added later is required to carry the directive the day it lands,
+/// instead of the day someone remembers to extend a const.
+const PHASE_PROMPTS_DIR: &str = "pipeline/phase-prompts";
+
+/// The §5 sites that are **not** phase-prompts, relative to `skills/`.
+///
+/// **This list is hand-maintained, and nothing detects an omission from it.** A
+/// site added to the tree but not to this const is simply never checked: the
+/// suite stays green and the gap is invisible, which is this run's own defect
+/// class. It is written out anyway because the alternative — deriving "files
+/// that hand an agent a numbered checklist" — is not decidable from the text,
+/// and a wrong derivation would be the same silence with more machinery. The
+/// phase-prompts, where membership *is* decidable, are derived instead (see
+/// [`PHASE_PROMPTS_DIR`]); this const is the irreducible remainder.
+///
+/// **It is also incomplete on purpose, and the missing entries are the point.**
 /// §5 names four sites; Task 8 lands the two that fix 4 does not rewrite (plus
 /// §8's `pipeline`/`worktrees` note). The other two — `using-drovr`'s gate
 /// function (§4.1, Task 14) and each discipline skill's numbered procedure (§6
 /// section 6, Tasks 10–13) — land **inside** their fix-4 rewrite, and must not
 /// land before it: arm A′ is defined as fix-1-only, so fix-3 text in those five
 /// files would make the shipped tree stop matching what the frozen arm claims to
-/// be. Each of Tasks 10–14 extends this list as its site lands.
+/// be. Each of Tasks 10–14 adds its own entry here **in the same edit that adds
+/// the text** — an entry added earlier reddens the suite across a task boundary,
+/// which halts the pipeline loop.
 const TASK_BINDING_SITES: &[&str] = &[
-    "pipeline/phase-prompts/brainstorm.md",
-    "pipeline/phase-prompts/plan.md",
-    "pipeline/phase-prompts/implement-task.md",
-    "pipeline/phase-prompts/review.md",
-    "pipeline/phase-prompts/review-angle.md",
     "handoff/SKILL.md",
     "handoff/HANDOFF-template.md",
     "pipeline/SKILL.md",
     "worktrees/SKILL.md",
 ];
 
-/// Fix 3 (spec §5): every site listed in [`TASK_BINDING_SITES`] carries the
-/// task-binding directive.
+/// Every §5 site: the derived phase-prompts, then [`TASK_BINDING_SITES`].
+fn task_binding_sites() -> Vec<PathBuf> {
+    let dir = skills_dir().join(PHASE_PROMPTS_DIR);
+    let entries = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read phase-prompts dir {}: {e}", dir.display()));
+    let mut out: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("read_dir entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    out.sort();
+    assert!(
+        !out.is_empty(),
+        "no `.md` files under {} — the derived half of the site list is empty, \
+         so every assertion over it would pass having read nothing",
+        dir.display()
+    );
+    let skills = skills_dir();
+    out.extend(TASK_BINDING_SITES.iter().map(|site| skills.join(site)));
+    out
+}
+
+/// Fix 3 (spec §5): every site in [`task_binding_sites`] quotes
+/// [`TASK_BINDING_DIRECTIVE`] — the whole directive, verbatim up to wrapping and
+/// indentation — exactly once.
 ///
 /// **Read that scope literally. It is narrower than "every site that hands an
 /// agent a numbered checklist", and saying the broader thing would be false
 /// today as well as being this run's own defect class.** The four discipline
 /// skills' numbered procedures are precisely such sites and carry none of it
 /// yet: their directive lands inside each fix-4 rewrite (Tasks 10–13), because
-/// arm A′ is frozen as fix-1-only. [`TASK_BINDING_SITES`] is the list of what
-/// this check actually covers, and it says which sites are still missing and
-/// who owns them.
+/// arm A′ is frozen as fix-1-only. [`TASK_BINDING_SITES`] names what is still
+/// missing and who owns it.
 ///
-/// **This is a presence check over a list of files, which is this run's
-/// recurring defect class in its friendliest disguise** — a presence check whose
-/// walk finds nothing passes having read nothing. Three things stop it being
-/// vacuous:
+/// **What this checks is the text, not four keywords.** An earlier version
+/// asserted four substrings (`one tracked item per step`, `TodoWrite`,
+/// `TaskCreate`, `CHECKLIST.md`) and called itself a check that sites quote the
+/// canonical directive. It was not: a site could reword the directive wholesale
+/// and pass on the strength of four surviving keywords — the exact drift fix 3
+/// exists to prevent, in the check written to prevent it, and it would have been
+/// inherited by Tasks 10–14. [`task_binding_check_rejects_a_reworded_directive`]
+/// pins the difference with a rewording that carries all four of those old
+/// fragments and is still refused.
 ///
-///  1. **The corpus is an explicit list, not a glob**, and each entry is
-///     asserted to be a real file *before* it is searched. A renamed or deleted
-///     site fails here rather than silently dropping out of the check.
-///  2. **A negative control on frozen data.** The same fragments are asserted
-///     **absent** from `docs/skill-evidence/arms/A/` — the pre-fix snapshots,
-///     which by construction predate fix 3. If a fragment matched there, it
-///     would be text common to any skill file rather than a marker of the
-///     directive, and this check would be measuring nothing. Arm A is immutable
-///     and hash-checked (`arm_a_snapshots_match_manifest`), so the control
-///     cannot rot, and Tasks 10–13 adding the directive to the *live* discipline
-///     skills does not disturb it.
-///  3. It was watched RED — all nine sites failing, and the negative control
-///     passing — before any of the directive text was written.
+/// **This is still a presence check, which is this run's recurring defect class
+/// in its friendliest disguise** — one whose corpus finds nothing passes having
+/// read nothing. Three things stop it being vacuous:
 ///
-/// What it does **not** check is that the quoted text is §5's verbatim; it
-/// checks that the parts of it that have already been argued over survive. See
-/// [`TASK_BINDING_FRAGMENTS`].
+///  1. **Half the corpus is derived and half is asserted non-empty.** The
+///     phase-prompts come from a directory read that fails if it yields nothing;
+///     every site, derived or listed, is asserted to be a real file *before* it
+///     is read, so a renamed site fails here rather than dropping out silently.
+///  2. **`exactly once`, not `at least once`.** Two copies in one file is a
+///     failure, because the next author to edit one of them would leave the file
+///     stating its own rule twice and differently — which is how
+///     `skills/code-review/SKILL.md` came to state one rule three ways.
+///  3. It was watched RED — all nine sites failing — before any of the directive
+///     text was written, and the comparison was re-watched RED under the
+///     rewording above.
 #[test]
 fn task_binding_directive_present() {
-    let dir = skills_dir();
-
+    let canon = normalize_ws(TASK_BINDING_DIRECTIVE);
     assert!(
-        !TASK_BINDING_SITES.is_empty() && !TASK_BINDING_FRAGMENTS.is_empty(),
-        "TASK_BINDING_SITES and TASK_BINDING_FRAGMENTS must both be non-empty; \
-         an empty either way makes every assertion below vacuously true"
+        !canon.is_empty(),
+        "TASK_BINDING_DIRECTIVE is empty; every comparison below would be vacuous"
     );
 
-    let mut missing = Vec::new();
-    for site in TASK_BINDING_SITES {
-        let path = dir.join(site);
+    let mut wrong = Vec::new();
+    for path in task_binding_sites() {
         assert!(
             path.is_file(),
             "spec §5 site {} is not a file — a presence check cannot pass over a \
-             site that is not there. If the file moved, move this entry with it; \
+             site that is not there. If the file moved, move its entry with it; \
              do not drop it.",
             path.display()
         );
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        for fragment in TASK_BINDING_FRAGMENTS {
-            if !contents.contains(fragment) {
-                missing.push(format!("{}: `{fragment}`", path.display()));
-            }
+
+        let quotes = block_quotes(&contents);
+        let found = quotes.iter().filter(|quote| **quote == canon).count();
+        if found == 1 {
+            continue;
         }
+        // A near-miss is the likely failure — someone re-wrote a word — so show
+        // the drifting block rather than only the count.
+        let near = quotes
+            .iter()
+            .find(|quote| quote.contains("tracked item per step") && **quote != canon);
+        wrong.push(match (found, near) {
+            (0, Some(drifted)) => format!(
+                "{}: quotes a DIFFERENT directive:\n    {drifted}",
+                path.display()
+            ),
+            (0, None) => format!("{}: does not quote the directive", path.display()),
+            (n, _) => format!("{}: quotes the directive {n} times", path.display()),
+        });
     }
+
     assert!(
-        missing.is_empty(),
-        "{} site(s) are missing part of spec §5's task-binding directive:\n{}\n\
-         Quote §5's block quote — do not reword it, do not narrow it to one task \
-         tool, and do not drop the file-based fallback. An untracked checklist \
-         decays with the context window, which is the failure fix 3 exists to \
-         fight.",
-        missing.len(),
-        missing.join("\n"),
+        wrong.is_empty(),
+        "{} site(s) do not quote spec §5's directive exactly once:\n{}\n\n\
+         The canonical text is TASK_BINDING_DIRECTIVE, and it is the whole \
+         contract — quote it, do not reword it, do not narrow it to one task \
+         tool, and do not drop the file-based fallback. Re-wrapping and \
+         indenting it are fine; `normalize_ws` folds both. An untracked \
+         checklist decays with the context window, which is the failure fix 3 \
+         exists to fight.",
+        wrong.len(),
+        wrong.join("\n"),
+    );
+}
+
+/// [`block_quotes`] extracts what the sites actually contain, and
+/// [`task_binding_directive_present`]'s comparison refuses a rewording.
+///
+/// It exists because the check it guards used to accept one. Both cases are
+/// built **from** `TASK_BINDING_DIRECTIVE` rather than from a pasted copy, so
+/// they cannot drift away from the const they are about.
+#[test]
+fn task_binding_check_rejects_a_reworded_directive() {
+    let canon = normalize_ws(TASK_BINDING_DIRECTIVE);
+
+    // The shape the five phase-prompts use: indented inside a numbered step,
+    // with prose either side.
+    let indented: String = TASK_BINDING_DIRECTIVE
+        .trim()
+        .lines()
+        .map(|line| format!("   > {line}\n"))
+        .collect();
+    let page = format!("0. **Bind this checklist.**\n\n{indented}\n1. Next step.\n");
+    assert_eq!(
+        block_quotes(&page),
+        vec![canon.clone()],
+        "the extractor did not recover the directive from the shape the \
+         phase-prompts use to carry it"
     );
 
-    // The negative control. Arm A predates fix 3, so a fragment found there is a
-    // fragment that does not discriminate.
-    let arm_a = arms_dir().join("A");
-    let mut false_positives = Vec::new();
-    for skill in SkillName::ALL {
-        let path = arm_a.join(format!("{}.md", skill.as_str()));
-        let contents = fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "cannot read the arm A snapshot {}: {e} — it is this check's \
-                 negative control, not an optional extra",
-                path.display()
-            )
-        });
-        for fragment in TASK_BINDING_FRAGMENTS {
-            if contents.contains(fragment) {
-                false_positives.push(format!("{}: `{fragment}`", path.display()));
-            }
-        }
+    // Two quotes in one file stay two, as in `skills/handoff/SKILL.md`.
+    let two = format!("{page}\n> An unrelated design note.\n");
+    assert_eq!(
+        block_quotes(&two),
+        vec![canon.clone(), "An unrelated design note.".to_string()],
+        "adjacent block quotes must stay separate; joining them is what made an \
+         earlier hand-written checker report a correct file as divergent"
+    );
+
+    // The refutation: a rewording carrying every fragment the superseded check
+    // enforced. It must NOT be accepted as the directive.
+    let reworded = "When a skill gives you a numbered checklist, make one tracked item per step \
+                    with `TodoWrite` or `TaskCreate`, and otherwise use `CHECKLIST.md`.";
+    for fragment in [
+        "one tracked item per step",
+        "TodoWrite",
+        "TaskCreate",
+        "CHECKLIST.md",
+    ] {
+        assert!(
+            reworded.contains(fragment),
+            "this case only refutes the superseded fragment check if it carries \
+             every fragment that check enforced; it is missing `{fragment}`"
+        );
     }
-    assert!(
-        false_positives.is_empty(),
-        "fragment(s) of the task-binding directive appear in the pre-fix arm A \
-         snapshots:\n{}\n\
-         Arm A predates fix 3, so this means the fragment is ordinary skill \
-         prose rather than a marker of the directive, and the presence check \
-         above would pass on files that never received it. Pick a fragment that \
-         discriminates.",
-        false_positives.join("\n"),
+    assert_ne!(
+        normalize_ws(reworded),
+        canon,
+        "a reworded directive carrying all four legacy fragments compared equal \
+         to the canonical text — the comparison is not checking the wording"
     );
 }
 
