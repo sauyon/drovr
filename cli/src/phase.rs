@@ -377,6 +377,42 @@ fn discard_unlaunched_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
     }
 }
 
+/// Take back a pane whose launch SUCCEEDED but whose registration could not be
+/// persisted. Same three steps as [`discard_unlaunched_pane`], one crucial
+/// difference: the agent in this one is **alive**.
+///
+/// A separate function rather than a shared one precisely because of that
+/// difference. `discard_unlaunched_pane` rests on "`launch_in_pane` cannot fail
+/// after `pane_run` succeeds", so nothing is ever running in the pane it
+/// closes. Here something is, and closing it is a deliberate trade rather than
+/// a tidy-up: a live pane that `state.json` does not name is the immortal-pane
+/// bug — `drovr cleanup` closes only panes it can prove are drovr's (main's
+/// `8173f03`), so an unrecorded one reads as the human's and is never closed,
+/// while `attach`, `phase send` and the review UI are all blind to it. An agent
+/// killed a second after it started is recoverable by retrying; a pane nothing
+/// can see or close is not.
+///
+/// `retire_pane` still runs FIRST and is still saved, because it is the smaller
+/// write: if it lands and the close then fails, cleanup can at least prove the
+/// pane was drovr's.
+fn surrender_unrecordable_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
+    run.retire_pane(pane);
+    if let Err(e) = run.save() {
+        eprintln!(
+            "drovr: warning: could not record pane {pane} as drovr's ({e}); if closing it \
+             below also fails, `drovr cleanup` will treat it as yours and leave it open"
+        );
+    }
+    if let Err(e) = h.pane_close(pane) {
+        eprintln!(
+            "drovr: warning: pane {pane} is running an agent that nothing records, and it \
+             could not be closed either ({e}). Close it by hand (herdr pane close {pane}) \
+             — until then it will not be cleaned up and it blocks closing the run's \
+             workspace."
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workspace recovery
 // ---------------------------------------------------------------------------
@@ -1449,7 +1485,26 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // the pass it was stamped with, so `phase_wait` can still complete off it.
     // Sweeping first and then failing to save is the hole that leaves a phase
     // `Done` with its evidence gone.
-    run.save()?;
+    if let Err(e) = run.save() {
+        // ⚠️ An agent is LIVE in `pane` and `state.json` does not name it.
+        // That is the immortal-pane bug: main's `8173f03` made `drovr cleanup`
+        // close only panes it can PROVE are drovr's, so a live tab nothing
+        // records reads as the human's — never closed, and it blocks
+        // `workspace_close` for the whole run. "Never live-but-unrecorded" is
+        // the invariant, and when the record cannot be written the only way to
+        // keep it is to not leave the pane live.
+        surrender_unrecordable_pane(h, run, &pane);
+        return Err(io::Error::new(
+            e.kind(),
+            format!(
+                "phase '{}/{phase}' was relaunched, but its pane could not be recorded \
+                 ({e}), so the agent was closed again rather than left running with \
+                 nothing tracking it. The phase is untouched on disk — retry once the \
+                 run directory is writable.",
+                run.name
+            ),
+        ));
+    }
     // Best-effort, and NOT `?`. By this line the agent is running and its pane
     // is durably recorded, so a hard error here would report a rehydrate that
     // fully succeeded as a failure — the CLI would exit 1 and the HTTP handler
@@ -9695,6 +9750,57 @@ mod rehydrate_tests {
             !pass.matches_marker(""),
             "an untokenized leftover cannot complete a tokened phase"
         );
+    }
+
+    #[test]
+    fn a_rehydrate_that_cannot_record_its_pane_does_not_leave_it_live() {
+        // ⚠️ THE IMMORTAL-PANE BUG, third sighting. `launch_in_pane` succeeded,
+        // so an agent is RUNNING in `pane` — and then the save that would have
+        // recorded it failed. main's `8173f03` made `drovr cleanup` close only
+        // panes it can PROVE are drovr's, so a live tab nothing records reads as
+        // the human's: never closed, and it blocks `workspace_close` for the
+        // whole run.
+        //
+        // "Never live-but-unrecorded" is the invariant. When `state.json`
+        // cannot be written at all, the only way to keep it is to not leave the
+        // pane live.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-unsaveable");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-u")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        // Make every later write to the run dir fail: tmp+rename cannot create
+        // `state.json.tmp` in a directory it may not write.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = run_dir("rh-unsaveable");
+        let before = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = phase_rehydrate(&h, &mut run, "plan");
+        std::fs::set_permissions(&dir, before).unwrap();
+
+        let err = err.expect_err("a rehydrate that cannot record its pane has not succeeded");
+        assert!(
+            err.to_string().contains("could not be recorded"),
+            "the operator has to be told the record is what failed: {err}"
+        );
+        let calls = h.calls();
+        let pane = calls
+            .iter()
+            .find_map(|c| c.strip_prefix("pane_run pane="))
+            .map(|c| c.split_whitespace().next().unwrap_or("").to_owned())
+            .expect("the launch really happened");
+        assert!(
+            calls.iter().any(|c| c == &format!("pane_close pane={pane}")),
+            "the live pane must be taken back, not left for cleanup to disown: {calls:?}"
+        );
+        // …and the phase on disk is untouched, so a retry starts from the same
+        // place rather than from a half-rehydrated one.
+        let on_disk = RunState::load("rh-unsaveable").unwrap();
+        let p = on_disk.find_phase("plan").unwrap();
+        assert!(p.is_reaped(), "still reaped: {p:?}");
+        assert_eq!(p.pane_id(), None, "no pane recorded: {p:?}");
     }
 
     #[test]
