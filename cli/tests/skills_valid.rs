@@ -858,37 +858,93 @@ fn assert_arm_snapshots_match_manifest(arm: &str) {
     }
 }
 
-/// Does `commit` name a commit object that is present here?
+/// What this repository can say about one manifest row's `<commit>:<path>`.
 ///
-/// `git rev-parse <commit>:<path>` fails the same way whether the commit is
-/// missing or the path is, so the two are told apart before the failure is
-/// reported — otherwise "the path does not exist" sends a reader to audit a path
-/// when the real answer is that the history was rewritten out from under the
-/// row.
-fn commit_exists(commit: &str) -> bool {
-    Command::new("git")
-        .arg("cat-file")
-        .arg("-e")
-        .arg(format!("{commit}^{{commit}}"))
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+/// **`Undetermined` is a separate answer from the two absences, and that is the
+/// whole point of the type.** The predecessor of this enum folded "git could not
+/// be run" into "the commit is not here", so a spawn failure — an `EMFILE`
+/// partway through the row loop, git missing, a broken `PATH` — was reported as
+/// *"commit … is not present in this repository"*: a confident claim about
+/// history, produced by a check that had not looked. That is the fail-open shape
+/// this run keeps meeting, and it does not belong in the check that guards arm
+/// integrity, which every measurement rests on.
+///
+/// The precedent is `arm_a_snapshots_match_manifest`, which hard-fails when git
+/// is absent rather than skipping green. **A provenance check that cannot run
+/// must refuse, not conclude.**
+enum Provenance {
+    /// The commit holds exactly this blob at that path.
+    Blob(GitObjectId),
+    /// git answered, and the commit does not carry that path.
+    PathAbsent { git_says: String },
+    /// git answered, and the commit itself is not here.
+    CommitAbsent { git_says: String },
+    /// git could not be asked, or answered something unusable. Not an absence —
+    /// an absence of evidence.
+    Undetermined { how: String },
 }
 
-/// `git rev-parse <commit>:<source path>` for a manifest row, or `None` if that
-/// path does not exist in that commit.
-fn blob_at_commit(commit: &str, path: &str) -> Option<GitObjectId> {
-    let out = Command::new("git")
-        .arg("rev-parse")
-        .arg(format!("{commit}:{path}"))
+/// Run a `git` subcommand, keeping the failure to launch it distinct from the
+/// failure it reports.
+///
+/// `Err` is *"I could not ask"*; `Ok` is git's own answer, whatever it was.
+fn git_output(args: &[String]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("cannot run `git rev-parse {commit}:{path}`: {e}"));
-    if !out.status.success() {
-        return None;
+        .map_err(|e| format!("cannot run `git {}`: {e}", args.join(" ")))
+}
+
+/// git's stderr, trimmed — so a failure quotes git's own words instead of
+/// paraphrasing them.
+fn git_stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).trim().to_string()
+}
+
+/// Resolve one manifest row against the repository.
+///
+/// `git rev-parse <commit>:<path>` exits 128 whether the commit is missing or
+/// the path is, so a second question is asked to tell those apart — otherwise
+/// "the path does not exist" sends a reader to audit a path when the real answer
+/// is that the history was rewritten out from under the row. Note that
+/// `cat-file -e` also exits 128 for both "no such object" and "not a commit", so
+/// the two absences are distinguished by *which question git refused*, never by
+/// an exit code carrying more meaning than it has.
+fn resolve_provenance(commit: &str, path: &str) -> Provenance {
+    let rev_parse = ["rev-parse".to_string(), format!("{commit}:{path}")];
+    let out = match git_output(&rev_parse) {
+        Ok(out) => out,
+        Err(how) => return Provenance::Undetermined { how },
+    };
+
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // A zero exit that prints something other than an object id is git
+        // answering in a language this check does not speak. Reporting it as a
+        // missing path would blame the manifest for a broken toolchain.
+        return match GitObjectId::parse(&stdout) {
+            Ok(id) => Provenance::Blob(id),
+            Err(e) => Provenance::Undetermined {
+                how: format!("`git {}` succeeded but printed {e}", rev_parse.join(" ")),
+            },
+        };
     }
-    let stdout = String::from_utf8(out.stdout)
-        .unwrap_or_else(|e| panic!("`git rev-parse {commit}:{path}` output is not utf-8: {e}"));
-    GitObjectId::parse(stdout.trim()).ok()
+    let rev_parse_says = git_stderr(&out);
+
+    let cat_file = [
+        "cat-file".to_string(),
+        "-e".to_string(),
+        format!("{commit}^{{commit}}"),
+    ];
+    match git_output(&cat_file) {
+        Err(how) => Provenance::Undetermined { how },
+        Ok(out) if out.status.success() => Provenance::PathAbsent {
+            git_says: rev_parse_says,
+        },
+        Ok(out) => Provenance::CommitAbsent {
+            git_says: git_stderr(&out),
+        },
+    }
 }
 
 /// Every row's commit **contains** the blob the row records, at the path the row
@@ -940,37 +996,49 @@ fn manifest_commits_contain_their_snapshots() {
         "`git` is not resolvable, so no manifest row's provenance can be verified"
     );
 
+    // Two buckets, never merged: rows this check REFUTED, and rows it could not
+    // read. Reporting the second as the first would be the check inventing
+    // history it failed to consult.
     let mut wrong = Vec::new();
+    let mut unreadable = Vec::new();
     for row in &rows {
-        match blob_at_commit(row.commit.as_str(), &row.source_path) {
-            Some(found) if found == row.hash => {}
-            Some(found) => wrong.push(format!(
-                "  arm `{}` / `{}`: commit {} holds {} at `{}`, but the row records {}",
-                row.arm,
-                row.skill,
+        let at = format!("arm `{}` / `{}`", row.arm, row.skill);
+        match resolve_provenance(row.commit.as_str(), &row.source_path) {
+            Provenance::Blob(found) if found == row.hash => {}
+            Provenance::Blob(found) => wrong.push(format!(
+                "  {at}: commit {} holds {} at `{}`, but the row records {}",
                 row.commit.as_str(),
                 found.as_str(),
                 row.source_path,
                 row.hash.as_str(),
             )),
-            // The two failure modes read alike from `rev-parse` and mean
-            // completely different things, so they are separated before either
-            // is reported.
-            None if !commit_exists(row.commit.as_str()) => wrong.push(format!(
-                "  arm `{}` / `{}`: commit {} is not present in this repository",
-                row.arm,
-                row.skill,
+            Provenance::CommitAbsent { git_says } => wrong.push(format!(
+                "  {at}: commit {} is not present in this repository ({git_says})",
                 row.commit.as_str(),
             )),
-            None => wrong.push(format!(
-                "  arm `{}` / `{}`: commit {} exists but has no `{}`",
-                row.arm,
-                row.skill,
+            Provenance::PathAbsent { git_says } => wrong.push(format!(
+                "  {at}: commit {} exists but has no `{}` ({git_says})",
                 row.commit.as_str(),
                 row.source_path,
             )),
+            Provenance::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
         }
     }
+
+    // Reported before the refutations, because it changes what they are worth:
+    // if any row could not be read, this run did not verify the manifest, and
+    // saying which rows failed would imply the rest passed.
+    assert!(
+        unreadable.is_empty(),
+        "{} manifest row(s) could not be checked at all:\n{}\n\n\
+         This is NOT a finding about the manifest — it is this check reporting that it \
+         could not run. `git` could not be asked, or answered something unusable. \
+         A provenance check that cannot run must refuse rather than conclude, so it \
+         fails here instead of calling an unreadable row absent. Fix the environment \
+         and re-run; do not read the result below as a verdict.",
+        unreadable.len(),
+        unreadable.join("\n"),
+    );
 
     assert!(
         wrong.is_empty(),
