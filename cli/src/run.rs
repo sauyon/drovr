@@ -158,10 +158,11 @@ pub struct Phase {
     /// Whether drovr closed this phase's pane — see [`Reaped`], which cannot be
     /// set to "yes" from outside this module.
     ///
-    /// Written by nothing yet; reaping is a later step. It is declared now so
-    /// the whole capture record lands in one `state.json` shape rather than
-    /// migrating twice, and so the lifecycle rule is in place before the code
-    /// that depends on it is written.
+    /// Written by [`Phase::mark_reaped`] alone, on the reap paths in
+    /// `phase.rs`. It was declared one task before anything wrote it, so the
+    /// whole capture record landed in one `state.json` shape rather than
+    /// migrating twice, and so the lifecycle rule was in place before the code
+    /// that depends on it.
     #[serde(default, skip_serializing_if = "Reaped::is_no")]
     reaped: Reaped,
 }
@@ -176,9 +177,9 @@ pub struct Phase {
 /// about one phase, and as a bare `pub bool` beside `pane_id` the contradiction
 /// was one assignment away. A phase marked reaped while `pane_id` still names a
 /// pane makes `drovr attach` offer a pane that is gone, and makes cleanup and
-/// reaping disagree about whose pane it is. Task 6 is the code that will write
-/// this; the rule is here first, deliberately, because it is much harder to
-/// impose once reaping depends on the shape.
+/// reaping disagree about whose pane it is. The rule landed one task before
+/// reaping did, deliberately: it is much harder to impose once reaping depends
+/// on the shape.
 ///
 /// Serializes transparently as a bare `true`/`false`, so `state.json` is
 /// unchanged by the newtype.
@@ -433,8 +434,7 @@ impl Phase {
 
     /// Whether drovr has closed this phase's pane. Read by [`Phase::has_run`],
     /// by `phase_rehydrate` (a reaped phase is the thing it brings back), and by
-    /// `main::rehydrate_hint`. Still WRITTEN by nothing — [`Phase::mark_reaped`]
-    /// is task 6's.
+    /// `main::rehydrate_hint`. Written only by [`Phase::mark_reaped`].
     pub fn is_reaped(&self) -> bool {
         self.reaped.yes()
     }
@@ -453,11 +453,13 @@ impl Phase {
     /// Returns the pane id it dropped, which is what a caller needs to retire
     /// (`RunState::retire_pane`) so cleanup still knows the pane was drovr's.
     ///
-    /// The first caller is `phase::surrender_misattributed_pane` — error
-    /// recovery on a half-completed rehydrate, not reaping. Task 6 adds the
-    /// supersession-triggered ones; the transition is the same either way, and
-    /// deliberately so: "drovr closed this phase's pane" is one fact with one
-    /// way to record it.
+    /// Two callers, and they arrive from opposite directions:
+    /// `phase::surrender_misattributed_pane` (error recovery on a half-completed
+    /// rehydrate) and `phase::phase_reap` (supersession). Both go through
+    /// `phase::release_phase_from_pane`, so the retirement and this transition
+    /// land in one save. The transition is the same either way, and deliberately
+    /// so: "drovr closed this phase's pane" is one fact with one way to record
+    /// it.
     pub fn mark_reaped(&mut self) -> Option<String> {
         self.reaped = Reaped(true);
         self.pane_id.take()
@@ -532,6 +534,32 @@ pub enum NotRehydratable {
     NoProjectDir,
     /// The RUN has no herdr workspace, so there is nowhere to open the tab.
     NoWorkspace,
+}
+
+/// Why a phase's pane cannot be reaped — see [`RunState::reapable`].
+///
+/// An enum rather than an `Option<&str>` for the same reason
+/// [`NotRehydratable`] is one: each arm needs a different thing said, and the
+/// two callers do different things with them. `NoPane` is the ordinary,
+/// successful "nothing to do"; `RootShell` is a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReapable {
+    /// No phase of this run answers to that name.
+    NoSuchPhase,
+    /// It holds no pane: never launched, already reaped, or its pane died with
+    /// its workspace (`Phase::forget_dangling_pane`). Nothing to close and
+    /// nothing to clear — which is what makes a second reap of one phase a
+    /// no-op rather than an error.
+    NoPane,
+    /// Its recorded pane IS the run's root shell, named here.
+    ///
+    /// The root pane anchors the workspace for the run's whole lifetime, and
+    /// herdr destroys a workspace when its last pane closes — so reaping it
+    /// takes the workspace and every other phase in it. No phase this build
+    /// launches can reach this state (`phase_start` gives every phase its own
+    /// tab), but a `state.json` written by a build where the FIRST phase
+    /// claimed the root pane can, and such a run still loads and still works.
+    RootShell(String),
 }
 
 /// The three things a resume needs, handed over together or not at all.
@@ -1170,6 +1198,73 @@ impl RunState {
         }
         Ok(())
     }
+    /// ⭐ **THE reap precondition, in ONE place** — and the pane a reap would
+    /// close, so a caller cannot ask the question and then act on a different
+    /// answer.
+    ///
+    /// Two callers, deliberately sharing it: `phase::phase_reap` (which does it)
+    /// and [`RunState::superseded_by`] (which decides which phases get it done
+    /// to them). Written as separate checks, the automatic trigger would be free
+    /// to hand `phase_reap` a phase it refuses — and the root-shell arm is not a
+    /// refusal anyone wants discovered at the herdr call.
+    ///
+    /// It is deliberately NOT the mirror of [`RunState::rehydratable`]. That one
+    /// is a precondition for CREATING an agent, so it is strict about whether
+    /// there is anything to bring back; this one is a precondition for
+    /// DESTROYING a pane, and the only thing that makes a pane un-closeable is
+    /// that closing it would take the run's workspace with it. In particular a
+    /// reviewer is reapable (a delivered verdict is a file, not a pane) and a
+    /// phase of any status is reapable — `drovr phase reap` is also the
+    /// supported way to clear a registration whose pane herdr has lost, and that
+    /// phase may be `Running`. WHICH phases the automatic trigger picks is
+    /// `superseded_by`'s rule, not this one's.
+    pub fn reapable(&self, name: &str) -> Result<&str, NotReapable> {
+        let phase = self.find_phase(name).ok_or(NotReapable::NoSuchPhase)?;
+        let pane = phase.pane_id().ok_or(NotReapable::NoPane)?;
+        // Identity, not "is it in the same tab". Reaping closes the PANE it is
+        // given (see `phase::phase_reap` for why pane granularity rather than
+        // tab), so the only way to hurt the root shell is to be handed its id.
+        if self.root_pane.as_deref() == Some(pane) {
+            return Err(NotReapable::RootShell(pane.to_owned()));
+        }
+        Ok(pane)
+    }
+
+    /// ⭐ **The phases a launch of `starting` supersedes**: every OTHER phase
+    /// that is `Done` and still holds a reapable pane, in `phases` order.
+    ///
+    /// This is the whole rule for the automatic trigger, stated once where it
+    /// can be tested — rather than as a filter written inline above a
+    /// `phase_reap` call with a comment explaining why the conditions are there.
+    /// Each of the three is load-bearing:
+    ///
+    /// * **`Done`** — and never `Failed` or `Running`. A `Failed` phase's pane
+    ///   is exactly what a human attaches to in order to find out what went
+    ///   wrong, and a `Running` one has an agent in it. It is also what makes
+    ///   `RunState::live_agent_pane`'s no-fallback rule safe: that search skips
+    ///   `Done` phases, so a pane it returns is by construction not one reaping
+    ///   took.
+    /// * **OTHER than `starting`** — a phase re-entered by `phase_start` is
+    ///   `Done` on disk at the moment the new pass is persisted, and reaping it
+    ///   would close the pane the launch is about to use (or has just used).
+    /// * **holds a pane** — via [`RunState::reapable`], so the root shell and
+    ///   the already-reaped are both excluded by the same predicate the reap
+    ///   itself asks.
+    ///
+    /// **Only `phases`, never `review_phases`**, and that is a scope decision
+    /// rather than an oversight: a reviewer's pane belongs to a panel that may
+    /// still be in flight (a timed-out `code-review run` is resumed, and its
+    /// reviewers are waited on again), and `code_review_run` is the only thing
+    /// that knows whether that is so. It reaps its own panel, after the merge.
+    pub fn superseded_by(&self, starting: &str) -> Vec<String> {
+        self.phases
+            .iter()
+            .filter(|p| p.name != starting && p.status == PhaseStatus::Done)
+            .filter(|p| self.reapable(&p.name).is_ok())
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
     /// Look up a phase by name across BOTH `phases` and `review_phases`. Reviewer
     /// lookups (marker-drop, seed injection) need to resolve names living in
     /// `review_phases`; pipeline progress deliberately does NOT use this (it stays
@@ -1296,6 +1391,101 @@ mod tests {
         assert_eq!(
             placeholder.rehydratable("plan"),
             Err(NotRehydratable::NeverStarted)
+        );
+    }
+
+    /// The reap precondition answers with the PANE, so a caller cannot ask the
+    /// question and then close something else — and its refusals are the two
+    /// that are not "no".
+    #[test]
+    fn the_reap_gate_hands_back_the_pane_it_cleared() {
+        let mut run = completion_run(vec![running("plan")]);
+        assert_eq!(run.reapable("plan"), Ok("w:p1"));
+
+        // Already reaped, never launched, or its pane died with its workspace:
+        // one answer, and it is the ordinary "nothing to do" that makes a
+        // second reap of one phase a no-op rather than an error.
+        run.phases.push(reaped("done-already"));
+        run.phases.push(Phase::new("placeholder"));
+        assert_eq!(run.reapable("done-already"), Err(NotReapable::NoPane));
+        assert_eq!(run.reapable("placeholder"), Err(NotReapable::NoPane));
+        assert_eq!(run.reapable("nope"), Err(NotReapable::NoSuchPhase));
+
+        // ⚠️ The one real refusal. herdr destroys a workspace when its last pane
+        // closes, so reaping the root shell takes the workspace and every other
+        // phase in it. No phase this build launches can hold that id; a
+        // `state.json` from the build where the first phase claimed it can.
+        let mut legacy = completion_run(vec![running("plan")]);
+        legacy.root_pane = Some("w:p1".into());
+        assert_eq!(
+            legacy.reapable("plan"),
+            Err(NotReapable::RootShell("w:p1".into())),
+            "the pane that anchors the workspace is never reapable"
+        );
+
+        // A reviewer IS reapable — its verdict is a file, not a pane. That is
+        // the deliberate asymmetry with `rehydratable`, which refuses one.
+        let rev = rehydrate_run(vec![], vec![running("review:t:1:correctness")]);
+        assert_eq!(rev.reapable("review:t:1:correctness"), Ok("w:p1"));
+    }
+
+    /// The automatic trigger's whole rule, in the one place it is written.
+    #[test]
+    fn a_launch_supersedes_every_other_finished_phase_that_still_holds_a_pane() {
+        let mut run = completion_run(vec![]);
+        let with_pane = |name: &str, status: PhaseStatus, pane: &str| {
+            let mut p = Phase::new(name);
+            p.status = status;
+            p.set_pane(pane);
+            p
+        };
+        run.phases.push(with_pane("brainstorm", PhaseStatus::Done, "w:p1"));
+        // Failed keeps its pane: that pane is exactly what a human attaches to
+        // in order to find out what went wrong.
+        run.phases.push(with_pane("plan", PhaseStatus::Failed, "w:p2"));
+        // Running keeps its pane for the obvious reason.
+        run.phases.push(with_pane("implement", PhaseStatus::Running, "w:p3"));
+        // Done but already reaped — nothing left to take.
+        run.phases.push(reaped("review"));
+        // Done with a pane, and it is the one being re-entered.
+        run.phases.push(with_pane("verify", PhaseStatus::Done, "w:p5"));
+
+        assert_eq!(
+            run.superseded_by("verify"),
+            vec!["brainstorm".to_string()],
+            "only OTHER Done phases that still hold a reapable pane"
+        );
+        assert_eq!(
+            run.superseded_by("implement"),
+            vec!["brainstorm".to_string(), "verify".to_string()],
+            "starting a third phase supersedes both finished ones"
+        );
+
+        // A phase re-entered by `phase_start` is `Done` on disk at the moment
+        // its new pass is persisted — excluding it is what stops the launch
+        // closing the pane it is about to use.
+        assert!(
+            !run.superseded_by("brainstorm").contains(&"brainstorm".to_string()),
+            "a launch never supersedes itself"
+        );
+
+        // And the root shell is excluded through the same predicate the reap
+        // itself asks, rather than by a second rule written here.
+        run.root_pane = Some("w:p1".into());
+        assert!(
+            run.superseded_by("implement").is_empty()
+                || !run.superseded_by("implement").contains(&"brainstorm".to_string()),
+            "a phase holding the root pane is never superseded into a close"
+        );
+
+        // Reviewers are `code_review_run`'s to reap, not a launch's.
+        let mut with_reviewer = completion_run(vec![with_pane("plan", PhaseStatus::Running, "w:p9")]);
+        with_reviewer
+            .review_phases
+            .push(with_pane("review:t:1:correctness", PhaseStatus::Done, "w:r1"));
+        assert!(
+            with_reviewer.superseded_by("plan").is_empty(),
+            "a pipeline launch never reaps a panel that may still be in flight"
         );
     }
 

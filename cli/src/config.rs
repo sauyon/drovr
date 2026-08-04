@@ -288,6 +288,19 @@ pub struct Config {
     /// whenever a config file omits the key).
     #[serde(default = "default_true")]
     pub worktree: bool,
+    /// When true, drovr closes a phase's herdr pane once the run has provably
+    /// moved past it — `phase_start` reaps every other finished phase after its
+    /// own launch succeeds, and `code_review_run` reaps its panel once the
+    /// findings are merged. See `phase::phase_reap`.
+    ///
+    /// **On by default**, so `default_true` and not a bare `#[serde(default)]`,
+    /// which yields `false` whenever a config file omits the key — the same trap
+    /// `worktree` above documents. Set `reap_finished_panes = false` to keep
+    /// every pane until `drovr cleanup`, which is what drovr did before reaping
+    /// existed; nothing else changes, and `drovr phase reap` still works when
+    /// asked for explicitly, because that is a command rather than a policy.
+    #[serde(default = "default_true")]
+    pub reap_finished_panes: bool,
     /// SessionStart reflex configuration (see [`ReflexConfig`]).
     #[serde(default)]
     pub reflex: ReflexConfig,
@@ -442,6 +455,7 @@ impl Default for Config {
             angles: default_angles(),
             serve_host: default_serve_host(),
             worktree: default_true(),
+            reap_finished_panes: default_true(),
             reflex: ReflexConfig::default(),
             agents: default_agents(),
         }
@@ -886,6 +900,37 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir);
         }
+    }
+
+    /// The bare-`#[serde(default)]`-on-bool trap, for the opt-OUT switch: a
+    /// config file that says nothing about reaping must still reap, and one that
+    /// says `false` must be believed. Written as its own test because the
+    /// failure mode is silent in both directions — a default of `false` turns
+    /// reaping off for every user with a config file, and ignoring an explicit
+    /// `false` closes panes for the one user who asked drovr not to.
+    #[test]
+    fn reaping_is_on_unless_a_config_file_turns_it_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        set_config_home(tmp.path());
+        let path = tmp.path().join("drovr/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        assert!(
+            Config::default().reap_finished_panes,
+            "the built-in default is on"
+        );
+        // A real config file that simply does not mention it.
+        std::fs::write(&path, "default_agent = \"claude\"\n").unwrap();
+        assert!(
+            load_config().unwrap().reap_finished_panes,
+            "an absent key must not read as `false`"
+        );
+        std::fs::write(&path, "reap_finished_panes = false\n").unwrap();
+        assert!(
+            !load_config().unwrap().reap_finished_panes,
+            "an explicit opt-out must be honoured"
+        );
     }
 
     #[test]
@@ -1597,6 +1642,7 @@ readonly_flag = "--sandbox read-only"
             angles: default_angles(),
             serve_host: default_serve_host(),
             worktree: false,
+            reap_finished_panes: true,
             reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();
@@ -1628,6 +1674,7 @@ readonly_flag = "--sandbox read-only"
             angles: default_angles(),
             serve_host: default_serve_host(),
             worktree: false,
+            reap_finished_panes: true,
             reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();
@@ -1662,6 +1709,7 @@ readonly_flag = "--sandbox read-only"
             angles: default_angles(),
             serve_host: default_serve_host(),
             worktree: false,
+            reap_finished_panes: true,
             reflex: ReflexConfig::default(),
             agents: {
                 let mut m = BTreeMap::new();

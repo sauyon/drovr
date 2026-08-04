@@ -20,8 +20,9 @@ use clap::{Parser, Subcommand};
 use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
-    PhaseWaitOutcome, RehydrateOutcome, collect, diagnose_stuck_phase, phase_done,
-    phase_rehydrate, phase_send, phase_start, phase_wait, triage_blocked_phase,
+    PaneKept, PhaseWaitOutcome, ReapOutcome, RehydrateOutcome, collect, diagnose_stuck_phase,
+    phase_done, phase_reap, phase_rehydrate, phase_send, phase_start, phase_wait,
+    triage_blocked_phase,
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
@@ -211,6 +212,24 @@ enum PhaseCmd {
     /// conversation. Refuses a phase that still holds a pane (attach to that
     /// instead) and never creates a phase that does not exist.
     Rehydrate { run: String, phase_name: String },
+    /// Close a phase's herdr pane and release the phase from it.
+    ///
+    /// drovr does this by itself when a run moves past a phase (see
+    /// `reap_finished_panes`); this is the same operation on demand, and it is
+    /// also the supported way to clear a phase that records a pane herdr no
+    /// longer has — the state that otherwise makes `phase rehydrate` refuse
+    /// with "still holds pane" forever, with nothing able to clear it.
+    ///
+    /// Exit 0 = the pane is gone and the phase no longer records it (including
+    /// when there was nothing to reap, so re-running is safe). Exit 2 = the pane
+    /// is still there and the phase still holds it — herdr would not close it,
+    /// or could not be reached. Exit 1 = refused or failed.
+    ///
+    /// The phase's status is NOT changed: reaping says something about the pane,
+    /// not about whether the work was finished. Bring it back with
+    /// `drovr phase rehydrate`, which resumes the agent's session where the
+    /// backend offers one.
+    Reap { run: String, phase_name: String },
     /// Print a phase's composed brief and exit, spawning nothing.
     ///
     /// This is the text a phase agent should be given: drovr's template for that
@@ -699,6 +718,61 @@ fn rehydrate_report(run: &str, phase: &str, outcome: &RehydrateOutcome) -> Repor
     }
 }
 
+/// How a [`ReapOutcome`] is reported — the DECISION, split from the printing
+/// and the `process::exit`, exactly as [`rehydrate_report`] is and for the same
+/// reason: a decision that is tested while what the caller does with it is not
+/// is how two halves come to contradict each other undetected.
+///
+/// **`Kept` is exit 2, not 0**, and it is the only outcome that is not a
+/// success. The other three all end with the same thing true — the phase does
+/// not record a pane — and `NothingToReap` in particular has to be a success, or
+/// re-running a reap after one that worked would report failure for a state that
+/// is exactly what was asked for.
+fn reap_report(run: &str, phase: &str, outcome: &ReapOutcome) -> Report {
+    match outcome {
+        ReapOutcome::Closed { pane } => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "closed pane {pane} of phase '{phase}' — bring it back with \
+                 `drovr phase rehydrate {} {}`",
+                shell_single_quote(run),
+                shell_single_quote(phase)
+            ),
+        },
+        ReapOutcome::Cleared { pane } => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "phase '{phase}' recorded pane {pane}, which herdr no longer has — \
+                 cleared the registration, so the phase can be rehydrated again"
+            ),
+        },
+        ReapOutcome::NothingToReap => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!("phase '{phase}' holds no pane — nothing to reap"),
+        },
+        // The prose comes from the VARIANT, never the other way round.
+        ReapOutcome::Kept { pane, why } => Report {
+            code: 2,
+            to_stderr: true,
+            line: format!(
+                "drovr: phase '{phase}' still holds pane {pane} — {}. Nothing was \
+                 changed; `drovr cleanup {}` will reclaim it with the rest of the run.",
+                match why {
+                    PaneKept::CloseFailed(e) => format!("herdr would not close it ({e})"),
+                    PaneKept::Unreadable =>
+                        "herdr could not say whether it still exists, and drovr does not \
+                         drop a registration it cannot prove is stale"
+                            .to_string(),
+                },
+                shell_single_quote(run),
+            ),
+        },
+    }
+}
+
 /// The " Or bring back …" clause for a refusal, when the run has a phase whose
 /// pane drovr closed. Empty otherwise — a refusal must never advertise a
 /// recovery that would just error.
@@ -1173,7 +1247,9 @@ fn cmd_phase(sub: PhaseCmd) {
                     // Mark it Failed, exactly as the reviewer path does for the same
                     // condition. Left `Running`, a `phase wait` blocks forever on an
                     // agent that was never asked anything, and a re-entry believes the
-                    // phase is live. The pane stays up (never closed mid-run) and is
+                    // phase is live. The pane stays up — reaping only ever takes a
+                    // `Done` phase's, and a `Failed` phase's pane is what a human
+                    // attaches to in order to find out what went wrong — and it is
                     // still recorded, so `drovr cleanup` reclaims it.
                     if let Some(i) = state.phases.iter().position(|p| p.name == phase_name) {
                         state.phases[i].status = run::PhaseStatus::Failed;
@@ -1361,6 +1437,31 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: phase rehydrate failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Reap { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let mut state = load_run(&run);
+            match phase_reap(&h, &mut state, &phase_name) {
+                // The decision lives in `reap_report`; this is only the doing.
+                Ok(outcome) => {
+                    let r = reap_report(&run, &phase_name, &outcome);
+                    if r.to_stderr {
+                        eprintln!("{}", r.line);
+                    } else {
+                        println!("{}", r.line);
+                    }
+                    if r.code != 0 {
+                        process::exit(r.code);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("drovr: phase reap failed: {e}");
                     process::exit(1);
                 }
             }
@@ -2514,6 +2615,67 @@ mod tests {
         assert!(partial.to_stderr, "{partial:?}");
         assert!(partial.line.contains("INCOMPLETE"), "{partial:?}");
         assert!(partial.line.contains("Its seed was NOT re-sent"), "{partial:?}");
+    }
+
+    /// The same split as `rehydrate_report`, and the same failure class it
+    /// exists to close: a driver reads an exit code as success and carries on.
+    #[test]
+    fn a_reap_that_left_the_pane_standing_is_not_reported_as_success() {
+        let closed = reap_report(
+            "r",
+            "plan",
+            &ReapOutcome::Closed {
+                pane: "w:p1".into(),
+            },
+        );
+        assert_eq!(closed.code, 0);
+        assert!(!closed.to_stderr);
+        assert!(
+            closed.line.contains("drovr phase rehydrate"),
+            "a closed pane is recoverable, and the message should say how: {closed:?}"
+        );
+
+        // The stuck-registration repair. Also a success — the phase no longer
+        // records a pane, which is exactly what was asked for.
+        let cleared = reap_report(
+            "r",
+            "plan",
+            &ReapOutcome::Cleared {
+                pane: "w:p1".into(),
+            },
+        );
+        assert_eq!(cleared.code, 0);
+        assert!(!cleared.to_stderr);
+
+        // Idempotence has to be a success, or re-running a reap that already
+        // worked reports failure for the state it produced.
+        let nothing = reap_report("r", "plan", &ReapOutcome::NothingToReap);
+        assert_eq!(nothing.code, 0);
+        assert!(!nothing.to_stderr);
+
+        // ⚠️ The one that is not. The pane is still there and the phase still
+        // holds it — a driver that read this as 0 would believe the run had
+        // moved on from a pane that is still occupying the user's herdr.
+        for why in [
+            PaneKept::CloseFailed("herdr said no".into()),
+            PaneKept::Unreadable,
+        ] {
+            let kept = reap_report(
+                "r",
+                "plan",
+                &ReapOutcome::Kept {
+                    pane: "w:p1".into(),
+                    why,
+                },
+            );
+            assert_eq!(kept.code, 2, "{kept:?}");
+            assert!(kept.to_stderr, "{kept:?}");
+            assert!(kept.line.contains("w:p1"), "{kept:?}");
+            assert!(
+                kept.line.contains("drovr cleanup"),
+                "a pane drovr could not take is one cleanup still will: {kept:?}"
+            );
+        }
     }
 
     #[test]

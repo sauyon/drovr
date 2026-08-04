@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::config::{AgentLaunch, load_config};
 use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, PromptOutcome, SessionId};
 use crate::run::{
-    NotRehydratable, PassToken, Phase, PhaseStatus, REVIEWER_PREFIX, RunState,
+    NotReapable, NotRehydratable, PassToken, Phase, PhaseStatus, REVIEWER_PREFIX, RunState,
     is_reviewer_phase_name, run_dir,
 };
 use crate::shell::shell_single_quote;
@@ -960,17 +960,34 @@ pub fn phase_start<H: Herdr>(
     // launch-failure path.
     run.phases[idx].record_launch(launch.backend(), profile);
 
-    // Panes are never closed mid-run: closing any pane makes herdr reassign
-    // focus, disturbing the user. Every pane drovr opens (the root pane, each
-    // phase pane, each reviewer pane) is torn down at the end by `drovr cleanup`,
-    // once the user confirms — which is why `pane_id` is recorded here: it is how
-    // cleanup knows which panes are drovr's and which are the human's.
+    // `pane_id` is recorded here because it is how `drovr cleanup` — and now
+    // reaping — knows which panes are drovr's and which are the human's.
     //
     // `save_preserving_archived`, not `save`: the caller has held this state since
     // before the pane was launched, and the human may have archived the run from
     // the web UI in between. Writing a stale `archived: false` back would
     // un-archive a run whose workspace is already destroyed.
     run.save_preserving_archived()?;
+
+    // ⭐ THE SUPERSESSION TRIGGER, and its position is the whole design.
+    //
+    // AFTER the launch and after the save, because this is the first moment the
+    // run has provably moved past its finished phases — and only a launch that
+    // worked is evidence of that. On every earlier line the phase being started
+    // might still fail, and reaping on the strength of an attempt would close
+    // the panes of a run that has not moved anywhere.
+    //
+    // NOT on completion, which is the shape this looks like and must not be:
+    // `skills/pipeline` promises the driver that a pane outlives `drovr phase
+    // done`, and the implement↔review loop re-enters the SAME pane with `phase
+    // send` and no `phase start`. Reaping when a phase finishes would kill
+    // drovr's core quality loop on its first iteration.
+    //
+    // Best-effort throughout: `reap_superseded` returns nothing, so no failure
+    // here can turn a started phase into a failed command.
+    if cfg.reap_finished_panes {
+        reap_superseded(h, run, phase);
+    }
     Ok(())
 }
 
@@ -1235,7 +1252,10 @@ impl Unfinished {
                 let blocked = if *resuming {
                     " Until that pane is gone, rehydrating this phase again \
                      will refuse with \"still holds pane\" — which is correct \
-                     while the agent is still coming up."
+                     while the agent is still coming up, and wrong once it has \
+                     exited. `drovr phase reap` clears it either way: it closes \
+                     the pane if it is still there, and drops the registration \
+                     if herdr has already lost it."
                 } else {
                     ""
                 };
@@ -1275,9 +1295,12 @@ impl Unfinished {
                      failed: the id can surface a moment after the agent does. The pane is \
                      still there and still holds the phase — look with herdr pane read \
                      {pane}. Until that pane is gone, rehydrating this phase again will \
-                     refuse with \"still holds pane {p}\".",
+                     refuse with \"still holds pane {p}\"; `drovr phase reap {q_run} \
+                     {q_phase}` is what clears that, by closing the pane.",
                     expected.as_str(),
                     p = self.pane(),
+                    q_run = shell_single_quote(run_name),
+                    q_phase = shell_single_quote(phase),
                 )
             }
             Unfinished::NoSeed { .. } => format!(
@@ -1393,11 +1416,12 @@ fn acquire_run_lock(run_name: &str) -> io::Result<File> {
 ///   fresh agent; the note tells the operator to `phase send` it, and closing
 ///   it would destroy the very thing they were pointed at.
 ///
-/// `mark_reaped` is the right transition and not a borrowing of task 6's: it
+/// `mark_reaped` is the right transition and not a borrowing of reaping's: it
 /// says "drovr closed this phase's pane", which is exactly what happened, and
 /// it drops the registration in the same statement so the phase cannot claim a
 /// pane that is gone. Retire → save → close, the same order and for the same
-/// reason as [`surrender_unrecordable_pane`].
+/// reason as [`surrender_unrecordable_pane`] — and the REVERSE of
+/// [`phase_reap`]'s, which closes first; see there for why the two differ.
 ///
 /// The phase's `pane_agent` is left ALONE, which is the point: the session id
 /// this rehydrate failed to confirm is the one a retry needs.
@@ -1473,9 +1497,11 @@ fn unreleased_pane_error(run_name: &str, phase: &str, pane: &str, cause: &io::Er
             "the agent for phase '{run_name}/{phase}' came up in a DIFFERENT conversation, so \
              drovr closed pane {pane} again — but the phase could not be released from it \
              ({cause}). It still records that pane, so rehydrate will now refuse with \"still \
-             holds pane {pane}\", and nothing clears that on its own: fix the write error, \
-             then delete the \"pane_id\" field from phase \"{phase}\" in {state}.",
-            state = run_dir(run_name).join("state.json").display(),
+             holds pane {pane}\", and nothing re-attempts the release on its own: fix the \
+             write error, then run `drovr phase reap {q_run} {q_phase}`, which clears a \
+             registration whose pane has already gone.",
+            q_run = shell_single_quote(run_name),
+            q_phase = shell_single_quote(phase),
         ),
     )
 }
@@ -1507,7 +1533,9 @@ fn reseed_text(run_name: &str, phase: &str, seed: &str) -> String {
 ///    pane for is one to `drovr attach` to, not to duplicate an agent into.
 ///    (Cost of the simple rule: a phase whose pane herdr has lost, but which
 ///    drovr still records, cannot be rehydrated until something clears the
-///    registration. Nothing does that before reaping exists.)
+///    registration. [`phase_reap`] is that something — it takes the
+///    `PaneStanding::Gone` path and drops the registration, which is why it is a
+///    command and not only an automatic trigger.)
 /// 2. **Never append.** Unlike [`phase_start`], an unknown name is an error —
 ///    the HTTP caller is unauthenticated and `safe_component` is a filename
 ///    check, not an authorization one.
@@ -1612,7 +1640,9 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
                     "phase '{}/{phase}' still holds pane {pane}; rehydrate brings back a \
                      phase whose pane is gone. Look at that pane instead: herdr pane read \
                      {quoted_pane} (or herdr agent attach {quoted_pane}, if an agent is \
-                     still attached to it)",
+                     still attached to it) — or, if that pane is finished with, \
+                     `drovr phase reap {quoted_run} {quoted_phase}` closes it and clears \
+                     the registration this refusal is about",
                     run.name,
                     // `herdr pane read`, not `drovr attach <run>`: the latter
                     // resolves through `RunState::live_agent_pane`, which skips
@@ -1620,8 +1650,9 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
                     // what rehydrate is usually asked about, so it would attach
                     // to a DIFFERENT phase or deny any pane exists. And `read`
                     // rather than `agent attach`, because nothing clears
-                    // `pane_id` when an agent exits (that is task 6's job), so
-                    // this pane may well have no agent on it.
+                    // `pane_id` when an agent merely EXITS — reaping is
+                    // triggered by supersession, not by an agent going away —
+                    // so this pane may well have no agent on it.
                     quoted_pane = shell_single_quote(&pane),
                 ),
             ),
@@ -1965,6 +1996,348 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             seed,
             error: e.to_string(),
         })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reap
+// ---------------------------------------------------------------------------
+
+/// What drovr ESTABLISHED about a phase's pane, before deciding whether it may
+/// drop the phase's registration of it.
+///
+/// Three states and not a `bool`, because two of them arrive through the same
+/// `None` from [`Herdr::pane_info`] and they authorise opposite actions. This is
+/// the fourth time on this branch that a two-state encoding of a three-state
+/// fact would have produced a bug (`Capture`'s fill-vs-replace, reviewer
+/// identity by list-vs-name, `ResumeEvidence`'s confirmed/contradicted/
+/// unobserved), so the states are named.
+///
+/// The opposite actions, precisely:
+///
+/// * [`PaneStanding::Gone`] — herdr says there is no such pane. Clearing the
+///   registration is then the WHOLE POINT: it is the supported repair for a
+///   phase whose pane herdr has lost, which is otherwise stuck answering
+///   `HoldsPane` to every rehydrate with nothing able to clear it.
+/// * [`PaneStanding::Unknown`] — herdr could not be asked. Clearing here drops a
+///   registration for a pane that may be perfectly alive, which strands it:
+///   `drovr cleanup` closes only panes it can prove are drovr's, so an
+///   unrecorded one reads as the human's and is never closed, while it blocks
+///   `workspace_close` for the whole run. "I don't know" authorises nothing —
+///   the same rule the resume path settled on.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneStanding {
+    /// herdr answered `pane.get`: the pane is there, and can be closed.
+    ///
+    /// It says NOTHING about whether an agent is still attached, and reaping
+    /// deliberately does not ask. A pipeline phase's `claude` does not exit when
+    /// it runs `drovr phase done` — it sits at its composer — so "no agent
+    /// attached" is not a state a finished phase reaches, and waiting for it
+    /// would mean never reaping anything. Supersession is the evidence that a
+    /// phase is finished with; the agent's own exit is not.
+    Live,
+    /// herdr answered that there is NO SUCH PANE.
+    Gone,
+    /// herdr could not be asked — unreachable daemon, socket error, a response
+    /// shape drovr could not parse. Nothing was established.
+    Unknown,
+}
+
+/// Classify a phase's pane from one poll, disambiguating [`Herdr::pane_info`]'s
+/// `None`.
+///
+/// `pane_info` returns `None` both for a pane that is gone and for a poll that
+/// merely failed — [`PaneInfo`]'s doc says so explicitly, and says reaping is
+/// the thing that turns on the distinction. [`Herdr::pane_exists`] is the
+/// disambiguator, and it is biased the right way for this: only herdr's explicit
+/// `pane_not_found` answers `false`, so an unreachable daemon lands in
+/// [`PaneStanding::Unknown`] rather than being read as proof of death.
+///
+/// The second herdr round trip happens ONLY on the `None` path, which is the
+/// path that has already failed.
+fn pane_standing<H: Herdr>(h: &H, poll: Option<&PaneInfo>, pane: &str) -> PaneStanding {
+    match poll {
+        Some(_) => PaneStanding::Live,
+        None if !h.pane_exists(pane) => PaneStanding::Gone,
+        None => PaneStanding::Unknown,
+    }
+}
+
+/// What a [`phase_reap`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// The pane was closed and the phase released from it.
+    Closed { pane: String },
+    /// The pane was already gone, and the phase's registration of it has been
+    /// cleared. This is the repair for a stuck `HoldsPane`.
+    Cleared { pane: String },
+    /// The phase holds no pane at all — already reaped, never launched, or its
+    /// pane died with its workspace. Nothing was done and nothing was wrong,
+    /// which is what makes a second reap of one phase emit no close.
+    NothingToReap,
+    /// The pane is still there and the phase still holds it. **The phase is
+    /// EXACTLY as it was**: same status, not reaped, still recorded — which is
+    /// what keeps the pane inside `drovr_pane_ids` so `drovr cleanup` can still
+    /// prove it is drovr's.
+    Kept { pane: String, why: PaneKept },
+}
+
+/// Why a reap left the pane where it was.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaneKept {
+    /// `pane_close` failed, carrying herdr's reason.
+    CloseFailed(String),
+    /// herdr could not say whether the pane exists, so drovr cannot prove it is
+    /// gone — see [`PaneStanding::Unknown`].
+    Unreadable,
+}
+
+/// How the pane a phase records stopped existing.
+///
+/// A named pair rather than a `bool`, because [`unreaped_pane_error`] has to
+/// describe two different events — drovr closed it a moment ago, or herdr had
+/// already lost it — and the operator's next step differs.
+#[derive(Debug, Clone, Copy)]
+enum PaneGone {
+    ClosedByThisReap,
+    AlreadyMissing,
+}
+
+/// Close the pane a finished phase is holding, and release the phase from it.
+///
+/// **Reaping is supersession, not completion** — see `skills/pipeline`: `Done`
+/// is not terminal for a pane, because the implement↔review loop re-enters the
+/// same pane with `drovr phase send` and no `phase start`. So nothing here is
+/// triggered by a phase finishing. The triggers are the moments the run has
+/// provably moved past it: `phase_start` reaps every other finished phase after
+/// its own launch succeeds, `code_review_run` reaps its panel after the findings
+/// are merged, and `drovr phase reap` is the operator saying so directly.
+///
+/// # Order, and why it is the reverse of the surrender paths
+///
+/// [`surrender_misattributed_pane`] records the retirement and THEN closes, so
+/// a failed close still leaves the pane provably drovr's. Reaping closes FIRST
+/// and releases only if that worked, and the difference is what a failure has to
+/// leave behind:
+///
+/// * a surrender has already decided the pane must not stay — the record is
+///   wrong either way, so it is written first;
+/// * a reap is **best-effort and must never fail the phase**. A close that fails
+///   means the pane is still there, so the honest record is the one that was
+///   already on disk. Clearing `pane_id` anyway would be the immortal-pane bug
+///   arriving by the front door: `drovr cleanup` closes only panes it can prove
+///   are drovr's (main's `8173f03`), and a live pane no phase records reads as
+///   the human's — never closed, and blocking `workspace_close` for the run.
+///
+/// The release itself is [`release_phase_from_pane`], shared with the surrender
+/// path rather than written a second time: retire → mark reaped → save, all
+/// three onto a FRESH read, in one save that cannot half-land. That ordering is
+/// the family's lesson (`discard_unlaunched_pane`, `surrender_unrecordable_pane`,
+/// `surrender_misattributed_pane`), and reusing it is how this stays the fourth
+/// member rather than becoming a fifth.
+///
+/// # `pane_close`, never `tab_close`
+///
+/// A phase occupies one pane, in a tab drovr created for it — but the human can
+/// split their own pane into that tab (a shell for the tests beside the agent),
+/// and `tab.close` takes every pane in the tab. `8173f03` established "never
+/// close what you cannot prove is yours" at PANE granularity, and closing the
+/// tab would quietly widen that.
+///
+/// The reason this costs nothing: **verified live against herdr 0.7.5 — closing
+/// the last pane in a tab destroys the tab.** (Probe: `tab create` → `pane
+/// split` → `pane close` the split → `pane close` the original → `tab get`
+/// answers `tab_not_found`.) So in the ordinary case, where drovr's pane is the
+/// tab's only pane, the tab disappears exactly as `tab_close` would have made it
+/// — and in the case where it is not, the human's pane and its tab survive. It
+/// is also the primitive `drovr cleanup` and all three disposal paths already
+/// use, so there is one teardown call in drovr rather than two.
+///
+/// # Best-effort, and the one thing that is not
+///
+/// Every herdr call here may fail without failing the caller: a failed poll, a
+/// failed close and a failed focus restore all end in [`ReapOutcome::Kept`] or
+/// are ignored. The single `Err` is a release that could not be SAVED after the
+/// pane is already gone — see [`unreaped_pane_error`], which names what clears
+/// it. The automatic triggers treat even that as a warning; `drovr phase reap`
+/// surfaces it, because the operator asked.
+pub fn phase_reap<H: Herdr>(h: &H, run: &mut RunState, phase: &str) -> io::Result<ReapOutcome> {
+    require_phase_name(phase)?;
+    // Same lock and same re-read as `phase_rehydrate`, and for the same reason
+    // in reverse: reaping a phase a rehydrate is bringing back would close the
+    // pane it just opened, and the driver's `RunState` may be minutes old — a
+    // reap decided on a stale copy closes whatever pane that copy remembers.
+    let _lock = acquire_run_lock(&run.name)?;
+    *run = RunState::load(&run.name)?;
+    let pane = match run.reapable(phase) {
+        Ok(pane) => pane.to_owned(),
+        // Not an error: idempotence is the point. A second reap of one phase,
+        // and a reap of a phase that never held a pane, both land here.
+        Err(NotReapable::NoPane) => return Ok(ReapOutcome::NothingToReap),
+        Err(NotReapable::NoSuchPhase) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "run '{}' has no phase '{phase}' — reap never creates one",
+                    run.name
+                ),
+            ));
+        }
+        Err(NotReapable::RootShell(pane)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{}/{phase}' is recorded as holding pane {pane}, which is run \
+                     '{}'s root shell — herdr destroys a workspace when its last pane \
+                     closes, so reaping it would take the workspace and every other \
+                     phase in it. (Only a state.json written by an older drovr, where the \
+                     first phase claimed the root pane, can look like this; the run is \
+                     otherwise fine.) Use `drovr cleanup {}` to tear the whole run down.",
+                    run.name,
+                    run.name,
+                    shell_single_quote(&run.name),
+                ),
+            ));
+        }
+    };
+
+    // Poll BEFORE closing, and through `poll_phase_pane` rather than
+    // `Herdr::pane_info`, because it captures the session on the way past — and
+    // this is the LAST time anything will look at this pane. herdr reports
+    // `agent_session` only while the agent is alive, so an id that has not been
+    // banked by now is one a rehydrate will never have. Reaping without that is
+    // a downgrade: the pane goes and nothing can bring the conversation back.
+    let poll = poll_phase_pane(h, run, phase);
+    match pane_standing(h, poll.as_ref(), &pane) {
+        // Nothing was established, so nothing is destroyed and nothing is
+        // dropped. The phase is untouched and a later reap will ask again.
+        PaneStanding::Unknown => Ok(ReapOutcome::Kept {
+            pane,
+            why: PaneKept::Unreadable,
+        }),
+        // herdr has already lost the pane. There is nothing to close, and
+        // clearing the registration is the entire job: this is the state that
+        // leaves a phase answering `HoldsPane` to every rehydrate forever.
+        PaneStanding::Gone => {
+            release_phase_from_pane(run, phase, &pane).map_err(|e| {
+                unreaped_pane_error(&run.name, phase, &pane, PaneGone::AlreadyMissing, &e)
+            })?;
+            Ok(ReapOutcome::Cleared { pane })
+        }
+        PaneStanding::Live => {
+            // Focus is captured and restored around the close for the same
+            // reason `launch_in_pane` does it: closing a pane makes herdr
+            // reassign focus, and drovr must not move the user's view as a side
+            // effect of its own bookkeeping. Restoring is best-effort — a focus
+            // that could not be put back is not a reason to report a reap that
+            // happened as one that did not.
+            let prev_focus = h.focused_workspace();
+            let closed = h.pane_close(&pane);
+            if let Some(prev) = prev_focus {
+                let _ = h.workspace_focus(&prev);
+            }
+            match closed {
+                // ⚠️ The registration STAYS. See the ordering note above: a
+                // pane that is still there and no longer recorded is immortal.
+                Err(e) => Ok(ReapOutcome::Kept {
+                    pane,
+                    why: PaneKept::CloseFailed(e.to_string()),
+                }),
+                Ok(()) => {
+                    release_phase_from_pane(run, phase, &pane).map_err(|e| {
+                        unreaped_pane_error(&run.name, phase, &pane, PaneGone::ClosedByThisReap, &e)
+                    })?;
+                    Ok(ReapOutcome::Closed { pane })
+                }
+            }
+        }
+    }
+}
+
+/// The refusal for a phase whose pane is gone and which could not be released
+/// from it.
+///
+/// The sibling of [`unreleased_pane_error`], and it has the same job: not to
+/// repeat a comfortable lie. The phase now records a pane that does not exist,
+/// so `drovr attach` and `phase send` aim at nothing, and rehydrate refuses with
+/// "still holds pane" — and nothing re-attempts the release on its own.
+///
+/// Unlike its sibling it does NOT tell the operator to hand-edit `state.json`,
+/// because the command that fixes this now exists: re-running the reap once the
+/// run directory is writable takes the [`PaneStanding::Gone`] path and clears
+/// exactly this.
+fn unreaped_pane_error(
+    run_name: &str,
+    phase: &str,
+    pane: &str,
+    gone: PaneGone,
+    cause: &io::Error,
+) -> io::Error {
+    let what = match gone {
+        PaneGone::ClosedByThisReap => "drovr closed pane",
+        PaneGone::AlreadyMissing => "herdr no longer has pane",
+    };
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "{what} {pane}, but phase '{run_name}/{phase}' could not be released from it \
+             ({cause}). It still records that pane, so `drovr attach` and `drovr phase \
+             send` will aim at a pane that is gone and rehydrate will refuse with \"still \
+             holds pane {pane}\". Nothing clears that on its own: fix the write error, \
+             then run `drovr phase reap {q_run} {q_phase}` again — it clears a \
+             registration whose pane has already gone.",
+            q_run = shell_single_quote(run_name),
+            q_phase = shell_single_quote(phase),
+        ),
+    )
+}
+
+/// Reap every phase a launch of `starting` has superseded.
+///
+/// **Best-effort at every step, and that is a hard requirement**: this runs
+/// after `phase_start` has already launched an agent and recorded it, so a
+/// failure here must never turn a started phase into a failed command. Every
+/// outcome is reported and none is propagated.
+///
+/// WHICH phases is [`RunState::superseded_by`]'s rule, not a filter written
+/// here — the condition belongs in the API that answers it, or the automatic
+/// trigger and the reap itself get to disagree about what is reapable.
+///
+/// The lock is taken and dropped per phase, inside [`phase_reap`]: the run lock
+/// is `flock`-shaped and not re-entrant, so wrapping this loop in one would
+/// deadlock against the first `phase_reap` it calls.
+fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
+    for name in run.superseded_by(starting) {
+        match phase_reap(h, run, &name) {
+            // Said out loud: a pane vanishing from the user's herdr is a visible
+            // event, and a driver reading drovr's output should be able to see
+            // which phase it belonged to.
+            Ok(ReapOutcome::Closed { pane }) => {
+                eprintln!("drovr: closed pane {pane} of finished phase '{name}'");
+            }
+            Ok(ReapOutcome::Cleared { pane }) => {
+                eprintln!(
+                    "drovr: phase '{name}' recorded pane {pane}, which herdr no longer has \
+                     — cleared the registration"
+                );
+            }
+            Ok(ReapOutcome::NothingToReap) => {}
+            Ok(ReapOutcome::Kept { pane, why }) => eprintln!(
+                "drovr: warning: left pane {pane} of finished phase '{name}' open ({}); \
+                 `drovr cleanup` will reclaim it",
+                match why {
+                    PaneKept::CloseFailed(e) => e,
+                    PaneKept::Unreadable =>
+                        "herdr could not say whether it still exists, and drovr does not \
+                         drop a registration it cannot prove is stale"
+                            .to_string(),
+                }
+            ),
+            Err(e) => eprintln!(
+                "drovr: warning: could not reap finished phase '{name}' ({e}); the phase \
+                 that just started is unaffected"
+            ),
+        }
     }
 }
 
@@ -2399,7 +2772,7 @@ pub(crate) fn poll_phase_pane<H: Herdr>(
     // and the capture would attribute that pane's session to this phase —
     // permanently, because capture is one-shot: herdr drops the session when the
     // agent exits, so there is no later poll to correct it. It is also silent,
-    // and task 6 reaps off the record it corrupts. One argument, no pair to get
+    // and reaping runs off the record it would corrupt. One argument, no pair to get
     // wrong.
     let pane_id = run.find_phase(phase).and_then(|p| p.pane_id())?.to_owned();
     let info = h.pane_info(&pane_id);
@@ -2843,7 +3216,8 @@ fn pane_shows_payload(pane: &str, text: &str) -> bool {
 /// re-open, the previous iteration's `Done` status and completion marker both
 /// survive, so the `phase wait` that follows the send returns `Done` in
 /// microseconds while the agent has not yet read the prompt, and the driver
-/// advances (and, once task 6 lands, reaps a pane it just messaged).
+/// advances — and then the next `phase start` reaps a pane the driver had just
+/// messaged.
 pub fn phase_send<H: Herdr>(h: &H, run: &mut RunState, phase: &str, text: &str) -> io::Result<()> {
     phase_send_with_timeout(
         h,
@@ -3399,15 +3773,16 @@ pub enum PhaseWaitOutcome {
     /// the wait runs out of time (the common one — it signalled nothing). What is
     /// deliberately NOT detected is a re-entry via `phase send`, which leaves the
     /// token unchanged and is therefore structurally invisible to a token
-    /// comparison; task 1's handoff §5.1 routes that to task 6, together with the
-    /// monotonic re-entry counter it needs.
+    /// comparison; it is still unsolved, and needs a monotonic re-entry counter
+    /// beside the pass token.
     ///
     /// Deliberately NOT `TimedOut`, which it used to be reported as. The two are
     /// opposite verdicts about the same phase — "another pass took over, and it is
     /// the one to follow now" versus "the agent I am waiting on is not
-    /// progressing" — and nothing but log scraping could tell them apart. Task 6
-    /// keys pane teardown off this enum, and the pane here belongs to the LIVE
-    /// re-entry: a caller must be able to see that without parsing prose.
+    /// progressing" — and nothing but log scraping could tell them apart. Pane
+    /// teardown is keyed off verdicts like this one, and the pane here belongs to
+    /// the LIVE re-entry: a caller must be able to see that without parsing
+    /// prose.
     ///
     /// Like the `Done` path, this outcome adopts the freshly loaded run state
     /// (`*run = fresh`), so a caller that saves after waiting writes the
@@ -3439,8 +3814,8 @@ pub enum PhaseWaitOutcome {
 /// what makes the whole family of "state was persisted but the marker was
 /// destroyed (or vice versa)" failures fail closed: an interrupted `phase_start`
 /// or `phase_send` can leave a stale `Done` on disk, and short-circuiting on it
-/// would report success for a phase with no agent running. Task 6 tears panes
-/// down on this verdict, so that would close a live agent's pane.
+/// would report success for a phase with no agent running. A `Done` phase is
+/// exactly what the next launch reaps, so that would close a live agent's pane.
 ///
 /// Consequently the marker is NOT consumed on success — it IS the evidence, and
 /// keeping it is what makes a repeated wait idempotent without a status
@@ -3515,8 +3890,8 @@ pub fn phase_wait<H: Herdr>(
                 //
                 // Fails CLOSED: a load error aborts the wait rather than skipping
                 // the check. A completion that cannot be verified is exactly what
-                // must never be reported — task 6 tears panes down on this verdict,
-                // so an unverifiable `Done` closes a live agent's pane.
+                // must never be reported — a `Done` phase is what the next launch
+                // reaps, so an unverifiable `Done` closes a live agent's pane.
                 let mut fresh = RunState::load(&run.name).map_err(|e| {
                     io::Error::new(
                         e.kind(),
@@ -3556,7 +3931,7 @@ pub fn phase_wait<H: Herdr>(
                         );
                         // Adopt the fresh state, exactly as the `Done` path below
                         // does and for the same reason: a caller that saves after
-                        // waiting (task 6 records a reap that way) would otherwise
+                        // waiting (reaping records a reap that way) would otherwise
                         // write this waiter's hour-old snapshot back, restoring the
                         // superseded pass token and undoing the re-entry that
                         // superseded it. Nothing is written HERE — the re-entry
@@ -3586,7 +3961,7 @@ pub fn phase_wait<H: Herdr>(
                         fresh.save()?;
                         // Adopt the fresh state wholesale rather than patching one
                         // field into the caller's stale snapshot. A caller that
-                        // saves after waiting (task 6 records the reap this way)
+                        // saves after waiting (reaping records the reap this way)
                         // would otherwise write that snapshot back and undo exactly
                         // what this block prevents.
                         *run = fresh;
@@ -6039,11 +6414,13 @@ mod tests {
         );
     }
 
-    // Panes are never closed mid-run (herdr reassigns focus on any close); every
-    // pane drovr opened is reaped at end-of-run by `drovr cleanup`. `phase_start`
-    // must therefore never close a pane.
+    // A launch closes exactly the panes it SUPERSEDES — every other phase that
+    // is `Done` and still holds one (`phase::reap_tests`) — and nothing else.
+    // Here both phases are `Running`, so there is nothing to supersede and the
+    // count is zero: a launch must never close a pane that is still in play, and
+    // never the one it is launching into.
     #[test]
-    fn phase_start_never_closes_a_pane() {
+    fn phase_start_never_closes_a_pane_that_is_still_in_play() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("no-mid-run-close-test");
@@ -6054,7 +6431,7 @@ mod tests {
         let calls = h.calls();
         assert!(
             !calls.iter().any(|c| c.contains("pane_close")),
-            "phase_start must never close a pane mid-run: {calls:?}"
+            "a launch must not close a pane of a phase that is still running: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("agent_start")),
@@ -6147,9 +6524,10 @@ mod tests {
     // -- pass tokens: a re-entered phase must not complete off the old pass ------
     //
     // The pre-launch marker delete only narrows the window. The PREVIOUS pass's
-    // agent is still alive in the reused pane (panes are never closed mid-run) and
-    // can run `drovr phase done` again at any moment, recreating the marker after
-    // the delete. Every test below drives that exact sequence.
+    // agent is still alive in the reused pane — a re-entry relaunches into the
+    // same pane, and a launch never reaps the phase it is re-entering — and can
+    // run `drovr phase done` again at any moment, recreating the marker after the
+    // delete. Every test below drives that exact sequence.
 
     /// Simulate the agent launched by pass `token` running `drovr phase done`:
     /// the pane's environment carries `DROVR_PASS`, so the marker it writes is
@@ -6325,7 +6703,7 @@ mod tests {
     fn supersession_guard_fails_closed_when_state_cannot_be_reread() {
         // Finding 3. The guard used `if let Ok(fresh) = RunState::load(..)`, so any
         // load failure SKIPPED the check and the waiter completed anyway. A
-        // completion that cannot be verified must never be reported: task 6 tears
+        // completion that cannot be verified must never be reported: reaping tears
         // panes down on this verdict, so an unverifiable Done closes a live pane.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
@@ -6351,7 +6729,7 @@ mod tests {
     fn phase_wait_leaves_the_caller_holding_the_persisted_state() {
         // `phase_wait` commits onto freshly-loaded state. If it then patched only
         // `status` into the caller's entry-time snapshot, a caller that saves after
-        // waiting — task 6 records the reap exactly that way — would write the
+        // waiting — reaping records the reap exactly that way — would write the
         // stale snapshot back and undo everything else that happened meanwhile.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
@@ -6444,7 +6822,7 @@ mod tests {
         // `run` is this waiter's hour-old snapshot, still expecting pass A.
         // Supersession is its OWN outcome, never `TimedOut`: "another pass took
         // over, all is well" and "the agent is stuck" are opposite verdicts, and
-        // task 6 tears panes down on this one.
+        // reaping tears panes down on this one.
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Superseded,
@@ -6460,7 +6838,7 @@ mod tests {
     fn a_superseded_wait_leaves_the_caller_holding_the_re_entrys_state() {
         // The clobber half of the same defect. `phase_wait`'s Done path adopts the
         // freshly loaded state (`*run = fresh`) precisely so a caller that saves
-        // after waiting cannot write an hour-old snapshot back; task 6 records a
+        // after waiting cannot write an hour-old snapshot back; reaping records a
         // reap exactly that way. The supersession path has the SAME hazard and a
         // worse payload: the waiter's snapshot still carries the superseded pass
         // token and its `Running`/`Done` status, so saving it would restore the
@@ -9089,7 +9467,7 @@ mod capture_tests {
         // up: `phase_wait`'s marker branch RETURNS (`Done`, `Superseded`), so a
         // phase whose marker was already on disk at the first iteration was
         // never polled at all, and a session is readable only while its agent
-        // lives. Under task 6 that phase is then reaped with nothing to resume.
+        // lives. That phase is then reaped with nothing to resume.
         //
         // The fix is the same: poll at the top of the loop, before any branch
         // that can return.
@@ -9215,7 +9593,7 @@ mod capture_tests {
         // pane. The capture would then attribute that pane's session to this
         // phase — permanently, because capture is one-shot: herdr drops the
         // session when the agent exits, so no later poll corrects it. Silent,
-        // and task 6 reaps off the record it corrupted.
+        // and reaping runs off the record it corrupted.
         //
         // The pane is derived from the phase now, so the mismatch is not
         // expressible. This pins that the derivation picks the RIGHT pane.
@@ -9550,10 +9928,16 @@ mod capture_tests {
         );
     }
 
+    /// Polling a phase's pane records what it sees; it never acts on it.
+    ///
+    /// This began as a task-scope guard ("nothing reaps yet"), and that reading
+    /// expired when `phase_reap` landed. What it asserts did not: capture runs
+    /// inside every wait loop, twice a second, on panes whose agents are very
+    /// much alive — so a close reachable from here would be a close on no
+    /// evidence at all. Reaping has its own triggers and its own tests
+    /// (`phase::reap_tests`); this pins that the poll is not one of them.
     #[test]
-    fn nothing_in_this_task_reaps_a_pane() {
-        // Task scope guard: capture only. `reaped` is declared so the state.json
-        // shape migrates once, but no path writes it and no path closes a tab.
+    fn capture_never_reaps_a_pane() {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = capture_run("no-reaping");
@@ -9567,7 +9951,9 @@ mod capture_tests {
         assert_eq!(run.phases[0].pane_id(), Some(pane.as_str()));
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
         assert!(
-            !h.calls().iter().any(|c| c.contains("tab_close")),
+            !h.calls()
+                .iter()
+                .any(|c| c.contains("tab_close") || c.contains("pane_close")),
             "capture must never close anything: {:?}",
             h.calls()
         );
@@ -9635,7 +10021,7 @@ mod rehydrate_tests {
     }
 
     /// A phase that ran, was captured, and has since had its pane closed —
-    /// exactly the state reaping will leave behind (task 6) and the one
+    /// exactly the state reaping leaves behind, and the one
     /// rehydrate exists to recover from.
     fn reaped_phase(
         name: &str,
@@ -10866,8 +11252,10 @@ mod rehydrate_tests {
         let err = released.expect_err("a release that did not land is not a success");
         let msg = err.to_string();
         assert!(
-            msg.contains("ws-rh:doomed") && msg.contains("state.json"),
-            "must name the pane that is stuck and the file that clears it: {msg}"
+            msg.contains("ws-rh:doomed") && msg.contains("drovr phase reap"),
+            "must name the pane that is stuck and the COMMAND that clears it — this \
+             used to end in a hand-edit of state.json, and `drovr phase reap` is the \
+             supported repair now: {msg}"
         );
         assert!(
             !msg.contains("can be rehydrated again") && !msg.contains("will retry"),
@@ -11251,17 +11639,23 @@ mod rehydrate_tests {
 
     #[test]
     fn rehydrate_never_reaps_or_closes_anything() {
-        // Scope guard: task 5 brings panes BACK. Reaping — closing a pane
-        // because the run has moved past it — is task 6's, and a rehydrate that
-        // WORKS must never close anything.
+        // ⭐ KEPT DELIBERATELY once reaping landed, with its reason rewritten.
         //
-        // The three panes this task does close are all error recovery on its
-        // own half-completed operation, never supersession: a launch that
-        // failed (`discard_unlaunched_pane`), a pane that could not be recorded
-        // (`surrender_unrecordable_pane`), and one the phase's record cannot
-        // account for (`surrender_misattributed_pane`). Each has its own test;
-        // this one pins the success path, which is the one task 6 must not
-        // change either.
+        // It was a scope guard — "nothing closes panes yet" — and
+        // that reading expired the moment `phase_reap` existed. What it
+        // ASSERTS did not: reaping is triggered by supersession, and bringing a
+        // phase back is the opposite of superseding it, so a rehydrate that
+        // works must still close nothing. Deleting it would have removed the
+        // only thing standing between that rule and a future edit that reaps
+        // "while we are in here anyway".
+        //
+        // The panes this file does close are all one of two things, neither of
+        // them this path: error recovery on a half-completed operation (a
+        // launch that failed — `discard_unlaunched_pane`; a pane that could not
+        // be recorded — `surrender_unrecordable_pane`; one the phase's record
+        // cannot account for — `surrender_misattributed_pane`), or a reap,
+        // which has its own triggers and its own tests. Each has its own test;
+        // this one pins the success path.
         let _lock = ENV_LOCK.lock().unwrap();
         let (mut run, _cfg) = rehydrate_run("rh-no-close");
         run.phases
@@ -11281,6 +11675,527 @@ mod rehydrate_tests {
         assert!(
             !calls.iter().any(|c| c.contains("pane_close")),
             "{calls:?}"
+        );
+    }
+}
+
+/// Reaping — the supersession trigger, `drovr phase reap`, and the three things
+/// a pane's standing can be.
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+    use crate::herdr::{FakeHerdr, SessionId};
+    use crate::test_util::ENV_LOCK;
+
+
+    /// A run set up the way reaping meets one: its own data dir, its own config
+    /// dir (so `reap_finished_panes` is the built-in default and not whatever
+    /// the developer running the tests has configured), and a root shell that is
+    /// nobody's phase.
+    fn reap_run(name: &str) -> (RunState, tempfile::TempDir) {
+        // Caller must hold ENV_LOCK.
+        let cfg_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-reap-test-{name}"));
+            std::env::set_var("XDG_CONFIG_HOME", cfg_home.path());
+            std::env::remove_var(PASS_ENV);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        let _ = std::fs::remove_dir_all(run_dir(name));
+        let run = RunState {
+            name: name.to_owned(),
+            task: "test task".into(),
+            agent: Some("claude".into()),
+            phases: vec![],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("ws-rp".into()),
+            root_pane: Some("ws-rp:root".into()),
+            project_dir: "/tmp/drovr-proj-test".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        (run, cfg_home)
+    }
+
+    /// A finished phase still holding its pane — what reaping exists to find.
+    fn finished_phase(name: &str, pane: &str) -> Phase {
+        let mut p = Phase::new(name);
+        p.status = PhaseStatus::Done;
+        p.set_pane(pane);
+        p.record_launch("claude", None);
+        p
+    }
+
+    fn write_config(cfg_home: &tempfile::TempDir, body: &str) {
+        let path = cfg_home.path().join("drovr/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn closed_panes(h: &FakeHerdr) -> Vec<String> {
+        h.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("pane_close pane=").map(str::to_owned))
+            .collect()
+    }
+
+    /// The supersession trigger, and the three phases it must leave alone.
+    #[test]
+    fn a_launch_reaps_the_finished_phases_it_supersedes_and_nothing_else() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-supersede");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        // Failed keeps its pane: that pane is what a human attaches to in order
+        // to find out what went wrong.
+        let mut failed = finished_phase("plan", "ws-rp:p2");
+        failed.status = PhaseStatus::Failed;
+        run.phases.push(failed);
+        // Running keeps its pane for the obvious reason.
+        let mut running = finished_phase("spec", "ws-rp:p3");
+        running.status = PhaseStatus::Running;
+        run.phases.push(running);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        assert_eq!(
+            closed_panes(&h),
+            vec!["ws-rp:p1".to_string()],
+            "only the finished phase's pane is closed — not Failed, not Running, \
+             and never the root shell: {:?}",
+            h.calls()
+        );
+        // The phase is released, and its STATUS is untouched: reaping says
+        // something about the pane, not about whether the work was done.
+        let on_disk = RunState::load("reap-supersede").unwrap();
+        let reaped = on_disk.find_phase("brainstorm").unwrap();
+        assert!(reaped.is_reaped());
+        assert_eq!(reaped.pane_id(), None);
+        assert_eq!(reaped.status, PhaseStatus::Done);
+        assert!(
+            on_disk.retired_panes.iter().any(|p| p == "ws-rp:p1"),
+            "the pane must stay provably drovr's for `drovr cleanup`: {:?}",
+            on_disk.retired_panes
+        );
+        // And the caller's copy agrees with disk, so a save after this does not
+        // resurrect the pane it just closed.
+        assert!(run.find_phase("brainstorm").unwrap().is_reaped());
+    }
+
+    /// The trigger is AFTER the launch, and only a launch that worked is
+    /// evidence the run has moved past anything.
+    #[test]
+    fn a_launch_that_fails_reaps_nothing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-launch-failed");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_run();
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect_err("precondition: the launch failed");
+
+        assert!(
+            !closed_panes(&h).iter().any(|p| p == "ws-rp:p1"),
+            "a phase that could not be started supersedes nothing: {:?}",
+            h.calls()
+        );
+        assert!(!RunState::load("reap-launch-failed").unwrap()
+            .find_phase("brainstorm")
+            .unwrap()
+            .is_reaped());
+    }
+
+    /// Re-entering a phase (`phase start` on one that is already `Done`) must
+    /// not close the pane the launch is about to reuse.
+    #[test]
+    fn a_launch_never_reaps_the_phase_it_is_re_entering() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-reentry");
+        run.phases.push(finished_phase("implement", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "the re-entered phase keeps the pane it was just relaunched into: {:?}",
+            h.calls()
+        );
+        assert_eq!(
+            run.find_phase("implement").unwrap().pane_id(),
+            Some("ws-rp:p1")
+        );
+    }
+
+    /// The opt-out. Everything else about the launch is unchanged.
+    #[test]
+    fn reaping_is_off_when_the_config_turns_it_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, cfg) = reap_run("reap-opt-out");
+        write_config(&cfg, "reap_finished_panes = false\n");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        assert!(
+            closed_panes(&h).is_empty(),
+            "reaping off means no pane is closed: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("reap-opt-out").unwrap();
+        assert_eq!(
+            on_disk.find_phase("brainstorm").unwrap().pane_id(),
+            Some("ws-rp:p1"),
+            "and the phase keeps its pane until `drovr cleanup`"
+        );
+        // But the explicit command still works — it is an instruction, not a
+        // policy.
+        assert!(matches!(
+            phase_reap(&h, &mut run, "brainstorm").unwrap(),
+            ReapOutcome::Closed { .. }
+        ));
+    }
+
+    /// ⭐ THE REQUIRED FAILURE TEST. A close that does not happen must leave the
+    /// phase exactly as it was — because a pane that is still there and no
+    /// longer recorded is IMMORTAL: `drovr cleanup` closes only panes it can
+    /// prove are drovr's (main's `8173f03`), so an unrecorded one reads as the
+    /// human's, is never closed, and blocks `workspace_close` for the whole run.
+    #[test]
+    fn a_pane_that_cannot_be_closed_leaves_its_phase_exactly_as_it_was() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-close-fails");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_close();
+
+        let outcome = phase_reap(&h, &mut run, "brainstorm")
+            .expect("a failed close is best-effort, never an error");
+        assert!(
+            matches!(
+                outcome,
+                ReapOutcome::Kept {
+                    why: PaneKept::CloseFailed(_),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        for state in [&run, &RunState::load("reap-close-fails").unwrap()] {
+            let p = state.find_phase("brainstorm").unwrap();
+            assert_eq!(p.status, PhaseStatus::Done, "status untouched");
+            assert!(!p.is_reaped(), "reaped stays false");
+            assert_eq!(
+                p.pane_id(),
+                Some("ws-rp:p1"),
+                "⚠️ the REGISTRATION is what keeps the pane inside \
+                 `drovr_pane_ids`, so cleanup can still prove it is drovr's"
+            );
+        }
+    }
+
+    /// And the same failure inside the automatic trigger: the phase that just
+    /// started is unaffected, and `phase_start` still succeeds.
+    #[test]
+    fn a_reap_that_fails_never_fails_the_phase_that_triggered_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-best-effort");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        h.fail_pane_close();
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a reap that cannot close a pane must not fail the launch");
+
+        let on_disk = RunState::load("reap-best-effort").unwrap();
+        assert_eq!(
+            on_disk.find_phase("implement").unwrap().status,
+            PhaseStatus::Running
+        );
+        assert_eq!(
+            on_disk.find_phase("brainstorm").unwrap().pane_id(),
+            Some("ws-rp:p1")
+        );
+    }
+
+    /// Closing a pane makes herdr reassign focus. drovr captures it first and
+    /// puts it back, the same way `launch_in_pane` does — bookkeeping must not
+    /// move the user's view.
+    #[test]
+    fn a_reap_restores_the_focus_its_close_disturbed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-focus");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_reap(&h, &mut run, "brainstorm").unwrap();
+
+        let calls = h.calls();
+        let focused = calls.iter().position(|c| c == "focused_workspace");
+        let close = calls
+            .iter()
+            .position(|c| c == "pane_close pane=ws-rp:p1")
+            .expect("the pane was closed");
+        let restore = calls.iter().position(|c| c == "workspace_focus id=ws-focused");
+        assert!(
+            focused.is_some_and(|f| f < close) && restore.is_some_and(|r| r > close),
+            "focus must be captured before the close and restored after it: {calls:?}"
+        );
+    }
+
+    /// The pane is polled BEFORE it is closed, and the poll is the capturing one
+    /// — this is the last time anything will ever look at it. herdr reports
+    /// `agent_session` only while the agent is alive, so an id not banked here
+    /// is one a rehydrate will never have, and reaping without rehydrate is a
+    /// downgrade.
+    #[test]
+    fn a_reap_banks_the_session_before_it_closes_the_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-capture");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        phase_reap(&h, &mut run, "brainstorm").unwrap();
+
+        let on_disk = RunState::load("reap-capture").unwrap();
+        let p = on_disk.find_phase("brainstorm").unwrap();
+        assert_eq!(
+            p.pane_agent().and_then(|a| a.session()).map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("ws-rp:p1").as_str()),
+            "the session must be captured on the way past, or the phase is \
+             reaped and unrehydratable"
+        );
+        // And it really is rehydratable now — the point of banking it.
+        assert_eq!(on_disk.rehydratable("brainstorm"), Ok(()));
+
+        let calls = h.calls();
+        let poll = calls
+            .iter()
+            .position(|c| c.starts_with("pane_info pane=ws-rp:p1"))
+            .expect("the pane was polled");
+        let close = calls
+            .iter()
+            .position(|c| c == "pane_close pane=ws-rp:p1")
+            .expect("the pane was closed");
+        assert!(poll < close, "poll before close: {calls:?}");
+    }
+
+    /// Idempotent: the second reap of one phase emits no close at all.
+    #[test]
+    fn reaping_a_phase_twice_closes_one_pane() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-twice");
+        run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        assert!(matches!(
+            phase_reap(&h, &mut run, "brainstorm").unwrap(),
+            ReapOutcome::Closed { .. }
+        ));
+        let after_first = closed_panes(&h).len();
+        assert_eq!(
+            phase_reap(&h, &mut run, "brainstorm").unwrap(),
+            ReapOutcome::NothingToReap
+        );
+        assert_eq!(
+            closed_panes(&h).len(),
+            after_first,
+            "a phase that holds no pane has nothing to close: {:?}",
+            h.calls()
+        );
+    }
+
+    /// ⭐ The stuck `HoldsPane` repair, which is the whole reason
+    /// `drovr phase reap` is a command and not only a trigger.
+    ///
+    /// Three routes lead to a phase that records a pane herdr no longer has: a
+    /// `NeverReady` resume whose agent has since exited, a `ResumeUnobserved`
+    /// one, and a pane herdr simply lost. All three used to leave the operator
+    /// hand-editing `pane_id` out of `state.json`, because nothing else cleared
+    /// it — `rehydratable` answered `HoldsPane` forever.
+    #[test]
+    fn a_phase_whose_pane_herdr_has_lost_is_released_by_a_reap() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-lost-pane");
+        run.phases.push(finished_phase("plan", "ws-rp:p1"));
+        run.save().unwrap();
+        assert_eq!(
+            run.rehydratable("plan"),
+            Err(NotRehydratable::HoldsPane("ws-rp:p1".into())),
+            "precondition: the registration is what refuses the rehydrate"
+        );
+
+        let h = FakeHerdr::new();
+        // herdr cannot read the pane AND answers that it does not exist — the
+        // only combination that proves it is gone.
+        h.fail_pane_info();
+        h.kill_pane("ws-rp:p1");
+
+        assert_eq!(
+            phase_reap(&h, &mut run, "plan").unwrap(),
+            ReapOutcome::Cleared {
+                pane: "ws-rp:p1".into()
+            }
+        );
+        assert!(
+            closed_panes(&h).is_empty(),
+            "there was nothing to close: {:?}",
+            h.calls()
+        );
+
+        let on_disk = RunState::load("reap-lost-pane").unwrap();
+        assert_eq!(on_disk.rehydratable("plan"), Ok(()), "and the refusal is gone");
+        assert!(
+            on_disk.retired_panes.iter().any(|p| p == "ws-rp:p1"),
+            "still recorded as drovr's, in case herdr was wrong"
+        );
+    }
+
+    /// The other half of that classification, and the one a `bool` would have
+    /// got wrong: herdr could not be READ. Nothing was established, so nothing
+    /// is destroyed and nothing is dropped — dropping the registration here
+    /// strands a pane that may be perfectly alive.
+    #[test]
+    fn a_reap_that_cannot_reach_herdr_changes_nothing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-unreadable");
+        run.phases.push(finished_phase("plan", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // The poll fails, and `pane_exists` is biased toward "alive": only an
+        // explicit `pane_not_found` proves death, and an unreachable daemon
+        // does not give one.
+        h.fail_pane_info();
+
+        assert_eq!(
+            phase_reap(&h, &mut run, "plan").unwrap(),
+            ReapOutcome::Kept {
+                pane: "ws-rp:p1".into(),
+                why: PaneKept::Unreadable,
+            }
+        );
+        assert!(closed_panes(&h).is_empty(), "{:?}", h.calls());
+        let on_disk = RunState::load("reap-unreadable").unwrap();
+        let p = on_disk.find_phase("plan").unwrap();
+        assert!(!p.is_reaped());
+        assert_eq!(p.pane_id(), Some("ws-rp:p1"));
+    }
+
+    /// Never the pane that anchors the workspace. herdr destroys a workspace
+    /// when its last pane closes, so this one takes the run with it.
+    #[test]
+    fn a_reap_refuses_the_workspaces_root_shell() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-root");
+        // Only a `state.json` from the build where the first phase claimed the
+        // root pane looks like this. Such a run still loads and still works.
+        run.phases.push(finished_phase("plan", "ws-rp:root"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let err = phase_reap(&h, &mut run, "plan").expect_err("the root shell is never reapable");
+        assert!(err.to_string().contains("root shell"), "{err}");
+        assert!(closed_panes(&h).is_empty(), "{:?}", h.calls());
+        assert_eq!(
+            RunState::load("reap-root").unwrap()
+                .find_phase("plan")
+                .unwrap()
+                .pane_id(),
+            Some("ws-rp:root")
+        );
+    }
+
+    /// A reap decided on the caller's copy is a reap of whatever pane that copy
+    /// remembers. The driver holds one `RunState` across a whole run, and the
+    /// review server rehydrates from another process meanwhile.
+    #[test]
+    fn a_reap_reads_the_run_from_disk_before_it_decides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-stale-copy");
+        run.phases.push(finished_phase("plan", "ws-rp:old"));
+        run.save().unwrap();
+
+        // Another process moved the phase onto a different pane (a rehydrate).
+        let mut other = RunState::load("reap-stale-copy").unwrap();
+        other.find_phase_mut("plan").unwrap().set_pane("ws-rp:new");
+        other.save().unwrap();
+        assert_eq!(
+            run.find_phase("plan").unwrap().pane_id(),
+            Some("ws-rp:old"),
+            "precondition: the caller's copy is stale"
+        );
+
+        let h = FakeHerdr::new();
+        phase_reap(&h, &mut run, "plan").unwrap();
+
+        assert_eq!(
+            closed_panes(&h),
+            vec!["ws-rp:new".to_string()],
+            "the pane on disk is the one that gets closed, never the one in hand"
+        );
+    }
+
+    /// A release that cannot be saved after the pane is already gone is the ONE
+    /// failure a reap raises — and the message must name the command that
+    /// clears it rather than an edit to `state.json`, because that command now
+    /// exists.
+    #[test]
+    fn a_reap_that_cannot_record_itself_says_what_actually_clears_it() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePerms(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = reap_run("reap-unsaveable");
+        run.phases.push(finished_phase("plan", "ws-rp:p1"));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        // The lock file is created first: `O_CREAT` needs write permission on
+        // the directory, and the lock is taken before anything else — otherwise
+        // this would model "the reap was refused up front", a different failure.
+        let dir = run_dir("reap-unsaveable");
+        std::fs::File::create(dir.join("run.lock")).unwrap();
+        let before = std::fs::metadata(&dir).unwrap().permissions();
+        let _restore = RestorePerms(dir.clone(), before.clone());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = std::fs::write(dir.join(".probe"), b"").is_ok();
+        let res = phase_reap(&h, &mut run, "plan");
+        std::fs::set_permissions(&dir, before).unwrap();
+
+        if root {
+            return;
+        }
+        let err = res.expect_err("a reap that cannot record itself has not succeeded");
+        let msg = err.to_string();
+        assert!(msg.contains("ws-rp:p1"), "the pane must be named: {msg}");
+        assert!(
+            msg.contains("drovr phase reap"),
+            "the remedy is the command, not a hand-edit: {msg}"
+        );
+        assert!(
+            !msg.contains("pane_id") && !msg.contains("state.json"),
+            "the hand-edit instruction is retired: {msg}"
         );
     }
 }

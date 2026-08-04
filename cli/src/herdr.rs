@@ -386,8 +386,13 @@ impl PaneInfo {
     /// (`unknown`), and a live agent may momentarily have none. Callers that
     /// gate on a status should treat this as "not yet known", never as done.
     ///
-    /// No production caller yet — the poll sites read `agent_status` directly.
-    /// Task 6 is the one that has to tell "not yet known" from "done".
+    /// STILL NO PRODUCTION CALLER, and the reason is worth recording rather than
+    /// leaving to be rediscovered: reaping was expected to need this, and does
+    /// not. It classifies on whether the PANE could be read at all
+    /// (`phase::PaneStanding`), never on what the agent in it is doing — a
+    /// finished phase's `claude` sits at its composer rather than exiting, so a
+    /// status-based gate would mean never reaping anything. The poll sites that
+    /// do read `agent_status` want an exact value and read it directly.
     #[allow(dead_code)]
     pub fn status_unreadable(&self) -> bool {
         self.agent_status.is_none()
@@ -537,8 +542,25 @@ pub trait Herdr {
     ///
     /// Takes a [`TabId`], which only a `pane_info` read can produce, so a pane id
     /// cannot be passed here by mistake.
-    // Capability only for now: nothing in drovr closes a pane yet — reaping is a
-    // later step, and this landing on its own must not change any behavior.
+    //
+    // ⚠️ NO CALLER, deliberately, and reaping is the caller it was added for.
+    //
+    // A phase occupies one pane in a tab drovr created for it — but the human
+    // can split their own pane into that tab, and this takes every pane in it.
+    // main's `8173f03` established "never close what you cannot prove is yours"
+    // at PANE granularity, and closing the tab would quietly widen that. So
+    // `phase::phase_reap` uses `pane_close`.
+    //
+    // That costs nothing, because closing the last pane in a tab destroys the
+    // tab — verified live against herdr 0.7.5 (`tab create` → `pane split` →
+    // close the split → close the original → `tab get` answers `tab_not_found`).
+    // In the ordinary case, where drovr's pane is the tab's only pane, the tab
+    // goes exactly as it would have here; where it is not, the human's pane and
+    // its tab survive.
+    //
+    // Kept rather than deleted: it is the only binding for `tab.close`, it is
+    // tested, and [`TabId`] exists to make it safe. Anything that ever does want
+    // whole-tab teardown must first answer the question above.
     #[allow(dead_code)]
     fn tab_close(&self, tab_id: &TabId) -> io::Result<()>;
     /// Whether `pane_id` still exists. Distinct from [`Herdr::pane_info`], which
@@ -2466,10 +2488,10 @@ mod tests {
 
     // Both diagnostics are gated so a 500 ms poll loop reports once per process
     // rather than twice a second.
-    // Gated PER PANE, not per process: task 6 reaps across many panes, and one
+    // Gated PER PANE, not per process: reaping runs across many panes, and one
     // pane's transient failure must not silence every other pane's persistent
     // one — that is precisely when the log is needed.
-    // Task 6 treats a close as best-effort and swallows the error after logging
+    // Reaping treats a close as best-effort and swallows the error after logging
     // it, so an error that does not name the tab is close to useless.
     #[test]
     fn tab_close_error_message_names_the_tab_and_the_cause() {
@@ -2482,7 +2504,7 @@ mod tests {
     // herdr's JSON-RPC error body carries a machine-readable `code` alongside the
     // human `message` (both `required` in `herdr api schema --json`). Flattening
     // every application-level failure to `ErrorKind::Other` throws that away and
-    // leaves callers matching on prose — which is exactly what task 6 must not do:
+    // leaves callers matching on prose — which is exactly what reaping must not do:
     // reaping is best-effort and specifically wants to IGNORE a tab that is
     // already gone while still reporting a socket that is down.
     #[test]
@@ -2526,7 +2548,7 @@ mod tests {
     fn a_code_less_error_falls_back_to_the_message() {
         // Defence against a herdr that stops sending `code` (it is `required`
         // today): a "not found" phrasing is still worth classifying, because the
-        // alternative is task 6 string-matching it at the call site instead.
+        // alternative is the reap path string-matching it at the call site instead.
         assert_eq!(
             herdr_error_kind(None, "tab wAF:t9 not found"),
             io::ErrorKind::NotFound
@@ -3111,7 +3133,7 @@ mod tests {
         assert_ne!(working.agent_status, exited.agent_status);
     }
 
-    // Task 6 asserts on CALL ORDER (agent_read before tab_close, focus captured
+    // Reaping asserts on CALL ORDER (the pane polled before it is closed, focus captured
     // and restored around the close), so both new primitives must record an
     // unambiguous, argument-carrying line.
     #[test]
@@ -3139,7 +3161,7 @@ mod tests {
         );
     }
 
-    // Scripted failures mirror `fail_pane_run`: reaping is best-effort, so task 6
+    // Scripted failures mirror `fail_pane_run`: reaping is best-effort, so it
     // needs both a pane whose info cannot be read and a close that fails.
     #[test]
     fn fake_scripted_failures_for_pane_info_and_tab_close() {

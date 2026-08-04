@@ -3200,6 +3200,65 @@ mod tests {
         );
     }
 
+    /// The mirror must not keep typing into a pane drovr has closed.
+    ///
+    /// `mark_reaped` clears `pane_id` in the same statement it sets the flag, so
+    /// a reaped phase leaves the writable allow-list by construction rather than
+    /// by a check written here — which is exactly why that pair is one mutator.
+    /// Asserted end to end anyway: the browser holds a sticky `selectedPane` and
+    /// will go on naming a pane the run has moved past, and 409 (gated, before
+    /// herdr) is a different answer from 500 (gated in, failed at herdr).
+    #[test]
+    fn a_reaped_phases_pane_is_no_longer_writable() {
+        let tmp = make_root("reaped-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                crate::run::Phase::new("brainstorm"),
+                crate::run::Phase::new("implement"),
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        // brainstorm ran on w:p1 and drovr reaped it; implement is live on w:p2.
+        run.phases[0].status = crate::run::PhaseStatus::Done;
+        run.phases[0].set_pane("w:p1");
+        run.phases[0].mark_reaped();
+        run.retire_pane("w:p1");
+        run.phases[1].status = crate::run::PhaseStatus::Running;
+        run.phases[1].set_pane("w:p2");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(s, 409, "a reaped pane must be refused before herdr");
+        // ⚠️ And retiring it did NOT make it writable again. `retired_panes` is
+        // what `drovr cleanup` reads to prove a pane was drovr's; it is not a
+        // list of places the mirror may type.
+        assert!(
+            run.retired_panes.contains(&"w:p1".to_string()),
+            "precondition: the pane is retired, and still refused"
+        );
+
+        // Positive control: the live phase's pane passes the gate and fails at
+        // herdr instead, so the 409 above is discrimination, not a broken state.
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap2", "text/plain", "hi");
+        assert_eq!(s, 500, "the live phase's pane must still be writable");
+    }
+
     #[test]
     fn post_keys_honors_pane_gating() {
         // `?pane=` outside the run must never reach herdr: same allow-list as

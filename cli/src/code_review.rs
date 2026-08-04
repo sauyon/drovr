@@ -66,8 +66,8 @@ use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
 use crate::phase::{
-    archived_run_error, marker_completes_current_pass, phase_send, poll_phase_pane,
-    spawn_reviewer,
+    ReapOutcome, archived_run_error, marker_completes_current_pass, phase_reap, phase_send,
+    poll_phase_pane, spawn_reviewer,
 };
 use crate::run::{PhaseStatus, RunState, run_dir};
 
@@ -1287,6 +1287,39 @@ pub fn code_review_run<H: Herdr>(
         &serde_json::to_string_pretty(&merged).map_err(io::Error::other)?,
     )?;
 
+    // ⭐ REAP THE PANEL — and its position here is the whole design.
+    //
+    // AFTER every angle is harvested and the merged verdict is on disk. A
+    // reviewer's pane is not a data channel any more (findings arrive through
+    // the MCP server, not the transcript), but it is still the thing a resume
+    // waits on: every early return above — the timeout, the `harvest?` on an
+    // angle that finished without delivering, the abort when a seed cannot be
+    // delivered — leaves reviewers this pass may need again, and reaches none of
+    // this. Only a completed merge proves the panel is finished with.
+    //
+    // Every angle is `Done` by here, structurally: the loop exits only when
+    // nothing is pending, an angle that delivered is `Done`, and one that did
+    // not takes `harvest?` out of the function.
+    //
+    // Best-effort, per angle, and it never touches the verdict: this function
+    // has already produced its answer, so a pane that will not close is a
+    // warning and `drovr cleanup` reclaims it.
+    if cfg.reap_finished_panes {
+        for angle in &cfg.angles {
+            let phase = crate::run::reviewer_phase_name(task, iter, angle);
+            match phase_reap(h, run, &phase) {
+                Ok(ReapOutcome::Closed { pane }) => {
+                    println!("code-review: closed reviewer pane {pane} for angle '{angle}'");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "code-review: warning: could not reap the '{angle}' reviewer ({e}); \
+                     `drovr cleanup` will reclaim its pane"
+                ),
+            }
+        }
+    }
+
     Ok(if is_clean(&merged) {
         ReviewOutcome::Clean
     } else {
@@ -2386,6 +2419,133 @@ mod tests {
         );
     }
 
+    fn closed_panes(h: &FakeHerdr) -> Vec<String> {
+        h.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("pane_close pane=").map(str::to_owned))
+            .collect()
+    }
+
+    /// A panel that reached a verdict is finished with its reviewers, and their
+    /// panes are the largest thing a run accumulates — four per iteration, and a
+    /// task can take several iterations.
+    #[test]
+    fn a_finished_panel_reaps_its_reviewers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-panel");
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        // Panes recorded before the pass, so the assertion below names the ones
+        // that actually existed rather than whatever is left afterwards.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+
+        assert_eq!(
+            closed_panes(&h).len(),
+            4,
+            "one close per reviewer: {:?}",
+            h.calls()
+        );
+        let on_disk = RunState::load("cr-reap-panel").unwrap();
+        for p in &on_disk.review_phases {
+            assert!(p.is_reaped(), "{} must be reaped", p.name);
+            assert_eq!(p.pane_id(), None, "{}", p.name);
+            assert_eq!(
+                p.status,
+                PhaseStatus::Done,
+                "reaping says something about the pane, not about the verdict"
+            );
+        }
+        assert_eq!(
+            on_disk.retired_panes.len(),
+            4,
+            "every closed pane stays provably drovr's for `drovr cleanup`: {:?}",
+            on_disk.retired_panes
+        );
+        // The verdict itself is untouched — the merge ran before any of this.
+        let merged = parse_review(
+            &std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged.verdict, Verdict::Clean);
+    }
+
+    /// ⭐ Reaping is strictly AFTER the findings are in and merged. Every early
+    /// return — the timeout here, and the `harvest?` below — leaves reviewers a
+    /// resume may need to wait on again, and must reach no close at all.
+    ///
+    /// This is the load-bearing half of "reviewers are reaped after
+    /// `obtain_findings_json`": a reviewer whose pane is closed while it is
+    /// still working cannot deliver, and a resume would then respawn it — paying
+    /// for the whole review twice, having thrown away the one in progress.
+    #[test]
+    fn a_panel_that_does_not_reach_a_verdict_reaps_nothing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-timeout");
+        write_base(&run, "task-1");
+
+        // (a) timeout: nobody delivered, so every reviewer is still working.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        assert!(
+            closed_panes(&h).is_empty(),
+            "a pending reviewer's pane must survive the pass that gave up on it: {:?}",
+            h.calls()
+        );
+        for p in &run.review_phases {
+            assert!(p.pane_id().is_some(), "{} must keep its pane", p.name);
+        }
+
+        // (b) an angle that finished having delivered nothing aborts the pass
+        // before the merge — and so before any reap.
+        drop_pass_marker(&run, "task-1", 1, "correctness");
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
+        }
+        code_review_run(&h, &mut run, "task-1", 40, false, None)
+            .expect_err("precondition: an angle delivered nothing usable");
+        assert!(
+            closed_panes(&h).is_empty(),
+            "a pass that never reached a verdict must close nothing: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The opt-out reaches the panel too.
+    #[test]
+    fn a_panel_keeps_its_panes_when_reaping_is_turned_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-reap-off");
+        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("drovr/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "reap_finished_panes = false\n").unwrap();
+        write_base(&run, "task-1");
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, a, CLEAN);
+        }
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
+            ReviewOutcome::Clean
+        );
+        assert!(closed_panes(&h).is_empty(), "{:?}", h.calls());
+        assert!(
+            run.review_phases.iter().all(|p| p.pane_id().is_some()),
+            "every reviewer keeps its pane until `drovr cleanup`"
+        );
+    }
+
     #[test]
     fn readonly_reviewers_complete_from_herdr_status_and_findings_file() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -2886,7 +3046,7 @@ mod tests {
         // A pipeline phase survives that: `phase_wait` polls again every 500ms
         // for the life of the phase. A reviewer has no such second chance unless
         // ITS wait loop captures too — and reviewers are told to exit, at which
-        // point herdr drops the session for good, and task 6 closes the pane.
+        // point herdr drops the session for good, and reaping closes the pane.
         //
         // So: first poll started-but-session-less, later polls carrying one.
         let _lock = ENV_LOCK.lock().unwrap();
