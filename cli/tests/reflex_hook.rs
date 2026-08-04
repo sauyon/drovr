@@ -471,7 +471,7 @@ fn user_prompt_hook_passes_stdin_through_to_the_suppression_check() {
         eprintln!("skipping: bash not available");
         return;
     }
-    // The hook's whole job beyond exec'ing is handing the payload to the CLI,
+    // The hook's whole job beyond invoking drovr is handing the payload to it,
     // and nothing else in this file can tell a dropped stdin from a working
     // one: with no payload the gate fails open and emits, which is also what a
     // healthy hook does on a drifted session. So drive the ONE input that
@@ -548,8 +548,9 @@ fn run_gate_with_binary(bin: &Path, config_home: &Path) -> Output {
         .env("DROVR_BIN", bin)
         .env("XDG_CONFIG_HOME", config_home)
         .env_remove("DROVR_PHASE")
-        // Same scrubbing as `run_hook_with_stdin`, so a future caller of this
-        // helper cannot pick up an ambient sibling-platform marker.
+        // Kept identical to `run_hook_with_stdin` so the two helpers cannot
+        // drift. Nothing in `cli/src` or `hooks/` reads these today; the
+        // scrubbing is defensive, not load-bearing.
         .env_remove("CURSOR_PLUGIN_ROOT")
         .env_remove("COPILOT_CLI")
         .stdin(Stdio::null())
@@ -597,6 +598,16 @@ fn user_prompt_hook_degrades_silently_without_drovr() {
         out.stdout.is_empty(),
         "a missing drovr must inject nothing, got stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+    // "Silently" is half the name of this test, and stdout alone does not test
+    // it. Adding an `echo … >&2` beside the guard's `exit 0` would keep every
+    // other assertion green while putting a line in front of EVERY prompt of
+    // EVERY session for anyone who installed the plugin without the CLI — the
+    // exact outcome the guard exists to prevent.
+    assert!(
+        out.stderr.is_empty(),
+        "a missing drovr must say nothing at all, got stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -652,6 +663,14 @@ fn user_prompt_hook_never_exits_two() {
             "a drovr exiting {code} must be mapped to exit 1, never to a \
              prompt-blocking 2 and never to an unmeasured code"
         );
+        // The failure must stay LOUD. The whole argument for tolerating noise
+        // on the version-skew path is that the user gets a clue; adding a
+        // `2>/dev/null` to the invocation would leave this suite green and
+        // produce exactly the quiet-and-broken state the design rejects.
+        assert!(
+            !out.stderr.is_empty(),
+            "a drovr exiting {code} must let its stderr reach the user"
+        );
     }
 }
 
@@ -701,6 +720,14 @@ fn hooks_json_user_prompt_entry_has_no_matcher() {
     // `UserPromptSubmit` takes no matcher. Copying SessionStart's
     // `startup|clear|compact` across would be silently accepted and would gate
     // the hook on an event kind that never fires here.
+    // Bound the INNER array too: duplicating the command object leaves every
+    // assertion below passing while injecting the card twice per turn — 1094
+    // bytes, straight through the ~60 KB/100-turn ceiling the design budgets.
+    assert_eq!(
+        user_prompt[0]["hooks"].as_array().map(Vec::len),
+        Some(1),
+        "the UserPromptSubmit entry must declare exactly one command hook"
+    );
     assert!(
         user_prompt[0].get("matcher").is_none(),
         "the UserPromptSubmit entry must carry no matcher key, got {:#?}",
@@ -855,11 +882,20 @@ fn user_prompt_hook_emits_on_unloadable_config() {
     let cfg = tempfile::tempdir().unwrap();
     write_config(cfg.path(), "[reflex\nenabled = = false\n");
     let out = run_hook(USER_PROMPT, None, cfg.path());
+    let out_stderr = out.stderr.clone();
     let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
 
     assert!(
         injected.contains("DROVR GATE"),
         "an unloadable config must not silence the gate, got:\n{injected}"
+    );
+    // Running on defaults is only half the contract; the user must also be told
+    // their config.toml is broken. Deleting the eprintln in `cmd_reflex` would
+    // otherwise leave the gate quietly ignoring a typo forever.
+    let stderr = String::from_utf8_lossy(&out_stderr);
+    assert!(
+        !stderr.is_empty(),
+        "an unloadable config must warn on stderr, got nothing"
     );
 }
 
@@ -946,4 +982,63 @@ fn user_prompt_hook_resolves_drovr_from_path() {
         injected.contains("DROVR GATE"),
         "the gate must emit when drovr is resolved from PATH, got:\n{injected}"
     );
+}
+
+#[test]
+fn user_prompt_hook_runs_as_hooks_json_invokes_it() {
+    // Every other test in this file spawns `bash <script>`, which bypasses the
+    // shebang entirely — so the interpreter line was stated in comments and
+    // covered by nothing. `hooks.json` runs the file DIRECTLY, so the shebang,
+    // the exec bit and the real invocation path are all part of the contract.
+    //
+    // The mutation that matters: `#!/usr/bin/env bash` -> `#!/usr/bin/env sh`.
+    // Where `sh` is dash, `set -o pipefail` is unrecognised and the shell exits
+    // **2** — the one code this whole design exists never to emit, arriving
+    // before any of the script's own logic runs. `#!/bin/bash` is a quieter
+    // version of the same class: it breaks NixOS and Guix outright.
+    // The behavioural half below CANNOT catch the shebang mutation on every
+    // machine, and does not catch it on a machine where `/bin/sh` is bash — as
+    // it is on Arch, where this was written. The breakage is real but shows up
+    // only where `sh` is dash. So assert the interpreter as TEXT, which is
+    // deterministic everywhere, and keep the behavioural half for the exec bit
+    // and the real invocation path.
+    let script = std::fs::read_to_string(hook_script(USER_PROMPT))
+        .expect("hooks/user-prompt must be readable");
+    assert_eq!(
+        script.lines().next(),
+        Some("#!/usr/bin/env bash"),
+        "hooks/user-prompt must declare bash via env: a bare `#!/bin/bash` \
+         breaks NixOS/Guix, and `sh` (dash) dies on `set -o pipefail` with \
+         exit 2 — the one code this hook must never emit"
+    );
+
+    #[cfg(unix)]
+    {
+        let out = Command::new(hook_script(USER_PROMPT))
+            .env("CLAUDE_PLUGIN_ROOT", repo_root())
+            .env("DROVR_BIN", drovr_binary())
+            .env("XDG_CONFIG_HOME", tempfile::tempdir().unwrap().path())
+            .env_remove("DROVR_PHASE")
+            .stdin(Stdio::null())
+            .output();
+
+        let out = match out {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: cannot exec hooks/user-prompt directly ({e})");
+                return;
+            }
+        };
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "invoked directly, the hook must not exit 2 — stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+        assert!(
+            injected.contains("DROVR GATE"),
+            "the hook must emit when run the way hooks.json runs it, got:\n{injected}"
+        );
+    }
 }

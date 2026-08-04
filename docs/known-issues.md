@@ -1,5 +1,41 @@
 # Known issues
 
+## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
+
+**Status:** open, pre-existing. Found 2026-08-03 while wiring the `UserPromptSubmit`
+per-turn gate (`hooks/user-prompt`); the gate inherits the gap rather than causing it.
+
+**Severity:** medium (silent — the plugin loads, its skills work, and both reflexes are
+simply absent with no error anywhere).
+**Found:** 2026-08-03, reviewing what a store-path install actually contains.
+
+### Symptom
+
+Install the plugin from the flake's output rather than from a repo checkout and neither
+`SessionStart` nor `UserPromptSubmit` fires. No error is printed; `$out/share/drovr/`
+simply has no `hooks/` directory, so Claude Code finds no `hooks.json` to read.
+
+### Root cause
+
+`flake.nix`'s `postInstall` copies exactly two trees:
+
+```
+cp -r ${./skills} $out/share/drovr/skills
+cp -r ${./.claude-plugin} $out/share/drovr/.claude-plugin
+```
+
+`hooks/` was never added. Claude Code discovers hooks by reading `hooks/hooks.json`
+under the plugin root, so an absent directory is indistinguishable from a plugin that
+declares no hooks. Nothing fails loudly because nothing is expected to.
+
+### Fix
+
+Add `cp -r ${./hooks} $out/share/drovr/hooks` to `postInstall`, and check the exec bits
+survive the store copy (both scripts are mode 755 in the index, pinned for the gate by
+`cli/tests/reflex_hook.rs::user_prompt_hook_is_executable_in_the_index`). Deliberately
+NOT done as part of the gate task: it is a packaging change affecting both hooks equally
+and deserves review as one.
+
 ## The agent's change summary is hidden on the first review — FIXED 2026-07-25
 
 **Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;

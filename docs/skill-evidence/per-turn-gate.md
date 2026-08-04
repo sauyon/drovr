@@ -194,8 +194,11 @@ missing; doing it once per *prompt* is not.
 
 **Latency: 8–10 ms** for the whole hook (bash + process start + a 1 MiB tail read of the largest
 transcript on this machine, 29.8 MB), against a 3 ms floor with no transcript. Debug binary, warm
-cache; a release build is lower. `hooks.json` sets `"timeout": 5` — the default is 60s, and a
-stalled mount under `transcript_path` would otherwise hold the prompt for all of it.
+cache; a release build is lower. `hooks.json` sets `"timeout": 5` — the default is 60s. It guards **two** stalls, not one: a slow or
+hung mount under `transcript_path`, and the stdin read, which blocks until EOF or 64 KiB and is not
+redirected by the hook. **A hook killed at the timeout is non-blocking** — measured with a
+`sleep 30` stub behind a `timeout: 5` entry: the prompt was processed and the model answered
+normally, ~5s later. So the timeout closes a stall without opening a new prompt-eating path.
 
 **Prompts larger than the 64 KiB stdin cap are fine.** `read_hook_input` caps at 64 KiB and does not
 drain the rest, so the harness's write to the hook's stdin gets EPIPE. **Measured end to end with a
@@ -208,6 +211,13 @@ after the capped read.
 *and* the 547-byte card, because suppression recognises only a `drovr:*` **Skill tool call** in the
 transcript and a `SessionStart` injection is not one. ~10% overhead on top of an injection that just
 happened; judged acceptable rather than worth a second suppression mechanism.
+
+**The Nix-installed plugin ships no hooks at all.** `flake.nix`'s `postInstall` copies `skills` and
+`.claude-plugin` into `$out/share/drovr/` but not `hooks/`, so a plugin installed from the store path
+has neither `hooks.json` nor either script and **neither reflex runs**. Pre-existing — it affects
+`hooks/session-start` identically — and inherited rather than introduced by the gate. Filed in
+`docs/known-issues.md`; not fixed here, because packaging is outside this task's scope and the fix
+should be reviewed as a packaging change.
 
 **The kill switch is global, not per-project.** Config resolves to exactly one path
 (`${XDG_CONFIG_HOME:-$HOME/.config}/drovr/config.toml`), so `per_turn = false` turns the gate off

@@ -168,6 +168,7 @@ is hidden on macOS where it does not apply.
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
+| `drovr reflex --gate` | Render the per-turn gate card JSON (`UserPromptSubmit`). Run by the `user-prompt` hook; reads the hook payload on **stdin** to find `transcript_path`. Prints nothing when `enabled` or `per_turn` is false, or when the previous turn already invoked a `drovr:*` skill. Exactly one of `--skill` / `--gate` is required. |
 
 ## Run directory and state contracts
 
