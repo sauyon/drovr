@@ -176,10 +176,10 @@ compliance rates:** either budget a small number of true no-skill runs, or recor
 that the run compares armored arms to each other only and accepts that no such control will
 exist. It is a run-level call, not a task-level one, and it is deliberately not made here.
 
-**2. The answer key is in the prompt, immediately above the question.** The arm's **entire** text is pasted
-immediately before the scenario — for `tdd`, all 44 lines of it, whose Overview opens
-*"Test-first, always."* on line 10, ahead of a scenario asking whether to write the test
-first. Under that arrangement an agent that fails to
+**2. The answer key is in the prompt, immediately above the question.** The arm's
+**entire** text is pasted immediately before the scenario — for `tdd`, all 44 lines of it,
+whose Overview opens *"Test-first, always."* on line 10, ahead of a scenario asking whether
+to write the test first. Under that arrangement an agent that fails to
 comply is failing at reading, not only at resisting pressure. **10/10 compliant is therefore
 weak evidence that any armor is earning its bytes**, and it should not be read as such.
 
