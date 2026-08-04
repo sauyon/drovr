@@ -65,3 +65,8 @@ Further rules follow from the parser being strict for the whole file at once:
 | A | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `1d0cfad3da2755908dfa577e71da373990baaeef` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
 | A | code-review | `skills/code-review/SKILL.md` | `db0fd4310cb7a543655bae8419b9309965c35b7d` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
 | A | using-drovr | `skills/using-drovr/SKILL.md` | `fbc04aa14dc90e05fabd32d147d21c5e16913915` | `99540bdcdb016ca3b74530957f55c0e5ef29f4f9` | 2026-07-26 |
+| A-prime | tdd | `skills/tdd/SKILL.md` | `97d13e005dbd9984f1a690cea9beea61f94be9f3` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
+| A-prime | systematic-debugging | `skills/systematic-debugging/SKILL.md` | `241a2b16874d51bd5060893660fa82c0a7262d39` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
+| A-prime | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `192f87ac3b21cd7960da5e3b4a9684f0566ed64d` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
+| A-prime | code-review | `skills/code-review/SKILL.md` | `dd75c8c288e54782c78e35ace164708c645f9875` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
+| A-prime | using-drovr | `skills/using-drovr/SKILL.md` | `ae6b23b07ced4ebe2e606056001d5cdc9220cbe2` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |

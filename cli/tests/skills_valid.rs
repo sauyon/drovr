@@ -9,11 +9,12 @@
 //!      verification-before-completion, code-review) each have a
 //!      post-frontmatter body of at most 2200 bytes. The pre-existing skills
 //!      (using-drovr, handoff, pipeline) are NOT size-checked.
-//!   3. The arm A snapshots under `docs/skill-evidence/arms/A/` still hash to
-//!      the values `arms/MANIFEST.md` records. Arm A is the pre-fix baseline the
-//!      whole measurement is compared against, and it is unrecoverable without a
-//!      checkout once fix 1 rewrites the live `description:` lines — so this is a
-//!      tripwire, not a formality.
+//!   3. The arm snapshots under `docs/skill-evidence/arms/<arm>/` still hash to
+//!      the values `arms/MANIFEST.md` records — arm A (pre-fix) and arm A′ (fix 1
+//!      alone). Each existed on disk for one moment and is unrecoverable without
+//!      a checkout afterwards, so these are tripwires, not formalities. Fix 1 is
+//!      also asserted directly: no shipped skill scopes its trigger to a drovr
+//!      phase.
 //!   4. No markdown file under `skills/` shares an 8-word run with the
 //!      superpowers corpus. drovr ports mechanisms from superpowers and writes
 //!      its own sentences (spec §2.1 exception 2); this is the check that says
@@ -737,6 +738,36 @@ fn parse_manifest_rejects_schema_drift() {
 /// the snapshots against `MANIFEST.md`, never against `skills/`.
 #[test]
 fn arm_a_snapshots_match_manifest() {
+    assert_arm_snapshots_match_manifest("A");
+}
+
+/// Arm A′ is fix 1 alone: the five un-scoped `description:` lines and the four
+/// demoted body framings, and **nothing else**. It was snapshotted in the one
+/// moment it existed on disk — after Task 7's edits, before any fix-3 or fix-4
+/// text was written — so like arm A it is unrecoverable without a checkout.
+///
+/// It is the arm that separates *the defect repair helped* from *the armor
+/// helped*: without it, A-vs-B measures both changes at once and attributes the
+/// difference to whichever one the reader already believed in. spec §7.3 also
+/// makes it the **revert target**, so a corrupt A′ is not a lost comparison but
+/// a lost fallback.
+///
+/// A sibling test rather than a loop over both arms: the failing arm is then the
+/// test name, and later tasks snapshot `B`, `B-r<i>` and `voice` by adding their
+/// own three lines here rather than editing a shared list.
+#[test]
+fn arm_a_prime_snapshots_match_manifest() {
+    assert_arm_snapshots_match_manifest("A-prime");
+}
+
+/// The shared body of the per-arm tripwires above.
+///
+/// Every arm in this run is the same shape — the five measured skills, copied
+/// whole from `skills/<skill>/SKILL.md` — so the check is written once and
+/// parameterized on the arm. Copying it per arm would mean the hardening one
+/// tripwire received (`MANIFEST.md` row matching, the missing-row case, the
+/// git-absence rule) silently applying to some arms and not others.
+fn assert_arm_snapshots_match_manifest(arm: &str) {
     let arms = arms_dir();
     let manifest_path = arms.join("MANIFEST.md");
     let contents = fs::read_to_string(&manifest_path)
@@ -753,14 +784,14 @@ fn arm_a_snapshots_match_manifest() {
     for skill in SkillName::ALL.iter().map(|skill| skill.as_str()) {
         let matches: Vec<&ManifestRow> = rows
             .iter()
-            .filter(|r| r.arm == "A" && r.skill == skill)
+            .filter(|r| r.arm == arm && r.skill == skill)
             .collect();
-        // A second row for `(A, skill)` can no longer parse, so in practice this
-        // catches the *missing* row — a skill dropped from the manifest.
+        // A second row for `(arm, skill)` can no longer parse, so in practice
+        // this catches the *missing* row — a skill dropped from the manifest.
         assert_eq!(
             matches.len(),
             1,
-            "{}: expected exactly one arm A row for `{skill}`, found {}",
+            "{}: expected exactly one arm `{arm}` row for `{skill}`, found {}",
             manifest_path.display(),
             matches.len()
         );
@@ -772,21 +803,23 @@ fn arm_a_snapshots_match_manifest() {
 
         // `parse_manifest` already enforces the rule that fits every arm: a
         // `SKILL.md` file is owned by its parent directory, any other filename
-        // by its stem. That admits any `<dir>/<skill>/SKILL.md`; arm A's shape is
-        // known exactly, so here it is held to the one path it may have.
+        // by its stem. That admits any `<dir>/<skill>/SKILL.md`; these arms are
+        // copies of the live skill tree, so each is held to the one path it may
+        // have. (The `voice` arm is not — it snapshots `V0.md`/`V2.md` under one
+        // directory, so when it arrives it gets its own check, not this one.)
         let expected_source = format!("skills/{skill}/SKILL.md");
         assert_eq!(
             matches[0].source_path,
             expected_source,
-            "{}: arm A row for `{skill}` records source path `{}`, expected `{expected_source}`",
+            "{}: arm `{arm}` row for `{skill}` records source path `{}`, expected `{expected_source}`",
             manifest_path.display(),
             matches[0].source_path
         );
 
-        let snapshot = arms.join("A").join(format!("{skill}.md"));
+        let snapshot = arms.join(arm).join(format!("{skill}.md"));
         assert!(
             snapshot.is_file(),
-            "missing arm A snapshot {}",
+            "missing arm `{arm}` snapshot {}",
             snapshot.display()
         );
 
@@ -802,7 +835,7 @@ fn arm_a_snapshots_match_manifest() {
     // without git either way.
     assert!(
         git_available(),
-        "`git` is not resolvable, so the arm A snapshot hashes cannot be verified. \
+        "`git` is not resolvable, so the arm `{arm}` snapshot hashes cannot be verified. \
          This check guards a baseline that is unrecoverable without a checkout, so it \
          fails loudly rather than skipping."
     );
