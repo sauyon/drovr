@@ -86,3 +86,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | A-prime | code-review | `skills/code-review/SKILL.md` | `dd75c8c288e54782c78e35ace164708c645f9875` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
 | A-prime | using-drovr | `skills/using-drovr/SKILL.md` | `ae6b23b07ced4ebe2e606056001d5cdc9220cbe2` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
 | B | tdd | `skills/tdd/SKILL.md` | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | `30a99cd5667b0628fd278b8772ec42debff0c667` | 2026-08-04 |
+| B | systematic-debugging | `skills/systematic-debugging/SKILL.md` | `d5f02b66b0f37a252de38d193be68bcb16c6fefe` | `11e83185f3197a57230dd63d2b2d369c599bf5f0` | 2026-08-04 |
