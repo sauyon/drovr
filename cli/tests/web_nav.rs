@@ -147,10 +147,48 @@ fn seed_runs(runs_root: &PathBuf) {
     .unwrap();
     fs::write(zeta.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
 
+    // delta-idle carries the agent-tree fixture: a reaped phase whose session was
+    // captured (⟳, promising the conversation), a reaped phase whose session was
+    // not (⟳ too — it is still rehydratable, and the tooltip says it reseeds),
+    // a phase that never ran (NO ⟳ — the CLI would refuse it), and a live phase. `implement` stays `Running` so the run remains
+    // incomplete and the list-motion checks above see the same rows they always
+    // did. Reaped phases carry `pane_id: null` — drovr refuses to load a phase
+    // claiming both a pane and a reaping.
+    //
+    // ⚠️ `project_dir` and `workspace` are BOTH set, and that is load-bearing:
+    // rehydrating needs a directory to launch in and a workspace to open a tab
+    // in, so a run missing either offers no ⟳ at all. This fixture used to carry
+    // `project_dir: ""` and still rendered three buttons — the tree's predicate
+    // was weaker than the operation's, which is the defect
+    // `RunState::rehydratable` exists to close. The negative cases live in
+    // `review::tests::the_tree_offers_no_rehydrate_the_cli_would_refuse`.
+    let delta = runs_root.join("delta-idle");
+    fs::write(
+        delta.join("state.json"),
+        r#"{"name":"delta-idle","task":"task for delta-idle","gate":"spec","cursor":0,"project_dir":"/tmp/delta","workspace":"w1","phases":[
+{"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude","session":"sess-brainstorm"}},
+{"name":"plan","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude"}},
+{"name":"never-ran","status":"Pending","handoff_doc":null,"herdr_session":null,"pane_id":null},
+{"name":"implement","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w1:p3"}]}"#,
+    )
+    .unwrap();
+
     // alpha-deploy is the run the detail-view checks drive: put it in the state a
     // reviewer actually meets it in — `ready`, still on turn 0 (the counter only
     // moves when the reviewer submits), with the agent's summary posted.
     let alpha = runs_root.join("alpha-deploy");
+    // Link fixture for the "spec links" checks: a bare URL (the way specs
+    // actually cite sources), an explicit inline link, and a bare `.rs` filename
+    // — `.rs` is a live TLD, so an over-eager linkifier turns it into a URL.
+    fs::write(
+        alpha.join("spec.md"),
+        "# Spec for alpha-deploy\n\nContent.\n\n\
+         Source: https://example.com/paper\n\n\
+         Inline [the docs](https://example.com/docs) too.\n\n\
+         Touches cli/src/review.rs and phase.rs.\n\n\
+         Jump to [the top](#spec-for-alpha-deploy).\n",
+    )
+    .unwrap();
     fs::write(alpha.join("summary.txt"), "spec drafted and ready for review").unwrap();
     fs::write(alpha.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
     fs::write(
@@ -213,6 +251,28 @@ fn web_keyboard_navigation() {
                 "--disable-gpu",
                 "--no-first-run",
                 "--no-default-browser-check",
+                // Without this the suite hangs on the FIRST navigation and every run
+                // costs 20s to fail. Chromium's cookie store is loaded through OSCrypt,
+                // which on Linux fetches its key from the Secret Service over D-Bus; on a
+                // machine whose keyring has no unlocked default collection that call never
+                // returns and has no timeout. Every cookie-bearing request then queues
+                // behind it forever — the TCP connection is made, but no HTTP request is
+                // ever written, so the server logs nothing and `Page.navigate` never
+                // resolves. `file://` and same-document navigations are unaffected because
+                // they never touch the cookie store, which is what makes it look like a
+                // browser or network fault rather than a keyring one.
+                //
+                // `basic` uses a built-in key instead, which is what a throwaway profile
+                // wants anyway. It changes where the cookie store's KEY comes from, not
+                // cookie behavior — verified: cookies still set and read with it on, and
+                // the UI's own state (localStorage) is not touched by either.
+                //
+                // The two flags are per-platform and each is ignored elsewhere:
+                // `--password-store` is Linux/BSD, `--use-mock-keychain` is the macOS
+                // equivalent for the same failure against Keychain. Windows needs neither
+                // (DPAPI does not prompt). See docs/known-issues.md.
+                "--password-store=basic",
+                "--use-mock-keychain",
                 &format!("--remote-debugging-port={cdp_port}"),
                 "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", tmp.path().join("chrome").display()),

@@ -1,7 +1,9 @@
+mod brief;
 mod code_review;
 mod config;
 mod findings;
 mod herdr;
+mod mcp_findings;
 mod phase;
 mod reflex;
 mod review;
@@ -13,12 +15,14 @@ mod sha256;
 mod shell;
 mod worktree;
 
+use brief::compose_phase_brief;
 use clap::{Parser, Subcommand};
-use code_review::{ReviewOutcome, code_review_run, head_sha};
+use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
-    PhaseWaitOutcome, collect, diagnose_stuck_phase, phase_done, phase_send, phase_start,
-    phase_wait, triage_blocked_phase,
+    PaneKept, PhaseWaitOutcome, ReapOutcome, RehydrateOutcome, collect, diagnose_stuck_phase,
+    phase_done, phase_reap, phase_rehydrate, phase_send, phase_start, phase_wait, reap_retired,
+    triage_blocked_phase,
 };
 use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
@@ -96,6 +100,19 @@ enum Commands {
     /// Plumbing: collect the handoff doc for a finished phase.
     Collect { run: String, phase_name: String },
 
+    /// Write an empty `<phase>-HANDOFF.md` — the fixed seven sections and nothing
+    /// else — for the finishing agent to fill in from its own context.
+    ///
+    /// Structure only, by design: drovr does not guess which commits or files belong
+    /// to your session. Refuses to overwrite an existing handoff unless `--force`.
+    HandoffScaffold {
+        run: String,
+        phase_name: String,
+        /// Overwrite an existing `<phase>-HANDOFF.md`.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Plumbing: review subcommands.
     Review {
         #[command(subcommand)]
@@ -118,6 +135,24 @@ enum Commands {
         #[arg(long)]
         skill: PathBuf,
     },
+
+    /// Serve the review panel's one-tool MCP findings channel on stdio.
+    ///
+    /// Spawned by `code-review run` for each reviewer, never by a human. Reviewers run
+    /// read-only and so cannot write their own findings file; this exposes a single
+    /// `submit_findings` tool and performs that one write for them. The reviewer names
+    /// its angle, which is validated against the configured angles — it can never name
+    /// a path, so its one write always lands inside the run dir.
+    #[command(hide = true)]
+    McpFindings {
+        /// Run whose findings are being collected.
+        run: String,
+        /// Task under review, e.g. `task-3`.
+        task: String,
+        /// Review iteration this panel is serving. Scopes the findings file, so one
+        /// pass can never harvest another's verdicts.
+        iter: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -128,6 +163,18 @@ enum PhaseCmd {
         phase_name: String,
         #[arg(long)]
         seed: Option<PathBuf>,
+        /// Compose this phase's brief (see `phase brief`) and inject it once the
+        /// agent is at its composer. This is how a phase should be briefed: drovr
+        /// owns the frame, you supply only what it cannot know.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+        /// Spawn the agent WITHOUT a brief (the pre-brief behavior). For a phase
+        /// drovr has no template for, or when you will brief it by hand with
+        /// `phase send`.
+        #[arg(long)]
+        no_brief: bool,
     },
     /// Send text to a running phase pane. Waits for the agent to attach first;
     /// exit 2 = it never became ready within the readiness timeout (likely parked
@@ -135,6 +182,9 @@ enum PhaseCmd {
     Send {
         run: String,
         phase_name: String,
+        /// The text to send, or `-` to read it from stdin — which is how a composed
+        /// brief reaches an already-running phase:
+        /// `drovr phase brief <run> <phase> | drovr phase send <run> <phase> -`.
         text: String,
     },
     /// Wait for a phase to complete (polls for the `done` marker and the pane's
@@ -146,6 +196,70 @@ enum PhaseCmd {
         phase_name: String,
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
+    },
+    /// Bring back a phase whose pane is gone, RESUMING its recorded agent
+    /// session where the backend offers one (`claude --resume <id>`).
+    ///
+    /// Exit 0 = the pane is back AND the agent has this phase's context (its
+    /// session was resumed, or its seed was re-sent). Exit 2 = the pane is back
+    /// but the agent was NOT CONFIRMED to have it — never success, and not proof
+    /// the context is gone either: it is five different states, and the note on
+    /// stderr says which. One of them (herdr never reported a session id) is an
+    /// agent that may be perfectly resumed and merely slow to surface it, so
+    /// read the note before acting on it. Exit 1 = refused or failed.
+    ///
+    /// A fresh tab in the run's project dir, launched under the profile the
+    /// phase originally ran with. When no session was captured — or the backend
+    /// has no resume surface — a fresh agent is launched instead and the
+    /// phase's seed re-sent, which recovers the artifacts but not the
+    /// conversation. Refuses a phase that still holds a pane (attach to that
+    /// instead) and never creates a phase that does not exist.
+    Rehydrate { run: String, phase_name: String },
+    /// Close a phase's herdr pane and release the phase from it.
+    ///
+    /// drovr does this by itself when a run moves past a phase (see
+    /// `reap_finished_panes`); this is the same operation on demand, and it is
+    /// also the supported way to clear a phase that records a pane herdr no
+    /// longer has — the state that otherwise makes `phase rehydrate` refuse
+    /// with "still holds pane" forever, with nothing able to clear it.
+    ///
+    /// Exit 0 = the pane is gone and the phase no longer records it (including
+    /// when there was nothing to reap, so re-running is safe). Exit 2 = the pane
+    /// is still there and the phase still holds it — herdr would not close it,
+    /// or could not be reached. Exit 1 = refused or failed.
+    ///
+    /// It also sweeps the run's RETIRED panes — ones drovr opened that no phase
+    /// points at any more, which a replaced reviewer leaves behind. That part is
+    /// best-effort and reports itself; the exit code is about the phase you
+    /// named.
+    ///
+    /// Every reap trigger sweeps, so with `reap_finished_panes` on (the default)
+    /// the next `phase start` or `code-review run` already reclaims them. This
+    /// command sweeps ON DEMAND and regardless of that config — so it is the
+    /// only route short of `drovr cleanup` when reaping is turned off, and the
+    /// way to not wait for the next trigger when it is not.
+    ///
+    /// The phase's status is NOT changed: reaping says something about the pane,
+    /// not about whether the work was finished. Bring it back with
+    /// `drovr phase rehydrate`, which resumes the agent's session where the
+    /// backend offers one.
+    Reap { run: String, phase_name: String },
+    /// Print a phase's composed brief and exit, spawning nothing.
+    ///
+    /// This is the text a phase agent should be given: drovr's template for that
+    /// phase, its substitutions filled in, the run's task, and your `--context`.
+    /// Pipe it into `phase send` (or read it to see exactly what a phase is told).
+    /// Composed for `brainstorm`, `plan`, `implement-task-<N>` and `review`.
+    Brief {
+        run: String,
+        phase_name: String,
+        /// What this phase needs to know that drovr cannot compose: the task brief
+        /// from `plan.md`, accumulated interfaces, why the last attempt failed.
+        /// RECORDED, so a re-brief of this phase reuses it; `--context ''` clears it.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
     /// Mark a phase complete. Run by the phase AGENT itself as its final action —
     /// it drops the completion marker `drovr phase wait` polls for. Refuses for a
@@ -194,6 +308,33 @@ enum CodeReviewCmd {
         /// diff you no longer care about.
         #[arg(long)]
         fresh: bool,
+        /// What this change is about, in your words. drovr composes the brief; this
+        /// is the one part of it you supply. Recorded in the run dir, so a resume
+        /// briefs its reviewers identically.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        /// Read `--context` from a file (use for anything longer than a sentence).
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+    },
+    /// Print one angle's reviewer brief and exit, spawning nothing.
+    ///
+    /// For whenever you spawn the reviewer yourself instead of through the panel: an
+    /// in-harness read-only subagent, a host with no herdr integration for the review
+    /// agent, or a wedged panel. Pass this text to that reviewer VERBATIM — it is the
+    /// same brief `code-review run` injects, so the frame stays drovr's rather than
+    /// one the driver improvised.
+    Brief {
+        run: String,
+        task: String,
+        #[arg(long)]
+        angle: String,
+        /// See `code-review run --context`. Supplying it here RECORDS it too, so a
+        /// later `run` or `brief` for this task reuses it; `--context ''` clears it.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
 }
 
@@ -225,24 +366,6 @@ fn load_run(name: &str) -> RunState {
         eprintln!("drovr: failed to load run '{name}': {e}");
         process::exit(1);
     })
-}
-
-/// Copy the parts of a finished code-review pass onto a freshly-loaded state.
-///
-/// `code_review_run` mutates exactly two things — `review_phases` and, when it
-/// replaces a wedged reviewer, `retired_panes`. Both must survive, and nothing
-/// else in `from` may: it is a snapshot taken before a pass that runs for
-/// minutes, so writing it back whole would resurrect every pipeline phase's
-/// status as of panel-start, including a `Done` that a `phase send` re-entry has
-/// since cleared.
-///
-/// `retired_panes` is unioned rather than assigned: `fresh` may already carry
-/// retirements this snapshot predates.
-fn transplant_review_progress(fresh: &mut RunState, from: &RunState) {
-    fresh.review_phases = from.review_phases.clone();
-    for pane in &from.retired_panes {
-        fresh.retire_pane(pane);
-    }
 }
 
 fn save_run(run: &RunState) {
@@ -316,6 +439,57 @@ fn cmd_list() {
     }
 }
 
+/// Create the run's herdr workspace and label its root shell pane. `None` if
+/// herdr could not create it, which is a warning rather than a failure (the run
+/// still exists; `phase start` is what needs the workspace).
+///
+/// Returns the [`herdr::Workspace`] it was handed rather than a pair of
+/// same-typed `Option<String>`s: two positional `Option<String>`s are a
+/// swap away from silently recording the pane id as the workspace id.
+///
+/// The workspace is created in the project dir so the root shell and every phase
+/// tab start already `cd`'d into the project.
+///
+/// **The rename is why this is a function.** No phase ever runs in the root
+/// pane, so it sits in the switcher for the whole run showing an idle shell
+/// prompt with nothing to explain it. Labelling it says what it is and which run
+/// it anchors. Best-effort: a failed rename is cosmetic and must not cost the
+/// run its workspace.
+///
+/// The rename is wrapped in the `focused_workspace`/`workspace_focus`
+/// capture-and-restore that `launch_in_pane` uses, for the same reason:
+/// `pane_rename` has no `--no-focus` flag and yanks the user's focus onto the
+/// pane it renames. `workspace_create` is deliberately called with
+/// `focus: false` so `drovr new` never disturbs whatever the user is doing —
+/// renaming without the guard would undo that one call later.
+fn create_run_workspace<H: Herdr>(
+    herdr: &H,
+    name: &str,
+    project_dir: &str,
+) -> Option<herdr::Workspace> {
+    let prev_focus = herdr.focused_workspace();
+    let ws = match herdr.workspace_create(&format!("drovr:{name}"), project_dir) {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("drovr: warning: could not create herdr workspace: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = herdr.pane_rename(&ws.root_pane, &format!("drovr:{name} (idle shell)")) {
+        eprintln!("drovr: warning: could not label the run's root shell pane: {e}");
+    }
+    if let Some(prev) = prev_focus {
+        // Warn rather than swallow. The capture/restore exists precisely so
+        // `drovr new` does not move the user; if the restore fails they are left
+        // sitting in a brand-new idle workspace with no clue why, and the fix
+        // (switch back) is one they can only apply if they know it happened.
+        if let Err(e) = herdr.workspace_focus(&prev) {
+            eprintln!("drovr: warning: could not restore focus to workspace {prev}: {e}");
+        }
+    }
+    Some(ws)
+}
+
 fn cmd_new(
     name: &str,
     task: Option<String>,
@@ -386,16 +560,10 @@ fn cmd_new(
 
     let task_str = task.unwrap_or_else(|| "(no task specified)".to_string());
 
-    // Create the workspace in the project dir so its root shell pane (reused by
-    // the first phase) and every later tab start already `cd`'d into the project.
-    let (workspace, root_pane) =
-        match herdr.workspace_create(&format!("drovr:{name}"), &project_dir) {
-            Ok(ws) => (Some(ws.id), Some(ws.root_pane)),
-            Err(e) => {
-                eprintln!("drovr: warning: could not create herdr workspace: {e}");
-                (None, None)
-            }
-        };
+    let (workspace, root_pane) = match create_run_workspace(herdr, name, &project_dir) {
+        Some(ws) => (Some(ws.id), Some(ws.root_pane)),
+        None => (None, None),
+    };
 
     let run = RunState {
         name: name.to_owned(),
@@ -452,51 +620,287 @@ fn cmd_status(name: &str) {
     }
 }
 
+/// What `drovr attach` found to connect the human to.
+///
+/// The two variants are **not interchangeable**, and that is the whole point of
+/// distinguishing them: `Phase` holds an agent, `RootShell` is a bare `sh`. The
+/// only attach primitive herdr exposes is `herdr agent attach`, which requires
+/// an attached agent — there is no `herdr pane attach` — so the second variant
+/// cannot be handed to the same code path as the first. See [`AttachPlan`].
+#[derive(Debug)]
+enum AttachTarget<'a> {
+    Phase { phase: &'a str, pane: &'a str },
+    RootShell { pane: &'a str },
+}
+
+/// What `drovr attach` will actually DO about the target it found.
+///
+/// Split out from [`attach_target`] so the decision is testable without
+/// spawning `herdr` or calling `process::exit`. It exists because those two were
+/// once one function, and the fallback rung it added ("no phase pane → the idle
+/// root shell") silently contradicted the `herdr agent attach` it then ran: the
+/// root shell has no agent, so that attach could only ever fail with
+/// `agent_not_found`. Nothing walked that path in a test.
+#[derive(Debug)]
+enum AttachPlan {
+    /// Hand the terminal to `herdr agent attach <pane>`.
+    AttachAgent { phase: String, pane: String },
+    /// Print this to stderr and exit non-zero. There is no agent to attach to,
+    /// and saying so is more use than an opaque herdr error.
+    Refuse(String),
+}
+
+/// Decide what `drovr attach <name>` does, given the run's state.
+///
+/// A run with no live agent pane is **refused**, not silently redirected. The
+/// idle root shell is a real pane and `drovr cleanup` still owns it, but it is
+/// not a conversation: attaching there would drop the human at a `sh` prompt
+/// under a command whose entire contract is "show me this run's agent". The
+/// refusal names the workspace so they can open it in herdr themselves if the
+/// shell is genuinely what they wanted.
+fn attach_plan(run: &RunState, name: &str) -> AttachPlan {
+    match attach_target(run) {
+        Some(AttachTarget::Phase { phase, pane }) => AttachPlan::AttachAgent {
+            phase: phase.to_owned(),
+            pane: pane.to_owned(),
+        },
+        // The workspace and its anchor shell are alive; only the agents are gone.
+        Some(AttachTarget::RootShell { pane }) => AttachPlan::Refuse(format!(
+            "run '{name}' has no live agent pane — no phase holds one. Its workspace \
+             {} is still open, anchored by the idle shell {pane} (a plain shell, not \
+             an agent, so there is nothing to attach to).{recover} Start a phase with: \
+             drovr phase start {quoted} <phase>",
+            run.workspace.as_deref().unwrap_or("(unknown)"),
+            quoted = shell_single_quote(name),
+            recover = rehydrate_hint(run, name),
+        )),
+        None => AttachPlan::Refuse(format!(
+            "run '{name}' has no live agent pane, and no herdr workspace either \
+             (creation failed at `drovr new`, or the run was cleaned up). Start a \
+             phase with: drovr phase start {} <phase>",
+            shell_single_quote(name),
+        )),
+    }
+}
+
+/// Where a line goes and what it costs: stdout+exit 0, or stderr+a code.
+#[derive(Debug, PartialEq, Eq)]
+struct Report {
+    code: i32,
+    to_stderr: bool,
+    line: String,
+}
+
+/// How a [`RehydrateOutcome`] is reported — the DECISION, split from the
+/// printing and the `process::exit` so a test can reach it. Task 4's handoff
+/// §3d: a decision that is tested while what the caller does with it is not is
+/// how two halves come to contradict each other undetected.
+///
+/// **`Incomplete` is exit 2, not 0.** The pane is back, but the agent in it was
+/// not confirmed to have this phase's context — it never became ready (so a
+/// resume was never confirmed, or a seed never sent), there was no seed
+/// recorded, or the delivery failed. `phase send` already reserves
+/// exit 2 for exactly that ("so the driver can escalate rather than assume the
+/// seed landed"), and a driver that only checks the status would otherwise run
+/// `phase wait` against an agent nobody ever told what to do.
+fn rehydrate_report(run: &str, phase: &str, outcome: &RehydrateOutcome) -> Report {
+    match outcome {
+        RehydrateOutcome::Resumed => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!("phase '{phase}' resumed with its recorded session"),
+        },
+        RehydrateOutcome::Reseeded => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "phase '{phase}' relaunched — its session was not recoverable, so a fresh \
+                 agent was seeded from the handoff"
+            ),
+        },
+        // The prose comes from the VARIANT (`Unfinished::note`), never the
+        // other way round — so a caller that needs to know which failure this
+        // was matches on the type instead of on the sentence.
+        RehydrateOutcome::Incomplete(why) => Report {
+            code: 2,
+            to_stderr: true,
+            line: format!(
+                "drovr: phase '{phase}' relaunched INCOMPLETE — {}",
+                why.note(run, phase)
+            ),
+        },
+    }
+}
+
+/// How a [`ReapOutcome`] is reported — the DECISION, split from the printing
+/// and the `process::exit`, exactly as [`rehydrate_report`] is and for the same
+/// reason: a decision that is tested while what the caller does with it is not
+/// is how two halves come to contradict each other undetected.
+///
+/// **`Kept` is exit 2, not 0**, and it is the only outcome that is not a
+/// success. The other three all end with the same thing true — the phase does
+/// not record a pane — and `NothingToReap` in particular has to be a success, or
+/// re-running a reap after one that worked would report failure for a state that
+/// is exactly what was asked for.
+fn reap_report(run: &str, phase: &str, outcome: &ReapOutcome) -> Report {
+    match outcome {
+        ReapOutcome::Closed { pane } => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "closed pane {pane} of phase '{phase}' — bring it back with \
+                 `drovr phase rehydrate {} {}`",
+                shell_single_quote(run),
+                shell_single_quote(phase)
+            ),
+        },
+        ReapOutcome::Cleared { pane } => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!(
+                "phase '{phase}' recorded pane {pane}, which herdr no longer has — \
+                 cleared the registration, so the phase can be rehydrated again"
+            ),
+        },
+        ReapOutcome::NothingToReap => Report {
+            code: 0,
+            to_stderr: false,
+            line: format!("phase '{phase}' holds no pane — nothing to reap"),
+        },
+        // The prose comes from the VARIANT, never the other way round.
+        ReapOutcome::Kept { pane, why } => Report {
+            code: 2,
+            to_stderr: true,
+            line: format!(
+                "drovr: phase '{phase}' still holds pane {pane} — {}. Nothing was \
+                 changed; `drovr cleanup {}` will reclaim it with the rest of the run.",
+                match why {
+                    PaneKept::CloseFailed(e) => format!("herdr would not close it ({e})"),
+                    PaneKept::Unreadable =>
+                        "herdr could not say whether it still exists, and drovr does not \
+                         drop a registration it cannot prove is stale"
+                            .to_string(),
+                },
+                shell_single_quote(run),
+            ),
+        },
+    }
+}
+
+/// The " Or bring back …" clause for a refusal, when the run has a phase whose
+/// pane drovr closed. Empty otherwise — a refusal must never advertise a
+/// recovery that would just error.
+///
+/// The LAST reaped phase, because a run's phases are appended in order and the
+/// most recent one is the one a human losing their pane is asking about.
+/// Reviewers are excluded: they live in `review_phases` and are not what
+/// `drovr attach <run>` is looking for.
+fn rehydrate_hint(run: &RunState, name: &str) -> String {
+    match run.phases.iter().rev().find(|p| p.is_reaped()) {
+        Some(p) => format!(
+            " Phase '{}' was closed by drovr and can be brought back (resuming its \
+             session where the agent supports it): drovr phase rehydrate {} {}.",
+            p.name,
+            shell_single_quote(name),
+            shell_single_quote(&p.name),
+        ),
+        None => String::new(),
+    }
+}
+
+/// Pick what `drovr attach <run>` should connect to:
+///
+/// 1. [`RunState::live_agent_pane`] — the run's current phase, if it holds one.
+///    **The same call the review UI's mirror makes**, so `drovr attach` and the
+///    UI can never point at different panes for the same run. There is no
+///    fallback to an earlier phase; the reason is on `live_agent_pane`.
+/// 2. otherwise the workspace's idle root shell, which no phase ever occupies
+///    and which therefore outlives them all;
+/// 3. otherwise nothing — a run whose workspace creation failed at `drovr new`.
+///
+/// **Rung 2 is not an attach target** — see [`attach_plan`], which refuses it.
+/// It is reported rather than dropped because it distinguishes two refusals: a
+/// run whose workspace is still open and anchored, and one with no workspace at
+/// all. Those deserve different advice.
+fn attach_target(run: &RunState) -> Option<AttachTarget<'_>> {
+    match run.live_agent_pane() {
+        Some((phase, pane)) => Some(AttachTarget::Phase { phase, pane }),
+        None => run
+            .root_pane
+            .as_deref()
+            .map(|pane| AttachTarget::RootShell { pane }),
+    }
+}
+
 fn cmd_attach(name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
-    // Find the current/last-running phase pane
-    let pane_id = run
-        .first_incomplete()
-        .and_then(|i| run.phases.get(i))
-        .and_then(|p| p.pane_id.as_deref())
-        .or_else(|| {
-            // If all done, use the last phase's pane
-            run.phases.last().and_then(|p| p.pane_id.as_deref())
-        });
 
-    match pane_id {
-        Some(id) => {
-            // Shell out: herdr agent attach <pane_id>
-            let status = std::process::Command::new("herdr")
-                .args(["agent", "attach", id])
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("drovr: failed to exec herdr: {e}");
-                    process::exit(1);
-                });
-            if !status.success() {
-                process::exit(status.code().unwrap_or(1));
-            }
-        }
-        None => {
-            eprintln!(
-                "drovr: no active pane for run '{name}'; try: drovr phase start {} <phase>",
-                shell_single_quote(name)
-            );
+    let (phase, pane_id) = match attach_plan(&run, name) {
+        AttachPlan::AttachAgent { phase, pane } => (phase, pane),
+        AttachPlan::Refuse(msg) => {
+            eprintln!("drovr: {msg}");
             process::exit(1);
         }
+    };
+    // Name the phase: `attach_target`'s rung 2 can land somewhere other than the
+    // phase the human had in mind, and a silent attach hides which.
+    eprintln!("drovr: attaching to phase '{phase}' of run '{name}'");
+
+    // Shell out: herdr agent attach <pane_id>
+    let status = std::process::Command::new("herdr")
+        .args(["agent", "attach", &pane_id])
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("drovr: failed to exec herdr: {e}");
+            process::exit(1);
+        });
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Carry what a code-review panel recorded onto a freshly loaded run state.
+///
+/// **Transplant, never write `state` back wholesale.** A panel runs for many
+/// minutes and `state` is a snapshot from before it started; saving the whole
+/// thing would resurrect every pipeline phase's status as of panel-start —
+/// including a `Done` that a `phase send` re-entry has since cleared, which
+/// makes the next `phase wait` report success for an agent that is mid-work.
+///
+/// `code_review_run` mutates exactly two things, and BOTH have to come across:
+///
+/// * `review_phases` — the reviewers it spawned and their status.
+/// * `retired_panes` — load-bearing, not bookkeeping. `drovr cleanup` closes
+///   exactly the panes this file records and treats everything else in the
+///   workspace as the human's, so a pane dropped from `review_phases` without
+///   landing here is immortal AND blocks `workspace_close` for the whole run.
+///   The resume path retires a replaced reviewer's pane immediately before
+///   `spawn_reviewer`, which can then fail — leaving that retirement in memory
+///   only. This used to drop it on exactly that path.
+///
+/// `retired_panes` is UNIONED, not assigned: the freshly loaded state may
+/// already record retirements this snapshot never saw, and `retire_pane` is
+/// idempotent, so neither side loses.
+fn merge_panel_progress(merged: &mut RunState, state: &RunState) {
+    merged.review_phases = state.review_phases.clone();
+    for pane in &state.retired_panes {
+        merged.retire_pane(pane.clone());
     }
 }
 
 /// Every pane id drovr created for `run`, in creation order and deduped: the
-/// workspace's root pane while no phase has claimed it yet (`phase_start` moves
-/// that id onto the phase, so it lives in exactly one place), each phase's pane,
-/// each reviewer's pane, and every pane retired from a phase but still drovr's
-/// (see `RunState::retired_panes`).
+/// workspace's idle root pane, each phase's pane, each reviewer's pane, and
+/// every pane retired from a phase but still drovr's (see
+/// `RunState::retired_panes`).
+///
+/// `root_pane` is now an unconditional entry — no phase ever claims that id, so
+/// it stays in exactly one place for the run's lifetime. (It used to move onto
+/// the first phase, which is why the dedup below exists and why a `state.json`
+/// written by an older build can still list it in both places.)
 ///
 /// This list is the whole definition of "drovr's panes" at cleanup: a pane drovr
 /// created but failed to record is indistinguishable from one the human opened,
@@ -506,12 +910,13 @@ fn drovr_pane_ids(run: &RunState) -> Vec<String> {
     let ids = run
         .root_pane
         .iter()
-        .chain(run.phases.iter().filter_map(|p| p.pane_id.as_ref()))
-        .chain(run.review_phases.iter().filter_map(|p| p.pane_id.as_ref()))
-        .chain(run.retired_panes.iter());
+        .map(String::as_str)
+        .chain(run.phases.iter().filter_map(|p| p.pane_id()))
+        .chain(run.review_phases.iter().filter_map(|p| p.pane_id()))
+        .chain(run.retired_panes.iter().map(String::as_str));
     for id in ids {
-        if !out.contains(id) {
-            out.push(id.clone());
+        if !out.iter().any(|seen| seen == id) {
+            out.push(id.to_owned());
         }
     }
     out
@@ -707,31 +1112,72 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
     }
 }
 
-fn cmd_resurrect(name: &str) {
+/// `drovr resurrect`, minus the process plumbing: RESTORE the run — which means
+/// making its herdr workspace real again — and then report where to resume.
+///
+/// The order is the whole point. This command's help says it "reloads a stopped
+/// run and reports the resume point", and it used to print
+/// `To resume: drovr phase start …` having restored nothing, so the resume it
+/// advertised died on the next command with a raw `workspace_not_found`. A
+/// recovery command that reports success it did not achieve is worse than one
+/// that errors: it sends you looking for the fault somewhere else entirely.
+/// Either the workspace is there when this returns `Ok`, or this returns `Err`.
+fn resurrect_report<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<String> {
+    let Some(idx) = run.first_incomplete() else {
+        // Nothing to resume into, so nothing to provision: a finished run does
+        // not need a workspace conjured up to be told it is finished.
+        return Ok(format!(
+            "run '{}' is fully complete — nothing to resurrect",
+            run.name
+        ));
+    };
+
+    let mut out = String::new();
+    if let phase::WorkspaceHealing::Reprovisioned { orphaned } = phase::ensure_workspace(h, run)? {
+        // Shared wording, so a driver reading this and the stderr warning
+        // `phase_start` prints does not have to work out that they are the same
+        // event described twice.
+        out.push_str("restored: ");
+        out.push_str(&phase::healing_report(run, &orphaned));
+        out.push('\n');
+    }
+
+    // Re-read the resume point: the repair above may have demoted the phase that
+    // was `Running` to `Failed`, which does not move `first_incomplete` — but
+    // reading it again keeps this honest if that ever changes.
+    let idx = run.first_incomplete().unwrap_or(idx);
+    out.push_str(&format!(
+        "run '{}' — resume at phase {idx}: {}\n",
+        run.name, run.phases[idx].name
+    ));
+    // Print all phases for context
+    for (i, p) in run.phases.iter().enumerate() {
+        out.push_str(&format!(
+            "  [{i}] {} — {}\n",
+            p.name,
+            phase_status_str(&p.status)
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "To resume: drovr phase start {} {}",
+        shell_single_quote(&run.name),
+        shell_single_quote(&run.phases[idx].name)
+    ));
+    Ok(out)
+}
+
+fn cmd_resurrect<H: Herdr>(h: &H, name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
-    let run = load_run(name);
-    match run.first_incomplete() {
-        Some(idx) => {
-            println!(
-                "run '{name}' — resume at phase {idx}: {}",
-                run.phases[idx].name
-            );
-            // Print all phases for context
-            for (i, p) in run.phases.iter().enumerate() {
-                println!("  [{i}] {} — {}", p.name, phase_status_str(&p.status));
-            }
-            println!();
-            println!(
-                "To resume: drovr phase start {} {}",
-                shell_single_quote(name),
-                shell_single_quote(&run.phases[idx].name)
-            );
-        }
-        None => {
-            println!("run '{name}' is fully complete — nothing to resurrect");
+    let mut run = load_run(name);
+    match resurrect_report(h, &mut run) {
+        Ok(report) => println!("{report}"),
+        Err(e) => {
+            eprintln!("drovr: cannot resurrect run '{name}': {e}");
+            process::exit(1);
         }
     }
 }
@@ -770,17 +1216,92 @@ fn cmd_phase(sub: PhaseCmd) {
             run,
             phase_name,
             seed,
+            context,
+            context_file,
+            no_brief,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
+            let context = read_context_arg(context, context_file);
             let mut state = load_run(&run);
+
+            // Compose BEFORE spawning. A phase whose brief cannot be composed (no
+            // template for that name) must not end up as a live agent sitting at an
+            // empty composer waiting for a driver to improvise one — that is the
+            // failure mode this whole mechanism exists to remove.
+            let composed = if no_brief {
+                None
+            } else {
+                match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                    Ok(brief) => Some(brief),
+                    Err(e) => {
+                        eprintln!("drovr: {e}");
+                        eprintln!(
+                            "drovr: (or spawn it unbriefed with `drovr phase start {run} \
+                             {phase_name} --no-brief`)"
+                        );
+                        process::exit(1);
+                    }
+                }
+            };
+
             if let Err(e) = phase_start(&h, &mut state, &phase_name, seed.as_deref()) {
                 eprintln!("drovr: phase start failed: {e}");
                 process::exit(1);
             }
             println!("started phase '{phase_name}' for run '{run}'");
+
+            if let Some(brief) = composed {
+                if let Err(e) = phase_send(&h, &mut state, &phase_name, &brief) {
+                    // The pane is up but unbriefed. Say so precisely: the phase is
+                    // NOT running its task, and a driver that reads "started" alone
+                    // would wait forever on an agent that was never asked anything.
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
+                            eprintln!("drovr: {diag}");
+                        } else {
+                            eprintln!("drovr: {e}");
+                        }
+                    } else {
+                        eprintln!("drovr: could not deliver the brief: {e}");
+                    }
+                    // Mark it Failed, exactly as the reviewer path does for the same
+                    // condition. Left `Running`, a `phase wait` blocks forever on an
+                    // agent that was never asked anything, and a re-entry believes the
+                    // phase is live. The pane stays up — reaping only ever takes a
+                    // `Done` phase's, and a `Failed` phase's pane is what a human
+                    // attaches to in order to find out what went wrong — and it is
+                    // still recorded, so `drovr cleanup` reclaims it.
+                    if let Some(i) = state.phases.iter().position(|p| p.name == phase_name) {
+                        state.phases[i].status = run::PhaseStatus::Failed;
+                        if let Err(e) = state.save() {
+                            // The phase is still `Running` ON DISK, so a later
+                            // `phase wait` would block forever on an agent that was never
+                            // briefed. That is a worse state than the send failure itself,
+                            // and it is not remediable by re-sending — exit 1, not the
+                            // exit 2 that means "re-brief it".
+                            eprintln!(
+                                "drovr: could not record the failed phase ({e}) — phase \
+                                 '{phase_name}' is still Running on disk with an UNBRIEFED \
+                                 agent; fix the run dir before anything waits on it"
+                            );
+                            process::exit(1);
+                        }
+                    }
+                    // The brief's context is recorded, so the remediation needs no
+                    // --context: `phase brief` reuses it.
+                    eprintln!(
+                        "drovr: phase '{phase_name}' marked FAILED — its pane is alive but the \
+                         agent was never briefed. Re-send with `drovr phase brief {run} \
+                         {phase_name} | drovr phase send {run} {phase_name} -` once the pane is \
+                         at its composer"
+                    );
+                    process::exit(2);
+                }
+                println!("briefed phase '{phase_name}' ({} bytes)", brief.len());
+            }
         }
         PhaseCmd::Send {
             run,
@@ -792,6 +1313,40 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
+            // `-` reads stdin, so a brief drovr composed can be piped straight in
+            // without a driver retyping (or paraphrasing) it.
+            let text = if text == "-" {
+                // Bounded: a prompt is a message, and an accidental `cat huge.bin |` would
+                // otherwise be read wholly into memory and then typed into a pane.
+                //
+                // Deliberately LARGER than MAX_CONTEXT: the canonical use of `send -` is
+                // `drovr phase brief … | drovr phase send … -`, and a brief is the template
+                // frame PLUS up to MAX_CONTEXT of context. Reusing the context cap here
+                // would let a legitimate at-limit brief be rejected by the very remediation
+                // drovr prints.
+                const MAX_STDIN: u64 = 4 << 20; // 4 MiB
+                let mut buf = String::new();
+                if let Err(e) =
+                    io::Read::read_to_string(&mut io::Read::take(io::stdin(), MAX_STDIN), &mut buf)
+                {
+                    eprintln!("drovr: cannot read the message from stdin: {e}");
+                    process::exit(1);
+                }
+                if buf.trim().is_empty() {
+                    eprintln!("drovr: refusing to send an empty message read from stdin");
+                    process::exit(1);
+                }
+                if buf.len() as u64 == MAX_STDIN {
+                    eprintln!(
+                        "drovr: refusing to send {MAX_STDIN} bytes from stdin — that is not a \
+                         brief; check what you piped in"
+                    );
+                    process::exit(1);
+                }
+                buf
+            } else {
+                text
+            };
             if let Err(e) = phase_send(&h, &mut state, &phase_name, &text) {
                 // A readiness timeout (agent never attached) is not a plain send
                 // failure — the agent is almost certainly parked on a prompt with
@@ -800,10 +1355,17 @@ fn cmd_phase(sub: PhaseCmd) {
                 // and a distinct exit code (2) so the driver can escalate rather
                 // than assume the seed landed.
                 if e.kind() == io::ErrorKind::TimedOut {
+                    // ALWAYS print the error itself. It names WHICH of the
+                    // failures happened — never attached, seed swallowed, would
+                    // not submit — and, for the swallowed one, why drovr refused
+                    // to press a key on the user's behalf. `diagnose_stuck_phase`
+                    // is additive context, a pane snapshot, not a replacement
+                    // diagnosis: it used to REPLACE this text, which both lost the
+                    // explanation and asserted the wrong cause, since it phrases
+                    // every verdict as a `phase wait` timeout.
+                    eprintln!("drovr: {e}");
                     if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
-                        eprintln!("drovr: {diag}");
-                    } else {
-                        eprintln!("drovr: {e}");
+                        eprintln!("drovr: pane context — {diag}");
                     }
                     process::exit(2);
                 }
@@ -872,6 +1434,83 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: phase wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Rehydrate { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let mut state = load_run(&run);
+            match phase_rehydrate(&h, &mut state, &phase_name) {
+                // The decision lives in `rehydrate_report`; this is only the
+                // doing. See there for why an incomplete rehydrate exits 2.
+                Ok(outcome) => {
+                    let r = rehydrate_report(&run, &phase_name, &outcome);
+                    if r.to_stderr {
+                        eprintln!("{}", r.line);
+                    } else {
+                        println!("{}", r.line);
+                    }
+                    if r.code != 0 {
+                        process::exit(r.code);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("drovr: phase rehydrate failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Reap { run, phase_name } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let mut state = load_run(&run);
+            // The run's retired panes go too, and BEFORE the phase's: they
+            // belong to no phase, so this command is the only route an operator
+            // has to them short of `drovr cleanup`. It is best-effort and says
+            // so itself — it cannot fail this command, and it does not enter
+            // `reap_report`, whose exit code is about the phase that was named.
+            reap_retired(&h, &mut state);
+            match phase_reap(&h, &mut state, &phase_name) {
+                // The decision lives in `reap_report`; this is only the doing.
+                Ok(outcome) => {
+                    let r = reap_report(&run, &phase_name, &outcome);
+                    if r.to_stderr {
+                        eprintln!("{}", r.line);
+                    } else {
+                        println!("{}", r.line);
+                    }
+                    if r.code != 0 {
+                        process::exit(r.code);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("drovr: phase reap failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Brief {
+            run,
+            phase_name,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: {e}");
                     process::exit(1);
                 }
             }
@@ -974,6 +1613,127 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+/// Resolve `--context` / `--context-file` into the context text. clap enforces that
+/// the two are mutually exclusive, so this only has to read the file. An unreadable
+/// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
+/// context to be in the brief, and silently reviewing without it is the failure this
+/// whole mechanism exists to prevent.
+/// Read `--context-file`: a regular file, not through a symlink, size-bounded.
+///
+/// The path is often inside the run dir, which agents write to (handoffs live there), so it
+/// gets the same treatment as a recorded context: a symlink there would inject an arbitrary
+/// readable file into the brief, a FIFO would hang the driver on `read_to_string`, and a
+/// metadata-only size check is a TOCTOU the read itself has to enforce.
+fn read_context_file(path: &std::path::Path) -> String {
+    use brief::MAX_CONTEXT;
+    let bail = |msg: String| -> ! {
+        eprintln!("drovr: {msg}");
+        process::exit(1);
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    if meta.file_type().is_symlink() {
+        bail(format!(
+            "--context-file {} is a symlink; pass the real path",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        bail(format!(
+            "--context-file {} is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
+             context; check what you passed",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    let mut text = String::new();
+    if let Err(e) = io::Read::read_to_string(&mut io::Read::take(file, MAX_CONTEXT + 1), &mut text)
+    {
+        bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        ));
+    }
+    if text.len() as u64 > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} grew past the {MAX_CONTEXT}-byte limit while being read",
+            path.display()
+        ));
+    }
+    text
+}
+
+fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
+    // One cap for every path context can arrive by, defined next to the record I/O that
+    // enforces it on reuse.
+    use brief::MAX_CONTEXT;
+    match (context, context_file) {
+        (Some(text), _) if text.len() as u64 > MAX_CONTEXT => {
+            eprintln!(
+                "drovr: --context is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not \
+                 a context; check what you passed",
+                text.len()
+            );
+            process::exit(1);
+        }
+        (Some(text), _) => Some(text),
+        (None, Some(path)) => Some(read_context_file(&path)),
+        (None, None) => None,
+    }
+}
+
+/// `drovr handoff-scaffold` — write the empty 7-section handoff for `phase`.
+///
+/// Never clobbers silently: a handoff already on disk is an agent's authored work (or a
+/// half-written draft), and losing it costs the whole compression pass that produced it.
+fn cmd_handoff_scaffold(run: &str, phase_name: &str, force: bool) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    if let Err(e) = validate_label("phase", phase_name) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    let dir = run::run_dir(run);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("drovr: cannot create run dir: {e}");
+        process::exit(1);
+    }
+    let path = dir.join(format!("{phase_name}-HANDOFF.md"));
+    if path.exists() && !force {
+        eprintln!(
+            "drovr: {} already exists — refusing to overwrite an authored handoff (pass \
+             --force to replace it)",
+            path.display()
+        );
+        process::exit(1);
+    }
+    if let Err(e) = std::fs::write(&path, brief::handoff_scaffold()) {
+        eprintln!("drovr: cannot write {}: {e}", path.display());
+        process::exit(1);
+    }
+    println!("scaffolded {}", path.display());
+}
+
 fn cmd_code_review(sub: CodeReviewCmd) {
     match sub {
         CodeReviewCmd::Base { run, task } => {
@@ -990,10 +1750,7 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // record; mirror `phase_start`'s guidance rather than recording a
             // base from the wrong directory.
             if state.project_dir.is_empty() {
-                eprintln!(
-                    "drovr: run '{run}' has no project_dir (created before this fix); \
-                     please recreate the run with `drovr new`"
-                );
+                eprintln!("drovr: {}", phase::missing_project_dir_error(&run));
                 process::exit(1);
             }
             let sha = head_sha(&state.project_dir).unwrap_or_else(|e| {
@@ -1015,11 +1772,42 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                 path.display()
             );
         }
+        CodeReviewCmd::Brief {
+            run,
+            task,
+            angle,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("task", &task) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("angle", &angle) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match code_review_brief(&state, &task, &angle, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: cannot compose brief: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         CodeReviewCmd::Run {
             run,
             task,
             timeout_ms,
             fresh,
+            context,
+            context_file,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
@@ -1031,31 +1819,14 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             }
             let h = SystemHerdr::new();
             let mut state = load_run(&run);
-            let outcome = code_review_run(&h, &mut state, &task, timeout_ms, fresh);
-            // Persist the review_phases progress the panel recorded (spawned
-            // reviewers, done/running status) BEFORE handling the result:
-            // `code_review_run` appends reviewer phases as it spawns them and can
-            // then fail (e.g. a mid-spawn `phase_send` error) with those phases
-            // only in memory, so an unconditional save here keeps disk and memory
-            // in sync on every path — including the `Err` early-exit below.
-            //
-            // Transplant only what `code_review_run` mutates onto a freshly-loaded
-            // state. A panel runs for many minutes and `state` is a snapshot from
-            // before it started; writing the whole thing back would resurrect
-            // every pipeline
-            // phase's status as of panel-start — including a `Done` that a
-            // `phase send` re-entry has since cleared, which makes the next
-            // `phase wait` report success for an agent that is mid-work.
-            // It mutates `retired_panes` too: replacing a wedged reviewer retires
-            // the old pane before respawning, and if that respawn then fails the
-            // function returns `Err` without ever saving. Transplanting only
-            // `review_phases` dropped that record, and a pane drovr created but
-            // never recorded is one `drovr cleanup` treats as the human's — so it
-            // is never closed, and its presence can stop the whole workspace being
-            // closed. Union rather than overwrite: the fresh state may carry
-            // retirements this snapshot predates.
+            let context = read_context_arg(context, context_file);
+            let outcome =
+                code_review_run(&h, &mut state, &task, timeout_ms, fresh, context.as_deref());
+            // Persist what the panel recorded, on EVERY path including the
+            // `Err` early-exit below — `code_review_run` mutates state in memory
+            // and can then fail with none of it saved.
             let mut merged = load_run(&run);
-            transplant_review_progress(&mut merged, &state);
+            merge_panel_progress(&mut merged, &state);
             save_run(&merged);
             let outcome = outcome.unwrap_or_else(|e| {
                 eprintln!("drovr: code-review run failed: {e}");
@@ -1078,6 +1849,15 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                         "code-review: reviewers did not finish for '{task}' within timeout (re-run to resume)"
                     );
                     process::exit(2);
+                }
+                // Exit 1 with `Error`: both are "stop and fix the setup", and the
+                // pipeline's failure model already routes 1 to STOP-and-diagnose. The
+                // variants stay distinct in the type so a caller reading the outcome
+                // (rather than the exit code) can tell an empty range from a broken one;
+                // the specific diagnosis is already on stderr.
+                ReviewOutcome::EmptyRange => {
+                    eprintln!("code-review: nothing to review for '{task}' (see message above)");
+                    process::exit(1);
                 }
                 ReviewOutcome::Error => {
                     eprintln!("code-review: could not run panel for '{task}' (see message above)");
@@ -1130,13 +1910,41 @@ fn main() {
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
-        Commands::Resurrect { name } => cmd_resurrect(&name),
+        Commands::Resurrect { name } => cmd_resurrect(&herdr, &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
+        Commands::HandoffScaffold {
+            run,
+            phase_name,
+            force,
+        } => cmd_handoff_scaffold(&run, &phase_name, force),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::McpFindings { run, task, iter } => {
+            // Both reach the filesystem as path components. The panel always supplies
+            // names it has already validated, but this is a write-capable entrypoint
+            // and nothing stops it being invoked directly — so it validates its own
+            // inputs rather than trusting its only intended caller.
+            for (kind, value) in [("run name", &run), ("task", &task)] {
+                if let Err(e) = validate_label(kind, value) {
+                    eprintln!("drovr: mcp-findings: {e}");
+                    process::exit(1);
+                }
+            }
+            let angles = match config::load_config() {
+                Ok(c) => c.angles,
+                Err(e) => {
+                    eprintln!("drovr: mcp-findings could not load config: {e}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, iter, &angles) {
+                eprintln!("drovr: mcp-findings failed: {e}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -1177,27 +1985,81 @@ mod tests {
         tmp
     }
 
+    #[test]
+    fn the_panel_merge_carries_retired_panes_not_just_review_phases() {
+        // `retired_panes` is what tells `drovr cleanup` a pane is drovr's. Since
+        // main's `8173f03`, cleanup closes only panes it can prove it opened and
+        // leaves everything else standing as the human's — so a pane that is
+        // dropped from `review_phases` but never lands in `retired_panes` is
+        // immortal, and blocks `workspace_close` for the whole run.
+        //
+        // The resume path retires a replaced reviewer's pane immediately before
+        // `spawn_reviewer`, which can then fail — so the retirement exists only
+        // in the panel's in-memory copy when this merge runs. Transplanting just
+        // `review_phases` dropped it on exactly that path.
+        let mut on_disk = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![run::Phase::new("plan")],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec!["w:earlier".into()],
+        };
+        // What the panel held when it failed: a respawned reviewer registered,
+        // the replaced one's pane retired — neither of them saved.
+        let mut panel = on_disk.clone();
+        panel.review_phases = vec![run::Phase::new("review:task-1:1:correctness")];
+        panel.retire_pane("w:replaced");
+
+        merge_panel_progress(&mut on_disk, &panel);
+
+        assert_eq!(on_disk.review_phases.len(), 1, "reviewers come across");
+        assert!(
+            on_disk.retired_panes.contains(&"w:replaced".to_string()),
+            "and so does the retirement, or that pane is immortal: {:?}",
+            on_disk.retired_panes
+        );
+        assert!(
+            on_disk.retired_panes.contains(&"w:earlier".to_string()),
+            "unioned, not assigned — a retirement the panel never saw must survive"
+        );
+        // Pipeline phases are deliberately NOT transplanted: the panel's snapshot
+        // is minutes old and would resurrect a status a re-entry has since cleared.
+        assert_eq!(on_disk.phases.len(), 1);
+    }
+
     /// A saved run in workspace `wAC` whose recorded drovr panes are `wAC:p1`
     /// (the brainstorm phase, mid-flight) and `wAC:p2` (a reviewer). No worktree,
     /// so `cmd_cleanup` runs to completion instead of exiting on the prune path.
-    #[cfg(test)]
     fn seed_paned_run(name: &str) -> RunState {
         let run = RunState {
             name: name.into(),
             task: "t".into(),
             agent: None,
-            phases: vec![run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("wAC:p1".into()),
-                ..Default::default()
-            }],
-            review_phases: vec![run::Phase {
-                name: "review:brainstorm:1:correctness".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("wAC:p2".into()),
-                ..Default::default()
-            }],
+            phases: vec![
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAC:p1"),
+            ],
+            review_phases: vec![
+                {
+                    let mut p = run::Phase::new("review:brainstorm:1:correctness");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAC:p2"),
+            ],
             gate: "spec".into(),
             cursor: 0,
             workspace: Some("wAC".into()),
@@ -1212,62 +2074,138 @@ mod tests {
         run
     }
 
-    /// The workspace drovr created for a run is still the human's to use — they
-    /// open their own shell or editor tab in it while the run works. Cleanup must
-    /// reap only the panes drovr created and leave that workspace standing;
-    /// `workspace_close` would take the human's panes down with it.
-    #[test]
-    fn transplant_carries_retired_panes_not_just_review_phases() {
-        use crate::run::Phase;
+    // -- resurrect --------------------------------------------------------------
 
-        // What `code_review_run` leaves in memory when replacing a wedged reviewer
-        // and the respawn then fails: the old pane is retired, and the function
-        // returns Err without ever saving.
-        let mut snapshot = RunState {
-            name: "r".into(),
+    /// A run whose workspace is gone, mid-flight at `implement`.
+    #[cfg(test)]
+    fn seed_workspaceless_run(name: &str) -> RunState {
+        let run = RunState {
+            name: name.into(),
             task: "t".into(),
             agent: None,
-            phases: vec![],
-            review_phases: vec![Phase::new("review:task-1:1:correctness")],
+            phases: vec![
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Done;
+                    p
+                },
+                {
+                    let mut p = run::Phase::new("implement");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAG:p1"),
+            ],
+            review_phases: vec![],
             gate: "spec".into(),
             cursor: 0,
-            workspace: None,
+            workspace: Some("wAG".into()),
             root_pane: None,
-            project_dir: String::new(),
+            project_dir: "/tmp/p".into(),
             worktree_path: None,
             worktree_branch: None,
             archived: false,
             retired_panes: vec![],
         };
-        snapshot.retire_pane("w:p2");
-
-        let mut fresh = snapshot.clone();
-        fresh.review_phases.clear();
-        fresh.retired_panes.clear();
-        // A retirement recorded by someone else while the pass ran.
-        fresh.retire_pane("w:p7");
-
-        transplant_review_progress(&mut fresh, &snapshot);
-
-        assert_eq!(
-            fresh.review_phases.len(),
-            1,
-            "the panel's reviewer phases must land"
-        );
-        assert!(
-            fresh.retired_panes.contains(&"w:p2".to_string()),
-            "a pane retired during the pass must survive — one drovr created but \
-             never recorded is one `cleanup` treats as the human's, so it is never \
-             closed and can keep the whole workspace open: {:?}",
-            fresh.retired_panes
-        );
-        assert!(
-            fresh.retired_panes.contains(&"w:p7".to_string()),
-            "and a retirement this snapshot predates must not be overwritten: {:?}",
-            fresh.retired_panes
-        );
+        run.save().expect("seed run");
+        run
     }
 
+    /// `resurrect`'s help says it "reloads a stopped run and reports the resume
+    /// point". It used to print `To resume: drovr phase start …` having restored
+    /// nothing at all, so the resume it advertised failed on the next command —
+    /// worse than an error, because it reads as success.
+    #[test]
+    fn resurrect_restores_the_workspace_it_advertises_a_resume_into() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-restores");
+        let mut run = seed_workspaceless_run("lost-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).expect("resurrect must restore or refuse");
+
+        assert!(
+            fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "resurrect must actually restore the workspace: {:?}",
+            fake.calls()
+        );
+        assert_ne!(
+            RunState::load("lost-ws").unwrap().workspace.as_deref(),
+            Some("wAG"),
+            "and persist the new one, or the next command hits the same dead id"
+        );
+        assert!(
+            report.contains("To resume: drovr phase start"),
+            "having restored it, it may say how to resume: {report}"
+        );
+        assert!(
+            report.contains("implement"),
+            "the phase whose agent died is where you resume: {report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The other half of "restore what you advertise, or refuse and say why".
+    #[test]
+    fn resurrect_that_cannot_restore_refuses_instead_of_advertising_a_resume() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-refuses");
+        let mut run = seed_workspaceless_run("unfixable-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+        fake.fail_workspace_create();
+
+        let err = resurrect_report(&fake, &mut run)
+            .expect_err("a resume it cannot deliver must be an error, not a printout");
+        assert!(
+            !err.to_string().contains("To resume"),
+            "it must not smuggle the resume instruction into the failure: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A finished run needs no workspace, and resurrect must not create one just
+    /// to tell you there is nothing to do.
+    #[test]
+    fn resurrect_of_a_finished_run_provisions_nothing() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-complete");
+        let mut run = seed_workspaceless_run("done-ws");
+        for p in run.phases.iter_mut() {
+            p.status = PhaseStatus::Done;
+        }
+        run.save().unwrap();
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).unwrap();
+
+        assert!(report.contains("fully complete"), "{report}");
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "no workspace is needed to say a run is finished: {:?}",
+            fake.calls()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The workspace drovr created for a run is still the human's to use — they
+    /// open their own shell or editor tab in it while the run works. Cleanup must
+    /// reap only the panes drovr created and leave that workspace standing;
+    /// `workspace_close` would take the human's panes down with it.
     #[test]
     fn cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create() {
         use crate::herdr::FakeHerdr;
@@ -1428,34 +2366,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The set of panes drovr owns: every phase pane, every reviewer pane, and
-    /// `root_pane` when no phase ever claimed it (a run cleaned up before its
-    /// first `phase start` — nothing else records that pane).
+    /// The set of panes drovr owns: `root_pane` (which no phase ever claims, so
+    /// it is always drovr's to reclaim), every phase pane, and every reviewer
+    /// pane.
     #[test]
-    fn drovr_pane_ids_covers_phases_reviewers_and_an_unclaimed_root() {
+    fn drovr_pane_ids_covers_phases_reviewers_and_the_root_shell() {
         let mut run = RunState {
             name: "r".into(),
             task: "t".into(),
             agent: None,
             phases: vec![
-                run::Phase {
-                    name: "brainstorm".into(),
-                    status: PhaseStatus::Done,
-                    pane_id: Some("w:p1".into()),
-                    ..Default::default()
-                },
-                run::Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    ..Default::default()
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Done;
+                    p
+                }
+                .with_pane("w:p1"),
+                {
+                    let mut p = run::Phase::new("plan");
+                    p.status = PhaseStatus::Pending;
+                    p
                 },
             ],
-            review_phases: vec![run::Phase {
-                name: "review:plan:1:correctness".into(),
-                status: PhaseStatus::Running,
-                pane_id: Some("w:p2".into()),
-                ..Default::default()
-            }],
+            review_phases: vec![
+                {
+                    let mut p = run::Phase::new("review:plan:1:correctness");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("w:p2"),
+            ],
             gate: "spec".into(),
             cursor: 0,
             workspace: Some("w".into()),
@@ -1474,11 +2414,390 @@ mod tests {
         assert_eq!(drovr_pane_ids(&run), vec!["w:root", "w:p1", "w:p2", "w:p0"]);
         run.retired_panes = vec![];
 
-        // Once a phase claims the root pane, `root_pane` is cleared and the phase
-        // carries the id — it must appear exactly once either way.
+        // A `state.json` written by an older build, where the first phase DID
+        // claim the root pane: the id must still appear exactly once.
         run.root_pane = None;
-        run.phases[1].pane_id = Some("w:root".into());
+        run.phases[1].set_pane("w:root");
         assert_eq!(drovr_pane_ids(&run), vec!["w:p1", "w:root", "w:p2"]);
+    }
+
+    /// A `RunState` carrying just the fields `attach_target` reads.
+    fn attach_run(phases: Vec<(&str, PhaseStatus, Option<&str>)>, root: Option<&str>) -> RunState {
+        RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: phases
+                .into_iter()
+                .map(|(name, status, pane)| {
+                    let mut p = run::Phase::new(name);
+                    p.status = status;
+                    if let Some(pane) = pane {
+                        p.set_pane(pane);
+                    }
+                    p
+                })
+                .collect(),
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: root.map(str::to_owned),
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        }
+    }
+
+    /// What `drovr attach` connects to, in preference order — and why the last
+    /// two rungs exist: once phases are reaped, a finished run holds no phase
+    /// pane at all, and exiting 1 on the human's "show me this run" is a worse
+    /// answer than the workspace's idle shell.
+    #[test]
+    fn attach_prefers_the_current_phase_then_reports_the_root_shell() {
+        use PhaseStatus::{Done, Running};
+
+        // The phase actually being worked wins, even though a later one has a pane.
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Running, Some("w:p2")),
+                ("review", PhaseStatus::Pending, Some("w:p3")),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::Phase {
+                phase: "implement",
+                pane: "w:p2"
+            })
+        ));
+
+        // All done → no current phase, so no phase target. It must NOT offer
+        // the last pane it can find: under reaping those are the panes that get
+        // closed, and a finished run's stale pane is not its current state.
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Done, Some("w:p2")),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+
+        // Same when the current phase simply has no pane yet: an EARLIER
+        // phase's pane is not an answer to "attach me to this run".
+        let run = attach_run(
+            vec![
+                ("brainstorm", Done, Some("w:p1")),
+                ("implement", Running, None),
+            ],
+            Some("w:root"),
+        );
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+
+        // No phase pane anywhere → the run's idle root shell, reported as such
+        // so `attach_plan` can refuse it by name rather than attaching to it.
+        let run = attach_run(vec![("brainstorm", Done, None)], Some("w:root"));
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+
+        // Nothing at all (a run whose workspace creation failed) → None.
+        let run = attach_run(vec![("brainstorm", Done, None)], None);
+        assert!(attach_target(&run).is_none());
+
+        // No phases at all — the shape a caller that recovered from an
+        // unreadable `state.json` holds, where `first_incomplete()` is vacuously
+        // `None`. The root shell rung must still answer, and must not panic.
+        let run = attach_run(vec![], Some("w:root"));
+        assert!(matches!(
+            attach_target(&run),
+            Some(AttachTarget::RootShell { pane: "w:root" })
+        ));
+        let run = attach_run(vec![], None);
+        assert!(attach_target(&run).is_none());
+    }
+
+    /// The root-shell rung must never end in `herdr agent attach`.
+    ///
+    /// This is the test whose absence let that ship: `attach_target` was unit
+    /// tested, but nothing walked the decision `cmd_attach` makes *with* the
+    /// target it gets back, so "fall back to the root shell" and "attach to an
+    /// agent" could contradict each other undetected. `herdr agent attach`
+    /// requires an attached agent and the root shell has none — there is no
+    /// `herdr pane attach` to fall back to — so the honest answer is a refusal
+    /// that says what is actually true.
+    #[test]
+    fn attach_refuses_the_root_shell_instead_of_attaching_to_a_nonexistent_agent() {
+        use PhaseStatus::{Done, Running};
+
+        // A live phase pane is the one case that really attaches.
+        let run = attach_run(vec![("implement", Running, Some("w:p2"))], Some("w:root"));
+        match attach_plan(&run, "r") {
+            AttachPlan::AttachAgent { phase, pane } => {
+                assert_eq!(phase, "implement");
+                assert_eq!(pane, "w:p2");
+            }
+            AttachPlan::Refuse(msg) => panic!("a live phase pane must attach, got: {msg}"),
+        }
+
+        // No phase pane, but the workspace and its idle shell are still there.
+        // Distinctive ids, so asserting they appear is not satisfied by the
+        // surrounding prose — the fixture's default `"w"` is a substring of
+        // "workspace" and would make the check vacuous.
+        let mut run = attach_run(vec![("brainstorm", Done, None)], Some("ws-77:root"));
+        run.workspace = Some("ws-77".into());
+        let msg = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { pane, .. } => {
+                panic!("the root shell has no agent to attach to, but got pane {pane}")
+            }
+        };
+        assert!(
+            msg.contains("no live agent pane"),
+            "must say plainly that there is no agent: {msg}"
+        );
+        assert!(
+            msg.contains("ws-77") && !msg.contains("(unknown)"),
+            "must name the REAL workspace so the user can go there themselves: {msg}"
+        );
+        assert!(
+            msg.contains("ws-77:root"),
+            "must name the idle shell it is refusing, not just describe one: {msg}"
+        );
+        assert!(
+            msg.contains("drovr phase start"),
+            "must say what to do next: {msg}"
+        );
+
+        // No workspace at all — a distinct situation, and a distinct message:
+        // there is no idle shell to point the user at.
+        let run = attach_run(vec![("brainstorm", Done, None)], None);
+        let bare = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { .. } => panic!("nothing exists to attach to"),
+        };
+        assert!(
+            bare.contains("no live agent pane"),
+            "must say plainly that there is no agent: {bare}"
+        );
+        assert_ne!(
+            bare, msg,
+            "a run with no workspace must not be described as if it had an idle shell"
+        );
+
+        // Nothing in this run was reaped, so neither refusal may advertise a
+        // rehydrate: `phase_rehydrate` would refuse a phase that never had its
+        // pane closed, and a refusal must not send the user at a second error.
+        for m in [&msg, &bare] {
+            assert!(
+                !m.contains("rehydrate"),
+                "nothing is reaped here, so nothing to bring back: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_rehydrate_never_reports_as_success() {
+        use phase::RehydrateOutcome::*;
+        // The failure class `docs/known-issues.md` keeps recording: a driver
+        // reads an exit code as success and carries on. A rehydrate that
+        // brought the pane back without CONFIRMING the agent has its context is
+        // NOT success — a `phase wait` after it may block on an agent nobody
+        // told what to do. Not confirmed is deliberately weaker than "did not
+        // get it": `ResumeUnobserved` is an agent that may be perfectly resumed,
+        // which is why `Unfinished` is five variants and not a bool. Assert the
+        // code AND the stream: a driver reads one, a human the other.
+        let done = rehydrate_report("r", "plan", &Resumed);
+        assert_eq!(done.code, 0);
+        assert!(!done.to_stderr);
+        assert!(done.line.contains("resumed with its recorded session"), "{done:?}");
+
+        let seeded = rehydrate_report("r", "plan", &Reseeded);
+        assert_eq!(seeded.code, 0, "a reseeded agent DID get its context");
+        assert!(!seeded.to_stderr);
+
+        let partial = rehydrate_report(
+            "r",
+            "plan",
+            &Incomplete(crate::phase::Unfinished::NeverReady {
+                pane: "w:p1".into(),
+                waited: std::time::Duration::from_secs(30),
+                resuming: false,
+                had_seed: true,
+            }),
+        );
+        assert_eq!(
+            partial.code, 2,
+            "the pane is back but the agent was never told what it is doing: {partial:?}"
+        );
+        assert!(partial.to_stderr, "{partial:?}");
+        assert!(partial.line.contains("INCOMPLETE"), "{partial:?}");
+        assert!(partial.line.contains("Its seed was NOT re-sent"), "{partial:?}");
+    }
+
+    /// The same split as `rehydrate_report`, and the same failure class it
+    /// exists to close: a driver reads an exit code as success and carries on.
+    #[test]
+    fn a_reap_that_left_the_pane_standing_is_not_reported_as_success() {
+        let closed = reap_report(
+            "r",
+            "plan",
+            &ReapOutcome::Closed {
+                pane: "w:p1".into(),
+            },
+        );
+        assert_eq!(closed.code, 0);
+        assert!(!closed.to_stderr);
+        assert!(
+            closed.line.contains("drovr phase rehydrate"),
+            "a closed pane is recoverable, and the message should say how: {closed:?}"
+        );
+
+        // The stuck-registration repair. Also a success — the phase no longer
+        // records a pane, which is exactly what was asked for.
+        let cleared = reap_report(
+            "r",
+            "plan",
+            &ReapOutcome::Cleared {
+                pane: "w:p1".into(),
+            },
+        );
+        assert_eq!(cleared.code, 0);
+        assert!(!cleared.to_stderr);
+
+        // Idempotence has to be a success, or re-running a reap that already
+        // worked reports failure for the state it produced.
+        let nothing = reap_report("r", "plan", &ReapOutcome::NothingToReap);
+        assert_eq!(nothing.code, 0);
+        assert!(!nothing.to_stderr);
+
+        // ⚠️ The one that is not. The pane is still there and the phase still
+        // holds it — a driver that read this as 0 would believe the run had
+        // moved on from a pane that is still occupying the user's herdr.
+        for why in [
+            PaneKept::CloseFailed("herdr said no".into()),
+            PaneKept::Unreadable,
+        ] {
+            let kept = reap_report(
+                "r",
+                "plan",
+                &ReapOutcome::Kept {
+                    pane: "w:p1".into(),
+                    why,
+                },
+            );
+            assert_eq!(kept.code, 2, "{kept:?}");
+            assert!(kept.to_stderr, "{kept:?}");
+            assert!(kept.line.contains("w:p1"), "{kept:?}");
+            assert!(
+                kept.line.contains("drovr cleanup"),
+                "a pane drovr could not take is one cleanup still will: {kept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_offers_a_rehydrate_when_a_phase_was_reaped() {
+        // The counterpart to the assertion above: once a pane HAS been closed,
+        // the refusal has somewhere to send the user.
+        use crate::run::PhaseStatus::Done;
+        let mut run = attach_run(vec![("brainstorm", Done, None), ("plan", Done, None)], Some("ws-77:root"));
+        run.workspace = Some("ws-77".into());
+        // BOTH reaped, so "picks the last" is a real assertion rather than
+        // "picks the only one" — the run has moved past brainstorm, and that is
+        // the phase a human losing their pane is asking about.
+        run.phases[0].set_pane("ws-77:p1");
+        run.phases[0].mark_reaped();
+        run.phases[1].set_pane("ws-77:p9");
+        run.phases[1].mark_reaped();
+
+        let msg = match attach_plan(&run, "r") {
+            AttachPlan::Refuse(msg) => msg,
+            AttachPlan::AttachAgent { pane, .. } => panic!("a reaped phase has no pane: {pane}"),
+        };
+        assert!(
+            msg.contains("drovr phase rehydrate 'r' 'plan'"),
+            "must name the run AND the phase, ready to paste: {msg}"
+        );
+        // The LAST reaped phase, not the first — both are reaped, and `plan` is
+        // where the run got to.
+        assert!(!msg.contains("'brainstorm'"), "{msg}");
+        // It is an addition, not a replacement — starting a new phase is still
+        // the answer for someone who does not want the old one back.
+        assert!(msg.contains("drovr phase start"), "{msg}");
+    }
+
+    /// `drovr new` labels the workspace's root shell so the idle tab explains
+    /// itself, and a failed rename is cosmetic — it must never cost the run its
+    /// workspace.
+    #[test]
+    fn new_labels_the_idle_root_shell_and_survives_a_failed_rename() {
+        use crate::herdr::FakeHerdr;
+
+        let h = FakeHerdr::new();
+        let ws = create_run_workspace(&h, "alpha", "/tmp/p").expect("workspace must be created");
+        let root = ws.root_pane.clone();
+        let calls = h.calls();
+        let rename = calls
+            .iter()
+            .find(|c| c.contains("pane_rename"))
+            .expect("the root shell must be renamed");
+        assert!(
+            rename.contains(&format!("pane={root}")),
+            "the RUN's root pane is what gets renamed: {rename}"
+        );
+        assert!(
+            rename.contains("alpha") && rename.to_lowercase().contains("idle"),
+            "the label must name the run and say the shell is idle: {rename}"
+        );
+
+        // `pane_rename` has no `--no-focus` flag, and `workspace_create` is
+        // called with `focus: false` precisely so `drovr new` never disturbs the
+        // user. Renaming without capture/restore would undo that one call later,
+        // yanking the user onto a brand-new idle workspace.
+        let idx = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle}: {calls:?}"))
+        };
+        assert!(
+            idx("focused_workspace") < idx("pane_rename"),
+            "focus must be captured before the rename: {calls:?}"
+        );
+        assert!(
+            idx("pane_rename") < idx("workspace_focus id=ws-focused"),
+            "focus must be restored after the rename: {calls:?}"
+        );
+
+        let h = FakeHerdr::new();
+        h.fail_pane_rename();
+        assert!(
+            create_run_workspace(&h, "beta", "/tmp/p").is_some(),
+            "a cosmetic rename failure must not discard the workspace"
+        );
+
+        // Same for a focus restore that fails: it is reported, not fatal. The
+        // run must not lose the workspace it just created over where the user
+        // happens to be looking.
+        let h = FakeHerdr::new();
+        h.fail_workspace_focus();
+        assert!(
+            create_run_workspace(&h, "gamma", "/tmp/p").is_some(),
+            "a failed focus restore must not discard the workspace"
+        );
     }
 
     /// `drovr cleanup` must leave the run marked archived. Without it the session
@@ -1626,6 +2945,7 @@ mod tests {
                         run,
                         phase_name,
                         seed,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -1771,6 +3091,7 @@ mod tests {
                         task,
                         timeout_ms,
                         fresh,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -1784,6 +3105,147 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `--context` and `--context-file` are alternatives, not a pair. clap enforces
+    /// it, so a driver cannot supply two different contexts and leave drovr guessing.
+    /// A brief is composed by default now; `--no-brief` is the explicit opt-out, and
+    /// `--context` is the only part of the brief a driver supplies.
+    #[test]
+    fn parse_phase_start_context_and_no_brief() {
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "implement-task-2",
+            "--context",
+            "task brief from plan.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start {
+                    context, no_brief, ..
+                },
+            } => {
+                assert_eq!(context.as_deref(), Some("task brief from plan.md"));
+                assert!(!no_brief, "briefing is the default");
+            }
+            _ => panic!("wrong variant"),
+        }
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "verify-land",
+            "--no-brief",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start { no_brief, .. },
+            } => assert!(no_brief),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "phase",
+                "start",
+                "myrun",
+                "plan",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_phase_brief() {
+        let cli = parse(&["drovr", "phase", "brief", "myrun", "plan"]).unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Brief {
+                    run, phase_name, ..
+                },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(phase_name, "plan");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_code_review_context_args_are_mutually_exclusive() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "run",
+            "myrun",
+            "task-1",
+            "--context",
+            "the retry loop is new",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Run { context, .. },
+            } => assert_eq!(context.as_deref(), Some("the retry loop is new")),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "code-review",
+                "run",
+                "myrun",
+                "task-1",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected, not silently resolved"
+        );
+    }
+
+    #[test]
+    fn parse_code_review_brief() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "brief",
+            "myrun",
+            "task-1",
+            "--angle",
+            "security",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub:
+                    CodeReviewCmd::Brief {
+                        run, task, angle, ..
+                    },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(task, "task-1");
+                assert_eq!(angle, "security");
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&["drovr", "code-review", "brief", "myrun", "task-1"]).is_err(),
+            "an angle-less brief has no frame to compose"
+        );
     }
 
     #[test]
@@ -1867,6 +3329,31 @@ mod tests {
         assert!(validate_label("task", "").is_err());
     }
 
+    /// `mcp-findings` turns `run` and `task` into path components, and it is the one
+    /// write-capable entrypoint drovr exposes. It is spawned by the panel with names
+    /// already validated, but nothing stops it being invoked directly, so it must
+    /// enforce the same rule rather than inherit it from its intended caller.
+    #[test]
+    fn mcp_findings_run_and_task_are_the_labels_the_dispatch_validates() {
+        let cmd = Cli::parse_from(["drovr", "mcp-findings", "../escape", "task-1", "2"]);
+        let Commands::McpFindings { run, task, iter } = cmd.command else {
+            panic!("expected McpFindings");
+        };
+        assert_eq!(iter, 2, "the iteration scopes the findings file");
+        // Exactly the checks the dispatch arm applies before serving.
+        assert!(
+            validate_label("run name", &run).is_err(),
+            "a traversing run name must be refused"
+        );
+        assert!(validate_label("task", &task).is_ok());
+        for bad in ["../escape", "a/b", ".."] {
+            assert!(
+                validate_label("task", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
     // -- format_progress helper -------------------------------------------------
 
     #[test]
@@ -1878,10 +3365,10 @@ mod tests {
             phases: vec![run::Phase::new("brainstorm"), run::Phase::new("plan")],
             // A populated review_phases list must not shift the "0/2" progress or
             // the "current" phase — format_progress walks `phases` only.
-            review_phases: vec![run::Phase {
-                name: "review:task-1:1:correctness".into(),
-                status: PhaseStatus::Running,
-                ..Default::default()
+            review_phases: vec![{
+                let mut p = run::Phase::new("review:task-1:1:correctness");
+                p.status = PhaseStatus::Running;
+                p
             }],
             gate: "spec".into(),
             cursor: 0,
@@ -1904,10 +3391,10 @@ mod tests {
             name: "r".into(),
             task: "t".into(),
             agent: None,
-            phases: vec![run::Phase {
-                name: "brainstorm".into(),
-                status: PhaseStatus::Done,
-                ..Default::default()
+            phases: vec![{
+                let mut p = run::Phase::new("brainstorm");
+                p.status = PhaseStatus::Done;
+                p
             }],
             review_phases: vec![],
             gate: "spec".into(),

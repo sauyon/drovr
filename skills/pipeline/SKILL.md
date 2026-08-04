@@ -12,10 +12,10 @@ Pipeline drives a full run through four phases — **brainstorm → plan → imp
 the reviewer must approve `spec.md` before any code is written. Everything after the gate
 runs unattended unless a phase fails.
 
-**REQUIRED SUB-SKILL:** every boundary uses `drovr:handoff` (start → inject → wait →
-collect; the phase agent authors its own handoff before `phase done`). This skill does not
-repeat those mechanics — read it first. Injecting
-each phase's briefing is **your** job; the CLI spawns a plain `claude` and seeds nothing.
+**REQUIRED SUB-SKILL:** every boundary uses `drovr:handoff` (start → wait → collect; the
+phase agent authors its own handoff before `phase done`). This skill does not repeat those
+mechanics — read it first. drovr composes each phase's briefing and injects it at
+`phase start`; your job is the `--context` it cannot know.
 
 You are the **driver** (single writer of the orchestration). The phase agents are the
 single writers of their own artifacts. Read-only fan-out goes to explorers, never to
@@ -106,7 +106,9 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
-   `{turn, decision, feedback, answers, annotations}`. Forward it to the agent:
+   `{turn, decision, feedback, answers, annotations}`. An empty `feedback` does not mean an empty
+   turn — the reviewer may have said everything in `annotations` (per-line comments on the spec).
+   Forward it to the agent:
    ```
    drovr phase send <run> brainstorm "Reviewer requested changes (see feedback.json). Revise spec.md, then run: drovr review summary <run> \"<what changed>\""
    ```
@@ -120,6 +122,14 @@ If a reviewer submits **before** the agent's first `drovr review summary`, the s
 straight `idle → waiting` — unusual but possible. It self-heals: the agent's next
 `drovr review summary` still flips it to `ready`.
 
+**The panel's two roles (below) do not apply here — this gate already has them, in the
+machine.** The adjudicator is the human, who is by construction not the spec's author, and the
+`approved` marker is written by the *server* on the reviewer's action — the agent's own move is
+to post a summary, not to decide. Nothing to separate, and no doc rule needed: the state
+machine is the separation. (It is not a security boundary — the server has no auth and an agent
+with a shell can forge the marker. It is enough against the failure this entry is about, which
+is an honest agent adjudicating itself by accident.)
+
 ## The implement loop
 
 `plan.md` lists tasks with per-task interfaces. Run **each task as its own fresh phase** so
@@ -127,10 +137,12 @@ context stays clean — do not reuse one long-lived agent:
 
 ```
 for each task N in plan.md:
-    drovr phase start <run> implement-task-<N> --seed <run_dir>/plan-HANDOFF.md
-    drovr phase send  <run> implement-task-<N>  "<phase-prompts/implement-task.md>
-                                                 + task N brief
-                                                 + accumulated interfaces so far"
+    drovr phase start <run> implement-task-<N> --context-file <ctx>   # composes the
+                                                 # brief from phase-prompts/implement-task.md
+                                                 # and injects it. <ctx> = task N brief from
+                                                 # plan.md + accumulated interfaces so far.
+                                                 # You never write the frame; inspect it with
+                                                 # `drovr phase brief <run> implement-task-<N>`
     drovr phase wait  <run> implement-task-<N> --timeout-ms 3600000   # BACKGROUND it, then
                                                                       # end the turn
     # No separate compress step: the task agent authored implement-task-<N>-HANDOFF.md
@@ -146,11 +158,21 @@ harness wake you with the exit code. **Do no work of your own while it runs** �
 single-writer rule, and it is the reason to go idle rather than the reason to foreground.
 
 **Fold interfaces forward:** each task's handoff carries the interfaces it introduced;
-include those in the next task's injected briefing so later tasks bind to real signatures.
+pass those as the next task's `--context` so later tasks bind to real signatures.
 `drovr phase start` appends any unseen phase name, so `implement-task-<N>` phases are created
 on demand alongside the four seeded phases.
 
 ### Review each task until clean — driver-run panel
+
+**Two roles, one gate.** Anyone may RUN the panel, as often as they like —
+it is a test suite. Only the **driver's** run is the **gate**: a clean
+verdict on a panel you ran yourself is evidence, never permission to
+report done.
+
+Both roles use the same command and drovr cannot tell them apart, so the separation is
+yours to keep: run your own panel after every task, no matter what the task report says
+its own panels found. See `docs/known-issues.md` for the run where the author's fifth panel
+came back clean and the driver's sixth, on the identical commit, did not.
 
 After a task's `drovr phase wait` returns done (so the agent has already authored its
 handoff), and **before** starting the next task, the **driver** runs the automatic review
@@ -160,7 +182,8 @@ writing any code, so `HEAD` is the pre-task SHA. Then the driver runs the blocki
 branches on its exit code:
 
 ```
-drovr code-review run <run> task-<N>          # blocking; spawns one reviewer per angle.
+drovr code-review run <run> task-<N> --context "<what this task changed>"
+                                              # blocking; spawns one reviewer per angle.
                                               # BACKGROUND it and end the turn — the panel
                                               # runs well past the 600 000 ms foreground cap.
 case $? in
@@ -169,7 +192,12 @@ case $? in
   2)  # timeout — reviewers are slow, not broken. Re-run the SAME command: it resumes
       #   the panel in flight, banks the angles already in, waits only on stragglers.
       #   Loop on 2 as freely as on 3. Never add --fresh to "unstick" it.
-  1)  # error — STOP and diagnose (see Failure model)
+  1)  # error — STOP and diagnose (see Failure model). One cause is specific and the
+      #   message names it: an EMPTY RANGE — `base..head` contains no change, usually
+      #   because the task committed nothing since `code-review base`. The panel refuses
+      #   rather than returning the clean verdict it used to. Do not re-run it — send the
+      #   task agent back to commit its work, or re-record the base if it was recorded
+      #   too late.
 esac
 ```
 
@@ -182,10 +210,40 @@ drovr code-review run <run> task-<N>                             # re-run the pa
 ```
 
 Re-entry needs **no `drovr phase start`**: `drovr phase done` only writes a marker — it never
-closes the pane (panes live until `drovr cleanup`), so the task's agent is still alive and
-`drovr phase send` reaches it directly. The agent drops a fresh `drovr phase done` marker when
-it finishes the fix, which the following `phase wait` sees. `phase send` clears the previous
-iteration's completion first, so that wait really does wait.
+closes the pane, so the task's agent is still alive and `drovr phase send` reaches it directly.
+The agent drops a fresh `drovr phase done` marker when it finishes the fix, which the following
+`phase wait` sees. `phase send` clears the previous iteration's completion first, so that wait
+really does wait.
+
+**⚠️ The pane outlives `phase done` — it does NOT outlive the next `phase start`.** With
+`reap_finished_panes` on (the default), `drovr phase start <run> <anything>` closes the pane of
+every *other* `Done` phase once its own launch succeeds. Supersession is exactly what reaping is
+triggered by, and starting the next phase is what supersedes this one. So:
+
+> **While you still intend to `phase send` back into task N, do not start any other phase.**
+> Finish the implement↔review loop for task N — clean panel — *then* start task N+1.
+
+Running the panel is safe: `drovr code-review run` reaps its own reviewers, never the
+implementer. Only `drovr phase start` touches the task's pane.
+
+Get the order wrong and the send **fails** rather than landing somewhere wrong, and the message
+names the way back:
+
+```
+drovr phase rehydrate <run> implement-task-<N>   # brings the pane back, then re-send
+```
+
+Rehydrate resumes that agent's own session where the backend offers one. **Exit 0 = the agent
+has its context back. Exit 2 = the pane is back but the agent was NOT CONFIRMED to have its
+context** — never read that as success, and never assume the context is gone either. Exit 2 is
+five different states, and **stderr names which one**: the agent never reported ready · it came
+up carrying a *different* session (that pane is surrendered) · herdr never reported *any*
+session id (the pane is still there, and the agent may be perfectly resumed and merely slow to
+surface it) · a fresh agent is up with no seed to give it · the seed would not send. Read the
+note, then act on the state it names — reseeding or retrying on the third one throws away a live
+agent that was fine. When no session was recoverable at all it reseeds instead, and says so
+(exit 0): the artifacts come back, the conversation does not. Ordering is the cheap fix;
+rehydrate is the expensive one.
 
 Loop with **impact-scaled judgement** — no hardcoded floor or ceiling on iterations. Stop when
 the panel is clean *and* converged for the change's impact (a small change may need one pass; a
@@ -194,10 +252,12 @@ without the diff improving) — then surface it rather than looping forever. The
 Important **and** nits on re-entry; only critical/important block the clean gate, but a clean
 task should not ship known nits it can cheaply fix.
 
-**Single-writer invariant:** the panel is the only reviewer activity in flight, and every
-reviewer exits (drops its `drovr phase done` marker) before the implementer re-enters to fix.
-Never have a reviewer pane alive while the implementer writes — that breaks the single-writer
-rule. `code-review run` blocks until all angles finish, so the driver naturally serializes them.
+**Single-writer invariant:** every reviewer exits (drops its `drovr phase done` marker) before
+the implementer re-enters to fix. Never have a reviewer pane alive while the implementer writes
+— that breaks the single-writer rule. What keeps it is that `code-review run` **blocks** until
+all angles finish, so panels serialize against writing whoever started them: yours, because you
+wait on it before re-entering implement; an author-run one, because the task agent is parked in
+that call and not editing while its reviewers are alive.
 
 ## Self-review before a phase reports done — REQUIRED
 
@@ -215,6 +275,12 @@ is IN ADDITION to the pipeline's final review phase (step 4): self-review catche
 phase early, where they are cheap; the final review is the independent cross-check over the
 whole change.
 
+A phase agent may run the automatic panel for this self-review instead of hand-spawned
+subagents — it is the better reviewer, and running it often is good. What it must never do is
+read its own clean panel as the decision that it is done: that is the gate, and the gate is
+yours. "Its report shows the self-review happened" is a check that it reviewed and fixed, not
+a verdict you inherit — run your own panel over the same task regardless.
+
 ## Failure model — stop, don't cascade
 
 - A phase `wait` exits `1` (failed) or never leaves `2` (timeout) → **STOP**, name the phase,
@@ -222,6 +288,16 @@ whole change.
   live). Do not proceed.
 - `drovr phase done` keeps refusing (agent never authored the handoff), or `drovr collect`
   yields an empty or malformed handoff → **STOP**.
+  *One refusal is not a stop, though:* `phase done` run from a plain shell instead of from
+  inside the phase's own pane fails with `$DROVR_PASS is not set`, because the marker must
+  carry the pass token the agent was launched under. The refusal prints the exact command to
+  use; the general form is
+  ```
+  DROVR_PASS=$(jq -r '.phases[]|select(.name=="<phase>").pass' <run_dir>/state.json) \
+    drovr phase done <run> <phase>
+  ```
+  (`<run_dir>` = `~/.local/share/drovr/runs/<run>`; use `.review_phases[]` for a reviewer.)
+  The handoff must still exist — this bypasses the pane, not the contract.
 - A failed implement task **halts the loop** naming that task — later tasks depend on its
   interfaces.
 
@@ -239,6 +315,8 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | One agent for all implement tasks | One fresh phase per task; fold interfaces forward. |
 | Proceeding past a failed/empty handoff | Stop and diagnose — never seed the next phase with garbage. |
 | Skipping the review panel between tasks | Run `drovr code-review run <run> task-<N>` after each task completes; loop on exit 3. |
+| Starting task N+1 while still iterating on task N | `phase start` **reaps** every other finished phase's pane, so the `phase send` back into task N then fails. Finish N's loop first. If you already started N+1: `drovr phase rehydrate <run> implement-task-<N>`, **then re-send the findings and `phase wait` as usual** — rehydrate restores the pane, never the instruction, so on exit 0 the agent is sitting idle until you send. On exit 2 the context is NOT CONFIRMED (not that it is gone) — read stderr for which of the five states, act on that, and only then send. |
+| Accepting a task because ITS report says its own panel came back clean | Author-run panels are iteration feedback. Only your run is the gate — run it. |
 | Reviewer pane alive while the implementer fixes | `code-review run` blocks until all reviewers exit; only then re-enter implement. Single writer. |
 | Looping the panel forever on recurring findings | Impact-scaled stop: when it stops converging, surface it — don't loop. |
 | Running `phase wait` / `code-review run` in the foreground | Background them and end the turn. Foreground Bash caps at 600 000 ms, so long healthy phases report a false exit `2`. |

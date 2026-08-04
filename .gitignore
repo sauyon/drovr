@@ -2,3 +2,8 @@ target/
 .superpowers/
 cli/config.json
 result
+# drovr run worktrees, including the ones the e2e tests create under cli/
+.drovr/
+# rustc's default output name, from a bare `rustc foo.rs` — a stray one got
+# auto-committed by `drovr cleanup` (see docs/known-issues.md).
+rust_out

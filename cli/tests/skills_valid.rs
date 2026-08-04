@@ -14,7 +14,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Body-size budget (bytes) for the methodology skills.
-const BODY_BUDGET: usize = 2200;
+///
+/// Re-baselined 2200 → 2600 when `code-review` gained the "never write a reviewer's
+/// prompt, pass `drovr code-review brief` output verbatim" rule. 2200 was set when that
+/// skill's body was 2197 — three bytes of headroom — so any new rule had to be paid for
+/// by degrading an existing one, and the cap had started editing the content rather than
+/// bounding it. The point is to keep these four skills scannable, not to hold a number.
+///
+/// Re-baselined again, 2600 → 3200, for the same reason and by the same rule: pane
+/// reaping made two facts load-bearing for anyone recovering a panel — a reviewer cannot
+/// be rehydrated (its MCP findings channel does not survive a resume, so a resumed one
+/// could never deliver) and the panel reaps its own panes once findings merge, so a
+/// reviewer's reasoning is readable only before the run returns. `code-review` was at
+/// 2588 of 2600, twelve bytes of headroom, and the cap was again about to decide the
+/// content. The other three bodies are 1544–1674, so only this skill was ever near it.
+/// Largest body is now 3044; 3200 leaves room for one more rule before the next
+/// deliberate look.
+const BODY_BUDGET: usize = 3200;
 
 /// Skills subject to the body-size budget.
 const METHODOLOGY_SKILLS: &[&str] = &[

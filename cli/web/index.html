@@ -21,6 +21,7 @@
     --success: #16a34a;
     --warn-bg: #fef9c3;
     --warn-border: #ca8a04;
+    --warn-text: #854d0e;
     --ins-bg: #d1fae5;
     --del-bg: #fee2e2;
     --del-text: #991b1b;
@@ -43,6 +44,7 @@
       --success: #4ade80;
       --warn-bg: #422006;
       --warn-border: #d97706;
+      --warn-text: #fbbf24;
       --ins-bg: #064e3b;
       --del-bg: #450a0a;
       --del-text: #fca5a5;
@@ -62,6 +64,7 @@
     --success: #4ade80;
     --warn-bg: #422006;
     --warn-border: #d97706;
+    --warn-text: #fbbf24;
     --ins-bg: #064e3b;
     --del-bg: #450a0a;
     --del-text: #fca5a5;
@@ -80,6 +83,7 @@
     --success: #16a34a;
     --warn-bg: #fef9c3;
     --warn-border: #ca8a04;
+    --warn-text: #854d0e;
     --ins-bg: #d1fae5;
     --del-bg: #fee2e2;
     --del-text: #991b1b;
@@ -363,7 +367,11 @@
     font-weight: 700;
     border: none;
   }
-  .annotatable:hover .annot-trigger { opacity: 1; }
+  /* Hover alone would hide this from keyboard and touch reviewers — and since a
+     saved inline comment now stands in for the feedback box, the submit gate
+     points them here. Focus has to reveal it too. */
+  .annotatable:hover .annot-trigger,
+  .annot-trigger:focus-visible { opacity: 1; }
   .annotation-box {
     background: var(--warn-bg);
     border: 1px solid var(--warn-border);
@@ -405,6 +413,51 @@
     font-size: 0.82rem;
   }
   .saved-annot-chip .annot-comment { flex: 1; color: var(--text); }
+  /* Dropped from the payload because the line it quotes changed — dimmed and
+     tagged so it can't be mistaken for a comment that will be sent. Colour is
+     not the only signal: .annot-stranded-tag carries the reason in words. */
+  .saved-annot-chip.stranded { border-color: var(--warn-border); opacity: 0.75; }
+  .saved-annot-chip.stranded .annot-comment { text-decoration: line-through; }
+  /* --warn-text, not --warn-border: that token is tuned as a border accent and
+     only reaches 2.8:1 as text on the light background, under the 4.5:1 AA needs.
+     A tag that exists for low-vision reviewers has to be legible to them. */
+  .annot-stranded-tag {
+    color: var(--warn-text);
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .unanchored-panel {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin-bottom: 12px;
+  }
+  .unanchored-title {
+    color: var(--warn-text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .unanchored-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 0.82rem;
+    padding: 3px 0;
+  }
+  .unanchored-quote {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .unanchored-comment { flex: 1; color: var(--text); }
+  .unanchored-note { color: var(--muted); font-size: 0.78rem; margin-bottom: 6px; }
   .saved-annot-chip .annot-remove {
     cursor: pointer;
     color: var(--danger);
@@ -722,6 +775,17 @@
   .agent-node:hover { background: var(--hover, rgba(127,127,127,0.08)); }
   .agent-node.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .agent-node.no-pane { cursor: default; opacity: 0.7; }
+  /* Reaped: drovr closed this pane. Dimmer than merely pane-less, because it
+     is a phase that RAN and is now recoverable rather than one still to come. */
+  .agent-node.reaped { opacity: 0.5; }
+  .agent-node.reaped:hover { opacity: 0.85; }
+  .agent-rehydrate {
+    margin-left: auto; background: none; border: 1px solid var(--border);
+    color: var(--muted); border-radius: 4px; cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 2px 6px;
+  }
+  .agent-rehydrate:hover { color: var(--fg); border-color: var(--accent); }
+  .agent-rehydrate:disabled { cursor: progress; opacity: 0.5; }
   .agent-dot { width: 9px; height: 9px; border-radius: 50%; background: #888; flex: 0 0 auto; }
   .agent-dot.st-Running { background: #f5a623; }
   .agent-dot.st-Done { background: #3ec46d; }
@@ -730,6 +794,8 @@
   .agent-name { font-family: var(--mono); }
   .agent-angle { color: var(--muted); font-size: 0.85em; }
   .agent-children { margin-left: 18px; border-left: 1px solid var(--border); padding-left: 6px; }
+  .agents-note { margin-top: 8px; font-size: 0.88rem; color: var(--muted); }
+  .agents-note.bad { color: var(--danger); }
 
   /* ---- New session form ---- */
   .new-session-form {
@@ -899,7 +965,19 @@
        node to inspect its live session in the panel below. -->
   <div id="agents-panel" style="display:none" class="panel">
     <div class="panel-title">Agents</div>
+    <!-- Why the ⟳ buttons below may not reflect YOUR config. Owned by the
+         poller, unlike #agents-note (which reports what a click did and must
+         survive the 2s re-render), so the two never overwrite each other. -->
+    <div id="agents-config-error" class="agents-note bad" style="display:none"></div>
     <div id="agents-tree" class="agents-tree"></div>
+    <!-- What a ⟳ actually did. A rehydrate has three outcomes the human must
+         not have to guess between — the session came back, a fresh agent was
+         seeded from the handoff, or the agent was NOT CONFIRMED to have this
+         phase's context — and the last one is a 200, not an error. That last
+         one is five states rather than one (the seed is only two of them), so
+         the CLI's own note is rendered verbatim rather than summarised here.
+         Without this the tree just quietly stops showing the ⟳. -->
+    <div id="agents-note" class="agents-note" style="display:none"></div>
   </div>
 
   <div id="session-panel" style="display:none" class="panel">
@@ -943,6 +1021,12 @@
     <div id="diff-content" class="diff-content md-content"></div>
   </div>
 
+  <!-- Outside #doc-panel on purpose: that panel is hidden whenever there is no
+       spec text, which is precisely when comments can no longer be matched and
+       this list is the only place they are still visible. Nested inside, it would
+       disappear in the one case it exists for. -->
+  <div id="unanchored-annots" style="display:none"></div>
+
   <div id="doc-panel" style="display:none" class="panel">
     <div class="panel-title">Current spec</div>
     <div id="doc-content" class="md-content"></div>
@@ -984,7 +1068,7 @@
       </label>
     </div>
 
-    <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes)…"></textarea>
+    <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes, unless you left inline comments)…"></textarea>
     <div class="btn-row">
       <button class="primary" id="submit-btn" onclick="submitDecision()">Submit</button>
       <button class="danger" id="cancel-btn" onclick="cancelRun()"
@@ -1069,7 +1153,35 @@ var routeGen = 0;
 // Token.map = [startLine, endLine], both 0-indexed; we emit startLine+1 (1-based).
 var md = (function() {
   if (!window.markdownit) return null;
-  var instance = window.markdownit();
+  // linkify: specs cite sources as bare URLs far more often than as [txt](url),
+  // and markdown-it leaves bare URLs as plain text by default.
+  var instance = window.markdownit({ linkify: true });
+  // fuzzyLink off — it matches scheme-less text whose last segment is a live TLD,
+  // which in a Rust repo turns every bare `phase.rs` into http://phase.rs. Specs
+  // name source files constantly, so require an explicit scheme.
+  instance.linkify.set({ fuzzyLink: false });
+
+  // Citations open in a new tab: unsubmitted answers are read straight off the
+  // live radio buttons (collectAnswers) and an annotation draft isn't in
+  // localStorage until Save, so navigating this page away mid-review loses both.
+  // In-document fragments are left alone — they scroll, they don't navigate.
+  var origLinkOpen = instance.renderer.rules.link_open;
+  instance.renderer.rules.link_open = function(tokens, idx, options, env, self) {
+    var href = tokens[idx].attrGet('href') || '';
+    // Only links that actually leave the page get a new tab. `[t]()` renders
+    // href="" — a new tab of this same page. A `#fragment` must not get one
+    // either, but it cannot be left alone: this whole app routes off
+    // location.hash, so letting the browser follow it navigates the reviewer out
+    // of the run (parseHash finds no /runs/<name> and route() shows the session
+    // list, tearing down the form). scrollSpecFragment intercepts those instead.
+    if (href && href.charAt(0) !== '#') {
+      tokens[idx].attrSet('target', '_blank');
+      tokens[idx].attrSet('rel', 'noopener noreferrer');
+    }
+    return origLinkOpen
+      ? origLinkOpen(tokens, idx, options, env, self)
+      : self.renderToken(tokens, idx, options);
+  };
 
   // Patch renderToken to inject data-source-line on opening block tokens that have .map
   var origRenderToken = instance.renderer.renderToken.bind(instance.renderer);
@@ -1405,6 +1517,10 @@ async function refreshReview() {
 var annotations = {};
 var _annotIdSeq = 0;
 var currentTurn = 0;
+// The spec source this page is currently showing, so a saved annotation can be
+// checked against the text it was written against. Reassigned on every refresh(),
+// including to [] when the doc did not load — never left pointing at a stale run.
+var specSourceLines = [];
 
 // Persist annotations across page refreshes (incl. the loop's own reload after
 // each turn). Keyed by turn: a manual refresh mid-turn restores in-progress
@@ -1433,10 +1549,83 @@ function loadAnnotations(turn) {
     if (stored && stored.turn === turn && stored.annotations) {
       annotations = stored.annotations;
       _annotIdSeq = stored.seq || _annotIdSeq;
+      migrateCommentQuotes();
     } else if (stored && stored.turn !== turn) {
       localStorage.removeItem(annotKey()); // stale (new turn) — already cleared above
     }
   } catch (e) {}
+}
+
+// Comments saved before the quote moved onto the comment carry only the entry's
+// shared quote. Stamp it onto each of them at LOAD, while it still describes the
+// text they were written against — reading it lazily instead would hand them
+// whatever a later save on that line overwrote it with, silently re-anchoring a
+// stale comment to text it was never about. After this, no comment lacks a quote,
+// so nothing downstream has to fall back to a value that keeps changing.
+function migrateCommentQuotes() {
+  Object.keys(annotations).forEach(function(lineStr) {
+    var entry = annotations[lineStr];
+    if (!entry || !entry.comments) return;
+    entry.comments.forEach(function(c) {
+      if (typeof c.quote !== 'string') c.quote = entry.quote;
+    });
+  });
+}
+
+// Give every heading an id so a spec's own `[text](#a-heading)` link has something
+// to reach. markdown-it does not emit ids, so before this there was nothing to
+// scroll to even if the browser were allowed to follow the link.
+// Namespace for generated heading ids. The spec is agent-written text: a heading
+// as ordinary as `# Feedback` would otherwise put id="feedback" on an <h1>, and
+// getElementById('feedback') — which submitDecision calls to read the textarea —
+// answers with whichever comes first in the document. #doc-content precedes the
+// form, so the heading wins, `.value` is undefined, and Submit dies on
+// undefined.trim() with nothing shown to the reviewer. A prefix no static element
+// uses keeps the spec's own words from ever colliding with the page's chrome.
+var SPEC_HEADING_ID = 'spec-h-';
+// Punctuation is stripped by blacklist rather than by whitelisting \w: \w is ASCII,
+// so a CJK or accented heading would slug to nothing and collapse into `section`,
+// leaving every heading in a non-English spec unreachable by its own links.
+function slugifyHeading(text) {
+  return String(text).toLowerCase()
+    .replace(/["'`#.,:;!?()\[\]{}<>\/\\|*_~^$%&+=@]+/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+function idHeadings(container) {
+  // Every id handed out so far, not a per-base counter: "Foo","Foo","Foo 1" all
+  // want `foo-1`, and a counter hands it out twice — getElementById then answers
+  // with the first, scrolling to the wrong heading. Step the suffix until free.
+  var taken = {};
+  var hs = container.querySelectorAll('h1, h2, h3, h4, h5, h6');
+  Array.prototype.forEach.call(hs, function(h) {
+    var base = slugifyHeading(h.textContent) || 'section';
+    var id = base, n = 0;
+    while (taken[id]) { n++; id = base + '-' + n; }
+    taken[id] = true;
+    h.id = SPEC_HEADING_ID + id;
+  });
+}
+
+// Scroll to a spec heading instead of letting the browser put the fragment in
+// location.hash, which the router reads as "leave this run".
+function scrollSpecFragment(href) {
+  var raw = href.replace(/^#/, '');
+  // markdown-it percent-encodes non-ASCII in hrefs, so `[x](#設計方針)` arrives as
+  // `#%E8%A8%AD...` while the heading's id holds the characters themselves — the
+  // decoded form has to be tried or every link in a non-English spec silently
+  // scrolls nowhere. Both forms are looked up: a spec may write either. decodeURI
+  // throws on a malformed escape, which is a link to nothing, not a page error.
+  var decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch (e) {}
+  // Looked up prefixed, and confirmed to live inside the spec: a bare
+  // getElementById on reviewer-supplied text could otherwise scroll the page to a
+  // piece of app chrome that happens to share the name.
+  var doc = document.getElementById('doc-content');
+  var target = document.getElementById(SPEC_HEADING_ID + decoded) ||
+               document.getElementById(SPEC_HEADING_ID + raw);
+  if (!target || !doc || !doc.contains(target)) return;
+  if (target.scrollIntoView) target.scrollIntoView({ block: 'start' });
 }
 
 // After rendering doc content, wire up annotation triggers on each block with data-source-line
@@ -1478,7 +1667,7 @@ function wireAnnotations(container, sourceLines) {
     block.appendChild(savedEl);
 
     // Render any existing saved annotations (carried over from previous render)
-    renderSavedAnnotations(lineNum, savedEl, quote);
+    renderSavedAnnotations(lineNum, savedEl);
 
     trigger.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -1487,13 +1676,23 @@ function wireAnnotations(container, sourceLines) {
   });
 }
 
-function renderSavedAnnotations(lineNum, container, quote) {
+function renderSavedAnnotations(lineNum, container) {
   container.innerHTML = '';
   var entry = annotations[lineNum];
   if (!entry || !entry.comments.length) return;
+  // collectAnnotations drops a comment whose line no longer reads the way it did
+  // when it was saved. Left unmarked, it would sit on screen looking submitted and
+  // be silently absent from the turn — worst on approve, or with feedback typed,
+  // where the submit gate never runs and says nothing. Judged per comment: one
+  // line can hold both a stale comment and a fresh one written after a revision.
   entry.comments.forEach(function(c) {
+    var stranded = !commentIsAnchored(lineNum, entry, c);
     var chip = document.createElement('div');
-    chip.className = 'saved-annot-chip';
+    chip.className = stranded ? 'saved-annot-chip stranded' : 'saved-annot-chip';
+    if (stranded) {
+      chip.title = 'The spec line this comment was written on has changed, so it ' +
+                   'will not be sent. Remove it and comment on the new text.';
+    }
     var commentEl = document.createElement('span');
     commentEl.className = 'annot-comment';
     commentEl.textContent = c.text;
@@ -1503,9 +1702,17 @@ function renderSavedAnnotations(lineNum, container, quote) {
     removeBtn.textContent = '×';
     removeBtn.addEventListener('click', function() {
       removeAnnotation(lineNum, c.id);
-      renderSavedAnnotations(lineNum, container, quote);
+      renderSavedAnnotations(lineNum, container);
     });
     chip.appendChild(commentEl);
+    // A visible tag, not just the tooltip: a title attribute is invisible to
+    // keyboard and touch reviewers, who would never learn the comment is dropped.
+    if (stranded) {
+      var tag = document.createElement('span');
+      tag.className = 'annot-stranded-tag';
+      tag.textContent = 'line changed — not sent';
+      chip.appendChild(tag);
+    }
     chip.appendChild(removeBtn);
     container.appendChild(chip);
   });
@@ -1536,10 +1743,15 @@ function openAnnotationBox(block, lineNum, quote, savedEl) {
     if (!text) return;
     _annotIdSeq++;
     if (!annotations[lineNum]) annotations[lineNum] = { quote: quote, comments: [] };
-    annotations[lineNum].quote = quote;
-    annotations[lineNum].comments.push({ id: _annotIdSeq, text: text });
+    // The quote rides on the COMMENT, not the line. Two comments can sit on one
+    // line with the spec revised in between, so a per-line quote would be whatever
+    // was saved last — overwriting it here re-anchored older comments written
+    // against text that is gone, and shipped them as if they still applied. The
+    // entry's own quote is therefore left exactly as first written and never read
+    // for anchoring; migrateCommentQuotes drains it into pre-existing comments.
+    annotations[lineNum].comments.push({ id: _annotIdSeq, text: text, quote: quote });
     saveAnnotations();
-    renderSavedAnnotations(lineNum, savedEl, quote);
+    renderSavedAnnotations(lineNum, savedEl);
     box.remove();
   });
 
@@ -1565,16 +1777,142 @@ function removeAnnotation(lineNum, id) {
   saveAnnotations();
 }
 
+// A saved annotation keeps the line number and quote it was written against, but
+// the spec underneath it can move: `review summary` re-renders the doc panel, and
+// on a re-summarised SAME turn loadAnnotations restores by turn number alone, so
+// the old anchors come back over new text. Sending the agent a change request
+// pinned to a line that no longer reads that way points it at the wrong place —
+// and since an inline comment can now be a turn's entire payload (see
+// needsWrittenFeedback), a stale one could be everything the agent receives.
+// So an annotation counts only while the line it quotes still reads the same.
+// No spec text means the anchor cannot be checked, not that it is fine: an
+// unverifiable quote is exactly what must not reach the agent as a whole turn.
+//
+// Judged per COMMENT: comments saved on one line at different times can quote
+// different text, and an entry-level check would let the newest save vouch for
+// older comments written against text that has since gone.
+// Deliberately no fallback to entry.quote: that value is shared by the line and
+// gets rewritten by later saves, so borrowing it would vouch for a comment using
+// text it was never written against. Old-shape comments get a real quote stamped
+// on at load (migrateCommentQuotes); anything still missing one is unverifiable,
+// and unverifiable must read as stranded rather than as fine.
+function commentQuote(c) {
+  return typeof c.quote === 'string' ? c.quote : null;
+}
+function commentIsAnchored(lineNum, entry, c) {
+  if (!specSourceLines.length) return false;
+  var q = commentQuote(c);
+  return q !== null && specSourceLines[lineNum - 1] === q;
+}
+function haveSpecText() { return specSourceLines.length > 0; }
+
 function collectAnnotations() {
   var result = [];
   Object.keys(annotations).forEach(function(lineStr) {
     var lineNum = parseInt(lineStr, 10);
     var entry = annotations[lineNum];
     entry.comments.forEach(function(c) {
-      result.push({ line: lineNum, quote: entry.quote, comment: c.text });
+      if (!commentIsAnchored(lineNum, entry, c)) return;
+      result.push({ line: lineNum, quote: commentQuote(c), comment: c.text });
     });
   });
   return result;
+}
+
+// Comments dropped from the payload that have no block left to be marked on. The
+// inline `.stranded` chip only reaches comments whose line still renders as a
+// block; when a revision DELETES the commented line (the most natural response to
+// "cut this"), wireAnnotations never visits that line and the chip is never drawn.
+// Without this panel the comment would disappear from the page and from the turn
+// with nothing said, which is the failure the inline marker exists to prevent.
+function renderUnanchoredPanel() {
+  var panel = document.getElementById('unanchored-annots');
+  if (!panel) return;
+  var orphans = [];
+  Object.keys(annotations).forEach(function(lineStr) {
+    var lineNum = parseInt(lineStr, 10);
+    var entry = annotations[lineNum];
+    if (!entry.comments.length) return;
+    // Rendered inline already? Then the chip carries the marker; don't say it twice.
+    if (document.getElementById('saved-annots-' + lineNum)) return;
+    entry.comments.forEach(function(c) {
+      if (commentIsAnchored(lineNum, entry, c)) return;
+      orphans.push({ line: lineNum, quote: commentQuote(c), comment: c.text, id: c.id });
+    });
+  });
+  panel.innerHTML = '';
+  if (!orphans.length) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  panel.className = 'unanchored-panel';
+  // "The line is gone" is only true when there IS a spec to be gone from. With no
+  // spec text — an absent spec.md or a failed fetch, which the server answers the
+  // same way — these comments are merely unverifiable, and saying they were deleted
+  // would talk the reviewer into discarding good work over a transient hiccup. In
+  // that state the discard buttons are withheld too: an irreversible one-click
+  // delete has no business sitting under a claim the page cannot substantiate.
+  var specKnown = haveSpecText();
+  var title = document.createElement('div');
+  title.className = 'unanchored-title';
+  title.textContent = !specKnown
+    ? (orphans.length === 1 ? '1 comment cannot be matched — the spec text is not loaded'
+                            : orphans.length + ' comments cannot be matched — the spec text is not loaded')
+    : (orphans.length === 1 ? '1 comment will not be sent — the spec line it was written on is gone'
+                            : orphans.length + ' comments will not be sent — the spec lines they were written on are gone');
+  panel.appendChild(title);
+  if (!specKnown) {
+    var note = document.createElement('div');
+    note.className = 'unanchored-note';
+    note.textContent = 'Nothing has been discarded. Reload to match them against the spec again.';
+    panel.appendChild(note);
+  }
+  orphans.forEach(function(o) {
+    var row = document.createElement('div');
+    row.className = 'unanchored-row';
+    var was = document.createElement('div');
+    was.className = 'unanchored-quote';
+    was.textContent = 'was on line ' + o.line + ': ' + o.quote;
+    var said = document.createElement('div');
+    said.className = 'unanchored-comment';
+    said.textContent = o.comment;
+    row.appendChild(was);
+    row.appendChild(said);
+    if (specKnown) {
+      var drop = document.createElement('button');
+      drop.className = 'annot-remove';
+      drop.setAttribute('type', 'button');
+      drop.textContent = '×';
+      drop.title = 'Discard this comment';
+      drop.addEventListener('click', function() {
+        removeAnnotation(o.line, o.id);
+        renderUnanchoredPanel();
+      });
+      row.appendChild(drop);
+    }
+    panel.appendChild(row);
+  });
+}
+
+// Comments the reviewer can still SEE but that collectAnnotations drops, so the
+// submit gate can say why it is refusing instead of claiming they said nothing.
+function strandedAnnotations() {
+  var n = 0;
+  Object.keys(annotations).forEach(function(lineStr) {
+    var lineNum = parseInt(lineStr, 10);
+    var entry = annotations[lineNum];
+    entry.comments.forEach(function(c) {
+      if (!commentIsAnchored(lineNum, entry, c)) n++;
+    });
+  });
+  return n;
+}
+
+// Request-changes has to tell the agent *something*, but an inline comment is
+// already that something — a reviewer who commented on the exact lines they want
+// changed shouldn't have to restate it in the box. Only saved comments count:
+// collectAnnotations is what actually reaches feedback.json, so an unsaved draft
+// sitting in a line's textarea would be feedback the agent never sees.
+function needsWrittenFeedback(feedbackVal) {
+  return !feedbackVal && !collectAnnotations().length;
 }
 
 // ---- Open questions (multiple choice) ----
@@ -1753,16 +2091,25 @@ async function refresh() {
   // leaving the last render in place showed the PREVIOUS run's spec under this
   // run's name. route() deliberately does not show this panel — visibility is
   // owned here, so the stale doc is never briefly visible on the way in either.
+  // specSourceLines is assigned OUTSIDE the `if` for the same reason one step on:
+  // fetchText collapses a 204, a non-2xx and a network failure all to '', and
+  // leaving the previous value in place would check this run's annotations against
+  // whatever ran before it — possibly a different run's spec.
+  specSourceLines = docText ? docText.split('\n') : [];
   var docContentEl = document.getElementById('doc-content');
   if (docText) {
     docContentEl.innerHTML = renderMd(docText);
-    var sourceLines = docText.split('\n');
-    wireAnnotations(docContentEl, sourceLines);
+    idHeadings(docContentEl);
+    wireAnnotations(docContentEl, specSourceLines);
     showEl('doc-panel');
   } else {
     docContentEl.innerHTML = '';
     hideEl('doc-panel');
   }
+  // Comments whose line is gone from the spec entirely have no block left to hang
+  // a marker on, so they get listed on their own — otherwise dropping them from
+  // the payload is invisible.
+  renderUnanchoredPanel();
 
   // diff panel — before→after diff of the raw markdown SOURCE (not rendered
   // HTML): unchanged lines neutral, removals red, additions green.
@@ -1860,8 +2207,21 @@ async function submitDecision(forced) {
   }
   var feedbackVal = document.getElementById('feedback').value.trim();
 
-  if (decisionVal === 'request-changes' && !feedbackVal) {
-    showError('Feedback is required when requesting changes.');
+  if (decisionVal === 'request-changes' && needsWrittenFeedback(feedbackVal)) {
+    // Distinguish the ways of having nothing to send. With comments on screen that
+    // were not counted, "you said nothing" reads as the button being broken.
+    var stranded = strandedAnnotations();
+    showError(!stranded
+      ? 'Say what to change: add feedback, or an inline comment on the spec.'
+      : haveSpecText()
+        ? 'The spec changed under your inline comments, so they no longer match the ' +
+          'lines they quote. Re-add them on the new text, or type feedback here.'
+        // Not "the spec failed to load": fetchText collapses a failed request and a
+        // genuinely empty spec.md into the same '', so naming a cause would be a
+        // guess. Say what is observable — there is no text to match against.
+        : 'There is no spec text to match your inline comments against. ' +
+          'Reload the page, or type feedback here.');
+    document.getElementById('feedback').focus();  // as blankCustomAnswer does below
     return;
   }
 
@@ -2363,14 +2723,49 @@ function selectPane(pane, name) {
 
 function agentNodeHtml(node) {
   var pane = node.pane_id || '';
-  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (pane && pane === selectedPane ? ' selected' : '');
+  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (node.reaped ? ' reaped' : '')
+    + (pane && pane === selectedPane ? ' selected' : '');
   var angle = node.angle ? ' <span class="agent-angle">· ' + escHtml(node.angle) + '</span>' : '';
+  // The button appears exactly when a click will WORK — `rehydratable` is the
+  // same predicate the CLI and the HTTP handler gate on, so it can never be
+  // offered on a phase that then refuses. `resumable` is a different question
+  // (will the conversation come back, or is this a fresh agent reading the
+  // notes?) and it decides what the button PROMISES, not whether it is there.
+  var rehydrate = node.rehydratable
+    ? '<button class="agent-rehydrate" data-phase="' + escHtml(node.name)
+      + '" title="' + (node.resumable
+          ? 'Rehydrate: resume this phase&#39;s session in a new pane'
+          : 'Rehydrate: no session to resume — launches a fresh agent and re-sends the seed')
+      + '">⟳</button>'
+    : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
   return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
     + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
-    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + rehydrate
     + '</div>' + kids;
+}
+
+// Report what a ⟳ did (or failed to do) under the tree. Cleared on navigation
+// by route(), never by a poll — a note about the rehydrate you just triggered
+// must outlive the 2s re-render that follows it.
+function agentsNote(text, bad) {
+  var el = document.getElementById('agents-note');
+  el.textContent = text || '';
+  el.classList.toggle('bad', !!bad);
+  el.style.display = text ? '' : 'none';
+}
+
+// Every pane id currently in the tree, at any depth.
+function treePanes(nodes) {
+  var out = {};
+  (function walk(list) {
+    (list || []).forEach(function(n) {
+      if (n.pane_id) out[n.pane_id] = true;
+      walk(n.children);
+    });
+  })(nodes);
+  return out;
 }
 
 async function pollAgents(gen) {
@@ -2381,6 +2776,13 @@ async function pollAgents(gen) {
     if (gen !== routeGen) return;
     var el = document.getElementById('agents-tree');
     var nodes = (tree && tree.nodes) || [];
+    // A config drovr could not read means `resumable` was decided by the
+    // built-in backends, not the user's. Say so rather than letting the ⟳
+    // appear or vanish for a reason nothing on screen explains. textContent:
+    // the text carries a parse error verbatim.
+    var cfgErr = document.getElementById('agents-config-error');
+    cfgErr.textContent = (tree && tree.config_error) || '';
+    cfgErr.style.display = cfgErr.textContent ? '' : 'none';
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
       : '<div class="review-empty">No agents spawned yet.</div>';
@@ -2389,6 +2791,58 @@ async function pollAgents(gen) {
       var pane = n.getAttribute('data-pane');
       if (pane) n.onclick = function() { selectPane(pane, n.querySelector('.agent-name').textContent); };
     });
+    el.querySelectorAll('.agent-rehydrate').forEach(function(b) {
+      b.onclick = function(ev) {
+        // The row's own click selects a pane; this row has none, but a future
+        // one might — never let the button double as a row click.
+        ev.stopPropagation();
+        b.disabled = true;
+        var phase = b.getAttribute('data-phase');
+        // A rehydrate that has to re-seed waits for the fresh agent to attach,
+        // which can take tens of seconds. Say so, or a disabled button is
+        // indistinguishable from a wedged one.
+        agentsNote('Rehydrating ' + phase + '…', false);
+        fetch(api('rehydrate') + '?phase=' + encodeURIComponent(phase), { method: 'POST' })
+          .then(function(r) {
+            return r.json().catch(function() { return {}; })
+              .then(function(d) { return { ok: r.ok, status: r.status, body: d }; });
+          })
+          .then(function(res) {
+            // A reseed waits for the fresh agent to attach, which can take ~30s
+            // — long enough for the user to navigate to another run first. The
+            // note element is page-global, so writing to it now would file this
+            // run's outcome under whatever run is on screen. Same `routeGen`
+            // guard every poller in this file uses.
+            if (gen !== routeGen) return;
+            if (!res.ok) {
+              b.disabled = false;
+              agentsNote(res.body.error || ('Rehydrate failed (' + res.status + ')'), true);
+              return;
+            }
+            // `detail` is the CLI's own line, and it is the whole point: it
+            // distinguishes "resumed with its session" from "relaunched, and
+            // the seed was NOT re-sent" — both of which are HTTP 200. The
+            // second is flagged, because a pane that is back but was never told
+            // what it is doing is not a success the user should scroll past.
+            agentsNote(res.body.detail || ('Rehydrated ' + phase),
+                       res.body.complete === false);
+            // Refresh now rather than waiting out the 2s tick, and cancel the
+            // pending one so the two chains don't both keep polling.
+            if (agentsTimer) clearTimeout(agentsTimer);
+            pollAgents(gen);
+          })
+          .catch(function() {
+            if (gen !== routeGen) return;
+            b.disabled = false;
+            agentsNote('Rehydrate request failed — is `drovr serve` still up?', true);
+          });
+      };
+    });
+    // A pane that has left the tree must not stay selected. `?pane=<gone>`
+    // answers 204 on the mirror and 409 on send, which reads as a wedged UI
+    // rather than as a stale selection — and a reaped node is exactly how a
+    // selected pane leaves.
+    if (selectedPane && !treePanes(nodes)[selectedPane]) selectPane(null, '');
   } catch (e) { /* transient; keep polling */ }
   if (gen === routeGen) agentsTimer = setTimeout(function(){ pollAgents(gen); }, 2000);
 }
@@ -2456,8 +2910,8 @@ async function sendKeys(keys) {
 
 // ---- Router ----
 var DETAIL_PANELS = ['summary-banner', 'agents-panel', 'session-panel', 'review-panel',
-  'diff-panel', 'doc-panel', 'waiting-overlay', 'approved-overlay', 'cancelled-overlay',
-  'form-section'];
+  'diff-panel', 'doc-panel', 'unanchored-annots', 'waiting-overlay', 'approved-overlay',
+  'cancelled-overlay', 'form-section'];
 
 async function route() {
   clearTimeout(pollTimer);
@@ -2527,6 +2981,12 @@ async function route() {
     // submittable indefinitely. loadAnnotations() then restores this run's own
     // in-progress comments from localStorage.
     annotations = {};
+    // ...and repaint the unanchored list from that now-empty map, in the same
+    // synchronous block. It renders only from refresh(), so on its own it would
+    // keep showing the PREVIOUS run's comment text — verbatim, under this run's
+    // name — until those fetches resolved, and forever if they rejected. Rendering
+    // rather than just hiding keeps one authority over what that panel says.
+    renderUnanchoredPanel();
     // Same class again, and the worst instance of it: the decision radio and the
     // feedback box are plain form fields that nothing ever reset, so prose typed
     // for one run stayed in the box — and the radio stayed on whatever was picked
@@ -2545,6 +3005,7 @@ async function route() {
   document.getElementById('session-target').textContent = 'active';
   showEl('agents-panel');
   showEl('session-panel');
+  agentsNote('', false);   // a note belongs to the run it was raised in
   pollAgents(routeGen);
   pollPane(routeGen);
   await refresh();
@@ -2884,6 +3345,24 @@ function initKeyNav() {
 
   // Clicking a row or a question adopts it as the cursor.
   document.addEventListener('click', syncCursorToClick, true);
+
+  // A spec's own `[text](#heading)` link must scroll, not route. Delegated so it
+  // covers every re-render of the doc panel, and capture-phase + preventDefault so
+  // the fragment never reaches location.hash — the router would read it as a run
+  // change and tear the form down, losing typed feedback and unsaved comments.
+  document.addEventListener('click', function(e) {
+    var a = e.target && e.target.closest ? e.target.closest('#doc-content a') : null;
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    if (href && href.charAt(0) !== '#') return; // external links keep their new tab
+    // Everything else stays in this tab. `[t]()` renders href="", which resolves to
+    // the current document and navigates for real — same state loss as a fragment,
+    // just a stranger-looking link. Modifier and middle clicks are intercepted too:
+    // a new tab would open the SPA at a bare fragment, which routes to the session
+    // list rather than the spec, so honouring them would hand over a broken view.
+    e.preventDefault();
+    if (href) scrollSpecFragment(href);
+  }, true);
 
   document.addEventListener('keydown', function(e) {
     // Never steal a browser/OS shortcut. Ctrl and Meta chords we claim are

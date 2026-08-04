@@ -62,7 +62,7 @@ stale status), and the live agent's next `drovr phase done` completes it normall
 To accept the old completion as-is, re-signal it deliberately from the run dir:
 
 ```
-: > "$(drovr path <run>)/<phase>.done"      # or: touch <run_dir>/<phase>.done
+touch ~/.local/share/drovr/runs/<run>/<phase>.done
 ```
 
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
@@ -474,6 +474,541 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
+## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle — FIXED 2026-08-02
+
+**Severity:** high — it manufactured the exact signal the pipeline uses to advance a task, and a
+vacuous clean is indistinguishable from a real one.
+**Found:** run `skill-stickiness`, task 3, panel 1, 2026-08-02. **Fixed** the same day, in run
+`panel-roles` — see the fix section at the end of this entry.
+
+### Reproduction
+
+```
+~/.local/share/drovr/runs/skill-stickiness/task-3-base.sha      5c8a7da
+~/.local/share/drovr/runs/skill-stickiness/task-3-review-1.head 5c8a7da   <- identical
+```
+
+Base equals head. The reviewed range `5c8a7da..5c8a7da` is empty. All four angles
+(`task-3-review-1-{correctness,error-handling,security,type-design}.json`) returned
+`"verdict": "clean"`, `"findings": []` — and nothing anywhere said the range was empty.
+
+The agent had authored 17 scenario files and committed none of them, so nothing had moved HEAD
+since the base was recorded.
+
+**When `base == HEAD`, the panel returns a clean verdict having read no committed change.**
+
+### State the condition exactly
+
+It is tempting to write this as "uncommitted work reviews as clean." That is wrong, and the wrong
+version is more dangerous than no note at all, because it tells an agent that one commit makes it
+safe. The precise statement:
+
+- The committed scope is `git diff <base>..<head>`. It is empty when that range **contains no
+  change** — usually because nothing was committed since `drovr code-review base` ran, so
+  base == head. **But equal SHAs are not the property.** `git commit --allow-empty` advances HEAD
+  without touching the tree, so base != head while the diff is still empty. The first version of
+  the guard below compared the two SHAs and this case walked straight past it.
+- Commit some of the work and HEAD moves past base, so the range is real and the panel can return
+  real findings. Whatever is *still* uncommitted is simply outside that range.
+- So the hazard has two shapes: the empty range (this entry), and the quieter one where a partial
+  commit yields a real-looking review whose scope silently excludes the rest of the work.
+
+The seed does tell reviewers the scope is `git diff <base>..<head>` "**plus** the current working
+tree" (`cli/src/code_review.rs:326`), so uncommitted work is nominally in scope. That clause is
+not a substitute for a real range. Untracked files never appear in a `git diff`, and in the
+observed case there were 17 of them and all four angles still concluded clean. A prose
+instruction to also look around is not a scope, and it should not be relied on as one.
+
+### Why it is dangerous, not merely useless
+
+A clean verdict is not decoration — it is the signal `drovr:pipeline` branches on to advance a
+task (exit 0 → proceed to task N+1). This one is byte-identical to a real pass: same schema, same
+four angles, same exit code. Nothing downstream can tell the two apart, so the vacuous pass
+inherits the authority of a genuine one.
+
+That makes it the **fifth appearance of the vacuous-pass class in a single run** — a check that
+reports success by not checking anything. Each was found and fixed in the run's own reports:
+
+1. **task 1** — a git-missing skip that printed ok.
+2. **task 1** — assertion 4 compared nothing and passed.
+3. **task 2** — `discover_corpus_roots` dropped `read_dir` entry errors and unreadable version
+   dirs, so the overlap test could pass having indexed only part of the corpus
+   (`task2-report.md`, panel round 2, finding 3).
+4. **task 2** — the overlap check guarded *our* side against producing no shingles but not the
+   *corpus* side; the report calls the asymmetry "worse than neither being guarded, because it
+   reads as deliberate" (`task2-report.md:17`).
+5. **this** — the panel's own empty range.
+
+Four of the five were defects the panel *caught*. The fifth is the panel committing it. As
+`task2-report.md:116` puts it: it recurs "because a vacuous pass and a real one are
+indistinguishable from outside."
+
+### FIXED 2026-08-02 — an empty range is refused, and cannot be spelled `Clean`
+
+**Refuse to run when `base..head` contains no change, and say why.** An empty range is always a
+mistake, and there are only two ways to reach it:
+
+- the base was recorded *after* the work was committed (`drovr code-review base` run too late), or
+- nothing has been committed yet — the usual case, since the panel is reached at the end of a task
+  when uncommitted work is exactly what is on hand.
+
+Neither is a state in which a clean verdict means anything, so neither produces one. What shipped:
+
+- **A new `ReviewOutcome::EmptyRange` variant**, not a special case at the call site. The fix was
+  type-level: vacuous and real clean shared one outcome, and one `if` at one call site would have
+  left the illegal state representable for the next caller.
+- **The check asks what the range CONTAINS** (`range_is_empty`, via `git diff --quiet
+  base..head`: exit 0 = no differences, 1 = differences). **It deliberately does not compare the
+  two SHAs.** The first version did, and `git commit --allow-empty` defeats it — HEAD advances,
+  the tree does not, so `base != head` with an empty diff and the vacuous `Clean` returns
+  untouched. That near-miss is the entry's own lesson recurring inside its fix: *equal names* is
+  not *equal content*, and only one of them is the property worth checking.
+- **"Could not tell" is not "not empty".** If git cannot answer (an unresolvable base, say), the
+  guard prints a loud warning saying it did not run, and proceeds — it does not silently treat
+  the range as non-empty, and it does not refuse a pass that worked before the guard existed.
+- **Refused before any reviewer is spawned**, so a vacuous panel costs nothing rather than four
+  reviewer panes.
+- **Exit 1**, the setup-error channel the pipeline's failure model already routes to
+  STOP-and-diagnose. It does **not** warn and proceed: a warning on stderr next to a `clean`
+  verdict and a 0 exit is read as the verdict.
+- **Three tests.** `an_empty_review_range_is_refused_before_any_reviewer_is_spawned`,
+  `a_non_empty_range_still_reaches_the_reviewers`, and — the one that carries the property —
+  `an_empty_commit_is_refused_even_though_the_shas_differ`. Both guards were mutation-tested:
+  reverted to the SHA comparison, the empty-commit test failed with `left: Timeout, right:
+  EmptyRange` (the panel had spawned reviewers over nothing) while the other two still passed,
+  which is exactly why that third test earns its place.
+
+**Still open, deliberately:** the *partial* commit. It produces a real, non-empty range whose
+verdict is honest but silently narrower than the task's work, and nothing detects that — the
+panel cannot know what you meant to commit. `implement-task.md` tells the task agent to keep
+committing, and `ReviewOutcome::Clean`'s doc states in terms that a clean verdict covers the
+committed range and not the task. Both are documentation, not enforcement. Fixing it would mean
+redesigning what the panel's scope IS (e.g. refusing on a dirty tree), which is a larger question
+with real false-positive cost.
+
+## An author-run panel is not a gate: five author-run panels, then the driver's caught what they missed (2026-08-02)
+
+**Severity:** medium — the author's own verdict silently becomes the release decision, so the
+defect ships and the review cost is paid twice.
+**Found:** run `skill-stickiness`, task 3 (authoring the 17-scenario pressure corpus), 2026-08-02.
+**Not a bug in `code_review.rs`** — the panel worked exactly as built. The defect was in the docs:
+nothing distinguished *running* the panel from *being gated by* it.
+
+### What happened
+
+The task agent ran `drovr code-review run` **five times** on its own work (four angles each:
+correctness, error-handling, security, type-design), fixing what it found — 7 Important and 1 nit
+across the five — and committed `b16dea0 fix(writing-skills): remove a self-contradiction and a
+collapsed pressure set`. Its fifth panel returned clean on all four angles. It declared the task
+done.
+
+The **driver** then ran a sixth panel. The `correctness` angle returned an Important:
+
+> `skills/writing-skills/scenarios/verification-before-completion-1.md`: "Pressure list still
+> collapses to two effective levers: time, social, and exhaustion are all hurry-up variants;
+> pragmatic is the only distinct one."
+
+That is the same defect class `b16dea0` had just claimed to fix. The agent had correctly
+identified it, fixed it incompletely, and then adjudicated its own fix as sufficient.
+
+### The sharp version — a controlled comparison, not a count
+
+The count of five is the weaker fact, and one of the five was vacuous (see the entry above), so
+only four were real passes. The evidence that carries this entry is the pair at the end, which is
+controlled: panels 5 and 6 reviewed the **identical tree**.
+
+```
+task-3-review-5.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   author-run  → 4/4 angles clean
+task-3-review-6.head: b16dea0de3ee89ad14b2f2ba22fcea9548846756   driver-run  → correctness: 1 Important
+```
+
+Same base, same HEAD, same four angles, same reviewer configuration. The only variable was who
+invoked it. (Artifacts: `~/.local/share/drovr/runs/skill-stickiness/task-3-review-{5,6}-*.json`.)
+
+### Root cause — and what it is *not*
+
+Running the panel on your own work is good practice, and the five self-runs found real defects:
+7 of their 8 findings were Important, and every Important was fixed. That is the panel working
+as a test suite, which is what it should be. The defect is that **nothing named the difference** between
+that use and the acceptance gate, so a clean author-run verdict was read as permission to report
+done — and `drovr code-review run` offers no signal to tell the two uses apart.
+
+`skills/pipeline/SKILL.md` said the driver runs the panel; it never said an author-run panel is
+*not* the gate. `phase-prompts/implement-task.md` step 5 told the task agent to self-review with
+`drovr:code-review`, which reads as licence to substitute the panel for the decision.
+
+Two nearby effects worth knowing:
+
+- **The first of the five was vacuous, so only four were real passes.** Panel 1's head equalled
+  the recorded base (`5c8a7da`), so it reviewed an empty diff and reported clean from all four
+  angles. The agent caught this itself. It is a *different* defect class, recorded above — see
+  "The panel reviews `base..HEAD`". It does not weaken this entry, because this entry's evidence
+  is the controlled 5-vs-6 comparison, not the count.
+- **Cost.** Task 3 was reviewed 6×. Of the five author-run rounds, three (panels 2–4) returned
+  findings; panel 1 was the vacuous one and panel 5 was clean. The sixth is the one that decided
+  anything. An author-run panel is not wasted — three of them earned their keep — but it is
+  never the one that counts.
+
+### Why this is expected, not a fluke
+
+The panel is sampled and non-deterministic, so run 6 is not magic — it is one more independent
+draw. That is precisely the point: a single clean sample is evidence, not proof, and the party
+who wants to stop is the worst party to decide the sampling is finished.
+
+This repo already encodes the argument one level down. `spec.md` §7.3 of the `skill-stickiness`
+run mandates that arm B be scored by a read-only reviewer that is **not arm B's author**, with
+arm labels stripped, because "unblinded self-scoring by arm B's author is exactly what the
+replication literature this spec cites warns about." The panel gate is the same argument one
+level up. Consistent with, though not proof of, the published finding that intrinsic
+self-correction without external feedback can degrade output (Huang et al., *Large Language
+Models Cannot Self-Correct Reasoning Yet*, ICLR 2024, arXiv:2310.01798) and that self-correction
+depends on reliable external feedback (Kamoi et al., TACL 12 (2024) 1417–1440,
+arXiv:2406.01297). Panickssery et al. (*LLM Evaluators Recognize and Favor Their Own
+Generations*, NeurIPS 2024) is about an evaluator scoring its own generations, which is not quite
+this case — the reviewers here were independent agents — but it bears on the adjudication step,
+which is the one that failed.
+
+### Fix in place — documentation, deliberately
+
+The same paragraph now appears verbatim in `skills/code-review/SKILL.md`,
+`skills/pipeline/SKILL.md` and `skills/pipeline/phase-prompts/implement-task.md`: anyone may run
+the panel, only the driver's run is the gate, a clean author-run verdict is evidence and never
+permission. `implement-task.md` additionally requires the task report to list every panel the
+agent invoked itself, labelled author-run, so the distinction is visible downstream.
+
+**No mechanism was added, and this is the known gap.** `drovr code-review run` has no caller
+identity and cannot acquire one honestly: both roles run the same command on the same machine, so
+any "who ran it" field would be self-declared — a permission system agents route around, and
+worse, one that launders a self-declaration into the appearance of authority. The task report's
+author-run labels are self-reported *facts about the past*, which is a different thing from a
+self-declared *right*. What enforces the gate is the driver running its own panel after every
+task, unconditionally, regardless of what the report claims.
+
+## `drovr cleanup` auto-commits whatever the worktree is holding (2026-08-02)
+
+**Severity:** low, but it puts junk — including large binaries — into your branch's history under
+a message that describes the RUN, not the content.
+
+`drovr cleanup <run>` commits the worktree before pruning it, which is the right default: it is
+how work in progress survives a teardown. What it does not do is distinguish work from litter. On
+run `fix-lock-flake` it produced:
+
+```
+2e23622 drovr(fix-lock-flake): the serve-lock test shares the developer's lock path, …
+ cli/rust_out | Bin 0 -> 4517008 bytes
+```
+
+A 4.5 MB binary — `rust_out` is what a bare `rustc foo.rs` writes when nobody passes `-o`, left
+behind by something probing in that checkout — committed under the run's task description, which
+made it read like a real change.
+
+**Consequences to expect:**
+
+- `git branch -d <run branch>` will REFUSE after cleanup, because that auto-commit is not in
+  `main`. If you force it without looking, you are discarding a commit you never read. Check what
+  it contains first (`git show --stat <branch>`); it may be litter, or it may be work.
+- The commit message names the run's task, so the diff is the only thing that tells you which it
+  is.
+
+**Mitigation in place:** `rust_out` is now in `.gitignore`, alongside `target/` and `.drovr/`.
+That closes the specific case; the general one — cleanup committing anything untracked — stands
+by design.
+
+**Before running cleanup on a worktree you have been probing in:** `git status --short` it, and
+remove or ignore what you do not want in the branch.
+
+## "Read-only" reviewers can still mutate repo state through drovr itself (2026-07-31)
+
+**Severity:** low, but it leaks into the repo and into `git worktree list`.
+
+Reviewers run under a read-only flag (`cursor --mode plan`, `claude --permission-mode plan`),
+which stops them EDITING files. It does not stop them running commands, and the seed explicitly
+invites them to "run the tests". A reviewer verifying `drovr phase done`'s handoff gate did the
+natural thing and exercised it end to end:
+
+```
+drovr new gate-test --worktree     # …and gate-test2 … gate-test5, across two rounds
+```
+
+Each of those created a real git worktree under the *driver's* checkout (`cli/.drovr/wt/gate-testN`,
+because the reviewer's cwd was `cli/`) plus a branch `drovr/gate-testN`, registered in the shared
+repo. They then showed up as embedded git repositories in the driver's next `git add -A`, and were
+nearly committed.
+
+**So:** read-only bounds the editor, not the process. Anything a reviewer can invoke — drovr
+included — runs with the driver's permissions.
+
+**Mitigations in place:** `.drovr/` is now in `.gitignore`, so a leaked worktree cannot be staged
+by accident. Check `git worktree list` after a review round and remove strays
+(`git worktree remove <path>` + `git branch -D drovr/<name>`); they are clean by construction, so
+removal is safe.
+
+**Worth considering:** the reviewer seed could tell reviewers to exercise drovr against a scratch
+directory (`--dir "$(mktemp -d)"`) rather than the checkout under review.
+
+## A phase agent can plant its own `<phase>-context.md` (2026-07-27)
+
+**Severity:** medium — it is a back door around "drovr composes every brief", the whole point of
+the structural-briefs design.
+**Found:** review round 2 of run `structural-briefs`, security angle, `cli/src/brief.rs`.
+
+`brief::resolve_context` records driver context at `<run_dir>/<key>-context.md` and, when a later
+invocation passes no `--context`, reuses it. But the run dir is **agent-writable by contract** —
+every phase agent writes `<phase>-HANDOFF.md` there, and `drovr phase done` requires it. So an
+agent can create `<phase>-context.md` itself, and the next `drovr phase brief` / `phase start`
+without `--context` will present that text to the next agent as *driver* context.
+
+**Not fixed, deliberately.** Any check drovr could add here is a heuristic (provenance guessing,
+mtime comparison, a marker the agent could also write) layered under an authoritative mechanism,
+and a heuristic backstop is worse than a documented gap: it makes the hole look closed. The real
+boundary is the run dir's permissions, and drovr's model already trusts agents not to write
+`state.json` with nothing enforcing it — this is the same trust, in the same directory.
+
+**What does hold:** the reuse is announced on stderr with the path every time it happens
+(`drovr: reusing the recorded context for '<key>' (<path>)`), so a driver can see what is in
+effect; `--context ''` clears the record; and recording uses write-then-rename, so a symlink
+planted at that path is replaced rather than followed (that one WAS fixed — `fs::write` follows
+symlinks, which turned recording into a clobber of the link's target).
+
+**If you want it closed:** the context has to live somewhere agents cannot write, which means
+outside the run dir — a driver-side store keyed by run+phase. That is a design change, not a
+patch.
+
+**Hardlinks sit inside this same gap.** Reading a record refuses symlinks and non-regular files,
+but a HARDLINK at the record path is indistinguishable from the record itself and reads through to
+its target. Not separately patched, for the same reason: an actor who can create that link can
+already write the record's content directly, so refusing `nlink > 1` would add a check whose only
+effect is to imply a boundary that is not there. The narrow residue — linking a file one can link
+but not read — is bounded by `fs.protected_hardlinks`, which is on by default on Linux.
+
+## A read-only cursor reviewer can park at plan mode's "Ready to build?" gate (2026-07-27)
+
+**Severity:** medium — the reviewer never reports, and neither `idle` nor `blocked` distinguishes
+it from one that finished.
+**Found:** review round 4 of run `structural-briefs`, error-handling angle (`wBM:pG`).
+
+Reviewers run `cursor --mode plan`. Plan mode's natural terminus is a confirmation dialog:
+
+```
+Ready to build?
+ → 1. Yes, build locally (b)
+   2. Yes, build in cloud (c)
+   3. No, propose changes (p or Esc)
+```
+
+The agent had done the review and then offered to *implement* it. It sat at that gate with
+`agent_status: idle` — indistinguishable from a reviewer that finished and is waiting at its
+composer, which is why the panel's completion detection cannot see it either.
+
+**Never answer 1 or 2.** A reviewer that builds violates the read-only contract and drovr's
+single-writer rule at the same time.
+
+**Remedy:** `herdr agent send-keys <pane> escape` to decline, then send a reporting-only prompt
+("you are READ-ONLY; print one line per finding as SEVERITY|file:line|summary") and submit it with
+another `enter`. That recovered the angle, which then reported clean.
+
+**Distinguishing it from the unsubmitted-paste bug:** both look `idle`. Read the pane —
+`→ [Pasted text #1 +N lines]` in the composer is the paste bug; a `Ready to build?` box is this
+one. Same lesson as the `pgrep` mis-triage above: check the pane, not the status.
+
+## `rustfmt src/main.rs` (and `cargo fmt`) reformats every sibling module (2026-07-27)
+
+**Severity:** low, but it silently produces a huge unrelated diff.
+
+`cli/src` is not rustfmt-clean: `config.rs`, `herdr.rs`, `phase.rs`, `reflex.rs`, `review.rs` and
+`run.rs` all have pending formatting differences. Because rustfmt follows `mod` declarations,
+formatting `main.rs` — or running `cargo fmt` at all — rewrites all of them: ~500 lines across six
+files nobody touched, which then collide with other worktrees working on those files.
+
+**Do:** format the leaf module you edited (`rustfmt --edition 2024 cli/src/brief.rs`). Verify with
+`rustfmt --check` on that file and ignore diffs it reports for siblings.
+**Do not:** run `cargo fmt`, or `rustfmt` on `main.rs`, unless you intend to reformat the crate.
+If you do it by accident, `git checkout --` the files you did not edit.
+
+## The findings channel loses reviewer output two ways (2026-07-26/27)
+
+**Severity:** high — it fails the panel on any real diff, and both modes look like "the reviewer
+produced nothing" rather than "drovr could not read it".
+**Found:** run `structural-briefs`, task `branch`, 4 cursor reviewers over a 1152-line diff.
+Panel exit 1: `reviewer 'review:branch:1:error-handling' produced no findings JSON (no file
+written and none found in its transcript)` — while that reviewer's JSON was plainly visible in
+its pane.
+
+### 1. Reviewers emit UNFENCED JSON; the extractor only reads fences
+
+`extract_findings_json` walks ` ``` ` fences and takes the last block whose body starts with `{`.
+The cursor reviewers printed `Review complete. Findings below.` followed by a bare top-level JSON
+object — no fence. The only fenced block in the transcript was the *schema* echoed from the seed.
+So extraction found nothing even though valid findings were on screen.
+
+**FIXED** (`829a155`, hardened again in `1022510`): a fenced candidate must now PARSE as a
+`Review` — the seed's echoed schema is not JSON, and it was shadowing real findings — and when no
+fenced block yields one, `last_review_object` takes the last balanced `{...}` that parses. Its
+candidate starts are braces that begin a line, tried last-first: trying every brace was quadratic
+on a transcript full of code, and an unbalanced brace in prose could swallow the rest of the input
+so the real object was never attempted.
+
+### 2. The pane transcript is LOSSY, so JSON cannot be reconstructed from it at all
+
+`herdr agent read` (any `--source`, including `recent-unwrapped`, `--lines 800`) truncates long
+lines **mid-word**:
+
+```
+"rationale": "resolve_context treats trimmed-empty supplied context as None and falls th... A driver pas
+code-review's explicit recording semantics and dangerous on fix-loop re-runs."
+```
+
+Text is missing between `A driver pas` and `code-review's`, so the JSON is unparseable no matter
+how it is extracted. A `rationale` of any length — i.e. every useful finding — can hit this.
+
+This is the deeper form of the already-noted "make the findings channel durable, not a viewport":
+the viewport is not merely small, it is *destructive*.
+
+**Also ruled out as an escape:** asking the reviewer to write the JSON to a file. The reviewers
+run read-only (`cursor --mode plan`), which refuses the write. They fall back to printing, which
+is where the truncation is.
+
+**What actually worked** (both rounds, and it is the current workaround): tell the reviewer, via
+`--context`, to print one line per finding as `SEVERITY|file:line|summary` with every line under
+100 characters. Short lines wrap instead of truncating, so they survive. Rationale is lost, which
+is a real cost — the summary alone is usually enough to act on, but not always.
+
+**There IS a durable channel, found 2026-07-27:** a cursor reviewer in `--mode plan` saves its
+work to `~/.cursor/plans/<title>-<id>.plan.md` and prints the path
+(`Saved to home/sauyon/.cursor/plans/Security Review Findings-4ea3cb76.plan.md`). That file holds
+the FULL review — untruncated rationale, the "no finding" verifications, findings separated from
+nits — and is incomparably better than anything scraped from a pane. Round 5's security findings
+were only fully legible there.
+
+**Fix ideas, in order of preference:** (1) harvest the plan file: match the newest
+`~/.cursor/plans/*.plan.md` for the reviewer (title + mtime) and parse findings from it, falling
+back to the transcript. Cursor-specific, so it needs a per-agent hook rather than a hard-coded
+path; (2) any other channel drovr controls — the reviewer runs in a pane drovr spawned, so a file
+it is *permitted* to write beats scraping; (3) instruct short lines in the seed rather than in
+per-invocation context; (4) accept unfenced JSON — done, necessary but not sufficient.
+
+## One failing test cascades: a panic while holding `ENV_LOCK` poisons it (2026-07-27)
+
+**Severity:** low, but it wastes debugging time.
+
+The env-dependent tests serialize on `test_util::ENV_LOCK` and take it with
+`ENV_LOCK.lock().unwrap()`. A test that panics *while holding* it poisons the mutex, so every
+later test that locks also panics — one real failure reports as several. Seen while fixing the
+round-1 review findings: one genuine assertion failure in `brief::tests` surfaced as three
+failures, two of which passed in isolation.
+
+If a run reports N failures, re-run the first one alone before believing the other N-1.
+
+## `web_keyboard_navigation` hung on every run: Chromium's cookie store waits on the keyring (2026-08-01) — FIXED
+
+**Cause: `--password-store=basic` was missing from the test's chromium launch.** Fixed in
+`cli/tests/web_nav.rs`; the suite went from failing every run to passing three for three in ~13s.
+
+**The mechanism**, from a full NetLog (`--log-net-log --net-log-capture-mode=Everything`):
+
+1. `COOKIE_PERSISTENT_STORE_LOAD` begins at startup and never ends.
+2. Every `URL_REQUEST` that needs cookies (`privacy_mode: disabled`) stalls at
+   `COMPUTED_PRIVACY_MODE` — where `URLRequestHttpJob` calls into the cookie store — and never
+   reaches `HTTP_TRANSACTION_SEND_REQUEST`.
+3. The cookie store is loading its encryption key through OSCrypt, which on Linux asks the Secret
+   Service over D-Bus. `ReadAlias("default")` on `org.freedesktop.secrets` returns `/`: there is
+   no unlocked default collection. `gnome-keyring-daemon` runs with `--components=secrets` but the
+   keyring was never unlocked or aliased, and with `XDG_CURRENT_DESKTOP`/`DESKTOP_SESSION` empty
+   there is no prompter to answer. **That call has no timeout.**
+
+Every symptom follows, and each one is what made this look like something else:
+
+| Symptom | Why |
+|---|---|
+| `file://` and `about:blank#x` navigate instantly | they never touch the cookie store |
+| the target server logs **zero** requests | the TCP connection IS established — NetLog shows `TCP_CONNECT` completing — but no HTTP request is ever written to the socket |
+| `curl` to the same port works | different process, no keyring involved |
+| the DevTools session looks dead | it is not: `Page.navigate` never resolves and later commands queue behind it. `/json/list` still answers |
+| chromium's own background traffic succeeds | that traffic is `privacy_mode: enabled`, i.e. cookieless |
+
+**Three wrong diagnoses were recorded here before this one** — "environmental", then "load
+sensitivity in a fixed 20s CDP deadline", then "a Chromium 150 regression". None had measurements
+behind them. Ruled out along the way and worth not re-testing: the drovr server, CDP socket
+topology (flattened browser-endpoint sessions behave identically), `--headless` vs `=old`/`=new`,
+`--no-sandbox`, `--disable-dev-shm-usage`, `NetworkServiceInProcess`, `--no-proxy-server`,
+enterprise policy, machine load, the agent tool sandbox, and any chromium wrapper or flag file
+(`/usr/bin/chromium` is Arch's launcher and injects nothing; no `chromium-flags.conf` exists).
+
+**The general lesson for headless Chromium on Linux:** always pass `--password-store=basic`. A
+machine with no unlocked keyring turns every cookie-bearing request into an untimed wait, and the
+failure presents as a network or browser fault rather than a credential-store one.
+
+
+## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky, cause UNKNOWN (2026-07-26, 2026-08-01)
+
+**Severity:** low — it passes on re-run. Recorded so nobody re-derives what has already been
+ruled out.
+
+Two sightings, five days apart, both on a full `cargo test`, both passing alone and on the
+immediate re-run of the whole suite. **Never reproduced on demand** — 14 full-suite runs and 8
+`review::tests`-only runs since.
+
+**A previous version of this entry blamed cross-process contention on a shared lock path, and
+that is wrong.** Ruled out since:
+
+- **Not a shared path.** `make_root` is `tempfile::Builder::…tempdir()`, so each test gets a
+  unique directory; no other process or worktree can be touching that `server.pid`.
+- **Not cross-file lock aliasing.** `try_take_lock` is `File::try_lock` (flock), which is scoped
+  to the open file description; distinct files cannot contend.
+- **Not the `ENV_LOCK` poison cascade** (see the entry below). This test never takes `ENV_LOCK` —
+  it passes an explicit path precisely so it does not depend on `XDG_DATA_HOME`.
+
+So the cause is genuinely unknown, and guessing again would only produce another wrong entry.
+
+**What was done instead:** the test now reports, on every failure path, the lock path, the file's
+contents, and this process's pid — and which step failed (claim / pid record / re-claim after
+drop).
+
+**The third sighting delivered that evidence (2026-08-02, run `phase-reap`, task 5's fixes).**
+The message was:
+
+```
+after drop: …/server.pid contains "1123224"; this pid is 1123224
+```
+
+Two things follow, and both narrow it:
+
+- **The pid file held OUR OWN pid.** So the step that failed is the re-claim after `drop(held)` —
+  `try_take_lock` returned `WouldBlock` on a path nothing but this test has ever named, against a
+  lock this very process had just released. It is not another writer and not a stale file from an
+  earlier run; there is no second claimant to find.
+- **The rate was measured at this branch's test count: 1 failure in 8 full `--bin drovr` runs.**
+  It fired twice in three consecutive runs at one point, which read as a regression and was not —
+  8 runs put it back on the documented 5–8%. Before calling a red suite a regression, measure;
+  three runs is not a sample.
+
+**A fourth sighting, 2026-08-04, reproduced the signature exactly** (run `phase-reap`, task 7's
+review round, on a docs-only tree):
+
+```
+a lock released by dropping its File was still held.
+after drop: /tmp/drovr-review-test-lock-claimbpQZgS/server.pid contains "2430561";
+this pid is 2430561
+```
+
+Same step (re-claim after `drop`), same own-pid evidence, on a tree whose only changes were
+markdown. That rules out this branch's code as a contributor and makes the signature stable
+rather than a one-off reading. It passed on the immediate re-run and on a second full suite.
+
+**The rate may be machine- or load-dependent, and the documented 5–8% may be low.** Across task
+7's review rounds it fired **3 times in ~8 full-suite runs** on one machine — the same binary,
+the same test count, only markdown changing between runs. That is too small a sample to restate
+the rate from, and it does not contradict the earlier 1-in-8 and 2-in-30 measurements so much as
+suggest they are not a single number. If you are measuring, record the machine and whether
+anything else was loading it.
+
+This is consistent with the `O_CLOEXEC` / fork-window hypothesis in the entry below (a concurrent
+`Command::spawn` elsewhere in the suite briefly duplicates the fd between fork and exec, and an
+inherited open file description holds the flock). It does not confirm it — confirming means
+correlating red runs with a spawn, which still has not been done.
+
+**If you hit it:** paste that message here rather than re-investigating from scratch.
+
 ## `drovr code-review run` panel never completes (reviewer panes don't attach)
 
 **Severity:** medium (the automated review-until-clean panel is unusable; the driver must fall
@@ -543,6 +1078,8 @@ re-run against current `main`.~~ **CONFIRMED 2026-07-25, independently by two ru
   reported.
 - run `phase-reap`, branch `drovr/phase-reap` — the same symptom, same cause, plus a *second*
   failure mode behind it. Detailed below.
+- run `m3-schema-dos` (2026-07-26) — same cause a third time, initially mis-filed as "no reviewer
+  ever spawned" because the triage used `pgrep` instead of reading the pane. See below.
 
 ### Dogfooded end-to-end 2026-07-25 (run `phase-reap`, task-1, branch `drovr/phase-reap`)
 
@@ -577,6 +1114,38 @@ either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
 file "cursor reviewers never reach `done`" — that was an artifact of failure mode 1.
 
+### Also seen (2026-07-26, run `m3-schema-dos`, task `schema-dos-fix`) — same unsubmitted seed
+
+Two more passes of the unsubmitted-paste mode, from a driver that was a plain `claude` session drovr
+had not started. `0 of 4 angles finished` on both (`--timeout-ms 540000`, then 1500000), all four
+`schema-dos-fix-review-<angle>-seed.md` written, zero findings files.
+
+**A misdiagnosis worth recording, because the obvious check lies.** `pgrep -af 'drovr|code-review'`
+returned nothing for this panel, which reads as "no reviewer was ever spawned" — and it is wrong.
+The reviewers are `cursor-agent` processes inside herdr panes, so neither pattern matches them; the
+panes were registered and `Running` in `state.json` the whole time (`wB8:p2`–`p9`, both iterations).
+Reading one settled it in a single command:
+
+```
+herdr pane read wB8:p6 --source recent --lines 14   # → [Pasted text #1 +46 lines]
+```
+
+So: diagnose a stalled panel by reading a pane, never by grepping the process table. Check
+`state.json` for the reviewer pane ids first — they are recorded per angle per iteration.
+
+The plain-`claude` driver is circumstance, not cause: `spawn_reviewer` needs `run.workspace` from
+that run's `state.json` and nothing else, `drovr new` records it whoever invokes it, and no code
+path consults the calling session. A run with no workspace fails loudly instead.
+
+Credit where due: drovr handled the moving target correctly. HEAD changed between passes and pass
+2 reported `HEAD moved since review iteration 1 was seeded — starting a fresh panel instead of
+resuming it`, which is the right call — a resumed panel would have reviewed an abandoned design.
+
+**Workarounds, both used here:** send `Enter` to each reviewer pane after the panel spawns them (the
+documented fix below), or drive the review with a self-spawned read-only reviewer (Claude Code Agent
+tool, `general-purpose`, blocking). The latter found two Critical defects the author's own tests had
+missed, including a test that passed while allocating ~300 MB of grammar.
+
 ### Fix ideas (from the 2026-07-25 dogfood)
 
 1. **Make the findings channel durable, not a viewport.** Have the reviewer seed instruct writing
@@ -598,6 +1167,87 @@ keystroke is missing. Fixing "`drovr phase send` returns success with the prompt
 unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
 visible victim. Keep the self-spawned-reviewer workaround above until that lands.
 
+## A reviewer's `submit_findings` tool can be DEFERRED, so a tool-search outage loses the review
+
+**Severity:** medium (the panel's only findings channel becomes uncallable; every angle
+finishes having delivered nothing, and the pass fails).
+**Found:** 2026-07-26, probing the claude findings channel directly (`fix-review-json`):
+`claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config`, asked to call the
+tool.
+
+### Symptom
+
+The agent reports it cannot call the tool: `mcp__drovr-findings__submit_findings` is a
+*deferred* tool, its schema must be loaded through `ToolSearch` first, and `ToolSearch`
+answers `HTTP Error 502: Bad Gateway` (classifier unreachable). Nothing is written; the
+angle looks like a reviewer that simply produced nothing.
+
+### What the probe DID establish (both good)
+
+- claude accepts the server from `--mcp-config` **without** the "New MCP server found"
+  approval prompt (see that issue below — it applies to project-scoped `.mcp.json`, not to
+  a config passed on the command line), and registers it under `--permission-mode plan`.
+- The server itself is correct end-to-end: a hand-driven stdio JSON-RPC session
+  (`initialize` → `tools/list` → `tools/call`) returns the tool and writes
+  `<task>-review-<iter>-<angle>.json` exactly where the panel reads it.
+
+### Mitigations
+
+- **Seed** (`code_review::build_seed`): names the fully qualified id, says the tool may be
+  deferred and must have its schema loaded first, and states that calling it is the
+  *sanctioned* way to deliver from read-only mode — the same probe showed a cautious agent
+  stopping to ask permission for a tool it read as "writing". Asserted by
+  `code_review::tests::seed_routes_findings_through_the_submit_tool`.
+- **Launch** (`config::default_agents`): claude's reviewer launch carries
+  `--allowedTools=mcp__drovr-findings__submit_findings`, so plan mode's tool gate cannot
+  refuse the one tool the panel depends on. Note the `=` form: `--allowedTools` is
+  **variadic**, and as two argv words it swallows whatever follows it — passing it as
+  `--allowedTools <tool>` before a positional prompt makes claude exit with "Input must be
+  provided either through stdin or as a prompt argument". Asserted by
+  `config::tests::the_claude_reviewer_launch_pre_allows_exactly_the_findings_tool`.
+
+### Still open
+
+If the tool-search service is down, no seed wording and no flag helps — the schema cannot be
+loaded at all. The LLM leg of the probe was never completed for that reason, so "a real
+**claude** reviewer calls the tool and the file lands" is verified only at the protocol level
+(hand-driven stdio JSON-RPC) plus flag-parsing; the full agent-level path is verified live
+for **cursor** only (during design). Re-run the probe when the service is back:
+
+```
+claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config \
+  --allowedTools=mcp__drovr-findings__submit_findings "call submit_findings …"
+```
+
+## One silent reviewer fails the whole `code-review run` (exit 1) instead of one angle
+
+**Severity:** low-medium (recoverable — a plain re-run respawns the angle — but the exit code
+tells the pipeline driver to STOP and diagnose, for something self-healing).
+**Found:** 2026-07-26, reviewing the findings-channel wiring (`fix-review-json`). Not a
+regression; the behaviour predates the MCP findings channel.
+
+### Symptom
+
+A reviewer that finishes without delivering anything — it never called `submit_findings`, so
+`<task>-review-<iter>-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
+CLI maps to **exit 1** ("setup failure: STOP and diagnose"). The other three angles' findings
+are already banked on disk and no merged `<task>-review.json` is written.
+
+### Why it is arguably wrong
+
+The pass already knows how to recover from exactly this: the angle is marked
+`PhaseStatus::Failed`, and the next `drovr code-review run` replaces that reviewer in place
+(`cli/src/code_review.rs`, the respawn branch). So the state left behind is a *resumable* one,
+while the exit code says *unrecoverable*. Exit 2 (timeout — "resumable, re-run me") would
+describe it accurately, or the angle could simply be reported `Failed` and the pass continue.
+
+### Status: open, deliberately not changed
+
+Raised as an open question in the `fix-review-json` design and left alone on purpose — the exit
+code is a contract the pipeline skill reads, and changing it belongs in its own task with the
+driver's behaviour changed alongside. Re-running `drovr code-review run` is the workaround and
+it costs one reviewer, not a panel.
+
 ## `drovr phase send` returns success with the prompt left unsubmitted
 
 **Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as
@@ -607,7 +1257,8 @@ that is simply working.)
 **Found:** 2026-07-24, run `gpu-deploy-view`, every phase injection — including on the updated
 binary carrying the phase-send agent-readiness fix.
 **Reproduced:** 2026-07-25 (`mcp-endpoint`), 2026-07-25 (`phase-reap`, three callers, 12 sends),
-2026-07-26 (`skill-stickiness`, three times). See "Occurrences".
+2026-07-26 (`skill-stickiness`, three times), 2026-07-30 (`land-review-json`, 3 of 4 reviewer
+seeds — the measurement that settles the shape). See "Occurrences".
 
 ### Symptom
 
@@ -625,17 +1276,43 @@ Both fail the same way. There is also a rarer third mode where the send lands **
 and the composer stays empty (see Occurrences, `mcp-endpoint` case 1) — the payload is dropped
 outright while the command still reports success.
 
-### Root cause — not established
+### Root cause — not established, but its SHAPE is: a race
 
-Unknown. Two plausible-sounding explanations have been **ruled out** by evidence; do not fix
-against either.
+Unknown in mechanism. What is established is that it is **non-deterministic** — the same
+`phase send` code path, against four panes of the same backend, with payloads within **26 bytes**
+of each other, succeeded once and failed three times (2026-07-30, `land-review-json`; see
+Occurrences). Nothing about the *payload* predicts the outcome, so no fix may be predicated on
+one. That rules out an entire family of explanations at once, including the two below.
+
+Three plausible-sounding explanations have been **ruled out** by evidence; do not fix against
+any of them.
 
 - **Not payload size, and not a bracketed-paste commit failure.** Three sends of a few hundred
   bytes each failed on 2026-07-26, none rendering as a paste. Whatever fails, fails for inline
   text too. Independently confirmed from the other direction on run `phase-reap`: an **8-line**
   payload failed while rendering *as* a collapsed paste (`❯ [Pasted text #3 +8 lines]`), against
   the 6586-byte / 124-line payload previously recorded. Neither size nor rendering predicts it —
-  any fix predicated on "large bracketed paste" will miss this.
+  any fix predicated on "large bracketed paste" will miss this. The 2026-07-30 four-pane
+  measurement closes this off from the third direction: the pane that *worked* was neither the
+  largest nor the smallest of the four.
+- **Not cursor's "Workspace Trust Required" modal.** This is the most attractive wrong answer,
+  because the modal is real and it does swallow prompts — but it is not what happens here, and a
+  fix aimed at it makes things worse. Disproved three ways on 2026-07-30:
+  1. **`--trust` does not exist on the interactive path.** `cursor-agent --mode plan --trust
+     --workspace <dir>` exits immediately with `Error: --trust can only be used with
+     --print/headless mode`; in the bundle the flag is read only inside a headless-only branch.
+     Adding it to drovr's launch **breaks the launch outright**. Do not add `--trust` anywhere.
+  2. **Inherited trust makes the modal a non-event for drovr worktrees.** A fresh directory with
+     no trusted ancestor *does* show the modal, so the mechanism is genuine — but
+     `~/.cursor/projects/home-sauyon-devel/.workspace-trusted` is dated **2026-04-28**, months
+     before the first of these reports, and descendants inherit it. A launch into the real
+     worktree `.drovr/wt/land-mcp-findings` shows **no modal** and lands straight in the composer.
+  3. **No modal was present in any observed failure.** All four 2026-07-30 reviewer panes sat at
+     an ordinary composer with the text visibly pasted into it.
+
+  Related, and equally out of scope: drovr must **not** write cursor's `.workspace-trusted`
+  marker itself. That means reimplementing cursor's private directory-slug algorithm in order to
+  grant trust on the user's behalf — not obviously right, and not this bug.
 - **Not the `drovr phase send` CLI entry point.** Run `phase-reap` reproduced it from three
   different callers, including `code_review.rs`'s reviewer spawn, so the failure is in
   `phase::phase_send` itself (and therefore `agent_send` → socket `agent.prompt`). See
@@ -683,6 +1360,30 @@ pane — that is the only thing that distinguishes them. This bug is invisible f
 it was caught both times only by reading the pane directly.
 
 ### Occurrences
+
+**2026-07-30, run `land-review-json`, workspace `wC1`** — one `code-review` panel spawning four
+cursor reviewers, i.e. four `phase_send` calls a few seconds apart into four freshly-spawned
+panes of the same backend. This is the measurement that establishes the shape:
+
+| Pane | Angle | Seed | Submitted itself? |
+|---|---|---|---|
+| `wC1:p2` | correctness | 2701 B / 61 lines | **No** — sat as `→ [Pasted text #1 +62 lines]` |
+| `wC1:p3` | security | 2677 B / 61 lines | **No** |
+| `wC1:p4` | error-handling | 2703 B / 61 lines | **Yes** |
+| `wC1:p5` | type-design | 2680 B / 61 lines | **No** |
+
+Same day, a **claude** pane took a ~1.2 KB `phase send` and **self-submitted** — `agent_status:
+working` within 4s.
+
+Read it carefully, because it constrains any fix:
+
+- The four seeds span **26 bytes**. The one that submitted was neither the largest nor the
+  smallest. So the failure is not a function of the payload — **it is a race**, and a single
+  green run proves nothing. Any change here has to be exercised repeatedly, on cursor, until
+  both branches have been seen.
+- It is not backend-determined either: claude self-submits, and has been observed to *not*
+  self-submit on a large paste (`phase-reap`, case 2). Cursor is merely the far worse offender.
+- None of the four panes showed a trust modal or any other dialog. See "Root cause".
 
 **2026-07-25, run `mcp-endpoint`, pane `wAC:p1`** — installed nix-profile binary, 6586-byte /
 124-line briefing:
@@ -737,6 +1438,58 @@ renderings.
    measuring the wrong thing; it should distinguish "idle and accepting input" from "idle because
    it gave up".
 
+### Status: the false SUCCESS is FIXED 2026-07-30 (branch `drovr/fix-phase-send`)
+
+`phase_send` no longer treats `agent.prompt` returning as proof of delivery. It uses that call's
+native `wait` option (`until: [working, done]`) and returns `Ok` only when herdr **observed the
+agent start**; `agent_prompt_stalled` / `timeout` mean the payload did not take. On a stall it
+reads the pane for positive evidence the payload is in the composer — a `[Pasted text …]`
+placeholder or a verbatim prefix of its first line, in the last 8 non-empty lines, and required
+to have APPEARED across the prompt. Evidence → one `enter`, then re-confirm. No evidence
+(including a pane that cannot be read) → raise, never guess. See `cli/src/phase.rs`
+(`phase_send`, `pane_shows_payload`) and `Herdr::agent_prompt_confirm`.
+
+This does not stop the underlying race — it stops the **silent** failure. A send that does not
+take now exits 2 with a message naming which failure it was, instead of exiting 0.
+
+Verified live 2026-07-30 on herdr 0.7.5, all four branches:
+
+| Branch | How it was reached | Result |
+|---|---|---|
+| Healthy self-submit | 8 fresh cursor panes + 7 fresh claude panes, ~4 KB seed; plus one 77 KB payload | exit 0 in 0–1s, every agent ran and answered |
+| Stall → nudge → OK | claude, 77 KB, confirm deadline shortened to 250 ms to force the stall | `herdr agent send-keys <pane> enter` issued, then exit 0 |
+| Swallowed → raise | a cursor pane that dropped the payload outright (composer empty) | exit 2, **no keystroke** |
+| Parked on a menu → raise | claude parked on the `/model` picker, `❯ 2.` highlighted, "Enter to set as default" | exit 2, **no keystroke** |
+
+The no-keystroke claims are not inferred from the message: `drovr` was run with a logging
+`herdr` wrapper first on `PATH`, which recorded every CLI invocation. `agent_send_keys` is the
+only thing that shells the CLI, so an empty log is proof. A positive control (`herdr agent
+send-keys <pane> esc`) confirmed the wrapper records what it is meant to.
+
+### Still open: `until` is a LEVEL, not an edge
+
+Measured 2026-07-30 against herdr 0.7.5, and there is no API option for the other behaviour
+(`AgentPromptWaitOptions` is only `{until, timeout_ms}`). `agent.wait` on a pane that is
+*already* in one of the `until` states returns in **0.0s** with success, without observing any
+transition. On a pane that is not, it blocks the full deadline and answers `timeout` — so the
+wait works; it just cannot distinguish "started because of my prompt" from "was already going".
+
+So the guarantee is exactly: **if the pane was `idle` when the prompt went out, `Ok` means herdr
+saw it start.** That is the normal case — a freshly-spawned agent, or a re-entry into one parked
+at its composer. Two narrow cases fall outside it:
+
+- pane already `working` — `wait_agent_ready` admits `working`, so this is reachable when a send
+  targets a busy agent. `Ok` there proves nothing about this payload.
+- pane already `done` — very narrow, because `done` is momentary (see the EDGE entry below): an
+  agent parked at its prompt reads `idle`, so the driver's post-`phase wait` re-entry send
+  almost always lands on `idle`.
+
+Deliberately NOT worked around. The fix would be to have the readiness gate release only on
+`idle`, which changes what `phase send` does to a busy agent, and the alternative — juggling the
+`until` set against the pre-prompt status — has its own failure mode (a turn short enough that
+the transition is missed reads as a stall, and raises on a send that worked). Documented rather
+than papered over.
+
 ## Spawned agents park on the "New MCP server" approval prompt, undetected
 
 **Severity:** medium (every fresh agent in a project with an MCP server stalls at spawn until
@@ -774,6 +1527,23 @@ The **answering** half is done: `POST /api/runs/<run>/keys` (`{"keys":["3","ente
 `Herdr::agent_send_keys` → `herdr agent send-keys`, wired to an Enter/Esc/↑/↓/1–5 key row in the
 Live-session panel, so a parked agent can be cleared from the browser without attaching.
 (Route: `cli/src/review.rs:524` → `handle_post_keys`.)
+
+### Worse than a stall: `agent.prompt` can ANSWER an unclassified menu
+
+**Re-measured 2026-07-30, herdr 0.7.5**, and this is the part drovr cannot fix. A prompt
+delivered into a menu herdr never classified as `blocked` does not merely get swallowed — it can
+dismiss the menu and **accept the highlighted option**, inside `agent.prompt`, before drovr sees
+anything.
+
+Reproduced deterministically on claude's `/model` picker (a stand-in for the MCP approval, and
+easier to arm): pane parked with `❯ 2. Opus (1M context)` highlighted and `Enter to set as
+default` on screen, reporting `agent_status: idle`. One `agent.prompt` of an ordinary briefing
+later, the menu was gone and the status line read the option that had been highlighted. No key
+was sent by drovr — verified with a logging `herdr` wrapper on `PATH`, empty log.
+
+`phase_send`'s refusal to nudge protects the keystroke it controls, and it correctly reports the
+seed as undelivered. It cannot protect the one herdr issues. Closing this needs pre-send blocker
+detection, i.e. the manifest rules below — it lives **outside** this repo.
 
 The **detection** half is still open, re-confirmed 2026-07-25: no file under
 `~/.local/state/herdr/agent-detection/remote/` — `claude.toml` included — matches "mcp", so
@@ -818,6 +1588,78 @@ Make `review wait` treat a transient connect failure as retryable (re-run `ensur
 resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
 exit.
 
+## herdr's `agent_status: done` is an EDGE, not a level — FIXED 2026-07-27
+
+**Severity:** was high — a reviewer that did everything right hung its panel forever.
+**Found:** 2026-07-27, running the round-2 review panel for `land-mcp-findings`.
+
+### Symptom
+
+Four cursor reviewers all delivered valid findings files. The panel reported *"3 of 4 angles
+finished; still waiting on error-handling"* and timed out (exit 2) on two consecutive runs,
+with `branch-review-2-error-handling.json` sitting complete and parseable on disk the whole
+time. `state.json` had that angle `Running`; the other three `Done`.
+
+### Cause
+
+herdr reports `agent_status: "done"` for only a moment as a turn ends; an agent parked at its
+prompt reports `"idle"`. All four finished panes read `idle` when inspected afterwards. The
+panel's completion test was `done_marker exists || agent_status == Done`, and the marker never
+fires for reviewers — their seed forbids `drovr phase done` (confirmed: zero `.done` files in
+the run dir). So the only signal was that momentary edge. Three angles were polled while it
+was showing; the fourth was not, and no later poll could ever recover it. On resume, the
+banking branch was gated on `status == Done`, so a stuck `Running` angle could not be rescued
+by its own file either. Two gates, both asking the pane, both unrecoverable once missed.
+
+### Fix
+
+Completion is the artifact. A parseable `<task>-review-<iter>-<angle>.json` finishes the
+angle at both gates, whatever the pane says (`code_review::delivered_review`). herdr is now
+consulted for exactly one question the artifact cannot answer: has a reviewer finished
+*without* delivering? The server's write is atomic (temp + rename) so a file in flight cannot
+be read as a delivery.
+
+### Not affected: ordinary phases
+
+`phase.rs` uses `agent_status` for readiness and blocked-detection, never for completion —
+a phase agent completes by running `drovr phase done`, which drops the marker the wait polls.
+Only the review panel depended on the edge, because only reviewers are told not to run it.
+
+## `main` is not `cargo fmt` clean, and formatting one file reformats the whole crate
+
+**Severity:** medium — the last branch that got this wrong had to be rebuilt from scratch
+(`land-mcp-findings` exists only because of it).
+**Found:** 2026-07-27, formatting three files during `land-mcp-findings`.
+
+### The trap
+
+`cargo fmt --check` is dirty on `main` itself — currently `cli/src/herdr.rs`, `phase.rs`,
+`reflex.rs`, `review.rs`, `run.rs` and `cli/tests/web_nav.rs`. So "run `cargo fmt` before
+committing" sweeps ~450 lines of unrelated churn into your branch, which then collides with
+whatever else lands on `main`. That is exactly what forced `drovr/fix-review-json` to be
+replayed rather than merged.
+
+**And the obvious workaround does not work.** `rustfmt cli/src/main.rs` does *not* format
+one file: rustfmt follows `mod` declarations from the crate root, so naming `main.rs`
+reformats every module it reaches. Naming a leaf module (`cli/src/code_review.rs`) is
+likewise a crate-root entry for rustfmt's purposes if it is reachable. The sweep is silent —
+the command prints nothing.
+
+### What to do
+
+1. Check whether the debt is yours before touching it:
+   `git show main:<file> > /tmp/c.rs && rustfmt --edition 2024 --check /tmp/c.rs`.
+   Clean → your edit introduced it, fix it. Dirty → it is main's; leave it.
+2. After any `rustfmt`/`cargo fmt`, **`git diff --stat` before staging** and
+   `git checkout --` every file you did not otherwise change.
+3. Never `git add -A` a tree you have just formatted.
+
+### Fix
+
+Land one formatting-only commit on `main` that makes the tree clean, so `cargo fmt` becomes
+a no-op for everyone and this whole hazard disappears. It has not been done because such a
+commit conflicts with every branch in flight — it needs a quiet moment, not a fix.
+
 ## Test suite flakes under parallel `cargo test`; needs `--test-threads=1`
 
 **Severity:** low (green when run serially; false failures otherwise).
@@ -846,35 +1688,63 @@ CI workflow at all, so nothing enforces it today.)
 Have env-mutating tests set state via a scoped guard that restores on drop and is held across
 every read, or move them behind a single serial test harness.
 
-### A second, distinct flake: `lock_records_our_pid_and_releases_on_drop` (2026-07-26)
+## `lock_records_our_pid_and_releases_on_drop` flakes at ~5–8%, independent of test threads
 
-`review::tests::lock_records_our_pid_and_releases_on_drop` (`cli/src/review.rs:2311`) fails
-intermittently at `cli/src/review.rs:2326` with `released lock must be free` — `try_take_lock`
-returns `Ok(None)` (WouldBlock) for a lock the test just dropped.
+**Severity:** low as a bug, higher as a process hazard — it fails the nix build, so it can
+break `home-manager switch` for an unrelated change, and a *green* nix build is therefore not
+evidence the test is sound.
+**Found:** 2026-07-26, twice and independently: during task 3 of run `phase-reap`, and on
+`52db1cd`.
 
-**It is NOT the env-pollution cause above**, despite also being parallelism-only. The test
-locks `tmp.path().join("server.pid")` under a `tempfile` root and never reads `XDG_DATA_HOME`,
-so no other test can name that path — its own doc comment (`cli/src/review.rs:2306-2309`)
-already claims immunity to the env flake, and that claim holds. Something else releases late.
+### Symptom
 
-Measured 2026-07-26 on `52db1cd`:
+```
+---- review::tests::lock_records_our_pid_and_releases_on_drop stdout ----
+panicked at src/review.rs:2326:14: released lock must be free
+```
+
+The test (`cli/src/review.rs:2311`) claims the server lock on `tmp.path().join("server.pid")`
+in its own fresh `tempfile::tempdir()`, drops the `File`, and re-claims it. Intermittently the
+second `try_take_lock` comes back `Ok(None)` (`TryLockError::WouldBlock`) for a lock it just
+released.
+
+### Measured
 
 | how it was run | result |
 |---|---|
+| `cargo test lock_records_our_pid` alone | 100% green |
 | the `lock_*` tests alone, 25 consecutive runs | 25/25 green |
-| the whole `--bin drovr` suite, 12 consecutive runs | **1/12 red** |
+| the whole `--bin drovr` suite, 12 consecutive runs (`52db1cd`) | **1/12 red** |
+| `cargo test --bin drovr`, 30 consecutive runs (`8173f03` / `310fa7f`) | **2/30 red** |
+| the same tree with task 3's changes applied, 45 runs | ~3/45 red |
 | nix sandbox build of `52db1cd` (`home-manager switch`) | red once, green on immediate retry |
 
-**Hypothesis, not yet confirmed:** an fd inheritance window. `flock(2)` locks belong to the
-open file description, which survives `fork`, so a concurrently-spawning test (several here
-start real servers) transiently holds an inherited copy of this fd between its `fork` and its
-`exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops it at `exec` — which is
-exactly why the window is narrow and the failure rare. Confirming it means tracing whether the
-red runs coincide with a process spawn; that has not been done.
+The rate is the same with and without task 3's changes, so it is **not** caused by anything
+task 3 did. It passes 100% when run alone, so it is a whole-suite interaction, not a bug in
+`try_take_lock`'s logic.
 
-**Cost:** it fails the nix build, so it can break `home-manager switch` for an unrelated
-change. A retry is the workaround — the failure does not reproduce twice in a row. Note this
-means a *green* nix build is not evidence the test is sound.
+### It is NOT the env-pollution flake above
+
+That one is `XDG_DATA_HOME` pollution across parallel tests. This test touches no
+process-global env and locks a path under a `tempfile` root that no other test can name — its
+own doc comment (`cli/src/review.rs:2306-2309`) already claims immunity to the env flake, and
+that claim holds. Both are parallelism-only; they are different causes. Something else
+releases late.
+
+### Hypothesis, not yet confirmed
+
+An fd inheritance window. The lock is `std::fs::File::try_lock`, whose Unix release is per
+open-file-description, and an open file description survives `fork` — so a concurrently
+spawning test (several here start real servers) transiently holds an inherited copy of this fd
+between its `fork` and its `exec`. Rust sets `O_CLOEXEC` on files it opens, so the child drops
+it at `exec`, which is exactly why the window is narrow and the failure rare. Confirming it
+means tracing whether the red runs coincide with a process spawn; that has not been done.
+
+### Workaround
+
+Re-run — the failure does not reproduce twice in a row. Before believing a red `cargo test`,
+check whether the ONLY failure is this test. That habit is also how real regressions hide,
+which is why this is written down rather than tolerated.
 
 ## Session mirror shows raw terminal chrome, not clean conversation content
 
@@ -1036,12 +1906,12 @@ main checkout for the rest of the run.
    path is already in hand.
 2. Add a `drovr path <run>` helper that emits the worktree path alone, so the instruction is
    copy-pasteable and scriptable rather than something the driver reconstructs from a sentence.
-   **The demand for this is already on the page, and so is the bug:** the pre-token `phase wait`
-   entry above offers `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in `5beb62f`),
-   but there is no `path` subcommand — `drovr path` exits with "unrecognized subcommand", and
-   `cli/src/main.rs`'s `Commands` enum has no `Path` variant — so that command does not run today.
-   Either add the helper or rewrite that line against `<run_dir>`. **Task 7's docs pass owns it**;
-   left unedited here because this change is scoped to the worktree gap.
+   **The demand for this was already on the page, and so was the bug:** the pre-token `phase wait`
+   entry above offered `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in
+   `5beb62f`), but there is no `path` subcommand — `drovr path` exits with "unrecognized
+   subcommand", and `cli/src/main.rs`'s `Commands` enum has no `Path` variant. **That line is now
+   written against the run dir directly**, so nothing on this page prescribes a command that does
+   not exist. The helper itself is still unbuilt, and still worth building.
 
 Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
 making the documented step harder to miss, not a substitute for it.
@@ -1238,34 +2108,44 @@ as verified.
    zombie a fact about the run rather than something re-derived from herdr on every poll.
    (2) is the stronger fix: it survives herdr being down entirely.
 
-## Restoring an archived run does not make it runnable again
+## Restoring an archived run does not make it runnable again — FIXED 2026-08-02
 
 **Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
 expectation.
 **Found:** 2026-07-25, re-reviewing the archive button.
+**Fixed:** 2026-08-02 by fix idea 1 below — `phase_start` now re-provisions a workspace that
+is gone (`phase::ensure_workspace`), so Restore does mean what it looks like it means. The
+archived run's *panes* are still gone: a phase that was `Running` when it was archived comes
+back `Failed` and has to be restarted. See "A run whose herdr workspace disappears is
+unrecoverable through drovr's own commands" at the end of this file.
 
-`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — clears the flag
-and moves the row back to the active list. It cannot bring the agent back: archiving closed
-the run's herdr workspace, and nothing recreates one. `phase_start` (`cli/src/phase.rs`) only
-reuses a recorded `pane_id`, then `root_pane`, then `tab_create` against the run's existing
-`workspace` id; all three are dead after a close, and the only code that creates a workspace
-is `cmd_new`. So `drovr phase start` on a restored run fails.
+### What it used to do (before 2026-08-02)
+
+`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — cleared the flag
+and moved the row back to the active list, but could not bring the run back: archiving closed
+the run's herdr workspace and nothing recreated one. `phase_start` only reused a recorded
+`pane_id`, then `root_pane`, then `tab_create` against the run's existing `workspace` id; all
+three are dead after a close, and the only code that created a workspace was `cmd_new`. So
+`drovr phase start` on a restored run failed. Continuing meant a new run seeded from the
+handoff.
 
 One exception, and it is exactly the row the UI flags as anomalous: a ZOMBIE — archived while
 `workspace_close` failed — still has a live workspace and live panes recorded. Restoring one
-and running `drovr phase start` should reuse them and work. The blanket "restore does not make
-it runnable" is therefore wrong for the one case where the run was never really torn down.
+and running `drovr phase start` reused them and worked, then as now.
 
-The run's artifacts survive (spec, handoffs, branch), so the work is not lost — but continuing
-it means a new run seeded from the handoff, not a restore.
+### What it does now
 
-### Fix ideas
+Restore clears the flag; the next `drovr phase start` finds no live workspace and builds one
+(`phase::ensure_workspace`), in the run's `project_dir`, writing the new ids back. The panes
+are still gone, so a phase that was `Running` when it was archived comes back `Failed` and has
+to be restarted — Restore recovers the run, not its agents.
 
-1. Have `phase_start` create a fresh workspace when the recorded one is gone, and write the new
-   id back to `state.json` — makes Restore mean what it looks like it means.
-2. Or rename the control to something that does not imply resumability, and have it clear
-   `workspace`/`root_pane`/`pane_id` so the failure is a clean "no workspace" error rather than
-   a herdr rejection.
+**Restore is required, not optional.** `ensure_workspace` refuses to re-provision a run that is
+still `archived`: the destroyed workspace used to be the only thing enforcing that decision,
+and a repair that silently overrode it would start a live agent on a run the UI shows as filed
+away. `drovr phase start` on an archived run therefore says so and names the Restore button.
+`code_review_run` has its own archived check, and that one is now load-bearing for the same
+reason.
 
 ## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
 
@@ -1331,11 +2211,23 @@ our copy; the general fix is the compare-and-swap or lockfile already proposed a
 
 Two consequences worth knowing:
 
-1. The `|=` merge (rescue false→true, never true→false) is deliberately defensive but
-   currently unreachable: every caller reaching it has `archived == false` in memory, because
-   `code_review_run` refuses archived runs up front. Changing it to `=` passes the whole
-   suite. It is kept as `|=` because a future writer that legitimately holds `true` should
-   not have it cleared, but no test defends that and none can until such a writer exists.
+1. **The `|=` merge could undo a Restore — FIXED 2026-08-02, it is now `=`.** This paragraph
+   used to say the merge was unreachable "because `code_review_run` refuses archived runs up
+   front"; that is only true of runs archived *before* the panel starts.
+   `archiving_mid_run_survives_every_save_the_review_makes` (`cli/src/code_review.rs`) pins the
+   case that gets past it: the human archives while the panel is in flight,
+   `spawn_reviewer`'s trailing `save_preserving_archived` reads `true` off disk, and the
+   caller's copy is latched `true` for the rest of its life. If the human then hit Restore, the
+   panel's next save ORed the live `false` with that stale `true` and wrote `archived: true`
+   back — silently re-archiving a run they had just restored.
+
+   Fixed by making the rule one rule: **`state.json` is the authority for `archived`**, stated
+   on the field in `cli/src/run.rs`. `save_preserving_archived` now ADOPTS disk's value rather
+   than merging it, so it is wrong in neither direction, and every site that *consults* the
+   flag calls `RunState::refresh_archived`, which re-reads, adopts, and returns it — so no
+   caller can act on one answer and then write a different one. Nothing is lost by the change:
+   a caller that has *decided* to archive or restore owns the field and uses plain
+   `save`/`save_in`, which write it verbatim.
 2. The re-read swallows a load error (`if let Ok(disk)`), then `save` does `create_dir_all`.
    If `drovr cleanup --purge` deletes the run directory while a review is blocked, the
    eventual save recreates a `state.json` for a run the human explicitly deleted. This
@@ -1619,6 +2511,23 @@ is a natural thing to do and silently voids every one of those tables.
 This is the inverse of the danger the skill already names. `drovr:pipeline` warns "Only exit 0 is
 approval. A non-zero exit is never an approval" — the observed failure is an **exit 0 that is not
 an approval**, which no existing guidance covers.
+
+### Also hit on `code-review run` (2026-07-26, run `m3-schema-dos`)
+
+Same trap, different command, and it produced a **false clean review**. The driver ran
+
+```
+drovr code-review run m3-schema-dos schema-dos-fix --timeout-ms 540000 2>&1 | tail -30
+```
+
+The harness reported exit 0; the driver read that as the skill's "exit 0 clean" and told the human
+the panel had come back clean. The real status was **2 (timeout)** with `0 of 4 angles finished` —
+no angle had reviewed anything. Re-running as `cmd > log 2>&1; echo "DROVR_EXIT=$?"` showed
+`DROVR_EXIT=2` immediately.
+
+So the hazard is not specific to `review wait`: for `code-review run` the misread is arguably worse,
+because exit 0 there means "reviewed and clean" rather than merely "approved", so a piped invocation
+can certify unreviewed code.
 
 ### Workaround
 
@@ -2011,3 +2920,463 @@ That lock is the *only* check. `server.addr` is read solely to put a URL in the 
   hatch that could itself cause the split brain. Any second signal needs to identify *which*
   server answered (e.g. a per-server nonce in the response and in a discovery file), not just
   that something did.
+
+## A run whose herdr workspace disappears is unrecoverable through drovr's own commands (2026-08-02) — FIXED
+
+**Severity:** high — it made a live 23-task run at task 3 (approved spec, plan, two tasks of
+committed work) reachable only by hand-editing `state.json`, and the command built for
+recovery reported a resume it had not restored.
+**Found:** 2026-08-02, driving `skill-stickiness`.
+
+### What happened
+
+1. The driver closed the last remaining pane in workspace `wAG` while reaping finished
+   reviewer panes. herdr destroys a workspace when its final pane closes — reasonable of
+   herdr, and `drovr cleanup` does the same thing on purpose.
+2. `state.json` still read `"workspace": "wAG"`. Nothing validated it.
+3. `drovr phase start` failed with the raw daemon error:
+   `phase start failed: workspace wAG not found (herdr error code: workspace_not_found)`.
+4. `drovr resurrect skill-stickiness` printed the full phase list and
+   `To resume: drovr phase start 'skill-stickiness' 'implement'` — **an instruction that
+   could not work**, because `resurrect` never touched the workspace. This is the part worth
+   dwelling on: a recovery command that reports success it did not achieve is worse than one
+   that errors, because the next failure lands somewhere unrelated and you go looking there.
+5. Clearing `workspace` to `null` by hand produced a different refusal:
+   `run '…' has no herdr workspace (creation failed at drovr new); please recreate the run
+   with drovr new` — advice that would have discarded everything the run had produced.
+
+### The near-miss, if you are recovering by hand
+
+Recovery required calling `herdr workspace create` directly. **The first attempt omitted
+`--cwd`, so the new workspace's pane opened in an unrelated repository**
+(`~/devel/modular`, on someone else's branch). Nothing about the pane says so; it is a shell
+prompt like any other. It was caught only because the driver checked the pane's cwd before
+briefing an agent into it. One step later a phase agent would have been reading, editing and
+committing in the wrong repo, believing it was in the run's worktree.
+
+So: **always pass `--cwd <the run's project_dir>`**, and check `pwd` in the pane before you
+brief anything into it.
+
+### Digging out by hand (older binaries)
+
+```
+herdr workspace create --label 'drovr:<run>' --cwd "$(jq -r .project_dir ~/.local/share/drovr/runs/<run>/state.json)"
+```
+
+Then edit `~/.local/share/drovr/runs/<run>/state.json`: set `workspace` to the new id,
+`root_pane` to the new workspace's root pane id, drop every `pane_id` in `phases` and
+`review_phases` (they name panes that no longer exist), empty `retired_panes`, and change any
+`"status": "Running"` to `"Failed"` — those agents are gone with their context.
+
+### What changed
+
+`phase::ensure_workspace` (`cli/src/phase.rs`) now runs at the three points that actually
+need a workspace — `phase_start`, `spawn_reviewer` and `resurrect`. If `Herdr::workspace_exists`
+reports the recorded workspace gone (or none was ever recorded), it creates a replacement,
+**always with the run's `project_dir` as cwd**, and writes the new ids back. `resurrect` either
+restores the workspace or exits non-zero; it no longer prints a resume it cannot deliver.
+"Recreate the run" is no longer the advice for a lost workspace anywhere.
+
+### What is still true
+
+- **drovr does not stop a workspace from being emptied.** Holding the root pane open would
+  make this rarer, but it is a second, weaker mechanism beside the authoritative one and it
+  leaves an idle pane behind after `cleanup`. Re-provisioning is the guarantee; there is
+  deliberately no backstop.
+- **A phase that was `Running` becomes `Failed`, not respawned.** Its agent died with the
+  workspace, taking its context. Restart the one you want — silently respawning would present
+  work nobody is doing as still in flight, which is the same lie `resurrect` used to tell.
+- **`workspace_exists` is biased toward alive**, like `pane_exists`: only a workspace listing
+  herdr actually answered proves death. An unreachable daemon reads as "still there", because
+  re-provisioning over a live workspace would orphan the run's own agents.
+- **A repair must not decide what the human decided.** `ensure_workspace` refuses to
+  re-provision a run that is `archived` — the destroyed workspace was, before this change, the
+  only thing enforcing that decision, and repairing it silently would start a live agent on a
+  run the UI shows as filed away. Restore first. It consults the flag through
+  `RunState::refresh_archived`, which re-reads `state.json` (**the authority — see the field's
+  doc in `cli/src/run.rs`**) and adopts what it finds, so the save at the end of the repair
+  cannot write a stale value back over the human's decision. An unreadable `state.json` refuses
+  the repair rather than falling back to the copy in hand: a read error is not evidence that a
+  run is un-archived.
+- **A replacement workspace that cannot be recorded is closed again.** The id only exists once
+  herdr has created it, so it cannot be persisted first. If the save then fails,
+  `ensure_workspace` closes the workspace it just made and returns an error saying the repair
+  was rolled back — otherwise `state.json` would still name the dead workspace (so the next
+  attempt makes a *second* replacement) while the first stood in the switcher with nothing
+  pointing at it. If the close also fails, the message names the id and the label to close by
+  hand.
+- **A run with no `project_dir`** (created before that field existed) still cannot be repaired
+  — there is no cwd to open a workspace in. The error names that field and its path rather
+  than telling you to start over. Every site that refuses for this reason now raises the same
+  sentence (`phase::missing_project_dir_error`), pinned by a test, because the earlier
+  wording — "please recreate the run with `drovr new`" — was the same bad advice in a
+  different place.
+- **The repair is a check-then-act with no lock**, and `state.json` has no locking or
+  compare-and-swap anywhere (see "`drovr cleanup` can clobber a concurrent `state.json`
+  write"). Two drovr processes acting on one run at the same instant can both find the
+  workspace gone and both create a replacement; the loser is never recorded in `state.json`,
+  so nothing reaps it and it keeps a live agent process. It needs two concurrent writers on
+  one run, which the single-writer discipline forbids, and locking only this one site would
+  imply a guarantee the rest of the file does not make. If you suspect it: the orphan is
+  labelled `drovr:<run>` like its twin, so look for two workspaces with the same label in
+  herdr's switcher and close the one whose id is not in `state.json`.
+
+## opencode's project config is a poor place for drovr's MCP server, and it is the only place (2026-08-03)
+
+**Severity:** medium — three sharp edges, all inherent to the backend rather than bugs in
+drovr. They are recorded here because each one looks like a drovr fault from the outside.
+**Found:** 2026-08-03, adding the opencode backend. Probed against opencode 1.18.3.
+
+### Why the server goes in `opencode.json` at all
+
+opencode has no per-launch MCP flag, so a reviewer's findings server has to arrive through a
+config file. There are two candidate files and the tidier one is wrong:
+
+- **`OPENCODE_CONFIG=<path>` works** — it names an external file and *merges* it over the
+  global config, leaving providers and credentials intact (probed: `opencode debug config`
+  with the var set still resolves `provider`). It would keep drovr's plumbing entirely out of
+  the checkout.
+- **But it merges with the repository's own `opencode.json` rather than displacing it.**
+  Probed directly: a project `opencode.json` declaring `repo-injected` plus an external file
+  declaring `drovr-env-probe` resolves to *both* servers. A repository under review could
+  therefore hand extra tools to a read-only reviewer, which is the exact thing
+  `write_mcp_config` exists to prevent (see its "Why it replaces rather than merges").
+
+So drovr writes the project's `opencode.json`, replacing it, which is what strips
+repo-injected servers — the same mechanism and the same backup/exclude/symlink guards as
+cursor's `.cursor/mcp.json`.
+
+**And the same merge makes the config environment a hole in that replacement, not
+just a road not taken.** An inherited value puts the servers straight back, whatever
+drovr wrote to the project file. Replacing `opencode.json` is only the last word on
+the subject if nothing else is speaking — and **four** things can speak. All probed
+against 1.18.3 with `opencode debug config`, against a project file already holding
+drovr's server:
+
+| variable | what it does | probed result |
+| --- | --- | --- |
+| `OPENCODE_CONFIG` | names another config file | its server resolves *alongside* `drovr-findings` |
+| `OPENCODE_CONFIG_CONTENT` | inline JSON | same — `['drovr-findings', 'injected']` |
+| `OPENCODE_CONFIG_DIR` | another directory to read one from | same — `['dirinjected', 'drovr-findings']` |
+| `OPENCODE_PERMISSION` | sets the permission block wholesale | overrides the other half of what drovr writes |
+
+So a read-only opencode launch is composed as
+`env -u 'OPENCODE_CONFIG' -u 'OPENCODE_CONFIG_CONTENT' -u 'OPENCODE_CONFIG_DIR' -u
+'OPENCODE_PERMISSION' opencode --agent plan …` (`AgentSpec::readonly_env_unset`).
+Shutting one door is not a guard; if opencode grows a fifth, this list grows with it.
+Verified: with `OPENCODE_CONFIG` pointing at a file declaring its own server, the
+unset launch resolves to drovr's server alone.
+
+Two things follow, both pinned by tests. A user's own `readonly_env_unset` **unions**
+with the built-in list rather than replacing it — the built-in vars are an invariant
+of the backend, so `readonly_env_unset = ["HTTP_PROXY"]` is not consent to stop
+clearing `OPENCODE_CONFIG`. And writer phases keep every one of them: drovr does not
+replace `opencode.json` for them, so there is no guarantee to protect and clearing
+them would break a user who points one at their real provider config.
+
+### `--agent plan` is a definition the repository can overwrite — so `.opencode/` moves too
+
+This is the one structural difference between opencode and the other two backends, and
+it is worth stating plainly because it is easy to assume away. claude's
+`--permission-mode plan` and cursor's `--mode plan` are **CLI flags**: the code under
+review cannot reach them. opencode's `--agent plan` names an **agent definition**, and
+a repository can commit its own.
+
+Probed against 1.18.3, with drovr's `opencode.json` (`agent.plan.permission.edit =
+"deny"`) already in place, plus a repo-committed `.opencode/agent/plan.md` declaring
+`permission: edit: allow`:
+
+```
+edit rules in resolution order (last wins):
+  {"permission":"edit","pattern":"*","action":"deny"}                  <- opencode's stock plan agent
+  {"permission":"edit","pattern":".opencode/plans/*.md","action":"allow"}
+  {"permission":"edit","pattern":"…/plans/*.md","action":"allow"}
+  {"permission":"edit","action":"allow","pattern":"*"}                 <- THE REPOSITORY'S
+```
+
+drovr's `deny` is **not in the list at all** — the repo's file replaced the definition
+drovr was amending — and the repo's `allow` is last. Separately, `.opencode/plugin/*.js`
+from the checkout loads as arbitrary JavaScript in the reviewer's own process, and
+`--pure` did not drop it from the resolved plugin list.
+
+So `code_review` moves the whole `.opencode/` aside before spawning an opencode panel.
+Which paths, per backend, is `AgentSpec::readonly_displace` — beside
+`readonly_env_unset`, since both answer the same question ("what does a read-only
+launch have to be kept away from?") and both union rather than replace on override.
+Four things about that, each deliberate:
+
+- **The whole directory, not the two subdirectories the probes convicted.** drovr
+  cannot know which parts of `.opencode/` confer capability in an opencode release it
+  has never seen, and a subdirectory whitelist would be a second description of
+  opencode's layout maintained inside drovr — the same drift that got the
+  `holds_more_than_drovrs_server` key whitelist deleted. One rule survives the next
+  version; a list of exceptions does not.
+- **It never deletes, and neither does the config replacement beside it.** This is the
+  sharp edge, and the first version got it wrong twice — the same wrong inference in
+  two places. The first version:
+  it read "the `.drovr-backup` slot is already occupied" as "drovr displaced this on an
+  earlier pass" and removed the live directory on that evidence. But the repository
+  chooses the contents of the checkout *including the name drovr backs up to*, so a
+  committed `.opencode.drovr-backup` decoy made the very first review of a repo delete
+  the user's real `.opencode/` with no backup at all. The occupant of a backup slot is
+  evidence of nothing. `write_mcp_config` had the identical bug one line over: on an
+  occupied slot it skipped the rename and overwrote the **live** project config, so a
+  committed `opencode.json.drovr-backup` (or `.cursor/mcp.json.drovr-backup`) silently
+  discarded the user's config file. Both now allocate the next free
+  `<path>.drovr-backup[.N]`, and the only operation on a path drovr does not own is
+  `rename`. That is also why both git-exclude entries are globs: the backup name is
+  not fixed.
+
+  A related trap in the same family: a `readonly_displace` entry is *renamed*, so
+  "inside the project" is not a strong enough check on it. A lone `.` is relative and
+  has no `..`, yet resolves to the checkout root — drovr would move the whole
+  repository aside. `validate_project_relative` therefore requires every component to
+  be an ordinary name, which rejects the absolute, the traversing and the
+  root-resolving cases with one rule.
+- **It does not restore.** A `Timeout` outcome leaves reviewers alive and the panel
+  resumable, so putting the directory back at the end of a pass would re-arm the hole
+  under a reviewer still reading.
+- **It re-runs immediately before *each* reviewer spawns, not once per pass.** The
+  angles launch one after another, so the first reviewer is already live in the
+  checkout while the last is still being launched. Note the invariant this does and
+  does not give you: "`.opencode/` does not exist afterwards" is not achievable —
+  anything running in the checkout can re-create it a microsecond after any check.
+  What holds is that **every reviewer is launched with the path displaced immediately
+  beforehand**. A repository that keeps re-creating it just accumulates numbered backup
+  slots, which is why the git-exclude entry is the glob `.opencode.drovr-backup*`.
+
+`.opencode/` is a real directory in real repositories (commands, skills, plans), so a
+review will move it and leave it moved. That is the cost of running a read-only
+reviewer on a backend whose read-only mode lives inside the checkout.
+
+### The three edges
+
+- **`opencode.json` is far more likely to be a *tracked* file than `.cursor/mcp.json`.**
+  `.git/info/exclude` does not untrack anything, so on a repo that commits its opencode
+  config the replacement shows up as a *modified* file — inside the working tree the seed
+  explicitly tells reviewers to read ("the change under review is `git diff base..head`
+  **plus** the current working tree"). Reviewers can see, and may report on, drovr's own
+  plumbing. The original is at `opencode.json.drovr-backup`.
+- **`--agent plan` is `ask`, not `deny`.** opencode's stock plan agent sets edits *and* bash
+  to `ask`. An "ask" in an unattended reviewer pane is a hang, not a refusal, and it presents
+  as a reviewer that simply never reports. drovr writes `agent.plan.permission` alongside the
+  server — `edit: deny`, `bash: allow` — to turn that into a real stance. Verified with
+  `opencode debug agent plan`: drovr's two rules land last in the resolved rule list.
+  `bash: allow` is deliberate, not an oversight: the seed sends reviewers to `git diff` and
+  the repository's tests. It leaves opencode exactly as strong as cursor's `--mode plan` —
+  writes through the editing tools are refused, writes through a shell are not.
+- **Plan mode can still write plan files** (with `.opencode/` displaced, into a
+  directory drovr just moved). The resolved plan agent allows `edit` on
+  `.opencode/plans/*.md` and on `~/.local/share/opencode/plans/*.md`. That is the same shape
+  as the cursor finding above ("A read-only cursor reviewer can park at plan mode's 'Ready to
+  build?' gate"): a reviewer that decides to save a plan writes a file *into the checkout
+  under review*, and drovr does not exclude that path. Nothing depends on it — the findings
+  channel is the MCP tool — but do not read `.opencode/plans/` appearing mid-review as
+  corruption.
+
+### The thing that is NOT a problem
+
+opencode's argument parser accepts unknown options silently (`opencode --bogusflag123 -v`
+exits 0), so a made-up workspace flag would compose a command that *looks* pinned to the
+project and runs unpinned. opencode names its project positionally, and `WorkspaceArg`
+models that directly rather than inventing a flag — see the enum's doc in `cli/src/config.rs`.
+## A ONE-angle panel can reuse a review iteration, and inherit the dead reviewer's verdict
+
+**Severity:** low — unreachable with the default four angles, and it needs a failing
+`clear_findings_file` on top of that. Written down because it is a *decision* (not to widen the
+fix), not an oversight.
+**Found:** 2026-08-03, by analysis during task 6 of run `phase-reap`, while checking a claimed
+"`review_phases` is append-only" invariant. **The invariant is false**, which is the more useful
+half of the finding.
+
+### The claim that turned out to be wrong
+
+`next_iter` (`cli/src/code_review.rs`) is `max(existing iteration)+1` over `run.review_phases`,
+and it was believed safe because that list only grows. It does not: `code_review_run`'s resume
+path does `run.review_phases.retain(|p| p.name != phase)` before respawning an angle in place.
+
+What actually protects the counter is two other things.
+
+1. **Arity.** The retain removes ONE angle's entry immediately before its respawn. With ≥2
+   configured angles (the default is 4), the other entries of that iteration keep `max` where it
+   is even if the spawn then fails and `?` propagates.
+2. **Ordering.** `clear_findings_file` runs *before* `spawn_reviewer`, so on the one path that
+   prunes, that angle's findings file is already gone. Even where an iteration number were
+   reused, there would be no stale verdict left to harvest.
+
+### The residual hole
+
+With **exactly one** configured angle, a resume whose `clear_findings_file` **fails**:
+
+- `?` propagates with the entry already removed from `review_phases`;
+- the removal is persisted anyway — `main.rs`'s `merge_panel_progress` runs on every path
+  including the `Err` early-exit, and it *assigns* `review_phases` rather than merging it;
+- the old `<task>-review-<iter>-<angle>.json` is still on disk, because clearing it is what
+  failed.
+
+`next_iter` then returns that same iteration, and the replacement panel can be credited with the
+dead reviewer's verdict.
+
+### Working around it
+
+Configure more than one angle. `angles` defaults to four; a single-angle config is the only way
+in, and there is no reason to run a one-angle panel except to save tokens on a trivial change.
+
+### Why it was not fixed
+
+Both candidate fixes make the code worse than the hole. Retaining the entry until the respawn
+succeeds means a live pane no phase records if the respawn fails — the immortal-pane bug this
+branch spent three tasks closing. Deriving the iteration from something other than
+`review_phases` means a second source of truth for the counter. A test would either re-test
+`next_iter` (the multi-angle case) or enshrine the subtlety (the single-angle one). If it is ever
+worth closing, the shape to look at is making the counter monotonic on disk rather than derived.
+
+## herdr's "polling is degraded" diagnostic fires on a reap's EXPECTED path
+
+**Severity:** low (cosmetic, but it reads as a fault during a supported repair).
+**Found:** 2026-08-03, task 6 of run `phase-reap`.
+
+### Symptom
+
+Reaping a phase whose pane herdr has already lost — `drovr phase reap <run> <phase>`, or the
+retired-pane sweep re-probing a pane a previous sweep closed — prints:
+
+```
+drovr: herdr's pane.get failed for pane <id>: <err>. Agent status polling is degraded —
+phase sends and waits will run to their timeouts with no other explanation. (A pane that has
+been closed reports this too.)
+```
+
+Nothing is wrong. That is the `Gone` path, and `Gone` is exactly what authorises the reap to
+clear the registration. The command then succeeds.
+
+### Why
+
+`Herdr::pane_info` (`cli/src/herdr.rs`) reports a failed `pane.get` once per pane per process,
+because for its original caller — `phase_send`'s readiness gate and `phase_wait` — a silent
+`None` means an unexplained timeout on a healthy agent. Reaping asks the same question for the
+opposite reason: it *wants* to hear that the pane is gone. The diagnostic cannot tell the two
+callers apart, so it warns for both. The parenthetical was added for exactly this, and is not
+enough — the sentence before it still says "degraded".
+
+### What NOT to do
+
+Do not loosen the gate. It exists for a real failure (herdr unreachable, or a response shape
+drovr cannot read) that is otherwise invisible, and the reap path is the one place where its
+false positive is harmless. If it is worth fixing, the fix is a caller-supplied expectation —
+`pane_info` told that "gone" is an acceptable answer here — not a quieter diagnostic.
+
+## `cargo clippy -D warnings` is not a gate, and counting its findings is not straightforward
+
+**Severity:** medium as a process hazard — the task briefs on run `phase-reap` named
+`cargo clippy --all-targets -- -D warnings` as a per-task gate, and it has never passed on
+`main`, so every task either ignored the gate or would have had to fix unrelated code to meet it.
+**Found:** 2026-07-26 (task 1 of run `phase-reap`); decided 2026-08-04 (task 7).
+
+### The decision
+
+**The gate is PARITY, not zero: a branch must introduce no new finding.** Fixing the baseline is
+a separate, deliberate change and is not any task's to absorb — the same reasoning as the
+`cargo fmt` entry above, whose formatting-only commit conflicts with every branch in flight.
+`cargo fmt` is not run at all on this repo; clippy is run, and compared.
+
+Compare the **sets**, not the counts. Line numbers move as code does, so a finding is
+pre-existing if the same lint already fired in the same file at base. Measured for run
+`phase-reap`: base (`377dff0`) has **10**, the branch head has **8** — two fewer, because code
+carrying a `collapsible_if` and a dead-code warning was rewritten. Nothing new was added.
+
+### Measuring is subtler than it looks
+
+Two traps, and the naive count hits both.
+
+1. **Cargo does not re-emit warnings for targets it did not recompile.** A warm run silently
+   under-reports: on this branch, touching only `src/main.rs` reported **4** findings where a
+   cold run reports **8**. A number that changes with the cache is not a number.
+2. **One source-level warning is reported once per compilation target.** `cli/src/*.rs` compiles
+   as both `bin "drovr"` and `bin "drovr" test`, which is what the
+   `warning: drovr (bin "drovr") generated 1 warning (1 duplicate)` summary lines mean.
+
+Force a full re-check and dedupe by source location:
+
+```sh
+cd cli
+touch src/*.rs tests/*.rs        # or: CARGO_TARGET_DIR=$(mktemp -d)
+cargo clippy --all-targets --message-format=short 2>&1 |
+  grep ': warning: ' | sort -u
+```
+
+`--message-format=short` emits one `file:line:col: warning: …` line per finding, so `sort -u`
+collapses the per-target duplicates. Verified stable across a warm run and a cold one (fresh
+`CARGO_TARGET_DIR`), and against a scratch export of `main`.
+
+### Fix
+
+Land one clippy-only commit on `main`. Ten findings — four `manual_split_once`, two
+`chunks_exact`, two `collapsible_if`, one dead method, one `&PathBuf` — all mechanical, all with
+a suggested rewrite. Like the `cargo fmt` cleanup it wants a quiet moment rather than a branch
+that happens to notice, and until then the parity rule above is the gate.
+
+## A phase whose agent never took a turn records a session id that cannot be resumed (2026-08-04)
+
+**Severity:** low — hard to reach, nothing is lost, and the pane is kept. It costs the operator
+one confusing exit 2 during a repair.
+**Found:** 2026-08-04, the final live verification of run `phase-reap`, on a throwaway run
+`reapcheck` against the release build of that branch.
+
+### Symptom
+
+A reaped phase advertises `rehydratable: true, resumable: true` — the UI shows ⟳ — and
+`drovr phase rehydrate <run> <phase>` comes back `Incomplete(ResumeUnobserved)`, exit 2. Reading
+the restored pane shows claude answering the resume with:
+
+```
+No conversation found with session ID: a143f094-0973-48ae-98ff-46ceea6ecc69
+```
+
+Observed end to end: `drovr phase start reapcheck brainstorm --no-brief` spawned the pane, herdr
+reported `agent_session.value = a143f094-…` almost immediately, and `phase wait` captured it into
+`state.json` as `pane_agent.session` — correctly, by design. The agent was then **never
+prompted**. The phase was completed and superseded, the reap closed its pane (`reaped: true`), and
+the rehydrate relaunched with `claude … --resume 'a143f094-…'` against a session claude had no
+record of.
+
+The exit 2 and the kept pane are the *correct* behaviour — `ResumeUnobserved` surrenders nothing,
+precisely because a slow session id is indistinguishable from a failed resume. The gap is that
+here the resume really had failed, for a knowable reason, and the operator is told "that is not
+proof the resume failed".
+
+### Root cause
+
+herdr surfaces a session id as soon as the agent process is up; claude writes the conversation
+transcript (`<session-id>.jsonl`) only once the session has content. Confirmed both ways on the
+same run: no transcript existed for the never-prompted agent, and one did exist for a phase that
+had taken a single turn. So there is a window in which drovr records — truthfully — a session id
+that `--resume` cannot resolve.
+
+### How narrow it is
+
+Reaping only ever targets a phase that reached `Done`, and a phase does not normally reach `Done`
+without its agent doing work. The routes in are the unusual ones: a phase completed manually
+through the `DROVR_PASS` escape hatch, or an explicit `drovr phase reap` on a phase whose seed was
+never delivered — and `drovr phase send` now detects a swallowed seed, so that second case is
+visible rather than silent.
+
+**Rehydrate itself works.** The contrasting case was verified on the same run: a phase that had
+taken exactly one turn (session `04fa2210-0cfe-4b11-825e-299b3aa14bcd`) was reaped and rehydrated
+to exit 0, *"resumed with its recorded session"*, with the marker string from the original
+conversation still in the restored pane and herdr reporting the same session id afterwards. This
+entry is only about the never-had-a-conversation window.
+
+### What to do
+
+The pane is kept, so read it — `herdr pane read <pane>` shows the "No conversation found" line,
+which is what distinguishes this from a session id that is merely slow to surface. Then
+`drovr phase reap <run> <phase>` clears the registration, and the phase can be re-seeded from its
+handoff.
+
+### Why it is not fixed
+
+The honest fix would be for drovr to distinguish "session id known" from "session resumable", and
+it cannot check the second without reaching into claude's storage layout. Guessing instead — a
+heuristic under the authoritative flag — would make the ⟳ look trustworthy when it is not. The
+current message is truthful about what drovr observed; this entry supplies what it cannot.

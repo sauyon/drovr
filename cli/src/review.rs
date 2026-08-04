@@ -364,7 +364,11 @@ fn safe_component(s: &str) -> bool {
 /// A recorded base is a bare git object id (hex, ≤64 chars for SHA-256). Reject
 /// anything else so it can never be interpreted as a git rev-arg or flag when
 /// interpolated into `git diff <base>..HEAD`.
-fn safe_sha(sha: &str) -> bool {
+///
+/// `pub(crate)` because the review panel interpolates the SAME recorded file into the
+/// same shape of git command (`code_review::base_sha`) and must not grow a second,
+/// drifting opinion about what a base may contain. One validator, both call sites.
+pub(crate) fn safe_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -691,6 +695,9 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         // browser can answer numbered/arrow menus that `send` cannot drive.
         (Method::Post, "keys") => handle_post_keys(req, &p, url),
 
+        // POST rehydrate?phase=<name> — bring back a phase whose pane is gone.
+        (Method::Post, "rehydrate") => handle_post_rehydrate(req, &p, run, url),
+
         _ => respond_404(req),
     }
 }
@@ -699,42 +706,72 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 // Live session mirror (herdr read / prompt)
 // ---------------------------------------------------------------------------
 
-/// The pane that is this run's live agent session: the first phase still
-/// `Running` (with a pane), else the workspace root pane. `None` when the run
-/// has no live pane to mirror.
+/// The pane this run's live mirror follows — [`RunState::live_agent_pane`], the
+/// same answer `drovr attach` gets. `None` when the run has no live agent pane,
+/// which the endpoints render as 204 / "no live pane".
+///
+/// **Neither the workspace root pane nor an earlier phase's pane is a
+/// fallback.** The root pane once was, but only reachably so before the first
+/// `phase start`, because that phase then claimed it; phases now leave the idle
+/// shell alone for the whole run, so falling back would point the mirror at an
+/// `sh` prompt and present it as the run's agent. The earlier-phase fallback is
+/// refused for the reason spelled out on `live_agent_pane`. An empty mirror is
+/// honest; a stale one is not.
 fn active_pane(run: &RunState) -> Option<String> {
-    run.phases
-        .iter()
-        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id.is_some())
-        .and_then(|ph| ph.pane_id.clone())
-        .or_else(|| run.root_pane.clone())
+    run.live_agent_pane().map(|(_, pane)| pane.to_owned())
 }
 
-/// Every pane id that belongs to `run` (phases, review panels, root pane). The
-/// allow-list that gates `?pane=<id>` so a run-scoped endpoint can never be used
-/// to read or write an arbitrary herdr pane outside the run.
-fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    for ph in run.phases.iter().chain(run.review_phases.iter()) {
-        if let Some(pane) = &ph.pane_id {
-            set.insert(pane.clone());
-        }
-    }
+/// What a request wants to do with the pane it names, which decides which
+/// allow-list gates it — see [`run_writable_panes`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Every pane a run-scoped endpoint may READ: each phase pane, each reviewer
+/// pane, and the workspace's idle root shell. The allow-list that stops
+/// `?pane=<id>` from being used to reach an arbitrary herdr pane outside the run.
+fn run_readable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = run_writable_panes(run);
     if let Some(root) = &run.root_pane {
         set.insert(root.clone());
     }
     set
 }
 
-/// Resolve which pane a `/pane` or `/send` request targets. An explicit
-/// `?pane=<id>` is honored only when it belongs to `run` (else `None`); with no
-/// param, falls back to the run's [`active_pane`].
-fn resolve_pane(run: &RunState, url: &str) -> Option<String> {
+/// Every pane a run-scoped endpoint may WRITE (`/send`, `/keys`): the agent
+/// panes only — the root shell is excluded.
+///
+/// **This is not a privilege boundary.** Typing into a live claude pane is
+/// arbitrary code execution by design, so the unauthenticated server's reach is
+/// exactly what it was. It is a footgun guard: the root shell is a bare `sh`
+/// that now stays alive for the whole run, so a `/send` resolving there would
+/// execute the user's *prose* as a shell command instead of prompting an agent.
+fn run_writable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for ph in run.phases.iter().chain(run.review_phases.iter()) {
+        if let Some(pane) = ph.pane_id() {
+            set.insert(pane.to_owned());
+        }
+    }
+    set
+}
+
+/// Resolve which pane a `/pane`, `/send` or `/keys` request targets. An explicit
+/// `?pane=<id>` is honored only when it belongs to `run` under `access` (else
+/// `None`); with no param, falls back to the run's [`active_pane`], which never
+/// yields the root shell and so needs no further gating.
+fn resolve_pane(run: &RunState, url: &str, access: Access) -> Option<String> {
     match query_param(url, "pane") {
         // Pane ids contain a `:` (`w16:p3`), which the browser's
         // `encodeURIComponent` sends as `%3A` — decode before matching, or the
         // allow-list never hits and every explicitly-selected pane 409s.
-        Some(requested) => run_pane_ids(run).take(&percent_decode(&requested)),
+        Some(requested) => match access {
+            Access::Read => run_readable_panes(run),
+            Access::Write => run_writable_panes(run),
+        }
+        .take(&percent_decode(&requested)),
         None => active_pane(run),
     }
 }
@@ -773,7 +810,8 @@ fn percent_decode(s: &str) -> String {
 /// `GET /api/runs/<run>/pane[?pane=<id>]` — the recent transcript of a run
 /// agent's session, as plain text (204 when there is no such live pane).
 fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Read))
+    else {
         respond_empty(req, 204);
         return;
     };
@@ -797,13 +835,13 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// get a dead run out of the way; `drovr cleanup --purge` remains the way to
 /// reclaim the worktree.
 ///
-/// Restore is NOT an undo. It clears the flag and puts the row back in the
-/// active list, but the workspace is gone: `phase_start` only ever reuses a
-/// recorded `pane_id`/`root_pane` or calls `tab_create` against the run's
-/// existing `workspace` id, and nothing anywhere recreates a closed workspace
-/// (only `drovr new` makes one). So `drovr phase start` on a restored run errors
-/// out. Restore is for undoing a misclick before you rely on the run, not for
-/// resurrecting one. See docs/known-issues.md.
+/// Restore clears the flag, puts the row back in the active list, and the run is
+/// runnable again: archiving destroys the workspace, but `phase::ensure_workspace`
+/// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
+/// records the new ids. What it cannot restore is the *agents* — every pane died
+/// with the workspace, so a phase that was `Running` when it was archived comes
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
+/// archived run does not make it runnable again — FIXED 2026-08-02".
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
 /// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
@@ -895,7 +933,8 @@ fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
 
 fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
     let text = read_body(&mut req);
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -958,7 +997,8 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
             return;
         }
     };
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -972,13 +1012,238 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
     }
 }
 
+/// `POST /api/runs/<run>/rehydrate?phase=<name>` — bring back a phase whose
+/// pane is gone, resuming its recorded session where the backend supports it.
+///
+/// **Shells out to `current_exe()`**, exactly as [`handle_post_new_run`] does,
+/// so the CLI stays the sole writer of `state.json`. The server is a long-lived
+/// daemon holding no run state; a second writer here would race the driver's own
+/// `phase start` / `phase wait` for a whole-file save.
+///
+/// Three refusals, all BEFORE the shell-out:
+///
+/// * **400** — no `?phase=`, or a name that is not a safe filename component.
+/// * **404** — a phase this run does not have. [`safe_component`] permits `:`
+///   (reviewer names need it) and is a path check, **not an authorization
+///   one** — and `phase_start` appends any name it is handed. Without the
+///   membership test an unauthenticated caller could invent phases.
+/// * **409** — the phase is not in a state to be brought back: it still holds a
+///   pane, it has never run (`drovr new` pre-seeds `Pending` placeholders, and
+///   starting one is `phase start`'s job), it never got an agent, or it is a
+///   reviewer. Every one of them is [`RunState::rehydratable`], read from the
+///   same `state.json` the CLI reads, so the status code and the CLI's refusal
+///   cannot disagree.
+///
+/// And one non-refusal worth its own line:
+///
+/// * **200 with `complete: false`** — child exit 2. The pane IS back, but the
+///   agent in it was not confirmed to have the phase's context. Neither a 500
+///   (which would claim nothing happened) nor a plain `ok: true` (which would
+///   let a caller checking only the status treat it as fully recovered).
+///
+/// # ⚠️ This endpoint is unauthenticated and it starts agent processes
+///
+/// Recorded here because it is a real question with a considered answer, not
+/// an oversight — and because the next person to read this handler will ask it.
+///
+/// **It is not a new capability class.** This server is unauthenticated by
+/// design and already offers arbitrary code execution: `POST /send` types into
+/// a live claude pane, and a claude pane runs bash. Nothing here widens what a
+/// caller who can reach the port may do.
+///
+/// **What it does add is process creation** — talking to an existing agent
+/// versus starting a new one — so the question is resource consumption, and
+/// the answer is that it is bounded by the run's own shape rather than by the
+/// caller's persistence:
+///
+/// 1. A caller cannot invent a target. Rehydrate NEVER appends a phase (unlike
+///    `phase_start`), so the 404 above confines it to phases already in
+///    `state.json`, and the `NeverStarted` / `NoAgentEverRan` refusals confine
+///    it further to phases that have actually run.
+/// 2. A caller cannot multiply agents on one phase. `HoldsPane` refuses a phase
+///    that already has a pane, and a successful rehydrate records one — so the
+///    ceiling is one live agent per already-run phase, which is exactly the
+///    steady state the run has when nothing is reaped.
+/// 3. A flood cannot beat the check. `phase_rehydrate` takes an exclusive
+///    per-run lock and re-reads `state.json` under it, so concurrent requests
+///    serialize and every one after the first sees the pane the first recorded.
+///
+/// **The residual cost, accepted:** each request can occupy one server worker
+/// for up to `SEND_READY_TIMEOUT` (30s) while the agent comes up, and a caller
+/// may restart a reaped phase's agent once. The first is the same slow-handler
+/// exposure `GET /pane` has against a slow herdr; the second is one process for
+/// a phase that is supposed to have one. Neither justifies inventing an auth
+/// scheme for a server whose front door is already open by design — and a
+/// half-measure here would read as protection this endpoint does not have.
+/// `serve_host` defaults to `127.0.0.1`, which is the actual boundary.
+fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
+    let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
+        respond_str(req, 400, "text/plain", "missing phase".into());
+        return;
+    };
+    let phase = percent_decode(&phase);
+    if !safe_component(&phase) {
+        respond_str(req, 400, "text/plain", "invalid phase".into());
+        return;
+    }
+    let Some(state) = load_run_state(&p.dir) else {
+        respond_str(req, 404, "text/plain", "no such run".into());
+        return;
+    };
+    // The SAME predicate `phase_rehydrate` gates on, off the same `state.json`
+    // — not a re-derivation. Written separately, this path checked two of the
+    // CLI's three refusals, so the button a human clicks was more permissive
+    // than the command it shells out to.
+    //
+    // `NoSuchPhase` is the one arm that is a 404 (the name does not exist here
+    // — and `safe_component` permits `:` and is a path check, NOT an
+    // authorization one). Every other arm names a real phase drovr is refusing
+    // to act on, which is a 409.
+    if let Err(why) = state.rehydratable(&phase) {
+        use crate::run::NotRehydratable as Why;
+        let msg = match &why {
+            Why::NoSuchPhase => "no such phase".to_string(),
+            Why::Reviewer => format!(
+                "phase '{phase}' is a review-panel agent — its findings channel cannot be \
+                 re-attached to a resumed session; run the panel again instead"
+            ),
+            Why::HoldsPane(pane) => format!("phase '{phase}' still holds pane {pane}"),
+            Why::NeverStarted => {
+                format!("phase '{phase}' has never run — start it, don't rehydrate it")
+            }
+            Why::NoAgentEverRan => {
+                format!("phase '{phase}' has no agent on record — start it again, with its seed")
+            }
+            Why::NoProjectDir => {
+                format!("run '{run_name}' records no project_dir, so there is nowhere to launch")
+            }
+            Why::NoWorkspace => {
+                format!("run '{run_name}' has no herdr workspace to open a tab in")
+            }
+        };
+        let code = if why == Why::NoSuchPhase { 404 } else { 409 };
+        respond_str(req, code, "text/plain", msg);
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            // JSON, like the other two 500s below: a client that parses the
+            // body on failure must not hit one branch that throws instead.
+            let msg = format!("cannot resolve drovr binary: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            );
+            return;
+        }
+    };
+    // ⚠️ `--` before the positionals is LOAD-BEARING, not tidiness. The exit-2
+    // arm below reads exit 2 as the CLI's "incomplete" outcome — but clap uses
+    // exit 2 for its own usage errors, and neither `safe_component` here nor
+    // `require_phase_name` in the CLI rejects a phase name starting with `-`.
+    // Without the `--`, `?phase=-weird` would make clap fail to parse, exit 2,
+    // and be reported as "the pane is back but incomplete" when in fact nothing
+    // was ever created. `--` makes every positional a value, so exit 2 from the
+    // child can only come from `phase_rehydrate`.
+    match Command::new(&exe)
+        .args(["phase", "rehydrate", "--", run_name, &phase])
+        .output()
+    {
+        Ok(o) if o.status.success() => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({
+                "ok": true,
+                "complete": true,
+                "phase": phase,
+                // The CLI's own line, which distinguishes "resumed with its
+                // session" from "relaunched and reseeded" — the difference the
+                // human actually cares about.
+                "detail": String::from_utf8_lossy(&o.stdout).trim(),
+            })
+            .to_string(),
+        ),
+        // ⚠️ Exit 2 is the CLI's "the pane is back, but the agent was NOT
+        // CONFIRMED to have this phase's context". It must NOT flatten into
+        // either bucket: a 500 would claim nothing happened (a pane really was
+        // created and recorded), and a plain `ok: true` would let a caller
+        // checking only the status treat an unconfirmed agent as fully
+        // recovered. 200 with `complete: false`, and `detail` carries the CLI's
+        // stderr note — which is what says WHICH of the five states it was, a
+        // distinction this status code cannot make and must not appear to.
+        Ok(o) if o.status.code() == Some(2) => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({
+                "ok": true,
+                "complete": false,
+                "phase": phase,
+                "detail": String::from_utf8_lossy(&o.stderr).trim(),
+            })
+            .to_string(),
+        ),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // Log it too. Every sibling handler does (`handle_post_send`,
+            // `handle_post_keys`, `handle_get_pane`), and the browser tells the
+            // user to "see the drovr server log" — which has to actually
+            // contain something for that to be advice rather than a dead end.
+            eprintln!("drovr rehydrate: {run_name}/{phase} failed: {err}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": err }).to_string(),
+            )
+        }
+        Err(e) => {
+            let msg = format!("failed to run drovr phase rehydrate: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            )
+        }
+    }
+}
+
 /// `GET /api/runs/<run>/agents` — the tree of spawned agents: each phase pane
 /// with its per-task review panels nested beneath it. Only agents that actually
 /// have a pane appear (unstarted placeholder phases are omitted).
 fn handle_get_agents(req: Request, p: &RunPaths) {
+    // A config that fails to load must not blank the tree — but it must not be
+    // SILENT either. `resumable` is computed from the agent map, so a config
+    // drovr could not read means every ⟳ on this page is decided by the
+    // built-in backends rather than the user's, and the button then appears (or
+    // vanishes) for a reason nothing on screen explains. Serve the tree, carry
+    // the reason with it, and let the page say so.
+    let (cfg, config_error) = match crate::config::load_config() {
+        Ok(cfg) => (cfg, None),
+        Err(e) => (
+            crate::config::Config::default(),
+            Some(format!(
+                "drovr could not read your config ({e}), so the ⟳ buttons below are decided \
+                 by the built-in agent map — a resume surface you configured yourself is not \
+                 reflected here."
+            )),
+        ),
+    };
     let tree = match load_run_state(&p.dir) {
-        Some(run) => build_agent_tree(&run),
-        None => serde_json::json!({ "workspace": serde_json::Value::Null, "nodes": [] }),
+        Some(run) => build_agent_tree(&run, &cfg, config_error.as_deref()),
+        None => serde_json::json!({
+            "workspace": serde_json::Value::Null,
+            "nodes": [],
+            "config_error": config_error,
+        }),
     };
     respond_str(req, 200, "application/json", tree.to_string());
 }
@@ -991,31 +1256,75 @@ fn status_str(status: &crate::run::PhaseStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Build the agent tree for `run`: phases (that have a pane) as top-level nodes,
+/// Whether a rehydrate would bring the CONVERSATION back, as opposed to
+/// launching a fresh agent that re-reads the notes.
+///
+/// **This is not what gates the ⟳ button** — `rehydratable` is (a phase with no
+/// session is still worth bringing back; it reseeds). This decides what the
+/// button PROMISES, so the two are reported separately and each named for what
+/// it means. Reporting only this under a name the button reads would put a ⟳ on
+/// phases the CLI then refuses, and hide it from phases it would have recovered.
+///
+/// Both halves matter, and the second is easy to miss: codex ships with no
+/// resume surface at all, so a codex phase can carry a perfectly good session id
+/// and still only be relaunchable.
+fn has_resumable_session(phase: &crate::run::Phase, cfg: &crate::config::Config) -> bool {
+    phase
+        .resume_target()
+        .is_some_and(|target| cfg.resume_surface(target.backend()).is_some())
+}
+
+/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
 /// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
 /// `implement-<task>` phase. Reviews with no matching phase land in a trailing
 /// group node so nothing is dropped.
-fn build_agent_tree(run: &RunState) -> serde_json::Value {
+///
+/// `config_error` is why `cfg` is NOT the user's own config, when it is not. It
+/// travels with the tree rather than being logged, because the poll that builds
+/// this runs every two seconds — a log line would be either spam or invisible,
+/// and the person it concerns is looking at the page, not the server's stderr.
+fn build_agent_tree(
+    run: &RunState,
+    cfg: &crate::config::Config,
+    config_error: Option<&str>,
+) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
-        let Some(pane) = &rp.pane_id else { continue };
+        // A placeholder is not an agent — see `Phase::has_run`, the same
+        // predicate `phase_rehydrate` refuses on, so the tree never offers a ⟳
+        // the CLI would then reject. A REAPED phase does show, dimmed: hiding
+        // it would make a pane drovr closed look like one that never ran, which
+        // is the opposite of what someone hunting for it needs.
+        if !rp.has_run() {
+            continue;
+        }
         let parts: Vec<&str> = rp.name.split(':').collect();
         let task = parts.get(1).copied().unwrap_or("").to_string();
         let angle = parts.get(3).copied().unwrap_or("").to_string();
-        reviews_by_task.entry(task).or_default().push(serde_json::json!({
-            "name": rp.name, "kind": "review", "angle": angle,
-            "status": status_str(&rp.status), "pane_id": pane,
-        }));
+        reviews_by_task
+            .entry(task)
+            .or_default()
+            .push(serde_json::json!({
+                "name": rp.name, "kind": "review", "angle": angle,
+                "status": status_str(&rp.status), "pane_id": rp.pane_id(),
+                "reaped": rp.is_reaped(), "rehydratable": run.rehydratable(&rp.name).is_ok(),
+                "resumable": has_resumable_session(rp, cfg),
+            }));
     }
     let mut nodes = Vec::new();
     for ph in &run.phases {
-        let Some(pane) = &ph.pane_id else { continue };
+        if !ph.has_run() {
+            continue;
+        }
         let task_key = ph.name.strip_prefix("implement-").unwrap_or("");
         let children = reviews_by_task.remove(task_key).unwrap_or_default();
         nodes.push(serde_json::json!({
             "name": ph.name, "kind": "phase",
-            "status": status_str(&ph.status), "pane_id": pane, "children": children,
+            "status": status_str(&ph.status), "pane_id": ph.pane_id(),
+            "reaped": ph.is_reaped(), "rehydratable": run.rehydratable(&ph.name).is_ok(),
+            "resumable": has_resumable_session(ph, cfg),
+            "children": children,
         }));
     }
     for (task, revs) in reviews_by_task {
@@ -1024,7 +1333,11 @@ fn build_agent_tree(run: &RunState) -> serde_json::Value {
             "status": "", "pane_id": serde_json::Value::Null, "children": revs,
         }));
     }
-    serde_json::json!({ "workspace": run.workspace, "nodes": nodes })
+    serde_json::json!({
+        "workspace": run.workspace,
+        "nodes": nodes,
+        "config_error": config_error,
+    })
 }
 
 /// `GET /api/runs/<run>/review/diff?task=<task>`: unified `git diff
@@ -1875,10 +2188,10 @@ mod tests {
         let phases: Vec<crate::run::Phase> = statuses
             .iter()
             .enumerate()
-            .map(|(i, s)| crate::run::Phase {
-                name: format!("phase{i}"),
-                status: s.clone(),
-                ..Default::default()
+            .map(|(i, s)| {
+                let mut p = crate::run::Phase::new(&format!("phase{i}"));
+                p.status = s.clone();
+                p
             })
             .collect();
         let state = RunState {
@@ -2591,13 +2904,26 @@ mod tests {
         assert_eq!(v[0]["state"], "idle");
     }
 
+    /// The mirror's default target: the running phase, else the last phase that
+    /// still holds a pane, else nothing.
+    ///
+    /// It used to fall back to `run.root_pane`, which was dead code while the
+    /// first phase consumed that pane. Now that the root shell stays idle for
+    /// the whole run, that fallback would silently point the UI at an empty
+    /// shell — so the honest answer when no phase has a pane is `None` (204 /
+    /// "no live pane"), not a shell prompt dressed up as an agent.
     #[test]
-    fn active_pane_prefers_running_phase_then_root() {
-        let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
-            name: name.into(),
-            status,
-            pane_id: pane.map(|s| s.to_string()),
-            ..Default::default()
+    fn active_pane_is_the_current_phase_or_nothing() {
+        let mkphase = |name: &str, status, pane: Option<&str>| {
+            let mut p = {
+                let mut p = crate::run::Phase::new(name);
+                p.status = status;
+                p
+            };
+            if let Some(pane) = pane {
+                p.set_pane(pane);
+            }
+            p
         };
         let mut run = RunState {
             name: "r".into(),
@@ -2618,14 +2944,52 @@ mod tests {
             archived: false,
             retired_panes: vec![],
         };
-        // Running phase wins.
+        // The phase the run is on.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
-        // No running phase → falls back to the workspace root pane.
+        // Every phase Done → nothing to mirror. It must NOT fall back to that
+        // phase's own pane once the run has moved past it, nor to an earlier
+        // phase's: under reaping those are exactly the panes that get closed,
+        // so a fallback would mirror a dead or recycled pane as if it were live.
         run.phases[1].status = crate::run::PhaseStatus::Done;
-        assert_eq!(active_pane(&run).as_deref(), Some("w:root"));
-        // Neither → None.
-        run.root_pane = None;
         assert_eq!(active_pane(&run), None);
+        // Still nothing once the panes are actually gone — and still not the
+        // idle root shell, which outlives every phase.
+        run.phases[1].mark_reaped();
+        run.phases[0].mark_reaped();
+        assert!(
+            run.root_pane.is_some(),
+            "the root shell outlives the phases"
+        );
+        assert_eq!(active_pane(&run), None);
+    }
+
+    /// `POST /send` must never resolve to the workspace's idle root shell.
+    ///
+    /// Not a privilege boundary — sending into a live claude pane is arbitrary
+    /// code execution by design, and that surface is unchanged. It is a
+    /// footgun: the root shell is a bare `sh` alive for the whole run, so a
+    /// `/send` landing there runs the user's PROSE as a shell command. Reading
+    /// it is harmless and stays allowed.
+    #[test]
+    fn the_root_shell_is_readable_but_never_writable() {
+        use crate::run::PhaseStatus::Running;
+        let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
+
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root"),
+            "mirroring the idle shell is fine"
+        );
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Write),
+            None,
+            "typing into the idle shell is not"
+        );
+        // A phase pane is writable, so the gate is about the root shell alone.
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
     }
 
     // A RunState with the given phases / review phases; other fields are inert.
@@ -2649,12 +3013,12 @@ mod tests {
     }
 
     fn ph(name: &str, status: crate::run::PhaseStatus, pane: Option<&str>) -> crate::run::Phase {
-        crate::run::Phase {
-            name: name.into(),
-            status,
-            pane_id: pane.map(|s| s.to_string()),
-            ..Default::default()
+        let mut p = crate::run::Phase::new(name);
+        p.status = status;
+        if let Some(pane) = pane {
+            p.set_pane(pane);
         }
+        p
     }
 
     #[test]
@@ -2671,7 +3035,7 @@ mod tests {
                 ph("review:task-1:1:security", Done, Some("w:p5")),
             ],
         );
-        let tree = build_agent_tree(&run);
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
         assert_eq!(tree["workspace"], "w");
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "placeholder omitted: {tree}");
@@ -2695,13 +3059,24 @@ mod tests {
             vec![],
         );
         // Explicit pane belonging to the run is honored.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:p3").as_deref(), Some("w:p3"));
-        // The root pane is in the allow-list.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:root").as_deref(), Some("w:root"));
-        // A pane outside the run is rejected (no silent fallback).
-        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99"), None);
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
+        // The root pane is in the READABLE allow-list (see
+        // `the_root_shell_is_readable_but_never_writable`).
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root")
+        );
+        // A pane outside the run is rejected (no silent fallback), read or write.
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Read), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Write), None);
         // No param → active_pane (first Running phase).
-        assert_eq!(resolve_pane(&run, "/x").as_deref(), Some("w:p1"));
+        assert_eq!(
+            resolve_pane(&run, "/x", Access::Write).as_deref(),
+            Some("w:p1")
+        );
     }
 
     #[test]
@@ -2710,11 +3085,14 @@ mod tests {
         let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
         // The browser sends encodeURIComponent("w:p3") = "w%3Ap3"; without
         // decoding it misses the allow-list and every selected pane 409s.
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3Ap3").as_deref(), Some("w:p3"));
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w%3Ap3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
         // Decoding must not open a hole: a foreign pane is still rejected.
-        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99", Access::Write), None);
         // Malformed escapes are passed through verbatim (and so simply miss).
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w%3", Access::Write), None);
     }
 
     #[test]
@@ -2796,6 +3174,130 @@ mod tests {
         }
     }
 
+    /// End-to-end proof that `/send` and `/keys` really use the WRITABLE
+    /// allow-list, not just that the pure resolver can tell the two apart.
+    ///
+    /// A wrong `Access` at either call site is invisible to the unit tests: the
+    /// handler would resolve the root pane, hand it to `SystemHerdr`, and fail
+    /// there instead — so this asserts 409 (gated before herdr) rather than the
+    /// 500 an ungated request would produce with no herdr running.
+    ///
+    /// The read side cannot be asserted the same way: `GET /pane` answers 204
+    /// both when the pane is gated and when herdr cannot be reached, so the
+    /// readable set is pinned by `the_root_shell_is_readable_but_never_writable`.
+    #[test]
+    fn the_root_shell_is_refused_by_the_write_endpoints_over_http() {
+        let tmp = make_root("root-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        // An idle root shell plus one phase pane. Both are needed: the phase
+        // pane is the POSITIVE CONTROL that keeps this test from passing
+        // vacuously. If the `state.json` below failed to parse, or `root_pane`
+        // were dropped, every request would 409 for the wrong reason — the
+        // phase pane's 500 is what proves the state loaded and the gate is
+        // discriminating rather than refusing everything.
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![crate::run::Phase::new("implement")],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.phases[0].status = crate::run::PhaseStatus::Running;
+        run.phases[0].set_pane("w:p1");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        for (path, ctype, body) in [
+            ("send?pane=w%3Aroot", "text/plain", "ls -la"),
+            (
+                "keys?pane=w%3Aroot",
+                "application/json",
+                r#"{"keys":["enter"]}"#,
+            ),
+        ] {
+            let (s, _) = http_post(&addr, &format!("/api/runs/r/{path}"), ctype, body);
+            assert_eq!(s, 409, "{path} must refuse the idle root shell");
+        }
+
+        // Positive control: the phase pane IS writable, so it gets past the gate
+        // and fails at herdr instead (no daemon in the test environment).
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(
+            s, 500,
+            "a phase pane must pass the gate and fail at herdr, not be refused"
+        );
+    }
+
+    /// The mirror must not keep typing into a pane drovr has closed.
+    ///
+    /// `mark_reaped` clears `pane_id` in the same statement it sets the flag, so
+    /// a reaped phase leaves the writable allow-list by construction rather than
+    /// by a check written here — which is exactly why that pair is one mutator.
+    /// Asserted end to end anyway: the browser holds a sticky `selectedPane` and
+    /// will go on naming a pane the run has moved past, and 409 (gated, before
+    /// herdr) is a different answer from 500 (gated in, failed at herdr).
+    #[test]
+    fn a_reaped_phases_pane_is_no_longer_writable() {
+        let tmp = make_root("reaped-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                crate::run::Phase::new("brainstorm"),
+                crate::run::Phase::new("implement"),
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        // brainstorm ran on w:p1 and drovr reaped it; implement is live on w:p2.
+        run.phases[0].status = crate::run::PhaseStatus::Done;
+        run.phases[0].set_pane("w:p1");
+        run.phases[0].mark_reaped();
+        run.retire_pane("w:p1");
+        run.phases[1].status = crate::run::PhaseStatus::Running;
+        run.phases[1].set_pane("w:p2");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(s, 409, "a reaped pane must be refused before herdr");
+        // ⚠️ And retiring it did NOT make it writable again. `retired_panes` is
+        // what `drovr cleanup` reads to prove a pane was drovr's; it is not a
+        // list of places the mirror may type.
+        assert!(
+            run.retired_panes.contains(&"w:p1".to_string()),
+            "precondition: the pane is retired, and still refused"
+        );
+
+        // Positive control: the live phase's pane passes the gate and fails at
+        // herdr instead, so the 409 above is discrimination, not a broken state.
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap2", "text/plain", "hi");
+        assert_eq!(s, 500, "the live phase's pane must still be writable");
+    }
+
     #[test]
     fn post_keys_honors_pane_gating() {
         // `?pane=` outside the run must never reach herdr: same allow-list as
@@ -2810,6 +3312,288 @@ mod tests {
             r#"{"keys":["enter"]}"#,
         );
         assert_eq!(s, 409);
+    }
+
+    #[test]
+    fn post_rehydrate_refuses_before_it_can_shell_out() {
+        // Every refusal short-circuits before `current_exe()`, so they are safe
+        // to exercise in-process. The happy path shells out to the CLI — which
+        // is the point: the CLI stays the sole writer of state.json — and is
+        // covered by `phase::rehydrate_tests` plus manual verification.
+        let tmp = make_root("rehydrate-http");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let mut run: RunState = serde_json::from_str(
+            &fs::read_to_string(dir.join("state.json")).unwrap(),
+        )
+        .unwrap();
+        let mut live = crate::run::Phase::new("plan");
+        live.status = crate::run::PhaseStatus::Running;
+        live.set_pane("w:p1");
+        let mut reaped = crate::run::Phase::new("brainstorm");
+        reaped.status = crate::run::PhaseStatus::Done;
+        reaped.set_pane("w:p0");
+        reaped.mark_reaped();
+        // A phase `phase_start` persisted as Running and then failed to launch:
+        // has_run() is true, but no agent was ever recorded.
+        let mut launch_failed = crate::run::Phase::new("launch-failed");
+        launch_failed.status = crate::run::PhaseStatus::Running;
+        let mut reviewer = crate::run::Phase::new("review:task-1:1:security");
+        reviewer.status = crate::run::PhaseStatus::Done;
+        reviewer.set_pane("w:p2");
+        reviewer.record_launch("claude", None);
+        reviewer.mark_reaped();
+        run.review_phases = vec![reviewer];
+        run.phases = vec![
+            reaped,
+            live,
+            crate::run::Phase::new("placeholder"),
+            launch_failed,
+        ];
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let before = fs::read_to_string(dir.join("state.json")).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        // No phase at all → 400, not a rehydrate of "".
+        let (s, _) = http_post(&addr, "/api/runs/r/rehydrate", "text/plain", "");
+        assert_eq!(s, 400);
+
+        // A phase this run does not have → 404. `safe_component` permits `:` and
+        // is a filename check, NOT an authorization one, and `phase_start`
+        // happily appends unknown names — so the membership test is what stops
+        // an unauthenticated caller inventing phases.
+        let (s, _) = http_post(&addr, "/api/runs/r/rehydrate?phase=nope", "text/plain", "");
+        assert_eq!(s, 404);
+        // A traversal-shaped name is refused before anything reads a path.
+        let (s, _) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=..%2Fevil",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 400);
+
+        // A phase that still holds a pane → 409. Duplicating an agent into a
+        // live conversation is exactly what rehydrate must not do.
+        let (s, body) = http_post(&addr, "/api/runs/r/rehydrate?phase=plan", "text/plain", "");
+        assert_eq!(s, 409, "{body}");
+
+        // A phase that has never run → 409 as well, and for a reason worth
+        // keeping separate: `drovr new` pre-seeds placeholders, so without this
+        // an unauthenticated caller could START one out of pipeline order.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=placeholder",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("never run"), "{body}");
+
+        // …and the third refusal, which this path used to omit entirely: a
+        // phase that LOOKS started (`phase_start` persists `Running` before it
+        // launches) but never got an agent. The CLI refuses it; so must the
+        // button, or the endpoint a human clicks is more permissive than the
+        // command it shells out to.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=launch-failed",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("no agent on record"), "{body}");
+
+        // A reviewer → 409. Its findings channel cannot be re-attached to a
+        // resumed session, so bringing it back would produce an agent unable to
+        // do the one thing it exists for.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=review%3Atask-1%3A1%3Asecurity",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("review-panel agent"), "{body}");
+
+        assert_eq!(
+            fs::read_to_string(dir.join("state.json")).unwrap(),
+            before,
+            "a refused rehydrate must not write state.json"
+        );
+    }
+
+    #[test]
+    fn agent_tree_carries_reaped_phases_but_not_placeholders() {
+        use crate::run::PhaseStatus::*;
+        let mut reaped = ph("brainstorm", Done, Some("w:p1"));
+        reaped.record_launch("claude", None);
+        assert!(reaped.record_session(
+            crate::herdr::SessionId::new("sess-b".into()).unwrap()
+        ));
+        reaped.mark_reaped();
+        // Reaped, but nothing was ever captured for it — the UI must not offer
+        // a ⟳ that would land on a reseed the human did not ask for.
+        let mut sessionless = ph("plan", Done, Some("w:p2"));
+        sessionless.record_launch("claude", None);
+        sessionless.mark_reaped();
+
+        let run = tree_run(
+            vec![
+                reaped,
+                sessionless,
+                ph("implement", Pending, None), // unstarted placeholder → STILL omitted
+                ph("implement-task-1", Running, Some("w:p3")),
+            ],
+            vec![],
+        );
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
+        let nodes = tree["nodes"].as_array().unwrap();
+        assert_eq!(
+            nodes.len(),
+            3,
+            "reaped phases appear; the placeholder does not: {tree}"
+        );
+
+        assert_eq!(nodes[0]["name"], "brainstorm");
+        assert_eq!(nodes[0]["reaped"], true);
+        assert_eq!(nodes[0]["resumable"], true);
+        assert_eq!(nodes[0]["rehydratable"], true);
+        assert!(nodes[0]["pane_id"].is_null(), "a reaped phase has no pane");
+
+        assert_eq!(nodes[1]["name"], "plan");
+        assert_eq!(nodes[1]["reaped"], true);
+        // No session to resume — but STILL rehydratable: it reseeds, and the ⟳
+        // is gated on that. The two fields answer different questions.
+        assert_eq!(nodes[1]["resumable"], false);
+        assert_eq!(nodes[1]["rehydratable"], true);
+
+        assert_eq!(nodes[2]["name"], "implement-task-1");
+        assert_eq!(nodes[2]["reaped"], false);
+        assert_eq!(nodes[2]["pane_id"], "w:p3");
+        assert_eq!(
+            nodes[2]["rehydratable"], false,
+            "a phase holding a live pane must not be offered a ⟳ the CLI refuses"
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_resume_surface_is_not_advertised_as_resumable() {
+        // The ⟳ button promises the CONVERSATION back. codex ships with no
+        // resume field, so a captured session id is not enough — clicking it
+        // would silently reseed.
+        use crate::run::PhaseStatus::Done;
+        let mut p = ph("plan", Done, Some("w:p1"));
+        p.record_launch("codex", None);
+        assert!(p.record_session(crate::herdr::SessionId::new("sess-c".into()).unwrap()));
+        p.mark_reaped();
+        let run = tree_run(vec![p], vec![]);
+
+        let cfg = crate::config::Config::default();
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["resumable"], false);
+
+        // …and it flips the moment the user opts codex in.
+        let mut cfg = cfg;
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["resumable"], true);
+    }
+
+    #[test]
+    fn the_tree_offers_no_rehydrate_the_cli_would_refuse() {
+        // The ⟳ is gated on the SAME predicate the CLI and the handler ask, so
+        // the run-level prerequisites have to reach the tree too — a button
+        // rendered on a run with no workspace is a button that errors on click.
+        // A reviewer never gets one at all: its findings channel cannot be
+        // re-attached to a resumed session.
+        use crate::run::PhaseStatus::Done;
+        let reaped = |name: &str| {
+            let mut p = ph(name, Done, Some("w:p1"));
+            p.record_launch("claude", None);
+            p.mark_reaped();
+            p
+        };
+        let run = tree_run(
+            vec![reaped("implement-task-1")],
+            vec![reaped("review:task-1:1:security")],
+        );
+        let cfg = crate::config::Config::default();
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["rehydratable"], true);
+        assert_eq!(
+            tree["nodes"][0]["children"][0]["rehydratable"],
+            false,
+            "a reviewer must never be offered a ⟳: {tree}"
+        );
+        // …and the reviewer is still SHOWN, dimmed — hiding it would make a
+        // pane drovr closed look like one that never ran.
+        assert_eq!(tree["nodes"][0]["children"][0]["reaped"], true);
+
+        let mut no_ws = tree_run(vec![reaped("implement-task-1")], vec![]);
+        no_ws.workspace = None;
+        let tree = build_agent_tree(&no_ws, &cfg, None);
+        assert_eq!(
+            tree["nodes"][0]["rehydratable"], false,
+            "no workspace means nowhere to open the tab: {tree}"
+        );
+    }
+
+    #[test]
+    fn the_tree_and_the_launcher_read_the_same_resume_surface() {
+        // `has_resumable_session` used to reach into `cfg.agents` and test
+        // `spec.resume` itself — a SECOND classifier of the fact
+        // `Config::resume_launch` classifies when it decides between resuming
+        // and reseeding. This branch has already paid twice for exactly that
+        // shape (`Capture::from_poll` vs `PaneState::from_poll`). Pin that the
+        // two agree for every backend, including the ones the config file adds.
+        use crate::run::PhaseStatus::Done;
+        let mut cfg = crate::config::Config::default();
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
+        for backend in ["claude", "cursor", "codex", "not-in-the-config"] {
+            let mut p = ph("plan", Done, Some("w:p1"));
+            p.record_launch(backend, None);
+            assert!(p.record_session(crate::herdr::SessionId::new("s-1".into()).unwrap()));
+            let target = p.resume_target().unwrap();
+            // `Ok(None)` is "no resume surface"; `Err` is "the config does not
+            // know this backend at all", which is also not a resume.
+            let launcher = cfg
+                .resume_launch(&target, "/tmp/p", false)
+                .ok()
+                .flatten()
+                .is_some();
+            assert_eq!(
+                has_resumable_session(&p, &cfg),
+                launcher,
+                "the ⟳'s promise and the launcher disagree about '{backend}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_that_would_not_load_is_reported_rather_than_swallowed() {
+        // The tree falls back to the BUILT-IN agent map when the user's config
+        // cannot be read, so `resumable` is computed against the wrong backends
+        // and the ⟳ appears (or vanishes) for a reason nothing on screen
+        // explains. Serving the tree anyway is right — a config typo must not
+        // blank the panel — but silently is not.
+        use crate::run::PhaseStatus::Done;
+        let run = tree_run(vec![ph("plan", Done, Some("w:p1"))], vec![]);
+        let cfg = crate::config::Config::default();
+
+        let clean = build_agent_tree(&run, &cfg, None);
+        assert_eq!(clean["config_error"], serde_json::Value::Null);
+
+        let broken = build_agent_tree(&run, &cfg, Some("expected a value at line 3"));
+        assert!(
+            broken["config_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("expected a value at line 3")),
+            "the reason has to reach the page: {broken}"
+        );
+        // …and the tree is still served, or a config typo blanks the panel.
+        assert_eq!(broken["nodes"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -3190,18 +3974,48 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        let held = try_take_lock(&path).expect("claim").expect("uncontended");
+        // Every failure here reports the path and what the file held, because this test
+        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
+        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
+        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
+        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
+        // If it fails again, the message below is the evidence to file.
+        let whats_there = |when: &str| -> String {
+            format!(
+                "{when}: {} contains {:?}; this pid is {}",
+                path.display(),
+                fs::read_to_string(&path).unwrap_or_else(|e| format!("<unreadable: {e}>")),
+                std::process::id()
+            )
+        };
+
+        let held = try_take_lock(&path)
+            .unwrap_or_else(|e| panic!("claim failed: {e}; {}", whats_there("at claim")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a freshly created tempdir path was already locked. {}",
+                    whats_there("at claim")
+                )
+            });
         assert_eq!(
-            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             Some(std::process::id()),
-            "the holder records its pid for humans to kill"
+            "the holder records its pid for humans to kill. {}",
+            whats_there("after claim")
         );
 
         // Nothing has to prove the holder died for the lock to be free again.
         drop(held);
         let _held = try_take_lock(&path)
-            .expect("claim after release")
-            .expect("released lock must be free");
+            .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a lock released by dropping its File was still held. {}",
+                    whats_there("after drop")
+                )
+            });
     }
 
     /// A server that was killed leaves the file behind with its pid in it. The

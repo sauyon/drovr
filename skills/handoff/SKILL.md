@@ -32,32 +32,37 @@ exists. Preserve decisions + interfaces, drop narration.
 Assume a run exists (`drovr new <run> --task "..."` — see `drovr:using-drovr` for setup).
 Run name is `<run>`; the phase you are running is `<phase>`.
 
-1. **Start the phase.** Seed = the PRIOR phase's handoff (omit `--seed` for the first phase).
+1. **Start the phase — briefed.** drovr composes the brief (frame, scope, completion
+   contract) and injects it; your `--context` is the part it cannot know, which across a
+   handoff boundary is the PRIOR phase's handoff:
    ```
-   drovr phase start <run> <phase> --seed ~/.local/share/drovr/runs/<run>/<prev>-HANDOFF.md
+   drovr collect <run> <prev> > /tmp/<prev>-handoff.md   # prints <prev>-HANDOFF.md
+   drovr phase start <run> <phase> --context-file /tmp/<prev>-handoff.md
    ```
-   This spawns a **plain `claude`** and records the seed path in `state.json`. It does
-   **not** inject anything into the agent yet.
+   For the first phase there is no prior handoff — omit `--context` and the run's task
+   carries it. Read exactly what the agent will be told with
+   `drovr phase brief <run> <phase>`; do not retype or paraphrase it.
 
-2. **Inject the briefing + completion contract — THIS IS REQUIRED.** The CLI does not seed the
-   agent; you do. Compose the first message = the phase's instructions + the prior handoff
-   content, and send it:
+2. **Check it landed.** `phase start` prints `briefed phase '<phase>'` on success. If it
+   exits 2 the pane is up but UNBRIEFED — re-deliver once the agent is at its composer:
    ```
-   drovr collect <run> <prev>                          # prints <prev>-HANDOFF.md
-   drovr phase send <run> <phase> "<instructions>\n\n<pasted handoff content>"
+   drovr phase brief <run> <phase> --context-file /tmp/<prev>-handoff.md \
+     | drovr phase send <run> <phase> -
    ```
-   `drovr phase send` writes the text and submits it. For the first phase, the briefing is the
-   task itself, not a prior handoff.
+   `phase send` also stays available for free-form mid-flight nudges; a message is not a
+   brief, and you never author the frame.
 
-   The instructions you inject MUST end with the **completion contract**, whose final two
+   The composed brief carries the **completion contract**, whose final two
    actions are, in order:
    1. **Author the handoff.** Write `~/.local/share/drovr/runs/<run>/<phase>-HANDOFF.md` — the
       fixed 7-section document (see `HANDOFF-template.md`), compressed from your own context,
       **git pointers mandatory**. This is *your* job as the finishing agent; nothing compresses
       it for you.
    2. **Signal done:** run `drovr phase done <run> <phase>`. It **refuses with an error until
-      the handoff above exists and is non-empty** — the handoff and the done-marker are one
-      atomic completion step.
+      the handoff above exists, is non-empty, and has no section left at the scaffold's
+      `TODO`** — the handoff and the done-marker are one atomic completion step, and a form
+      still holding its placeholders carries nothing for the next phase to inherit. The
+      error names the unfilled sections.
 
    Also tell the agent that any review subagents it launches must run in the **foreground**
    (never `run_in_background`, never yield waiting on them), so step 3 can detect completion.
@@ -106,17 +111,19 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    ```
    drovr collect <run> <phase>
    ```
-   Prints the handoff (the file the agent authored). It becomes the `--seed` for the next
-   phase's step 1, and the pasted content for its step 2.
+   Prints the handoff (the file the agent authored). It becomes the next phase's
+   `--context-file` in step 1 — drovr puts it in the brief it composes.
 
 ## Quick reference
 
 | Step | Command | Note |
 |---|---|---|
-| start | `drovr phase start <run> <phase> [--seed <path>]` | plain claude; records seed path only |
-| **inject** | `drovr phase send <run> <phase> "<text>"` | **you must do this — CLI won't**; end the text with the completion contract (author handoff → `phase done`) |
+| **start (briefed)** | `drovr phase start <run> <phase> --context-file <prev handoff>` | composes the brief AND injects it; prints `briefed phase …`. Exit 2 = pane up but unbriefed |
+| inspect | `drovr phase brief <run> <phase> [--context …]` | prints exactly what the agent is told, spawning nothing |
+| re-brief | `drovr phase brief … \| drovr phase send <run> <phase> -` | for a phase already running; `phase send "<text>"` is for free-form nudges only |
 | wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `5`=superseded by a newer pass → re-arm, not a stuck agent · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
+| scaffold | `drovr handoff-scaffold <run> <phase>` | writes the empty 7 sections for the AGENT to fill; refuses to overwrite an authored one. Structure only — drovr does not guess which commits are yours. `phase done` refuses while any section is still `TODO` |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
 
 ## The HANDOFF doc shape
@@ -153,13 +160,30 @@ the pane live.
 Seeding a fresh agent from a garbage handoff wastes the whole downstream chain — a broken
 briefing is worse than a stopped run.
 
+**Not a stop condition: `phase done` refusing with `$DROVR_PASS is not set`.** The marker must
+carry the pass token the agent was launched under, so `drovr phase done` only works from inside
+the phase's own pane. Run by hand from a plain shell it refuses — and prints the exact command
+that would work, token included. The general form, for when you are composing it yourself:
+
+```
+DROVR_PASS=$(jq -r '.phases[]|select(.name=="<phase>").pass' <run_dir>/state.json) \
+  drovr phase done <run> <phase>
+```
+
+`<run_dir>` is `~/.local/share/drovr/runs/<run>`; a reviewer phase lives under
+`.review_phases[]` instead. This is the escape hatch for a phase whose agent is gone but whose
+work is finished — it bypasses the pane, not the contract: `<phase>-HANDOFF.md` must still
+exist, with no `TODO` sections left.
+
 ## Common mistakes
 
 | Mistake | Fix |
 |---|---|
-| Skipping step 2 ("start seeds it") | It doesn't. The fresh agent sits idle until you `phase send`. |
+| Writing the brief yourself | drovr composes it. You supply `--context`; `phase brief` shows the result. A hand-written frame drifts from the contract and nothing detects it. |
+| Ignoring exit 2 from `phase start` | The pane is up and UNBRIEFED. Re-deliver with `phase brief \| phase send -`; a `phase wait` on it never returns. |
 | Expecting a separate compress step | There isn't one. The finishing agent authors the handoff itself, as its final action, before `phase done`. |
 | `phase done` failing "handoff missing" | The agent must author `<phase>-HANDOFF.md` *before* running `phase done`; the marker won't drop without it. |
+| `phase done` naming sections "still at the scaffold's TODO" | A scaffolded handoff was never filled in. Write those sections from your own context — nothing else will — then re-run. |
 | Foregrounding `drovr phase wait` | Background it and end the turn. Foreground Bash is capped at 600 000 ms, so a long healthy phase reports a false exit `2`. |
 | Backgrounding the wait and then working | Background the wait *and go idle*. The single-writer rule is what forbids working here, not foreground-ness. |
 | Pasting file contents into the handoff | Use artifact pointers (paths + git refs); the successor re-reads. |

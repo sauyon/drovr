@@ -88,6 +88,10 @@ Revise loop: edit `spec.md` →
 
 **REQUIRED BACKGROUND:** the downstream skills assume this file's contracts —
 single-writer rule, the run dir at `~/.local/share/drovr/runs/<name>/`, and that
-`drovr phase start` spawns a plain `claude` and does **not** inject the seed
-(injecting the briefing is the skill's job, via `drovr phase send`).
+**drovr composes every brief; you supply only context.** `drovr phase start <run>
+<phase> --context "<what this phase needs that drovr cannot know>"` composes the
+phase's brief and injects it. Never write the frame yourself: `drovr phase brief`
+prints what an agent will be told, and `drovr code-review brief … --angle <angle>`
+does the same for a reviewer you spawn in-harness. `phase send` remains for
+free-form nudges — a message is not a brief.
 <!-- /reflex:section:escalation -->

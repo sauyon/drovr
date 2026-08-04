@@ -190,6 +190,13 @@ async function reload(ready) {
 }
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
 const QUESTIONS_READY = { probe: cursorQuestion, ok: q => !!q, label: 'questions panel' };
+const agentNodes = () => evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-node')).map(function(e){
+    return { name: e.querySelector('.agent-name').textContent,
+             reaped: e.classList.contains('reaped'),
+             rehydrate: !!e.querySelector('.agent-rehydrate') };
+  });`);
+const AGENTS_READY = { probe: agentNodes, ok: n => n.length > 0, label: 'agent tree' };
 
 // ---------------------------------------------------------------------------
 console.log('\n== session list: motion ==');
@@ -1236,6 +1243,140 @@ check('the agent change summary shows on the first review (turn 0)', await evalu
          (document.getElementById('summary-text').textContent || '').indexOf('ready for review') !== -1;`), true);
 check('...and the turn really is 0', await evaluate(`return currentTurn;`), 0);
 
+console.log('\n== run detail: spec links ==');
+// Specs cite sources as bare URLs far more often than as [txt](url), and
+// markdown-it leaves bare URLs as plain text unless linkify is on — the whole
+// citation list rendered unclickable. Read hrefs off the rendered spec.
+const specLinks = () => evaluate(`
+  return Array.prototype.map.call(
+    document.querySelectorAll('#doc-content a'),
+    function(a) { return { href: a.getAttribute('href'), target: a.getAttribute('target'),
+                           rel: a.getAttribute('rel') }; });`);
+const links = await specLinks();
+// Asserted first and separately because one check below ('open in a new tab') is
+// an .every(), which is vacuously true on an empty list — so "the spec rendered
+// no links at all" has to fail loudly here rather than sail through as a green
+// check. The .some() and expected-non-empty checks fail on their own in that case.
+check('the rendered spec has links to inspect', links.length > 0, true);
+check('a bare URL in the spec becomes a link',
+  links.some(l => l.href === 'https://example.com/paper'), true);
+check('an explicit [txt](url) link still works',
+  links.some(l => l.href === 'https://example.com/docs'), true);
+// fuzzyLink would match any word whose last segment is a live TLD, and `.rs` is
+// one — every source file a spec names would turn into an outbound link.
+check('a bare source filename is not linkified',
+  links.filter(l => /\.rs$/.test(l.href || '')), []);
+// Citations open in a new tab: unsubmitted answers live only in the radio buttons
+// and an unsaved annotation draft only in the DOM, so navigating away loses both.
+check('external spec links open in a new tab',
+  links.filter(l => /^https?:/.test(l.href || '')).every(l => l.target === '_blank'), true);
+// ...but an in-document fragment must stay in this tab: it scrolls the spec, and
+// _blank would instead reload the whole SPA in a second tab.
+check('an in-document fragment link stays in this tab',
+  links.filter(l => (l.href || '').charAt(0) === '#').map(l => l.target), [null]);
+// _blank without noopener hands the opened page a live window.opener back into the
+// review UI. Asserted separately because the target check above would stay green if
+// the rel line alone were dropped.
+check('...and a new tab cannot reach back through window.opener',
+  links.filter(l => l.target === '_blank').every(l => /noopener/.test(l.rel || '')), true);
+// Leaving the fragment to the browser is NOT harmless here: the whole app routes off
+// location.hash, so the router reads a bare fragment as "no run" and tears the detail
+// view down mid-review — typed feedback and unsaved comments with it. Clicked for
+// real; reading the href back would never have caught it.
+// Read AFTER yielding: hashchange is queued as its own task, and route() — the thing
+// that clears currentRun and hides the panel — only runs from that handler. Sampled
+// synchronously, runHeld/docStillShown would read true even with the fix reverted,
+// naming coverage the check did not have.
+check('clicking a fragment link does not navigate out of the run', await evaluate(`
+  return (async function() {
+    var a = Array.prototype.filter.call(
+      document.querySelectorAll('#doc-content a'),
+      function(x) { return (x.getAttribute('href') || '').charAt(0) === '#'; })[0];
+    if (!a) return 'no fragment link in the fixture spec';
+    var beforeHash = location.hash, beforeRun = currentRun;
+    a.click();
+    await new Promise(function(r) { setTimeout(r, 100); });
+    return { hashHeld: location.hash === beforeHash, runHeld: currentRun === beforeRun,
+             docStillShown: document.getElementById('doc-panel').style.display !== 'none' };
+  })();`),
+  { hashHeld: true, runHeld: true, docStillShown: true });
+// The same protection for `[t]()`, which renders href="" — it resolves to the current
+// document and navigates for real, so "not a fragment" must not mean "leave it alone".
+check('clicking an empty-href link does not navigate either', await evaluate(`
+  return (async function() {
+    var doc = document.getElementById('doc-content');
+    var a = document.createElement('a');
+    a.setAttribute('href', '');
+    a.textContent = 'empty link';
+    doc.appendChild(a);
+    var beforeHash = location.hash, beforeRun = currentRun;
+    a.click();
+    await new Promise(function(r) { setTimeout(r, 100); });
+    var got = { hashHeld: location.hash === beforeHash, runHeld: currentRun === beforeRun,
+                docStillShown: document.getElementById('doc-panel').style.display !== 'none' };
+    a.remove();
+    return got;
+  })();`),
+  { hashHeld: true, runHeld: true, docStillShown: true });
+// ...and it has somewhere to land: markdown-it emits no heading ids, so before
+// idHeadings() every in-spec fragment pointed at nothing whatsoever.
+check('spec headings get ids for a fragment to reach', await evaluate(`
+  var h = document.querySelector('#doc-content h1');
+  return h ? h.id : null;`), 'spec-h-spec-for-alpha-deploy');
+// The prefix is the whole point: the spec is agent-written text, and a heading as
+// ordinary as `# Feedback` would otherwise take id="feedback" — which precedes the
+// form in the document, so getElementById('feedback') hands submitDecision an <h1>
+// instead of the textarea and Submit dies on undefined.trim(), silently, for the
+// rest of the review. Rendered here through the real render path.
+// Rendered into a scratch container appended to the live document — the ids have to
+// really be in the document for the shadowing to be possible at all — rather than by
+// overwriting #doc-content, which would tear out the wired blocks later checks use.
+check('a heading cannot steal an id the page itself uses', await evaluate(`
+  var scratch = document.createElement('div');
+  document.getElementById('doc-content').appendChild(scratch);
+  scratch.innerHTML = renderMd('# Feedback\\n\\nbody\\n\\n# Submit btn\\n');
+  idHeadings(scratch);
+  var got = {
+    // The form's own elements still answer to their ids...
+    feedbackIsTextarea: document.getElementById('feedback').tagName.toLowerCase(),
+    // ...and submitDecision's very first read still works rather than throwing.
+    canReadFeedback: typeof document.getElementById('feedback').value === 'string',
+    headingIds: Array.prototype.map.call(scratch.querySelectorAll('h1'), function(h) { return h.id; })
+  };
+  scratch.remove();
+  return got;`), {
+    feedbackIsTextarea: 'textarea', canReadFeedback: true,
+    headingIds: ['spec-h-feedback', 'spec-h-submit-btn']
+  });
+// Non-ASCII headings must still slug to something distinct, or every heading in a
+// non-English spec collapses to `section` and none of its own links resolve.
+check('a non-ASCII heading still gets a usable id', await evaluate(`
+  var scratch = document.createElement('div');
+  document.getElementById('doc-content').appendChild(scratch);
+  scratch.innerHTML = renderMd('# 設計方針\\n\\nbody\\n\\n# Café plan\\n');
+  idHeadings(scratch);
+  var ids = Array.prototype.map.call(scratch.querySelectorAll('h1'), function(h) { return h.id; });
+  scratch.remove();
+  return ids;`), ['spec-h-設計方針', 'spec-h-café-plan']);
+// Having the id is not the same as being reachable. markdown-it percent-encodes
+// non-ASCII in an href, so the link arrives as %E8%A8%AD… while the id holds the
+// characters themselves — a lookup on the raw href misses and the jump silently
+// does nothing. Only clicking a real link end to end catches that; asserting on
+// idHeadings' output alone cannot, which is how it survived a round.
+check('a fragment link into a non-ASCII heading actually scrolls to it', await evaluate(`
+  var scratch = document.createElement('div');
+  document.getElementById('doc-content').appendChild(scratch);
+  scratch.innerHTML = renderMd('# 設計方針\\n\\n[jump](#設計方針)\\n');
+  idHeadings(scratch);
+  var h = scratch.querySelector('h1');
+  var a = scratch.querySelector('a');
+  var scrolled = null;
+  h.scrollIntoView = function() { scrolled = this.id; };
+  a.click();
+  var got = { hrefWasEncoded: a.getAttribute('href') !== '#設計方針', scrolledTo: scrolled };
+  scratch.remove();
+  return got;`), { hrefWasEncoded: true, scrolledTo: 'spec-h-設計方針' });
+
 console.log('\n== run detail: answering questions ==');
 check('cursor lands on the first question', await cursorQuestion(), 'Which cache backend should the deploy use?');
 await press('j');
@@ -1269,6 +1410,313 @@ check('duplicate question ids are refused', await evaluate(`
   var got = duplicateQuestionId();
   currentQuestions = saved;
   return got;`), 'dup');
+
+console.log('\n== run detail: request-changes must say something ==');
+// Driven through the real submit path, not the helper: this is the gate that
+// stops a contentless request-changes reaching the agent. Safe to call — the
+// guard returns before the fetch, so the run's state does not move. The decision
+// radio is selected explicitly rather than trusting the page default: if it were
+// ever 'approve' here, this would fall through the gate into a REAL submit and
+// flip the seeded run, and every check after it would fail for the wrong reason.
+check('request-changes with nothing to say is refused', await evaluate(`
+  document.querySelector('input[name="decision"][value="request-changes"]').checked = true;
+  document.getElementById('feedback').value = '';
+  submitDecision();
+  var err = document.getElementById('form-error');
+  return err.style.display !== 'none' && err.textContent;`),
+  'Say what to change: add feedback, or an inline comment on the spec.');
+check('...and the box it tells you to fill gets the focus', await activeId(), 'feedback');
+// Hand focus back: the navigator deliberately goes inert while a text box has it,
+// so leaving it in the textarea would make every later keypress check a no-op.
+await evaluate(`document.getElementById('feedback').blur(); return 1;`);
+// An inline comment IS the feedback — the reviewer already said what to change,
+// on the line they want changed. Requiring the box too was busywork.
+// The quote is the fixture spec's real line 1 (web_nav.rs seeds it), hardcoded rather
+// than read back from specSourceLines: a comment only counts while the line it quotes
+// still reads the same (annotationIsAnchored), and comparing the page's own value to
+// itself would pass even if that comparison were reduced to `x === x`.
+check('a saved inline comment stands in for the feedback box', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: '# Spec for alpha-deploy', comments: [{ id: 1, text: 'drop this', quote: '# Spec for alpha-deploy' }] } };
+  var got = needsWrittenFeedback('');
+  annotations = saved;
+  return got;`), false);
+// ...but only a SAVED one: collectAnnotations is what reaches feedback.json, so
+// an entry with no comments on it must not unlock the submit.
+check('an empty annotation entry does not', await evaluate(`
+  var saved = annotations;
+  annotations = { 12: { quote: 'a spec line', comments: [] } };
+  var got = needsWrittenFeedback('');
+  annotations = saved;
+  return got;`), true);
+check('typed feedback still works on its own',
+  await evaluate(`return needsWrittenFeedback('please rework the cache section');`), false);
+// Asserting on the helper alone is only half the gate: drop the annotation term at
+// the call site and every check above stays green while the old behavior is back.
+// So submit for REAL, with fetch stubbed — what reached the wire is the assertion.
+// The stub answers {ok:false}, the one reply that re-enables the buttons without a
+// refresh(), so the seeded run's state never moves. `setup` runs with annotations
+// already cleared; both it and the feedback box are undone afterwards.
+const stubbedSubmit = setup => evaluate(`
+  return (async function() {
+    var savedAnnots = annotations, savedFetch = window.fetch, sent = null;
+    annotations = {};
+    // Set here, not inherited from whichever check ran last: this only worked
+    // because it matches the HTML's default, so a reordering would break it silently.
+    document.querySelector('input[name="decision"][value="request-changes"]').checked = true;
+    ${setup}
+    window.fetch = function(url, opts) {
+      sent = { url: String(url), body: JSON.parse(opts.body) };
+      return Promise.resolve({ json: function() { return Promise.resolve({ ok: false }); } });
+    };
+    try { await submitDecision(); } finally {
+      window.fetch = savedFetch;
+      annotations = savedAnnots;
+      document.getElementById('feedback').value = '';
+    }
+    if (!sent) return 'nothing was sent';
+    return { posted: /\\/submit$/.test(sent.url), decision: sent.body.decision,
+             feedback: sent.body.feedback, annotations: sent.body.annotations.length };
+  })();`);
+
+check('an annotation-only request-changes reaches the server',
+  await stubbedSubmit(`annotations = { 1: { quote: '# Spec for alpha-deploy', comments: [{ id: 1, text: 'drop this', quote: '# Spec for alpha-deploy' }] } };`),
+  { posted: true, decision: 'request-changes', feedback: '', annotations: 1 });
+// The mirror case. Without it, a payload that hardcoded feedback:'' would pass every
+// other check in this file — the reviewer's prose would vanish between box and wire.
+check('...and typed feedback reaches it intact, verbatim',
+  await stubbedSubmit(`document.getElementById('feedback').value = 'rework the cache section';`),
+  { posted: true, decision: 'request-changes', feedback: 'rework the cache section', annotations: 0 });
+
+// A comment can outlive the line it was written on: `review summary` re-renders the
+// doc panel, and on a re-summarised SAME turn loadAnnotations restores by turn number
+// alone, so old anchors come back over new text. Now that one comment can be a turn's
+// entire payload, a stale one must not be what the agent receives.
+check('a comment stranded by a spec revision does not count as feedback', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: 'a line the spec no longer has', comments: [{ id: 1, text: 'drop this', quote: 'a line the spec no longer has' }] } };
+  var got = [needsWrittenFeedback(''), collectAnnotations().length, strandedAnnotations()];
+  annotations = saved;
+  return got;`), [true, 0, 1]);
+// ...and the refusal has to name the real reason: the comment is still on screen, so
+// "you said nothing" would read as the submit button being broken.
+check('the refusal says the spec moved under the comment', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: 'a line the spec no longer has', comments: [{ id: 1, text: 'drop this', quote: 'a line the spec no longer has' }] } };
+  document.querySelector('input[name="decision"][value="request-changes"]').checked = true;
+  document.getElementById('feedback').value = '';
+  submitDecision();
+  annotations = saved;
+  var err = document.getElementById('form-error');
+  return err.style.display !== 'none' && /no longer match/.test(err.textContent);`), true);
+await evaluate(`document.getElementById('feedback').blur(); return 1;`);
+// The stranding test is only meaningful if an UNCHANGED line still counts — otherwise
+// annotationIsAnchored could reject everything and both checks above would still pass.
+check('...while a comment still matching its line does count', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: '# Spec for alpha-deploy', comments: [{ id: 1, text: 'drop this', quote: '# Spec for alpha-deploy' }] } };
+  var got = [needsWrittenFeedback(''), collectAnnotations().length, strandedAnnotations()];
+  annotations = saved;
+  return got;`), [false, 1, 0]);
+// Dropping it from the payload is only half the job: on approve, or with feedback
+// typed, the submit gate never runs, so the ONLY place the reviewer can learn their
+// comment was dropped is the comment itself. It has to say so on screen, in words —
+// a colour or a title tooltip alone reaches neither a keyboard nor a touch reviewer.
+check('a stranded comment says so where the reviewer can see it', await evaluate(`
+  var saved = annotations, savedLines = specSourceLines;
+  annotations = { 1: { quote: 'a line the spec no longer has', comments: [{ id: 7, text: 'drop this', quote: 'a line the spec no longer has' }] } };
+  var el = document.getElementById('saved-annots-1');
+  renderSavedAnnotations(1, el);
+  var chip = el.querySelector('.saved-annot-chip');
+  var got = [!!chip && chip.classList.contains('stranded'),
+             chip ? (chip.querySelector('.annot-stranded-tag') || {}).textContent : null];
+  annotations = saved; specSourceLines = savedLines;
+  renderSavedAnnotations(1, el);
+  return got;`), [true, 'line changed — not sent']);
+// ...and an anchored one is left alone, or the marker would just always be on.
+check('...and a comment that still matches is not marked', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: specSourceLines[0], comments: [{ id: 8, text: 'keep this', quote: specSourceLines[0] }] } };
+  var el = document.getElementById('saved-annots-1');
+  renderSavedAnnotations(1, el);
+  var chip = el.querySelector('.saved-annot-chip');
+  var got = [!!chip, !!chip && chip.classList.contains('stranded'),
+             !!chip && !!chip.querySelector('.annot-stranded-tag')];
+  annotations = saved;
+  renderSavedAnnotations(1, el);
+  return got;`), [true, false, false]);
+// The inline marker can only reach a comment whose line still renders as a block.
+// Delete the commented line — the most natural way for an agent to answer "cut this"
+// — and wireAnnotations never visits it, so the chip is never drawn: the comment
+// would vanish from the page AND from the turn, silently. Hence a panel of its own.
+check('a comment whose line is gone is listed, not just dropped', await evaluate(`
+  var saved = annotations;
+  annotations = { 999: { quote: 'a paragraph that was deleted', comments: [{ id: 9, text: 'rework this', quote: 'a paragraph that was deleted' }] } };
+  renderUnanchoredPanel();
+  var panel = document.getElementById('unanchored-annots');
+  var got = { shown: panel.style.display !== 'none',
+              says: /will not be sent/.test(panel.textContent),
+              quotesIt: /a paragraph that was deleted/.test(panel.textContent),
+              keepsTheWords: /rework this/.test(panel.textContent) };
+  annotations = saved;
+  renderUnanchoredPanel();
+  return got;`), { shown: true, says: true, quotesIt: true, keepsTheWords: true });
+// ...and it stays out of the way when there is nothing to report, rather than sitting
+// empty above every spec.
+check('...and the panel is hidden when every comment is anchored', await evaluate(`
+  var saved = annotations;
+  annotations = { 1: { quote: specSourceLines[0], comments: [{ id: 10, text: 'fine', quote: specSourceLines[0] }] } };
+  renderUnanchoredPanel();
+  var hidden = document.getElementById('unanchored-annots').style.display === 'none';
+  annotations = saved;
+  renderUnanchoredPanel();
+  return hidden;`), true);
+// With no spec text — an absent spec.md answers the same as a failed fetch — these
+// comments are unverifiable, not deleted. Saying "the line is gone" next to a
+// one-click permanent discard would talk a reviewer into throwing away good work
+// over a transient hiccup, so the wording changes and the discard button is withheld.
+check('a panel with no spec to compare against does not claim the lines were deleted',
+  await evaluate(`
+  var saved = annotations, savedLines = specSourceLines;
+  annotations = { 4: { quote: 'a line that is still there', comments: [{ id: 12, text: 'rework this', quote: 'a line that is still there' }] } };
+  specSourceLines = [];
+  renderUnanchoredPanel();
+  var panel = document.getElementById('unanchored-annots');
+  var got = { shown: panel.style.display !== 'none',
+              claimsGone: /is gone|are gone/.test(panel.textContent),
+              saysNotLoaded: /not loaded/.test(panel.textContent),
+              reassures: /Nothing has been discarded/.test(panel.textContent),
+              keepsTheWords: /rework this/.test(panel.textContent),
+              discardButtons: panel.querySelectorAll('.annot-remove').length };
+  annotations = saved; specSourceLines = savedLines;
+  renderUnanchoredPanel();
+  return got;`), {
+    shown: true, claimsGone: false, saysNotLoaded: true, reassures: true,
+    keepsTheWords: true, discardButtons: 0
+  });
+// The third arm of the submit gate. A doc that failed to load leaves specSourceLines
+// empty, which makes every comment unverifiable — telling the reviewer their spec
+// "changed" would be a guess, and telling them they said nothing is plainly false.
+check('no spec text to match against is named as the reason, not blamed on the reviewer',
+  await evaluate(`
+  var saved = annotations, savedLines = specSourceLines;
+  annotations = { 1: { quote: 'whatever was here', comments: [{ id: 11, text: 'rework this', quote: 'whatever was here' }] } };
+  specSourceLines = [];
+  document.querySelector('input[name="decision"][value="request-changes"]').checked = true;
+  document.getElementById('feedback').value = '';
+  submitDecision();
+  annotations = saved; specSourceLines = savedLines;
+  var err = document.getElementById('form-error');
+  return err.style.display !== 'none' && err.textContent;`),
+  'There is no spec text to match your inline comments against. ' +
+  'Reload the page, or type feedback here.');
+await evaluate(`document.getElementById('feedback').blur(); return 1;`);
+
+// Everything above seeds `annotations` by hand, which would keep passing even if the
+// UI that populates it were broken — and then a reviewer's real comment would neither
+// unlock the gate nor ship. Drive the actual widget: reveal the trigger, type, Save.
+// `line`/`quote` are checked against the spec source the server served, because the
+// agent-facing docs (skills/pipeline/phase-prompts/brainstorm.md) promise an agent it
+// can find the commented text by that line number — a wrong anchor sends it editing
+// the wrong part of its own spec.
+check('a comment saved through the real annotation UI is what unlocks the gate', await evaluate(`
+  return (async function() {
+    var specLines = (await (await fetch(api('doc'))).text()).split('\\n');
+    var block = document.querySelector('#doc-content .annotatable');
+    block.querySelector('.annot-trigger').click();
+    var box = block.querySelector('.annotation-box');
+    box.querySelector('textarea').value = 'tighten this section';
+    box.querySelector('.annotation-save-btn').click();
+    var saved = collectAnnotations();
+    var unlocked = !needsWrittenFeedback('');
+    block.querySelector('.annot-remove').click();   // undo through the real remove button
+    return {
+      comment: saved.length === 1 && saved[0].comment,
+      lineIsBlockStart: !!saved[0] && saved[0].line === parseInt(block.getAttribute('data-source-line'), 10),
+      quotesThatSpecLine: !!saved[0] && saved[0].quote === specLines[saved[0].line - 1],
+      unlocked: unlocked,
+      relocksOnRemove: needsWrittenFeedback('')
+    };
+  })();`), {
+    comment: 'tighten this section', lineIsBlockStart: true, quotesThatSpecLine: true,
+    unlocked: true, relocksOnRemove: true
+  });
+
+// Every staleness check above seeds `annotations` directly and exercises the READ
+// side. The write side is where it broke: saving a second comment on a line used to
+// overwrite one shared per-line quote, which retroactively re-anchored the stale
+// comment already sitting there and shipped it as if it still applied — with the
+// marker gone from its chip, so the reviewer could not even see it happen. Drive the
+// real Save button on a line that already holds a stranded comment.
+check('re-commenting a line does not revive the stale comment on it', await evaluate(`
+  var savedAnnots = annotations;
+  var block = document.querySelector('#doc-content .annotatable');
+  var lineNum = parseInt(block.getAttribute('data-source-line'), 10);
+  // A comment quoting text this line no longer has: stranded, as the chip shows.
+  annotations = {};
+  annotations[lineNum] = { quote: 'text this line has not had for a while',
+                           comments: [{ id: 101, text: 'the old ask',
+                                        quote: 'text this line has not had for a while' }] };
+  var before = { stranded: strandedAnnotations(), sent: collectAnnotations().length };
+  // Now the reviewer comments on what the line says TODAY, through the real widget.
+  block.querySelector('.annot-trigger').click();
+  var box = block.querySelector('.annotation-box');
+  box.querySelector('textarea').value = 'the new ask';
+  box.querySelector('.annotation-save-btn').click();
+  var sent = collectAnnotations();
+  var chips = block.querySelectorAll('.saved-annot-chip');
+  var got = {
+    beforeStranded: before.stranded, beforeSent: before.sent,
+    // Only the new comment travels; the old one stays out of the payload.
+    sentTexts: Array.prototype.map.call(sent, function(a) { return a.comment; }),
+    stillStranded: strandedAnnotations(),
+    // ...and its chip still says so, rather than silently looking fresh.
+    strandedChips: Array.prototype.filter.call(chips, function(el) {
+      return el.classList.contains('stranded'); }).length,
+    chipCount: chips.length
+  };
+  annotations = savedAnnots;
+  saveAnnotations();
+  renderSavedAnnotations(lineNum, document.getElementById('saved-annots-' + lineNum));
+  renderUnanchoredPanel();
+  return got;`), {
+    beforeStranded: 1, beforeSent: 0,
+    sentTexts: ['the new ask'], stillStranded: 1, strandedChips: 1, chipCount: 2
+  });
+// The same trap one upgrade earlier. A comment saved before quotes moved onto
+// comments has no `quote` of its own, and borrowing the line's — which the next
+// save rewrites — revives it exactly as above. The reviewers carrying that data are
+// the ones who were already stranded, so they must not be the ones it breaks for.
+check('an old-shape comment is migrated at load, not left borrowing the line quote',
+  await evaluate(`
+  var savedAnnots = annotations, savedTurn = currentTurn;
+  var wasOn = 'the text it was written against';
+  var block = document.querySelector('#doc-content .annotatable');
+  var lineNum = parseInt(block.getAttribute('data-source-line'), 10);
+  // Old shape, exactly as it sits in a pre-upgrade localStorage: no per-comment quote.
+  var stored = { turn: currentTurn, seq: 201, annotations: {} };
+  stored.annotations[lineNum] = { quote: wasOn, comments: [{ id: 201, text: 'the old ask' }] };
+  localStorage.setItem(annotKey(), JSON.stringify(stored));
+  loadAnnotations(currentTurn);
+  var migrated = annotations[lineNum].comments[0].quote;
+  // The reviewer now comments on what the line says today, through the REAL Save
+  // button — the path that used to overwrite the line's shared quote. Pushing the
+  // comment by hand instead would skip that write and prove nothing.
+  block.querySelector('.annot-trigger').click();
+  var box = block.querySelector('.annotation-box');
+  box.querySelector('textarea').value = 'the new ask';
+  box.querySelector('.annotation-save-btn').click();
+  var got = { migratedQuote: migrated,
+              sentTexts: collectAnnotations().map(function(a) { return a.comment; }),
+              stranded: strandedAnnotations() };
+  annotations = savedAnnots; currentTurn = savedTurn;
+  saveAnnotations();
+  renderSavedAnnotations(lineNum, document.getElementById('saved-annots-' + lineNum));
+  renderUnanchoredPanel();
+  return got;`), {
+    migratedQuote: 'the text it was written against',
+    sentTexts: ['the new ask'], stranded: 1
+  });
 
 console.log('\n== pointer and keyboard agree ==');
 check('clicking a question adopts it as the cursor', await evaluate(`
@@ -1322,7 +1770,117 @@ check('the page can scroll clear of the fixed hint bar', await evaluate(`
   var bar = document.getElementById('keyhint').getBoundingClientRect().height;
   return pad >= bar * 2;`), true);
 
+console.log('\n== agent tree: a reaped phase ==');
+await goto('#/runs/delta-idle', AGENTS_READY);
+const tree = await agentNodes();
+check('a reaped phase is still listed — hiding it would look like it never ran',
+  tree.map(n => n.name), ['brainstorm', 'plan', 'implement']);
+check('reaped phases render dimmed', tree.map(n => n.reaped), [true, true, false]);
+// The ⟳ is gated on `rehydratable` — the same predicate the CLI refuses on — so
+// it appears on BOTH reaped phases (the second reseeds rather than resuming, and
+// its tooltip says so) and on neither the live one nor a phase that never ran.
+// Gating it on "has a session" instead would hide a recovery that works, and
+// gating it on `reaped` alone would offer one the CLI then rejects.
+check('⟳ appears exactly where a click will work',
+  tree.map(n => n.rehydrate), [true, true, false]);
+check('the ⟳ says which one you get', await evaluate(`
+  return Array.from(document.querySelectorAll('#agents-tree .agent-rehydrate'))
+    .map(function(b){ return b.title.indexOf('resume this') !== -1 ? 'session' : 'reseed'; });`),
+  ['session', 'reseed']);
+// The stub answers the way the server does, so the click handler's real
+// response path runs — including `r.json()`, which is where the outcome the
+// human needs lives.
+const stubbedClick = (ok, body) => evaluate(`
+  var seen = null, real = window.fetch;
+  window.fetch = function(u, o) {
+    seen = { url: u, method: (o || {}).method };
+    return Promise.resolve({ ok: ${ok}, status: ${ok ? 200 : 500},
+                             json: function(){ return Promise.resolve(${JSON.stringify(body)}); } });
+  };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  return seen;`);
+const agentsNoteText = () => evaluate(`
+  var e = document.getElementById('agents-note');
+  return { text: e.textContent, bad: e.classList.contains('bad'), shown: e.style.display !== 'none' };`);
+
+check('⟳ posts to the run-scoped rehydrate endpoint',
+  await stubbedClick(true, { ok: true, complete: false, phase: 'brainstorm',
+    detail: "phase 'brainstorm' relaunched INCOMPLETE — its seed was NOT re-sent" }),
+  { url: '/api/runs/delta-idle/rehydrate?phase=brainstorm', method: 'POST' });
+// A rehydrate that could not deliver the seed is an HTTP 200. If the page drops
+// the body, the user sees the ⟳ vanish and never learns the agent is blank.
+await waitFor(agentsNoteText, n => n.text.indexOf('NOT re-sent') !== -1, 8000,
+  'the outcome detail to be shown');
+// …and it must READ as a problem. `complete: false` means the pane came back
+// but the agent was never told what it is doing — not a success to scroll past.
+check('an incomplete rehydrate is flagged, not reported as plain success',
+  (await agentsNoteText()).bad, true);
+
+// The control: a rehydrate that DID everything must not be flagged, or "flag
+// everything" would pass the check above.
+const enabledButton = () => evaluate(`
+  var b = document.querySelector('#agents-tree .agent-rehydrate');
+  return !!b && !b.disabled;`);
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
+await stubbedClick(true, { ok: true, complete: true, phase: 'brainstorm',
+  detail: "phase 'brainstorm' resumed with its recorded session" });
+await waitFor(agentsNoteText, n => n.text.indexOf('resumed with') !== -1, 8000,
+  'the success detail');
+check('a complete rehydrate is NOT flagged', (await agentsNoteText()).bad, false);
+
+// Wait for a button that is ENABLED, not merely present: the click above left
+// the old element disabled on purpose, and clicking a disabled button is a
+// silent no-op — the next check would then assert against the previous note.
+await waitFor(enabledButton, v => v === true, 8000, 'the tree to re-render');
+check('a failed rehydrate reports the reason the server gave, not just a status code',
+  await (async () => {
+    await stubbedClick(false, { ok: false, error: 'run has no herdr workspace' });
+    await waitFor(agentsNoteText, n => n.bad, 8000, 'the failure note');
+    return await agentsNoteText();
+  })(),
+  { text: 'run has no herdr workspace', bad: true, shown: true });
+check('a failed rehydrate re-enables its button', await evaluate(`
+  var b = document.querySelector('#agents-tree .agent-rehydrate');
+  return b ? b.disabled : null;`), false);
+
+
+// A pane that leaves the tree must not stay selected: `?pane=<gone>` answers
+// 204 on the mirror and 409 on send, which reads as a wedged UI rather than as
+// a stale selection — and a reaped node is exactly how a pane leaves.
+check('a live pane can be selected', await evaluate(`
+  selectPane('w1:p3', 'implement'); return selectedPane;`), 'w1:p3');
+check('a pane outside the tree starts out selected too', await evaluate(`
+  selectPane('w1:gone', 'ghost'); return selectedPane;`), 'w1:gone');
+await waitFor(() => evaluate(`return selectedPane;`), v => v === null, 8000,
+  'the stale pane to be dropped');
+check('the mirror falls back to the run default once it is dropped',
+  await evaluate(`return document.getElementById('session-target').textContent;`), 'active');
+
+// A reseed waits for the fresh agent to attach — up to 30s — so the response can
+// easily land after the user has moved on. `#agents-note` is page-global, so an
+// unguarded write files run A's outcome under run B. Hold the response open,
+// navigate, THEN settle it: without the guard the note lands on the wrong run.
+// `location.hash` (not Page.navigate) so the in-flight promise survives.
+check('a rehydrate response can be held open across a navigation', await evaluate(`
+  window.__settle = null;
+  var real = window.fetch;
+  window.fetch = function() { return new Promise(function(res){ window.__settle = res; }); };
+  document.querySelector('#agents-tree .agent-rehydrate').click();
+  window.fetch = real;
+  location.hash = '#/runs/beta-cache';
+  return typeof window.__settle === 'function';`), true);
+await waitFor(hash, h => h === '#/runs/beta-cache', 8000, 'the other run');
+await evaluate(`
+  window.__settle({ ok: true, status: 200,
+                    json: function(){ return Promise.resolve({ detail: 'LEAKED FROM delta-idle' }); } });
+  return 1;`);
+await sleep(400);
+check('a response arriving after navigation is dropped, not filed under the new run',
+  await evaluate(`return document.getElementById('agents-note').textContent;`), '');
+
 console.log('\n== leaving a run ==');
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');
@@ -1394,10 +1952,28 @@ await goto('#/runs/alpha-deploy', {
 // Plant a line comment on ALPHA first, so there is something real to leak: with
 // no annotations on the outgoing run this check would pass no matter what.
 await evaluate(`
-  annotations = { 1: { quote: 'Spec for alpha-deploy', comments: [{ id: 1, text: 'alpha-only comment' }] } };
+  // Quote taken from the live spec so the comment is anchored: a comment counts
+  // only while the line it quotes still reads the same, and this check is about
+  // cross-run leakage, not anchoring — an unanchored plant would leave it with
+  // nothing to leak.
+  annotations = { 1: { quote: specSourceLines[0],
+                       comments: [{ id: 1, text: 'alpha-only comment', quote: specSourceLines[0] }] } };
+  // A SECOND plant, deliberately unanchored, so #unanchored-annots is populated
+  // too. The anchored one above never reaches that panel, so on its own it leaves
+  // the panel's own leak untested — and that panel renders the comment's text
+  // verbatim, which is the reviewer's private prose about another run's spec.
+  // Line 999: a line the spec does not have, so no block renders for it and the
+  // comment lands in the panel rather than as an inline chip on a real block.
+  annotations[999] = { quote: 'a line alpha no longer has',
+                       comments: [{ id: 2, text: 'alpha-only stranded note',
+                                    quote: 'a line alpha no longer has' }] };
+  renderUnanchoredPanel();
   return JSON.stringify(collectAnnotations()).indexOf('alpha-only') !== -1;`);
 check('the planted annotation is really submittable on alpha',
   await evaluate(`return collectAnnotations().length;`), 1);
+check('...and the stranded one is really on screen to leak', await evaluate(`
+  var p = document.getElementById('unanchored-annots');
+  return p.style.display !== 'none' && /alpha-only stranded note/.test(p.textContent);`), true);
 await evaluate(`
   window.__origFetch = window.fetch;
   window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
@@ -1413,6 +1989,14 @@ check('...and no panel claiming to show one',
 // entirely and alpha's comment would still be in the payload POSTed for epsilon.
 check('...and no stale annotations to submit under this run',
   await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
+// The unanchored panel is a sibling of #doc-panel, so main's reset of that panel
+// does not reach it, and it only ever repaints from refresh() — which just
+// rejected. Left out of the synchronous reset it keeps displaying the previous
+// run's comment text, under this run's name, with nothing to correct it.
+check('...and no previous run\'s comments still displayed', await evaluate(`
+  var p = document.getElementById('unanchored-annots');
+  return { hidden: p.style.display === 'none', leaks: /alpha-only/.test(p.textContent) };`),
+  { hidden: true, leaks: false });
 await evaluate(`window.fetch = window.__origFetch; return 1;`);
 
 console.log('\n== the decision form does not carry across runs ==');
@@ -1449,7 +2033,12 @@ await goto('#/runs/alpha-deploy', QUESTIONS_READY);
 await evaluate(`
   document.getElementById('feedback').value = 'half-written feedback I am still editing';
   document.querySelector('input[name="decision"][value="approve"]').checked = true;
-  annotations = { 2: { quote: 'Content.', comments: [{ id: 9, text: 'in-progress note' }] } };
+  // Anchored for the same reason: this pins annotation PERSISTENCE, so the plant
+  // has to be one that would actually survive to be submitted. Line 3, not line 2:
+  // line 2 of the fixture spec is blank, and '' === '' anchors against any spec
+  // with a blank line there — a pin that holds without the real text matching.
+  annotations = { 3: { quote: specSourceLines[2],
+                       comments: [{ id: 9, text: 'in-progress note', quote: specSourceLines[2] }] } };
   saveAnnotations();   // every real mutation site does this, so match real usage
   return 1;`);
 const sameRunGen = await evaluate(`return routeGen;`);
