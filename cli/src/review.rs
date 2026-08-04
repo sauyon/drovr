@@ -1168,12 +1168,30 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
 /// with its per-task review panels nested beneath it. Only agents that actually
 /// have a pane appear (unstarted placeholder phases are omitted).
 fn handle_get_agents(req: Request, p: &RunPaths) {
-    // A config that fails to load must not blank the tree: fall back to the
-    // built-in agent map, which is what `resumable` is asking about anyway.
-    let cfg = crate::config::load_config().unwrap_or_default();
+    // A config that fails to load must not blank the tree — but it must not be
+    // SILENT either. `resumable` is computed from the agent map, so a config
+    // drovr could not read means every ⟳ on this page is decided by the
+    // built-in backends rather than the user's, and the button then appears (or
+    // vanishes) for a reason nothing on screen explains. Serve the tree, carry
+    // the reason with it, and let the page say so.
+    let (cfg, config_error) = match crate::config::load_config() {
+        Ok(cfg) => (cfg, None),
+        Err(e) => (
+            crate::config::Config::default(),
+            Some(format!(
+                "drovr could not read your config ({e}), so the ⟳ buttons below are decided \
+                 by the built-in agent map — a resume surface you configured yourself is not \
+                 reflected here."
+            )),
+        ),
+    };
     let tree = match load_run_state(&p.dir) {
-        Some(run) => build_agent_tree(&run, &cfg),
-        None => serde_json::json!({ "workspace": serde_json::Value::Null, "nodes": [] }),
+        Some(run) => build_agent_tree(&run, &cfg, config_error.as_deref()),
+        None => serde_json::json!({
+            "workspace": serde_json::Value::Null,
+            "nodes": [],
+            "config_error": config_error,
+        }),
     };
     respond_str(req, 200, "application/json", tree.to_string());
 }
@@ -1199,18 +1217,25 @@ fn status_str(status: &crate::run::PhaseStatus) -> String {
 /// resume surface at all, so a codex phase can carry a perfectly good session id
 /// and still only be relaunchable.
 fn has_resumable_session(phase: &crate::run::Phase, cfg: &crate::config::Config) -> bool {
-    phase.resume_target().is_some_and(|target| {
-        cfg.agents
-            .get(target.backend())
-            .is_some_and(|spec| spec.resume.is_some())
-    })
+    phase
+        .resume_target()
+        .is_some_and(|target| cfg.resume_surface(target.backend()).is_some())
 }
 
 /// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
 /// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
 /// `implement-<task>` phase. Reviews with no matching phase land in a trailing
 /// group node so nothing is dropped.
-fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::Value {
+///
+/// `config_error` is why `cfg` is NOT the user's own config, when it is not. It
+/// travels with the tree rather than being logged, because the poll that builds
+/// this runs every two seconds — a log line would be either spam or invisible,
+/// and the person it concerns is looking at the page, not the server's stderr.
+fn build_agent_tree(
+    run: &RunState,
+    cfg: &crate::config::Config,
+    config_error: Option<&str>,
+) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
@@ -1256,7 +1281,11 @@ fn build_agent_tree(run: &RunState, cfg: &crate::config::Config) -> serde_json::
             "status": "", "pane_id": serde_json::Value::Null, "children": revs,
         }));
     }
-    serde_json::json!({ "workspace": run.workspace, "nodes": nodes })
+    serde_json::json!({
+        "workspace": run.workspace,
+        "nodes": nodes,
+        "config_error": config_error,
+    })
 }
 
 /// `GET /api/runs/<run>/review/diff?task=<task>`: unified `git diff
@@ -2918,7 +2947,7 @@ mod tests {
                 ph("review:task-1:1:security", Done, Some("w:p5")),
             ],
         );
-        let tree = build_agent_tree(&run, &crate::config::Config::default());
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
         assert_eq!(tree["workspace"], "w");
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "placeholder omitted: {tree}");
@@ -3252,7 +3281,7 @@ mod tests {
             ],
             vec![],
         );
-        let tree = build_agent_tree(&run, &crate::config::Config::default());
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(
             nodes.len(),
@@ -3295,15 +3324,72 @@ mod tests {
         let run = tree_run(vec![p], vec![]);
 
         let cfg = crate::config::Config::default();
-        let tree = build_agent_tree(&run, &cfg);
+        let tree = build_agent_tree(&run, &cfg, None);
         assert_eq!(tree["nodes"][0]["resumable"], false);
 
         // …and it flips the moment the user opts codex in.
         let mut cfg = cfg;
         cfg.agents.get_mut("codex").unwrap().resume =
             Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
-        let tree = build_agent_tree(&run, &cfg);
+        let tree = build_agent_tree(&run, &cfg, None);
         assert_eq!(tree["nodes"][0]["resumable"], true);
+    }
+
+    #[test]
+    fn the_tree_and_the_launcher_read_the_same_resume_surface() {
+        // `has_resumable_session` used to reach into `cfg.agents` and test
+        // `spec.resume` itself — a SECOND classifier of the fact
+        // `Config::resume_launch` classifies when it decides between resuming
+        // and reseeding. This branch has already paid twice for exactly that
+        // shape (`Capture::from_poll` vs `PaneState::from_poll`). Pin that the
+        // two agree for every backend, including the ones the config file adds.
+        use crate::run::PhaseStatus::Done;
+        let mut cfg = crate::config::Config::default();
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
+        for backend in ["claude", "cursor", "codex", "not-in-the-config"] {
+            let mut p = ph("plan", Done, Some("w:p1"));
+            p.record_launch(backend, None);
+            assert!(p.record_session(crate::herdr::SessionId::new("s-1".into()).unwrap()));
+            let target = p.resume_target().unwrap();
+            // `Ok(None)` is "no resume surface"; `Err` is "the config does not
+            // know this backend at all", which is also not a resume.
+            let launcher = cfg
+                .resume_launch(&target, "/tmp/p", false)
+                .ok()
+                .flatten()
+                .is_some();
+            assert_eq!(
+                has_resumable_session(&p, &cfg),
+                launcher,
+                "the ⟳'s promise and the launcher disagree about '{backend}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_that_would_not_load_is_reported_rather_than_swallowed() {
+        // The tree falls back to the BUILT-IN agent map when the user's config
+        // cannot be read, so `resumable` is computed against the wrong backends
+        // and the ⟳ appears (or vanishes) for a reason nothing on screen
+        // explains. Serving the tree anyway is right — a config typo must not
+        // blank the panel — but silently is not.
+        use crate::run::PhaseStatus::Done;
+        let run = tree_run(vec![ph("plan", Done, Some("w:p1"))], vec![]);
+        let cfg = crate::config::Config::default();
+
+        let clean = build_agent_tree(&run, &cfg, None);
+        assert_eq!(clean["config_error"], serde_json::Value::Null);
+
+        let broken = build_agent_tree(&run, &cfg, Some("expected a value at line 3"));
+        assert!(
+            broken["config_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("expected a value at line 3")),
+            "the reason has to reach the page: {broken}"
+        );
+        // …and the tree is still served, or a config typo blanks the panel.
+        assert_eq!(broken["nodes"].as_array().unwrap().len(), 1);
     }
 
     #[test]

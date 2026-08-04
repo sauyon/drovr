@@ -547,6 +547,20 @@ impl Config {
         Ok(name.to_owned())
     }
 
+    /// The resume surface `agent` offers, or `None` — either the config does not
+    /// know this agent, or it knows it and it has none.
+    ///
+    /// **THE lookup, and the only one.** [`Config::resume_launch`] composes from
+    /// it, and the review UI asks it whether a ⟳ promises the CONVERSATION back
+    /// or merely a fresh agent reading the notes. The UI used to reach into
+    /// `self.agents` and test `spec.resume` itself — a second classifier of one
+    /// fact, which is the shape that has already cost this branch two rounds
+    /// (`Capture::from_poll` vs `PaneState::from_poll`). Two callers, one
+    /// answer.
+    pub fn resume_surface(&self, agent: &str) -> Option<&ResumeSpec> {
+        self.agents.get(agent)?.resume.as_ref()
+    }
+
     /// How `agent` is handed an MCP server, if it can be. The caller needs this
     /// *before* [`Config::launch`]: the config file has to exist at
     /// [`McpDelivery::config_path`] by the time the agent starts.
@@ -695,8 +709,13 @@ impl Config {
         // anything to, and `ResumeTarget` is how that proof travels — taking the
         // pair apart at the one call site that composes `--resume` would hand it
         // straight back.
-        let spec = self.agent(target.backend())?;
-        let Some(resume) = spec.resume.as_ref() else {
+        // An agent the config does not know at all is an ERROR, not a reseed:
+        // a phase recording a backend nothing defines is a broken config, and
+        // `compose` below would fail on it anyway.
+        self.agent(target.backend())?;
+        // …but "known, and offers no way to resume" is an ordinary `Ok(None)`.
+        // Read through `resume_surface`, the one lookup the review UI also asks.
+        let Some(resume) = self.resume_surface(target.backend()) else {
             return Ok(None);
         };
         // No `mcp_config`. A resumed agent is handed no MCP server, and for a

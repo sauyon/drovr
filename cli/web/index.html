@@ -912,6 +912,10 @@
        node to inspect its live session in the panel below. -->
   <div id="agents-panel" style="display:none" class="panel">
     <div class="panel-title">Agents</div>
+    <!-- Why the ⟳ buttons below may not reflect YOUR config. Owned by the
+         poller, unlike #agents-note (which reports what a click did and must
+         survive the 2s re-render), so the two never overwrite each other. -->
+    <div id="agents-config-error" class="agents-note bad" style="display:none"></div>
     <div id="agents-tree" class="agents-tree"></div>
     <!-- What a ⟳ actually did. A rehydrate has three outcomes the human must
          not have to guess between — the session came back, a fresh agent was
@@ -2430,6 +2434,13 @@ async function pollAgents(gen) {
     if (gen !== routeGen) return;
     var el = document.getElementById('agents-tree');
     var nodes = (tree && tree.nodes) || [];
+    // A config drovr could not read means `resumable` was decided by the
+    // built-in backends, not the user's. Say so rather than letting the ⟳
+    // appear or vanish for a reason nothing on screen explains. textContent:
+    // the text carries a parse error verbatim.
+    var cfgErr = document.getElementById('agents-config-error');
+    cfgErr.textContent = (tree && tree.config_error) || '';
+    cfgErr.style.display = cfgErr.textContent ? '' : 'none';
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
       : '<div class="review-empty">No agents spawned yet.</div>';
