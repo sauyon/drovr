@@ -10644,8 +10644,17 @@ mod rehydrate_tests {
 
     #[test]
     fn rehydrate_never_reaps_or_closes_anything() {
-        // Scope guard: task 5 brings panes BACK. Closing is task 6's, and the
-        // only pane this task may close is one whose own launch just failed.
+        // Scope guard: task 5 brings panes BACK. Reaping — closing a pane
+        // because the run has moved past it — is task 6's, and a rehydrate that
+        // WORKS must never close anything.
+        //
+        // The three panes this task does close are all error recovery on its
+        // own half-completed operation, never supersession: a launch that
+        // failed (`discard_unlaunched_pane`), a pane that could not be recorded
+        // (`surrender_unrecordable_pane`), and one the phase's record cannot
+        // account for (`surrender_misattributed_pane`). Each has its own test;
+        // this one pins the success path, which is the one task 6 must not
+        // change either.
         let _lock = ENV_LOCK.lock().unwrap();
         let (mut run, _cfg) = rehydrate_run("rh-no-close");
         run.phases

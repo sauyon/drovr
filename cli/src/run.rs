@@ -378,8 +378,12 @@ impl Phase {
     ///
     /// Returns the pane id it dropped, which is what a caller needs to retire
     /// (`RunState::retire_pane`) so cleanup still knows the pane was drovr's.
-    /// Nothing calls this yet — task 6 does.
-    #[allow(dead_code)]
+    ///
+    /// The first caller is `phase::surrender_misattributed_pane` — error
+    /// recovery on a half-completed rehydrate, not reaping. Task 6 adds the
+    /// supersession-triggered ones; the transition is the same either way, and
+    /// deliberately so: "drovr closed this phase's pane" is one fact with one
+    /// way to record it.
     pub fn mark_reaped(&mut self) -> Option<String> {
         self.reaped = Reaped(true);
         self.pane_id.take()
