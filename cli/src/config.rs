@@ -95,7 +95,7 @@ impl Default for ReflexConfig {
 ///
 /// `per_turn` is deliberately absent: it governs the gate, and a renderer that
 /// cannot name it cannot accidentally branch on it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionReflex<'a> {
     pub enabled: bool,
     pub preamble: Option<&'a str>,
@@ -168,7 +168,8 @@ pub struct Config {
     /// whenever a config file omits the key).
     #[serde(default = "default_true")]
     pub worktree: bool,
-    /// SessionStart reflex configuration (see [`ReflexConfig`]).
+    /// Reflex configuration for **both** hooks — the `SessionStart` router
+    /// injection and the per-turn gate card (see [`ReflexConfig`]).
     #[serde(default)]
     pub reflex: ReflexConfig,
     #[serde(default = "default_agents")]
@@ -891,10 +892,18 @@ escalation = true
         // Each view carries its own fields and no others — the whole reason the
         // split exists. Asserted on the SAME parsed config, so this cannot pass
         // by testing a hand-built value that no config.toml produces.
+        //
+        // THE `enabled = true` / `per_turn = false` SKEW ABOVE IS LOAD-BEARING:
+        // it is what catches a view that crosses the wires (e.g. `session()`
+        // returning `enabled: self.enabled && self.per_turn`). Do not "tidy" the
+        // fixture so the two bools agree.
+        // Asserted absolutely, not against `cfg`'s own fields — `x == x` would
+        // hold for a view that copied the wrong field into the right slot.
         let session = cfg.session();
-        assert_eq!(session.enabled, cfg.enabled);
+        assert!(session.enabled);
         assert_eq!(session.preamble, Some("BESPOKE FRAMING"));
-        assert_eq!(session.sections, &cfg.sections);
+        assert_eq!(session.sections.get("escalation"), Some(&false));
+        assert_eq!(session.sections.get("methodology"), Some(&true));
 
         let gate = cfg.gate();
         assert_eq!(
@@ -921,17 +930,43 @@ escalation = true
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
-            "[reflex.gate]\nper_turn = false\n",
+            "[reflex]\n\
+             enabled = false\n\
+             \n\
+             [reflex.gate]\n\
+             per_turn = false\n\
+             \n\
+             [reflex.session]\n\
+             preamble = \"X\"\n",
         )
         .unwrap();
         set_config_home(tmp.path());
 
         let cfg = load_config().unwrap().reflex;
+
+        // POSITIVE CONTROL FIRST. Without it this whole test asserts only that
+        // some values equal their defaults — which is also what "the config file
+        // was never read at all" produces, so a renamed `config_path()`, a
+        // wrong env var in `set_config_home`, or a `load_config` that swallowed
+        // the parse error would all keep it green while it claims to guard this
+        // exact direction.
+        assert!(
+            !cfg.enabled,
+            "the flat [reflex] key must have been read — if this fails the rest \
+             of this test proves nothing, because unread and ignored look alike"
+        );
+
+        // Now the negatives, for BOTH nested spellings: a migration that moved
+        // only one of them would otherwise slip past.
         assert!(
             cfg.per_turn,
             "`per_turn` lives at the top of [reflex], not under [reflex.gate]; \
              if this ever starts passing, the schema moved and every existing \
              config.toml silently lost its setting"
+        );
+        assert!(
+            cfg.preamble.is_none(),
+            "`preamble` lives at the top of [reflex], not under [reflex.session]"
         );
     }
 

@@ -937,7 +937,7 @@ fn cmd_reflex(mode: ReflexMode<'_>) {
                 eprintln!("drovr: failed to load config ({e}); gating on reflex defaults");
                 config::Config::default()
             });
-            return cmd_reflex_gate(&cfg.reflex);
+            return cmd_reflex_gate(cfg.reflex.gate());
         }
         ReflexMode::Session(path) => path,
     };
@@ -997,13 +997,16 @@ impl<'a> ReflexMode<'a> {
 ///
 /// The one thing that does silence it is an explicit decision — `enabled` or
 /// `per_turn` set to `false` in a config that loaded successfully.
-fn cmd_reflex_gate(cfg: &config::ReflexConfig) {
+/// Takes the [`config::GateReflex`] view, not the whole `[reflex]` table, so the
+/// gate command cannot name `preamble`/`sections` either — narrowing at
+/// `gate_json` alone would leave this frame able to read them.
+fn cmd_reflex_gate(cfg: config::GateReflex) {
     // A hook that is somehow run without a payload still gets a decision.
     let stdin_json = reflex::read_hook_input(std::io::stdin());
     let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
         .and_then(|p| reflex::read_transcript_tail(&p));
 
-    if let Some(json) = reflex::gate_json(cfg.gate(), transcript.as_deref()) {
+    if let Some(json) = reflex::gate_json(cfg, transcript.as_deref()) {
         println!("{json}");
     }
 }

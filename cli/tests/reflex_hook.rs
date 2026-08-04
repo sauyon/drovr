@@ -1141,3 +1141,47 @@ fn session_only_config_keys_do_not_reach_the_gate_card() {
         "the disabled section must still be subtracted from the SessionStart reflex"
     );
 }
+
+#[test]
+fn gate_only_config_keys_do_not_reach_the_session_reflex() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // The mirror of `session_only_config_keys_do_not_reach_the_gate_card`, and
+    // the half that had no test at all. `per_turn` governs the gate; it must not
+    // touch the SessionStart reflex.
+    //
+    // The mutation this exists to catch is a one-liner in `cmd_reflex`: folding
+    // `per_turn` into the `enabled` check, or an early
+    // `if !cfg.reflex.per_turn { return; }`. Every user who set
+    // `per_turn = false` to quiet the per-turn card would silently lose the
+    // router injection too — and before this test the whole suite stayed green,
+    // because the unit tests cover `session()`/`gate()` rather than `cmd_reflex`.
+    let cfg = tempfile::tempdir().unwrap();
+    write_config(cfg.path(), "[reflex]\nper_turn = false\n");
+
+    let session = injected_context(
+        &ok_stdout(run_hook(SESSION_START, None, cfg.path())),
+        "SessionStart",
+    );
+    let baseline = {
+        let plain = tempfile::tempdir().unwrap();
+        injected_context(
+            &ok_stdout(run_hook(SESSION_START, None, plain.path())),
+            "SessionStart",
+        )
+    };
+    assert_eq!(
+        session, baseline,
+        "per_turn is gate-only: it must leave the SessionStart reflex byte-identical"
+    );
+
+    // ...and the same config demonstrably DOES silence the gate, so this is a
+    // test about routing rather than one that proves the key was ignored.
+    let gate = ok_stdout(run_hook(USER_PROMPT, None, cfg.path()));
+    assert!(
+        gate.trim().is_empty(),
+        "per_turn = false must still silence the gate, got:\n{gate}"
+    );
+}

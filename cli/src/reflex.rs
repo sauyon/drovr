@@ -1,15 +1,26 @@
-//! Renders the SessionStart reflex context from the router skill markdown.
+//! Renders the context both of drovr's reflex hooks inject.
 //!
-//! The `session-start` hook delegates here (`drovr reflex`) so the reflex is
-//! shaped by `[reflex]` config rather than baked into the bash hook. Three pure
-//! steps compose the output:
+//! Both bash hooks delegate here (`drovr reflex`) so their behaviour is shaped by
+//! `[reflex]` config rather than baked into a shell script.
+//!
+//! **`SessionStart`** — the full router-skill injection, from
+//! `hooks/session-start`. Three pure steps compose it:
 //!   1. [`render_body`] strips `<!-- reflex:section:NAME -->` markers and omits
 //!      any section disabled in config.
 //!   2. [`wrap`] frames the body in the `<EXTREMELY_IMPORTANT>` envelope with the
 //!      configured (or default) preamble.
-//!   3. [`envelope`] packages it as the Claude Code SessionStart hook JSON.
+//!   3. [`envelope`] packages it as Claude Code hook JSON for a [`HookEvent`].
 //!
 //! [`reflex_json`] threads them together and honors the master `enabled` switch.
+//!
+//! **`UserPromptSubmit`** — the per-turn gate card, from `hooks/user-prompt`.
+//! [`GATE_CARD`] is a `const` (not extracted from the skill), and [`gate_json`]
+//! emits it unless the reflex is off, `per_turn` is off, or
+//! [`skill_invoked_last_turn`] shows the previous turn already ran the
+//! discipline. See `docs/skill-evidence/per-turn-gate.md`.
+//!
+//! Each entry point takes only its own slice of `[reflex]` — [`SessionReflex`]
+//! and [`GateReflex`] — so neither can read the other's keys.
 
 use crate::config::{GateReflex, SessionReflex};
 use std::collections::BTreeMap;
@@ -665,6 +676,18 @@ mod tests {
         let cfg = ReflexConfig::default();
         let json = reflex_json(SAMPLE, cfg.session()).expect("enabled reflex must emit");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // The event/payload PAIRING, not just the payload. `HookEvent` stops a
+        // call site misspelling a name; it cannot stop `reflex_json` handing the
+        // gate's variant to the session's body. Without this, swapping
+        // `HookEvent::SessionStart` for `UserPromptSubmit` here passes every
+        // `--bin drovr` test — and the integration tests that would catch it
+        // skip-pass wherever bash is unavailable. `gate_context` asserts the
+        // mirror of this on every gate test.
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("SessionStart"),
+            "the router injection must announce itself as a SessionStart hook"
+        );
         let ctx = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
