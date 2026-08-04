@@ -155,6 +155,11 @@ with a broken briefing:
 - `drovr phase done` keeps failing because the agent never authored the handoff, or
   `drovr collect` returns empty / missing the fixed sections.
 
+Diagnose with `herdr agent read <pane>` (raw transcript), or `drovr attach <run>` to inspect
+the pane live.
+Seeding a fresh agent from a garbage handoff wastes the whole downstream chain — a broken
+briefing is worse than a stopped run.
+
 **Not a stop condition: `phase done` refusing with `$DROVR_PASS is not set`.** The marker must
 carry the pass token the agent was launched under, so `drovr phase done` only works from inside
 the phase's own pane. Run by hand from a plain shell it refuses — and prints the exact command
@@ -169,11 +174,6 @@ DROVR_PASS=$(jq -r '.phases[]|select(.name=="<phase>").pass' <run_dir>/state.jso
 `.review_phases[]` instead. This is the escape hatch for a phase whose agent is gone but whose
 work is finished — it bypasses the pane, not the contract: `<phase>-HANDOFF.md` must still
 exist, with no `TODO` sections left.
-
-Diagnose with `herdr agent read <pane>` (raw transcript), or `drovr attach <run>` to inspect
-the pane live.
-Seeding a fresh agent from a garbage handoff wastes the whole downstream chain — a broken
-briefing is worse than a stopped run.
 
 ## Common mistakes
 

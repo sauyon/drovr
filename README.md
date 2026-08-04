@@ -89,6 +89,9 @@ provably moved past a phase:
 | `drovr code-review run`, after the findings are merged | the panel's own reviewer panes |
 | `drovr phase reap <run> <phase>` | the phase you named |
 
+All three also sweep the run's **retired** panes — ones drovr opened that no
+phase points at any more (see `retired_panes` below).
+
 Reaping closes a **pane**, not a tab: a phase's tab may also hold a pane the
 human split into it, and drovr closes only what it can prove is its own. In the
 ordinary case — drovr's pane alone in its tab — the tab goes with it.
