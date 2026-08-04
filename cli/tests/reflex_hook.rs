@@ -394,6 +394,13 @@ fn user_prompt_record(text: &str) -> String {
     format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#)
 }
 
+/// An assistant record carrying one `text` block — the previous turn's reply.
+fn assistant_text_record(text: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+    )
+}
+
 /// Write `contents` to `<dir>/transcript.jsonl` and return the path.
 fn write_transcript(dir: &Path, contents: &str) -> PathBuf {
     let path = dir.join("transcript.jsonl");
@@ -532,6 +539,13 @@ fn user_prompt_hook_emits_when_last_turn_invoked_no_skill() {
     // belongs to an earlier turn and must not suppress. Without this case the
     // suppression test would pass just as well against a hook that emitted
     // nothing at all, ever.
+    //
+    // THE TRAILING `user` RECORD HERE IS AN EARLIER TURN'S PROMPT, NOT THIS
+    // TURN'S. It does not model the transcript as it looks when the hook fires
+    // — at that moment the submitting prompt is NOT yet a `type: "user"` record
+    // (see `user_prompt_hook_suppresses_on_the_real_hook_time_tail`). Reading
+    // this fixture as the hook-time shape suggests suppression can never fire
+    // in production, which is the opposite of what it does.
     let cfg = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let transcript = write_transcript(
@@ -554,6 +568,109 @@ fn user_prompt_hook_emits_when_last_turn_invoked_no_skill() {
     assert!(
         injected.contains("DROVR GATE"),
         "a skill call in an EARLIER turn must not suppress the card, got:\n{injected}"
+    );
+}
+
+/// The records Claude Code appends after the assistant's reply, which are what
+/// actually sit at the tail when `UserPromptSubmit` fires.
+///
+/// **Captured from a live 2-turn session, not invented.** The submitting prompt
+/// is NOT written as a `type: "user"` record before the hook runs — it arrives
+/// as `type: "last-prompt"`, followed by a `type: "mode"` record. Neither is a
+/// turn boundary, so the backward walk passes them and reaches the previous
+/// turn. Everything downstream of the suppression rule depends on that.
+fn hook_time_tail(prompt: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"type":"last-prompt","lastPrompt":"{prompt}","leafUuid":"u1","sessionId":"s1"}}"#,
+            "\n",
+            r#"{{"type":"mode","mode":"normal","sessionId":"s1"}}"#,
+        ),
+        prompt = prompt
+    )
+}
+
+#[test]
+fn user_prompt_hook_suppresses_on_the_real_hook_time_tail() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // THE PRODUCTION CASE, and the one every other suppression test was missing:
+    // a transcript shaped exactly as it is at the moment the hook fires.
+    //
+    // Every other fixture here ends at the previous turn's last record, which
+    // quietly assumes the submitting prompt is not yet on disk. That assumption
+    // is true, but it was never tested — and a reviewer reading the fixture in
+    // `..._emits_when_last_turn_invoked_no_skill` as the hook-time shape
+    // concluded suppression could never fire in production at all. It does; this
+    // pins why. Measured on a live 2-turn session: at fire time the tail is the
+    // previous turn's assistant record, then `last-prompt`, then `mode`.
+    //
+    // If Claude Code ever starts writing the submitting prompt as a `user`
+    // record before the hook, this test goes red — and it should, because the
+    // suppression rule and the cost bound the whole mechanism claims would both
+    // be gone.
+    let cfg = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let transcript = write_transcript(
+        work.path(),
+        &format!(
+            "{}\n{}\n{}\n{}\n",
+            user_prompt_record("fix the parser"),
+            skill_call_records("drovr:tdd", "toolu_1"),
+            assistant_text_record("done"),
+            hook_time_tail("now ship it")
+        ),
+    );
+    let out = run_hook_with_stdin(
+        USER_PROMPT,
+        None,
+        cfg.path(),
+        Some(&hook_payload(&transcript)),
+    );
+    let stdout = ok_stdout(out);
+
+    assert!(
+        stdout.trim().is_empty(),
+        "with the REAL hook-time tail, a previous turn that ran a drovr:* skill \
+         must suppress the card, but stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn user_prompt_hook_emits_on_the_real_hook_time_tail_without_a_skill() {
+    if !bash_available() {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    // Non-vacuity partner for the case above: same hook-time tail, no skill call
+    // in the previous turn. Without this, the suppression test would pass
+    // equally against a gate that had gone silent for some unrelated reason —
+    // an unreadable transcript, say, which also produces empty stdout.
+    let cfg = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let transcript = write_transcript(
+        work.path(),
+        &format!(
+            "{}\n{}\n{}\n",
+            user_prompt_record("fix the parser"),
+            assistant_text_record("done"),
+            hook_time_tail("now ship it")
+        ),
+    );
+    let out = run_hook_with_stdin(
+        USER_PROMPT,
+        None,
+        cfg.path(),
+        Some(&hook_payload(&transcript)),
+    );
+    let injected = injected_context(&ok_stdout(out), "UserPromptSubmit");
+
+    assert!(
+        injected.contains("DROVR GATE"),
+        "with the real hook-time tail and no skill last turn, the card must be \
+         emitted, got:\n{injected}"
     );
 }
 

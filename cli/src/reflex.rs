@@ -318,6 +318,21 @@ pub fn skill_invoked_last_turn(transcript_jsonl: &str) -> bool {
                 }
             }
             Some("assistant") if invokes_drovr_skill(&record, &succeeded) => return true,
+            // SKIPPING UNKNOWN RECORD TYPES IS LOAD-BEARING, not laziness, and
+            // it is the one place this scan does NOT resolve toward emitting.
+            //
+            // When `UserPromptSubmit` fires, the submitting prompt is not yet a
+            // `user` record: Claude Code has appended `{"type":"last-prompt",…}`
+            // and `{"type":"mode",…}` after the previous turn's reply (measured
+            // on a live 2-turn session). Treating either as a boundary stops the
+            // walk before it can reach anything, so suppression would never fire
+            // in production at all — the mechanism's whole cost bound, gone,
+            // while every fixture that ends at the previous turn stayed green.
+            //
+            // The cost of skipping is bounded by the `user` arm above: an
+            // unknown type cannot carry a skill call, and the first real prompt
+            // still ends the walk. Pinned end-to-end by
+            // `user_prompt_hook_suppresses_on_the_real_hook_time_tail`.
             _ => {}
         }
     }
