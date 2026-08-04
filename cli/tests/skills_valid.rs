@@ -67,15 +67,6 @@ fn arms_dir() -> PathBuf {
 /// (plan §1.4). Named here so the corpus check spells it once.
 const EVIDENCE_LEDGER: &str = "run-ledger.md";
 
-/// The five skills snapshotted into every measurement arm.
-const ARM_SNAPSHOT_SKILLS: &[&str] = &[
-    "tdd",
-    "systematic-debugging",
-    "verification-before-completion",
-    "code-review",
-    "using-drovr",
-];
-
 /// A parsed SKILL.md: the frontmatter `name`/`description` and the body after
 /// the closing `---`.
 struct Skill {
@@ -763,10 +754,13 @@ fn arm_a_snapshots_match_manifest() {
     // Everything that does not need git runs first, so a git-less environment
     // still reports a corrupt manifest rather than only "git is missing".
     let mut to_verify = Vec::new();
-    for skill in ARM_SNAPSHOT_SKILLS {
+    // Every measured skill is snapshotted into every arm — this is the whole
+    // set, not a subset of it. The manifest cells and the snapshot filenames are
+    // both text, so the wire name is what gets compared.
+    for skill in SkillName::ALL.iter().map(|skill| skill.as_str()) {
         let matches: Vec<&ManifestRow> = rows
             .iter()
-            .filter(|r| r.arm == "A" && r.skill == *skill)
+            .filter(|r| r.arm == "A" && r.skill == skill)
             .collect();
         // A second row for `(A, skill)` can no longer parse, so in practice this
         // catches the *missing* row — a skill dropped from the manifest.
@@ -1052,15 +1046,6 @@ const SCENARIO_CORPUS_AUTHORED: bool = true;
 /// plan §1.2: 15 per-skill scenarios plus 2 `using-drovr` no-skill-applies ones.
 const EXPECTED_SCENARIO_FILES: usize = 17;
 
-/// The five skills under measurement.
-const SCENARIO_SKILLS: &[&str] = &[
-    "tdd",
-    "systematic-debugging",
-    "verification-before-completion",
-    "code-review",
-    "using-drovr",
-];
-
 /// §7.1's seven pressure types. A scenario may only draw from these.
 const PRESSURE_TYPES: &[&str] = &[
     "time",
@@ -1109,47 +1094,63 @@ enum Tag {
     Holdout,
 }
 
-/// One of the five skills under measurement.
+/// Declares the closed set of measured skills **once**: the variants, `ALL` and
+/// the on-disk names all expand from the one table below.
 ///
-/// `tag` was already an enum while `skill` was a `String` that had been checked
-/// against a closed list and then handed on as though it had not been. Now the
-/// check produces a value only the check can produce.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum SkillName {
-    Tdd,
-    SystematicDebugging,
-    VerificationBeforeCompletion,
-    CodeReview,
-    UsingDrovr,
+/// This is a macro because the alternative kept failing the same way. `skill`
+/// began as a `String` checked against a closed list and then handed on as
+/// though it had not been; `SkillName` fixed that, but the *set* went on being
+/// re-spelled beside it — a hand-written `ALL` and two `&[&str]` consts, none of
+/// them tied to the variants — so a sixth skill could be a variant that `ALL`
+/// omits, and `parse` (which walks `ALL`) would then reject a skill the type
+/// says exists, silently. **Nothing enforced any of it.** One table makes
+/// divergence unrepresentable rather than merely discouraged: there is nowhere
+/// else to write a skill name, so nothing can disagree.
+///
+/// Consumers walk `SkillName::ALL`; none re-lists the names. Every use is the
+/// whole set — arms, scenarios and evidence each cover all five — so no subset
+/// exists here to justify.
+macro_rules! skill_names {
+    ($($variant:ident => $wire:literal,)+) => {
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum SkillName {
+            $($variant,)+
+        }
+
+        impl SkillName {
+            /// Every measured skill, in manifest order.
+            const ALL: &'static [SkillName] = &[$(SkillName::$variant,)+];
+
+            fn as_str(self) -> &'static str {
+                match self {
+                    $(SkillName::$variant => $wire,)+
+                }
+            }
+        }
+    };
+}
+
+skill_names! {
+    Tdd => "tdd",
+    SystematicDebugging => "systematic-debugging",
+    VerificationBeforeCompletion => "verification-before-completion",
+    CodeReview => "code-review",
+    UsingDrovr => "using-drovr",
 }
 
 impl SkillName {
-    /// The measured set, in manifest order — the typed spelling of it, for
-    /// consumers that need to walk all five rather than parse one.
-    ///
-    /// Nothing makes this exhaustive over the variants: a sixth skill compiles
-    /// fine while missing here. `as_str`'s match is the compiler-checked half —
-    /// a new variant must be named there — and this is the half a human keeps.
-    const ALL: &'static [SkillName] = &[
-        SkillName::Tdd,
-        SkillName::SystematicDebugging,
-        SkillName::VerificationBeforeCompletion,
-        SkillName::CodeReview,
-        SkillName::UsingDrovr,
-    ];
-
     fn parse(raw: &str) -> Option<Self> {
         SkillName::ALL.iter().copied().find(|s| s.as_str() == raw)
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            SkillName::Tdd => "tdd",
-            SkillName::SystematicDebugging => "systematic-debugging",
-            SkillName::VerificationBeforeCompletion => "verification-before-completion",
-            SkillName::CodeReview => "code-review",
-            SkillName::UsingDrovr => "using-drovr",
-        }
+    /// The accepted values, in `ALL` order — for error text that must name
+    /// exactly what `parse` accepts, and cannot be a second list saying so.
+    fn accepted() -> String {
+        SkillName::ALL
+            .iter()
+            .map(|skill| skill.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1477,7 +1478,7 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
     let skill = SkillName::parse(&skill_raw).ok_or_else(|| {
         format!(
             "`skill: {skill_raw}` is not one of: {}",
-            SCENARIO_SKILLS.join(", ")
+            SkillName::accepted()
         )
     })?;
 
@@ -1717,14 +1718,15 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
     // from the per-skill split. `class` is read off the parsed scenario — the
     // filename grammar was settled once, in `parse_scenario`, and is not
     // re-guessed here with a substring search.
-    for skill in SCENARIO_SKILLS {
+    for skill in SkillName::ALL {
         let numbered: Vec<&Scenario> = parsed
             .iter()
-            .filter(|s| s.skill.as_str() == *skill && s.class == ScenarioClass::Numbered)
+            .filter(|s| s.skill == *skill && s.class == ScenarioClass::Numbered)
             .collect();
         let dev = numbered.iter().filter(|s| s.tag == Tag::Dev).count();
         let holdout = numbered.iter().filter(|s| s.tag == Tag::Holdout).count();
         if dev != 1 || holdout != 2 {
+            let skill = skill.as_str();
             return Err(format!(
                 "`{skill}` has {dev} dev and {holdout} holdout scenario(s); §7.3's held-out design \
                  requires exactly 1 and 2. Authoring against a scenario that then grades the text \
@@ -2212,7 +2214,7 @@ fn scenario_corpus_requires_one_dev_and_two_holdout() {
     };
     let full = |tags: [&str; 3]| -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for skill in SCENARIO_SKILLS {
+        for skill in SkillName::ALL.iter().map(|skill| skill.as_str()) {
             for (i, tag) in tags.iter().enumerate() {
                 let n = i as u32 + 1;
                 out.push((format!("{skill}-{n}"), file(skill, n, tag)));
