@@ -289,21 +289,73 @@ impl Phase {
         self.pane_agent = Some(agent);
     }
 
-    /// Record a session captured from a live poll, if this phase has a launch
-    /// record to attach it to. Returns whether it landed.
+    /// Record a session captured from a live poll. Returns whether it landed.
     ///
-    /// `false` means there is no `PhaseAgent`, and that is not a failure to
-    /// paper over: a session is only meaningful beside the backend that created
-    /// it, so it must not be stored without one. The caller establishes the
-    /// launch record first (`record_launch`) and retries.
+    /// `false` means one of the two things this refuses, and neither is a
+    /// failure to paper over:
+    ///
+    /// * there is no `PhaseAgent` — a session is only meaningful beside the
+    ///   backend that created it, so it must not be stored without one. The
+    ///   caller establishes the launch record first (`record_launch`);
+    /// * a session is ALREADY held — see [`Phase::accepts_captured_session`].
     pub fn record_session(&mut self, session: SessionId) -> bool {
         match self.pane_agent.as_mut() {
-            Some(agent) => {
-                agent.record_session(session);
-                true
-            }
+            Some(agent) => agent.record_session(session),
             None => false,
         }
+    }
+
+    /// ⭐ **Whether a captured session may be written to this phase: only into
+    /// an EMPTY slot.** The rule, in one place, asked by the predicates that
+    /// decide whether a capture has work to do and enforced by
+    /// [`PhaseAgent::record_session`], which is the only thing that can write
+    /// one.
+    ///
+    /// # The bug this closes
+    ///
+    /// A rehydrate that RESUMES deliberately does not `record_launch` — the
+    /// conversation is meant to be the same one, so the agent record must
+    /// survive the relaunch. Both of its waits poll the NEW pane through a
+    /// capturing poll, and when the resume did not land that pane's agent
+    /// reports a *different* session. Capture wrote it over the recorded id and
+    /// saved it, so an honest exit-2 "your conversation did not come back" left
+    /// the state worse than before the attempt: the resume token a retry needs
+    /// was gone, and every later rehydrate would compose `--resume` for a
+    /// stranger's conversation instead of reseeding from the handoff.
+    ///
+    /// It was first closed one layer up, in the capture logic. That left the
+    /// rule in a caller rather than on the API that mutates, so any future call
+    /// to `record_session` with a session already held reintroduced it with no
+    /// type error. It lives here now, and the predicate and the mutator are the
+    /// same fact so they cannot disagree about whether there is work to do.
+    ///
+    /// # Why "fill, never replace" is right in general
+    ///
+    /// A session is meaningful only beside the agent process that created it,
+    /// and a new process means a new record: [`Phase::record_launch`] REPLACES
+    /// the whole `PhaseAgent`, clearing the session, and a capture then fills
+    /// the empty slot. That is the only sanctioned way a session ever changes.
+    /// So a poll reporting a session *different* from the recorded one is never
+    /// evidence of a legitimate change — it says the pane is running an agent
+    /// the phase's record does not describe, which is a thing to refuse to
+    /// write down, not a thing to overwrite with.
+    ///
+    /// `true` for a phase with no agent record at all: the capture path creates
+    /// one (carrying the backend it resolved) and then fills it, so there is
+    /// genuinely something to add.
+    ///
+    /// # What it deliberately gives up
+    ///
+    /// A backend that minted a NEW session id on resume would never have its
+    /// record updated. That is known not to be claude's behaviour — verified
+    /// live, `claude --resume <id>` reports `<id>` back byte-identical — and
+    /// drovr could not tell such a backend apart from "we landed in a
+    /// stranger's conversation" anyway. Both deserve the same answer, and it is
+    /// an unconfirmed resume, not a silent overwrite.
+    pub fn accepts_captured_session(&self) -> bool {
+        self.pane_agent
+            .as_ref()
+            .is_none_or(|a| a.session().is_none())
     }
 
     /// The half of the rehydrate precondition that is about the PHASE.
@@ -576,8 +628,20 @@ impl PhaseAgent {
     /// that the conversation stopped existing. `phase_start` clears by replacing
     /// the whole `PhaseAgent`, which is the one case where the old id really
     /// does name someone else's conversation.
-    pub fn record_session(&mut self, session: SessionId) {
+    /// Fill this record's session. Returns whether it landed.
+    ///
+    /// **Refuses to REPLACE a session already held** — see
+    /// [`Phase::accepts_captured_session`] for why that rule lives on the
+    /// mutator and not in a caller. [`PhaseAgent::launched`] (via
+    /// `Phase::record_launch`) is the only way a held session is ever
+    /// discarded, and it discards it by replacing the whole record, which is
+    /// exactly where a new agent process starts.
+    pub fn record_session(&mut self, session: SessionId) -> bool {
+        if self.session.is_some() {
+            return false;
+        }
         self.session = Some(session);
+        true
     }
 
     /// Everything a resume needs, or `None`. All three or nothing — that is the
@@ -1993,6 +2057,60 @@ mod tests {
         assert!(
             p.pane_agent().is_none(),
             "unknown keys are dropped, not adopted; the next poll re-captures"
+        );
+    }
+
+    #[test]
+    fn only_a_relaunch_may_replace_a_held_session() {
+        // ⭐ THE RULE, ON THE API THAT MUTATES — not in one caller.
+        //
+        // Round 3 fixed a critical (an unconfirmed resume overwriting the very
+        // session id it was trying to confirm) by gating `Capture::apply`. But
+        // `record_session` still assigned unconditionally, so the rule lived in
+        // one caller-specific layer: any future call with a session already
+        // held reintroduced the overwrite with no type error, and the bug that
+        // cost two rounds would be back.
+        //
+        // A session is meaningful only beside the agent process that made it,
+        // so the ONE sanctioned way it changes is a new process —
+        // `record_launch`, which replaces the whole record and clears the slot.
+        // Capture fills the empty slot. Nothing replaces.
+        let first = SessionId::new("sess-first".into()).unwrap();
+        let second = SessionId::new("sess-second".into()).unwrap();
+
+        let mut p = Phase::new("plan");
+        assert!(
+            !p.record_session(first.clone()),
+            "no agent record → nowhere to put a session"
+        );
+
+        p.record_launch("claude", None);
+        assert!(p.record_session(first.clone()), "fills an empty slot");
+        assert!(
+            !p.record_session(second.clone()),
+            "and REFUSES to replace a held one — the pane would be running an \
+             agent the record does not describe"
+        );
+        assert_eq!(p.resume_target().map(|t| t.session()), Some(&first));
+
+        // The sanctioned path: a new process, so a new record.
+        p.record_launch("claude", None);
+        assert!(
+            p.resume_target().is_none(),
+            "a relaunch clears the session — that IS how one is discarded"
+        );
+        assert!(p.record_session(second.clone()));
+        assert_eq!(p.resume_target().map(|t| t.session()), Some(&second));
+
+        // And the predicate `Capture` asks is the same one the mutator enforces,
+        // so a caller cannot decide there is work to do that the API refuses.
+        assert!(!p.accepts_captured_session());
+        p.record_launch("claude", None);
+        assert!(p.accepts_captured_session());
+        assert!(
+            Phase::new("plan").accepts_captured_session(),
+            "a phase with no agent record yet still accepts one — `record_capture` \
+             creates the record first"
         );
     }
 

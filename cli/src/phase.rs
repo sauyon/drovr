@@ -1191,33 +1191,27 @@ impl Unfinished {
                 } else {
                     "Its seed was NOT re-sent"
                 };
-                // What to do next depends on whether the pane is still there,
-                // and on the resume path it is not: a pane the phase's record
-                // cannot account for is given back so the phase stays
-                // retryable (`surrender_misattributed_pane`). Sending someone
-                // to `herdr pane read` a pane drovr just closed is the same
-                // class of wrong answer as the outcome this type exists to
-                // stop being wrong about.
-                if *resuming {
-                    format!(
-                        "the agent for phase '{phase}' did not become ready within {waited} \
-                         after resuming its session. {why}. Its pane was closed again, so the \
-                         phase is unchanged and can be rehydrated again — if a retry fails the \
-                         same way, the session is most likely gone: `drovr phase start \
-                         {q_run} {q_phase} <seed>` starts it fresh instead.",
-                        q_run = shell_single_quote(run_name),
-                        q_phase = shell_single_quote(phase),
-                    )
+                // THE PANE IS STILL THERE on every `NeverReady` — drovr
+                // observed nothing, and nothing is not grounds for closing it
+                // (see the arm in `phase_rehydrate`). So the guidance is the
+                // same shape on both paths: go and look at it. Only the
+                // resume path adds what a retry will run into, because there
+                // the pane blocks one until it is gone.
+                let blocked = if *resuming {
+                    " Until that pane is gone, rehydrating this phase again \
+                     will refuse with \"still holds pane\" — which is correct \
+                     while the agent is still coming up."
                 } else {
-                    format!(
-                        "the agent for phase '{phase}' did not become ready within {waited} on \
-                         pane {p}. {why}. It may be parked on a first-run or permission prompt, \
-                         or it may never have attached at all. Look with herdr pane read {pane} \
-                         — that works either way, where `herdr agent attach` needs an agent to \
-                         already be there — then `drovr phase send {run_name} {phase} …`",
-                        p = self.pane(),
-                    )
-                }
+                    ""
+                };
+                format!(
+                    "the agent for phase '{phase}' did not become ready within {waited} on \
+                     pane {p}. {why}. It may be parked on a first-run or permission prompt, \
+                     or it may never have attached at all. Look with herdr pane read {pane} \
+                     — that works either way, where `herdr agent attach` needs an agent to \
+                     already be there — then `drovr phase send {run_name} {phase} …`.{blocked}",
+                    p = self.pane(),
+                )
             }
             Unfinished::ResumeUnconfirmed {
                 expected, observed, ..
@@ -1307,11 +1301,26 @@ fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
 /// a pane running an agent it cannot account for, and `HoldsPane` refuses every
 /// retry for as long as it stands.
 ///
-/// So the rule is not "did the rehydrate fail" but **"does the phase's record
-/// describe the agent in the pane"**. On the reseed path it does
-/// (`record_launch` ran), the note tells the operator to `phase send` that
-/// agent, and closing it would destroy the very thing they were pointed at —
-/// which is why this is not called there.
+/// # ⭐ The rule: POSITIVE EVIDENCE of misattribution, never mere doubt
+///
+/// The one caller is `ResumeUnconfirmed`, where drovr **observed a different
+/// session**. That is evidence the record does not describe the pane, and it is
+/// what authorises destroying an agent.
+///
+/// Two neighbouring failures deliberately do NOT call this:
+///
+/// * **`NeverReady { resuming: true }`** — drovr observed *nothing*. This
+///   branch is built on "the marker is the evidence; absence of confirmation is
+///   not evidence", and "I don't know" must not authorise closing a pane. The
+///   usual cause is the recoverable one: the agent is parked on a first-run or
+///   permission prompt and a human clicks through. drovr already treats that as
+///   human-recoverable (`phase wait` exit 4, `diagnose_stuck_phase`), and
+///   closing the pane throws it away irreversibly. The cost is that
+///   `HoldsPane` refuses a retry while it stands — right while the agent is
+///   starting, wrong once it has exited, and the note says so.
+/// * **the reseed path** — `record_launch` ran, so the record DOES describe the
+///   fresh agent; the note tells the operator to `phase send` it, and closing
+///   it would destroy the very thing they were pointed at.
 ///
 /// `mark_reaped` is the right transition and not a borrowing of task 6's: it
 /// says "drovr closed this phase's pane", which is exactly what happened, and
@@ -1321,25 +1330,83 @@ fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
 ///
 /// The phase's `pane_agent` is left ALONE, which is the point: the session id
 /// this rehydrate failed to confirm is the one a retry needs.
-fn surrender_misattributed_pane<H: Herdr>(h: &H, run: &mut RunState, phase: &str) {
-    let Some(pane) = run.find_phase_mut(phase).and_then(Phase::mark_reaped) else {
-        return;
-    };
-    run.retire_pane(&pane);
-    if let Err(e) = run.save() {
-        eprintln!(
-            "drovr: warning: phase '{}/{phase}' could not be released from pane {pane} ({e}); \
-             it will keep refusing a rehydrate with \"still holds pane {pane}\" until the \
-             run's state is writable again",
-            run.name
-        );
-    }
-    if let Err(e) = h.pane_close(&pane) {
+/// Returns `Err` when the phase could NOT be released. That is not a warning to
+/// print past: while the registration stands, `rehydratable` answers
+/// `HoldsPane` for a pane that no longer exists, so **no outcome whose guidance
+/// assumes a retry may be reported**. The caller must turn this into an error
+/// that says what actually clears it.
+fn surrender_misattributed_pane<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    pane: &str,
+) -> io::Result<()> {
+    let released = release_phase_from_pane(run, phase, pane)
+        // Wrapped HERE rather than at the call site, so no caller can forget:
+        // the `Err` this returns already says what is true and what clears it.
+        .map_err(|e| unreleased_pane_error(&run.name, phase, pane, &e));
+    // Closed either way. If the release landed this is the ordinary case; if it
+    // did not, leaving the pane open would add an IMMORTAL pane (cleanup closes
+    // only panes it can prove are drovr's, and an unretired one it cannot) to
+    // an already-stuck registration — two manual repairs instead of one.
+    if let Err(e) = h.pane_close(pane) {
+        let cleanup = if released.is_ok() {
+            "it is recorded as drovr's, so `drovr cleanup` will take it"
+        } else {
+            // Do not claim a retirement that never landed.
+            "and the retirement did not land either, so `drovr cleanup` will treat it as \
+             yours and leave it: close it by hand"
+        };
         eprintln!(
             "drovr: warning: could not close pane {pane} after an unconfirmed resume ({e}); \
-             it is recorded as drovr's, so `drovr cleanup` will take it"
+             {cleanup}"
         );
     }
+    released
+}
+
+/// Clear `phase`'s registration of `pane` and record the retirement, **on disk**.
+///
+/// Written onto a FRESH read, like [`surrender_unrecordable_pane`] and for the
+/// same reason: by the time this runs, up to `SEND_READY_TIMEOUT` of polling
+/// has happened and capture persists through a copy of its own, so the caller's
+/// `RunState` is not the state to write back. On success the caller's copy is
+/// replaced wholesale rather than mutated in parallel — one assignment, so the
+/// two cannot drift.
+///
+/// `pane` is retired explicitly rather than taken from `mark_reaped`'s return:
+/// the pane being given back is the one the caller opened and is closing, which
+/// is the honest thing to record whatever the registration happens to say.
+fn release_phase_from_pane(run: &mut RunState, phase: &str, pane: &str) -> io::Result<()> {
+    let mut fresh = RunState::load(&run.name)?;
+    if let Some(p) = fresh.find_phase_mut(phase) {
+        p.mark_reaped();
+    }
+    fresh.retire_pane(pane);
+    fresh.save()?;
+    *run = fresh;
+    Ok(())
+}
+
+/// The refusal for a phase drovr closed a pane for but could not un-register.
+///
+/// Its whole job is to not repeat the lie this replaced: the phase is NOT
+/// unchanged, a retry will NOT work, and making the run dir writable again does
+/// not fix it by itself — nothing re-attempts the release. So it names the one
+/// edit that does clear it, the same way [`missing_project_dir_error`] names
+/// the field it needs.
+fn unreleased_pane_error(run_name: &str, phase: &str, pane: &str, cause: &io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "the agent for phase '{run_name}/{phase}' came up in a DIFFERENT conversation, so \
+             drovr closed pane {pane} again — but the phase could not be released from it \
+             ({cause}). It still records that pane, so rehydrate will now refuse with \"still \
+             holds pane {pane}\", and nothing clears that on its own: fix the write error, \
+             then delete the \"pane_id\" field from phase \"{phase}\" in {state}.",
+            state = run_dir(run_name).join("state.json").display(),
+        ),
+    )
 }
 
 /// The prompt a reseeded agent gets. It says the conversation is gone, because
@@ -1503,13 +1570,18 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // above is the authority on both, so a second test would be a second place
     // for the answer to live.
     //
-    // `readonly` is derived from `review_phases`, which is what MAKES a phase a
-    // reviewer — the same fact `rehydratable` refuses on, so today this is
-    // always false. It is derived rather than hardcoded because the day
-    // reviewers become rehydratable again, the alternative is a resumed
-    // reviewer silently launched without its `readonly_flag`: a second WRITER
-    // in a run whose entire discipline is that there is exactly one.
-    let readonly = run.review_phases.iter().any(|p| p.name == phase);
+    // `readonly` asks `is_reviewer_phase_name` — the SAME predicate
+    // `rehydratable` refuses reviewers on, not `review_phases` membership
+    // beside it. Today it is always false (a reviewer never reaches this line),
+    // but two spellings of "is this a reviewer" is exactly the drift the last
+    // two rounds each fixed once: a `review_phases` entry whose name lacked the
+    // prefix would pass the gate and then launch WITH `readonly_flag`, and a
+    // reviewer-shaped name in `phases` the other way round. It is derived
+    // rather than hardcoded to `false` because the day reviewers become
+    // rehydratable again, the alternative is a resumed reviewer silently
+    // launched as a second WRITER in a run whose whole discipline is that there
+    // is exactly one.
+    let readonly = is_reviewer_phase_name(phase);
     let seed = run
         .find_phase(phase)
         .expect("rehydratable() proved the phase is in this run")
@@ -1720,13 +1792,25 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // session must not be able to hold the caller for twice `ready_timeout`.
     let polling = Polling::until(Instant::now() + ready_timeout, poll_interval);
     let Some(ready) = wait_agent_ready_until(h, run, phase, polling) else {
-        // On the resume path the phase's record still describes the OLD agent
-        // (a resume does not `record_launch`), so a pane that never came up is
-        // one the phase cannot account for. Give it back, or `HoldsPane`
-        // refuses every retry for as long as it stands.
-        if resume_session.is_some() {
-            surrender_misattributed_pane(h, run, phase);
-        }
+        // ⚠️ THE PANE IS KEPT HERE, on every path, and the asymmetry with
+        // `ResumeUnconfirmed` below is deliberate.
+        //
+        // `NeverReady` means drovr observed NOTHING — no status at all. This
+        // branch is built on "the marker is the evidence; absence of
+        // confirmation is not evidence", and destroying a pane is not something
+        // "I don't know" may authorise. The common cause is precisely the
+        // recoverable one: the agent is parked on a first-run or permission
+        // prompt, a human clicks through, and the conversation is fine. drovr
+        // already treats that as human-recoverable — `phase wait` has exit 4
+        // and `diagnose_stuck_phase` for it — and closing the pane throws that
+        // away irreversibly.
+        //
+        // The cost, and it is real: while that pane stands, `rehydratable`
+        // answers `HoldsPane` and refuses a retry. That is right while the
+        // agent is starting up and wrong once it has exited, and drovr cannot
+        // tell those apart without a liveness probe this predicate
+        // deliberately does not do. The note below therefore sends the operator
+        // to the pane rather than promising a retry.
         return Ok(RehydrateOutcome::Incomplete(Unfinished::NeverReady {
             pane,
             waited: ready_timeout,
@@ -1756,10 +1840,20 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
                 Ok(()) => RehydrateOutcome::Resumed,
                 Err(observed) => {
                     // Confirmed would have made the record true of the pane.
-                    // Unconfirmed means the phase is recording a pane running
-                    // someone else's conversation — see
-                    // `surrender_misattributed_pane`.
-                    surrender_misattributed_pane(h, run, phase);
+                    // Unconfirmed means drovr POSITIVELY OBSERVED a different
+                    // session, so the phase is recording a pane running someone
+                    // else's conversation — see `surrender_misattributed_pane`.
+                    //
+                    // ⚠️ The `?` is load-bearing. A release that did not land
+                    // leaves `HoldsPane` answering for a pane that is gone, and
+                    // `ResumeUnconfirmed`'s note tells the operator the phase is
+                    // unchanged and a retry will work. Reporting that outcome
+                    // over a stuck registration is guidance that can only
+                    // mislead, so the failure becomes an error that says what
+                    // actually clears it. (`io::Result` is `#[must_use]` and
+                    // clippy runs at `-D warnings`, so this cannot be quietly
+                    // dropped back to a warning.)
+                    surrender_misattributed_pane(h, run, phase, &pane)?;
                     RehydrateOutcome::Incomplete(Unfinished::ResumeUnconfirmed {
                         pane,
                         expected,
@@ -1866,48 +1960,6 @@ impl Capture {
         self.tab_id.is_none() && self.session.is_none()
     }
 
-    /// ⭐ **A capture may FILL a phase's session. It may never REPLACE a
-    /// different one.** The one rule, asked by every site that decides whether
-    /// a poll's session gets written.
-    ///
-    /// # The bug this closes
-    ///
-    /// A rehydrate that RESUMES deliberately does not `record_launch` — the
-    /// conversation is meant to be the same one, so the agent record must
-    /// survive. Both of its waits poll the NEW pane through `poll_phase_pane`,
-    /// which captures; and when the resume did not land, that pane's agent
-    /// reports a *different* session. Capture wrote it over the recorded id and
-    /// saved it, so an honest exit-2 "your conversation did not come back" left
-    /// the state worse than before the attempt: the resume token a retry needs
-    /// was gone, and every later rehydrate would compose `--resume` for a
-    /// stranger's conversation instead of reseeding from the handoff.
-    ///
-    /// # Why "fill, never replace" is right in general, not just here
-    ///
-    /// A session is meaningful only beside the agent process that created it,
-    /// and a new process means a new record: `Phase::record_launch` REPLACES the
-    /// whole `PhaseAgent`, clearing the session, and capture then fills the
-    /// empty slot. That is the only sanctioned way a session changes (task 3's
-    /// rule, "replacing the record is the only way a session is ever
-    /// discarded"). So a poll that reports a session *different* from the
-    /// recorded one is never evidence of a legitimate change — it says the pane
-    /// is running an agent the phase's record does not describe, which is a
-    /// thing to refuse to write down, not a thing to overwrite with.
-    ///
-    /// The reseed path is unaffected: `record_launch` runs there, so capture
-    /// fills an absent session exactly as before.
-    ///
-    /// # What it deliberately gives up
-    ///
-    /// A backend that minted a NEW session id on resume would never have its
-    /// record updated. That is now known not to be claude's behaviour —
-    /// verified live, `claude --resume <id>` reports `<id>` back byte-identical
-    /// — and drovr could not tell such a backend apart from "we landed in a
-    /// stranger's conversation" anyway. Both deserve the same answer, and it is
-    /// `Incomplete(ResumeUnconfirmed)`, not a silent overwrite.
-    fn session_is_an_addition(reported: Option<&SessionId>, held: Option<&SessionId>) -> bool {
-        matches!((reported, held), (Some(_), None))
-    }
 
     /// Whether applying this to `p` would change anything.
     ///
@@ -1918,11 +1970,10 @@ impl Capture {
     /// "nothing to do" and never retries.
     fn would_change(&self, p: &Phase) -> bool {
         let new_tab = matches!(&self.tab_id, Some(t) if p.tab_id.as_deref() != Some(t.as_str()));
-        // Fill, never replace — see `Capture::session_is_an_addition`.
-        let new_session = Capture::session_is_an_addition(
-            self.session.as_ref(),
-            p.pane_agent().and_then(|a| a.session()),
-        );
+        // Fill, never replace. The SAME question `PhaseAgent::record_session`
+        // enforces, asked of the same function — so this cannot decide there is
+        // work to do that the mutator will then refuse.
+        let new_session = self.session.is_some() && p.accepts_captured_session();
         new_tab || new_session
     }
 
@@ -1943,7 +1994,7 @@ impl Capture {
     ///   the backend at all here;
     /// * both hold one — nothing to add, because a capture may fill a session
     ///   but never replace a different one
-    ///   ([`Capture::session_is_an_addition`]). This arm used to compare the
+    ///   ([`crate::run::Phase::accepts_captured_session`]). This arm used to compare the
     ///   two through `resumable_for` and say "yes" when they differed, which is
     ///   how an unconfirmed resume came to overwrite the very id it was trying
     ///   to confirm. Not consulting the backend here also makes the guard
@@ -1979,18 +2030,16 @@ impl Capture {
         if let Some(tab) = &self.tab_id {
             p.tab_id = Some(tab.clone());
         }
-        // ⚠️ Gated on the SAME rule `would_change` uses, and it has to be:
-        // `would_change` is true when EITHER the tab or the session is new, so
-        // an unconfirmed resume — new pane, hence new tab id, and a stranger's
-        // session — passed this block and wrote the session anyway. One rule,
-        // asked at every site that could write it.
-        if let Some(id) = self
-            .session
-            .as_ref()
-            .filter(|id| {
-                Capture::session_is_an_addition(Some(id), p.pane_agent().and_then(|a| a.session()))
-            })
-        {
+        // NOT gated here, deliberately: `PhaseAgent::record_session` refuses to
+        // replace a held session itself, so this call is safe to make
+        // unconditionally and there is no second copy of the rule to keep in
+        // step. (It used to be gated here instead, which is what made the rule
+        // caller-specific — the defect round 4 moved onto the mutating API.)
+        //
+        // Note `would_change` above is true when EITHER the tab or the session
+        // is new, so an unconfirmed resume — new pane, hence new tab id, and a
+        // stranger's session — does reach this line. It is refused below.
+        if let Some(id) = self.session.as_ref() {
             // The return is deliberately ignored, and the reason is an invariant
             // `record_capture` maintains rather than something visible here — so
             // it is written down, because a reader (and a reviewer) otherwise has
@@ -9513,6 +9562,43 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn readonly_and_the_reviewer_refusal_answer_from_the_same_predicate() {
+        // The gate said "reviewer" by NAME (`is_reviewer_phase_name`) while the
+        // launch said it by LIST (`review_phases` membership). Two spellings of
+        // one question, which is the drift the last two rounds each fixed once
+        // — and it is reachable: a `review_phases` entry whose name lacks the
+        // prefix passes the gate and then launched WITH `readonly_flag`, i.e.
+        // as a reviewer the gate had just decided was not one.
+        //
+        // Such an entry is malformed state (`spawn_reviewer` cannot make one),
+        // and the point is not which answer it gets but that it gets ONE.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-one-predicate");
+        run.review_phases
+            .push(reaped_phase("legacy-not-prefixed", "claude", None, Some("s")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        script_resumed_session(&h, "s", "claude", 8);
+
+        // The gate says "not a reviewer"…
+        assert_eq!(run.rehydratable("legacy-not-prefixed"), Ok(()));
+        phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "legacy-not-prefixed",
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        // …so the launch must not turn round and treat it as one.
+        let launch = pane_run_call(&h);
+        assert!(
+            !launch.contains("--permission-mode plan"),
+            "the gate and the launch must answer from one predicate: {launch}"
+        );
+    }
+
+    #[test]
     fn a_reviewer_is_refused_rather_than_brought_back_unable_to_deliver() {
         // ⚠️ This test replaces `a_rehydrated_reviewer_is_still_read_only`,
         // which asserted that a rehydrated reviewer kept its `readonly_flag`.
@@ -9866,10 +9952,12 @@ mod rehydrate_tests {
         // refuses every retry, so a rehydrate that failed cannot be attempted
         // again.
         //
-        // The asymmetry with the reseed path is the whole rule: there
-        // `record_launch` DID run, so the record describes the pane, the note
-        // tells the operator to `phase send` it, and closing it would destroy
-        // the very agent they were pointed at.
+        // The asymmetry is the whole rule: surrender needs POSITIVE evidence
+        // of misattribution. Here `record_launch` DID run, so the record
+        // describes the pane, the note tells the operator to `phase send` it,
+        // and closing it would destroy the very agent they were pointed at.
+        // `NeverReady { resuming: true }` keeps its pane for the other half of
+        // the rule — drovr observed nothing, and nothing is not evidence.
         let _lock = ENV_LOCK.lock().unwrap();
         let (mut run, _cfg) = rehydrate_run("rh-give-back");
         run.phases
@@ -10068,22 +10156,37 @@ mod rehydrate_tests {
             note.contains("conversation was NOT restored"),
             "must say what did not happen, in the resume's own terms: {note}"
         );
-        // ⚠️ This assertion used to be "the pane is real and recorded either
-        // way". It is not any more, and the change is deliberate: on the resume
-        // path the phase's record still describes the OLD agent, so a pane it
-        // cannot account for is given back rather than left blocking every
-        // retry with `HoldsPane`. See
-        // `an_unconfirmed_resume_gives_its_pane_back_so_the_phase_can_be_retried`
-        // for the rule and `a_reseed_that_is_incomplete_keeps_its_pane_because_the_record_fits_it`
-        // for the case where the pane DOES stay.
+        // ⚠️ THE PANE IS KEPT, and which failures may destroy one is the whole
+        // point of this assertion.
+        //
+        // `NeverReady` means drovr observed NOTHING — the agent reported no
+        // status at all. "I don't know" must not authorise destroying a pane,
+        // and this branch's founding rule is exactly that: the marker is the
+        // evidence, absence of confirmation is not evidence. The common cause
+        // is the recoverable one — the agent parked on a first-run or
+        // permission prompt, a human clicks through, and the resumed
+        // conversation is fine. drovr already treats that as human-recoverable
+        // (`phase wait` exit 4, `diagnose_stuck_phase`); closing the pane
+        // throws it away and cannot be undone.
+        //
+        // `ResumeUnconfirmed` is the opposite and DOES surrender: there drovr
+        // positively observed a DIFFERENT session, so the record demonstrably
+        // does not describe that pane. See
+        // `an_unconfirmed_resume_gives_its_pane_back_so_the_phase_can_be_retried`.
         assert!(
-            run.find_phase("plan").unwrap().is_reaped(),
-            "the pane was given back: {:?}",
+            !run.find_phase("plan").unwrap().is_reaped(),
+            "an unobserved agent is not a misattributed one: {:?}",
             run.find_phase("plan")
         );
         assert!(
-            note.contains("rehydrated again"),
-            "and the note must offer the retry that is now possible: {note}"
+            !h.calls().iter().any(|c| c.starts_with("pane_close")),
+            "nothing may be closed on no evidence: {:?}",
+            h.calls()
+        );
+        let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
+        assert!(
+            note.contains(&pane) && note.contains("herdr pane read"),
+            "and the operator must be sent to the pane that is still there: {note}"
         );
     }
 
@@ -10309,6 +10412,90 @@ mod rehydrate_tests {
             "{:?}",
             h.calls()
         );
+    }
+
+    #[test]
+    fn a_pane_that_cannot_be_released_says_what_is_true_not_what_would_be_convenient() {
+        // ⚠️ AN HONEST EXIT CODE WITH WRONG GUIDANCE IS NOT HONEST.
+        //
+        // The surrender closes the pane and then records the release. If that
+        // record does not land, disk still names a `pane_id` for a pane that no
+        // longer exists, so `rehydratable` answers `HoldsPane` FOREVER — while
+        // the outcome this used to return said the phase was unchanged and
+        // could be rehydrated again, and the warning implied the refusal would
+        // lift once the run dir was writable. It never does: writability does
+        // not clear `pane_id`; only a successful save would.
+        //
+        // So the failure is an `Err`, and its text names the one thing that
+        // actually clears it.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-stuck-release");
+        let mut p = reaped_phase("plan", "claude", None, Some("sess-abc"));
+        p.set_pane("ws-rh:doomed");
+        run.phases.push(p);
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir = run_dir("rh-stuck-release");
+        let before = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let released = surrender_misattributed_pane(&h, &mut run, "plan", "ws-rh:doomed");
+        std::fs::set_permissions(&dir, before).unwrap();
+
+        let err = released.expect_err("a release that did not land is not a success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ws-rh:doomed") && msg.contains("state.json"),
+            "must name the pane that is stuck and the file that clears it: {msg}"
+        );
+        assert!(
+            !msg.contains("can be rehydrated again") && !msg.contains("will retry"),
+            "must not promise a retry the recorded state will refuse: {msg}"
+        );
+        // The pane is closed either way: leaving it open would add an immortal
+        // pane to an already-stuck registration — two manual repairs, not one.
+        assert!(
+            h.calls().iter().any(|c| c == "pane_close pane=ws-rh:doomed"),
+            "{:?}",
+            h.calls()
+        );
+    }
+
+    #[test]
+    fn a_released_pane_is_written_onto_a_fresh_read() {
+        // The success half, and the reason it is not written from the caller's
+        // copy: by the time the surrender runs, up to `SEND_READY_TIMEOUT` of
+        // polling has happened and capture persists through a copy of its own,
+        // so the caller's `RunState` is not the state to write back. Same rule
+        // as `surrender_unrecordable_pane`.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-released");
+        let mut p = reaped_phase("plan", "claude", None, Some("sess-abc"));
+        p.set_pane("ws-rh:doomed");
+        run.phases.push(p);
+        run.save().unwrap();
+        // A capture that landed on DISK while the waits ran, which the caller's
+        // copy knows nothing about. It must survive the release.
+        let mut mid = RunState::load("rh-released").unwrap();
+        mid.find_phase_mut("plan").unwrap().tab_id = Some("tab-captured".into());
+        mid.save().unwrap();
+        let h = FakeHerdr::new();
+
+        surrender_misattributed_pane(&h, &mut run, "plan", "ws-rh:doomed").unwrap();
+
+        let on_disk = RunState::load("rh-released").unwrap();
+        let p = on_disk.find_phase("plan").unwrap();
+        assert_eq!(p.pane_id(), None, "{p:?}");
+        assert!(p.is_reaped(), "{p:?}");
+        assert_eq!(
+            p.tab_id.as_deref(),
+            Some("tab-captured"),
+            "a write from the caller's stale copy would have lost this: {p:?}"
+        );
+        assert!(on_disk.retired_panes.iter().any(|x| x == "ws-rh:doomed"));
+        // …and the caller's copy is brought up to date rather than left lying.
+        assert!(run.find_phase("plan").unwrap().is_reaped());
     }
 
     #[test]
