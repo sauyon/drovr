@@ -995,6 +995,13 @@ Same step (re-claim after `drop`), same own-pid evidence, on a tree whose only c
 markdown. That rules out this branch's code as a contributor and makes the signature stable
 rather than a one-off reading. It passed on the immediate re-run and on a second full suite.
 
+**The rate may be machine- or load-dependent, and the documented 5–8% may be low.** Across task
+7's review rounds it fired **3 times in ~8 full-suite runs** on one machine — the same binary,
+the same test count, only markdown changing between runs. That is too small a sample to restate
+the rate from, and it does not contradict the earlier 1-in-8 and 2-in-30 measurements so much as
+suggest they are not a single number. If you are measuring, record the machine and whether
+anything else was loading it.
+
 This is consistent with the `O_CLOEXEC` / fork-window hypothesis in the entry below (a concurrent
 `Command::spawn` elsewhere in the suite briefly duplicates the fd between fork and exec, and an
 inherited open file description holds the flock). It does not confirm it — confirming means

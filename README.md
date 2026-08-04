@@ -90,7 +90,8 @@ provably moved past a phase:
 | `drovr phase reap <run> <phase>` | the phase you named |
 
 All three also sweep the run's **retired** panes — ones drovr opened that no
-phase points at any more (see `retired_panes` below).
+phase points at any more (see `retired_panes` below). For the first two that
+sweep is inside the config gate below; `drovr phase reap` sweeps either way.
 
 Reaping closes a **pane**, not a tab: a phase's tab may also hold a pane the
 human split into it, and drovr closes only what it can prove is its own. In the
@@ -170,7 +171,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
-| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
+| `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, retired panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |
 
 ### Review UI keyboard navigation
 
@@ -221,12 +222,16 @@ also the supported way to clear a phase that records a pane herdr no longer has
 pane" forever, with nothing able to clear it.
 
 It additionally **sweeps the run's retired panes**: panes drovr opened that no
-phase points at any more, which a reviewer replaced mid-panel leaves behind.
-They belong to no phase, so this is the only command that reaches them short of
-`drovr cleanup`. The sweep is best-effort and reports itself; **it does not
-affect the exit code**, which is about the phase you named. `drovr phase reap`
-runs it regardless of `reap_finished_panes` — the config gates the two automatic
-triggers, not the command.
+phase points at any more, which a reviewer replaced mid-panel leaves behind. The
+sweep is best-effort and reports itself; **it does not affect the exit code**,
+which is about the phase you named.
+
+All three triggers sweep (see the table above), so on the default config an
+orphaned retired pane is already reclaimed by the next `phase start` or
+`code-review run` — you do not need this command for it. What this command adds
+is the sweep **on demand**: it runs regardless of `reap_finished_panes`, so with
+the automatic triggers off it is the only route to a retired pane short of
+`drovr cleanup`, and with them on it is how you avoid waiting for the next one.
 
 `drovr phase rehydrate` is the way back. It opens a fresh tab in the run's
 project directory, under the profile the phase originally ran with, and asks the
@@ -254,11 +259,13 @@ resumed reviewer would have no `submit_findings` tool, so it could never
 deliver. A panel is **re-run, not rehydrated** — `drovr code-review run` resumes
 a panel in flight, so it costs only the angles actually lost.
 
-In `drovr serve`, a reaped phase renders dimmed in the agent tree with a **⟳**
-button. The button appears exactly where a click will work (it is gated on the
-same predicate the CLI refuses on), and its tooltip says which of the two things
-it promises: resume this phase's session, or launch a fresh agent and re-send
-the seed.
+In `drovr serve`, a reaped phase renders dimmed in the agent tree and carries a
+**⟳** button. Three independent predicates, deliberately: the dimming says the
+pane was *reaped*; the button appears wherever a phase is *rehydratable*, which
+is not only the reaped ones and is the same predicate the CLI refuses on, so a
+click can never hit a refusal; and its tooltip is decided by whether the phase is
+*resumable*, i.e. which of the two things a click promises — resume this phase's
+session, or launch a fresh agent and re-send the seed.
 
 ## Run directory and state contracts
 
@@ -348,7 +355,7 @@ The server reads and writes these files in each run dir:
 |---|---|---|
 | `<phase>.done` | `drovr phase done` | Completion marker, stamped with the pass token of the agent that wrote it. `drovr phase wait` accepts it only if that token matches the phase's current `pass`, which is what stops a previous pass's still-live agent from completing the current one. |
 | `<phase>-HANDOFF.md` | the finishing phase agent | See above; `drovr collect` reads it. |
-| `run.lock` | `drovr phase rehydrate` / `reap` | The exclusive lock serializing the commands that move a run's panes around. Rehydrate and reap are the same read-modify-write over `pane_id` in opposite directions, so they share one lock — reaping a phase a rehydrate is bringing back would end with a live pane nothing records. Advisory and kernel-held, so a crashed holder leaves nothing stale; a second command **fails rather than queues**, since the holder may be inside a 30 s readiness wait. (Named `rehydrate.lock` while rehydrate was its only holder.) |
+| `run.lock` | any command that reaps or rehydrates | The exclusive lock serializing the commands that move a run's panes around: `drovr phase rehydrate` and `drovr phase reap` directly, and `drovr phase start` / `drovr code-review run` through the reaping they trigger. Rehydrate and reap are the same read-modify-write over `pane_id` in opposite directions, so they share one lock — reaping a phase a rehydrate is bringing back would end with a live pane nothing records. Advisory and kernel-held, so a crashed holder leaves nothing stale; a second command **fails rather than queues**, since the holder may be inside a 30 s readiness wait. (Named `rehydrate.lock` while rehydrate was its only holder.) |
 
 ## Review loop flow
 

@@ -229,10 +229,15 @@ enum PhaseCmd {
     /// or could not be reached. Exit 1 = refused or failed.
     ///
     /// It also sweeps the run's RETIRED panes — ones drovr opened that no phase
-    /// points at any more, which a replaced reviewer leaves behind. They belong
-    /// to no phase, so this is the only command that reaches them short of
-    /// `drovr cleanup`. That part is best-effort and reports itself; the exit
-    /// code is about the phase you named.
+    /// points at any more, which a replaced reviewer leaves behind. That part is
+    /// best-effort and reports itself; the exit code is about the phase you
+    /// named.
+    ///
+    /// Every reap trigger sweeps, so with `reap_finished_panes` on (the default)
+    /// the next `phase start` or `code-review run` already reclaims them. This
+    /// command sweeps ON DEMAND and regardless of that config — so it is the
+    /// only route short of `drovr cleanup` when reaping is turned off, and the
+    /// way to not wait for the next trigger when it is not.
     ///
     /// The phase's status is NOT changed: reaping says something about the pane,
     /// not about whether the work was finished. Bring it back with
