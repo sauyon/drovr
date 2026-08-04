@@ -147,6 +147,32 @@ fn seed_runs(runs_root: &PathBuf) {
     .unwrap();
     fs::write(zeta.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
 
+    // delta-idle carries the agent-tree fixture: a reaped phase whose session was
+    // captured (⟳, promising the conversation), a reaped phase whose session was
+    // not (⟳ too — it is still rehydratable, and the tooltip says it reseeds),
+    // a phase that never ran (NO ⟳ — the CLI would refuse it), and a live phase. `implement` stays `Running` so the run remains
+    // incomplete and the list-motion checks above see the same rows they always
+    // did. Reaped phases carry `pane_id: null` — drovr refuses to load a phase
+    // claiming both a pane and a reaping.
+    //
+    // ⚠️ `project_dir` and `workspace` are BOTH set, and that is load-bearing:
+    // rehydrating needs a directory to launch in and a workspace to open a tab
+    // in, so a run missing either offers no ⟳ at all. This fixture used to carry
+    // `project_dir: ""` and still rendered three buttons — the tree's predicate
+    // was weaker than the operation's, which is the defect
+    // `RunState::rehydratable` exists to close. The negative cases live in
+    // `review::tests::the_tree_offers_no_rehydrate_the_cli_would_refuse`.
+    let delta = runs_root.join("delta-idle");
+    fs::write(
+        delta.join("state.json"),
+        r#"{"name":"delta-idle","task":"task for delta-idle","gate":"spec","cursor":0,"project_dir":"/tmp/delta","workspace":"w1","phases":[
+{"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude","session":"sess-brainstorm"}},
+{"name":"plan","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,"reaped":true,"pane_agent":{"backend":"claude"}},
+{"name":"never-ran","status":"Pending","handoff_doc":null,"herdr_session":null,"pane_id":null},
+{"name":"implement","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w1:p3"}]}"#,
+    )
+    .unwrap();
+
     // alpha-deploy is the run the detail-view checks drive: put it in the state a
     // reviewer actually meets it in — `ready`, still on turn 0 (the counter only
     // moves when the reviewer submits), with the agent's summary posted.

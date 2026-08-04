@@ -58,3 +58,11 @@ the reviewer yourself.
 **Exit 2 is slow, not broken.** Re-running the *same* command RESUMES: it keeps the
 angles already banked and waits only on stragglers. Loop on 2 as freely as on 3.
 `--fresh` throws it away and pays for a new one — never use it to unstick a timeout.
+
+**A panel is re-run, never rehydrated.** `drovr phase rehydrate` refuses a reviewer:
+findings arrive through an MCP server handed over at launch, which no resumed session
+can be re-attached to — it could never deliver. Re-run the panel; it resumes.
+
+**It closes its own panes** once findings merge, so read a reviewer's pane *before* the
+run returns if you want its reasoning; `<task>-review.json` is what survives. The
+implementer's pane is untouched.
