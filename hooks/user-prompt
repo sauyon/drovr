@@ -79,8 +79,11 @@ command -v "$DROVR" >/dev/null 2>&1 || exit 0
 #
 # MEASURED on Claude Code 2.1.220: a `UserPromptSubmit` hook that exits **2** is
 # a BLOCKING error — the user's prompt is discarded unprocessed and the harness
-# prints "Original prompt: …" instead of answering it. Other non-zero codes are
-# non-blocking (127 was verified to let the turn through untouched).
+# prints "Original prompt: …" instead of answering it. Three other outcomes were
+# verified to let the turn through untouched: exit **1** (this line's mapping,
+# confirmed end-to-end behind a stub reproducing clap's usage error), exit 127,
+# and being killed at the hook `timeout`. Only those are known-safe, which is why
+# the mapping targets 1 exactly rather than "some non-zero".
 #
 # `exec` would hand the child's status straight to the harness, and clap exits
 # **2** on a usage error. The binary is installed by hand, independently of the
