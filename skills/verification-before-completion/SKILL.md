@@ -1,6 +1,6 @@
 ---
 name: verification-before-completion
-description: Use when about to claim a drovr task is done, fixed, or passing, before writing the report or signalling phase done
+description: Use when about to claim any work is done, fixed, or passing, before reporting, committing, or handing off — requires running the verification command in this message and reading its output; evidence before assertion, always
 ---
 
 # Verification Before Completion
@@ -11,8 +11,8 @@ description: Use when about to claim a drovr task is done, fixed, or passing, be
 Verify before claiming done: run the task's tests and the build/linter, and
 confirm they pass by reading the actual output.
 
-This matters doubly in drovr: a phase that reports "done" on unverified work
-cascades a broken interface into the next phase's briefing, which binds to it.
+Unverified work reported as done does not stay contained: whoever picks it up
+next binds to the interface you claimed, not the one you actually have.
 
 ## Before you say "done"
 
@@ -37,6 +37,6 @@ cascades a broken interface into the next phase's briefing, which binds to it.
 
 ## The claim
 
-Only after the evidence is in hand may you write the report and run
-`drovr phase done`. The report records the verification output, not a summary of
-your confidence.
+Only after the evidence is in hand may you write it up. The write-up records the
+verification output, not a summary of your confidence. If you are in a phase,
+this is also what gates `drovr phase done`.

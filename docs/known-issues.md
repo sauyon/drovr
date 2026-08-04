@@ -1,5 +1,51 @@
 # Known issues
 
+## Four methodology skills tell an agent working inline that they do not apply — FIXED 2026-08-04
+
+**Status:** fixed on `drovr/skill-stickiness` (spec §3, fix 1). The five `description:` lines
+are un-scoped and the four body phase-framings are demoted to *additional* consequences.
+Regression check: `cli/tests/skills_valid.rs::no_phase_scoped_description_literals`.
+
+**Severity:** medium (silent, and it disables the discipline exactly when nothing else is
+watching — an agent working inline skips the skill and no error is produced anywhere).
+**Found:** 2026-08-01, run `skill-stickiness`, reading the four `description:` lines against
+`skills/using-drovr/SKILL.md`'s escalation contract.
+
+### Symptom
+
+An agent working inline — not inside a `drovr phase` — reads `drovr:tdd`'s trigger, sees *"in a
+drovr phase"*, and correctly concludes the skill does not apply to what it is doing. Same for
+`systematic-debugging`, `verification-before-completion` (*"a drovr task"*) and `code-review`
+(*"a drovr phase has produced"*). The skills load, their bodies are correct, and the agent
+never reaches them.
+
+### Root cause
+
+Two documents disagreed, and the losing one was the one the agent reads first.
+`skills/using-drovr/SKILL.md` makes inline work the **default** — *"Default: do the work inline
+in this session. Do not reach for phases for a task that fits"* — while four of the five skills
+it routes to scoped their own trigger to a phase. A `description:` is a **trigger, not a
+summary**: it is the line that decides whether the skill is read at all, so a precondition
+written into it is a precondition on the whole discipline. Nothing detected the contradiction
+because each file was internally consistent; the defect lived in the gap between them.
+
+The fifth skill, `using-drovr` itself, had the adjacent version of the same trap: its
+description *summarised* the router instead of triggering it, giving the agent a shortcut it
+could take **instead of** reading the skill.
+
+### Fix
+
+`skills/*/SKILL.md:3` for all five now state an unconditional trigger (spec §3's table,
+verbatim). Every remaining drovr-phase reference in the four bodies is reworded as a
+clearly-marked *additional* consequence — *"Inside a drovr phase this also binds the next
+phase's contract"* — never a precondition. `systematic-debugging`'s read-only-explorer rule was
+already unconditional and is unchanged.
+
+`no_phase_scoped_description_literals` asserts the three literals are absent from every
+`skills/*/SKILL.md`. Because an absence check passes just as happily when it reads nothing, it
+runs the same matcher over the frozen pre-fix snapshots in `docs/skill-evidence/arms/A/`, where
+every literal must still be found, and fails if the matcher comes back empty there.
+
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
 **Status:** open, pre-existing — the `UserPromptSubmit` per-turn gate inherits the gap
@@ -663,6 +709,20 @@ channel is missing.
 Have `code-review brief` take a flag (or detect the absence of the MCP server) and emit a
 prose-output instruction instead of the `submit_findings` one — the brief already owns the
 findings schema, so only the delivery sentence differs.
+
+## Follow-ups
+
+Wanted work that is not a defect — nothing here is broken today.
+
+- **Render fenced `dot` blocks in the review UI, and show the phase/gate graph alongside the
+  plan** (raised 2026-08-04, run `skill-stickiness`, spec §2.3). The skill docs author their
+  decision graphs as fenced `dot` blocks, and an agent reads the source whether or not anything
+  renders it — so the docs work as they are. The gap is human-facing: a reviewer orienting in a
+  run in progress is asking *where in the procedure is this*, which is a position in a branching
+  structure that prose has to re-linearise. spec §2.3 puts the doc side in scope and the
+  rendering side out of it (§8), so this is recorded rather than built. No claim is made about
+  how much faster anyone reads a graph; that would be a comparative with no measurement behind
+  it.
 
 ## Resolved
 

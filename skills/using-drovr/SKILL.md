@@ -1,6 +1,6 @@
 ---
 name: using-drovr
-description: Use at the start of every session as the always-on router — establishes the single-writer discipline, points to the right drovr:* methodology skill for the task, and defines when to escalate a task into its own phase
+description: Use at the start of every session and before every response, including before clarifying questions and before reading any file — routes to the right drovr skill and requires invoking it whenever there is even a 1% chance one applies
 ---
 
 # Using Drovr

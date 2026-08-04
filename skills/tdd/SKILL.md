@@ -1,6 +1,6 @@
 ---
 name: tdd
-description: Use when implementing any feature or bugfix in a drovr phase, before writing implementation code
+description: Use when implementing any feature or bugfix, before writing implementation code — requires a test you have watched fail before any implementation exists; no production code without a red test first
 ---
 
 # TDD
@@ -12,9 +12,9 @@ it fail, then write the minimal code to make it pass. A test you never saw fail
 proves nothing — it may pass for the wrong reason, or not exercise the behavior
 at all.
 
-In a drovr phase you are the single writer. The test is the contract the next
-phase binds to, so it must be real: keep changes scoped to this task's
-interfaces so the folded-forward contracts stay accurate.
+Keep the test scoped to the interfaces you are actually changing — a test that
+drifts wider stops being a contract anyone can rely on. Inside a drovr phase
+this also binds the next phase's contract.
 
 ## The cycle
 

@@ -1,6 +1,6 @@
 ---
 name: systematic-debugging
-description: Use when encountering any bug, test failure, or unexpected behavior in a drovr phase, before proposing or writing a fix
+description: Use when encountering any bug, test failure, or unexpected behavior, before proposing or writing a fix — requires a reproduction and a mechanistic root cause before any code change
 ---
 
 # Systematic Debugging
@@ -11,9 +11,10 @@ description: Use when encountering any bug, test failure, or unexpected behavior
 have not reproduced and localized is a guess — it may hide the bug or add a new
 one. Work the loop below in order; do not skip to the fix.
 
-In a drovr phase you are the single writer. Fan-out investigation belongs to
-**read-only explorers** (e.g. `explore-mcp`), never to parallel writers — dispatch
-them to understand code you only need to read, and keep editing to yourself.
+Fan-out investigation belongs to **read-only explorers** (e.g. `explore-mcp`),
+never to parallel writers — dispatch them to understand code you only need to
+read, and keep editing to yourself. Inside a drovr phase this is also what keeps
+the single-writer rule intact.
 
 ## The loop
 

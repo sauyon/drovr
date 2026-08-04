@@ -2754,7 +2754,12 @@ struct SharedPassage {
 ///
 ///   * §3's replacement `description:` for `systematic-debugging` keeps the
 ///     opening the current one shares with superpowers, so fix 1 (Task 7) does
-///     not clear it.
+///     not clear it — it **lengthened** the run, exactly as this note predicted.
+///   * §3's replacement `description:` for `tdd` **is** superpowers'
+///     `test-driven-development` description, word for word, as its opening
+///     clause. Fix 1 did not create the collision by carelessness: the string is
+///     frozen spec text, and the pre-fix `in a drovr phase` was the only thing
+///     interrupting the run.
 ///   * §4.1 step 1 says to **keep** `using-drovr`'s `<SUBAGENT-STOP>` block, so
 ///     fix 2's doc layer (Task 14) does not clear it either.
 ///
@@ -2769,11 +2774,23 @@ struct SharedPassage {
 const KNOWN_SHARED_PASSAGES: &[SharedPassage] = &[
     SharedPassage {
         file: "systematic-debugging/SKILL.md",
-        passage: "Use when encountering any bug, test failure, or unexpected behavior",
+        passage: "Use when encountering any bug, test failure, or unexpected behavior, before proposing",
         why: "the trigger description. spec §3 freezes a replacement that keeps this opening, \
-              so Task 7 (fix 1) does not clear it — it lengthens the shared run instead, by \
-              deleting the `in a drovr phase` that currently interrupts it. \
+              so Task 7 (fix 1) did not clear it — it lengthened the shared run instead, by \
+              deleting the `in a drovr phase` that had interrupted it. Extended from ten words \
+              to twelve when fix 1 landed, which is the growth the pre-fix note predicted. \
               Task 23 (§9) decides: reword, or attribute",
+    },
+    SharedPassage {
+        file: "tdd/SKILL.md",
+        passage: "Use when implementing any feature or bugfix, before writing implementation code",
+        why: "the trigger description, and the worst of the three: spec §3's frozen replacement \
+              reproduces superpowers' `test-driven-development` description in full as its \
+              opening clause, so the shared run is a whole description rather than a phrase two \
+              authors happened to converge on. It appeared when Task 7 deleted the \
+              `in a drovr phase` that had interrupted it, and Task 7 could not reword it — §3's \
+              strings are frozen and are what arm A′ measures. Task 23 (§9) decides: reword, or \
+              attribute. Attribution is the likelier answer here",
     },
     SharedPassage {
         file: "using-drovr/SKILL.md",
@@ -3008,6 +3025,123 @@ fn methodology_skills_within_body_budget() {
             path.display()
         );
     }
+}
+
+/// The three literals fix 1 exists to remove (spec §3).
+///
+/// Each one scoped an unconditional discipline to a drovr *phase*, while
+/// `using-drovr` makes working inline the default — so an agent working inline
+/// read the trigger and correctly concluded the skill did not apply.
+///
+/// **Case-sensitive, deliberately.** The defect is the scoping in a
+/// `description:`; a body sentence like *"In a drovr phase this also binds the
+/// next phase's contract"* is the demoted form fix 1 asks for, and banning it
+/// case-insensitively would forbid the repair along with the defect.
+const PHASE_SCOPED_LITERALS: &[&str] = &[
+    "in a drovr phase",
+    "a drovr task",
+    "a drovr phase has produced",
+];
+
+/// Does `contents` carry any of the phase-scoping literals? Returns the ones it
+/// carries, so the failure text can name them.
+///
+/// Factored out because it is run over two corpora: the live skills, where it
+/// must find nothing, and the frozen arm A snapshots, where it must find
+/// everything. One matcher, so the negative assertion cannot drift away from
+/// the positive control that proves the matcher works.
+fn phase_scoped_literals_in(contents: &str) -> Vec<&'static str> {
+    PHASE_SCOPED_LITERALS
+        .iter()
+        .copied()
+        .filter(|literal| contents.contains(literal))
+        .collect()
+}
+
+/// Fix 1 (spec §3): no shipped skill scopes its trigger to a drovr phase.
+///
+/// **This is an absence test, and an absence test is this run's recurring
+/// defect class wearing its most convincing costume** — it passes just as
+/// cheerfully when the walk globs nothing, when it reads the wrong tree, or when
+/// the literals were never there. Green here is worth nothing on its own.
+///
+/// Three things make it worth something:
+///
+///  1. **A positive control on real, frozen data.** The same matcher is run over
+///     `docs/skill-evidence/arms/A/`, the pre-fix snapshot, where every literal
+///     must still be found. Arm A is immutable (`arm_a_snapshots_match_manifest`
+///     hashes it), so this control cannot rot — and if the matcher ever stops
+///     matching, this test fails instead of quietly passing.
+///  2. **The walk is asserted to have covered the measured skills**, so an empty
+///     or mis-rooted glob is a failure rather than a pass.
+///  3. It was watched RED against the pre-fix text before fix 1 landed.
+///
+/// It stays green through the §6 rewrites and through a §7.3 revert to A′ — fix
+/// 1 ships regardless of every measurement outcome, so A′ carries it too.
+#[test]
+fn no_phase_scoped_description_literals() {
+    let files = skill_files(&skills_dir());
+
+    // Guard 2: the walk found a corpus, and specifically it found the skills
+    // whose descriptions carried the defect. A glob that matched nothing would
+    // otherwise satisfy every assertion below.
+    let found: HashSet<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    for skill in SkillName::ALL {
+        assert!(
+            found.contains(skill.as_str()),
+            "the skills walk over {} did not find `{}`; an absence check that \
+             globbed nothing would pass having read nothing",
+            skills_dir().display(),
+            skill.as_str()
+        );
+    }
+
+    let mut hits = Vec::new();
+    for (_, path) in &files {
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for literal in phase_scoped_literals_in(&contents) {
+            hits.push(format!("{}: `{literal}`", path.display()));
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "{} skill file(s) still scope discipline to a drovr phase:\n{}\n\
+         An agent working inline — which `using-drovr` makes the default — reads \
+         this and concludes the skill does not apply. Rephrase the phase \
+         reference as an *additional* consequence, never a precondition (spec §3).",
+        hits.len(),
+        hits.join("\n"),
+    );
+
+    // Guard 1: the positive control. Arm A is the pre-fix text, frozen; if the
+    // matcher above found nothing there either, it is not matching at all.
+    let arm_a = arms_dir().join("A");
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    for skill in SkillName::ALL {
+        let path = arm_a.join(format!("{}.md", skill.as_str()));
+        let contents = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the arm A snapshot {}: {e} — it is this check's \
+                 positive control, not an optional extra",
+                path.display()
+            )
+        });
+        seen.extend(phase_scoped_literals_in(&contents));
+    }
+    let unmatched: Vec<&str> = PHASE_SCOPED_LITERALS
+        .iter()
+        .copied()
+        .filter(|literal| !seen.contains(literal))
+        .collect();
+    assert!(
+        unmatched.is_empty(),
+        "the matcher found no occurrence of {unmatched:?} anywhere in {} — arm A \
+         is the pre-fix text and every literal is present in it by construction, \
+         so this means the check above is asserting the absence of something it \
+         cannot detect",
+        arm_a.display(),
+    );
 }
 
 /// The evidence corpus is the only citable record behind every numeric or
