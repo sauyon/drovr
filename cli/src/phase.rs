@@ -1296,26 +1296,41 @@ impl Unfinished {
     }
 }
 
-/// Take the exclusive lock that serializes rehydrates of `run_name`, held for
-/// as long as the returned file lives.
+/// Take the exclusive lock that serializes the commands which move a run's
+/// panes around, held for as long as the returned file lives.
 ///
-/// **Why a FILE lock.** The two racers are separate processes — the HTTP
-/// handler deliberately shells out to `current_exe()` so the CLI stays the sole
-/// writer of `state.json` — so nothing in this address space can serialize
-/// them. The kernel holds an advisory lock for a process and drops it however
-/// that process dies, so a crashed rehydrate never leaves a claim anyone has to
-/// judge stale.
+/// **Two holders, one lock, on purpose.** `phase_rehydrate` brings a phase back
+/// on a new pane and `phase_reap` closes one and drops the registration — they
+/// are the same read-modify-write over the same field, in opposite directions,
+/// and reaping a phase a rehydrate is bringing back (or the reverse) is a race
+/// that ends with a live pane nothing records. One file (`run.lock`, not the
+/// `rehydrate.lock` it was named while rehydrate was the only holder), because
+/// two locks taken in two orders is how a deadlock is built.
+///
+/// **Why a FILE lock.** The racers are separate processes — the HTTP handler
+/// deliberately shells out to `current_exe()` so the CLI stays the sole writer
+/// of `state.json` — so nothing in this address space can serialize them. The
+/// kernel holds an advisory lock for a process and drops it however that
+/// process dies, so a crashed holder never leaves a claim anyone has to judge
+/// stale.
 ///
 /// **Why it fails rather than waits.** The holder may be inside a 30-second
 /// readiness wait, and a queued second rehydrate would then either duplicate
 /// the first (if it did not re-read) or refuse anyway (if it did). Refusing now
-/// says the true thing immediately and keeps the HTTP worker free.
+/// says the true thing immediately and keeps the HTTP worker free. A reap
+/// refused this way is best-effort at every automatic trigger, so it warns and
+/// the phase is untouched.
 ///
-/// The lock alone does not close the race — see `phase_rehydrate`, which
-/// re-reads `state.json` under it. Serializing two launches without that just
-/// makes them consecutive rather than simultaneous.
-fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
-    let path = run_dir(run_name).join("rehydrate.lock");
+/// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped: a second
+/// `open` + lock in the SAME process blocks on itself. So no holder may call
+/// another — `phase_start`'s reap loop calls `phase_reap` per phase, each
+/// taking and dropping the lock, and never wraps the loop in one.
+///
+/// The lock alone does not close the race — see `phase_rehydrate` and
+/// `phase_reap`, which both re-read `state.json` under it. Serializing two
+/// launches without that just makes them consecutive rather than simultaneous.
+fn acquire_run_lock(run_name: &str) -> io::Result<File> {
+    let path = run_dir(run_name).join("run.lock");
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1327,10 +1342,11 @@ fn acquire_rehydrate_lock(run_name: &str) -> io::Result<File> {
         Err(TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
-                "another rehydrate of run '{run_name}' is already in progress (it may be \
-                 waiting up to 30s for its agent to come up). Wait for it to finish and \
-                 look at the phase again — two rehydrates of one phase would leave two \
-                 live agents and record only one."
+                "another drovr command is moving run '{run_name}'s panes around (a \
+                 rehydrate may be waiting up to 30s for its agent to come up). Wait for \
+                 it to finish and look at the phase again — two rehydrates of one phase \
+                 would leave two live agents and record only one, and reaping a phase a \
+                 rehydrate is bringing back would close the pane it just opened."
             ),
         )),
         Err(TryLockError::Error(e)) => Err(e),
@@ -1548,7 +1564,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // The lock serializes them and the RE-READ under it is what makes that
     // enough: the loser has to see what the winner wrote, or being second is
     // no different from being simultaneous. Held for the whole function.
-    let _lock = acquire_rehydrate_lock(&run.name)?;
+    let _lock = acquire_run_lock(&run.name)?;
     // The caller's copy may predate the lock by any amount — the driver holds
     // one across a whole run, and the winner of the race above wrote while this
     // process was blocked. `state.json` under the lock is the only authority.
@@ -10922,7 +10938,7 @@ mod rehydrate_tests {
         run.save().unwrap();
 
         // (a) while another process holds the lock, nothing is launched at all.
-        let held = acquire_rehydrate_lock("rh-concurrent").expect("first holder");
+        let held = acquire_run_lock("rh-concurrent").expect("first holder");
         let h = FakeHerdr::new();
         let err = phase_rehydrate(&h, &mut run, "plan")
             .expect_err("a second rehydrate must not run beside the first");
@@ -10979,7 +10995,7 @@ mod rehydrate_tests {
         // Make every later write to the run dir fail: tmp+rename cannot create
         // `state.json.tmp` in a directory it may not write.
         //
-        // The rehydrate lock file is created FIRST, because O_CREAT needs write
+        // The run lock file is created FIRST, because O_CREAT needs write
         // permission on the directory and the lock is taken before the launch —
         // otherwise this test would model "rehydrate refused up front", which
         // is a different (and much less interesting) failure. An existing file
@@ -10988,7 +11004,7 @@ mod rehydrate_tests {
         // lock file has been there since the first rehydrate.
         use std::os::unix::fs::PermissionsExt;
         let dir = run_dir("rh-unsaveable");
-        std::fs::File::create(dir.join("rehydrate.lock")).unwrap();
+        std::fs::File::create(dir.join("run.lock")).unwrap();
         let before = std::fs::metadata(&dir).unwrap().permissions();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = phase_rehydrate(&h, &mut run, "plan");
