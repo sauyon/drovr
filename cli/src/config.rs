@@ -90,18 +90,58 @@ impl McpDelivery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeSpec {
     /// `<command> … <flag> '<id>'` — where the other flags go.
-    Flag(String),
+    Flag(ResumeToken),
     /// `<command> <subcommand> '<id>' …` — immediately after the command.
-    Subcommand(String),
+    Subcommand(ResumeToken),
 }
 
+/// The flag or subcommand word itself — **never empty**, by construction.
+///
+/// A newtype over a private `String` rather than a bare `String` in the variant,
+/// because an empty token is not a cosmetic defect: `resume_flag = ""` composes
+/// `<command>  '<id>'`, handing the session id to the agent as a positional
+/// argument, and an empty *flag* is exactly how a bare `--resume` reaches the
+/// shell — which opens claude's interactive session picker and parks the pane
+/// forever, with no human anywhere near it.
+///
+/// The check used to live in `TryFrom<AgentSpecWire>`, i.e. on the config-file
+/// path only. Everything else — the built-in map, tests, any future caller —
+/// was on the honour system, and `ResumeSpec::Flag(String::new())` was one
+/// expression away. Enum variants are as public as their enum, so the guard
+/// cannot live on the variant; it lives here, on the only value the variants can
+/// hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeToken(String);
+
 impl ResumeSpec {
-    /// The flag or subcommand text, for composing.
+    /// A flag-shaped resume surface (claude, cursor). `Err` names the problem
+    /// for a config file to print verbatim.
+    pub fn flag(token: impl Into<String>) -> Result<ResumeSpec, String> {
+        ResumeToken::new(token, "resume_flag").map(ResumeSpec::Flag)
+    }
+
+    /// A subcommand-shaped resume surface (codex). Same validation.
+    pub fn subcommand(token: impl Into<String>) -> Result<ResumeSpec, String> {
+        ResumeToken::new(token, "resume_subcommand").map(ResumeSpec::Subcommand)
+    }
+
+    /// The flag or subcommand text, for composing. Non-empty by construction.
     fn token(&self) -> &str {
         match self {
-            ResumeSpec::Flag(f) => f,
-            ResumeSpec::Subcommand(s) => s,
+            ResumeSpec::Flag(t) | ResumeSpec::Subcommand(t) => &t.0,
         }
+    }
+}
+
+impl ResumeToken {
+    /// The ONLY constructor. `key` names the config field in the error, so the
+    /// message reads the same whether the value came from a file or from code.
+    fn new(token: impl Into<String>, key: &str) -> Result<ResumeToken, String> {
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(format!("{key} must not be empty"));
+        }
+        Ok(ResumeToken(token))
     }
 }
 
@@ -147,20 +187,12 @@ struct AgentSpecWire {
 impl TryFrom<AgentSpecWire> for AgentSpec {
     type Error = String;
     fn try_from(w: AgentSpecWire) -> Result<AgentSpec, String> {
-        // Empty is the bare-`--resume` hazard written into a config file:
-        // `resume_flag = ""` composes `<command>  '<id>'`, i.e. the id as a
-        // positional argument. Rejected here, where the user can see why.
-        for (key, value) in [
-            ("resume_flag", &w.resume_flag),
-            ("resume_subcommand", &w.resume_subcommand),
-        ] {
-            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
-                return Err(format!("{key} must not be empty"));
-            }
-        }
+        // Emptiness is rejected by `ResumeToken`, not here — see that type for
+        // why the guard cannot sit on this path alone. This match decides only
+        // WHICH shape was spelled, and refuses both at once.
         let resume = match (w.resume_flag, w.resume_subcommand) {
-            (Some(flag), None) => Some(ResumeSpec::Flag(flag)),
-            (None, Some(sub)) => Some(ResumeSpec::Subcommand(sub)),
+            (Some(flag), None) => Some(ResumeSpec::flag(flag)?),
+            (None, Some(sub)) => Some(ResumeSpec::subcommand(sub)?),
             (None, None) => None,
             (Some(_), Some(_)) => {
                 return Err(
@@ -293,6 +325,16 @@ fn default_angles() -> Vec<String> {
     ]
 }
 
+/// The resume surface claude and cursor share (`-r, --resume [value]` on both,
+/// verified against the real CLIs as a flag whose value is OPTIONAL).
+///
+/// One constructor rather than two literals: `ResumeSpec::flag` is fallible, so
+/// two call sites would be two `expect`s, and the built-in map is exactly the
+/// place where "the token is obviously non-empty" would stop being checked.
+fn builtin_resume_flag() -> ResumeSpec {
+    ResumeSpec::flag("--resume").expect("the built-in resume flag is non-empty")
+}
+
 fn default_agents() -> BTreeMap<String, AgentSpec> {
     let mut m = BTreeMap::new();
     m.insert(
@@ -306,7 +348,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             review_model: None,
             // Verified against the real CLI: `claude -r, --resume [value]` —
             // a flag whose value is OPTIONAL.
-            resume: Some(ResumeSpec::Flag("--resume".into())),
+            resume: Some(builtin_resume_flag()),
             mcp: Some(McpDelivery::ConfigFlag {
                 flag: "--mcp-config".into(),
                 // `--strict-mcp-config`: exactly the servers drovr passed, none of
@@ -336,7 +378,7 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
             model_flag: Some("--model".into()),
             review_model: Some("composer-2.5".into()),
             // Verified against the real CLI: `agent --resume [chatId]`.
-            resume: Some(ResumeSpec::Flag("--resume".into())),
+            resume: Some(builtin_resume_flag()),
             // No per-launch scoping exists: servers come from the project's
             // `.cursor/mcp.json`, so drovr writes that file instead.
             //
@@ -912,16 +954,34 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(
             cfg.agents["claude"].resume,
-            Some(ResumeSpec::Flag("--resume".into()))
+            Some(builtin_resume_flag())
         );
         assert_eq!(
             cfg.agents["cursor"].resume,
-            Some(ResumeSpec::Flag("--resume".into()))
+            Some(builtin_resume_flag())
         );
         // codex gets NEITHER on purpose: `codex resume <id>` is the documented
         // shape but was never verified against the real CLI, and an unverified
         // guess composes a wrong command line where `None` merely reseeds.
         assert_eq!(cfg.agents["codex"].resume, None);
+    }
+
+    #[test]
+    fn an_empty_resume_token_is_not_constructible() {
+        // An empty flag is precisely how a bare `--resume` gets emitted, and a
+        // bare `--resume` opens claude's interactive picker and parks the pane
+        // forever. The guard used to live in `TryFrom<AgentSpecWire>`, which
+        // covers the config file and NOTHING else: `ResumeSpec::Flag("".into())`
+        // was constructible in code, and the built-in map and every future
+        // caller were on the honour system. It lives in the type now.
+        assert!(ResumeSpec::flag("").is_err());
+        assert!(ResumeSpec::flag("   ").is_err());
+        assert!(ResumeSpec::flag("\t\n").is_err());
+        assert!(ResumeSpec::subcommand("").is_err());
+        assert!(ResumeSpec::subcommand(" ").is_err());
+        // And the valid one still round-trips to exactly what it was given.
+        assert_eq!(ResumeSpec::flag("--resume").unwrap().token(), "--resume");
+        assert_eq!(ResumeSpec::subcommand("resume").unwrap().token(), "resume");
     }
 
     #[test]
@@ -977,7 +1037,7 @@ mod tests {
     fn a_resume_subcommand_comes_immediately_after_the_command() {
         let mut cfg = Config::default();
         let codex = cfg.agents.get_mut("codex").unwrap();
-        codex.resume = Some(ResumeSpec::Subcommand("resume".into()));
+        codex.resume = Some(ResumeSpec::subcommand("resume").expect("literal is non-empty"));
         let ph = resumable_phase("codex", "sess-9");
         let launch = cfg
             .resume_launch(&ph.resume_target().unwrap(), "/tmp/p", false)
@@ -1031,7 +1091,7 @@ mod tests {
         let cfg = load_config().unwrap();
         assert_eq!(
             cfg.agents["claude"].resume,
-            Some(ResumeSpec::Flag("--resume".into()))
+            Some(builtin_resume_flag())
         );
     }
 
@@ -1055,7 +1115,7 @@ mod tests {
         let cfg = load_config().unwrap();
         assert_eq!(
             cfg.agents["claude"].resume,
-            Some(ResumeSpec::Subcommand("resume".into()))
+            Some(ResumeSpec::subcommand("resume").expect("literal is non-empty"))
         );
     }
 
@@ -1089,7 +1149,7 @@ mod tests {
         // …and the built-ins are still whole beside it.
         assert_eq!(
             cfg.agents["claude"].resume,
-            Some(ResumeSpec::Flag("--resume".into()))
+            Some(builtin_resume_flag())
         );
     }
 

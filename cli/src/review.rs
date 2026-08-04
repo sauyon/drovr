@@ -3301,7 +3301,7 @@ mod tests {
         // …and it flips the moment the user opts codex in.
         let mut cfg = cfg;
         cfg.agents.get_mut("codex").unwrap().resume =
-            Some(crate::config::ResumeSpec::Subcommand("resume".into()));
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
         let tree = build_agent_tree(&run, &cfg);
         assert_eq!(tree["nodes"][0]["resumable"], true);
     }
