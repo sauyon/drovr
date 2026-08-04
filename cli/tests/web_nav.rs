@@ -77,10 +77,22 @@ fn http_get_ok(addr: &str, path: &str) -> bool {
     resp.lines().next().is_some_and(|l| l.contains(" 200"))
 }
 
-/// The fixture the driver's assertions are written against: four runs so the
-/// list has something to move over and re-sort, and one run carrying the three
-/// open questions the detail-view checks answer.
+/// The fixture the driver's assertions are written against: five runs so the
+/// list has something to move over and re-sort, one carrying the three open
+/// questions the detail-view checks answer, and one with no spec at all.
 fn seed_runs(runs_root: &PathBuf) {
+    // A run whose gate was never opened, so it has NO spec.md at all — the state
+    // a run sits in between `drovr new` and the first `review summary`. The
+    // driver navigates into it from a run that DOES have a spec, to prove the
+    // doc panel is cleared rather than left showing the previous run's spec.
+    let nospec = runs_root.join("epsilon-nospec");
+    fs::create_dir_all(&nospec).expect("create run dir");
+    fs::write(
+        nospec.join("state.json"),
+        r#"{"name":"epsilon-nospec","task":"task for epsilon-nospec","phases":[],"gate":"spec","cursor":0,"project_dir":""}"#,
+    )
+    .unwrap();
+
     for run in ["alpha-deploy", "beta-cache", "gamma-review", "delta-idle"] {
         let dir = runs_root.join(run);
         fs::create_dir_all(&dir).expect("create run dir");
@@ -213,6 +225,28 @@ fn web_keyboard_navigation() {
                 "--disable-gpu",
                 "--no-first-run",
                 "--no-default-browser-check",
+                // Without this the suite hangs on the FIRST navigation and every run
+                // costs 20s to fail. Chromium's cookie store is loaded through OSCrypt,
+                // which on Linux fetches its key from the Secret Service over D-Bus; on a
+                // machine whose keyring has no unlocked default collection that call never
+                // returns and has no timeout. Every cookie-bearing request then queues
+                // behind it forever — the TCP connection is made, but no HTTP request is
+                // ever written, so the server logs nothing and `Page.navigate` never
+                // resolves. `file://` and same-document navigations are unaffected because
+                // they never touch the cookie store, which is what makes it look like a
+                // browser or network fault rather than a keyring one.
+                //
+                // `basic` uses a built-in key instead, which is what a throwaway profile
+                // wants anyway. It changes where the cookie store's KEY comes from, not
+                // cookie behavior — verified: cookies still set and read with it on, and
+                // the UI's own state (localStorage) is not touched by either.
+                //
+                // The two flags are per-platform and each is ignored elsewhere:
+                // `--password-store` is Linux/BSD, `--use-mock-keychain` is the macOS
+                // equivalent for the same failure against Keychain. Windows needs neither
+                // (DPAPI does not prompt). See docs/known-issues.md.
+                "--password-store=basic",
+                "--use-mock-keychain",
                 &format!("--remote-debugging-port={cdp_port}"),
                 "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", tmp.path().join("chrome").display()),

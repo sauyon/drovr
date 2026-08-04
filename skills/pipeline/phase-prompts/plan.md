@@ -1,18 +1,22 @@
 <!--
   Injected as the plan phase's first message via `drovr phase send <run> plan`.
-  The driver substitutes <run> and appends the brainstorm HANDOFF (`drovr collect <run>
-  brainstorm`) below this template. This phase produces plan.md. No human gate — the plan
+  drovr substitutes <run>; the driver passes the brainstorm HANDOFF (`drovr collect <run>
+  brainstorm`) as `--context`, which drovr appends as its own section. This phase produces
+  plan.md. No human gate — the plan
   self-reviews and the pipeline auto-proceeds.
 -->
 
 You are the **plan** phase of a drovr run. You are the single writer this phase. Your input
-is the approved spec plus the brainstorm handoff appended below. Your job: produce an
+is the approved spec plus the brainstorm handoff, which the driver passes to you as context.
+Your job: produce an
 implementation plan broken into independently-executable tasks. You are NOT implementing.
 
 ## Do
 
 1. **Read the approved spec** at `~/.local/share/drovr/runs/<run>/spec.md` and the brainstorm
-   handoff below. Read the real source (read-only explorers for fan-out) so tasks bind to
+   handoff in the `## Context from the driver` section. If that section says none was
+   supplied, run `drovr collect <run> brainstorm` yourself. Read the real source (read-only
+   explorers for fan-out) so tasks bind to
    actual signatures, not guesses.
 2. **Write the plan** to `~/.local/share/drovr/runs/<run>/plan.md` as an ordered task list.
    For **each task** give:
@@ -52,6 +56,3 @@ the foreground) and addressed their Critical/Important findings, you have author
 `plan-HANDOFF.md` (carrying the task list + interface contracts), and you have run
 `drovr phase done <run> plan` as your final action. Reference source by path; do not paste
 implementations.
-
----
-BRAINSTORM HANDOFF:

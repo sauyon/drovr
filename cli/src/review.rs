@@ -209,14 +209,31 @@ impl RunPaths {
 struct Ctx {
     runs_root: PathBuf,
     cells: Mutex<HashMap<String, Arc<Mutex<ReviewState>>>>,
+    /// `host:port` values this server will answer state-changing requests for.
+    /// Empty means "reject every write" — fail closed, so a construction path
+    /// that forgets to populate it cannot silently disable the guard.
+    allowed_hosts: Vec<String>,
+    /// Set when bound to a wildcard address (`0.0.0.0`/`::`), where the reachable
+    /// addresses cannot be enumerated ahead of time. Then any `Host` that is an
+    /// IP *literal* on this port is accepted. That keeps a LAN/Tailscale reviewer
+    /// working while still defeating rebinding, which fundamentally needs a DNS
+    /// *name* — `evil.example:8791` is not an IP literal and stays refused.
+    wildcard_port: Option<u16>,
 }
 
 impl Ctx {
-    fn new(runs_root: PathBuf) -> Self {
+    fn new(runs_root: PathBuf, allowed_hosts: Vec<String>) -> Self {
         Ctx {
             runs_root,
             cells: Mutex::new(HashMap::new()),
+            allowed_hosts,
+            wildcard_port: None,
         }
+    }
+
+    fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
+        self.wildcard_port = port;
+        self
     }
 
     fn paths(&self, run: &str) -> RunPaths {
@@ -347,7 +364,11 @@ fn safe_component(s: &str) -> bool {
 /// A recorded base is a bare git object id (hex, ≤64 chars for SHA-256). Reject
 /// anything else so it can never be interpreted as a git rev-arg or flag when
 /// interpolated into `git diff <base>..HEAD`.
-fn safe_sha(sha: &str) -> bool {
+///
+/// `pub(crate)` because the review panel interpolates the SAME recorded file into the
+/// same shape of git command (`code_review::base_sha`) and must not grow a second,
+/// drifting opinion about what a base may contain. One validator, both call sites.
+pub(crate) fn safe_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -377,10 +398,143 @@ fn parse_run_path(path: &str) -> Option<(&str, &str)> {
     })
 }
 
+/// Read a request header case-insensitively.
+fn header_of(req: &Request, name: &'static str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// Whether a state-changing request may proceed.
+///
+/// Two checks, and the FIRST is the load-bearing one:
+///
+/// 1. **`Host` must be an address this server actually serves.** Comparing
+///    `Origin` against `Host` alone is not enough, because a browser derives both
+///    from the same URL the page was loaded from — so they agree by construction
+///    even when that URL is the attacker's. That is DNS rebinding: a page served
+///    from `evil.example:8791` whose DNS is then re-pointed at `127.0.0.1` sends
+///    `Origin: http://evil.example:8791` and `Host: evil.example:8791`, matching
+///    each other perfectly while the connection lands here. Checking `Host`
+///    against the addresses we bound breaks that: the forged name is not one of
+///    them. This matters most for `/send` and `/keys`, which type into a live
+///    agent's pane — remote command injection, not a flag flip.
+/// 2. **A present `Origin` must be same-origin.** Catches the ordinary
+///    cross-origin POST. The opaque `null` (sandboxed iframe, `file://` page)
+///    fails this: it can never legitimately be this server.
+///
+/// A missing `Origin` is not a browser cross-origin write at all — curl and
+/// drovr's own CLI send none — so check 1 alone governs those.
+fn write_allowed(req: &Request, allowed_hosts: &[String], wildcard_port: Option<u16>) -> bool {
+    let Some(host) = header_of(req, "Host") else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    if !allowed_hosts.iter().any(|h| h == &host) && !wildcard_ip_host(&host, wildcard_port) {
+        return false;
+    }
+    match header_of(req, "Origin") {
+        None => true,
+        // Lowercased on both sides: `host` was normalised above, so comparing a
+        // raw origin against it would reject on nothing but casing. Bound to a
+        // local rather than chained, so nothing borrows from a temporary.
+        Some(origin) => {
+            let origin = origin.to_ascii_lowercase();
+            origin.split("://").nth(1) == Some(host.as_str())
+        }
+    }
+}
+
+/// Whether `host` is an IP literal on the wildcard bind's port.
+///
+/// Only reachable when the server bound `0.0.0.0`/`::`, where the set of
+/// addresses a reviewer might legitimately use is not knowable up front. An IP
+/// literal is safe to accept because DNS rebinding needs a *name*: the attacker
+/// controls `evil.example`'s resolution, not the literal `192.168.1.5`, and a
+/// page served from a bare IP has no rebinding lever at all.
+fn wildcard_ip_host(host: &str, wildcard_port: Option<u16>) -> bool {
+    let Some(port) = wildcard_port else {
+        return false;
+    };
+    let Some((h, p)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if p.parse::<u16>() != Ok(port) {
+        return false;
+    }
+    h.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Whether `host` names a wildcard bind ("listen on every interface").
+///
+/// Parsed rather than string-matched: `serve_host` is a free-form String with
+/// only a non-empty check (`cli/src/config.rs`), so a user can legitimately write
+/// `::0`, `[::0]` or `0:0:0:0:0:0:0:0`. A spelling this misses is not a security
+/// hole — it fails closed — but it is a silent lockout: the page loads and every
+/// button 403s, which is a miserable thing to debug.
+fn is_wildcard_host(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// The `host:port` values a server bound to `host:port` legitimately answers to.
+/// Loopback aliases are included because the reviewer may reach the UI by any of
+/// them; a forged name is excluded precisely because it is not in this list.
+fn allowed_hosts_for(host: &str, port: u16) -> Vec<String> {
+    // Bracket a bare IPv6 literal: browsers send `Host: [::1]:8791`, never `::1:8791`.
+    let display = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut out = vec![format!("{display}:{port}").to_ascii_lowercase()];
+    // Parsed, not string-matched, for the same reason as `is_wildcard_host`:
+    // `serve_host` is free-form, so `::1`, `[::1]` and `0:0:0:0:0:0:0:1` are all
+    // spellings of loopback a user could reasonably write.
+    let parsed = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>();
+    let loopback_ish = host.eq_ignore_ascii_case("localhost")
+        || parsed.is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if loopback_ish {
+        for alias in ["127.0.0.1", "localhost", "[::1]"] {
+            let candidate = format!("{alias}:{port}").to_ascii_lowercase();
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
 fn handle(req: Request, ctx: &Arc<Ctx>) {
     let method = req.method().clone();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+
+    // Cross-origin writes are refused. This server has no authentication, so
+    // without it any page the user happens to visit while it is running can POST
+    // here from their browser: `fetch(url, {mode:'no-cors', ...})` sends a simple
+    // request with no preflight, and CORS only stops the attacker READING the
+    // reply — the side effect has already happened. That now includes closing a
+    // herdr workspace and killing a live agent's panes (`/archive`), typing into
+    // a live pane (`/send`), and approving a spec (`/submit`).
+    //
+    // Checking `Origin` is enough and costs nothing: browsers always attach it to
+    // a cross-origin request and cannot be talked out of it from script, while
+    // curl and drovr's own CLI send no `Origin` at all and are unaffected.
+    if method == Method::Post && !write_allowed(&req, &ctx.allowed_hosts, ctx.wildcard_port) {
+        eprintln!("drovr: refused an untrusted POST to {path}");
+        respond_str(req, 403, "text/plain", "untrusted write refused".into());
+        return;
+    }
 
     // GET / — serve embedded index.html (the SPA: list view + run detail)
     if method == Method::Get && path == "/" {
@@ -431,7 +585,9 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
 
     // GET /api/runs — the session list view.
     if method == Method::Get && path == "/api/runs" {
-        respond_str(req, 200, "application/json", list_runs_json(ctx));
+        // One herdr call answers liveness for every row (see `workspace_list`).
+        let live = crate::herdr::SystemHerdr::new().workspace_list();
+        respond_str(req, 200, "application/json", list_runs_json(ctx, live.as_deref()));
         return;
     }
 
@@ -484,6 +640,14 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
             }
             _ => respond_empty(req, 204),
         },
+
+        // POST archive — file a run away (or restore it). Body: {"archived":bool}.
+        //
+        // Archiving is the browser's equivalent of `drovr cleanup`: it closes the
+        // run's herdr workspace and sets the flag. Restoring only clears the flag
+        // — closed panes cannot be reopened, and the run resumes via
+        // `drovr phase start` with a fresh agent seeded from its handoff.
+        (Method::Post, "archive") => handle_archive(req, ctx, run),
 
         // GET summary — raw summary.txt (or empty string)
         (Method::Get, "summary") => {
@@ -629,6 +793,109 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 
 /// `POST /api/runs/<run>/send[?pane=<id>]` — type the request body into a run
 /// agent's pane (herdr submits it). 409 when there is no such live pane.
+/// `POST /api/runs/<run>/archive` — body `{"archived":true|false}`.
+///
+/// The browser-side twin of `drovr cleanup`, minus the worktree pruning: that
+/// path can squash-commit and delete branches, which is not something a button
+/// should do without a git-aware conversation. Panes and the flag are enough to
+/// get a dead run out of the way; `drovr cleanup --purge` remains the way to
+/// reclaim the worktree.
+///
+/// Restore clears the flag, puts the row back in the active list, and the run is
+/// runnable again: archiving destroys the workspace, but `phase::ensure_workspace`
+/// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
+/// records the new ids. What it cannot restore is the *agents* — every pane died
+/// with the workspace, so a phase that was `Running` when it was archived comes
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
+/// archived run does not make it runnable again — FIXED 2026-08-02".
+/// Close `state`'s herdr workspace when archiving; report whether it closed.
+///
+/// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
+/// half — the part that kills panes — can be driven by `FakeHerdr` in a test.
+/// The handler itself is bound to `Request`/`SystemHerdr` and cannot be.
+///
+/// Restoring never touches herdr: closed panes cannot be reopened, so a restore
+/// is purely a flag change.
+fn close_for_archive<H: Herdr>(h: &H, state: &RunState, archived: bool) -> bool {
+    if !archived {
+        return false;
+    }
+    let Some(ws) = state.workspace.as_deref() else {
+        return false;
+    };
+    match h.workspace_close(ws) {
+        Ok(()) => true,
+        // Overwhelmingly "workspace not found" — the panes died long ago and this
+        // run has been stale ever since. That is precisely the case the reviewer
+        // is trying to clear, so it must not block the archive.
+        Err(e) => {
+            eprintln!("drovr archive: workspace_close({ws}) failed: {e}");
+            false
+        }
+    }
+}
+
+fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
+    let body = read_body(&mut req);
+    let want = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("archived").and_then(|a| a.as_bool()));
+    let Some(archived) = want else {
+        respond_str(req, 400, "text/plain", "body must be {\"archived\":bool}".into());
+        return;
+    };
+
+    let dir = ctx.runs_root.join(run);
+    let Some(state) = load_run_state(&dir) else {
+        // "Not there" and "there but unreadable" are different answers, and the
+        // reviewer can tell them apart: `list_runs_in` lists any run whose
+        // state.json merely EXISTS, so an unparseable one is visible on the page
+        // with a working-looking Archive button. Answering 404 to a click on a row
+        // they can plainly see reads as a bug in the page.
+        let (code, msg): (u16, &str) = if dir.join("state.json").is_file() {
+            (409, "run state is unreadable; fix or remove its state.json")
+        } else {
+            (404, "no such run")
+        };
+        respond_str(req, code, "text/plain", msg.into());
+        return;
+    };
+
+    // Close the workspace BEFORE flipping the flag, and only when archiving. If
+    // the close fails for a reason other than "already gone" we still archive:
+    // the flag is about how the run is filed, and refusing to file it would
+    // leave the reviewer with a row they cannot clear from the browser.
+    let workspace_closed = close_for_archive(&crate::herdr::SystemHerdr::new(), &state, archived);
+
+    // Re-read before writing. `save_in` rewrites the WHOLE file, and the close
+    // above is a blocking round-trip to the herdr daemon — a phase agent can
+    // land its own `state.json` write during it (recording a phase as Done, say),
+    // which writing back the copy loaded above would silently revert. This server
+    // is multi-threaded and this endpoint is a button a human can hit mid-phase,
+    // so the window is far more reachable than the equivalent one in
+    // `cmd_cleanup`. Re-reading narrows it to this function's own last two
+    // statements; closing it completely needs locking in `RunState::save`
+    // (docs/known-issues.md).
+    let mut state = load_run_state(&dir).unwrap_or(state);
+    state.archived = archived;
+    if let Err(e) = state.save_in(&dir) {
+        eprintln!("drovr archive: could not save run '{run}': {e}");
+        respond_str(req, 500, "text/plain", "could not save run state".into());
+        return;
+    }
+    respond_str(
+        req,
+        200,
+        "application/json",
+        serde_json::json!({
+            "ok": true,
+            "archived": archived,
+            "workspace_closed": workspace_closed,
+        })
+        .to_string(),
+    );
+}
+
 fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
     let text = read_body(&mut req);
     let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
@@ -976,7 +1243,12 @@ fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths
 }
 
 /// Build the `GET /api/runs` JSON payload: one object per run, newest first.
-fn list_runs_json(ctx: &Arc<Ctx>) -> String {
+///
+/// `live_workspaces` is the set of workspace ids herdr currently has open, or
+/// `None` when herdr could not be reached. Each row reports `live` as
+/// `true`/`false`/`null` accordingly — `null` is "unknown", and the UI must treat
+/// it with the same caution as `true` (it gates a workspace-closing archive).
+fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String {
     let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
     for name in list_runs_in(&ctx.runs_root) {
         let dir = ctx.runs_root.join(&name);
@@ -995,8 +1267,62 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
         // archived it, or when the human cancelled at the gate — the one terminal
         // verdict that ends a run without completing it. An unreadable state.json
         // is `None` here and stays visible rather than being hidden as complete.
-        let complete = run_state.as_ref().is_some_and(|s| s.is_complete())
-            || rs.state == LoopState::Cancelled;
+        let live = match (live_workspaces, run_state.as_ref()) {
+            // herdr could not be reached: unknown for every run.
+            (None, _) => None,
+            // The run's own state.json did not parse, so we never learned its
+            // workspace id. That is UNKNOWN, not "no panes" — the ambiguity is
+            // this run's file rather than herdr, but the answer is the same, and
+            // claiming `false` asserts a fact we have no basis for. `list_runs_in`
+            // only checks state.json EXISTS, so such runs really are listed.
+            (Some(_), None) => None,
+            (Some(ids), Some(st)) => match st.workspace.as_deref() {
+                // Parsed, and genuinely has no workspace recorded.
+                None => Some(false),
+                Some(ws) => Some(ids.iter().any(|i| i == ws)),
+            },
+        };
+        // Liveness gates the ARCHIVED case only, and nothing else.
+        //
+        // Archiving sets the flag even when closing the workspace failed, so an
+        // archived run with an open workspace is a zombie: filed away while an
+        // agent still runs in panes we believe we shut. That one stays in the
+        // active list, because a fold is exactly where it must not go.
+        //
+        // Finishing every phase is different. Nothing closes a workspace on
+        // completion — only `cleanup` and this endpoint ever call
+        // `workspace_close` — so a normally-finished run keeps its workspace open
+        // indefinitely. Gating on liveness there stranded EVERY finished run in
+        // the active list, which is the clutter this feature exists to remove.
+        let archived = run_state.as_ref().is_some_and(|s| s.archived);
+        // A zombie is specifically an ARCHIVED run whose workspace is still open:
+        // the human asked to close it, the close failed, and nothing else reports
+        // that. Surfaced regardless of phase progress — the anomaly is that an
+        // explicit request did not take effect, which is worth seeing whether or
+        // not the pipeline happened to finish.
+        //
+        // Going through `is_complete()` rather than recomputing keeps its
+        // empty-phases guard: a run whose state.json will not parse stays visible
+        // instead of being hidden as finished.
+        //
+        // `Some(true)` deliberately, NOT `!= Some(false)`. The asymmetry with the
+        // archive confirm — which DOES treat unknown as live — is the point:
+        //
+        // * The confirm gates a destructive act. Unknown must warn, because being
+        //   wrong there means killing a live agent.
+        // * This decides whether to assert "panes still live" on a row. Unknown
+        //   asserting it would stamp that warning on EVERY archived run whenever
+        //   `herdr workspace list` blips — false alarms on a claim we cannot
+        //   support, which is exactly how a warning stops being read.
+        //
+        // The cost is that a genuine zombie collapses while herdr is unreachable.
+        // That is transient and self-healing — the next successful poll surfaces
+        // it again — and `live: null` on the row lets the UI tell the reviewer
+        // liveness is unknown rather than let them read the grouping as fact.
+        let zombie = archived && live == Some(true);
+        let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
+            || rs.state == LoopState::Cancelled)
+            && !zombie;
         // Sort key: most-recently-touched review artifact (fall back to 0).
         let updated = fs::metadata(dir.join("review.state.json"))
             .or_else(|_| fs::metadata(dir.join("state.json")))
@@ -1020,7 +1346,14 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
                 // Lets the list say *why* a run is complete: "archived" (cleaned
                 // up with phases outstanding) reads very differently from a run
                 // that actually finished its pipeline.
-                "archived": run_state.as_ref().is_some_and(|s| s.archived),
+                "archived": archived,
+                // Whether the run's herdr workspace is still open. `null` when
+                // herdr could not be asked — never coerced to `false`, because
+                // archiving closes panes and "unknown" must not read as "safe".
+                "live": match live {
+                    None => serde_json::Value::Null,
+                    Some(b) => serde_json::Value::Bool(b),
+                },
             }),
         ));
     }
@@ -1078,7 +1411,22 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     eprintln!("drovr review server listening on http://{bound_addr}");
     eprintln!("  runs: {root:?}");
 
-    let ctx = Arc::new(Ctx::new(root));
+    // Built from the BOUND port, never the requested one: `--port 0` asks the OS
+    // to pick, so `port` is still 0 here while every real request carries the
+    // assigned port. Using the requested value would put `host:0` in the
+    // allowlist and reject every write — locking the user out of their own UI.
+    let bound_port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(port);
+    // A wildcard bind cannot know which address a reviewer will actually use, so
+    // it falls back to "any IP literal on this port" (see `wildcard_ip_host`).
+    // Without this, binding 0.0.0.0 — the whole point of which is reaching the UI
+    // from another machine — serves a readable page whose every button 403s.
+    let wildcard = is_wildcard_host(host).then_some(bound_port);
+    let ctx =
+        Arc::new(Ctx::new(root, allowed_hosts_for(host, bound_port)).with_wildcard_port(wildcard));
     let server = Arc::new(server);
 
     let mut handles = Vec::with_capacity(WORKERS);
@@ -1485,7 +1833,8 @@ mod tests {
     fn start_server(runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
-        let ctx = Arc::new(Ctx::new(runs_root));
+        let bound_port = server.server_addr().to_ip().expect("ip addr").port();
+        let ctx = Arc::new(Ctx::new(runs_root, allowed_hosts_for("127.0.0.1", bound_port)));
         let server = Arc::new(server);
         for _ in 0..2 {
             let server = Arc::clone(&server);
@@ -1532,9 +1881,7 @@ mod tests {
             .map(|(i, s)| crate::run::Phase {
                 name: format!("phase{i}"),
                 status: s.clone(),
-                handoff_doc: None,
-                herdr_session: None,
-                pane_id: None,
+                ..Default::default()
             })
             .collect();
         let state = RunState {
@@ -1583,8 +1930,23 @@ mod tests {
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("state.json"), b"{ not json").unwrap();
 
-        let ctx = Arc::new(Ctx::new(tmp.clone()));
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx)).unwrap();
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+
+        // An unreadable state.json means the run's workspace id was never read, so
+        // liveness is UNKNOWN. Reporting `false` asserts "no live panes", which is
+        // a claim we have no basis for — and the row IS listed (`list_runs_in`
+        // only checks the file exists), so the reviewer sees and acts on it.
+        assert!(
+            row_for(&rows, "broken")["live"].is_null(),
+            "an unparseable state.json makes liveness unknown, not false"
+        );
+        // ...while a run that parsed and genuinely records no workspace is not live.
+        assert_eq!(
+            row_for(&rows, "midflight")["live"],
+            false,
+            "a parsed run with no workspace really is not live"
+        );
 
         assert_eq!(row_for(&rows, "finished")["complete"], true);
         assert_eq!(row_for(&rows, "finished")["done"], 4);
@@ -1616,6 +1978,445 @@ mod tests {
     }
 
     #[test]
+    fn cross_origin_writes_are_refused_but_same_origin_and_cli_are_not() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-csrf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        make_run_with_phases(&tmp, "guarded", &[Running, Pending], false);
+        let addr = start_server(tmp.clone());
+
+        let archived = || -> bool {
+            let s: RunState = serde_json::from_str(
+                &fs::read_to_string(tmp.join("guarded").join("state.json")).unwrap(),
+            )
+            .unwrap();
+            s.archived
+        };
+
+        // A page on another origin: the drive-by case. Refused, and — the part
+        // that actually matters — the side effect must not have happened.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("http://evil.example"),
+        );
+        assert_eq!(code, 403, "a cross-origin POST must be refused");
+        assert!(!archived(), "a refused request must not archive the run");
+
+        // An opaque origin (sandboxed iframe, file://) is not 'absent' — refuse.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("null"),
+        );
+        assert_eq!(code, 403, "the opaque `null` origin must be refused");
+        assert!(!archived());
+
+        // DNS REBINDING: the attacker's page is served from evil.example, whose
+        // DNS is then re-pointed at this server. The browser derives BOTH headers
+        // from that one URL, so Origin == Host and an Origin-vs-Host check waves
+        // it through. Only the Host allowlist stops this.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("http://evil.example"),
+            Some("evil.example"),
+        );
+        assert_eq!(
+            code, 403,
+            "a rebound Host must be refused even though Origin matches it"
+        );
+        assert!(!archived(), "a rebinding attempt must not archive the run");
+
+        // Same, with no Origin — the shape a plain cross-site <form> POST takes.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            None,
+            Some("evil.example"),
+        );
+        assert_eq!(code, 403, "an unknown Host is refused with or without Origin");
+        assert!(!archived());
+
+        // Casing must not decide the outcome: `Host` is normalised, so `Origin`
+        // has to be too, or an uppercase spelling would 403 for no good reason.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some(&format!("HTTP://{}", addr.to_uppercase())),
+            Some(&addr.to_uppercase()),
+        );
+        assert_eq!(code, 200, "an upper-cased Host/Origin pair is still same-origin");
+        assert!(archived());
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":false}"#,
+            Some(&format!("http://{addr}")),
+        );
+        assert_eq!(code, 200);
+        assert!(!archived());
+
+        // drovr's own UI: Origin matches Host.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some(&format!("http://{addr}")),
+        );
+        assert_eq!(code, 200, "the review UI's own origin must be allowed");
+        assert!(archived());
+
+        // curl / the drovr CLI send no Origin at all and must keep working.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":false}"#,
+            None,
+        );
+        assert_eq!(code, 200, "a request with no Origin is not a browser write");
+        assert!(!archived());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn allowed_hosts_cover_the_ways_a_reviewer_actually_reaches_the_ui() {
+        // Loopback: all three spellings work, because the reviewer may use any.
+        let lo = allowed_hosts_for("127.0.0.1", 8791);
+        for expected in ["127.0.0.1:8791", "localhost:8791", "[::1]:8791"] {
+            assert!(lo.contains(&expected.to_string()), "missing {expected} in {lo:?}");
+        }
+        // A bare IPv6 literal must be bracketed — browsers send `Host: [::1]:80`.
+        assert!(allowed_hosts_for("::1", 8791).contains(&"[::1]:8791".to_string()));
+        // A specific non-loopback bind allows exactly itself.
+        let tail = allowed_hosts_for("100.71.4.9", 8791);
+        assert_eq!(tail, vec!["100.71.4.9:8791".to_string()]);
+    }
+
+    #[test]
+    fn every_spelling_of_a_wildcard_bind_is_recognised() {
+        // `serve_host` is a free-form String, so all of these are things a user can
+        // actually write. A spelling missed here is not a hole — it fails closed —
+        // but it is a silent lockout: page loads, every button 403s.
+        for h in ["0.0.0.0", "::", "[::]", "::0", "[::0]", "0:0:0:0:0:0:0:0"] {
+            assert!(is_wildcard_host(h), "{h} is a wildcard bind");
+        }
+        for h in ["127.0.0.1", "::1", "localhost", "192.168.1.5", "evil.example", ""] {
+            assert!(!is_wildcard_host(h), "{h} is NOT a wildcard bind");
+        }
+        // A wildcard bind still offers the loopback aliases, since the machine
+        // running the server reaches it that way.
+        let ws = allowed_hosts_for("::0", 8791);
+        assert!(ws.contains(&"localhost:8791".to_string()), "{ws:?}");
+    }
+
+    /// Give an existing fixture run a workspace id, so liveness is computable.
+    /// The default fixture leaves `workspace: None`, which pins `live` to
+    /// `Some(false)` and makes the live combinations untestable — the gap that
+    /// let a regression stranding every finished run reach a green suite.
+    fn set_workspace(dir: &Path, ws: &str) {
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some(ws.to_string());
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_is_complete_even_though_its_workspace_is_still_open() {
+        use crate::run::PhaseStatus::Done;
+        let tmp = std::env::temp_dir().join(format!("drovr-fin-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // The ordinary end of a pipeline: all four phases Done, nobody has run
+        // `cleanup` yet — so the herdr workspace is still open. Nothing closes it
+        // on completion, so this is the COMMON state of a finished run, not an
+        // edge case, and it must still collapse into "Completed".
+        let dir = make_run_with_phases(&tmp, "finished", &[Done, Done, Done, Done], false);
+        set_workspace(&dir, "wAG");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        let row = row_for(&rows, "finished");
+        assert_eq!(row["live"], true, "precondition: the workspace really is open");
+        assert_eq!(row["archived"], false);
+        assert_eq!(
+            row["complete"], true,
+            "a run that finished every phase belongs in Completed even with its \
+             workspace open — gating this on liveness strands every finished run \
+             in the active list, which is the clutter the group exists to remove"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_run_whose_panes_are_still_live_is_never_filed_as_complete() {
+        use crate::run::PhaseStatus::{Done, Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-zombie-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Archived, but its workspace close failed — the agent is still running.
+        let dir = make_run_with_phases(&tmp, "zombie", &[Running, Pending], true);
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some("wAG".into());
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        let row = row_for(&rows, "zombie");
+        assert_eq!(row["archived"], true);
+        assert_eq!(row["live"], true);
+        assert_eq!(
+            row["complete"], false,
+            "an archived run with a LIVE workspace must stay in the active list — \
+             filing it under Completed hides the one row that needs attention"
+        );
+
+        // Once the workspace really is gone, it files away normally.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+        assert_eq!(row_for(&rows, "zombie")["complete"], true);
+
+        // Herdr unreachable: liveness is unknown, and the row does NOT claim
+        // "panes still live". A deliberate asymmetry with the archive confirm,
+        // which treats unknown as live because it gates a destructive act —
+        // asserting it here would stamp the warning on every archived run on any
+        // herdr blip. `live: null` is what tells the UI to say liveness is
+        // unknown instead of presenting the grouping as verified.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+        let row = row_for(&rows, "zombie");
+        assert!(row["live"].is_null(), "herdr unreachable is unknown, not false");
+        assert_eq!(
+            row["complete"], true,
+            "with liveness unknown the row collapses rather than asserting a \
+             claim we cannot support; transient and self-healing on the next poll"
+        );
+
+        // Finishing every phase does NOT excuse a failed close. The anomaly is
+        // that an explicit archive request didn't take effect, which is worth
+        // surfacing whether or not the pipeline happened to finish.
+        let dir = make_run_with_phases(&tmp, "done-zombie", &[Done, Done], true);
+        set_workspace(&dir, "wAG");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        assert_eq!(
+            row_for(&rows, "done-zombie")["complete"],
+            false,
+            "an archived run with an open workspace stays visible even with all phases Done"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wildcard_bind_accepts_ip_literals_but_never_a_rebound_name() {
+        // Binding 0.0.0.0 exists to be reached from another machine, so the LAN or
+        // Tailscale address a reviewer types must work...
+        assert!(wildcard_ip_host("192.168.1.5:8791", Some(8791)));
+        assert!(wildcard_ip_host("100.71.4.9:8791", Some(8791)));
+        assert!(wildcard_ip_host("[fd7a::1]:8791", Some(8791)));
+        // ...while a DNS name never does. Rebinding needs a name it controls; an
+        // IP literal gives the attacker no lever, which is what makes this safe.
+        assert!(!wildcard_ip_host("evil.example:8791", Some(8791)));
+        assert!(!wildcard_ip_host("localhost:8791", Some(8791)));
+        // Wrong port, and the non-wildcard case, stay closed.
+        assert!(!wildcard_ip_host("192.168.1.5:9999", Some(8791)));
+        assert!(!wildcard_ip_host("192.168.1.5:8791", None));
+        assert!(!wildcard_ip_host("192.168.1.5", Some(8791)));
+    }
+
+    #[test]
+    fn archiving_closes_the_workspace_and_restoring_never_does() {
+        use crate::herdr::FakeHerdr;
+        let mut state = tree_run(vec![], vec![]);
+        state.workspace = Some("wAG".into());
+
+        let h = FakeHerdr::new();
+        assert!(
+            close_for_archive(&h, &state, true),
+            "archiving closes the run's workspace"
+        );
+        assert!(h.calls().iter().any(|c| c == "workspace_close id=wAG"));
+
+        // Restoring must not touch herdr at all — there is nothing to reopen, and
+        // a stray close here would kill panes on what is meant to be an undo.
+        let h = FakeHerdr::new();
+        assert!(!close_for_archive(&h, &state, false));
+        assert!(
+            h.calls().is_empty(),
+            "restore must issue no herdr calls: {:?}",
+            h.calls()
+        );
+
+        // An already-gone workspace is the common case for a stale run: report
+        // "not closed" but never fail, or the row could never be filed away.
+        let h = FakeHerdr::new();
+        h.set_fail_workspace_close(true);
+        assert!(!close_for_archive(&h, &state, true));
+
+        // A run that never recorded a workspace has nothing to close.
+        let mut no_ws = tree_run(vec![], vec![]);
+        no_ws.workspace = None;
+        let h = FakeHerdr::new();
+        assert!(!close_for_archive(&h, &no_ws, true));
+        assert!(h.calls().is_empty());
+    }
+
+    #[test]
+    fn fake_reports_configured_live_workspaces() {
+        use crate::herdr::FakeHerdr;
+        let h = FakeHerdr::new();
+        h.set_live_workspaces(Some(vec!["w1".into()]));
+        assert_eq!(h.workspace_list(), Some(vec!["w1".to_string()]));
+        h.set_live_workspaces(None);
+        assert_eq!(h.workspace_list(), None, "unreachable herdr stays unknown");
+    }
+
+    #[test]
+    fn list_runs_json_reports_workspace_liveness() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mk = |name: &str, ws: Option<&str>| {
+            let dir = make_run_with_phases(&tmp, name, &[Running, Pending], false);
+            let mut s: RunState =
+                serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+            s.workspace = ws.map(|w| w.to_string());
+            fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+        };
+        mk("alive", Some("wAG"));
+        mk("dead", Some("wZZ"));
+        mk("no-workspace", None);
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["w1".to_string(), "wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        assert_eq!(row_for(&rows, "alive")["live"], true);
+        assert_eq!(row_for(&rows, "dead")["live"], false);
+        assert_eq!(
+            row_for(&rows, "no-workspace")["live"],
+            false,
+            "a run that never recorded a workspace has nothing live to close"
+        );
+
+        // herdr unreachable: liveness is UNKNOWN, never silently "false" — the UI
+        // gates a pane-closing archive on this.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+        assert!(
+            row_for(&rows, "alive")["live"].is_null(),
+            "unknown liveness must not be reported as not-live"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_endpoint_separates_missing_from_unreadable() {
+        let tmp = std::env::temp_dir().join(format!("drovr-arch404-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Present on the page (listing only requires state.json to EXIST), but its
+        // contents do not parse.
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+
+        let addr = start_server(tmp.clone());
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/broken/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(
+            code, 409,
+            "a run that is listed but unreadable must not answer 'no such run' — \
+             the reviewer can see the row, so 404 reads as a bug in the page"
+        );
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/ghost/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(code, 404, "a genuinely absent run is still 404");
+    }
+
+    #[test]
+    fn archive_endpoint_sets_and_clears_the_flag() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-archep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        make_run_with_phases(&tmp, "filed", &[Running, Pending], false);
+
+        let addr = start_server(tmp.clone());
+        let archived_on_disk = || -> bool {
+            let s: RunState = serde_json::from_str(
+                &fs::read_to_string(tmp.join("filed").join("state.json")).unwrap(),
+            )
+            .unwrap();
+            s.archived
+        };
+
+        assert!(!archived_on_disk(), "precondition");
+        let (code, body) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"archived":true}"#);
+        assert_eq!(code, 200, "body: {body}");
+        assert!(archived_on_disk(), "archive must persist to state.json");
+
+        // Archiving sets ONE field. Everything else must survive byte-for-byte:
+        // the handler rewrites the whole file, so a stale or partially-populated
+        // struct here would quietly erase a concurrent phase-status write.
+        let after: RunState = serde_json::from_str(
+            &fs::read_to_string(tmp.join("filed").join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after.task, "t");
+        assert_eq!(after.phases.len(), 2, "phases must not be dropped");
+        assert_eq!(after.phases[0].status, crate::run::PhaseStatus::Running);
+        assert_eq!(after.gate, "spec");
+
+        // The write must land in the server's runs_root, not the ambient data dir.
+        assert!(
+            tmp.join("filed").join("state.json").is_file(),
+            "state.json must be written under the server's runs_root"
+        );
+
+        let (code, _) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"archived":false}"#);
+        assert_eq!(code, 200);
+        assert!(!archived_on_disk(), "restore must clear the flag");
+
+        // Malformed and unknown-run requests are rejected, not silently ignored.
+        let (code, _) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"nope":1}"#);
+        assert_eq!(code, 400);
+        let (code, _) = http_post(&addr, "/api/runs/ghost/archive", "application/json", r#"{"archived":true}"#);
+        assert_eq!(code, 404);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn list_runs_json_treats_a_cancelled_gate_as_complete() {
         use crate::run::PhaseStatus::{Pending, Running};
         let tmp = std::env::temp_dir().join(format!("drovr-cancelled-{}", std::process::id()));
@@ -1629,8 +2430,8 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = Arc::new(Ctx::new(tmp.clone()));
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx)).unwrap();
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
         assert_eq!(
             row_for(&rows, "abandoned")["complete"],
             true,
@@ -1655,6 +2456,48 @@ mod tests {
         (status, body)
     }
 
+    /// POST with an optional `Origin` header, for exercising the cross-origin
+    /// write guard. `None` models curl / the drovr CLI, which send none.
+    fn http_post_origin(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> (u16, String) {
+        http_post_full(addr, path, body, origin, None)
+    }
+
+    /// POST with an overridable `Host` as well as `Origin`. Forging `Host` is how
+    /// a DNS-rebinding request actually looks on the wire, so the guard cannot be
+    /// tested honestly without it. `host: None` sends the real address.
+    fn http_post_full(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+        host: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let host_hdr = host.unwrap_or(addr);
+        let origin_line = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        write!(
+            stream,
+            "POST {path} HTTP/1.0\r\nHost: {host_hdr}\r\n{origin_line}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let status: u16 = resp
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
+        (status, rb)
+    }
+
     fn http_post(addr: &str, path: &str, content_type: &str, body: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         write!(
@@ -1671,7 +2514,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let rb = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
         (status, rb)
     }
 
@@ -1720,9 +2563,8 @@ mod tests {
         let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         };
         let mut run = RunState {
             name: "r".into(),
@@ -1777,9 +2619,8 @@ mod tests {
         crate::run::Phase {
             name: name.into(),
             status,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: pane.map(|s| s.to_string()),
+            ..Default::default()
         }
     }
 
@@ -2316,18 +3157,48 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        let held = try_take_lock(&path).expect("claim").expect("uncontended");
+        // Every failure here reports the path and what the file held, because this test
+        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
+        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
+        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
+        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
+        // If it fails again, the message below is the evidence to file.
+        let whats_there = |when: &str| -> String {
+            format!(
+                "{when}: {} contains {:?}; this pid is {}",
+                path.display(),
+                fs::read_to_string(&path).unwrap_or_else(|e| format!("<unreadable: {e}>")),
+                std::process::id()
+            )
+        };
+
+        let held = try_take_lock(&path)
+            .unwrap_or_else(|e| panic!("claim failed: {e}; {}", whats_there("at claim")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a freshly created tempdir path was already locked. {}",
+                    whats_there("at claim")
+                )
+            });
         assert_eq!(
-            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             Some(std::process::id()),
-            "the holder records its pid for humans to kill"
+            "the holder records its pid for humans to kill. {}",
+            whats_there("after claim")
         );
 
         // Nothing has to prove the holder died for the lock to be free again.
         drop(held);
         let _held = try_take_lock(&path)
-            .expect("claim after release")
-            .expect("released lock must be free");
+            .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a lock released by dropping its File was still held. {}",
+                    whats_there("after drop")
+                )
+            });
     }
 
     /// A server that was killed leaves the file behind with its pid in it. The

@@ -2,6 +2,8 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -23,6 +25,371 @@ use std::collections::VecDeque;
 pub struct Workspace {
     pub id: String,
     pub root_pane: String,
+}
+
+/// A herdr tab id, carrying its own proof: the inner string is private to this
+/// module and only [`parse_pane_info`] builds one, so the only way to name a tab
+/// is to have read the pane that lives in it.
+///
+/// [`Herdr::tab_close`] takes one of these, which makes "closed a tab by passing
+/// a pane id" a compile error rather than a runtime surprise — and the surprise
+/// would be severe: closing the wrong tab can take out the workspace root tab
+/// and destroy the run.
+///
+/// Pane ids are deliberately NOT newtyped. They are persisted in `state.json`,
+/// gated by the HTTP server's pane allowlists and threaded through herdr's JSON;
+/// the ripple is out of proportion to the risk, and `tab_close` is the only
+/// call where a mix-up is destructive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabId(String);
+
+impl TabId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A resumable session id, carrying its own proof: the inner string is private
+/// to this module, so one can only be built here — by parsing a `kind == "id"`
+/// session.
+///
+/// It exists to make [`AgentSession`]'s guarantee structural rather than
+/// conventional. An enum's variants are as public as the enum, so with every
+/// variant holding a bare `String` a caller could merge them in one pattern —
+/// `Id { value, .. } | Path { value } => value` — and walk off with a transcript
+/// path where a session id was expected. Giving `Id` a payload type of its own
+/// makes that or-pattern fail to type-check, and [`IdSession`] keeps the id out
+/// of reach of a direct destructure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionId(String);
+
+// Capability only for now: nothing in drovr resumes a session yet, so the id is
+// read by tests alone until task 5 composes `--resume`.
+#[allow(dead_code)]
+impl SessionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The agent session herdr records on a pane (`agent_session`), keyed by herdr's
+/// own `kind` discriminator.
+///
+/// Only a `kind == "id"` session may ever be interpolated into an agent's
+/// `--resume` argument — a transcript path there would be read as a session
+/// name. That rule lives in the TYPE rather than in every caller: the id is
+/// reachable through [`AgentSession::resumable_for`], and only for an `Id` that
+/// herdr attributes to the backend asking for it; the value it hands back is a
+/// [`SessionId`] no other variant can produce. A `Path`'s value is still readable — diagnostics
+/// need it — but only by naming `Path` explicitly, which is a deliberate,
+/// greppable act.
+///
+/// Parsing stays FAITHFUL: an id session with no `agent` key is still parsed as
+/// `Id { agent: None }`, because that is what herdr said. It is `resumable` that
+/// refuses it — the safety judgement is a method, not a lie about the wire.
+///
+/// herdr DROPS this whole key once the pane's agent process exits (verified
+/// against 0.7.5), so it must be captured while the agent is alive.
+/// The payload of an [`AgentSession::Id`]. Its fields are PRIVATE to this
+/// module, which is the whole point: Rust has no field-level privacy on enum
+/// variants, so with the id and the agent sitting directly on the variant any
+/// same-crate caller could write `if let AgentSession::Id { value, .. }` and
+/// walk off with the id having skipped the agent check entirely — reproducing
+/// the bug [`AgentSession::resumable_for`] exists to prevent. Behind this struct,
+/// destructuring the variant yields something you cannot read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdSession {
+    value: SessionId,
+    /// The agent that owns the session (`claude`, `cursor`, …). herdr 0.7.5's
+    /// schema marks it required, so `None` is defence against a future version
+    /// dropping it rather than a case seen in the wild — and a session id is
+    /// only safe to resume with the backend that created it, so a caller that
+    /// cannot confirm the backend must not resume at all.
+    agent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSession {
+    /// A resumable session id, behind an opaque payload.
+    Id(IdSession),
+    /// A transcript path. Never a resume operand.
+    Path { value: String },
+    /// A kind this drovr does not know. Preserved verbatim so it is visible in
+    /// diagnostics, and never resumable.
+    Other { kind: String, value: String },
+}
+
+// Capability only for now: nothing in drovr reads a session yet — capturing it
+// onto `Phase` is a later step, and resuming from it later still.
+#[allow(dead_code)]
+impl AgentSession {
+    /// The session id — and ONLY when this is an id session that herdr
+    /// attributes to `expected_backend`. A `kind:"path"` session, an
+    /// unrecognised kind, an id herdr did not attribute to any agent, and an id
+    /// belonging to a *different* backend all yield `None`, as does an empty
+    /// `expected_backend`: a caller that cannot name its own backend has nothing
+    /// to verify against.
+    ///
+    /// This is the single chokepoint for the whole resume rule, and it takes the
+    /// backend as an argument precisely so the check cannot be skipped — the id
+    /// is not obtainable until it has passed. Never interpolate a path as a
+    /// session id; never resume an id that came from another agent. Resuming a
+    /// claude session under cursor is not a recoverable mistake, so it is not
+    /// merely discouraged here, it is unreachable.
+    ///
+    /// Backend names compare case-insensitively after trimming: they come from
+    /// user config on one side and herdr on the other, and a casing difference
+    /// is not a mismatch.
+    pub fn resumable_for(&self, expected_backend: &str) -> Option<&SessionId> {
+        let expected = expected_backend.trim();
+        if expected.is_empty() {
+            return None;
+        }
+        match self {
+            AgentSession::Id(IdSession {
+                value,
+                agent: Some(agent),
+            }) if agent.trim().eq_ignore_ascii_case(expected) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The agent that owns the session, when herdr reported one. Only an `Id`
+    /// session carries it, because it is only ever consulted to decide whether
+    /// a resume is safe.
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            AgentSession::Id(id) => id.agent.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// herdr's own `kind` string, for diagnostics and logging.
+    pub fn kind(&self) -> &str {
+        match self {
+            AgentSession::Id(_) => "id",
+            AgentSession::Path { .. } => "path",
+            AgentSession::Other { kind, .. } => kind,
+        }
+    }
+}
+
+/// A pane's agent status, as reported by herdr.
+///
+/// The vocabulary is `idle|working|blocked|done|unknown`, but it is herdr's to
+/// extend, so anything else is preserved verbatim as [`AgentStatus::Other`]
+/// rather than collapsed onto a known state. That matters more than it looks:
+/// `Done` is the verdict that tears a pane down, and a future herdr state
+/// silently reading as `Done` would close a live agent's pane.
+///
+/// `Unknown` is herdr's own literal `"unknown"` — the status of a pane whose
+/// agent has exited — and is distinct from `Option::None`, which means herdr
+/// reported no status field at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+    Other(String),
+}
+
+impl AgentStatus {
+    /// Classify a raw herdr status. Total: an unrecognised value becomes
+    /// `Other`, never a known state.
+    pub fn from_herdr(status: &str) -> AgentStatus {
+        match status {
+            "idle" => AgentStatus::Idle,
+            "working" => AgentStatus::Working,
+            "blocked" => AgentStatus::Blocked,
+            "done" => AgentStatus::Done,
+            "unknown" => AgentStatus::Unknown,
+            other => AgentStatus::Other(other.to_string()),
+        }
+    }
+
+    /// The raw herdr string this status came from.
+    pub fn as_str(&self) -> &str {
+        match self {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Working => "working",
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Unknown => "unknown",
+            AgentStatus::Other(raw) => raw,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A snapshot of one pane, from herdr's `pane.get`. This is drovr's ONLY poll
+/// primitive: status polling reads it, and reaping resolves a pane's tab through
+/// it.
+///
+/// `tab_id` is required — a `PaneInfo` that cannot name the pane's tab is of no
+/// use to either caller — while `agent_status` and `agent_session` are both
+/// optional, because a pane whose agent has exited reports `agent_status:
+/// "unknown"` and carries no session at all.
+///
+/// **The two `None`s are not the same and must never be collapsed:**
+///
+/// - `pane_info(..) == None` — the poll FAILED. herdr was unreachable, or the
+///   pane is gone. It says nothing about the agent.
+/// - `Some(PaneInfo { agent_status: Some(Unknown), agent_session: None, .. })` —
+///   the poll SUCCEEDED and the agent has exited. The tab is still there.
+///
+/// Reaping turns on exactly this distinction: treating a transient poll failure
+/// as "the agent exited" tears down a pane whose agent is alive and working. So
+/// there is no projection helper on [`Herdr`] that could lose it — the only poll
+/// returns the whole `PaneInfo`, and each caller narrows it in the open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInfo {
+    pub tab_id: TabId,
+    pub agent_status: Option<AgentStatus>,
+    pub agent_session: Option<AgentSession>,
+}
+
+/// What one [`Herdr::pane_info`] poll established about a pane. Classifies the
+/// WHOLE poll result — its `None` included — so the outcomes cannot be confused
+/// by reconstructing them from two `Option`s at each call site.
+///
+/// Reaping and session capture both turn on this, in opposite directions:
+/// treating [`PaneState::Unreadable`] as [`PaneState::NoAgentSession`] tears
+/// down a pane whose agent is alive and working, while treating
+/// `NoAgentSession` as `Unreadable` means finished panes never get reaped at
+/// all.
+// Capability only for now: reaping and session capture are later steps, so
+// `Unreadable` is constructed by tests alone until one of them polls.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneState {
+    /// The poll FAILED — herdr unreachable, a socket error, or the pane is gone.
+    /// It says NOTHING about the agent: never reap on this, and never clear a
+    /// captured session on it. `pane_info` has already printed one diagnostic
+    /// per process explaining why.
+    Unreadable,
+    /// herdr answered and reports an agent session on the pane: an agent is
+    /// attached. Its `agent_status` says what that agent is *doing*, which is a
+    /// separate question — and may be absent, see [`PaneInfo::status_unreadable`].
+    AgentAttached,
+    /// herdr answered: the pane and its tab are still there, but NO agent
+    /// session is attached.
+    ///
+    /// **This covers two situations herdr does not let drovr tell apart:** an
+    /// agent that ran and has since exited (herdr reports `agent_status:
+    /// "unknown"` and DROPS the session), and a pane that never ran an agent at
+    /// all — a bare shell, which is exactly what a run's root pane is.
+    /// `pane.get` carries neither an `agent` nor an `agent_session` key in
+    /// either case, so this variant is named for what it can actually prove.
+    ///
+    /// Consequences for the two consumers:
+    /// - a session id captured earlier must be KEPT here, not cleared — herdr
+    ///   dropping it is not the agent disowning it;
+    /// - **this is NOT a licence to close the tab.** Whether a session-less pane
+    ///   is one of the run's finished phases or its root shell is a property of
+    ///   the RUN, and the caller must decide it from run state — the same
+    ///   boundary that keeps the root-tab guard out of this module.
+    NoAgentSession,
+}
+
+#[allow(dead_code)]
+impl PaneState {
+    /// Classify a whole `pane_info` result, `None` and all.
+    pub fn from_poll(poll: Option<&PaneInfo>) -> PaneState {
+        match poll {
+            None => PaneState::Unreadable,
+            Some(info) => info.state(),
+        }
+    }
+}
+
+// Capability only for now: reaping and session capture are later steps.
+#[allow(dead_code)]
+impl PaneInfo {
+    /// This pane's state. Never [`PaneState::Unreadable`] — holding a `PaneInfo`
+    /// is itself proof the poll succeeded. Use [`PaneState::from_poll`] to
+    /// classify a result that may be `None`.
+    pub fn state(&self) -> PaneState {
+        if self.has_agent_session() {
+            PaneState::AgentAttached
+        } else {
+            PaneState::NoAgentSession
+        }
+    }
+
+    /// Whether herdr reports an agent session on this pane. This is THE signal
+    /// for "is an agent attached" — keyed off the session, never off the
+    /// status: herdr drops `agent_session` when an agent exits, whereas a
+    /// status can be missing on a perfectly live pane, and a stale `working`
+    /// can outlive the session it described.
+    pub fn has_agent_session(&self) -> bool {
+        self.agent_session.is_some()
+    }
+
+    /// Whether herdr answered without an `agent_status` for this pane. Distinct
+    /// from [`PaneInfo::has_agent_session`] — an exited agent has a status
+    /// (`unknown`), and a live agent may momentarily have none. Callers that
+    /// gate on a status should treat this as "not yet known", never as done.
+    pub fn status_unreadable(&self) -> bool {
+        self.agent_status.is_none()
+    }
+}
+
+/// Whether a prompt actually took — i.e. whether herdr OBSERVED the agent move
+/// after it was submitted.
+///
+/// This exists because `agent.prompt` returning success only means "herdr typed
+/// it", not "the agent received it". Two real failures hide behind that success:
+/// a payload typed into a modal that ignores it, and a payload that lands in the
+/// composer but is never submitted. Both leave the agent motionless, so herdr's
+/// own "did the status change" observation is the signal worth having.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PromptOutcome {
+    /// The wait was SATISFIED: the agent is in `working`/`done`.
+    ///
+    /// Read that literally. herdr's `until` is a level, not an edge (see
+    /// [`Herdr::agent_prompt_confirm`]), so this means "herdr observed the agent
+    /// start" only when the pane was not ALREADY in one of those states when the
+    /// prompt went out — which is the caller's precondition to establish, not
+    /// something this value asserts. `phase_send` establishes it by prompting a
+    /// pane at its composer.
+    ///
+    /// There is deliberately no third variant for "was already active". herdr
+    /// cannot report it (the response is identical either way), so drovr could
+    /// only infer it from a separate status read — and having inferred it, there
+    /// is nothing different to DO: nudging is forbidden without composer
+    /// evidence, and raising would fail a send that most likely worked. A variant
+    /// that changes no decision is a worse lie than a documented precondition.
+    Started,
+    /// herdr saw NO state change in the wait window. The payload did not take;
+    /// the caller must work out why before doing anything about it.
+    Stalled,
+}
+
+/// herdr error codes that mean "the prompt produced no movement" rather than
+/// "the call failed". `agent_prompt_stalled` is herdr's precise no-state-change
+/// verdict; `timeout` is what it degrades to when the caller's deadline expires
+/// before that verdict is reached. Neither is a transport or protocol failure,
+/// so both map to [`PromptOutcome::Stalled`] instead of an error.
+const STALL_CODES: &[&str] = &["agent_prompt_stalled", "timeout"];
+
+/// Map a herdr socket error code onto a [`PromptOutcome`], or `None` when the
+/// code is a genuine failure the caller should surface as an error.
+///
+/// A MISSING code is not a stall. The classification fails closed here, unlike
+/// [`herdr_error_kind`], which may fall back to the message: the answer to a
+/// stall is a keystroke at the pane, and guessing one from prose is exactly how
+/// a key gets pressed on a dialog nobody read.
+fn stall_outcome_for_code(code: Option<&str>) -> Option<PromptOutcome> {
+    STALL_CODES
+        .contains(&code?)
+        .then_some(PromptOutcome::Stalled)
 }
 
 pub trait Herdr {
@@ -55,7 +422,39 @@ pub trait Herdr {
     /// Restore focus to a workspace (best-effort). `pane_run`/`pane_rename` have
     /// no `--no-focus` flag, so drovr captures focus before and restores it after.
     fn workspace_focus(&self, id: &str) -> io::Result<()>;
+    /// Type AND submit a prompt, without checking whether the agent received it.
+    /// Use [`Herdr::agent_prompt_confirm`] for anything whose delivery matters;
+    /// this raw form is for keystroke-ish sends (the blocked-prompt auto-answer)
+    /// and the browser mirror's fire-and-forget `/send`.
     fn agent_send(&self, target: &str, text: &str) -> io::Result<()>;
+    /// Submit `text` and have herdr CONFIRM the agent actually started, using
+    /// `agent.prompt`'s native `wait` (`until: [working, done]`). Returns
+    /// [`PromptOutcome::Stalled`] — not an error — when herdr observed no state
+    /// change within `timeout`, which is the only reliable way to learn that a
+    /// prompt was swallowed or left sitting unsubmitted.
+    ///
+    /// `timeout` should stay >= 5s: herdr only reports the precise
+    /// `agent_prompt_stalled` verdict once its own 5s no-state-change window has
+    /// elapsed, and degrades to a bare `timeout` below that.
+    ///
+    /// CAVEAT, measured against 0.7.5: `until` is a LEVEL, not an edge. A pane
+    /// ALREADY in one of those states answers in 0.0s having observed nothing, so
+    /// [`PromptOutcome::Started`] means "herdr saw the agent start" only when the
+    /// pane was not already `working`/`done` when the prompt went out — which is
+    /// the normal case, since `phase_send` prompts a pane at its composer. herdr
+    /// exposes no edge-triggered form (`AgentPromptWaitOptions` is `{until,
+    /// timeout_ms}` and nothing else). See `docs/known-issues.md`, "`until` is a
+    /// LEVEL, not an edge", for why this is documented rather than worked around.
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> io::Result<PromptOutcome>;
+    /// Wait for an agent already holding a payload to reach `working`/`done`
+    /// (socket `agent.wait`), without submitting anything new. Used to confirm a
+    /// follow-up keystroke actually got the pending prompt moving.
+    fn agent_wait_started(&self, target: &str, timeout: Duration) -> io::Result<PromptOutcome>;
     /// Press keys in an agent's pane (`herdr agent send-keys`). Unlike
     /// [`Herdr::agent_send`], which types a prompt, this drives the agent's
     /// *menus* — the "New MCP server" approval, the trust-dir prompt, the model
@@ -63,20 +462,79 @@ pub trait Herdr {
     /// (`enter`, `esc`, `up`, `down`, digits like `3`).
     fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()>;
     fn agent_read(&self, target: &str) -> io::Result<String>;
-    /// The pane's `agent_status` (`idle|working|blocked|done|unknown`) as reported
-    /// by herdr, or `None` if it cannot be read/parsed. READ-ONLY: it must never
-    /// move focus (it shells `herdr pane get`, which does not focus), so
-    /// `phase_wait` can poll it every iteration without disturbing the user.
-    fn agent_status(&self, pane_id: &str) -> Option<String>;
-    /// Whether `pane_id` still exists. Distinct from [`Herdr::agent_status`],
-    /// which returns `None` both for a pane that is gone *and* for one whose
-    /// status merely failed to parse — too ambiguous to act on. Callers use this
-    /// to decide a pane is genuinely dead (e.g. `code-review` resume respawning a
-    /// reviewer), so it is deliberately biased toward `true`: only a definitive
-    /// "no such pane" answer returns `false`; an unreachable daemon reports `true`
-    /// (unknown → assume alive) so a transient blip never kills live work.
+    /// Read a pane's state (socket `pane.get`): its tab, its agent status and its
+    /// agent session. `None` means the pane could not be read at all — NOT that
+    /// its agent is gone (see [`PaneInfo`] for that distinction).
+    ///
+    /// READ-ONLY: `pane.get` is a query and does not move focus, so this is safe
+    /// to poll every iteration without disturbing the user.
+    ///
+    /// It is drovr's ONLY poll. There is deliberately no `agent_status`
+    /// projection beside it: such a helper returned `None` both when the poll
+    /// failed and when herdr answered that the agent had exited, and reaping
+    /// turns on telling those apart. Callers narrow this themselves —
+    /// `pane_info(id).and_then(|info| info.agent_status)` where only the status
+    /// matters — so a collapse is always written out loud at the site that wants
+    /// it. **Do not re-add a status-only method to this trait.**
+    fn pane_info(&self, pane_id: &str) -> Option<PaneInfo>;
+    /// Close a tab and every pane in it (socket `tab.close`). The only pane
+    /// teardown besides `workspace_close`, and it must never be aimed at the tab
+    /// holding a run's root pane — a policy the CALLER enforces, since only it
+    /// knows the run.
+    ///
+    /// Takes a [`TabId`], which only a `pane_info` read can produce, so a pane id
+    /// cannot be passed here by mistake.
+    // Capability only for now: nothing in drovr closes a pane yet — reaping is a
+    // later step, and this landing on its own must not change any behavior.
+    #[allow(dead_code)]
+    fn tab_close(&self, tab_id: &TabId) -> io::Result<()>;
+    /// Whether `pane_id` still exists. Distinct from [`Herdr::pane_info`], which
+    /// returns `None` both for a pane that is gone *and* for a poll that merely
+    /// failed — too ambiguous to act on. Callers use this to decide a pane is
+    /// genuinely dead (e.g. `code-review` resume respawning a reviewer), so it is
+    /// deliberately biased toward `true`: only a definitive "no such pane" answer
+    /// returns `false`; an unreachable daemon reports `true` (unknown → assume
+    /// alive) so a transient blip never kills live work.
+    /// Every live workspace id, or `None` if herdr could not be reached/parsed.
+    ///
+    /// One call answers "is this run still alive?" for EVERY run at once, which is
+    /// what makes it affordable on the session list's 2s poll — the per-run
+    /// alternative (a `pane_info` read per recorded `pane_id`) is a herdr round
+    /// trip per row. `None` is deliberately distinct from `Some(vec![])`: "herdr
+    /// is down, we do not know" must not read as "nothing is running", or the UI
+    /// would offer to archive live runs without warning.
+    ///
+    /// Not a status projection, so it is not what the note above forbids: it
+    /// answers about WORKSPACES, and its unknown case is `None` by construction
+    /// rather than by collapsing two different answers into one.
+    fn workspace_list(&self) -> Option<Vec<String>>;
+    /// Whether `workspace` still exists. The workspace-level twin of
+    /// [`Herdr::pane_exists`], and it carries the same bias: only an answer herdr
+    /// actually gave — a listing that does not contain `workspace` — proves death;
+    /// an unreachable daemon reports `true`.
+    ///
+    /// That bias is load-bearing. Its caller (`phase::ensure_workspace`) responds
+    /// to `false` by CREATING a replacement workspace and clearing every recorded
+    /// pane id, so a transient blip read as "gone" would orphan a run's live
+    /// agents — strictly worse than the failure this exists to fix.
+    fn workspace_exists(&self, workspace: &str) -> bool;
     fn pane_exists(&self, pane_id: &str) -> bool;
     fn integration_present(&self, agent: &str) -> bool;
+}
+
+/// Pull `result.workspaces[].workspace_id` out of a `herdr workspace list`
+/// response. Split out from the trait impl so the shape can be pinned by tests
+/// without a live herdr.
+fn parse_workspace_ids(stdout: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let workspaces = v.get("result")?.get("workspaces")?.as_array()?;
+    Some(
+        workspaces
+            .iter()
+            .filter_map(|w| w.get("workspace_id").and_then(|i| i.as_str()))
+            .map(|s| s.to_owned())
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -86,27 +544,117 @@ pub trait Herdr {
 /// Read timeout for a single JSON-RPC request/response round-trip on the socket.
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Slack added to a *blocking* call's own deadline when setting the socket read
+/// timeout. `agent.prompt`/`agent.wait` carrying a `wait` option hold the response
+/// open for up to their `timeout_ms`, which is far longer than
+/// [`SOCKET_READ_TIMEOUT`]; without this the socket read would time out first and
+/// we would report a transport failure instead of herdr's real verdict.
+const SOCKET_WAIT_GRACE: Duration = Duration::from_secs(5);
+
+/// A socket response whose herdr-reported error `code` is load-bearing. Distinct
+/// from `io::Result`: [`CallResult::Failed`] means herdr ANSWERED, and answered
+/// with an error — which for the `wait` calls can still be a normal outcome.
+enum CallResult {
+    Ok(Value),
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
+}
+
 /// Claude auth env vars propagated to spawned agents so they use the caller's
 /// authenticated profile rather than the default `~/.claude` dir.
-const AGENT_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"];
+const AGENT_ENV_VARS: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+];
 
-pub struct SystemHerdr;
+pub struct SystemHerdr {
+    /// The `herdr` executable to shell out to. Always plain `"herdr"` (resolved
+    /// via `PATH`) in production; tests point it at a stub instead.
+    ///
+    /// This exists so tests never have to mutate the process-global `PATH`.
+    /// Doing that corrupted unrelated tests: `cargo test` runs the whole binary's
+    /// tests in ONE process, and the ones that shell out to `git` do not take the
+    /// env lock, so they failed with "No such file or directory" whenever they
+    /// overlapped a `PATH`-rewriting test.
+    bin: std::path::PathBuf,
+}
 
 impl SystemHerdr {
     pub fn new() -> Self {
-        Self
+        Self {
+            bin: std::path::PathBuf::from("herdr"),
+        }
+    }
+
+    /// A `SystemHerdr` that shells out to `bin` instead of whatever `PATH` says.
+    /// Test-only: it is the seam that lets the real implementation's failure
+    /// branches be driven without touching global state.
+    #[cfg(test)]
+    pub fn with_bin(bin: impl Into<std::path::PathBuf>) -> Self {
+        Self { bin: bin.into() }
     }
 
     /// Shell out to the `herdr` binary (still used for `integration status` and
     /// `session stop`, which are unchanged in 0.7.5).
     fn run(&self, args: &[&str]) -> io::Result<std::process::Output> {
-        Command::new("herdr").args(args).output()
+        Command::new(&self.bin).args(args).output()
     }
 
     /// Perform one JSON-RPC call over the herdr Unix socket. Writes a single
     /// request line and reads a single response line; returns the `result`
     /// value on success, or an `io::Error` carrying the error message.
+    ///
+    /// Thin wrapper over [`SystemHerdr::socket_call_coded`] for the majority of
+    /// calls, where a herdr-reported error is just a failure and the only thing
+    /// its `code` decides is the [`io::ErrorKind`].
     fn socket_call(&self, method: &str, params: Value) -> io::Result<Value> {
+        match self.socket_call_coded(method, params, SOCKET_READ_TIMEOUT)? {
+            CallResult::Ok(value) => Ok(value),
+            CallResult::Failed { code, message } => Err(Self::classified_error(&code, &message)),
+        }
+    }
+
+    /// The `io::Error` a herdr-reported failure becomes. Split out so the wait
+    /// calls, which inspect the code themselves first, still produce the exact
+    /// same error as every other call once they decide it is a real failure.
+    fn classified_error(code: &Option<String>, message: &str) -> io::Error {
+        io::Error::new(
+            herdr_error_kind(code.as_deref(), message),
+            herdr_error_message(code.as_deref(), message),
+        )
+    }
+
+    /// Interpret a `wait`-bearing call's response: success means herdr observed
+    /// the agent start, a stall code means it observed nothing move, and anything
+    /// else is a real error worth surfacing.
+    fn outcome_from(result: CallResult) -> io::Result<PromptOutcome> {
+        match result {
+            CallResult::Ok(_) => Ok(PromptOutcome::Started),
+            CallResult::Failed { code, message } => stall_outcome_for_code(code.as_deref())
+                .ok_or_else(|| Self::classified_error(&code, &message)),
+        }
+    }
+
+    /// [`SystemHerdr::socket_call`] that PRESERVES herdr's machine-readable error
+    /// `code` instead of collapsing the response to an `io::Error`, and takes an
+    /// explicit socket read timeout for calls that block server-side.
+    ///
+    /// The nesting is deliberate: the outer `io::Result` is a transport/parse
+    /// failure (no socket, malformed line), while [`CallResult::Failed`] is herdr
+    /// answering normally with an error. Only the latter can mean "the prompt
+    /// stalled", so the two must not be conflated — a daemon that is down would
+    /// otherwise read as an agent that did not move, and get a key pressed at it.
+    fn socket_call_coded(
+        &self,
+        method: &str,
+        params: Value,
+        read_timeout: Duration,
+    ) -> io::Result<CallResult> {
         let path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| {
             io::Error::other("HERDR_SOCKET_PATH is not set; cannot reach herdr socket")
         })?;
@@ -116,7 +664,7 @@ impl SystemHerdr {
             .unwrap_or_else(|_| "0".to_string());
 
         let mut stream = UnixStream::connect(&path)?;
-        stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
+        stream.set_read_timeout(Some(read_timeout))?;
 
         let request = json!({ "id": id, "method": method, "params": params });
         let mut line = serde_json::to_string(&request)?;
@@ -135,13 +683,31 @@ impl SystemHerdr {
 
         let value: Value = serde_json::from_str(response.trim())?;
         if let Some(err) = value.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown herdr error");
-            return Err(io::Error::other(msg.to_string()));
+            // A JSON-RPC error body carries a machine-readable `code` next to the
+            // human `message` (both `required` per `herdr api schema --json`).
+            // The code is carried out of here rather than classified in place:
+            // most callers only want an `io::Error` (see `socket_call`, which
+            // classifies on the code rather than returning `Other` for every
+            // application-level failure — a caller that cannot tell "no such tab"
+            // from "socket down" has to match on prose, and reaping needs exactly
+            // that distinction), but the `wait` calls decide something else
+            // entirely from it: whether the agent merely failed to move.
+            return Ok(CallResult::Failed {
+                code: err
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|c| !c.trim().is_empty()),
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown herdr error")
+                    .to_string(),
+            });
         }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        Ok(CallResult::Ok(
+            value.get("result").cloned().unwrap_or(Value::Null),
+        ))
     }
 
     /// Build the `env` object for `workspace.create` from the claude auth vars
@@ -274,6 +840,25 @@ impl Herdr for SystemHerdr {
             .map(|s| s.to_owned())
     }
 
+    fn workspace_list(&self) -> Option<Vec<String>> {
+        let out = self.run(&["workspace", "list"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_workspace_ids(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn workspace_exists(&self, workspace: &str) -> bool {
+        // Built on `workspace_list` rather than on a per-workspace herdr call
+        // because that method already encodes the unknown-vs-empty distinction
+        // this needs: `None` is "could not ask", and only `Some(ids)` is an answer
+        // worth acting on.
+        match self.workspace_list() {
+            Some(ids) => ids.iter().any(|id| id == workspace),
+            None => true,
+        }
+    }
+
     fn workspace_focus(&self, id: &str) -> io::Result<()> {
         let out = self.run(&["workspace", "focus", id])?;
         if !out.status.success() {
@@ -291,6 +876,44 @@ impl Herdr for SystemHerdr {
         // only wrote text into the input box) is gone.
         self.socket_call("agent.prompt", json!({ "target": target, "text": text }))?;
         Ok(())
+    }
+
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> io::Result<PromptOutcome> {
+        // `wait.until` is [working, done] rather than herdr's default
+        // (idle|done|blocked): the default waits for the turn to SETTLE, which for
+        // a phase briefing means blocking until the whole phase finishes. We only
+        // want "the agent picked it up and started".
+        let result = self.socket_call_coded(
+            "agent.prompt",
+            json!({
+                "target": target,
+                "text": text,
+                "wait": {
+                    "until": ["working", "done"],
+                    "timeout_ms": timeout.as_millis() as u64,
+                },
+            }),
+            timeout + SOCKET_WAIT_GRACE,
+        )?;
+        Self::outcome_from(result)
+    }
+
+    fn agent_wait_started(&self, target: &str, timeout: Duration) -> io::Result<PromptOutcome> {
+        let result = self.socket_call_coded(
+            "agent.wait",
+            json!({
+                "target": target,
+                "until": ["working", "done"],
+                "timeout_ms": timeout.as_millis() as u64,
+            }),
+            timeout + SOCKET_WAIT_GRACE,
+        )?;
+        Self::outcome_from(result)
     }
 
     fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
@@ -319,15 +942,50 @@ impl Herdr for SystemHerdr {
         Ok(find_string_field(&result, "text").unwrap_or_default())
     }
 
-    fn agent_status(&self, pane_id: &str) -> Option<String> {
-        // `pane get` is a read-only query and does not move focus, so this is safe
-        // to poll from `phase_wait` on every iteration.
-        let out = self.run(&["pane", "get", pane_id]).ok()?;
-        if !out.status.success() {
-            return None;
+    fn pane_info(&self, pane_id: &str) -> Option<PaneInfo> {
+        // Socket `pane.get` (params: `pane_id`) is a read-only query and does not
+        // move focus, so this is safe to poll from `phase_wait` on every
+        // iteration. Every failure — herdr unreachable, pane gone, unexpected
+        // shape — collapses to `None`: a best-effort read must never break a
+        // poll loop. But it must not collapse SILENTLY: both failures present
+        // downstream as an unexplained readiness or wait timeout, so each is
+        // reported once per process.
+        let result = match self.socket_call("pane.get", json!({ "pane_id": pane_id })) {
+            Ok(result) => result,
+            Err(err) => {
+                // Connection refused, read timeout, or a JSON-RPC error such as
+                // an unknown pane — herdr's own message is the only clue, and
+                // `.ok()?` used to drop it on the floor.
+                if first_time_for(&PANE_GET_ERROR_WARNED, pane_id) {
+                    eprintln!("{}", pane_get_error_message(pane_id, &err.to_string()));
+                }
+                return None;
+            }
+        };
+        let info = parse_pane_info(&result);
+        if info.is_none() && first_time_for(&PANE_GET_SHAPE_WARNED, pane_id) {
+            // A closed/unknown pane comes back as a socket *error* handled
+            // above, so an unparseable SUCCESS means herdr's response shape
+            // moved under us. That degrades silently and totally (every poll
+            // `None` → `phase_send` burns its readiness timeout on a healthy
+            // agent, `blocked` is never detected early).
+            eprintln!("{}", pane_get_shape_message(pane_id, &result));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        parse_agent_status(&stdout)
+        info
+    }
+
+    fn tab_close(&self, tab_id: &TabId) -> io::Result<()> {
+        // Socket `tab.close` (params: `tab_id`) → `{"type":"ok"}`. The error is
+        // re-wrapped with the tab it names, matching `pane_info`'s diagnostics,
+        // because reaping is meant to log a failed close and carry on — a log
+        // line that does not say which tab is close to useless. The original
+        // `ErrorKind` is preserved: a caller may yet want to tell "no such tab"
+        // (already gone, ignorable) from "socket down" (a real failure).
+        self.socket_call("tab.close", json!({ "tab_id": tab_id.as_str() }))
+            .map_err(|err| {
+                io::Error::new(err.kind(), tab_close_error_message(tab_id, &err.to_string()))
+            })?;
+        Ok(())
     }
 
     fn pane_exists(&self, pane_id: &str) -> bool {
@@ -336,10 +994,15 @@ impl Herdr for SystemHerdr {
         // too), so only herdr's explicit `pane_not_found` counts as death — see
         // `pane_get_proves_missing`. Anything else, including a failure to run the
         // binary at all, reports alive so a blip never respawns live work.
+        //
+        // The verdict reads BOTH streams: herdr answers a missing pane on stderr
+        // with an empty stdout, so consulting stdout alone made every dead pane
+        // report alive.
         match self.run(&["pane", "get", pane_id]) {
-            Ok(out) if !out.status.success() => {
-                !pane_get_proves_missing(&String::from_utf8_lossy(&out.stdout))
-            }
+            Ok(out) if !out.status.success() => !pane_get_proves_missing(
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
             _ => true,
         }
     }
@@ -386,6 +1049,116 @@ fn find_string_field(value: &Value, key: &str) -> Option<String> {
     }
 }
 
+/// Panes whose unreadable `pane.get` success has been reported.
+static PANE_GET_SHAPE_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Panes whose socket-layer `pane.get` failure has been reported.
+static PANE_GET_ERROR_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// `true` the first time `pane_id` is seen in `seen`, `false` for every later
+/// call with the same pane. Turns a 500 ms poll loop's diagnostic into one line
+/// per pane instead of two a second — and keys it PER PANE, because a reap loop
+/// polls many: one pane's transient failure must not silence a different pane's
+/// persistent one.
+///
+/// A poisoned lock is recovered rather than treated as an error: the set holds
+/// nothing but pane ids, so a panicking thread cannot have left it inconsistent,
+/// and reporting `true` forever after would turn the diagnostic back into the
+/// once-a-poll spam this gate exists to prevent.
+///
+/// BOUNDED at [`WARNED_PANES_CAP`]. These sets are `static` — they live for the
+/// whole process, and the always-on review server is the one drovr process that
+/// never restarts and polls the most panes. Remembering every id it ever saw is
+/// a slow leak in exactly the wrong place.
+fn first_time_for(seen: &Mutex<BTreeSet<String>>, pane_id: &str) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Clear rather than evict one entry: the set is a de-duplication gate, not a
+    // cache, so there is no entry that is more worth keeping than another, and
+    // wholesale clearing gives a bound with no bookkeeping. The cost of forgetting
+    // is one repeated diagnostic per still-failing pane per CAP distinct panes —
+    // which is the same order as the once-per-pane guarantee it protects, and far
+    // better than the twice-a-second spam the gate exists to stop.
+    if seen.len() >= WARNED_PANES_CAP && !seen.contains(pane_id) {
+        seen.clear();
+    }
+    seen.insert(pane_id.to_string())
+}
+
+/// How many pane ids a warn-once set remembers before forgetting all of them.
+/// Comfortably above the panes any single run has (a phase each, plus a root
+/// shell), so a normal `drovr` invocation never reaches it and the once-per-pane
+/// guarantee is exact; a long-lived server crosses it only after having polled
+/// that many DISTINCT panes.
+const WARNED_PANES_CAP: usize = 512;
+
+/// The diagnostic for a `pane.get` that succeeded with a shape
+/// [`parse_pane_info`] does not recognise. Names the result's top-level keys
+/// only, never their values: the payload carries cwds and terminal titles.
+fn pane_get_shape_message(pane_id: &str, result: &Value) -> String {
+    let keys = match result.as_object() {
+        Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+        None => "<not an object>".to_string(),
+    };
+    format!(
+        "drovr: herdr's pane.get returned a shape drovr cannot read for pane \
+         {pane_id} (expected a `pane` object with a `tab_id`; got keys: {keys}). \
+         Agent status polling is degraded — phase sends will wait out their \
+         readiness timeout. Check the herdr version."
+    )
+}
+
+/// The diagnostic for a `pane.get` that failed at the socket layer. Unlike
+/// [`pane_get_shape_message`], which prints keys and never values, this echoes
+/// herdr's message verbatim — `socket_call` only ever surfaces a JSON-RPC
+/// `error.message` or an OS error string, neither of which carries a payload.
+fn pane_get_error_message(pane_id: &str, err: &str) -> String {
+    format!(
+        "drovr: herdr's pane.get failed for pane {pane_id}: {err}. \
+         Agent status polling is degraded — phase sends and waits will run to \
+         their timeouts with no other explanation. (A pane that has been closed \
+         reports this too.)"
+    )
+}
+
+/// Classify a herdr JSON-RPC error body into an [`io::ErrorKind`] a caller can
+/// `match` on.
+///
+/// The kind, not the message, is the interface: reaping is best-effort and wants
+/// to IGNORE a tab that is already gone (`NotFound`) while still reporting a
+/// socket that is down, and `tab_close` preserves this kind through its own
+/// `map_err` for exactly that reason. Without it every application-level failure
+/// arrives as `ErrorKind::Other` and the only way to discriminate is parsing
+/// herdr's prose — an invariant living in string literals instead of the type.
+///
+/// * `*_not_found` → `NotFound`. Matched by SUFFIX (`pane_not_found`,
+///   `tab_not_found`, and any `workspace_not_found`/`agent_not_found` a later
+///   herdr grows) so the mapping does not need a drovr release per code.
+/// * `invalid_request` → `InvalidInput`. That is drovr calling herdr wrongly — a
+///   bad params key or an unknown method — never a transient condition.
+/// * anything else → `Other`. Deliberately NOT guessed at from the message: an
+///   unmapped code is an unknown condition, and claiming a kind for it would let a
+///   caller silently swallow a failure it has never seen. The code is preserved in
+///   the message (see [`herdr_error_message`]) so a human can still act on it.
+///
+/// The message is consulted ONLY when the code is absent or empty — defence
+/// against a future herdr that stops sending it, since the alternative is the call
+/// sites string-matching instead.
+fn herdr_error_kind(code: Option<&str>, message: &str) -> io::ErrorKind {
+    match code.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) if code.ends_with("not_found") => io::ErrorKind::NotFound,
+        Some("invalid_request") => io::ErrorKind::InvalidInput,
+        Some(_) => io::ErrorKind::Other,
+        None => {
+            let msg = message.to_ascii_lowercase();
+            if msg.contains("not found") || msg.contains("no such") {
+                io::ErrorKind::NotFound
+            } else {
+                io::ErrorKind::Other
+            }
+        }
+    }
+}
+
 /// Collect every pane id in a `pane.list` result that belongs to `workspace`.
 ///
 /// Walks the value rather than indexing a fixed path (`result.panes[]`) so a
@@ -425,17 +1198,6 @@ fn collect_pane_ids_into(value: &Value, workspace: &str, out: &mut Vec<String>) 
     }
 }
 
-/// Parse a pane's `agent_status` from herdr's `pane get` / `pane list` JSON.
-/// The status may live directly on `result` (`pane get`) or on a pane object
-/// inside `result.panes` (`pane list`); this walks the value recursively and
-/// returns the first `"agent_status"` string it finds. Returns `None` when the
-/// field is absent or the JSON does not parse (a best-effort read must never
-/// panic the poll loop).
-fn parse_agent_status(json: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    find_agent_status(&v)
-}
-
 /// Whether a failed `herdr pane get` proves the pane is GONE, as opposed to merely
 /// failing for some other reason.
 ///
@@ -444,33 +1206,93 @@ fn parse_agent_status(json: &str) -> Option<String> {
 /// as "pane is dead" and make [`Herdr::pane_exists`] tell callers to respawn a
 /// reviewer that is alive and working. Only herdr's explicit `pane_not_found` error
 /// code is treated as proof of death; anything else is "cannot tell", i.e. alive.
-fn pane_get_proves_missing(stdout: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<Value>(stdout) else {
-        return false;
-    };
-    v.get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(Value::as_str)
-        == Some("pane_not_found")
+///
+/// BOTH streams are examined because herdr puts the error on **stderr** and leaves
+/// stdout empty (see `pane_get_error_on_stderr_proves_a_pane_is_missing`). Checking
+/// stdout alone made this function answer "cannot tell" for every real dead pane.
+fn pane_get_proves_missing(stdout: &str, stderr: &str) -> bool {
+    [stdout, stderr].iter().any(|s| {
+        serde_json::from_str::<Value>(s).is_ok_and(|v| {
+            v.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str)
+                == Some("pane_not_found")
+        })
+    })
 }
 
-/// Recursively search a JSON value for the first `"agent_status"` string.
-fn find_agent_status(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(s)) = map.get("agent_status") {
-                return Some(s.clone());
-            }
-            for child in map.values() {
-                if let Some(found) = find_agent_status(child) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(arr) => arr.iter().find_map(find_agent_status),
-        _ => None,
+/// herdr's own error text, with its machine code appended when there is one.
+///
+/// The message stays FIRST and verbatim: `pane_get_error_message` and
+/// `tab_close_error_message` embed it, and it is what a human reads. The code is
+/// appended rather than substituted because [`herdr_error_kind`] deliberately
+/// leaves unmapped codes as `Other` — the code in the text is then the only clue
+/// to what herdr actually refused.
+fn herdr_error_message(code: Option<&str>, message: &str) -> String {
+    match code.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) => format!("{message} (herdr error code: {code})"),
+        None => message.to_string(),
     }
+}
+
+/// The error a failed `tab.close` carries. Reaping treats a close as
+/// best-effort — it logs the failure and moves on — so the message has to name
+/// the tab it was aiming at, or the log says nothing usable.
+fn tab_close_error_message(tab_id: &TabId, err: &str) -> String {
+    format!("herdr tab.close failed for tab {}: {err}", tab_id.as_str())
+}
+
+/// A non-empty string field of `value`, or `None`. herdr writes `""` for some
+/// absent fields, and an empty tab id or session value is as useless as a
+/// missing one.
+fn non_empty_string(value: &Value, key: &str) -> Option<String> {
+    match value.get(key)?.as_str()? {
+        "" => None,
+        s => Some(s.to_string()),
+    }
+}
+
+/// Parse the `result` of a `pane.get` call into a [`PaneInfo`].
+///
+/// herdr 0.7.5 nests the payload at `result.pane` (`{type:"pane_info", pane:{…}}`),
+/// not on `result` itself. This reads it STRUCTURALLY rather than with
+/// [`find_string_field`]'s recursive dig: `pane_id`, `tab_id`, `terminal_id` and
+/// the session's `agent`/`kind`/`value`/`source` are all strings, so a
+/// first-match walk would happily hand back a `pane_id` when asked for a
+/// `tab_id`.
+///
+/// Returns `None` when the shape is not a single pane or carries no `tab_id` —
+/// a `PaneInfo` that cannot name its tab serves neither caller.
+fn parse_pane_info(result: &Value) -> Option<PaneInfo> {
+    let pane = result.get("pane")?;
+    Some(PaneInfo {
+        tab_id: TabId(non_empty_string(pane, "tab_id")?),
+        agent_status: non_empty_string(pane, "agent_status")
+            .map(|raw| AgentStatus::from_herdr(&raw)),
+        agent_session: pane.get("agent_session").and_then(parse_agent_session),
+    })
+}
+
+/// Parse a pane's `agent_session` object. Both `kind` and `value` are required —
+/// a session drovr cannot classify is one it must not resume — while `agent` is
+/// optional. Note that a pane whose agent has exited has no `agent_session` key
+/// at all, which is exactly `None` here.
+fn parse_agent_session(value: &Value) -> Option<AgentSession> {
+    let kind = non_empty_string(value, "kind")?;
+    let session_value = non_empty_string(value, "value")?;
+    Some(match kind.as_str() {
+        "id" => AgentSession::Id(IdSession {
+            value: SessionId(session_value),
+            agent: non_empty_string(value, "agent"),
+        }),
+        "path" => AgentSession::Path {
+            value: session_value,
+        },
+        _ => AgentSession::Other {
+            kind,
+            value: session_value,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -483,16 +1305,54 @@ pub struct FakeHerdr {
     counter: RefCell<u32>,
     /// Queued return strings for agent_read (FIFO)
     read_queue: RefCell<VecDeque<String>>,
-    /// Queued return values for agent_status (FIFO). `None` entries model a pane
-    /// whose status could not be read/parsed; an empty queue also yields `None`.
+    /// Queued statuses for the `pane_info` poll (FIFO), the shorthand for tests
+    /// that only care about `agent_status`. `None` entries model a pane that
+    /// could not be read at all.
     status_queue: RefCell<VecDeque<Option<String>>>,
+    /// Queued whole `pane_info` results (FIFO). Takes precedence over
+    /// `status_queue`, for tests that care about the tab id or the session.
+    pane_info_queue: RefCell<VecDeque<Option<PaneInfo>>>,
+    /// Queued outcomes for `agent_prompt_confirm` / `agent_wait_started` (FIFO,
+    /// shared so a test scripts the delivery sequence in call order). An empty
+    /// queue yields `Started` — a healthy agent that took the prompt first try.
+    outcome_queue: RefCell<VecDeque<PromptOutcome>>,
     /// When true, the next `pane_run` returns an error (tests the failure path).
     fail_pane_run: RefCell<bool>,
-    /// When true, every `agent_send` returns an error (models a pane that accepted a
-    /// launch but cannot be given its prompt).
+    /// What `workspace_list` reports. `None` models an unreachable herdr, which
+    /// callers must treat as "unknown", not "nothing is live".
+    live_workspaces: RefCell<Option<Vec<String>>>,
+    /// When true, `workspace_close` errors (models closing an already-gone
+    /// workspace, the common case when a run's panes died long ago).
+    fail_workspace_close: RefCell<bool>,
+    /// When true, every `pane_info` reads as unreadable (`None`).
+    fail_pane_info: RefCell<bool>,
+    /// When true, every `tab_close` returns an error — reaping is best-effort,
+    /// so callers must survive it.
+    fail_tab_close: RefCell<bool>,
+    /// When true, every prompt delivery — `agent_send` AND
+    /// `agent_prompt_confirm` — returns an error (tests what a caller reports
+    /// about the state a failed send leaves behind).
     fail_agent_send: RefCell<bool>,
+    /// When true, EVERY `agent_read` returns an error — models a pane drovr
+    /// cannot inspect, so callers that reason about pane contents must fail safe.
+    fail_agent_read: RefCell<bool>,
+    /// `Some(n)`: only the next `n` `agent_read`s fail, and the rest succeed.
+    /// Bounds `fail_agent_read` so a test can model a caller whose FIRST look at a
+    /// pane failed and whose second succeeded — the two-look asymmetry a single
+    /// boolean cannot express.
+    agent_read_failures_left: RefCell<Option<u32>>,
     /// Pane ids that `pane_exists` reports as gone; every other pane exists.
     dead_panes: RefCell<std::collections::HashSet<String>>,
+    /// Workspace ids that `workspace_exists` reports as gone; every other
+    /// workspace exists. Separate from `live_workspaces` (which backs
+    /// `workspace_list`) so the default stays "the run's workspace is fine" —
+    /// `workspace_list`'s default is the empty list, and inferring existence from
+    /// it would make every pre-existing test look like a vanished workspace.
+    dead_workspaces: RefCell<std::collections::HashSet<String>>,
+    /// When true, `workspace_create` errors — herdr is there but will not give us
+    /// a workspace. The path on which recovery must refuse LOUDLY rather than
+    /// advertise a resume it cannot deliver.
+    fail_workspace_create: RefCell<bool>,
     /// Panes each workspace holds, as `workspace_panes` will report them. A
     /// workspace with no entry reports empty — the "nothing but drovr's own panes"
     /// case most tests want.
@@ -504,6 +1364,12 @@ pub struct FakeHerdr {
     /// transcripts belong to a specific pane; a test that cares which pane it is
     /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
     read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
+    /// `(call substring, run name)`. The first recorded call containing the
+    /// substring writes `archived: true` into that run's `state.json`, then
+    /// disarms. This models the human clicking Archive in the web UI *while* a
+    /// long-running command holds its own copy of that state — the only way to
+    /// drive that race deterministically from a test.
+    archive_on_call: RefCell<Option<(String, String)>>,
 }
 
 #[cfg(test)]
@@ -514,12 +1380,23 @@ impl FakeHerdr {
             counter: RefCell::new(0),
             read_queue: RefCell::new(VecDeque::new()),
             status_queue: RefCell::new(VecDeque::new()),
+            pane_info_queue: RefCell::new(VecDeque::new()),
+            outcome_queue: RefCell::new(VecDeque::new()),
             fail_pane_run: RefCell::new(false),
+            live_workspaces: RefCell::new(Some(Vec::new())),
+            fail_workspace_close: RefCell::new(false),
+            fail_pane_info: RefCell::new(false),
+            fail_tab_close: RefCell::new(false),
             fail_agent_send: RefCell::new(false),
+            fail_agent_read: RefCell::new(false),
+            agent_read_failures_left: RefCell::new(None),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
+            dead_workspaces: RefCell::new(std::collections::HashSet::new()),
+            fail_workspace_create: RefCell::new(false),
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
+            archive_on_call: RefCell::new(None),
         }
     }
 
@@ -547,10 +1424,23 @@ impl FakeHerdr {
         self.dead_panes.borrow_mut().insert(pane_id.into());
     }
 
-    /// Make every `agent_send` fail: the pane launched, but its prompt can never be
-    /// delivered. Cheaper than driving `phase_send`'s 30s readiness timeout.
-    pub fn fail_agent_send(&self) {
-        *self.fail_agent_send.borrow_mut() = true;
+    /// Model `workspace_id` having been destroyed — the live failure this fake
+    /// exists to reproduce: herdr destroys a workspace when its last pane closes,
+    /// and `state.json` goes on naming it. Every pane inside it dies with it, so
+    /// this kills those too.
+    pub fn kill_workspace(&self, workspace_id: &str, panes: impl IntoIterator<Item = String>) {
+        self.dead_workspaces
+            .borrow_mut()
+            .insert(workspace_id.to_owned());
+        for pane in panes {
+            self.kill_pane(pane);
+        }
+    }
+
+    /// Make every `workspace_create` fail — herdr is reachable but will not hand
+    /// out a workspace.
+    pub fn fail_workspace_create(&self) {
+        *self.fail_workspace_create.borrow_mut() = true;
     }
 
     /// Queue a transcript for one specific pane, taking priority over `push_read`.
@@ -562,6 +1452,39 @@ impl FakeHerdr {
             .push_back(text.into());
     }
 
+    /// Declare which workspace ids herdr should report as live.
+    pub fn set_live_workspaces(&self, ids: Option<Vec<String>>) {
+        *self.live_workspaces.borrow_mut() = ids;
+    }
+
+    pub fn set_fail_workspace_close(&self, fail: bool) {
+        *self.fail_workspace_close.borrow_mut() = fail;
+    }
+
+    /// The tab the fake reports for `pane_id` when a test has not scripted a
+    /// whole `PaneInfo`. Exposed so tests can assert on `tab_close` without
+    /// hard-coding the derivation.
+    pub fn tab_id_for(pane_id: &str) -> TabId {
+        TabId(format!("tab-of-{pane_id}"))
+    }
+
+    /// The raw session-id value the fake reports for an agent attached to
+    /// `pane_id`. Exposed so a test can assert on a captured/persisted id
+    /// without hard-coding the derivation.
+    pub fn session_value_for(pane_id: &str) -> String {
+        format!("session-of-{pane_id}")
+    }
+
+    /// The session the fake reports for an agent attached to `pane_id`, owned by
+    /// `claude` — the default backend. A test needing another backend scripts a
+    /// whole `PaneInfo` with [`FakeHerdr::push_pane_info`].
+    fn session_for(pane_id: &str) -> AgentSession {
+        AgentSession::Id(IdSession {
+            value: SessionId(Self::session_value_for(pane_id)),
+            agent: Some("claude".to_string()),
+        })
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
@@ -571,13 +1494,29 @@ impl FakeHerdr {
         self.read_queue.borrow_mut().push_back(text.into());
     }
 
-    /// Queue a value to be returned by the next `agent_status` call. Pass
-    /// `Some("blocked")` to model a blocked pane, or `None` to model an
-    /// unreadable status. Mirrors `push_read`.
+    /// Queue a status for the next `pane_info` poll. Pass `Some("blocked")` to
+    /// model a blocked pane, or `None` to model a pane that cannot be read at
+    /// all. Mirrors `push_read`.
+    ///
+    /// Takes the RAW herdr string, classified through [`AgentStatus::from_herdr`]
+    /// exactly as a real response would be — so `push_status(Some("compacting"))`
+    /// models a herdr state drovr has never seen.
+    ///
+    /// The session follows the status the way herdr's does: `"unknown"` is the
+    /// status of a pane whose agent has EXITED, so it comes back with no
+    /// session; every other status models an attached agent, which always
+    /// carries one.
     pub fn push_status(&self, status: Option<impl Into<String>>) {
         self.status_queue
             .borrow_mut()
             .push_back(status.map(Into::into));
+    }
+
+    /// Queue a whole `PaneInfo` for the next `pane_info` call — for tests that
+    /// care about the tab id or the agent session. Takes precedence over
+    /// `push_status`. `None` models a pane that could not be read.
+    pub fn push_pane_info(&self, info: Option<PaneInfo>) {
+        self.pane_info_queue.borrow_mut().push_back(info);
     }
 
     /// Make the next `pane_run` fail, so a caller's error handling can be tested.
@@ -585,8 +1524,75 @@ impl FakeHerdr {
         *self.fail_pane_run.borrow_mut() = true;
     }
 
+    /// Arm the concurrent-archive hook: the next recorded call containing
+    /// `needle` archives run `run` on disk. See [`FakeHerdr::archive_on_call`].
+    pub fn archive_on_call(&self, needle: &str, run: &str) {
+        *self.archive_on_call.borrow_mut() = Some((needle.to_owned(), run.to_owned()));
+    }
+
+    /// Make every `pane_info` read as unreadable (`None`), whatever is queued.
+    pub fn fail_pane_info(&self) {
+        *self.fail_pane_info.borrow_mut() = true;
+    }
+
+    /// Make every `tab_close` fail. Reaping is best-effort: a phase must survive
+    /// this without erroring and without marking itself reaped.
+    pub fn fail_tab_close(&self) {
+        *self.fail_tab_close.borrow_mut() = true;
+    }
+
+    /// Make every prompt delivery fail, `agent_prompt_confirm` included — a
+    /// transport failure, distinct from a prompt that is delivered and does not
+    /// take (`push_outcome(Stalled)`). `phase_send` re-opens the phase BEFORE it
+    /// sends, so this is how a test reaches the state a failed delivery leaves.
+    pub fn fail_agent_send(&self) {
+        *self.fail_agent_send.borrow_mut() = true;
+    }
+
+    /// Make every `agent_read` fail, modelling a pane whose contents drovr cannot
+    /// see. Callers that decide anything from pane contents must fail safe.
+    pub fn fail_agent_read(&self) {
+        *self.fail_agent_read.borrow_mut() = true;
+    }
+
+    /// Let `agent_read` start working again after `n` more failures — for the
+    /// case a single failure mode cannot express: a caller that looks TWICE and
+    /// gets a different answer each time.
+    pub fn allow_agent_read_after(&self, n: u32) {
+        *self.agent_read_failures_left.borrow_mut() = Some(n);
+    }
+
+    /// Queue an outcome for the next delivery-confirming call
+    /// (`agent_prompt_confirm` or `agent_wait_started`, which share one queue so
+    /// a test can script "the prompt stalls, then the nudge takes").
+    pub fn push_outcome(&self, outcome: PromptOutcome) {
+        self.outcome_queue.borrow_mut().push_back(outcome);
+    }
+
+    /// Consume the next scripted delivery outcome, defaulting to `Started` so a
+    /// test that does not care about delivery (the common case) models a healthy
+    /// agent rather than tripping `phase_send`'s undelivered-seed error.
+    fn next_outcome(&self) -> PromptOutcome {
+        self.outcome_queue
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(PromptOutcome::Started)
+    }
+
     fn record(&self, call: String) {
-        self.calls.borrow_mut().push(call);
+        self.calls.borrow_mut().push(call.clone());
+        // Borrow, clone, drop — the write below re-enters nothing, but holding a
+        // RefCell borrow across it would be a latent panic.
+        let armed = self.archive_on_call.borrow().clone();
+        if let Some((needle, run)) = armed
+            && call.contains(&needle)
+        {
+            *self.archive_on_call.borrow_mut() = None;
+            if let Ok(mut s) = crate::run::RunState::load(&run) {
+                s.archived = true;
+                s.save().expect("hook: archive the run on disk");
+            }
+        }
     }
 
     fn next_id(&self) -> String {
@@ -607,6 +1613,9 @@ impl Herdr for FakeHerdr {
         self.record(format!(
             "workspace_create label={label} cwd={cwd} -> {ws_id} root_pane={root_pane}"
         ));
+        if *self.fail_workspace_create.borrow() {
+            return Err(io::Error::other("scripted workspace_create failure"));
+        }
         Ok(Workspace {
             id: ws_id,
             root_pane,
@@ -615,7 +1624,15 @@ impl Herdr for FakeHerdr {
 
     fn workspace_close(&self, id: &str) -> io::Result<()> {
         self.record(format!("workspace_close id={id}"));
+        if *self.fail_workspace_close.borrow() {
+            return Err(io::Error::other("workspace not found"));
+        }
         Ok(())
+    }
+
+    fn workspace_list(&self) -> Option<Vec<String>> {
+        self.record("workspace_list".to_string());
+        self.live_workspaces.borrow().clone()
     }
 
     fn pane_close(&self, pane_id: &str) -> io::Result<()> {
@@ -675,6 +1692,26 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    fn agent_prompt_confirm(
+        &self,
+        target: &str,
+        text: &str,
+        _timeout: Duration,
+    ) -> io::Result<PromptOutcome> {
+        self.record(format!(
+            "agent_prompt_confirm target={target} text={text:?}"
+        ));
+        if *self.fail_agent_send.borrow() {
+            return Err(io::Error::other("scripted agent_send failure"));
+        }
+        Ok(self.next_outcome())
+    }
+
+    fn agent_wait_started(&self, target: &str, _timeout: Duration) -> io::Result<PromptOutcome> {
+        self.record(format!("agent_wait_started target={target}"));
+        Ok(self.next_outcome())
+    }
+
     fn agent_send_keys(&self, target: &str, keys: &[String]) -> io::Result<()> {
         self.record(format!("agent_send_keys target={target} keys={keys:?}"));
         Ok(())
@@ -682,6 +1719,19 @@ impl Herdr for FakeHerdr {
 
     fn agent_read(&self, target: &str) -> io::Result<String> {
         self.record(format!("agent_read target={target}"));
+        if *self.fail_agent_read.borrow() {
+            // A bounded failure count disarms itself, so a test can script
+            // "the first look failed, the second succeeded".
+            let mut left = self.agent_read_failures_left.borrow_mut();
+            match left.as_mut() {
+                Some(0) => {}
+                Some(n) => {
+                    *n -= 1;
+                    return Err(io::Error::other("scripted agent_read failure"));
+                }
+                None => return Err(io::Error::other("scripted agent_read failure")),
+            }
+        }
         // A transcript queued for this exact pane wins; otherwise fall back to the
         // pane-agnostic queue most tests use.
         if let Some(text) = self
@@ -696,23 +1746,79 @@ impl Herdr for FakeHerdr {
         Ok(text)
     }
 
-    fn agent_status(&self, pane_id: &str) -> Option<String> {
-        self.record(format!("agent_status target={pane_id}"));
-        // A scripted status (pushed via `push_status`) is consumed FIFO. When the
-        // queue is empty the fake models a booted, ready agent parked at its
-        // composer — `Some("idle")` — so a test that does not care about status
-        // (the common case) sails through `phase_send`'s readiness gate instead of
-        // waiting out its timeout. Tests that need a different status (blocked,
-        // done, or an unreadable `None`) push it explicitly.
-        match self.status_queue.borrow_mut().pop_front() {
-            Some(scripted) => scripted,
-            None => Some("idle".to_string()),
+    fn pane_info(&self, pane_id: &str) -> Option<PaneInfo> {
+        // Resolution order: a scripted failure, then a whole scripted `PaneInfo`,
+        // then a scripted status, then the default. A scripted status (pushed via
+        // `push_status`) is consumed FIFO; when both queues are empty the fake
+        // models a booted, ready agent parked at its composer — `Some("idle")` —
+        // so a test that does not care about status (the common case) sails
+        // through `phase_send`'s readiness gate instead of waiting out its
+        // timeout. Tests that need a different status (blocked, done, or an
+        // unreadable `None`) push it explicitly.
+        //
+        // FIDELITY: an attached agent ALWAYS carries an `agent_session` in real
+        // herdr — captured live on a `working` pane, and absent on a captured
+        // exited one; only an exited agent, whose status is herdr's own
+        // `unknown`, lacks a session. The fake ties the two
+        // together the same way, because reaping classifies on the SESSION, and
+        // a session-less "live" pane here would teach every later test the
+        // opposite of what herdr does.
+        let info = if *self.fail_pane_info.borrow() {
+            None
+        } else if let Some(scripted) = self.pane_info_queue.borrow_mut().pop_front() {
+            scripted
+        } else {
+            let status = match self.status_queue.borrow_mut().pop_front() {
+                Some(scripted) => scripted,
+                None => Some("idle".to_string()),
+            };
+            // A scripted `None` status means the pane could not be read at all.
+            status.map(|status| {
+                let status = AgentStatus::from_herdr(&status);
+                let agent_session = match status {
+                    AgentStatus::Unknown => None,
+                    _ => Some(Self::session_for(pane_id)),
+                };
+                PaneInfo {
+                    tab_id: Self::tab_id_for(pane_id),
+                    agent_status: Some(status),
+                    agent_session,
+                }
+            })
+        };
+        // `pane_info` IS the status poll, so the recorded line names the status:
+        // assertions that count (or forbid) status polls match on `agent_status`.
+        let outcome = match &info {
+            Some(i) => format!(
+                "tab_id={} agent_status={:?} agent_session={:?}",
+                i.tab_id.as_str(),
+                i.agent_status,
+                i.agent_session
+            ),
+            None => "unreadable agent_status=None".to_string(),
+        };
+        self.record(format!("pane_info pane={pane_id} -> {outcome}"));
+        info
+    }
+
+    fn tab_close(&self, tab_id: &TabId) -> io::Result<()> {
+        // Recorded before the scripted failure, so call-order assertions see the
+        // attempt whether or not it succeeded.
+        self.record(format!("tab_close tab={}", tab_id.as_str()));
+        if *self.fail_tab_close.borrow() {
+            return Err(io::Error::other("scripted tab_close failure"));
         }
+        Ok(())
     }
 
     fn pane_exists(&self, pane_id: &str) -> bool {
         self.record(format!("pane_exists target={pane_id}"));
         !self.dead_panes.borrow().contains(pane_id)
+    }
+
+    fn workspace_exists(&self, workspace: &str) -> bool {
+        self.record(format!("workspace_exists target={workspace}"));
+        !self.dead_workspaces.borrow().contains(workspace)
     }
 
     fn integration_present(&self, agent: &str) -> bool {
@@ -728,6 +1834,189 @@ impl Herdr for FakeHerdr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `f` against a real [`SystemHerdr`] wired to a stub `herdr` that prints
+    /// `stdout` and exits `code`.
+    ///
+    /// `FakeHerdr` cannot cover this: it *is* the stand-in, so it can never show
+    /// that `SystemHerdr` — the only impl that talks to the daemon — honours the
+    /// unknown-vs-empty and biased-toward-alive contracts.
+    ///
+    /// The stub is injected via [`SystemHerdr::with_bin`] rather than by putting it
+    /// on `PATH`. Two earlier versions of this helper got that wrong: one relied on
+    /// `execvp` refusing a non-executable `PATH` entry (it skips it and keeps
+    /// searching, so the test silently ran against the developer's real herdr), and
+    /// the replacement mutated the process-global `PATH`, which broke unrelated
+    /// tests that shell out to `git` without taking the env lock. Injection touches
+    /// no global state, so these tests are safe under `cargo test`'s parallelism and
+    /// need no lock at all.
+    #[cfg(unix)]
+    fn with_stub_herdr<T>(stdout: &str, code: i32, f: impl FnOnce(&SystemHerdr) -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            !stdout.contains('\''),
+            "stub stdout is single-quoted for the shell; a quote in it would not survive"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("herdr");
+        let ran = tmp.path().join("ran");
+        // `:> ran` records that the stub really executed, so a test cannot pass by
+        // silently failing to invoke it — the exact way the first version broke.
+        // Both `:` and the redirect are shell builtins, needing nothing from PATH.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n:> '{}'\necho '{stdout}'\nexit {code}\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = f(&SystemHerdr::with_bin(&bin));
+        assert!(
+            ran.exists(),
+            "the stub herdr was never executed — this test is not testing what it claims"
+        );
+        out
+    }
+
+    /// Run `f` against a [`SystemHerdr`] pointed at a path that does not exist, so
+    /// `Command::output` fails to launch it at all — a branch distinct from "ran and
+    /// exited nonzero", and the only way to reach `pane_exists`'s catch-all arm.
+    #[cfg(unix)]
+    fn with_missing_herdr<T>(f: impl FnOnce(&SystemHerdr) -> T) -> T {
+        let tmp = tempfile::tempdir().unwrap();
+        f(&SystemHerdr::with_bin(tmp.path().join("herdr-does-not-exist")))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreachable_herdr_reports_unknown_liveness_and_assumes_panes_alive() {
+        // herdr is installed and runs, but the daemon is down: nonzero exit,
+        // nothing parseable on stdout.
+        let (live, alive) = with_stub_herdr("", 1, |h| (h.workspace_list(), h.pane_exists("w1:p1")));
+
+        assert_eq!(
+            live, None,
+            "an unreachable herdr must report unknown, never `Some(vec![])` — \
+             'nothing is live' would let the UI archive running work with no warning"
+        );
+        assert!(
+            alive,
+            "a nonzero exit alone must not count as a dead pane, or a transient blip \
+             would let code-review respawn reviewers over live ones"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_herdr_that_cannot_be_launched_is_unknown_and_assumes_panes_alive() {
+        // The binary is not there at all, so `Command::output` fails to launch it.
+        // A DIFFERENT branch from "ran and exited nonzero" — `pane_exists`'s
+        // catch-all `_ => true` is only reachable this way.
+        let (live, alive) = with_missing_herdr(|h| (h.workspace_list(), h.pane_exists("w1:p1")));
+
+        assert_eq!(
+            live, None,
+            "failing to launch herdr at all is still unknown, never 'nothing is live'"
+        );
+        assert!(
+            alive,
+            "failing to launch herdr at all must still report the pane alive"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_an_explicit_pane_not_found_proves_a_pane_is_gone() {
+        let alive = with_stub_herdr(r#"{"error":{"code":"pane_not_found"}}"#, 1, |h| {
+            h.pane_exists("w1:p1")
+        });
+        assert!(
+            !alive,
+            "herdr's explicit `pane_not_found` is the one answer that proves death"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reachable_herdr_reporting_no_workspaces_is_empty_not_unknown() {
+        // The other half of the distinction: herdr answered, and the answer is
+        // genuinely "nothing is running".
+        let live = with_stub_herdr(
+            r#"{"id":"x","result":{"type":"workspace_list","workspaces":[]}}"#,
+            0,
+            |h| h.workspace_list(),
+        );
+        assert_eq!(
+            live,
+            Some(vec![]),
+            "a successful empty answer must stay distinguishable from unreachable"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_exists_trusts_only_a_listing_herdr_actually_answered() {
+        // The workspace-recovery detection primitive. It has to carry the SAME
+        // bias as `pane_exists` — only a definitive answer proves death — because
+        // a false "gone" makes `phase_start` re-provision a workspace whose panes
+        // are alive and working, orphaning the run's own agents.
+        let listing = r#"{"id":"x","result":{"type":"workspace_list","workspaces":[
+            {"workspace_id":"w1"},{"workspace_id":"wAG"}
+        ]}}"#;
+        let (present, absent) = with_stub_herdr(listing, 0, |h| {
+            (h.workspace_exists("wAG"), h.workspace_exists("wZZ"))
+        });
+        assert!(present, "a workspace in the listing is live");
+        assert!(
+            !absent,
+            "a workspace absent from a listing herdr DID answer is genuinely gone — \
+             this is the case that must be detected instead of failing on the raw \
+             `workspace_not_found` from a later call"
+        );
+
+        let blip = with_stub_herdr("", 1, |h| h.workspace_exists("wAG"));
+        assert!(
+            blip,
+            "an unreachable herdr is unknown, and unknown must read as alive"
+        );
+    }
+
+    #[test]
+    fn parses_workspace_ids_from_a_real_herdr_response() {
+        // Trimmed from actual `herdr workspace list` output (herdr 0.7.5). Kept
+        // verbatim in shape so a field rename upstream fails here rather than
+        // silently reporting every run as dead — which would let the UI offer to
+        // archive a workspace that is very much alive.
+        let out = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+            {"active_tab_id":"w1:t31","agent_status":"idle","focused":false,"label":"modular","number":1,"pane_count":3,"tab_count":3,"workspace_id":"w1"},
+            {"active_tab_id":"wAG:t1","agent_status":"working","focused":false,"label":"drovr:skill-stickiness","number":5,"pane_count":1,"tab_count":1,"workspace_id":"wAG"}
+        ]}}"#;
+        assert_eq!(
+            parse_workspace_ids(out),
+            Some(vec!["w1".to_string(), "wAG".to_string()])
+        );
+    }
+
+    #[test]
+    fn workspace_id_parse_failures_are_unknown_not_empty() {
+        // The distinction matters: `Some(vec![])` means "herdr answered, nothing
+        // is running"; `None` means "we could not ask". Callers gate a
+        // destructive archive on it, so conflating the two would drop the guard.
+        assert_eq!(parse_workspace_ids("not json"), None);
+        assert_eq!(parse_workspace_ids(r#"{"result":{}}"#), None);
+        assert_eq!(
+            parse_workspace_ids(r#"{"result":{"workspaces":[]}}"#),
+            Some(vec![])
+        );
+        // A workspace entry missing its id is skipped, not fatal.
+        assert_eq!(
+            parse_workspace_ids(r#"{"result":{"workspaces":[{"label":"x"},{"workspace_id":"w2"}]}}"#),
+            Some(vec!["w2".to_string()])
+        );
+    }
 
     #[test]
     fn fake_records_and_returns() {
@@ -794,28 +2083,81 @@ mod tests {
         assert!(find_string_field(&v, "pane_id").is_none());
     }
 
+    // -- where herdr actually puts the error -----------------------------------
+    // `herdr pane get <missing>` exits 1, prints NOTHING on stdout, and writes its
+    // error JSON to STDERR (verified against herdr 0.7.5 — protocol 18):
+    //
+    //   stdout: ""
+    //   stderr: {"error":{"code":"pane_not_found","message":"pane w1:p9 not found"}}
+    //
+    // Reading only stdout therefore made `pane_exists` blind: no real pane could
+    // ever be proven dead, so `code-review`'s resume waited forever on reviewers
+    // whose panes were gone instead of respawning them, and `cleanup`'s
+    // already-gone-pane guard never fired. Both streams are checked now.
+    #[test]
+    fn pane_get_error_on_stderr_proves_a_pane_is_missing() {
+        assert!(
+            pane_get_proves_missing(
+                "",
+                r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+            ),
+            "herdr writes the error to stderr — a pane proven gone there must count as gone"
+        );
+    }
+
+    #[test]
+    fn pane_get_error_on_stdout_still_proves_a_pane_is_missing() {
+        // Older herdr (and the socket path) answer on stdout. Keep honoring it, so
+        // the fix is additive rather than a swap of one blind spot for another.
+        assert!(pane_get_proves_missing(
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"}}"#,
+            ""
+        ));
+    }
+
+    #[test]
+    fn a_stderr_failure_that_is_not_pane_not_found_still_means_alive() {
+        // The whole point of the bias: an unreachable daemon must never read as a
+        // dead pane, whichever stream it complains on.
+        assert!(!pane_get_proves_missing(
+            "",
+            r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+        ));
+        assert!(!pane_get_proves_missing(
+            "",
+            "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+        ));
+        assert!(!pane_get_proves_missing("", ""), "silence proves nothing");
+    }
+
     #[test]
     fn only_pane_not_found_proves_a_pane_is_missing() {
         // The one answer that proves death.
         assert!(pane_get_proves_missing(
-            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#
+            r#"{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli:pane:get"}"#,
+            ""
         ));
 
         // Every other nonzero exit must read as "cannot tell" → alive. Reporting a
         // live reviewer dead makes `code-review` resume respawn work in progress.
         assert!(
             !pane_get_proves_missing(
-                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#
+                r#"{"error":{"code":"connection_refused","message":"daemon unreachable"}}"#,
+                ""
             ),
             "an unreachable daemon must never be read as a dead pane"
         );
         assert!(
             !pane_get_proves_missing(
-                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+                "Error: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }",
+                ""
             ),
             "a non-JSON failure (bad socket path) must not be read as a dead pane"
         );
-        assert!(!pane_get_proves_missing(""), "empty output proves nothing");
+        assert!(
+            !pane_get_proves_missing("", ""),
+            "empty output proves nothing"
+        );
     }
 
     // -- collect_pane_ids: what is actually in a workspace ---------------------
@@ -877,25 +2219,761 @@ mod tests {
         assert!(h.workspace_panes("ws-1").is_err());
     }
 
-    #[test]
-    fn parse_agent_status_from_pane_get() {
-        // `pane get` shape: status sits on the `result` object.
-        let json = r#"{"result":{"pane_id":"w1:p1","agent_status":"blocked"}}"#;
-        assert_eq!(parse_agent_status(json).as_deref(), Some("blocked"));
+    /// A verbatim `pane.get` response from herdr 0.7.5 for a pane whose claude
+    /// agent is alive. Captured live by the driver; the payload nests at
+    /// `result.pane`, NOT on `result` itself.
+    const LIVE_PANE_GET: &str = r#"{"id":"cli:pane:get","result":{"pane":{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"cca92f5b-3a8c-4008-a9f2-e2fa191395e5"},"agent_status":"working","cwd":"/home/sauyon/devel/drovr","display_agent":"claude","focused":false,"label":"implement-task-1","pane_id":"wAF:p1","revision":4,"tab_id":"wAF:t1","terminal_id":"term_abc","workspace_id":"wAF"},"type":"pane_info"}}"#;
+
+    /// The same call against a pane whose agent has EXITED: `agent_status` is
+    /// `"unknown"` and herdr drops the `agent` / `agent_session` keys entirely.
+    /// The pane (and its `tab_id`) still exist.
+    const EXITED_PANE_GET: &str = r#"{"id":"cli:pane:get","result":{"pane":{"agent_status":"unknown","cwd":"/home/sauyon/devel/drovr","focused":false,"label":"review-task-1","pane_id":"wAF:p2","revision":9,"tab_id":"wAF:t2","terminal_id":"term_def","workspace_id":"wAF"},"type":"pane_info"}}"#;
+
+    /// `socket_call` hands `parse_pane_info` the `result` value, so tests peel
+    /// the JSON-RPC envelope the same way.
+    fn socket_result(json: &str) -> Value {
+        serde_json::from_str::<Value>(json)
+            .unwrap()
+            .get("result")
+            .cloned()
+            .unwrap()
     }
 
     #[test]
-    fn parse_agent_status_from_pane_list() {
-        // `pane list` shape: status sits on a pane object nested in an array.
-        let json = r#"{"result":{"panes":[{"pane_id":"w1:p1","agent_status":"idle"},{"pane_id":"w1:p2","agent_status":"working"}]}}"#;
-        // Returns the first agent_status found while walking the value.
-        assert_eq!(parse_agent_status(json).as_deref(), Some("idle"));
+    fn parse_pane_info_reads_live_pane_get() {
+        let info = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
+        assert_eq!(info.tab_id.as_str(), "wAF:t1");
+        assert_eq!(info.agent_status, Some(AgentStatus::Working));
+        let session = info.agent_session.expect("live agent carries a session");
+        assert_eq!(session.kind(), "id");
+        assert_eq!(
+            session.resumable_for("claude").map(SessionId::as_str),
+            Some("cca92f5b-3a8c-4008-a9f2-e2fa191395e5")
+        );
+        assert_eq!(session.agent(), Some("claude"));
+    }
+
+    // A poll that fails at the SOCKET layer (connection refused, read timeout,
+    // JSON-RPC "unknown pane") is invisible downstream — it presents as an
+    // unexplained readiness or wait timeout. Say so once, naming the pane and
+    // herdr's own message.
+    #[test]
+    fn pane_get_error_message_names_the_pane_and_the_cause() {
+        let msg = pane_get_error_message("wAF:p1", "connection refused");
+        assert!(msg.contains("wAF:p1"), "msg: {msg}");
+        assert!(msg.contains("connection refused"), "msg: {msg}");
+        assert!(msg.contains("pane.get"), "msg: {msg}");
+    }
+
+    // The shape diagnostic names the KEYS it got, never their values: the
+    // payload carries cwds and terminal titles.
+    #[test]
+    fn pane_get_shape_message_lists_keys_not_values() {
+        let msg = pane_get_shape_message(
+            "wAF:p7",
+            &socket_result(
+                r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/home/someone/secret-project"}]}}"#,
+            ),
+        );
+        assert!(msg.contains("panes"), "msg: {msg}");
+        assert!(
+            msg.contains("wAF:p7"),
+            "the degraded pane must be nameable: {msg}"
+        );
+        assert!(
+            !msg.contains("secret-project"),
+            "values must never be printed: {msg}"
+        );
+        // A non-object result is reported, not swallowed.
+        assert!(pane_get_shape_message("wAF:p7", &Value::Null).contains("not an object"));
+    }
+
+    // Both diagnostics are gated so a 500 ms poll loop reports once per process
+    // rather than twice a second.
+    // Gated PER PANE, not per process: task 6 reaps across many panes, and one
+    // pane's transient failure must not silence every other pane's persistent
+    // one — that is precisely when the log is needed.
+    // Task 6 treats a close as best-effort and swallows the error after logging
+    // it, so an error that does not name the tab is close to useless.
+    #[test]
+    fn tab_close_error_message_names_the_tab_and_the_cause() {
+        let msg = tab_close_error_message(&TabId("wAF:t1".to_string()), "no such tab");
+        assert!(msg.contains("wAF:t1"), "msg: {msg}");
+        assert!(msg.contains("no such tab"), "msg: {msg}");
+        assert!(msg.contains("tab.close"), "msg: {msg}");
+    }
+
+    // herdr's JSON-RPC error body carries a machine-readable `code` alongside the
+    // human `message` (both `required` in `herdr api schema --json`). Flattening
+    // every application-level failure to `ErrorKind::Other` throws that away and
+    // leaves callers matching on prose — which is exactly what task 6 must not do:
+    // reaping is best-effort and specifically wants to IGNORE a tab that is
+    // already gone while still reporting a socket that is down.
+    #[test]
+    fn a_not_found_code_becomes_a_matchable_error_kind() {
+        // Probed against the live 0.7.5 daemon, not guessed: `tab.close` on an
+        // unknown tab answers `{"code":"tab_not_found", …}` and `pane.get` on an
+        // unknown pane answers `{"code":"pane_not_found", …}`.
+        assert_eq!(
+            herdr_error_kind(Some("tab_not_found"), "tab wAF:t9 not found"),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            herdr_error_kind(Some("pane_not_found"), "pane wAF:p9 not found"),
+            io::ErrorKind::NotFound
+        );
+        // Matched by SUFFIX, so a herdr that grows `workspace_not_found` or
+        // `agent_not_found` classifies without a drovr release.
+        assert_eq!(
+            herdr_error_kind(Some("workspace_not_found"), "workspace wAF not found"),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
-    fn parse_agent_status_missing_or_bad_json_returns_none() {
-        assert!(parse_agent_status(r#"{"result":{"pane_id":"w1:p1"}}"#).is_none());
-        assert!(parse_agent_status("not json at all").is_none());
+    fn a_malformed_call_is_invalid_input_and_anything_else_stays_other() {
+        // `invalid_request` is drovr's own bug (a bad params key, an unknown
+        // method) — never a transient condition to retry or ignore.
+        assert_eq!(
+            herdr_error_kind(Some("invalid_request"), "invalid request: missing field `tab_id`"),
+            io::ErrorKind::InvalidInput
+        );
+        // An unmapped code must NOT be guessed at from its message: `Other` is the
+        // honest answer, and the message still carries the code for a human.
+        assert_eq!(
+            herdr_error_kind(Some("agent_busy"), "agent is busy"),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn a_code_less_error_falls_back_to_the_message() {
+        // Defence against a herdr that stops sending `code` (it is `required`
+        // today): a "not found" phrasing is still worth classifying, because the
+        // alternative is task 6 string-matching it at the call site instead.
+        assert_eq!(
+            herdr_error_kind(None, "tab wAF:t9 not found"),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            herdr_error_kind(None, "connection reset"),
+            io::ErrorKind::Other
+        );
+        assert_eq!(herdr_error_kind(Some(""), "no such pane"), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_error_message_keeps_herdrs_own_text_and_names_the_code() {
+        // `pane_get_error_message` / `tab_close_error_message` echo this verbatim,
+        // and it is the only clue a human gets for an unmapped code.
+        let msg = herdr_error_message(Some("tab_not_found"), "tab wAF:t9 not found");
+        assert!(msg.starts_with("tab wAF:t9 not found"), "msg: {msg}");
+        assert!(msg.contains("tab_not_found"), "msg: {msg}");
+        // No code, nothing to append.
+        assert_eq!(herdr_error_message(None, "connection reset"), "connection reset");
+    }
+
+    // -- the delivery-confirming wait calls ------------------------------------
+
+    #[test]
+    fn a_wait_that_answers_normally_means_herdr_observed_the_start() {
+        // Success on an `agent.prompt`/`agent.wait` carrying a `wait` option is the
+        // ONLY positive proof drovr has that a seed arrived: herdr held the response
+        // open until it saw the agent enter `working`/`done`.
+        assert_eq!(
+            SystemHerdr::outcome_from(CallResult::Ok(Value::Null)).unwrap(),
+            PromptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn a_stall_verdict_is_an_outcome_not_an_error() {
+        // `agent_prompt_stalled` is herdr's precise no-state-change verdict, and
+        // `timeout` is what it degrades to when our deadline expires before that
+        // verdict is reached. Neither is a transport or protocol failure — they are
+        // the answer the caller asked for, so they must not surface as `Err` or the
+        // caller cannot tell "the seed did not take" from "herdr is down".
+        for code in ["agent_prompt_stalled", "timeout"] {
+            let result = CallResult::Failed {
+                code: Some(code.to_string()),
+                message: "no state change within 5000ms".to_string(),
+            };
+            assert_eq!(
+                SystemHerdr::outcome_from(result).unwrap(),
+                PromptOutcome::Stalled,
+                "code {code} must read as a stall"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_failure_on_a_wait_call_is_still_a_classified_error() {
+        // Everything that is NOT a stall stays an error, and keeps going through the
+        // same classification as every other call — so a caller can still match
+        // `NotFound` on a vanished pane rather than string-matching prose, and the
+        // code survives in the message for an unmapped one.
+        let err = SystemHerdr::outcome_from(CallResult::Failed {
+            code: Some("pane_not_found".to_string()),
+            message: "pane wC1:p2 not found".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("pane_not_found"), "err: {err}");
+    }
+
+    #[test]
+    fn a_code_less_failure_on_a_wait_call_is_not_mistaken_for_a_stall() {
+        // Fail CLOSED on a missing code: "we could not tell why" must never read as
+        // "the agent simply did not move", because the caller answers a stall by
+        // pressing a key at the pane.
+        let err = SystemHerdr::outcome_from(CallResult::Failed {
+            code: None,
+            message: "connection reset".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "connection reset");
+    }
+
+    #[test]
+    fn fake_outcome_queue_is_shared_and_defaults_to_started() {
+        // The queue is shared across `agent_prompt_confirm` and `agent_wait_started`
+        // so a test can script the real sequence — "the prompt stalls, then the
+        // nudge takes" — in call order.
+        let h = FakeHerdr::new();
+        assert_eq!(
+            h.agent_prompt_confirm("w1:p1", "hi", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Started,
+            "an empty queue models a healthy agent, so tests that do not care sail through"
+        );
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Started);
+        assert_eq!(
+            h.agent_prompt_confirm("w1:p1", "hi", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Stalled
+        );
+        assert_eq!(
+            h.agent_wait_started("w1:p1", Duration::from_secs(1))
+                .unwrap(),
+            PromptOutcome::Started
+        );
+        let calls = h.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("agent_prompt_confirm") && c.contains("hi")),
+            "the confirming prompt must record its payload: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("agent_wait_started")),
+            "the post-nudge wait must be distinguishable from the prompt: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn fake_can_model_a_pane_that_cannot_be_read() {
+        // A caller that decides anything from pane CONTENTS has to have this branch
+        // driven: an unreadable pane is not an empty one.
+        let h = FakeHerdr::new();
+        h.push_read("composer");
+        h.fail_agent_read();
+        assert!(h.agent_read("w1:p1").is_err());
+    }
+
+    #[test]
+    fn first_time_is_true_once_per_pane() {
+        let seen = Mutex::new(BTreeSet::new());
+        assert!(first_time_for(&seen, "w1:p1"), "the first call reports");
+        assert!(!first_time_for(&seen, "w1:p1"), "and every later one is silent");
+        assert!(
+            first_time_for(&seen, "w1:p2"),
+            "a different pane reports on its own"
+        );
+        assert!(!first_time_for(&seen, "w1:p2"));
+    }
+
+    #[test]
+    fn the_warned_pane_set_is_bounded() {
+        // These sets are `static`: they live for the whole process, and the
+        // always-on review server is the one drovr process that never restarts.
+        // Remembering every pane id it ever polled is a slow leak.
+        let seen = Mutex::new(BTreeSet::new());
+        for i in 0..10_000 {
+            first_time_for(&seen, &format!("w1:p{i}"));
+        }
+        let len = seen.lock().unwrap().len();
+        assert!(
+            len < 10_000,
+            "the warned-pane set must not grow with every pane ever polled: {len}"
+        );
+        // Whatever the eviction rule, the gate it exists for still holds for a
+        // pane seen right now.
+        assert!(first_time_for(&seen, "w1:fresh"));
+        assert!(!first_time_for(&seen, "w1:fresh"));
+    }
+
+    // Tasks 3 and 6 both hinge on telling these three outcomes apart, so the
+    // classification is a named type rather than something each consumer
+    // reconstructs from two Options.
+    #[test]
+    fn pane_state_distinguishes_the_three_poll_outcomes() {
+        // (A) the poll itself failed — herdr unreachable, or the pane is gone.
+        assert_eq!(PaneState::from_poll(None), PaneState::Unreadable);
+
+        // (B) herdr answered and an agent is attached.
+        let live = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
+        assert_eq!(live.state(), PaneState::AgentAttached);
+        assert_eq!(PaneState::from_poll(Some(&live)), PaneState::AgentAttached);
+        assert!(live.has_agent_session());
+
+        // (C) herdr answered; the pane and its tab are there, no agent session.
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert_eq!(exited.state(), PaneState::NoAgentSession);
+        assert_eq!(PaneState::from_poll(Some(&exited)), PaneState::NoAgentSession);
+        assert!(!exited.has_agent_session());
+        assert_eq!(
+            exited.tab_id.as_str(),
+            "wAF:t2",
+            "an exited agent still has a closable tab"
+        );
+
+        // The three are pairwise distinct — a consumer that collapses any two of
+        // them either reaps a live agent or never reaps at all.
+        assert_ne!(PaneState::from_poll(None), exited.state());
+        assert_ne!(exited.state(), live.state());
+    }
+
+    // A missing `agent_status` field is NOT the agent exiting: herdr may answer
+    // without a status while a session is plainly attached. Reaping must key off
+    // the session, never the status field.
+    #[test]
+    fn a_missing_status_field_is_not_an_exited_agent() {
+        let statusless = PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: None,
+            agent_session: Some(AgentSession::Id(IdSession {
+                value: SessionId("abc".to_string()),
+                agent: Some("claude".to_string()),
+            })),
+        };
+        assert!(statusless.status_unreadable());
+        assert!(statusless.has_agent_session());
+        assert_eq!(statusless.state(), PaneState::AgentAttached);
+
+        // And the converse: an exited agent's status is readable — herdr's own
+        // `unknown` — so the two predicates are genuinely independent.
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert!(!exited.status_unreadable());
+        assert!(!exited.has_agent_session());
+    }
+
+    // The state is keyed off the SESSION, never off the status. A pane that
+    // reports `working` with no session is still session-less — a status-keyed
+    // implementation (`agent_status == Some(Unknown)`) would call this attached
+    // and hide a finished pane from reaping forever.
+    #[test]
+    fn pane_state_is_keyed_off_the_session_not_the_status() {
+        let working_but_session_less = PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: Some(AgentStatus::Working),
+            agent_session: None,
+        };
+        assert!(!working_but_session_less.has_agent_session());
+        assert_eq!(working_but_session_less.state(), PaneState::NoAgentSession);
+        assert!(!working_but_session_less.status_unreadable());
+    }
+
+    // A pane that NEVER ran an agent — a bare shell, which is what drovr's own
+    // root pane is — is indistinguishable from one whose agent exited: herdr's
+    // `pane.get` reports neither an `agent` nor an `agent_session` for either.
+    // `NoAgentSession` is named for what it can actually prove. Deciding whether
+    // a session-less pane is safe to close needs the RUN, not this type.
+    #[test]
+    fn a_pane_that_never_had_an_agent_is_not_distinguishable_from_an_exited_one() {
+        let shell = parse_pane_info(&socket_result(
+            r#"{"result":{"pane":{"pane_id":"w1:p0","tab_id":"w1:t0","cwd":"/proj","focused":false}}}"#,
+        ))
+        .expect("a bare shell pane is still a readable pane");
+        assert_eq!(shell.state(), PaneState::NoAgentSession);
+        assert!(shell.status_unreadable(), "a shell has no agent_status at all");
+        let exited = parse_pane_info(&socket_result(EXITED_PANE_GET)).unwrap();
+        assert_eq!(
+            shell.state(),
+            exited.state(),
+            "same state — the difference is knowable only from the run"
+        );
+    }
+
+    #[test]
+    fn agent_status_parses_herdrs_vocabulary() {
+        for (raw, expected) in [
+            ("idle", AgentStatus::Idle),
+            ("working", AgentStatus::Working),
+            ("blocked", AgentStatus::Blocked),
+            ("done", AgentStatus::Done),
+            ("unknown", AgentStatus::Unknown),
+        ] {
+            assert_eq!(AgentStatus::from_herdr(raw), expected, "raw: {raw}");
+            assert_eq!(expected.as_str(), raw, "as_str must round-trip: {raw}");
+        }
+    }
+
+    // A herdr state this drovr has never heard of must be PRESERVED, never
+    // collapsed onto a known one. `Done` is what tears a pane down, so mistaking
+    // a new herdr state for it would reap a live agent.
+    #[test]
+    fn an_unrecognised_status_is_preserved_not_collapsed() {
+        let status = AgentStatus::from_herdr("compacting");
+        assert_eq!(status, AgentStatus::Other("compacting".to_string()));
+        assert_ne!(status, AgentStatus::Done);
+        assert_ne!(status, AgentStatus::Idle);
+        assert_ne!(status, AgentStatus::Unknown);
+        assert_eq!(status.as_str(), "compacting", "the raw value survives");
+        // And it reaches callers intact, straight off the wire.
+        let v = socket_result(
+            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_status":"compacting"}}}"#,
+        );
+        assert_eq!(
+            parse_pane_info(&v).unwrap().agent_status,
+            Some(AgentStatus::Other("compacting".to_string()))
+        );
+    }
+
+    // `kind == "id"` is the ONLY value that may ever be interpolated into an
+    // agent's `--resume`. The type carries that rule so no caller has to.
+    #[test]
+    fn only_an_id_session_is_resumable() {
+        let id = AgentSession::Id(IdSession {
+            value: SessionId("cca92f5b".to_string()),
+            agent: Some("claude".to_string()),
+        });
+        let resumable = id
+            .resumable_for("claude")
+            .expect("an id session owned by the backend asking for it");
+        assert_eq!(resumable, &SessionId("cca92f5b".to_string()));
+        assert_eq!(
+            resumable.as_str(),
+            "cca92f5b",
+            "the raw id is still reachable, but only through a SessionId"
+        );
+        // A MIS-attributed id is as unusable as an unattributed one: resuming a
+        // claude session under cursor is not a recoverable mistake, so the id is
+        // not obtainable at all unless the backend matches.
+        assert!(
+            id.resumable_for("cursor").is_none(),
+            "another backend must not be able to reach this id"
+        );
+        assert!(
+            id.resumable_for("").is_none(),
+            "a caller that cannot name its backend must not resume"
+        );
+        assert_eq!(
+            id.resumable_for("Claude").map(SessionId::as_str),
+            Some("cca92f5b"),
+            "backend names compare case-insensitively"
+        );
+        assert_eq!(id.agent(), Some("claude"));
+        assert_eq!(id.kind(), "id");
+
+        // An id whose owning agent herdr did not report is NOT resumable: with
+        // no backend to compare against we cannot know the id belongs to this
+        // run's agent, and resuming a claude session under cursor is not a
+        // recoverable mistake.
+        let agentless = AgentSession::Id(IdSession {
+            value: SessionId("cca92f5b".to_string()),
+            agent: None,
+        });
+        assert!(
+            agentless.resumable_for("claude").is_none(),
+            "half of the rule is not enough"
+        );
+        assert_eq!(agentless.kind(), "id", "but it is still an id session");
+
+        let path = AgentSession::Path {
+            value: "/tmp/transcript.jsonl".to_string(),
+        };
+        assert!(
+            path.resumable_for("claude").is_none(),
+            "a path is never a session id"
+        );
+        // …and a `Path`'s value cannot be passed off as one: only `Id` carries a
+        // `SessionId`, so an or-pattern merging the two variants to lift out a
+        // single `value` binding does not type-check.
+        assert!(path.resumable_for("claude").is_none());
+        assert_eq!(path.kind(), "path");
+        assert_eq!(path.agent(), None);
+
+        let other = AgentSession::Other {
+            kind: "handle".to_string(),
+            value: "abc".to_string(),
+        };
+        assert!(
+            other.resumable_for("claude").is_none(),
+            "an unrecognised kind is not resumable either"
+        );
+        assert_eq!(other.kind(), "handle");
+    }
+
+    // An exited agent must still yield `Some(PaneInfo)` — with `agent_session:
+    // None` and a populated `tab_id`. Task 3 leans on this distinction: `None`
+    // means "could not read the pane", which must never clear a captured
+    // session, whereas `Some` with no session means "pane alive, agent gone".
+    #[test]
+    fn parse_pane_info_exited_agent_keeps_tab_id_and_drops_session() {
+        let info = parse_pane_info(&socket_result(EXITED_PANE_GET))
+            .expect("an exited agent still has a pane");
+        assert_eq!(info.tab_id.as_str(), "wAF:t2");
+        assert_eq!(info.agent_status, Some(AgentStatus::Unknown));
+        assert!(info.agent_session.is_none());
+    }
+
+    // Regression guard for the reason this parser is structural: `pane_id`,
+    // `tab_id`, `terminal_id` and the session's own fields are ALL strings, so
+    // the recursive `find_string_field` dig would return whichever it met first.
+    #[test]
+    fn parse_pane_info_does_not_confuse_pane_id_with_tab_id() {
+        let info = parse_pane_info(&socket_result(LIVE_PANE_GET)).unwrap();
+        assert_ne!(info.tab_id.as_str(), "wAF:p1", "tab_id must not be the pane_id");
+        // And a pane id cannot be handed to `tab_close` at all: it takes a
+        // `TabId`, which only `pane_info`'s parser can build.
+        assert_eq!(info.tab_id, TabId("wAF:t1".to_string()));
+        assert_eq!(
+            find_string_field(&socket_result(LIVE_PANE_GET), "agent").as_deref(),
+            Some("claude"),
+            "sanity: the recursive dig is still what tab_create/agent_read use"
+        );
+    }
+
+    #[test]
+    fn parse_pane_info_rejects_shapes_that_are_not_a_pane() {
+        // `pane.list` shape — a pane *array*, not a single pane. Not a PaneInfo.
+        let list = socket_result(
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"idle"}]}}"#,
+        );
+        assert!(parse_pane_info(&list).is_none());
+        // No `tab_id` → nothing to close later, so not a usable PaneInfo.
+        let no_tab = socket_result(r#"{"result":{"pane":{"pane_id":"w1:p1","agent_status":"idle"}}}"#);
+        assert!(parse_pane_info(&no_tab).is_none());
+        // An empty tab_id is as good as absent.
+        let empty_tab =
+            socket_result(r#"{"result":{"pane":{"pane_id":"w1:p1","tab_id":"","agent_status":"idle"}}}"#);
+        assert!(parse_pane_info(&empty_tab).is_none());
+    }
+
+    // A `kind:"path"` session is still parsed and returned verbatim — task 5's
+    // resume path is what refuses to interpolate it, and it can only refuse a
+    // value it can see.
+    #[test]
+    fn parse_pane_info_keeps_non_id_session_kinds() {
+        let v = socket_result(
+            r#"{"result":{"pane":{"pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"idle","agent_session":{"kind":"path","value":"/tmp/t.jsonl"}}}}"#,
+        );
+        let session = parse_pane_info(&v).unwrap().agent_session.unwrap();
+        assert_eq!(
+            session,
+            AgentSession::Path {
+                value: "/tmp/t.jsonl".to_string()
+            }
+        );
+        assert!(
+            session.resumable_for("claude").is_none(),
+            "a path is not a session id"
+        );
+        // The `agent` key is optional, and an id session parses without it.
+        let v = socket_result(
+            r#"{"result":{"pane":{"tab_id":"w1:t1","agent_session":{"kind":"id","value":"abc"}}}}"#,
+        );
+        let session = parse_pane_info(&v).unwrap().agent_session.unwrap();
+        assert_eq!(session.kind(), "id", "it is still parsed faithfully");
+        assert_eq!(session.agent(), None);
+        assert!(
+            session.resumable_for("claude").is_none(),
+            "an id herdr did not attribute to an agent is not safely resumable"
+        );
+    }
+
+    // `kind` and `value` are each independently required: a session missing
+    // either one is no session. Asserted separately because a struct literal
+    // short-circuits on the first `?`, so dropping both at once would only ever
+    // prove the FIRST field is required.
+    #[test]
+    fn parse_pane_info_ignores_a_session_missing_kind_or_value() {
+        let case = |session: &str| {
+            let v = socket_result(&format!(
+                r#"{{"result":{{"pane":{{"tab_id":"w1:t1","agent_session":{session}}}}}}}"#
+            ));
+            parse_pane_info(&v).expect("the pane itself is still readable")
+        };
+        // Neither field.
+        let info = case(r#"{"agent":"claude","source":"herdr:claude"}"#);
+        assert_eq!(info.tab_id.as_str(), "w1:t1");
+        assert!(info.agent_session.is_none(), "an id-less session is no session");
+        assert!(info.agent_status.is_none());
+        // `kind` only — an unusable session id must not be resumable-looking.
+        assert!(
+            case(r#"{"kind":"id","agent":"claude"}"#).agent_session.is_none(),
+            "a session with no value must not parse"
+        );
+        assert!(
+            case(r#"{"kind":"id","value":"","agent":"claude"}"#)
+                .agent_session
+                .is_none(),
+            "an empty value is as absent as a missing one"
+        );
+        // `value` only — a value drovr cannot classify must not be resumed.
+        assert!(
+            case(r#"{"value":"cca92f5b","agent":"claude"}"#)
+                .agent_session
+                .is_none(),
+            "a session with no kind must not parse"
+        );
+    }
+
+    // `agent_status` is now a provided trait method over the single `pane_info`
+    // poll primitive: same contract (`idle|working|blocked|done|unknown` or
+    // `None`), one socket round-trip.
+    #[test]
+    fn a_failed_poll_is_distinguishable_from_an_exited_agent() {
+        let h = FakeHerdr::new();
+        // herdr could not be reached / the pane is gone.
+        h.push_pane_info(None);
+        assert!(
+            h.pane_info("w1:p1").is_none(),
+            "a failed poll yields no PaneInfo at all"
+        );
+        // The pane is alive and its agent has exited: herdr answered, the tab is
+        // still there, the status is its own `unknown`, and the session is gone.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: Some(AgentStatus::Unknown),
+            agent_session: None,
+        }));
+        let exited = h.pane_info("w1:p1").expect("an exited agent still has a pane");
+        assert_eq!(exited.tab_id.as_str(), "w1:t1");
+        assert_eq!(exited.agent_status, Some(AgentStatus::Unknown));
+        assert!(exited.agent_session.is_none());
+        // The two cases must never collapse: a reaper that mistook the first for
+        // the second would tear down a pane whose agent is alive and working.
+        // There is no projection on the trait that can lose this — `pane_info` is
+        // the only poll, and it returns the whole `PaneInfo`.
+        h.push_pane_info(Some(PaneInfo {
+            tab_id: TabId("w1:t1".to_string()),
+            agent_status: Some(AgentStatus::Working),
+            agent_session: None,
+        }));
+        let working = h.pane_info("w1:p1").unwrap();
+        assert_ne!(working.agent_status, exited.agent_status);
+    }
+
+    // Task 6 asserts on CALL ORDER (agent_read before tab_close, focus captured
+    // and restored around the close), so both new primitives must record an
+    // unambiguous, argument-carrying line.
+    #[test]
+    fn fake_records_pane_info_and_tab_close_with_arguments() {
+        let h = FakeHerdr::new();
+        h.pane_info("w1:p9");
+        h.tab_close(&TabId("w1:t9".to_string())).unwrap();
+        let calls = h.calls();
+        assert_eq!(calls.len(), 2, "one line per call: {calls:?}");
+        assert!(calls[0].starts_with("pane_info pane=w1:p9"), "call: {}", calls[0]);
+        assert_eq!(calls[1], "tab_close tab=w1:t9");
+    }
+
+    // `pane_info` is the status poll, so its recorded line carries the status —
+    // that is what the "no status poll happened" assertions in phase.rs match on.
+    #[test]
+    fn fake_pane_info_records_the_status_it_returned() {
+        let h = FakeHerdr::new();
+        h.push_status(Some("working"));
+        h.pane_info("w1:p1");
+        assert!(
+            h.calls()[0].contains("agent_status=Some(Working)"),
+            "call: {}",
+            h.calls()[0]
+        );
+    }
+
+    // Scripted failures mirror `fail_pane_run`: reaping is best-effort, so task 6
+    // needs both a pane whose info cannot be read and a close that fails.
+    #[test]
+    fn fake_scripted_failures_for_pane_info_and_tab_close() {
+        let h = FakeHerdr::new();
+        h.fail_pane_info();
+        assert!(h.pane_info("w1:p1").is_none());
+        assert!(h.pane_info("w1:p1").is_none(), "and stays unreadable");
+        // A failed poll is STILL a poll: it must be recorded, and its line must
+        // carry `agent_status` like every other, so "a poll happened but the
+        // pane was unreadable" stays distinguishable from "no poll happened".
+        let calls = h.calls();
+        assert_eq!(calls.len(), 2, "both polls recorded: {calls:?}");
+        for call in &calls {
+            assert!(call.starts_with("pane_info pane=w1:p1"), "call: {call}");
+            assert!(call.contains("agent_status=None"), "call: {call}");
+        }
+
+        let h = FakeHerdr::new();
+        h.fail_tab_close();
+        let err = h.tab_close(&TabId("w1:t1".to_string())).unwrap_err();
+        assert!(err.to_string().contains("tab_close"), "err: {err}");
+        assert_eq!(
+            h.calls(),
+            vec!["tab_close tab=w1:t1".to_string()],
+            "a failed close is still recorded, so order assertions see it"
+        );
+    }
+
+    // Unscripted, the fake models a normal live pane: an idle agent in a tab
+    // derived from the pane id, so tests that only care about `tab_close` can
+    // resolve a tab without scripting a full PaneInfo.
+    #[test]
+    fn fake_pane_info_defaults_to_an_idle_pane_with_a_derivable_tab() {
+        let h = FakeHerdr::new();
+        let info = h.pane_info("pane-1").unwrap();
+        assert_eq!(info.tab_id, FakeHerdr::tab_id_for("pane-1"));
+        assert_eq!(info.agent_status, Some(AgentStatus::Idle));
+        // An attached agent ALWAYS carries a session in real herdr: a live
+        // `working` pane was captured with one and an exited pane without (see
+        // LIVE_PANE_GET / EXITED_PANE_GET), and herdr 0.7.5's schema marks the
+        // field required whenever an agent is attached. A fake that omitted it
+        // would teach every later test that a live agent looks session-less, and
+        // reaping keys off exactly that.
+        assert_eq!(info.state(), PaneState::AgentAttached);
+        let session = info.agent_session.expect("an attached agent has a session");
+        assert_eq!(
+            session.resumable_for("claude").map(SessionId::as_str),
+            Some(FakeHerdr::session_value_for("pane-1").as_str())
+        );
+    }
+
+    // Only an EXITED agent lacks a session, and herdr signals that with its own
+    // `unknown` status — so the fake ties the two together the way herdr does.
+    #[test]
+    fn fake_pane_info_drops_the_session_only_for_an_exited_agent() {
+        let h = FakeHerdr::new();
+        h.push_status(Some("unknown"));
+        let exited = h.pane_info("pane-1").unwrap();
+        assert_eq!(exited.agent_status, Some(AgentStatus::Unknown));
+        assert!(!exited.has_agent_session());
+        assert_eq!(exited.state(), PaneState::NoAgentSession);
+        assert_eq!(
+            exited.tab_id,
+            FakeHerdr::tab_id_for("pane-1"),
+            "an exited agent still has a closable tab"
+        );
+
+        // Every other status models an attached agent, session and all —
+        // INCLUDING one drovr has never seen, so a refactor that enumerates the
+        // four known-live variants instead of "everything but unknown" is caught.
+        for status in ["idle", "working", "blocked", "done", "compacting"] {
+            h.push_status(Some(status));
+            let info = h.pane_info("pane-1").unwrap();
+            assert_eq!(
+                info.state(),
+                PaneState::AgentAttached,
+                "{status} is a live agent"
+            );
+        }
     }
 
     #[test]
@@ -903,14 +2981,15 @@ mod tests {
         let h = FakeHerdr::new();
         // Empty queue → a ready, idle agent (so phase_send's readiness gate does
         // not wait out its timeout when a test does not script status).
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
+        let status = |h: &FakeHerdr| h.pane_info("pane-1").and_then(|i| i.agent_status);
+        assert_eq!(status(&h), Some(AgentStatus::Idle));
         h.push_status(Some("blocked"));
         h.push_status(None::<String>);
         // Scripted values are consumed FIFO, including an explicit unreadable None.
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("blocked"));
-        assert_eq!(h.agent_status("pane-1"), None);
+        assert_eq!(status(&h), Some(AgentStatus::Blocked));
+        assert_eq!(h.pane_info("pane-1"), None, "an unreadable pane has no info");
         // Queue drained → back to the idle default.
-        assert_eq!(h.agent_status("pane-1").as_deref(), Some("idle"));
+        assert_eq!(status(&h), Some(AgentStatus::Idle));
         assert!(
             h.calls()
                 .iter()
@@ -986,6 +3065,8 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let env = SystemHerdr::new().agent_env();
         unsafe {
@@ -1027,6 +3108,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let env = SystemHerdr::new().agent_env();
         let map = env.as_object().expect("agent_env must be a JSON object");
@@ -1057,12 +3140,16 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
             std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
             std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-test");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://example.test");
         }
         let env = SystemHerdr::new().agent_env();
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_MODEL");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
         }
         let map = env.as_object().expect("agent_env must be a JSON object");
         assert_eq!(
@@ -1078,6 +3165,16 @@ mod tests {
         assert_eq!(
             map.get("ANTHROPIC_MODEL").and_then(Value::as_str),
             Some("claude-opus-4-5"),
+            "{env}"
+        );
+        assert_eq!(
+            map.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str),
+            Some("tok-test"),
+            "{env}"
+        );
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").and_then(Value::as_str),
+            Some("https://example.test"),
             "{env}"
         );
         assert_eq!(

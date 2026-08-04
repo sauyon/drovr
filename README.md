@@ -240,12 +240,13 @@ the intended interface for agents — the CLI is the mechanism, the skills are t
 | Skill | Use when |
 |---|---|
 | `drovr:using-drovr` | Orientation: prerequisites, the single-writer rule, and choosing handoff vs pipeline. |
-| `drovr:handoff` | Carry finished work across one phase boundary to a fresh agent (start → **inject seed** → wait → collect; the phase agent authors its own handoff before `phase done`). |
+| `drovr:handoff` | Carry finished work across one phase boundary to a fresh agent (start **briefed** → wait → collect; the phase agent authors its own handoff before `phase done`). |
 | `drovr:pipeline` | Run a whole change through brainstorm → plan → implement → review with a human spec gate. |
 
-**The load-bearing contract:** `drovr phase start` spawns a plain `claude` and only records
-the seed *path* — it does **not** inject the briefing. The skill injects it via
-`drovr phase send`. At the spec gate, the agent must run `drovr review summary <run> "<text>"`
+**The load-bearing contract:** drovr composes every brief and injects it —
+`drovr phase start <run> <phase> --context …` for a phase, `drovr code-review run/brief
+… --context …` for a reviewer. You supply only the context; `drovr phase brief` prints
+exactly what an agent will be told. Never author the frame yourself. At the spec gate, the agent must run `drovr review summary <run> "<text>"`
 after **every** edit to `spec.md`, and the finishing phase agent authors exactly
 `<phase>-HANDOFF.md` (the filename `drovr collect` reads) before `drovr phase done`.
 

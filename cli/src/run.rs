@@ -2,21 +2,120 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io};
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Default)]
 pub enum PhaseStatus {
+    #[default]
     Pending,
     Running,
     Done,
     Failed,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// Identifies ONE launch of a phase's agent ("pass"). Minted by `phase_start`,
+/// carried to the agent in `$DROVR_PASS`, stamped into `<phase>.done`, and
+/// compared for equality by `phase_wait` — never parsed, ordered, or displayed as
+/// anything but itself.
+///
+/// A newtype rather than a bare `String` because every other string in this area
+/// (phase names, pane ids, marker paths, env var names) is also a `String`, and
+/// mixing them up would be a silent equality check that is always false — i.e. a
+/// phase that never completes. This makes that class of mistake a type error.
+///
+/// An empty token is NOT representable — neither through [`PassToken::new`] nor
+/// through `Deserialize`. "This phase has no token" is `Option::None` and means
+/// something specific (a run created before pass tokens, which completes on an
+/// UNTOKENIZED marker); a `PassToken("")` would be `Some` while matching no
+/// marker at all, i.e. a phase that can never complete under either rule. The
+/// two must not be the same value.
+///
+/// Serializes transparently as a JSON string, so `state.json` is unchanged.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+#[serde(try_from = "String")]
+pub struct PassToken(String);
+
+impl PassToken {
+    /// `None` for a value no marker could ever match. The only in-tree caller
+    /// (`phase::new_pass_token`) builds from `format!`ed pid/nanos/counter and so
+    /// can never hit it, but `new` is `pub` and this is the invariant the type
+    /// exists to carry.
+    pub fn new(value: String) -> Option<PassToken> {
+        if value.trim().is_empty() {
+            return None;
+        }
+        Some(PassToken(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// Whether a `<phase>.done` marker holding `token` was written by the agent
+    /// this pass launched. Empty never matches: an empty marker means the writer
+    /// had no `$DROVR_PASS` at all, which is either a pre-token build or a
+    /// `phase done` run from outside the pane — neither is evidence about *this*
+    /// pass.
+    pub fn matches_marker(&self, token: &str) -> bool {
+        !token.is_empty() && token == self.0
+    }
+}
+
+/// The second constructor: `state.json` is a file, and anything that can write it
+/// can propose a token. It is held to exactly the rule [`PassToken::new`]
+/// enforces, so a deserialized token is as trustworthy as a minted one. A run
+/// whose state really does carry `"pass": ""` fails to load LOUDLY rather than
+/// running on with a phase that no `phase wait` could ever complete.
+impl TryFrom<String> for PassToken {
+    type Error = String;
+    fn try_from(value: String) -> Result<PassToken, String> {
+        PassToken::new(value).ok_or_else(|| "pass token must not be empty".to_string())
+    }
+}
+
+impl std::fmt::Display for PassToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One phase of a run. Construct via [`Phase::new`] or
+/// `Phase { name: …, ..Default::default() }` — never by listing every field, so
+/// adding a field stays a one-line diff instead of touching ~25 literal sites.
+///
+/// The cost of that convenience, for whoever adds the next field:
+/// * The compiler no longer flags construction sites that ought to populate it.
+///   Grep the `..Default::default()` sites and decide each one deliberately.
+/// * No field here is `#[serde(default)]`, so deserialization REQUIRES all of
+///   them. A new field without `#[serde(default)]` makes every existing
+///   `state.json` fail to load → `load_run` exits 1 → the run STOPs. Mirror
+///   `RunState`'s `#[serde(default, skip_serializing_if = "Option::is_none")]`
+///   and add a back-compat test for it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Phase {
     pub name: String,
     pub status: PhaseStatus,
     pub handoff_doc: Option<String>,
     pub herdr_session: Option<String>,
     pub pane_id: Option<String>,
+    /// Token identifying the CURRENT pass over this phase, minted by each
+    /// `phase_start` and exported into the agent's environment as `DROVR_PASS`.
+    /// `drovr phase done` stamps it into `<phase>.done`, and `phase_wait` accepts
+    /// a marker only if its token matches this one — which is what stops the
+    /// previous pass's still-live agent from completing the current pass by
+    /// recreating the marker. `None` only for runs created before pass tokens
+    /// existed — `phase_start` persists a token before it launches anything, so no
+    /// phase this build has started is ever `None`. Such a legacy phase completes
+    /// on an UNTOKENIZED marker (its agent has no `$DROVR_PASS` to stamp either);
+    /// a tokened marker against it is an inconsistency and is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<PassToken>,
+}
+
+impl Phase {
+    /// A `Pending` phase named `name`, with every other field at its default.
+    pub fn new(name: &str) -> Phase {
+        Phase {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -70,6 +169,62 @@ pub struct RunState {
     /// run that never finished its phases would otherwise display as live
     /// forever. `#[serde(default)]` + skip-if-false keeps pre-existing
     /// `state.json` files loading (and re-serializing) unchanged.
+    ///
+    /// # `state.json` IS THE AUTHORITY FOR THIS FIELD
+    ///
+    /// Unique among `RunState`'s fields: `archived` is set by a *different*
+    /// process from the one holding this struct — `drovr cleanup`, or the review
+    /// server's Archive/Restore button, both of which re-read and then
+    /// [`save`](RunState::save) — while every other field is owned by whoever
+    /// loaded the run. So an in-memory `archived` is a CACHE, and it can be stale
+    /// in either direction: `false` when the human has just archived, `true` when
+    /// they have just restored.
+    ///
+    /// The rule, and it has no exceptions:
+    ///
+    /// * **Consulting it means refreshing it** — call
+    ///   [`refresh_archived`](RunState::refresh_archived), which re-reads
+    ///   `state.json`, adopts what it finds, and returns it. Reading the field
+    ///   directly answers a question about your own copy, not about the run.
+    /// * **Writing it means owning it** — a caller that has *decided* to archive
+    ///   or restore sets the field and uses [`save`](RunState::save) /
+    ///   [`save_in`](RunState::save_in), which write it verbatim. Everyone else
+    ///   uses [`save_preserving_archived`](RunState::save_preserving_archived),
+    ///   which takes disk's value over its own.
+    ///
+    /// This was not always one rule, and the gap had teeth: a guard that read disk
+    /// while the save beside it merged with `|=` could refuse to repair a restored
+    /// run, or silently re-archive one. Two sources of truth for one bit is enough
+    /// to invert a human's decision.
+    ///
+    /// ## The rule is a CONVENTION — the type does not enforce it
+    ///
+    /// This field is `pub bool`, so nothing stops a new call site reading it
+    /// directly and acting on a stale value. Said plainly rather than left to be
+    /// inferred from the paragraphs above, which describe a discipline the
+    /// compiler knows nothing about.
+    ///
+    /// Not enforced because the obvious enforcement is worse than the gap. A
+    /// private field needs a constructor and rewrites at 17 struct literals across
+    /// 6 files (`RunState` has no `Default`), and an accessor that reads the
+    /// authority would put a `state.json` read behind every consultation —
+    /// including [`is_complete`](RunState::is_complete), which the review server
+    /// calls per row on a 2s poll. That trades a documented convention for a hot
+    /// disk read and a wide mechanical change.
+    ///
+    /// **Kept by these tests**, which fail if a site stops obeying it:
+    /// * `run::tests::refresh_archived_adopts_disk_in_both_directions`
+    /// * `run::tests::refresh_archived_fails_loudly_rather_than_picking_an_authority`
+    /// * `run::tests::a_save_never_re_archives_a_run_the_human_restored`
+    /// * `run::tests::a_stale_save_never_resurrects_an_archived_run`
+    /// * `run::tests::restore_can_still_clear_the_archived_flag`
+    /// * `phase::tests::repairing_a_restored_run_leaves_it_restored_on_disk`
+    /// * `phase::tests::a_restore_on_disk_beats_a_stale_archive_held_in_memory`
+    /// * `phase::tests::an_unreadable_state_json_refuses_the_repair_rather_than_guessing`
+    /// * `code_review::tests::archiving_mid_run_survives_every_save_the_review_makes`
+    ///
+    /// A reader added to that list is a reader that must go through
+    /// [`refresh_archived`](RunState::refresh_archived) first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
     /// Panes drovr opened that no longer belong to any phase, yet are still
@@ -144,14 +299,127 @@ impl RunState {
         let p = run_dir(name).join("state.json");
         serde_json::from_str(&fs::read_to_string(p)?).map_err(io::Error::other)
     }
+    /// Write `state.json` ATOMICALLY: serialize into a temp file in the same
+    /// directory, then `fs::rename` it over the target. A bare `fs::write`
+    /// truncates in place, so any concurrent READER (the always-on review server
+    /// reading run state, a second CLI invocation, a `phase wait` loop) can parse
+    /// a half-written file — and a failed `load_run` exits 1, which per the
+    /// pipeline skill STOPs the whole run. A same-directory rename is atomic on
+    /// POSIX: a reader sees either the old file or the new one, never a splice.
+    ///
+    /// The temp name carries pid + a process-local counter rather than being a
+    /// fixed `state.json.tmp`: two concurrent savers sharing one temp path would
+    /// interleave their writes into the same inode and rename that corruption
+    /// into place, which is precisely the failure this is meant to remove.
+    ///
+    /// Scope, precisely — this fixes torn READS and nothing else:
+    /// * NOT durability. The temp file is not `fsync`ed and neither is the
+    ///   directory, so a power loss can still leave a stale (or, on some
+    ///   filesystems, empty) `state.json`. Deliberate: `save` runs in poll loops
+    ///   and an fsync per save is not worth it for a workflow whose herdr
+    ///   workspace does not survive a crash either.
+    /// * NOT serialized updates. Every writer still does load→mutate→save on its
+    ///   own copy, so two concurrent CLI invocations cleanly clobber each other
+    ///   whole-file. Losing an update is the pre-existing behavior; this only
+    ///   guarantees the loser's file is never *corrupt*.
+    /// * A SIGKILL between the write and the rename orphans a
+    ///   `.state.json.tmp.<pid>.<n>`; nothing sweeps it. Cosmetic — every
+    ///   `read_dir` over a run root gates on a `state.json` child, and nothing
+    ///   enumerates inside a run dir.
     pub fn save(&self) -> io::Result<()> {
-        let dir = run_dir(&self.name);
-        fs::create_dir_all(&dir)?;
-        fs::write(
-            dir.join("state.json"),
-            serde_json::to_string_pretty(self).map_err(io::Error::other)?,
-        )?;
+        self.save_in(&run_dir(&self.name))
+    }
+    /// Save into an explicitly given run directory.
+    ///
+    /// The always-on server is parameterised on a `runs_root` (a temp dir under
+    /// test), so its writers must not go through [`RunState::save`]: that
+    /// resolves `run_dir()` from the ambient `XDG_DATA_HOME` and would write to
+    /// the developer's real data dir instead of the root the server was handed.
+    ///
+    /// The atomicity described on `save` lives HERE, so it applies to the
+    /// server's writes too — they are the ones a reader is most likely to race,
+    /// being a button a human can hit mid-phase.
+    pub fn save_in(&self, dir: &std::path::Path) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        fs::create_dir_all(dir)?;
+        let body = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        let tmp = dir.join(format!(
+            ".state.json.tmp.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Best-effort cleanup of the temp file on any failure, so a transient
+        // ENOSPC/EACCES can't litter the run dir with orphaned partials.
+        if let Err(e) = fs::write(&tmp, &body) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&tmp, dir.join("state.json")) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(())
+    }
+    /// Re-read `archived` from `state.json`, adopt it, and return it.
+    ///
+    /// THE way to consult [`archived`](RunState::archived) — see that field for
+    /// why disk is the authority. Adopting rather than merely returning is the
+    /// load-bearing half: it leaves this copy agreeing with disk, so the next
+    /// [`save_preserving_archived`] cannot write a stale value back and quietly
+    /// invert the human's decision.
+    ///
+    /// A read failure is an `Err`, NOT a fallback to the copy in hand. Callers
+    /// gate destructive or infrastructure-creating work on this, and a torn read
+    /// or a permissions problem must fail closed rather than silently decide which
+    /// authority applies. The one exception is a `state.json` that is not there:
+    /// nothing has ever been recorded about the run, so there is no decision to
+    /// contradict, and the value in hand stands.
+    ///
+    /// [`save_preserving_archived`]: RunState::save_preserving_archived
+    pub fn refresh_archived(&mut self) -> io::Result<bool> {
+        match RunState::load(&self.name) {
+            Ok(disk) => self.archived = disk.archived,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(self.archived)
+    }
+
+    /// Save every field from this copy EXCEPT [`archived`](RunState::archived),
+    /// which is taken from disk — the authority rule that field documents, applied
+    /// at the moment of writing.
+    ///
+    /// Long-running commands hold a `RunState` loaded minutes ago — `code-review
+    /// run` blocks for up to its timeout (30 min by default) before writing back —
+    /// and the human can archive OR restore from the web UI inside that window.
+    /// A plain [`save`] would write whichever value this copy happens to hold over
+    /// their decision, in whichever direction: reviving a run they filed away, or
+    /// re-filing one they just restored.
+    ///
+    /// Adopts disk's value (`=`) rather than merging it (`|=`). The merge was a
+    /// half-rule — it rescued an Archive and lost a Restore — and a half-rule is
+    /// how one bit ends up with two sources of truth. There is no writer this
+    /// costs: a caller that has *decided* to archive or restore owns the field and
+    /// uses [`save`]/[`save_in`], which write it verbatim.
+    ///
+    /// This narrows the race; it does not close it. A concurrent write landing
+    /// between the re-read and the write is still lost (see docs/known-issues.md
+    /// — `state.json` has no locking or compare-and-swap). An unreadable
+    /// `state.json` leaves the value in hand and proceeds, because this is a WRITE
+    /// path: refusing to persist a phase's progress over an unrelated read failure
+    /// would lose more than it protects. Callers that must not act on a stale flag
+    /// gate on [`refresh_archived`](RunState::refresh_archived) first, which does
+    /// fail closed.
+    ///
+    /// [`save`]: RunState::save
+    /// [`save_in`]: RunState::save_in
+    pub fn save_preserving_archived(&mut self) -> io::Result<()> {
+        if let Ok(disk) = RunState::load(&self.name) {
+            self.archived = disk.archived;
+        }
+        self.save()
     }
     pub fn first_incomplete(&self) -> Option<usize> {
         self.phases
@@ -231,9 +499,7 @@ mod tests {
         Phase {
             name: name.into(),
             status: PhaseStatus::Done,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         }
     }
 
@@ -241,9 +507,8 @@ mod tests {
         Phase {
             name: name.into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
             pane_id: Some("w:p1".into()),
+            ..Default::default()
         }
     }
 
@@ -294,6 +559,165 @@ mod tests {
         let round: RunState =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
         assert!(round.archived);
+    }
+
+    #[test]
+    fn a_stale_save_never_resurrects_an_archived_run() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+
+        // A long-running command (`code-review run` blocks for up to its timeout)
+        // loads the run while it is still active...
+        let mut stale = completion_run(vec![running("implement")]);
+        stale.save().unwrap();
+
+        // ...the human archives it from the web UI meanwhile, which closes the
+        // workspace and destroys every pane...
+        let mut archiver = RunState::load("r").unwrap();
+        archiver.archived = true;
+        archiver.save().unwrap();
+
+        // ...and only then does the long-running command write its copy back.
+        stale.phases[0].status = PhaseStatus::Done;
+        stale.save_preserving_archived().unwrap();
+
+        let on_disk = RunState::load("r").unwrap();
+        assert!(
+            on_disk.archived,
+            "a save carrying a stale `archived: false` must not un-archive a run \
+             whose workspace has already been destroyed"
+        );
+        assert_eq!(
+            on_disk.phases[0].status,
+            PhaseStatus::Done,
+            "the writer's own progress must still land — only `archived` is rescued"
+        );
+    }
+
+    /// The authority rule, at the type that owns it: consulting `archived` means
+    /// re-reading it, and what is on disk is what the run is.
+    #[test]
+    fn refresh_archived_adopts_disk_in_both_directions() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![running("implement")]);
+        s.save().unwrap();
+
+        // The human archives from the web UI while we hold our copy.
+        let mut ui = RunState::load("r").unwrap();
+        ui.archived = true;
+        ui.save().unwrap();
+        assert!(s.refresh_archived().unwrap(), "must report disk's true");
+        assert!(s.archived, "and adopt it, so a later save cannot revert it");
+
+        // ...then restores. The stale `true` we just adopted must not survive it:
+        // this is the direction a one-way `|=` merge gets wrong.
+        ui.archived = false;
+        ui.save().unwrap();
+        assert!(!s.refresh_archived().unwrap(), "must report disk's false");
+        assert!(!s.archived, "a Restore is as authoritative as an Archive");
+    }
+
+    #[test]
+    fn refresh_archived_fails_loudly_rather_than_picking_an_authority() {
+        // A guard that refuses archived runs must FAIL CLOSED on an unreadable
+        // state.json. Folding a read error into "trust my own copy" would let a
+        // torn read or a permissions problem silently decide which authority is
+        // in force — the caller cannot even tell it happened.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![running("implement")]);
+        s.save().unwrap();
+        fs::write(run_dir("r").join("state.json"), b"{ this is not json").unwrap();
+
+        assert!(
+            s.refresh_archived().is_err(),
+            "an unreadable state.json is not evidence about the archive flag"
+        );
+
+        // A run with NO state.json is different in kind: nothing has ever been
+        // recorded about it, so there is no decision to contradict the copy in
+        // hand. That must not be an error — `ensure_workspace` runs before a
+        // brand-new run's first save in tests, and on a run mid-creation.
+        fs::remove_file(run_dir("r").join("state.json")).unwrap();
+        let mut fresh = completion_run(vec![running("implement")]);
+        fresh.archived = true;
+        assert!(
+            fresh.refresh_archived().expect("absent is not unreadable"),
+            "with nothing on disk, the copy in hand is all there is"
+        );
+    }
+
+    #[test]
+    fn a_save_never_re_archives_a_run_the_human_restored() {
+        // The mirror of `a_stale_save_never_resurrects_an_archived_run`, and the
+        // half that a one-way `|=` merge got wrong: a long-running command whose
+        // copy latched `archived: true` (from an Archive it observed) must not
+        // write that back over a Restore that has since landed.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut stale = completion_run(vec![running("implement")]);
+        stale.archived = true;
+        stale.save().unwrap();
+
+        // The human restores it.
+        let mut restore = RunState::load("r").unwrap();
+        restore.archived = false;
+        restore.save().unwrap();
+
+        // The long-running command writes its progress back, still holding `true`.
+        stale.phases[0].status = PhaseStatus::Done;
+        stale.save_preserving_archived().unwrap();
+
+        let on_disk = RunState::load("r").unwrap();
+        assert!(
+            !on_disk.archived,
+            "a save carrying a stale `archived: true` must not undo a Restore"
+        );
+        assert_eq!(
+            on_disk.phases[0].status,
+            PhaseStatus::Done,
+            "the writer's own progress must still land"
+        );
+        assert!(
+            !stale.archived,
+            "and the writer's copy must agree with what it just wrote"
+        );
+    }
+
+    #[test]
+    fn restore_can_still_clear_the_archived_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![done("implement")]);
+        s.archived = true;
+        s.save().unwrap();
+
+        // Restore deliberately clears the flag and uses a plain `save`, which must
+        // NOT rescue the on-disk `true` — otherwise archiving would be one-way.
+        let mut restore = RunState::load("r").unwrap();
+        restore.archived = false;
+        restore.save().unwrap();
+
+        assert!(
+            !RunState::load("r").unwrap().archived,
+            "Restore must still be able to un-archive a run"
+        );
     }
 
     #[test]
@@ -374,26 +798,17 @@ mod tests {
                 Phase {
                     name: "brainstorm".into(),
                     status: PhaseStatus::Done,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
+                    ..Default::default()
                 },
-                Phase {
-                    name: "plan".into(),
-                    status: PhaseStatus::Pending,
-                    handoff_doc: None,
-                    herdr_session: None,
-                    pane_id: None,
-                },
+                Phase::new("plan"),
             ],
             // A populated review_phases list must NOT influence pipeline progress:
             // it round-trips but `first_incomplete` (and `format_progress`) ignore it.
             review_phases: vec![Phase {
                 name: "review:task-1:1:correctness".into(),
                 status: PhaseStatus::Running,
-                handoff_doc: None,
-                herdr_session: None,
                 pane_id: Some("p1".into()),
+                ..Default::default()
             }],
             gate: "spec".into(),
             cursor: 1,
@@ -473,13 +888,250 @@ mod tests {
     }
 
     #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = fat_run("tmpclean", 3);
+        s.save().unwrap();
+        s.cursor = 1;
+        s.save().unwrap();
+
+        // The real invariant is "no temp file survives a save"; asserting the dir
+        // holds ONLY state.json would start failing for the wrong reason the day
+        // anything else legitimately lands in a run dir.
+        let leftovers: Vec<String> = fs::read_dir(run_dir("tmpclean"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "save must rename its temp file away, leaving only state.json; found {leftovers:?}"
+        );
+        assert_eq!(RunState::load("tmpclean").unwrap().cursor, 1);
+    }
+
+    #[test]
+    fn concurrent_saves_never_expose_a_partial_state_json() {
+        // A bare `fs::write` truncates in place, so a concurrent `load` parses a
+        // half-written file, `load_run` exits 1, and per the pipeline skill the
+        // whole run STOPs.
+        //
+        // Tuned for DETECTION, verified by mutation (revert `save` to a bare
+        // `fs::write` and this must fail, repeatedly):
+        //  * MANY saves, not one huge one. The vulnerable window is between
+        //    `File::create`'s O_TRUNC and the write completing, and it is roughly
+        //    fixed per save — so detection scales with the NUMBER of saves, not
+        //    the size of each. 4 writers x 400 saves = 1600 windows.
+        //  * a moderate phases vec: big enough to keep the window open, small
+        //    enough that the reader's parse is cheap and it samples often. Both
+        //    a much fatter and a much thinner vec detect worse.
+        //  * each writer builds its `RunState` ONCE, outside the loop, so its
+        //    time goes into `fs::write` rather than into `format!`.
+        //
+        // Structured so NOTHING panics inside a spawned thread: a panic there
+        // would surface at a join on the main thread, which is holding ENV_LOCK,
+        // poisoning it and cascade-failing every other test in the binary. Threads
+        // return Results; the main thread asserts. `thread::scope` guarantees all
+        // threads are joined even if the body unwinds, so no thread can outlive
+        // the lock guard or the TempDir and race the next test's `set_var`.
+        const PHASES: usize = 200;
+        const WRITERS: usize = 4;
+        const SAVES: usize = 400;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        // Seed the file so the reader always has something to open.
+        fat_run("race", PHASES).save().unwrap();
+
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        let finished = &finished;
+        // Without this handshake the writers can burn through every save before
+        // the reader thread is first scheduled; the reader then does one clean
+        // read of a quiescent file and the test passes even against a
+        // deliberately non-atomic `save`. Verified by mutation: reverting `save`
+        // to a bare `fs::write` must fail this test.
+        let reading = std::sync::atomic::AtomicBool::new(false);
+        let reading = &reading;
+        let (write_errs, read_result) = std::thread::scope(|s| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    s.spawn(move || {
+                        let mut st = fat_run("race", PHASES);
+                        while !reading.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                        let mut errs = Vec::new();
+                        for i in 0..SAVES {
+                            st.cursor = w * 1000 + i;
+                            if let Err(e) = st.save() {
+                                errs.push(e.to_string());
+                            }
+                        }
+                        finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        errs
+                    })
+                })
+                .collect();
+            let reader = s.spawn(move || {
+                // Deadline backstop: if a writer dies without incrementing
+                // `finished`, this must fail the test rather than spin forever
+                // (`cargo test` has no per-test timeout, so a hang is worse than
+                // a failure).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let mut reads = 0usize;
+                loop {
+                    // Released only once the reader is actually in its loop, so
+                    // every save below overlaps a live read.
+                    reading.store(true, std::sync::atomic::Ordering::SeqCst);
+                    match RunState::load("race") {
+                        Ok(l) if l.phases.len() == PHASES => reads += 1,
+                        Ok(l) => {
+                            return Err(format!(
+                                "torn read: state.json parsed but held {} phases, not {PHASES}",
+                                l.phases.len()
+                            ));
+                        }
+                        Err(e) => return Err(format!("torn read: state.json did not parse: {e}")),
+                    }
+                    // Checked AFTER a read, so `reads` is non-zero even if every
+                    // writer finishes before this thread is first scheduled.
+                    if finished.load(std::sync::atomic::Ordering::SeqCst) == WRITERS {
+                        return Ok(reads);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err("writers never finished within 60s".to_string());
+                    }
+                }
+            });
+            let errs: Vec<String> = writers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+            (errs, reader.join().unwrap())
+        });
+
+        assert!(write_errs.is_empty(), "save() failed: {write_errs:?}");
+        let reads = read_result.expect("load must never observe a partially-written state.json");
+        assert!(reads > 0, "the reader thread must have observed some loads");
+    }
+
+    /// A `RunState` with `n` phases, fat enough that a non-atomic `save` has a
+    /// wide window in which a concurrent `load` sees a truncated file.
+    fn fat_run(name: &str, n: usize) -> RunState {
+        RunState {
+            name: name.into(),
+            task: "t".repeat(200),
+            agent: Some("claude".into()),
+            phases: (0..n)
+                .map(|i| Phase {
+                    name: format!("phase-{i}-{}", "x".repeat(64)),
+                    handoff_doc: Some("h".repeat(128)),
+                    ..Default::default()
+                })
+                .collect(),
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: "/tmp/proj".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        }
+    }
+
+    #[test]
+    fn missing_phase_pass_defaults_to_none() {
+        // The Phase-level back-compat guard. `Phase`'s fields are NOT
+        // `#[serde(default)]` as a group, so any field added without its own
+        // `#[serde(default)]` makes EVERY existing state.json fail to load →
+        // `load_run` exits 1 → the run STOPs. This pins that `pass` (and, by
+        // example, whatever task 3 adds next) is absent-tolerant.
+        let json = r#"{
+            "name":"old","task":"t",
+            "phases":[{"name":"plan","status":"Running","handoff_doc":null,"herdr_session":null,"pane_id":"w:p1"}],
+            "gate":"spec","cursor":0,"project_dir":"/tmp/proj"
+        }"#;
+        let loaded: RunState = serde_json::from_str(json).unwrap();
+        assert!(
+            loaded.phases[0].pass.is_none(),
+            "a Phase written before pass tokens must load with pass: None"
+        );
+        // And a phase with no pass must not start emitting one on re-save.
+        let out = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !out.contains("\"pass\""),
+            "pass: None must be skipped on serialize: {out}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pass_token_is_not_representable() {
+        // "no token" (a phase from a pre-token build, which completes on an EMPTY
+        // marker) and "a token that happens to be empty" are opposite statements
+        // about a phase, and `Option<PassToken>` already carries the first one.
+        // A `PassToken("")` would satisfy `pass.is_some()` while matching no
+        // marker at all — a phase that can never complete, by either rule.
+        assert!(PassToken::new(String::new()).is_none());
+        assert!(PassToken::new("   ".into()).is_none());
+        assert!(PassToken::new("abc-1".into()).is_some());
+
+        // `Deserialize` is a second constructor, reachable by anyone who can write
+        // state.json. It must enforce the same rule.
+        let r: Result<Phase, _> = serde_json::from_str(
+            r#"{"name":"plan","status":"Running","handoff_doc":null,
+                "herdr_session":null,"pane_id":null,"pass":""}"#,
+        );
+        assert!(
+            r.is_err(),
+            "an empty pass token on disk must not deserialize into Some(PassToken)"
+        );
+    }
+
+    #[test]
+    fn pass_token_only_matches_a_non_empty_equal_marker() {
+        let t = PassToken::new("abc-1".into()).unwrap();
+        assert!(t.matches_marker("abc-1"));
+        assert!(!t.matches_marker("abc-2"));
+        assert!(
+            !t.matches_marker(""),
+            "an empty marker is not evidence about any pass"
+        );
+        // Serializes transparently: state.json shape is unchanged by the newtype.
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"abc-1\"");
+        let p: Phase = serde_json::from_str(
+            r#"{"name":"plan","status":"Running","handoff_doc":null,
+                "herdr_session":null,"pane_id":null,"pass":"xyz-9"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.pass.unwrap().as_str(), "xyz-9");
+    }
+
+    #[test]
+    fn phase_default_is_pending_with_empty_fields() {
+        let p = Phase::new("plan");
+        assert_eq!(p.name, "plan");
+        assert_eq!(p.status, PhaseStatus::Pending);
+        assert!(p.handoff_doc.is_none());
+        assert!(p.herdr_session.is_none());
+        assert!(p.pane_id.is_none());
+        assert_eq!(Phase::default().name, "");
+        assert_eq!(PhaseStatus::default(), PhaseStatus::Pending);
+    }
+
+    #[test]
     fn find_phase_searches_both_lists() {
         let mk = |name: &str| Phase {
             name: name.into(),
             status: PhaseStatus::Running,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: None,
+            ..Default::default()
         };
         let s = RunState {
             name: "r".into(),
