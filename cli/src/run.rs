@@ -282,11 +282,33 @@ impl Phase {
         self.pane_agent = Some(PhaseAgent::launched(backend, profile));
     }
 
-    /// Adopt an agent record wholesale — used when reconciling with what is
-    /// already on disk, where the persisted record may carry a profile or
-    /// backend this process never saw.
-    pub fn adopt_pane_agent(&mut self, agent: PhaseAgent) {
+    /// Seed this phase's agent record from one read off disk, **only if it has
+    /// none**. Returns whether it landed.
+    ///
+    /// Used when reconciling with what is already persisted: another writer may
+    /// have recorded a profile or a backend this process never saw, so the
+    /// record is taken whole rather than rebuilt.
+    ///
+    /// ⚠️ **It REFUSES an occupied slot, and that refusal is the point.** This
+    /// was `adopt_pane_agent`, which assigned wholesale with no guard — so the
+    /// fill-never-replace rule that [`Phase::record_session`] enforces could be
+    /// walked straight around, session and all, without going through
+    /// [`Phase::record_launch`]. Production was safe only because its one
+    /// caller happened to test `pane_agent().is_none()` first, which is the
+    /// invariant living in a call-site `match` instead of in the API — the
+    /// same drift this module has now closed for reviewer identity and for
+    /// resume evidence. A future caller cannot skip a guard that is no longer
+    /// theirs to skip.
+    ///
+    /// `record_launch` remains the one sanctioned way an existing record — and
+    /// so a held session — is ever replaced, because that is where a new agent
+    /// process starts.
+    pub fn seed_pane_agent(&mut self, agent: PhaseAgent) -> bool {
+        if self.pane_agent.is_some() {
+            return false;
+        }
         self.pane_agent = Some(agent);
+        true
     }
 
     /// Record a session captured from a live poll. Returns whether it landed.
@@ -2112,6 +2134,55 @@ mod tests {
             "a phase with no agent record yet still accepts one — `record_capture` \
              creates the record first"
         );
+    }
+
+    #[test]
+    fn seeding_a_record_may_not_replace_one_that_is_already_there() {
+        // ⚠️ THE LAST DOOR ROUND 4 LEFT OPEN. `record_session` was made to
+        // refuse replacing a held session, but `adopt_pane_agent` assigned the
+        // whole `PhaseAgent` wholesale with no guard — so the rule could be
+        // walked straight around, session and all, without going through
+        // `record_launch`. Production was safe only because its one caller
+        // happened to check `pane_agent().is_none()` first, which puts the
+        // invariant in a call-site `match` rather than in the API.
+        //
+        // Same drift as reviewer identity (list vs name) and resume evidence
+        // (`Option` vs `ResumeEvidence`), and fixed the same way: the API
+        // refuses, so a future caller cannot skip a guard that no longer exists
+        // to be skipped.
+        let held = SessionId::new("sess-held".into()).unwrap();
+        let other = SessionId::new("sess-other".into()).unwrap();
+
+        // An empty slot is what seeding is FOR: a phase launched by a build
+        // that recorded no agent, reconciled against what is on disk.
+        let mut empty = Phase::new("plan");
+        let mut from_disk = PhaseAgent::launched("cursor", Some("/prof".into()));
+        assert!(from_disk.record_session(other.clone()));
+        assert!(
+            empty.seed_pane_agent(from_disk.clone()),
+            "an empty slot takes the persisted record whole — backend, profile and all"
+        );
+        assert_eq!(empty.pane_agent().map(|a| a.backend()), Some("cursor"));
+        assert_eq!(empty.resume_target().map(|t| t.session()), Some(&other));
+
+        // An occupied one refuses, and the held session is what it protects.
+        let mut occupied = Phase::new("plan");
+        occupied.record_launch("claude", None);
+        assert!(occupied.record_session(held.clone()));
+        assert!(
+            !occupied.seed_pane_agent(from_disk),
+            "a record already there is not something to overwrite"
+        );
+        assert_eq!(
+            occupied.resume_target().map(|t| t.session()),
+            Some(&held),
+            "the session survives, and so does the backend it belongs to"
+        );
+        assert_eq!(occupied.pane_agent().map(|a| a.backend()), Some("claude"));
+
+        // …and `record_launch` is still the one sanctioned way it changes.
+        occupied.record_launch("claude", None);
+        assert!(occupied.resume_target().is_none());
     }
 
     #[test]

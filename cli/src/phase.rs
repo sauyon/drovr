@@ -2281,13 +2281,17 @@ fn record_capture(run: &mut RunState, phase: &str, poll: Option<&PaneInfo>) {
     // here. Another writer may have recorded a profile (or a backend) this
     // process never saw, and re-deriving one would hand the caller a
     // `profile: None` that its next `run.save()` would write over the real one.
-    // Seeding only when the caller has none keeps this a write, never a clear.
+    //
+    // "Only when the caller has none" is `seed_pane_agent`'s own rule now, not
+    // a test written here: it used to be a `(None, Some(_))` match at this call
+    // site, which left the API able to replace a record — session and all —
+    // for anyone who did not think to write the same match.
     let persisted_agent = fresh
         .find_phase(phase)
         .and_then(|p| p.pane_agent().cloned());
     if let Some(p) = run.find_phase_mut(phase) {
-        if let (None, Some(agent)) = (p.pane_agent(), persisted_agent) {
-            p.adopt_pane_agent(agent);
+        if let Some(agent) = persisted_agent {
+            p.seed_pane_agent(agent);
         }
         capture.apply(p);
     }
