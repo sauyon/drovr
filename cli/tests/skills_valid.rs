@@ -3316,8 +3316,17 @@ const TASK_BINDING_SITES: &[&str] = &[
     "worktrees/SKILL.md",
 ];
 
-/// Fix 3 (spec §5): every site that hands an agent a numbered checklist also
-/// tells it to bind that checklist to tracked task state.
+/// Fix 3 (spec §5): every site listed in [`TASK_BINDING_SITES`] carries the
+/// task-binding directive.
+///
+/// **Read that scope literally. It is narrower than "every site that hands an
+/// agent a numbered checklist", and saying the broader thing would be false
+/// today as well as being this run's own defect class.** The four discipline
+/// skills' numbered procedures are precisely such sites and carry none of it
+/// yet: their directive lands inside each fix-4 rewrite (Tasks 10–13), because
+/// arm A′ is frozen as fix-1-only. [`TASK_BINDING_SITES`] is the list of what
+/// this check actually covers, and it says which sites are still missing and
+/// who owns them.
 ///
 /// **This is a presence check over a list of files, which is this run's
 /// recurring defect class in its friendliest disguise** — a presence check whose
