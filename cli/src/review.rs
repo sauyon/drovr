@@ -1052,27 +1052,39 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         respond_str(req, 404, "text/plain", "no such run".into());
         return;
     };
-    let Some(target) = state.find_phase(&phase) else {
-        respond_str(req, 404, "text/plain", "no such phase".into());
-        return;
-    };
     // The SAME predicate `phase_rehydrate` gates on, off the same `state.json`
     // — not a re-derivation. Written separately, this path checked two of the
     // CLI's three refusals, so the button a human clicks was more permissive
     // than the command it shells out to.
-    if let Err(why) = target.rehydratable() {
-        let msg = match why {
-            crate::run::NotRehydratable::HoldsPane(pane) => {
-                format!("phase '{phase}' still holds pane {pane}")
-            }
-            crate::run::NotRehydratable::NeverStarted => {
+    //
+    // `NoSuchPhase` is the one arm that is a 404 (the name does not exist here
+    // — and `safe_component` permits `:` and is a path check, NOT an
+    // authorization one). Every other arm names a real phase drovr is refusing
+    // to act on, which is a 409.
+    if let Err(why) = state.rehydratable(&phase) {
+        use crate::run::NotRehydratable as Why;
+        let msg = match &why {
+            Why::NoSuchPhase => "no such phase".to_string(),
+            Why::Reviewer => format!(
+                "phase '{phase}' is a review-panel agent — its findings channel cannot be \
+                 re-attached to a resumed session; run the panel again instead"
+            ),
+            Why::HoldsPane(pane) => format!("phase '{phase}' still holds pane {pane}"),
+            Why::NeverStarted => {
                 format!("phase '{phase}' has never run — start it, don't rehydrate it")
             }
-            crate::run::NotRehydratable::NoAgentEverRan => format!(
-                "phase '{phase}' has no agent on record — start it again, with its seed"
-            ),
+            Why::NoAgentEverRan => {
+                format!("phase '{phase}' has no agent on record — start it again, with its seed")
+            }
+            Why::NoProjectDir => {
+                format!("run '{run_name}' records no project_dir, so there is nowhere to launch")
+            }
+            Why::NoWorkspace => {
+                format!("run '{run_name}' has no herdr workspace to open a tab in")
+            }
         };
-        respond_str(req, 409, "text/plain", msg);
+        let code = if why == Why::NoSuchPhase { 404 } else { 409 };
+        respond_str(req, code, "text/plain", msg);
         return;
     }
 
@@ -1256,7 +1268,7 @@ fn build_agent_tree(
             .push(serde_json::json!({
                 "name": rp.name, "kind": "review", "angle": angle,
                 "status": status_str(&rp.status), "pane_id": rp.pane_id(),
-                "reaped": rp.is_reaped(), "rehydratable": rp.rehydratable().is_ok(),
+                "reaped": rp.is_reaped(), "rehydratable": run.rehydratable(&rp.name).is_ok(),
                 "resumable": has_resumable_session(rp, cfg),
             }));
     }
@@ -1270,7 +1282,7 @@ fn build_agent_tree(
         nodes.push(serde_json::json!({
             "name": ph.name, "kind": "phase",
             "status": status_str(&ph.status), "pane_id": ph.pane_id(),
-            "reaped": ph.is_reaped(), "rehydratable": ph.rehydratable().is_ok(),
+            "reaped": ph.is_reaped(), "rehydratable": run.rehydratable(&ph.name).is_ok(),
             "resumable": has_resumable_session(ph, cfg),
             "children": children,
         }));
@@ -3333,6 +3345,45 @@ mod tests {
             Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
         let tree = build_agent_tree(&run, &cfg, None);
         assert_eq!(tree["nodes"][0]["resumable"], true);
+    }
+
+    #[test]
+    fn the_tree_offers_no_rehydrate_the_cli_would_refuse() {
+        // The ⟳ is gated on the SAME predicate the CLI and the handler ask, so
+        // the run-level prerequisites have to reach the tree too — a button
+        // rendered on a run with no workspace is a button that errors on click.
+        // A reviewer never gets one at all: its findings channel cannot be
+        // re-attached to a resumed session.
+        use crate::run::PhaseStatus::Done;
+        let reaped = |name: &str| {
+            let mut p = ph(name, Done, Some("w:p1"));
+            p.record_launch("claude", None);
+            p.mark_reaped();
+            p
+        };
+        let run = tree_run(
+            vec![reaped("implement-task-1")],
+            vec![reaped("review:task-1:1:security")],
+        );
+        let cfg = crate::config::Config::default();
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["rehydratable"], true);
+        assert_eq!(
+            tree["nodes"][0]["children"][0]["rehydratable"],
+            false,
+            "a reviewer must never be offered a ⟳: {tree}"
+        );
+        // …and the reviewer is still SHOWN, dimmed — hiding it would make a
+        // pane drovr closed look like one that never ran.
+        assert_eq!(tree["nodes"][0]["children"][0]["reaped"], true);
+
+        let mut no_ws = tree_run(vec![reaped("implement-task-1")], vec![]);
+        no_ws.workspace = None;
+        let tree = build_agent_tree(&no_ws, &cfg, None);
+        assert_eq!(
+            tree["nodes"][0]["rehydratable"], false,
+            "no workspace means nowhere to open the tab: {tree}"
+        );
     }
 
     #[test]

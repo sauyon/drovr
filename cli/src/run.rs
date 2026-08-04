@@ -306,21 +306,18 @@ impl Phase {
         }
     }
 
-    /// Why this phase cannot be brought back, or `Ok(())` if it can.
+    /// The half of the rehydrate precondition that is about the PHASE.
     ///
-    /// **THE rehydrate precondition, in one place.** Three callers ask this
-    /// exact question and they must not answer it differently: `phase_rehydrate`
-    /// (which refuses), the `POST /rehydrate` handler (which must refuse the
-    /// same things, or the button a human clicks is more permissive than the
-    /// command), and the agent tree (whose ⟳ must appear only where a click
-    /// will work). Written as three separate predicates it drifted once
-    /// already — the HTTP path checked two of the three.
+    /// Private, and it must stay private: [`RunState::rehydratable`] is the one
+    /// predicate every caller asks, and this exists only as the part of it that
+    /// needs nothing but the phase. Exposed, it is a second, weaker gate — which
+    /// is exactly the defect that made the ⟳ render on phases the CLI refused.
     ///
     /// It is deliberately STRICTER than [`Phase::has_run`], which answers a
     /// different question ("is this a real phase or a `drovr new` placeholder",
     /// for display). Reusing the weaker one as the gate re-opens the door the
     /// `NoAgentEverRan` arm exists to close.
-    pub fn rehydratable(&self) -> Result<(), NotRehydratable> {
+    fn phase_level_rehydratable(&self) -> Result<(), NotRehydratable> {
         if let Some(pane) = self.pane_id() {
             return Err(NotRehydratable::HoldsPane(pane.to_owned()));
         }
@@ -389,7 +386,7 @@ impl Phase {
     }
 }
 
-/// Why a phase cannot be rehydrated — see [`Phase::rehydratable`].
+/// Why a phase cannot be rehydrated — see [`RunState::rehydratable`].
 ///
 /// An enum rather than a bool because each arm needs a *different* thing said
 /// to the user (attach to the pane / start the phase / start it WITH its seed),
@@ -397,6 +394,22 @@ impl Phase {
 /// re-deriving the reasons.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotRehydratable {
+    /// No phase of this run answers to that name. The one arm the HTTP layer
+    /// maps to 404 rather than 409; every other arm is a real phase drovr is
+    /// refusing to act on.
+    NoSuchPhase,
+    /// A review-panel agent.
+    ///
+    /// A reviewer's only job is to deliver findings, and it delivers them
+    /// through drovr's findings MCP server — written per (task, iteration) and
+    /// handed to the agent on its command line at launch. `resume_launch`
+    /// passes no `mcp_config`, so a resumed reviewer would come up with no
+    /// `submit_findings` tool and `delivered_review` would wait on a file that
+    /// can never appear. Threading the server through would mean rewriting the
+    /// per-task config for an OLD iteration, which is the file a currently
+    /// running panel's reviewers read. So drovr does not offer the button:
+    /// a panel is re-run (`drovr code-review run`), not rehydrated.
+    Reviewer,
     /// Still holds a pane, named here. Attach to it instead.
     HoldsPane(String),
     /// A `Pending` placeholder — `drovr new` seeds four of them. Nothing ran.
@@ -404,6 +417,11 @@ pub enum NotRehydratable {
     /// It looks started, but no agent was ever recorded: its last
     /// `phase start` persisted `Running` and then failed to launch.
     NoAgentEverRan,
+    /// The RUN records no `project_dir`, so there is no directory to launch the
+    /// agent in — and no cwd for its session to resolve under.
+    NoProjectDir,
+    /// The RUN has no herdr workspace, so there is nowhere to open the tab.
+    NoWorkspace,
 }
 
 /// The three things a resume needs, handed over together or not at all.
@@ -985,6 +1003,46 @@ impl RunState {
             self.retired_panes.push(id);
         }
     }
+
+    /// ⭐ **THE rehydrate precondition, in ONE place.**
+    ///
+    /// Three callers ask this exact question and they must not answer it
+    /// differently: `phase_rehydrate` (which refuses), the `POST /rehydrate`
+    /// handler (which must refuse the same things, or the button a human clicks
+    /// is more permissive than the command it shells out to), and the agent tree
+    /// (whose ⟳ must appear only where a click will work).
+    ///
+    /// It lives on `RunState`, not on `Phase`, because half of what a rehydrate
+    /// needs is not a property of the phase at all: the run has to record a
+    /// `project_dir` to launch in and a herdr workspace to open a tab in, and a
+    /// reviewer is a reviewer only by virtue of living in `review_phases`. Those
+    /// three were enforced inside `phase_rehydrate` and nowhere else, so the ⟳
+    /// rendered on phases that refused the moment they were clicked — the same
+    /// stronger-operation-than-predicate defect that had already been fixed one
+    /// level down.
+    ///
+    /// Order: identity, then category, then the phase, then the run. The most
+    /// specific true statement wins, because the arm IS the message.
+    pub fn rehydratable(&self, name: &str) -> Result<(), NotRehydratable> {
+        let Some(phase) = self.find_phase(name) else {
+            return Err(NotRehydratable::NoSuchPhase);
+        };
+        // A reviewer can be brought back, but not brought back USABLE — see
+        // `NotRehydratable::Reviewer`. Categorical, so it is answered before the
+        // per-phase state: "attach to its pane instead" would be advice toward a
+        // recovery that does not exist.
+        if self.review_phases.iter().any(|p| p.name == name) {
+            return Err(NotRehydratable::Reviewer);
+        }
+        phase.phase_level_rehydratable()?;
+        if self.project_dir.is_empty() {
+            return Err(NotRehydratable::NoProjectDir);
+        }
+        if self.workspace.is_none() {
+            return Err(NotRehydratable::NoWorkspace);
+        }
+        Ok(())
+    }
     /// Look up a phase by name across BOTH `phases` and `review_phases`. Reviewer
     /// lookups (marker-drop, seed injection) need to resolve names living in
     /// `review_phases`; pipeline progress deliberately does NOT use this (it stays
@@ -1051,6 +1109,86 @@ mod tests {
         p.status = PhaseStatus::Running;
         p.set_pane("w:p1");
         p
+    }
+
+    /// A phase in exactly the state reaping leaves behind: it ran, an agent was
+    /// recorded, its pane is gone.
+    fn reaped(name: &str) -> Phase {
+        let mut p = Phase::new(name);
+        p.status = PhaseStatus::Done;
+        p.set_pane("w:p9");
+        p.record_launch("claude", None);
+        p.mark_reaped();
+        p
+    }
+
+    /// `completion_run`, plus the two run-level things a rehydrate needs.
+    fn rehydrate_run(phases: Vec<Phase>, review_phases: Vec<Phase>) -> RunState {
+        let mut r = completion_run(phases);
+        r.review_phases = review_phases;
+        r.workspace = Some("ws".into());
+        r
+    }
+
+    #[test]
+    fn the_rehydrate_gate_asks_the_run_and_not_only_the_phase() {
+        // The predicate the UI uses to SHOW the ⟳ was weaker than the one
+        // `phase_rehydrate` enforces: the phase-level checks lived on `Phase`,
+        // while "the run records a project_dir" and "the run has a herdr
+        // workspace" were enforced inside the operation only. So the ⟳ rendered
+        // on phases that would refuse the moment they were clicked. One
+        // predicate, asked by all three callers.
+        let ok = rehydrate_run(vec![reaped("plan")], vec![]);
+        assert_eq!(ok.rehydratable("plan"), Ok(()));
+
+        let mut no_dir = rehydrate_run(vec![reaped("plan")], vec![]);
+        no_dir.project_dir = String::new();
+        assert_eq!(
+            no_dir.rehydratable("plan"),
+            Err(NotRehydratable::NoProjectDir)
+        );
+
+        let mut no_ws = rehydrate_run(vec![reaped("plan")], vec![]);
+        no_ws.workspace = None;
+        assert_eq!(no_ws.rehydratable("plan"), Err(NotRehydratable::NoWorkspace));
+
+        // And a name this run does not answer to is its own refusal, so the
+        // HTTP layer can map it to 404 without a second lookup.
+        assert_eq!(
+            ok.rehydratable("nope"),
+            Err(NotRehydratable::NoSuchPhase)
+        );
+
+        // The phase-level refusals still hold, through the same door.
+        let live = rehydrate_run(vec![running("plan")], vec![]);
+        assert_eq!(
+            live.rehydratable("plan"),
+            Err(NotRehydratable::HoldsPane("w:p1".into()))
+        );
+        let placeholder = rehydrate_run(vec![Phase::new("plan")], vec![]);
+        assert_eq!(
+            placeholder.rehydratable("plan"),
+            Err(NotRehydratable::NeverStarted)
+        );
+    }
+
+    #[test]
+    fn a_reviewer_is_not_rehydratable_because_its_findings_channel_cannot_come_back() {
+        // A reviewer delivers through drovr's findings MCP server, which is
+        // written per (task, iteration) and handed over on the command line at
+        // launch. `Config::resume_launch` passes no `mcp_config`, so a resumed
+        // reviewer would have no `submit_findings` tool at all — and
+        // `delivered_review` would then wait on a file that can never appear.
+        // Rather than a ⟳ that brings back an agent which cannot do its one
+        // job, the type refuses.
+        let run = rehydrate_run(vec![reaped("implement-task-1")], vec![reaped(
+            "review:task-1:1:security",
+        )]);
+        assert_eq!(run.rehydratable("implement-task-1"), Ok(()));
+        assert_eq!(
+            run.rehydratable("review:task-1:1:security"),
+            Err(NotRehydratable::Reviewer)
+        );
     }
 
     #[test]

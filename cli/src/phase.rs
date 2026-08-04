@@ -1091,23 +1091,43 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     poll_interval: Duration,
 ) -> io::Result<RehydrateOutcome> {
     require_phase_name(phase)?;
-    let existing = run.find_phase(phase).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "run '{}' has no phase '{phase}' — rehydrate never creates one \
-                 (use `drovr phase start` for that)",
-                run.name
-            ),
-        )
-    })?;
     // ONE precondition, shared with the HTTP handler and the agent tree — see
-    // `Phase::rehydratable`. Written as three checks here it drifted from the
-    // handler's two, so the button a human clicks refused less than the command.
-    if let Err(why) = existing.rehydratable() {
+    // `RunState::rehydratable`. Written as separate checks it drifted twice:
+    // first the handler checked two of the CLI's three, then the tree's
+    // predicate turned out to omit the run-level prerequisites this function
+    // enforced on its own.
+    if let Err(why) = run.rehydratable(phase) {
         let quoted_run = shell_single_quote(&run.name);
         let quoted_phase = shell_single_quote(phase);
         return Err(match why {
+            NotRehydratable::NoSuchPhase => io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "run '{}' has no phase '{phase}' — rehydrate never creates one \
+                     (use `drovr phase start` for that)",
+                    run.name
+                ),
+            ),
+            NotRehydratable::Reviewer => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "phase '{}/{phase}' is a review-panel agent, and a reviewer cannot be \
+                     brought back able to do its job: it delivers findings through drovr's \
+                     MCP server, which is handed over on the command line at launch and \
+                     cannot be re-attached to a resumed session. Run the panel again \
+                     instead: drovr code-review run {quoted_run} <task>",
+                    run.name
+                ),
+            ),
+            NotRehydratable::NoProjectDir => crate::phase::missing_project_dir_error(&run.name),
+            NotRehydratable::NoWorkspace => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "run '{}' has no herdr workspace (creation failed at `drovr new`); \
+                     please recreate the run with `drovr new`",
+                    run.name
+                ),
+            ),
             NotRehydratable::HoldsPane(pane) => io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -1147,22 +1167,22 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             ),
         });
     }
-    if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
-    }
-    // A reviewer lives in `review_phases`, and that is the ONLY thing that
-    // decides read-only here. A resumed reviewer launched without its
-    // `readonly_flag` is a second WRITER in a run whose entire discipline is
-    // that there is exactly one.
+    // `project_dir` and `workspace` are NOT re-checked here: `rehydratable`
+    // above is the authority on both, so a second test would be a second place
+    // for the answer to live.
+    //
+    // `readonly` is derived from `review_phases`, which is what MAKES a phase a
+    // reviewer — the same fact `rehydratable` refuses on, so today this is
+    // always false. It is derived rather than hardcoded because the day
+    // reviewers become rehydratable again, the alternative is a resumed
+    // reviewer silently launched without its `readonly_flag`: a second WRITER
+    // in a run whose entire discipline is that there is exactly one.
     let readonly = run.review_phases.iter().any(|p| p.name == phase);
-    let seed = existing.handoff_doc.clone();
+    let seed = run
+        .find_phase(phase)
+        .expect("rehydratable() proved the phase is in this run")
+        .handoff_doc
+        .clone();
     // Compose while the borrow of `run` is still alive, so the resume bundle
     // never has to be taken apart into loose owned values to escape it. The
     // block ends before anything mutates.
@@ -1241,16 +1261,10 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // A fresh tab, never `run.root_pane` — a rehydrated phase must be as
     // independently closeable as a started one, and the root shell anchors the
     // workspace for the run's whole lifetime.
-    let ws = run.workspace.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace (creation failed at `drovr new`); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        )
-    })?;
+    let ws = run
+        .workspace
+        .clone()
+        .expect("rehydratable() proved the run has a workspace");
     let pane = h.tab_create(&ws, phase, &cwd)?;
     // `pane_run` (via `launch_in_pane`), NOT `herdr agent start <pane>`, which
     // was raised as the likelier fit and checked against the real CLI:
@@ -8881,9 +8895,17 @@ mod rehydrate_tests {
     }
 
     #[test]
-    fn a_rehydrated_reviewer_is_still_read_only() {
-        // A resumed reviewer launched without its readonly flag is a SECOND
-        // writer in a run whose whole discipline is that there is one.
+    fn a_reviewer_is_refused_rather_than_brought_back_unable_to_deliver() {
+        // ⚠️ This test replaces `a_rehydrated_reviewer_is_still_read_only`,
+        // which asserted that a rehydrated reviewer kept its `readonly_flag`.
+        // It did — and it still would not have worked. A reviewer's ONLY job is
+        // to deliver findings, and it delivers them through drovr's findings
+        // MCP server, handed over on its command line at launch.
+        // `Config::resume_launch` passes no `mcp_config`, so a resumed reviewer
+        // has no `submit_findings` tool and `delivered_review` waits on a file
+        // that can never appear. Bringing an agent back unable to do the one
+        // thing it exists for is a worse outcome than refusing, so the
+        // predicate refuses — and NOTHING is launched.
         let _lock = ENV_LOCK.lock().unwrap();
         let (mut run, _cfg) = rehydrate_run("rh-reviewer");
         run.review_phases.push(reaped_phase(
@@ -8895,13 +8917,19 @@ mod rehydrate_tests {
         run.save().unwrap();
         let h = FakeHerdr::new();
 
-        phase_rehydrate(&h, &mut run, "review:task-1:1:security").unwrap();
-        let launch = pane_run_call(&h);
+        let err = phase_rehydrate(&h, &mut run, "review:task-1:1:security")
+            .expect_err("a reviewer cannot be rehydrated");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
         assert!(
-            launch.contains("--permission-mode plan"),
-            "the readonly flag must be re-passed: {launch}"
+            msg.contains("review-panel agent") && msg.contains("drovr code-review run"),
+            "the refusal has to name the thing that DOES work: {msg}"
         );
-        assert!(launch.contains("--resume 'sess-rev'"), "{launch}");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("tab_create")),
+            "a refusal must not open a tab first: {:?}",
+            h.calls()
+        );
     }
 
     #[test]

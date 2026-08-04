@@ -83,16 +83,21 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     let run_dir = xdg.join("drovr").join("runs").join("rh");
     fs::create_dir_all(&run_dir).expect("run dir");
 
-    // A phase that HAS run and holds no pane — i.e. one every pre-spawn refusal
-    // lets through. `project_dir` is empty, so the CLI itself refuses with a
-    // message no HTTP-layer check produces; seeing that exact text come back is
-    // what proves the request reached the CLI rather than being answered here.
+    // A phase that HAS run and holds no pane, in a run that satisfies every
+    // precondition `RunState::rehydratable` checks — so nothing short-circuits
+    // in the handler and the request really has to reach the CLI. What fails is
+    // one layer further down: `HERDR_SOCKET_PATH` names nothing, so
+    // `tab_create` cannot connect. Only the CLI ever talks to herdr, so seeing
+    // that failure come back is what proves the shell-out happened.
     fs::write(
         run_dir.join("state.json"),
-        r#"{"name":"rh","task":"t","gate":"spec","cursor":0,"project_dir":"","phases":[
+        r#"{"name":"rh","task":"t","gate":"spec","cursor":0,"project_dir":"/tmp",
+"workspace":"ws-http","phases":[
 {"name":"brainstorm","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,
  "reaped":true,"pane_agent":{"backend":"claude","session":"sess-http"}},
 {"name":"-weird","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,
+ "reaped":true,"pane_agent":{"backend":"claude"}},
+{"name":".hidden","status":"Done","handoff_doc":null,"herdr_session":null,"pane_id":null,
  "reaped":true,"pane_agent":{"backend":"claude"}}]}"#,
     )
     .expect("state.json");
@@ -101,10 +106,13 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     let addr = format!("127.0.0.1:{port}");
     // --host is explicit: `serve` otherwise takes serve_host from the
     // developer's own config, which may be an address this test cannot reach.
+    // `HERDR_SOCKET_PATH` is inherited by the CLI the handler spawns — that is
+    // the whole point: the failure this asserts on can only be produced there.
     let _server = KillOnDrop(
         Command::new(PathBuf::from(env!("CARGO_BIN_EXE_drovr")))
             .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
             .env("XDG_DATA_HOME", &xdg)
+            .env("HERDR_SOCKET_PATH", xdg.join("no-such-herdr.sock"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -121,14 +129,26 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
         .unwrap_or_else(|e| panic!("a 500 must carry JSON, got {body:?} ({e})"));
     assert_eq!(json["ok"], false, "{body}");
     let err = json["error"].as_str().unwrap_or("");
-    // The CLI's own words, not the handler's: only `phase_rehydrate` knows the
-    // run has no project_dir. If the handler ever answered on its own, this
-    // string would change.
+    // "drovr: phase rehydrate failed:" is printed by `main`, on the CLI's own
+    // stderr. The handler never writes it, so its presence is the proof that
+    // the request reached a spawned `drovr phase rehydrate` rather than being
+    // answered here.
     assert!(
-        err.contains("project_dir"),
+        err.contains("phase rehydrate failed"),
         "the CLI's diagnosis must reach the caller: {body}"
     );
-    assert!(err.contains("phase rehydrate failed"), "{body}");
+
+    // …and the CLI's own VALIDATOR is reached too, not just its herdr call.
+    // `safe_component` (the handler) permits a leading '.'; `require_phase_name`
+    // (the CLI) does not. `.hidden` really is a phase of this run, so every
+    // handler check passes and only the CLI can produce this refusal.
+    let (status, body) = http_post(&addr, "/api/runs/rh/rehydrate?phase=.hidden");
+    assert_eq!(status, 500, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert!(
+        json["error"].as_str().unwrap_or("").contains("leading '.'"),
+        "the two validators differ, and the stricter one is the CLI's: {body}"
+    );
 
     // A refusal that short-circuits before the spawn still answers, over the
     // same real server — so the two paths are wired to one endpoint.
@@ -141,7 +161,7 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     // handler reads exit 2 as "the pane is back but incomplete" — so without the
     // `--` in the shell-out this answers 200 `complete:false` for a request that
     // created nothing at all. With it, the CLI parses the name as a value and
-    // fails for the honest reason (no project_dir) → 500.
+    // fails for the honest reason (no herdr to make a tab in) → 500.
     let (status, body) = http_post(&addr, "/api/runs/rh/rehydrate?phase=-weird");
     assert!(
         !body.contains("unexpected argument"),
@@ -151,7 +171,10 @@ fn rehydrate_over_http_really_runs_the_cli_and_reports_its_failure() {
     let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
     assert_eq!(json["ok"], false, "{body}");
     assert!(
-        json["error"].as_str().unwrap_or("").contains("project_dir"),
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("phase rehydrate failed"),
         "the CLI's own diagnosis, for the real reason: {body}"
     );
 
