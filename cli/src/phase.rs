@@ -2335,6 +2335,14 @@ fn unreaped_pane_error(
 /// [`RunState::reapable_retired`]'s rule, written once where it can be tested,
 /// rather than a filter with a comment above the close.
 ///
+/// A retired pane may still have a LIVE agent in it — a reviewer replaced
+/// because it "produced nothing usable" was wedged, not dead — and closing it
+/// ends that agent. That is the intent, not a side effect: the decision to
+/// replace it was already taken, by the caller that retired it, and everything
+/// downstream has been reading its replacement ever since. Reaping does not ask
+/// whether an agent is attached for the same reason [`PaneStanding::Live`] says
+/// nothing about it.
+///
 /// # What it does with a pane it cannot see
 ///
 /// Classified by [`pane_standing`], the same three states a phase's pane gets,
