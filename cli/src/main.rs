@@ -670,7 +670,7 @@ struct Report {
 /// exit 2 for exactly that ("so the driver can escalate rather than assume the
 /// seed landed"), and a driver that only checks the status would otherwise run
 /// `phase wait` against an agent nobody ever told what to do.
-fn rehydrate_report(phase: &str, outcome: &RehydrateOutcome) -> Report {
+fn rehydrate_report(run: &str, phase: &str, outcome: &RehydrateOutcome) -> Report {
     match outcome {
         RehydrateOutcome::Resumed => Report {
             code: 0,
@@ -685,10 +685,16 @@ fn rehydrate_report(phase: &str, outcome: &RehydrateOutcome) -> Report {
                  agent was seeded from the handoff"
             ),
         },
-        RehydrateOutcome::Incomplete { note } => Report {
+        // The prose comes from the VARIANT (`Unfinished::note`), never the
+        // other way round — so a caller that needs to know which failure this
+        // was matches on the type instead of on the sentence.
+        RehydrateOutcome::Incomplete(why) => Report {
             code: 2,
             to_stderr: true,
-            line: format!("drovr: phase '{phase}' relaunched INCOMPLETE — {note}"),
+            line: format!(
+                "drovr: phase '{phase}' relaunched INCOMPLETE — {}",
+                why.note(run, phase)
+            ),
         },
     }
 }
@@ -1343,7 +1349,7 @@ fn cmd_phase(sub: PhaseCmd) {
                 // The decision lives in `rehydrate_report`; this is only the
                 // doing. See there for why an incomplete rehydrate exits 2.
                 Ok(outcome) => {
-                    let r = rehydrate_report(&phase_name, &outcome);
+                    let r = rehydrate_report(&run, &phase_name, &outcome);
                     if r.to_stderr {
                         eprintln!("{}", r.line);
                     } else {
@@ -2482,20 +2488,24 @@ mod tests {
         // what to do — and `phase send` already reserves exit 2 for exactly
         // this. Assert the code AND the stream: a driver reads one, a human the
         // other.
-        let done = rehydrate_report("plan", &Resumed);
+        let done = rehydrate_report("r", "plan", &Resumed);
         assert_eq!(done.code, 0);
         assert!(!done.to_stderr);
         assert!(done.line.contains("resumed with its recorded session"), "{done:?}");
 
-        let seeded = rehydrate_report("plan", &Reseeded);
+        let seeded = rehydrate_report("r", "plan", &Reseeded);
         assert_eq!(seeded.code, 0, "a reseeded agent DID get its context");
         assert!(!seeded.to_stderr);
 
         let partial = rehydrate_report(
+            "r",
             "plan",
-            &Incomplete {
-                note: "its seed was NOT re-sent".into(),
-            },
+            &Incomplete(crate::phase::Unfinished::NeverReady {
+                pane: "w:p1".into(),
+                waited: std::time::Duration::from_secs(30),
+                resuming: false,
+                had_seed: true,
+            }),
         );
         assert_eq!(
             partial.code, 2,
@@ -2503,7 +2513,7 @@ mod tests {
         );
         assert!(partial.to_stderr, "{partial:?}");
         assert!(partial.line.contains("INCOMPLETE"), "{partial:?}");
-        assert!(partial.line.contains("its seed was NOT re-sent"), "{partial:?}");
+        assert!(partial.line.contains("Its seed was NOT re-sent"), "{partial:?}");
     }
 
     #[test]

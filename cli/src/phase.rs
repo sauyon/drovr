@@ -1006,23 +1006,150 @@ pub fn spawn_reviewer<H: Herdr>(
 /// human must not have to guess at.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RehydrateOutcome {
-    /// The recorded session was resumed: same conversation, same agent, and the
-    /// agent confirmed ready on its new pane.
+    /// The recorded session was resumed: same conversation, same agent — with
+    /// herdr reporting that session id back on the new pane, not merely an
+    /// agent that came up there.
     Resumed,
     /// No session was recoverable, so a fresh agent was launched and the
     /// phase's seed re-sent. The conversation is gone; the written record is
     /// what the new agent has.
     Reseeded,
     /// The pane is back, but the agent in it was NOT confirmed to have this
-    /// phase's context. `note` says why — the agent never became ready (so a
-    /// resume was never confirmed, or a seed was never sent), there was no seed
-    /// recorded to send, or the delivery failed — and is meant to be printed
-    /// verbatim.
+    /// phase's context.
     ///
     /// **This is the only outcome that is not a success**, and the CLI gives it
     /// exit 2 (see `main::rehydrate_report`). Every path that cannot prove the
     /// agent is up and informed lands here rather than in `Resumed`/`Reseeded`.
-    Incomplete { note: String },
+    Incomplete(Unfinished),
+}
+
+/// Which of the four genuinely different things went wrong.
+///
+/// This was a `String` note, and a `String` is the wrong type for it: the note
+/// is what a human reads, but the *classification* is what a caller acts on —
+/// the HTTP layer, a driver deciding whether to retry, anything that needs to
+/// tell "the agent never came up" apart from "it came up in the wrong
+/// conversation". Recovering that by matching on prose is a caller that will
+/// eventually get it wrong. The prose is now derived from the variant
+/// ([`Unfinished::note`]) rather than the variant from the prose.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unfinished {
+    /// The agent never reported a started status on its new pane. It may be
+    /// parked on a first-run or permission prompt, or it may never have
+    /// attached at all.
+    NeverReady {
+        pane: String,
+        waited: Duration,
+        /// Whether this was a resume; decides what did NOT happen.
+        resuming: bool,
+        /// Whether there was a seed to send, so a reseed's note does not blame
+        /// a delivery that was never attempted.
+        had_seed: bool,
+    },
+    /// The agent came up, but herdr never reported it carrying the session it
+    /// was told to resume. The conversation did not come back — a stale id
+    /// makes the backend start a FRESH one, which looks perfectly healthy from
+    /// the outside.
+    ResumeUnconfirmed {
+        pane: String,
+        expected: SessionId,
+        /// What herdr reported instead, when it reported anything.
+        observed: Option<SessionId>,
+    },
+    /// A fresh agent is up, and this phase has no seed document to give it.
+    NoSeed { pane: String },
+    /// A fresh agent is up, and its seed could not be delivered.
+    SeedUndelivered {
+        pane: String,
+        seed: String,
+        error: String,
+    },
+}
+
+impl Unfinished {
+    /// The pane a human should look at. Every arm has one — the pane is always
+    /// back; that is what makes these outcomes rather than errors.
+    pub fn pane(&self) -> &str {
+        match self {
+            Unfinished::NeverReady { pane, .. }
+            | Unfinished::ResumeUnconfirmed { pane, .. }
+            | Unfinished::NoSeed { pane }
+            | Unfinished::SeedUndelivered { pane, .. } => pane,
+        }
+    }
+
+    /// The line printed verbatim to a human: what did not happen, and the one
+    /// command that moves it forward.
+    pub fn note(&self, run_name: &str, phase: &str) -> String {
+        let pane = shell_single_quote(self.pane());
+        match self {
+            Unfinished::NeverReady {
+                waited,
+                resuming,
+                had_seed,
+                ..
+            } => {
+                // Sub-second timeouts render as ms, so an injected test timeout
+                // does not print a misleading "within 0s" — the same rendering
+                // `phase_send` uses.
+                let waited = if waited.as_secs() >= 1 {
+                    format!("{}s", waited.as_secs())
+                } else {
+                    format!("{}ms", waited.as_millis())
+                };
+                // Three genuinely different things did not happen, and saying
+                // the wrong one is how a human debugs the wrong problem. The
+                // no-seed case is not hypothetical: `phase_start` takes
+                // `seed: Option<&Path>`.
+                let why = if *resuming {
+                    "Its recorded session may no longer resolve — the conversation was NOT restored"
+                } else if !*had_seed {
+                    "It has no recorded seed document either, so it has no context at all"
+                } else {
+                    "Its seed was NOT re-sent"
+                };
+                format!(
+                    "the agent for phase '{phase}' did not become ready within {waited} on pane \
+                     {p}. {why}. It may be parked on a first-run or permission prompt, or it \
+                     may never have attached at all. Look with herdr pane read {pane} — that \
+                     works either way, where `herdr agent attach` needs an agent to already be \
+                     there — then `drovr phase send {run_name} {phase} …`",
+                    p = self.pane(),
+                )
+            }
+            Unfinished::ResumeUnconfirmed {
+                expected, observed, ..
+            } => {
+                let saw = match observed {
+                    Some(o) => format!("it reports session '{}' instead", o.as_str()),
+                    None => "it reports no session at all".to_string(),
+                };
+                format!(
+                    "the agent for phase '{phase}' came up on pane {p}, but it is NOT the \
+                     conversation you asked for: drovr resumed session '{}' and {saw}. A \
+                     recorded id that no longer resolves makes the backend start a FRESH \
+                     conversation, which looks healthy from the outside — so the pane is \
+                     back and its history is not. Look with herdr pane read {pane}; if the \
+                     session really is gone, `drovr phase send {run_name} {phase} …` tells \
+                     the new agent what it is doing.",
+                    expected.as_str(),
+                    p = self.pane(),
+                )
+            }
+            Unfinished::NoSeed { .. } => format!(
+                "phase '{phase}' has no recorded seed document, so the fresh agent was \
+                 launched with no context. Send it some: `drovr phase send {q_run} \
+                 {q_phase} '<what to do>'`",
+                q_run = shell_single_quote(run_name),
+                q_phase = shell_single_quote(phase),
+            ),
+            Unfinished::SeedUndelivered { seed, error, .. } => format!(
+                "the fresh agent for phase '{phase}' is up, but its seed could not be \
+                 delivered ({error}). Re-send it: `drovr phase send {run_name} {phase} \
+                 '<read {seed}>'`"
+            ),
+        }
+    }
 }
 
 /// The prompt a reseeded agent gets. It says the conversation is gone, because
@@ -1195,7 +1322,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // agent.
     let cwd = run.project_dir.clone();
     let cfg = load_config()?;
-    let (launch, profile, resuming, fresh_backend) = {
+    let (launch, profile, resume_session, fresh_backend) = {
         let existing = run
             .find_phase(phase)
             .expect("the phase was located above and nothing removed it");
@@ -1215,20 +1342,28 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         let fresh_profile = recorded.and_then(|a| a.profile().map(str::to_owned));
 
         let resumed = match existing.resume_target() {
-            Some(target) => cfg
-                .resume_launch(&target, &cwd, readonly)?
-                .map(|launch| (launch, target.profile().map(str::to_owned))),
+            Some(target) => cfg.resume_launch(&target, &cwd, readonly)?.map(|launch| {
+                (
+                    launch,
+                    target.profile().map(str::to_owned),
+                    // Carried forward because it is what the resume has to be
+                    // CHECKED against later: the id drovr asked for, kept
+                    // before any poll can overwrite the phase's record with
+                    // whatever session the new pane turns out to hold.
+                    target.session().clone(),
+                )
+            }),
             None => None,
         };
-        // `resuming` is a fact about the composed command, not about whether a
-        // session existed: a backend with no resume surface has a perfectly good
-        // session id and still cannot be told to use it.
+        // `Some(session)` is a fact about the composed COMMAND, not about
+        // whether a session existed: a backend with no resume surface has a
+        // perfectly good session id and still cannot be told to use it.
         match resumed {
-            Some((launch, profile)) => (launch, profile, true, fresh_backend),
+            Some((launch, profile, session)) => (launch, profile, Some(session), fresh_backend),
             None => (
                 cfg.launch(&fresh_backend, &cwd, readonly, None)?,
                 fresh_profile,
-                false,
+                None,
                 fresh_backend,
             ),
         }
@@ -1299,7 +1434,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
             .find_phase_mut(phase)
             .expect("the phase was located above and nothing removed it");
         p.pass = Some(pass.clone());
-        if !resuming {
+        if resume_session.is_none() {
             // A relaunch REPLACES the agent record, which is the only way a
             // session is ever discarded: a new agent process means the id the
             // old record names is no longer this phase's conversation.
@@ -1349,59 +1484,61 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     //
     // It also re-captures the session on the way past (`poll_phase_pane`), so a
     // rehydrated phase is immediately rehydratable again.
-    if !wait_agent_ready(h, run, phase, ready_timeout, poll_interval) {
-        // Sub-second timeouts render as ms, so an injected test timeout does not
-        // print a misleading "within 0s" — the same rendering `phase_send` uses.
-        let waited = if ready_timeout.as_secs() >= 1 {
-            format!("{}s", ready_timeout.as_secs())
-        } else {
-            format!("{}ms", ready_timeout.as_millis())
-        };
-        // Three genuinely different things did not happen, and saying the wrong
-        // one is how a human debugs the wrong problem. The no-seed case is not
-        // hypothetical: `phase_start` takes `seed: Option<&Path>`.
-        let why = if resuming {
-            "Its recorded session may no longer resolve — the conversation was NOT restored"
-        } else if seed.is_none() {
-            "It has no recorded seed document either, so it has no context at all"
-        } else {
-            "Its seed was NOT re-sent"
-        };
-        return Ok(RehydrateOutcome::Incomplete {
-            note: format!(
-                "the agent for phase '{phase}' did not become ready within {waited} on pane \
-                 {pane}. {why}. It may be parked on a first-run or permission prompt, or it \
-                 may never have attached at all. Look with herdr pane read {quoted_pane} — \
-                 that works either way, where `herdr agent attach` needs an agent to already \
-                 be there — then `drovr phase send {run_name} {phase} …`",
-                run_name = run.name,
-                quoted_pane = shell_single_quote(&pane),
-            ),
-        });
-    }
-    if resuming {
-        return Ok(RehydrateOutcome::Resumed);
+    //
+    // ⚠️⚠️ And readiness is only the FIRST of the two things a resume has to
+    // prove. See `confirm_resumed_session` below: "an agent is up" and "your
+    // conversation is back" are different claims, and a stale id produces the
+    // first while quietly failing the second.
+    // ONE deadline across both waits. Confirmation is not a second timeout
+    // bolted on: a resume that comes up instantly and then never reports its
+    // session must not be able to hold the caller for twice `ready_timeout`.
+    let polling = Polling::until(Instant::now() + ready_timeout, poll_interval);
+    let Some(ready) = wait_agent_ready_until(h, run, phase, polling) else {
+        return Ok(RehydrateOutcome::Incomplete(Unfinished::NeverReady {
+            pane,
+            waited: ready_timeout,
+            resuming: resume_session.is_some(),
+            had_seed: seed.is_some(),
+        }));
+    };
+    // ⚠️ AND "the agent is up" is still not "your session came back". A stale id
+    // makes the backend start a FRESH conversation — attached, idle, and
+    // indistinguishable from a successful resume unless you ask herdr WHICH
+    // session it is in. The ⟳ promises the actual conversation, so `Resumed` is
+    // claimed on that answer and on nothing weaker.
+    if let Some(expected) = resume_session {
+        return Ok(
+            match confirm_resumed_session(
+                h,
+                run,
+                phase,
+                // The backend the COMMAND was composed for, out of the launch
+                // itself — never a name paired up beside it. That is the whole
+                // point of `AgentLaunch` carrying both.
+                launch.backend(),
+                &expected,
+                Some(ready),
+                polling,
+            ) {
+                Ok(()) => RehydrateOutcome::Resumed,
+                Err(observed) => RehydrateOutcome::Incomplete(Unfinished::ResumeUnconfirmed {
+                    pane,
+                    expected,
+                    observed,
+                }),
+            },
+        );
     }
     let Some(seed) = seed else {
-        return Ok(RehydrateOutcome::Incomplete {
-            note: format!(
-                "phase '{phase}' has no recorded seed document, so the fresh agent was \
-                 launched with no context. Send it some: `drovr phase send {quoted_run} \
-                 {quoted_phase} '<what to do>'`",
-                quoted_run = shell_single_quote(&run.name),
-                quoted_phase = shell_single_quote(phase),
-            ),
-        });
+        return Ok(RehydrateOutcome::Incomplete(Unfinished::NoSeed { pane }));
     };
     match h.agent_send(&pane, &reseed_text(&run.name, phase, &seed)) {
         Ok(()) => Ok(RehydrateOutcome::Reseeded),
-        Err(e) => Ok(RehydrateOutcome::Incomplete {
-            note: format!(
-                "the fresh agent for phase '{phase}' is up, but its seed could not be \
-                 delivered ({e}). Re-send it: `drovr phase send {} {phase} '<read {seed}>'`",
-                run.name
-            ),
-        }),
+        Err(e) => Ok(RehydrateOutcome::Incomplete(Unfinished::SeedUndelivered {
+            pane,
+            seed,
+            error: e.to_string(),
+        })),
     }
 }
 
@@ -1976,20 +2113,122 @@ fn wait_agent_ready<H: Herdr>(
     timeout: Duration,
     poll_interval: Duration,
 ) -> bool {
-    let deadline = Instant::now() + timeout;
+    wait_agent_ready_until(
+        h,
+        run,
+        phase,
+        Polling::until(Instant::now() + timeout, poll_interval),
+    )
+    .is_some()
+}
+
+/// [`wait_agent_ready`] against an absolute deadline, returning the `PaneInfo`
+/// of the poll that saw the agent start.
+///
+/// The info is returned rather than discarded because "the agent is up" and
+/// "the agent is in the conversation you asked for" are different questions
+/// answered by the *same* `pane.get`, and rehydrate has to ask both. A deadline
+/// rather than a duration so a caller can spend one budget across both without
+/// the second wait silently doubling the first.
+fn wait_agent_ready_until<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    polling: Polling,
+) -> Option<PaneInfo> {
     loop {
         // Exactly ONE poll per iteration, and it captures on the way past.
         // Narrow to the status inline rather than through a helper, so "the poll
         // failed" cannot be confused with a status.
-        let status = poll_phase_pane(h, run, phase).and_then(|info| info.agent_status);
-        if agent_has_started(status.as_ref()) {
-            return true;
+        let info = poll_phase_pane(h, run, phase);
+        if agent_has_started(info.as_ref().and_then(|i| i.agent_status.as_ref())) {
+            return info;
         }
+        if !polling.sleep() {
+            return None;
+        }
+    }
+}
+
+/// A polling budget: when to give up, and how long to wait between attempts.
+///
+/// The two always travel together — a deadline with someone else's interval is
+/// a wait that either spins or overshoots — so they cross a boundary as one
+/// value rather than as two parameters a caller pairs up. It also keeps the
+/// rehydrate waits on ONE budget: confirmation is not a second timeout bolted
+/// onto readiness.
+#[derive(Debug, Clone, Copy)]
+struct Polling {
+    deadline: Instant,
+    interval: Duration,
+}
+
+impl Polling {
+    fn until(deadline: Instant, interval: Duration) -> Polling {
+        Polling { deadline, interval }
+    }
+
+    /// Sleep until the next attempt, or return `false` when the budget is spent.
+    /// Never sleeps past the deadline.
+    fn sleep(&self) -> bool {
         let now = Instant::now();
-        if now >= deadline {
+        if now >= self.deadline {
             return false;
         }
-        thread::sleep(poll_interval.min(deadline - now));
+        thread::sleep(self.interval.min(self.deadline - now));
+        true
+    }
+}
+
+/// Poll until herdr reports the agent on this phase's pane carrying `expected`
+/// — i.e. until the resume is *confirmed* — or the deadline passes.
+///
+/// Returns `Ok(())` on confirmation, `Err(last_observed)` otherwise.
+///
+/// **Why this exists at all.** `wait_agent_ready` proves an agent is up. It
+/// proves nothing about WHICH conversation it is in, and a recorded session id
+/// that no longer resolves (pruned session file, cleared profile storage, a
+/// changed id format) makes the backend start a FRESH one — attached, idle,
+/// indistinguishable from a successful resume from the outside. The ⟳'s whole
+/// promise is that the actual conversation returns, so `Resumed` is claimed on
+/// herdr reporting the id back and on nothing weaker.
+///
+/// It keeps looking rather than judging one sample: the readiness gate returns
+/// on the FIRST poll that reports "started", and herdr does not necessarily
+/// carry an `agent_session` that early — the same one-poll lag that used to
+/// cost reviewers their captured sessions.
+fn confirm_resumed_session<H: Herdr>(
+    h: &H,
+    run: &mut RunState,
+    phase: &str,
+    backend: &str,
+    expected: &SessionId,
+    first: Option<PaneInfo>,
+    polling: Polling,
+) -> Result<(), Option<SessionId>> {
+    // `resumable_for` is the same chokepoint a capture goes through: a path
+    // session, one herdr attributes to a different agent, or none at all are
+    // all "not the id we asked for".
+    let observed_in = |info: &Option<PaneInfo>| -> Option<SessionId> {
+        info.as_ref()
+            .and_then(|i| i.agent_session.as_ref())
+            .and_then(|s| s.resumable_for(backend))
+            .cloned()
+    };
+    let mut last = observed_in(&first);
+    loop {
+        if last.as_ref() == Some(expected) {
+            return Ok(());
+        }
+        if !polling.sleep() {
+            return Err(last);
+        }
+        let info = poll_phase_pane(h, run, phase);
+        // Never overwrite something seen with nothing: an unreadable poll says
+        // no more about the session than it does about the agent.
+        if let Some(seen) = observed_in(&info) {
+            last = Some(seen);
+        }
     }
 }
 
@@ -8785,6 +9024,22 @@ mod rehydrate_tests {
         p
     }
 
+    /// Script `n` polls that report an agent up and carrying `session` — what
+    /// herdr shows for a resume that really did land on its old conversation.
+    ///
+    /// Without this the fake reports a session DERIVED from the new pane id,
+    /// which is what a backend that minted a fresh conversation would look
+    /// like — and is exactly the case a resume must not call `Resumed`.
+    fn script_resumed_session(h: &FakeHerdr, session: &str, backend: &str, n: usize) {
+        for _ in 0..n {
+            h.push_pane_info(Some(crate::herdr::PaneInfo {
+                tab_id: FakeHerdr::tab_id_for("rehydrated"),
+                agent_status: Some(crate::herdr::AgentStatus::Idle),
+                agent_session: Some(FakeHerdr::session_valued(session, Some(backend))),
+            }));
+        }
+    }
+
     fn pane_run_call(h: &FakeHerdr) -> String {
         h.calls()
             .into_iter()
@@ -8800,6 +9055,9 @@ mod rehydrate_tests {
             .push(reaped_phase("plan", "claude", Some("/tmp/prof"), Some("sess-abc")));
         run.save().unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-abc", "claude", 8);
 
         let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
         assert!(
@@ -8860,6 +9118,9 @@ mod rehydrate_tests {
         ));
         run.save().unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-p", "claude", 8);
 
         phase_rehydrate(&h, &mut run, "plan").unwrap();
         let launch = pane_run_call(&h);
@@ -8948,6 +9209,9 @@ mod rehydrate_tests {
             .push(reaped_phase("plan", "codex", None, Some("sess-cx")));
         run.save().unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-cx", "codex", 8);
 
         assert!(matches!(
             phase_rehydrate(&h, &mut run, "plan").unwrap(),
@@ -9095,6 +9359,116 @@ mod rehydrate_tests {
     }
 
     #[test]
+    fn a_resume_is_not_confirmed_until_the_session_itself_comes_back() {
+        // The next layer of "it launched is not it worked". The readiness gate
+        // proves an agent is UP on the new pane; it proves nothing about WHICH
+        // conversation it is in. A recorded id that no longer resolves makes
+        // claude start a fresh session and sit there looking perfectly healthy —
+        // idle, attached, ready — and the ⟳'s entire promise is that the actual
+        // conversation returns. Reporting `Resumed` for a stranger is the one
+        // lie that promise cannot afford.
+        //
+        // The fake reports a session DERIVED from the pane, so a relaunch onto a
+        // new pane yields a DIFFERENT id — precisely what a fresh conversation
+        // looks like from the outside.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-other-session");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        // The resume WAS composed and the agent DID come up — this is not the
+        // never-ready case and not a fallback to reseed.
+        assert!(pane_run_call(&h).contains("--resume 'sess-abc'"));
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
+            panic!("a session that did not come back is not a resume: {outcome:?}");
+        };
+        let Unfinished::ResumeUnconfirmed {
+            expected, observed, ..
+        } = why
+        else {
+            panic!("the reason must say WHICH failure this is: {why:?}");
+        };
+        assert_eq!(expected.as_str(), "sess-abc");
+        assert!(
+            observed.as_ref().is_some_and(|o| o.as_str() != "sess-abc"),
+            "the id herdr DID report is the diagnostic: {observed:?}"
+        );
+        let note = why.note("rh-other-session", "plan");
+        assert!(
+            note.contains("sess-abc") && note.contains("conversation"),
+            "the human has to be told the conversation is not back: {note}"
+        );
+    }
+
+    #[test]
+    fn a_resume_whose_session_comes_back_is_reported_resumed() {
+        // The control for the test above: when herdr reports the agent carrying
+        // the id it was told to resume, that IS the conversation coming back,
+        // and it must still be reported as such. Without this, "never claim
+        // Resumed" would pass trivially.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-confirmed");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        script_resumed_session(&h, "sess-abc", "claude", 8);
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(outcome, RehydrateOutcome::Resumed, "{outcome:?}");
+    }
+
+    #[test]
+    fn a_session_that_shows_up_a_poll_late_is_still_a_confirmed_resume() {
+        // The readiness gate returns on the FIRST poll that reports "started",
+        // and herdr does not necessarily carry an `agent_session` that early —
+        // the same one-poll lag that cost reviewers their captured sessions.
+        // Confirmation must therefore keep looking until the deadline rather
+        // than judging the resume on a single sample.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-late-session");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let h = FakeHerdr::new();
+        // Up, but no session yet.
+        h.push_pane_info(Some(crate::herdr::PaneInfo {
+            tab_id: FakeHerdr::tab_id_for("rehydrated"),
+            agent_status: Some(crate::herdr::AgentStatus::Idle),
+            agent_session: None,
+        }));
+        script_resumed_session(&h, "sess-abc", "claude", 8);
+
+        let outcome = phase_rehydrate_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(outcome, RehydrateOutcome::Resumed, "{outcome:?}");
+    }
+
+    #[test]
     fn a_resume_that_never_comes_up_is_not_reported_as_resumed() {
         // `pane_run` returning Ok means the command was ISSUED. A recorded
         // session id that no longer resolves — pruned session file, cleared
@@ -9124,9 +9498,14 @@ mod rehydrate_tests {
         // The resume WAS composed — this is not a fallback to reseed.
         assert!(pane_run_call(&h).contains("--resume 'sess-stale'"));
         let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
-        let RehydrateOutcome::Incomplete { note } = outcome else {
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
             panic!("an unconfirmed resume must not report as Resumed: {outcome:?}");
         };
+        assert!(
+            matches!(why, Unfinished::NeverReady { resuming: true, .. }),
+            "the variant IS the classification: {why:?}"
+        );
+        let note = why.note("rh-resume-dead", "plan");
         assert!(
             note.contains("conversation was NOT restored"),
             "must say what did not happen, in the resume's own terms: {note}"
@@ -9152,9 +9531,14 @@ mod rehydrate_tests {
 
         // (a) the agent comes up fine: the honest answer is "there was no seed".
         let outcome = phase_rehydrate(&h, &mut run, "plan").unwrap();
-        let RehydrateOutcome::Incomplete { note } = outcome else {
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
             panic!("a fresh agent with no context is not a success: {outcome:?}");
         };
+        assert!(
+            matches!(why, Unfinished::NoSeed { .. }),
+            "there was nothing to send, and the variant says so: {why:?}"
+        );
+        let note = why.note("rh-no-seed", "plan");
         assert!(note.contains("no recorded seed document"), "{note}");
         assert!(
             note.contains("drovr phase send 'rh-no-seed' 'plan'"),
@@ -9183,9 +9567,21 @@ mod rehydrate_tests {
             Duration::from_millis(1),
         )
         .unwrap();
-        let RehydrateOutcome::Incomplete { note } = outcome else {
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
             panic!("{outcome:?}");
         };
+        assert!(
+            matches!(
+                why,
+                Unfinished::NeverReady {
+                    resuming: false,
+                    had_seed: false,
+                    ..
+                }
+            ),
+            "never-ready AND seedless — two facts, both in the variant: {why:?}"
+        );
+        let note = why.note("rh-no-seed-stuck", "plan");
         assert!(
             note.contains("no recorded seed document either"),
             "must not claim a seed failed to send when there was none: {note}"
@@ -9227,9 +9623,22 @@ mod rehydrate_tests {
         .unwrap();
 
         let pane = run.find_phase("plan").unwrap().pane_id().unwrap().to_owned();
-        let RehydrateOutcome::Incomplete { note } = outcome else {
+        let RehydrateOutcome::Incomplete(why) = &outcome else {
             panic!("an undeliverable seed must not report as Reseeded: {outcome:?}");
         };
+        assert!(
+            matches!(
+                why,
+                Unfinished::NeverReady {
+                    resuming: false,
+                    had_seed: true,
+                    ..
+                }
+            ),
+            "{why:?}"
+        );
+        assert_eq!(why.pane(), pane, "every arm names a pane, and it is this one");
+        let note = why.note("rh-not-ready", "plan");
         assert!(note.contains(&pane), "must name the pane it created: {note}");
         assert!(
             note.contains(&format!("herdr pane read '{pane}'")),
@@ -9266,6 +9675,9 @@ mod rehydrate_tests {
         // A DIRECTORY where the marker file goes: `remove_file` cannot remove it.
         std::fs::create_dir_all(done_marker("rh-stuck-marker", "plan")).unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-sm", "claude", 8);
 
         let outcome = phase_rehydrate(&h, &mut run, "plan")
             .expect("a live, recorded pane is not a failed rehydrate");
@@ -9446,6 +9858,9 @@ mod rehydrate_tests {
         std::fs::create_dir_all(run_dir("rh-marker")).unwrap();
         std::fs::write(done_marker("rh-marker", "plan"), "old-pass").unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-m", "claude", 8);
 
         phase_rehydrate(&h, &mut run, "plan").unwrap();
 
@@ -9505,6 +9920,9 @@ mod rehydrate_tests {
             .push(reaped_phase("plan", "claude", None, Some("sess-n")));
         run.save().unwrap();
         let h = FakeHerdr::new();
+        // herdr reports the resumed conversation back — a resume is not
+        // confirmed on readiness alone.
+        script_resumed_session(&h, "sess-n", "claude", 8);
 
         phase_rehydrate(&h, &mut run, "plan").unwrap();
         let calls = h.calls();

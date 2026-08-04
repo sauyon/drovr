@@ -1585,6 +1585,24 @@ impl FakeHerdr {
         })
     }
 
+    /// A session with an EXPLICIT value rather than one derived from a pane id.
+    ///
+    /// Needed because the one thing a resume has to prove is that the agent came
+    /// back carrying *the id it was told to resume* — a value chosen by the test
+    /// fixture, not by whichever pane the relaunch happened to land on. Real
+    /// herdr reports exactly that: `claude --resume <id>` appends to the same
+    /// session file, so the id it reports afterwards is the id it was given.
+    ///
+    /// Panics on a value no `SessionId` could hold, so a fixture cannot silently
+    /// script a session drovr would refuse to capture.
+    pub fn session_valued(value: &str, agent: Option<&str>) -> AgentSession {
+        AgentSession::Id(IdSession {
+            value: SessionId::new(value.to_owned())
+                .expect("a fixture session value must be one a resume could carry"),
+            agent: agent.map(str::to_string),
+        })
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
