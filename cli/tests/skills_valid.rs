@@ -858,6 +858,133 @@ fn assert_arm_snapshots_match_manifest(arm: &str) {
     }
 }
 
+/// Does `commit` name a commit object that is present here?
+///
+/// `git rev-parse <commit>:<path>` fails the same way whether the commit is
+/// missing or the path is, so the two are told apart before the failure is
+/// reported — otherwise "the path does not exist" sends a reader to audit a path
+/// when the real answer is that the history was rewritten out from under the
+/// row.
+fn commit_exists(commit: &str) -> bool {
+    Command::new("git")
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{commit}^{{commit}}"))
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// `git rev-parse <commit>:<source path>` for a manifest row, or `None` if that
+/// path does not exist in that commit.
+fn blob_at_commit(commit: &str, path: &str) -> Option<GitObjectId> {
+    let out = Command::new("git")
+        .arg("rev-parse")
+        .arg(format!("{commit}:{path}"))
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run `git rev-parse {commit}:{path}`: {e}"));
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout)
+        .unwrap_or_else(|e| panic!("`git rev-parse {commit}:{path}` output is not utf-8: {e}"));
+    GitObjectId::parse(stdout.trim()).ok()
+}
+
+/// Every row's commit **contains** the blob the row records, at the path the row
+/// records.
+///
+/// This is what makes the commit cell provenance rather than a timestamp: a
+/// reader runs `git show <commit>:<source path>` and gets the exact text that
+/// arm measured. Without it the column degrades into "roughly when", and an arm
+/// whose text cannot be recovered from history is an arm nobody can audit.
+///
+/// **It is a separate test from [`assert_arm_snapshots_match_manifest`] on
+/// purpose, and the difference is the point.** That one asks *does the file on
+/// disk still hash to what the manifest says* — a drift tripwire on
+/// `arms/<arm>/<skill>.md`. This one asks *does the recorded history actually
+/// hold that text*, which is a claim about the repository and not about the
+/// snapshot. They failed independently: arm B's row matched its snapshot
+/// perfectly while naming a commit where `skills/tdd/SKILL.md` was still arm A′.
+///
+/// It walks **rows**, not `SkillName::ALL`, so it reaches arms that are still
+/// being filled in one skill at a time — arm `B` across Tasks 10–14 — which the
+/// per-arm tripwires cannot check until their last skill lands. **That is
+/// provenance only, not drift.** Nothing yet hashes
+/// `docs/skill-evidence/arms/B/<skill>.md`, so a byte appended to an arm B
+/// snapshot still passes the whole suite; closing that needs
+/// `arm_b_snapshots_match_manifest`, which `MANIFEST.md` defers to the task that
+/// lands arm B's fifth skill.
+///
+/// **Consequence worth knowing before you rebase:** every commit a row names is
+/// now load-bearing. Amending or rebasing one, or dropping the branch that
+/// carries it, turns this check red — and a shallow clone (`fetch-depth: 1`)
+/// has none of them. That is the cost of the column meaning something.
+#[test]
+fn manifest_commits_contain_their_snapshots() {
+    let manifest_path = arms_dir().join("MANIFEST.md");
+    let contents = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
+    let rows =
+        parse_manifest(&contents).unwrap_or_else(|e| panic!("{}: {e}", manifest_path.display()));
+    assert!(
+        !rows.is_empty(),
+        "{}: no rows, so this check compared nothing",
+        manifest_path.display()
+    );
+
+    // Same rule as the snapshot tripwires: git's absence FAILS rather than
+    // skips, because a skip prints `ok` having verified nothing.
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no manifest row's provenance can be verified"
+    );
+
+    let mut wrong = Vec::new();
+    for row in &rows {
+        match blob_at_commit(row.commit.as_str(), &row.source_path) {
+            Some(found) if found == row.hash => {}
+            Some(found) => wrong.push(format!(
+                "  arm `{}` / `{}`: commit {} holds {} at `{}`, but the row records {}",
+                row.arm,
+                row.skill,
+                row.commit.as_str(),
+                found.as_str(),
+                row.source_path,
+                row.hash.as_str(),
+            )),
+            // The two failure modes read alike from `rev-parse` and mean
+            // completely different things, so they are separated before either
+            // is reported.
+            None if !commit_exists(row.commit.as_str()) => wrong.push(format!(
+                "  arm `{}` / `{}`: commit {} is not present in this repository",
+                row.arm,
+                row.skill,
+                row.commit.as_str(),
+            )),
+            None => wrong.push(format!(
+                "  arm `{}` / `{}`: commit {} exists but has no `{}`",
+                row.arm,
+                row.skill,
+                row.commit.as_str(),
+                row.source_path,
+            )),
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} manifest row(s) name a commit that does not carry the text they record:\n{}\n\n\
+         The commit cell must be a commit CONTAINING the snapshot, not whatever `HEAD` \
+         happened to be while you were editing. Snapshot and append your row in a \
+         follow-up commit, after the one carrying the rewrite — recording `HEAD` while \
+         the rewrite is still uncommitted names a commit where the source path still \
+         holds the previous arm's text.",
+        wrong.len(),
+        wrong.join("\n"),
+    );
+}
+
 /// A URL is an address, not a sentence.
 ///
 /// spec §10 requires drovr to cite its sources, and superpowers cites some of
@@ -3963,6 +4090,17 @@ enum SectionMarker {
     /// (it is text the agent is meant to copy out), so a fence-blind matcher
     /// would report the one section that is hardest to get wrong as missing.
     Line(&'static str),
+    /// A **plain** fenced block (no info string) whose whole body is this text,
+    /// compared whitespace-folded — so the fence may wrap it, exactly as
+    /// [`SectionMarker::Line`] tolerates wrapping, but may hold nothing else.
+    ///
+    /// §6 section 4 is not "the Iron Law appears somewhere", it is "one fenced
+    /// all-caps line" — the fence is what makes it a short string an agent can
+    /// cite back, rather than one more sentence of prose in a file made of them.
+    /// That used to be a [`SectionMarker::Line`] plus a separate fence check in
+    /// `check_armor`: one requirement in two places, which is how the two drift
+    /// apart. Presence, ordering and fencing are one mechanism here.
+    FencedLiteral(&'static str),
     /// A fenced block whose info string names this language.
     Fence(&'static str),
 }
@@ -3976,6 +4114,14 @@ impl SectionMarker {
                 .find(|(_, found)| found == text)
                 .map(|(line, _)| line),
             SectionMarker::Line(text) => folded.find(&normalize_ws(text)),
+            SectionMarker::FencedLiteral(text) => fenced_blocks(body)
+                .ok()
+                .and_then(|blocks| {
+                    blocks
+                        .into_iter()
+                        .find(|b| b.info.is_empty() && normalize_ws(&b.body) == normalize_ws(text))
+                })
+                .map(|b| b.line),
             SectionMarker::Fence(lang) => fenced_blocks(body)
                 .ok()
                 .and_then(|blocks| blocks.into_iter().find(|b| b.lang() == *lang))
@@ -3988,6 +4134,9 @@ impl SectionMarker {
         match self {
             SectionMarker::Heading(text) => format!("a heading `{text}`"),
             SectionMarker::Line(text) => format!("the line \"{text}\""),
+            SectionMarker::FencedLiteral(text) => {
+                format!("a plain fenced block holding exactly \"{text}\"")
+            }
             SectionMarker::Fence(info) => format!("a fenced `{info}` block"),
         }
     }
@@ -4178,19 +4327,27 @@ fn headings(text: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// A §6 section that applies to some armored skills and not others.
+/// Which of §6's two CONDITIONAL sections this armored skill carries.
 ///
-/// **Both states are asserted, and that is the point.** §6 marks sections 7 and
-/// 6b CONDITIONAL and names which skills carry them; a check that only looked
-/// for them where they are required would let one appear anywhere else
-/// unremarked, which is how §2.3's placement rule ("the device earns its place
-/// on one loop, not on every page") erodes — one well-meant flowchart at a time.
-/// So `Excluded` is asserted absent, and the reason is §6's own naming rather
-/// than a judgement, which is why this variant carries no `why` of its own.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Conditional {
-    Required,
-    Excluded,
+/// **§6 partitions its four skills, so this is one choice and not two flags.**
+/// Section 6b is named for `tdd` and `systematic-debugging`; section 7 for
+/// `verification-before-completion` and `code-review`. Modelled as two
+/// independent booleans, "carries both" and "carries neither" were
+/// representable — states §6 does not define — and Tasks 11–13 each hand-write
+/// one of these entries, so the wrong combination would compile and only fail
+/// later, opaquely, against a real file.
+///
+/// **The section a skill does NOT carry is asserted absent**, which is the
+/// half that keeps §2.3's placement rule ("the device earns its place on one
+/// loop, not on every page") from eroding one well-meant flowchart at a time.
+/// The absent one needs no recorded reason the way [`SiteState::NotASite`] does:
+/// it follows from §6 naming the other, not from a judgement anyone made.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum ConditionalSection {
+    /// §6 section 6b — the cycle as a fenced `dot` graph.
+    CycleFlowchart,
+    /// §6 section 7 — claim → required evidence → not sufficient.
+    RequirementsTable,
 }
 
 /// A skill that carries §6's armor, and the per-skill strings §6 fixes for it.
@@ -4207,12 +4364,8 @@ struct Armor {
     /// §6 section 5's exact announcement sentence. §6 lists all four; they are
     /// commitment devices, so a paraphrase is a different device.
     announce: &'static str,
-    /// §6 section 7 — the requirements table. Only `verification-before-completion`
-    /// and `code-review`.
-    requirements_table: Conditional,
-    /// §6 section 6b — the cycle as a fenced `dot` graph. Only `tdd` and
-    /// `systematic-debugging`.
-    cycle_flowchart: Conditional,
+    /// Which of §6's two CONDITIONAL sections this skill carries — exactly one.
+    conditional: ConditionalSection,
 }
 
 /// What a `skills/<name>/SKILL.md` is, with respect to fix 4.
@@ -4233,7 +4386,14 @@ enum ArmorState {
     /// One of §6's four whose rewrite lands in a **named** later task. Asserted
     /// **not** armored until then, so the task that writes the text and forgets
     /// to flip this entry fails, and so does the reverse.
-    Pending { task: &'static str },
+    ///
+    /// Carries its `why` for the same reason [`SiteState::Deferred`] does: this
+    /// table is modelled on that one, and a deferral without a rationale is a
+    /// scheduling note rather than a decision.
+    Pending {
+        task: &'static str,
+        why: &'static str,
+    },
     /// Not one of §6's four. Asserted not armored. The reason is recorded
     /// because this is the variant that is a reading of §6's scope rather than
     /// of its text.
@@ -4244,7 +4404,7 @@ impl ArmorState {
     fn describe(&self) -> String {
         match self {
             ArmorState::Armored(_) => "recorded as Armored".to_string(),
-            ArmorState::Pending { task } => format!("recorded as Pending on {task}"),
+            ArmorState::Pending { task, why } => format!("recorded as Pending on {task} ({why})"),
             ArmorState::NotArmored { why } => format!("recorded as NotArmored ({why})"),
         }
     }
@@ -4263,19 +4423,31 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
         ArmorState::Armored(Armor {
             iron_law: "NO IMPLEMENTATION CODE BEFORE A TEST YOU HAVE WATCHED FAIL.",
             announce: "Using drovr:tdd — writing the failing test before the implementation.",
-            requirements_table: Conditional::Excluded,
-            cycle_flowchart: Conditional::Required,
+            conditional: ConditionalSection::CycleFlowchart,
         }),
     ),
     (
         "systematic-debugging",
-        ArmorState::Pending { task: "Task 11" },
+        ArmorState::Pending {
+            task: "Task 11",
+            why: "§6 section 6b — its rewrite carries the cycle flowchart",
+        },
     ),
     (
         "verification-before-completion",
-        ArmorState::Pending { task: "Task 12" },
+        ArmorState::Pending {
+            task: "Task 12",
+            why: "§6 section 7 — its rewrite carries the requirements table",
+        },
     ),
-    ("code-review", ArmorState::Pending { task: "Task 13" }),
+    (
+        "code-review",
+        ArmorState::Pending {
+            task: "Task 13",
+            why: "§6 section 7 — its rewrite carries the requirements table, and \
+                  promotes the FOREGROUND rule into the no-exceptions list",
+        },
+    ),
     (
         "using-drovr",
         ArmorState::NotArmored {
@@ -4320,15 +4492,17 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
 /// [`all_skills_have_valid_frontmatter`] already owns it. Two checks on one
 /// field would be two contracts that can disagree.
 ///
-/// Sections 6b and 7 are interleaved at their §6 positions when the skill
-/// declares them [`Conditional::Required`]. No skill declares both, so their
-/// order relative to each other is never exercised.
+/// The skill's one CONDITIONAL section is inserted at its §6 position. A skill
+/// has exactly one, so their order relative to each other never arises.
 fn required_sections(armor: &Armor) -> Vec<(&'static str, SectionMarker)> {
     let mut out = vec![
         ("2 Overview", SectionMarker::Heading("Overview")),
         ("3 Unity line", SectionMarker::Line(UNITY_LINE)),
         ("4 The Iron Law", SectionMarker::Heading("The Iron Law")),
-        ("4 Iron Law text", SectionMarker::Line(armor.iron_law)),
+        (
+            "4 Iron Law, fenced",
+            SectionMarker::FencedLiteral(armor.iron_law),
+        ),
         ("5 Announce", SectionMarker::Heading("Announce")),
         (
             "5 Announcement sentence",
@@ -4336,12 +4510,12 @@ fn required_sections(armor: &Armor) -> Vec<(&'static str, SectionMarker)> {
         ),
         ("6 The procedure", SectionMarker::Heading("The procedure")),
     ];
-    if armor.cycle_flowchart == Conditional::Required {
-        out.push(("6b Cycle flowchart", SectionMarker::Fence("dot")));
-    }
-    if armor.requirements_table == Conditional::Required {
-        out.push(("7 Requirements", SectionMarker::Heading("Requirements")));
-    }
+    out.push(match armor.conditional {
+        ConditionalSection::CycleFlowchart => ("6b Cycle flowchart", SectionMarker::Fence("dot")),
+        ConditionalSection::RequirementsTable => {
+            ("7 Requirements", SectionMarker::Heading("Requirements"))
+        }
+    });
     out.extend([
         ("8 Red flags", SectionMarker::Heading("Red flags — STOP")),
         (
@@ -4498,52 +4672,43 @@ fn check_armor(
         }
     };
 
-    // §6 section 4: the Iron Law is *fenced*. Unfenced it is one more sentence
-    // of prose in a file made of them.
-    if !blocks
-        .iter()
-        .any(|b| normalize_ws(&b.body) == normalize_ws(armor.iron_law))
-    {
-        wrong.push(format!(
-            "{}: no fenced block holds exactly the Iron Law \"{}\"",
-            path.display(),
-            armor.iron_law,
-        ));
-    }
-
-    // §6's CONDITIONAL sections, both directions.
-    if (armor.cycle_flowchart == Conditional::Required) != blocks.iter().any(|b| b.lang() == "dot")
-    {
-        wrong.push(match armor.cycle_flowchart {
-            Conditional::Required => format!(
-                "{}: §6 section 6b requires a fenced `dot` cycle here and there is none",
-                path.display()
-            ),
-            Conditional::Excluded => format!(
-                "{}: carries a fenced `dot` block, but §6 marks section 6b \
-                 CONDITIONAL and does not name this skill for it (§2.3: the \
-                 device earns its place on one loop, not on every page)",
-                path.display()
-            ),
-        });
-    }
-    // Asymmetric on purpose: the *required* direction matches §6's heading text
-    // exactly, because that text is the contract. The *forbidden* direction
-    // matches any heading that opens with it, so a section 7 smuggled in as
-    // "Requirements table" or "Requirements — what must be true" cannot walk
-    // around §6's scope on a title variation.
-    if armor.requirements_table == Conditional::Excluded
-        && let Some((line, found)) = headings(body)
-            .into_iter()
-            .find(|(_, text)| text.starts_with("Requirements"))
-    {
-        wrong.push(format!(
-            "{}: line {} is a `{found}` heading, but §6 marks section 7 \
-             CONDITIONAL and names only `verification-before-completion` and \
-             `code-review` for it",
-            path.display(),
-            at(line),
-        ));
+    // The CONDITIONAL section this skill does NOT carry is asserted absent.
+    // Its presence is `required_sections`' job, in the ordered pass below — this
+    // half is the one an ordering check cannot express.
+    //
+    // Asymmetric on purpose: the *required* direction matches §6's text exactly,
+    // because that text is the contract. The *forbidden* direction matches any
+    // heading that merely opens with it, so a section 7 smuggled in as
+    // "Requirements table" cannot walk around §6's scope on a title variation.
+    match armor.conditional {
+        // §6 names this skill for 6b, so section 7 must be absent.
+        ConditionalSection::CycleFlowchart => {
+            if let Some((line, found)) = headings(body)
+                .into_iter()
+                .find(|(_, text)| text.starts_with("Requirements"))
+            {
+                wrong.push(format!(
+                    "{}: line {} is a `{found}` heading, but §6 marks section 7 \
+                     CONDITIONAL and names only `verification-before-completion` \
+                     and `code-review` for it",
+                    path.display(),
+                    at(line),
+                ));
+            }
+        }
+        // §6 names this skill for 7, so the flowchart must be absent.
+        ConditionalSection::RequirementsTable => {
+            if let Some(block) = blocks.iter().find(|b| b.lang() == "dot") {
+                wrong.push(format!(
+                    "{}: line {} opens a fenced `dot` block, but §6 marks section \
+                     6b CONDITIONAL and names only `tdd` and \
+                     `systematic-debugging` for it (§2.3: the device earns its \
+                     place on one loop, not on every page)",
+                    path.display(),
+                    at(block.line),
+                ));
+            }
+        }
     }
 
     // Presence and order in one pass: §6 fixes an order, so a file with every
@@ -4614,12 +4779,10 @@ fn synthetic_body(armor: &Armor) -> Vec<String> {
     for (_, marker) in required_sections(armor) {
         match marker {
             SectionMarker::Heading(text) => lines.push(format!("## {text}")),
-            // §6 section 4 is the one line that has to be *fenced*; the rest of
-            // the required literals are prose.
-            SectionMarker::Line(text) if text == armor.iron_law => {
+            SectionMarker::Line(text) => lines.push(text.to_string()),
+            SectionMarker::FencedLiteral(text) => {
                 lines.extend(["```".to_string(), text.to_string(), "```".to_string()]);
             }
-            SectionMarker::Line(text) => lines.push(text.to_string()),
             SectionMarker::Fence(info) => lines.extend([
                 format!("```{info}"),
                 "digraph g { a -> b; }".to_string(),
@@ -4643,8 +4806,7 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
     let armor = Armor {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
-        requirements_table: Conditional::Excluded,
-        cycle_flowchart: Conditional::Required,
+        conditional: ConditionalSection::CycleFlowchart,
     };
     let path = Path::new("fixture/SKILL.md");
     let complaints = |body: &str, armor: &Armor| -> Vec<String> {
@@ -4687,6 +4849,26 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
         complaints(&wrapped, &armor)
     );
 
+    // §6 section 4 is a *fenced* line. The same words as prose are not the
+    // section, and neither is a fence carrying an info string — the plain fence
+    // is what marks it as the string to cite back.
+    let fenced_law = format!("```\n{}\n```", armor.iron_law);
+    for (variant, replacement) in [
+        ("unfenced", armor.iron_law.to_string()),
+        ("info-stringed", format!("```text\n{}\n```", armor.iron_law)),
+    ] {
+        let weakened = good.replace(&fenced_law, &replacement);
+        assert_ne!(weakened, good, "{variant}: the fixture did not change");
+        assert!(
+            complaints(&weakened, &armor)
+                .iter()
+                .any(|c| c.contains("4 Iron Law, fenced")),
+            "{variant}: an Iron Law that is not in a plain fenced block must be \
+             reported as the missing section: {:?}",
+            complaints(&weakened, &armor)
+        );
+    }
+
     // §6 fixes an *order*, so a page holding every section in the wrong sequence
     // does not satisfy it.
     //
@@ -4709,19 +4891,25 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
          case would keep passing with the order check disabled: {complained:?}"
     );
 
-    // The CONDITIONAL sections' absent direction: the same page, against a skill
-    // §6 does not name for the flowchart.
-    let excluded = Armor {
-        cycle_flowchart: Conditional::Excluded,
+    // The CONDITIONAL section's absent direction: the same page, read as a skill
+    // §6 names for section 7 instead. Its `dot` fence is then forbidden — and its
+    // missing `Requirements` heading is a second, expected complaint, so this
+    // case is held to `any` rather than `all`.
+    let other_half = Armor {
+        conditional: ConditionalSection::RequirementsTable,
         ..armor
     };
+    let complained = complaints(&good, &other_half);
     assert!(
-        complaints(&good, &excluded)
-            .iter()
-            .any(|c| c.contains("§6 marks section 6b")),
+        complained.iter().any(|c| c.contains("§6 marks section 6b")),
         "a `dot` flowchart on a skill §6 did not name for one must be reported: \
-         {:?}",
-        complaints(&good, &excluded)
+         {complained:?}"
+    );
+    assert!(
+        complained
+            .iter()
+            .any(|c| c.contains("`7 Requirements` is missing")),
+        "the other half of the partition must still be required: {complained:?}"
     );
     // A title variation must not walk around section 7's exclusion.
     for title in ["## Requirements", "## Requirements table"] {
@@ -4760,8 +4948,7 @@ fn a_page_that_documents_the_armor_does_not_carry_it() {
     let armor = Armor {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
-        requirements_table: Conditional::Excluded,
-        cycle_flowchart: Conditional::Required,
+        conditional: ConditionalSection::CycleFlowchart,
     };
     let documented = "\
 ## Overview

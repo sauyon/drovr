@@ -37,6 +37,16 @@ table would be, so do not write one.
 
 Further rules follow from the parser being strict for the whole file at once:
 
+- **The commit cell must be a commit that actually CONTAINS the recorded blob** at the recorded
+  source path — `git rev-parse <commit>:<source path>` has to print the hash cell.
+  `manifest_commits_contain_their_snapshots` enforces this for every row of every arm. That is
+  what makes the row a provenance record rather than a timestamp: a later reader runs
+  `git show <commit>:<source path>` and gets the exact text the arm measured.
+  **This dictates the order of your task's last two steps.** Snapshot and append your row
+  *after* the commit that carries the rewrite, in a follow-up commit — if you record `HEAD` while
+  your rewrite is still uncommitted, the cell names a commit where the source path still holds
+  the *previous* arm's text. Task 10 made exactly that mistake; nothing caught it, because until
+  now nothing checked.
 - **Arm `B` is filled in one skill at a time**, by Tasks 10–14, because each fix-4 rewrite is its
   own task with its own context. Until the last of them lands, `B` has fewer than five rows. Do
   **not** add an `arm_b_snapshots_match_manifest` test before then:
@@ -75,4 +85,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | A-prime | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `192f87ac3b21cd7960da5e3b4a9684f0566ed64d` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
 | A-prime | code-review | `skills/code-review/SKILL.md` | `dd75c8c288e54782c78e35ace164708c645f9875` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
 | A-prime | using-drovr | `skills/using-drovr/SKILL.md` | `ae6b23b07ced4ebe2e606056001d5cdc9220cbe2` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
-| B | tdd | `skills/tdd/SKILL.md` | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | `ff256a89bb0d731cf7806724326cdd4f6e27ec72` | 2026-08-04 |
+| B | tdd | `skills/tdd/SKILL.md` | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | `30a99cd5667b0628fd278b8772ec42debff0c667` | 2026-08-04 |
