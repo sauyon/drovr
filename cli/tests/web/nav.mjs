@@ -87,6 +87,7 @@ const KEYS = {
   k: { key: 'k', code: 'KeyK', vk: 75, text: 'k' },
   g: { key: 'g', code: 'KeyG', vk: 71, text: 'g' },
   G: { key: 'G', code: 'KeyG', vk: 71, text: 'G', mods: 8 },
+  a: { key: 'a', code: 'KeyA', vk: 65, text: 'a' },
   h: { key: 'h', code: 'KeyH', vk: 72, text: 'h' },
   i: { key: 'i', code: 'KeyI', vk: 73, text: 'i' },
   '/': { key: '/', code: 'Slash', vk: 191, text: '/' },
@@ -133,7 +134,8 @@ const cursorName = () => evaluate(`
 // the page's RUN_ROW_SEL: probes run against a page that may still be parsing,
 // and a bare reference throws ReferenceError before the script defines it. The
 // two are pinned together by the drift check in the completed-sessions section.
-const RUN_ROW_SEL = "#run-list-items > .run-row, #run-list-items details[open] .run-row";
+const RUN_ROW_SEL = "#run-list-items > .run-row-wrap > .run-row, " +
+                    "#run-list-items details[open] .run-row-wrap > .run-row";
 const rowNames = () => evaluate(`
   return Array.from(document.querySelectorAll(${JSON.stringify(RUN_ROW_SEL)})).map(function(e){return e.querySelector('.run-name').textContent;});`);
 // Every row in the DOM, collapsed or not.
@@ -158,6 +160,7 @@ const checkedIn = qi => evaluate(`
   var r = it.querySelector('input[type="radio"]:checked');
   return r ? r.value : null;`);
 const hash = () => evaluate(`return location.hash;`);
+const docText = () => evaluate(`return (document.getElementById('doc-content').textContent || '').trim();`);
 const filterOpen = () => evaluate(`return document.getElementById('nav-filter').style.display !== 'none';`);
 const helpOpen = () => evaluate(`return document.getElementById('key-help').classList.contains('open');`);
 const activeId = () => evaluate(`
@@ -174,6 +177,15 @@ function check(label, actual, expected) {
 
 async function goto(hashPath, ready) {
   await send('Page.navigate', { url: BASE + '/' + hashPath });
+  await waitFor(ready.probe, ready.ok, 8000, ready.label);
+}
+// A real document reload, unlike `goto`, which only changes the hash. Needed
+// before a test that measures render ORDERING: earlier sections press `a` and
+// click Archive without awaiting those actions' internal chains, so promises from
+// them can still be in flight and touch the cursor mid-measurement — which is
+// exactly how the race test below passed against a deliberately broken build.
+async function reload(ready) {
+  await send('Page.reload', { ignoreCache: false });
   await waitFor(ready.probe, ready.ok, 8000, ready.label);
 }
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
@@ -305,6 +317,264 @@ check('Enter on the focused summary toggles the group instead', await groupOpen(
 await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
 await waitFor(groupOpen, o => o === false, 4000, 'group collapsed for the next section');
 
+console.log('\n== session list: the cursor when a row leaves the view ==');
+await goto('#/', LIST_READY);
+// Two opposite failure modes, both reproduced in earlier rounds. What separates
+// them is WHY the row left, not how long it has been gone:
+//   * merely HIDDEN (collapsed into Completed, folded by a liveness flap) — the
+//     run still exists, so the selection must survive and come back.
+//   * actually GONE from the server's list (archived then purged, deleted) — the
+//     key names nothing, so it must be released at once or the numeric index
+//     repaints the cursor onto a different row after every re-sort.
+
+// --- hidden: collapse the Completed group with the cursor inside it ---
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open');
+await press('G');                       // last visible row = inside the group
+const insideGroup = await cursorName();
+check('cursor can be parked on a completed row',
+  ['epsilon-done', 'zeta-archived'].indexOf(insideGroup) !== -1, true);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed');
+check('collapsing the group does not steal the selection',
+  await evaluate(`return navCursorKey;`), insideGroup);
+// Survive several real render passes — the previous timeout-based rule released
+// the anchor after a few of these and permanently reassigned it.
+for (let i = 0; i < 5; i++) await evaluate(`return renderRunList(routeGen);`);
+check('...and it still is not stolen after repeated polls',
+  await evaluate(`return navCursorKey;`), insideGroup);
+// Holding the KEY is only half of it. While the anchored row is off screen the
+// cursor has no on-screen position, so nothing may be painted as selected and no
+// key may resolve to a row. Keeping the numeric index instead silently repainted
+// the cursor onto whatever row slid into that slot — and `a` then archived THAT
+// run: a destructive action on a session the reviewer never selected.
+check('...and no visible row is marked selected while the anchor is hidden',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 0);
+check('...and no row resolves under the cursor while the anchor is hidden',
+  await evaluate(`var r = navRows()[navCursor]; return r ? rowKey(r) : null;`), null);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group reopened');
+check('...so reopening the group restores the cursor to it',
+  await cursorName(), insideGroup);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed again');
+
+// --- gone: the run leaves /api/runs entirely ---
+await goto('#/', LIST_READY);
+await press('g');
+await press('j');
+const parked = await cursorName();
+// Stub /api/runs so the run really leaves the DATA, not just the DOM.
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.filter(function(x){ return x.name !== ${JSON.stringify(parked)}; }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+const released = await evaluate(`return navCursorKey;`);
+check('a run gone from the server list releases the anchor immediately',
+  released !== parked, true);
+check('...onto a row that actually exists',
+  (await rowNames()).indexOf(released) !== -1, true);
+const drift = [];
+for (let i = 0; i < 4; i++) {
+  await evaluate(`return renderRunList(routeGen);`);
+  drift.push(await evaluate(`return navCursorKey;`));
+}
+check('...and the cursor then stops drifting across rows',
+  drift.every(k => k === released), true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+console.log('\n== session list: a filtered-out row is still not the reviewer\'s doing ==');
+// A filter narrows the list, so when the reviewer TYPES, the cursor should follow
+// into what remains — and it does, because the filter input resets the anchor on
+// every keystroke. But the filtered set is recomputed on every 2s poll too, and a
+// run's `state` changes server-side constantly. If the selected run's new state
+// stops matching the filter text, its row leaves with no user action at all.
+// Treating "a filter is active" as "the reviewer did this" handed the cursor to
+// whatever slid into the slot — the same wrong-run archive, reachable again.
+await goto('#/', LIST_READY);
+await press('/');
+// Every active run's task is "task for <name>", so this matches all of them and
+// the list still has rows left after one drops out — an earlier version filtered
+// down to a single visible row, so removing it hit the empty-list branch and the
+// scenario never ran at all.
+await typeText('task');
+await waitFor(rowNames, r => r.length >= 3, 4000, 'filter matched at least three runs');
+// ArrowDown, not `j`: focus is still in the filter box, where `j` is just text.
+// (An earlier version pressed `j`, silently made the filter "taskj", matched
+// nothing, and asserted against an empty list.)
+await press('ArrowDown');
+const filtered = await cursorName();
+check('the filter is still the one we typed', await evaluate(`return listFilter;`), 'task');
+check('...and the cursor is on a row the filter matches',
+  (await rowNames()).indexOf(filtered) !== -1, true);
+// Exactly what the next poll returns when this run's task text changes so it no
+// longer matches. Nothing else changes; the reviewer touches nothing.
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === ${JSON.stringify(filtered)} ? Object.assign({}, x, {task: 'chore'}) : x;
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the filtered-out row really left the list',
+  (await rowNames()).indexOf(filtered), -1);
+check('...and rows remain, so this is not the empty-list branch',
+  (await rowNames()).length > 0, true);
+check('a poll filtering out the selected row does not reassign the anchor',
+  await evaluate(`return navCursorKey;`), filtered);
+check('...and no visible row is marked selected',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 0);
+check('...so `a` has no row to act on',
+  await evaluate(`var r = navRows()[navCursor]; return r ? rowKey(r) : null;`), null);
+await evaluate(`window.__restoreFetch(); return 1;`);
+await press('Escape');
+
+// A new filter must land the cursor at the top of whatever matches — including
+// when that keystroke's own fetch fails. The reset lives past an `await`, so a
+// rejected fetch skipped it entirely, leaving the anchor on a run the new filter
+// excludes; the cursor then parked and stayed invisible even after recovery.
+await goto('#/', LIST_READY);
+await press('g');
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) return Promise.reject(new Error('boom'));
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('/');
+await typeText('beta');
+await waitFor(() => evaluate(`return document.getElementById('run-list-items').textContent;`),
+  x => x.indexOf('Failed to load sessions') !== -1, 4000, 'the failed filter render');
+await evaluate(`window.__restoreFetch(); return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('a filter typed during a failed fetch still lands the cursor once it recovers',
+  await evaluate(`return document.querySelectorAll('.nav-cursor').length;`), 1);
+check('...on a row the filter actually matches',
+  (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await press('Escape');
+await waitFor(rowNames, r => r.length > 1, 4000, 'filter cleared');
+
+console.log('\n== session list: the cursor survives a failed fetch ==');
+await goto('#/', LIST_READY);
+await press('g');
+await press('j');
+const held = await cursorName();
+// A failed /api/runs replaces the list with "Failed to load sessions" — zero
+// rows. That is a server hiccup, not a deletion, so the selection must survive
+// it; clearing the anchor there discarded it before any hidden-vs-gone reasoning
+// could run, and the cursor never came back on the recovery poll.
+await evaluate(`
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) return Promise.reject(new Error('boom'));
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('a failed fetch empties the list', await evaluate(`
+  return document.querySelectorAll('.run-row').length;`), 0);
+check('...but does not discard the selection',
+  await evaluate(`return navCursorKey;`), held);
+await evaluate(`window.__restoreFetch(); return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('...so the cursor is back on its run once the server recovers',
+  await cursorName(), held);
+
+// A slow response must never overwrite a newer one: `routeGen` only changes when
+// the VIEW does, so it cannot order two fetches issued from the same view.
+const baselineRuns = await evaluate(`return knownRunNames.length;`);
+const afterRace = await evaluate(`
+  var realFetch = window.fetch;
+  var call = 0;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      call++;
+      var mine = call;
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        // Call 1 is the OLD snapshot (full list), delayed so it lands LAST.
+        // Call 2 is newer and drops one run.
+        var body = mine === 1 ? rows : rows.filter(function(x){ return x.name !== rows[0].name; });
+        var wait = mine === 1 ? 220 : 0;
+        return new Promise(function(res){
+          setTimeout(function(){ res({ok: true, json: function(){ return Promise.resolve(body); }}); }, wait);
+        });
+      });
+    }
+    return realFetch(u, o);
+  };
+  var stale = renderRunList(routeGen);
+  var fresh = renderRunList(routeGen);
+  return Promise.all([stale, fresh]).then(function(){
+    window.fetch = realFetch;
+    return knownRunNames.length;
+  });`);
+check('a stale list response cannot overwrite a newer one',
+  afterRace, baselineRuns - 1);
+// Leave the page on real data for the sections below.
+await evaluate(`return renderRunList(routeGen);`);
+
+// The mirror of the case above, and the one the suite could not previously
+// reach: the STALE call FAILS after the fresh one already rendered. Guarding
+// only the success path let its catch wipe a correct list to "Failed to load
+// sessions" — a phantom failure, easily read as the archive having failed.
+// Counted rather than hard-coded: this asserts the list is UNCHANGED, so the
+// number is whatever the fixture happens to hold. A hard-coded 6 broke the moment
+// a seventh fixture run was added upstream.
+const beforeStale = await evaluate(`return document.querySelectorAll('.run-row').length;`);
+check('a stale FAILED fetch cannot wipe a newer successful render', await evaluate(`
+  var realFetch = window.fetch;
+  var call = 0;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/api/runs') !== -1) {
+      call++;
+      if (call === 1) {
+        // Older call: rejects, but only after the newer one has rendered.
+        return new Promise(function(_res, rej){ setTimeout(function(){ rej(new Error('boom')); }, 220); });
+      }
+      return realFetch(u, o);
+    }
+    return realFetch(u, o);
+  };
+  var stale = renderRunList(routeGen);
+  var fresh = renderRunList(routeGen);
+  return Promise.all([stale, fresh]).then(function(){
+    return new Promise(function(res){ setTimeout(res, 320); });
+  }).then(function(){
+    window.fetch = realFetch;
+    // The claim is that the older call's rejection did not replace a good list
+    // with "Failed to load sessions" — so ask exactly that. Reporting a literal
+    // row count instead coupled this to the fixture size, and it broke the moment
+    // a seventh fixture run was added upstream.
+    var failed = document.querySelector('#run-list-items .review-empty');
+    if (failed) return 'wiped: ' + failed.textContent;
+    return document.querySelectorAll('.run-row').length > 0 ? 'intact' : 'empty';
+  });`), 'intact');
+await evaluate(`return renderRunList(routeGen);`);
+
 console.log('\n== session list: filter ==');
 await goto('#/', LIST_READY);
 await press('g');
@@ -333,7 +603,9 @@ console.log('\n== session list: cursor is anchored to its run, not its slot ==')
 // Explicitly not alpha-deploy: posting a summary overwrites the target's
 // summary.txt, and the detail-view checks below assert on alpha's seeded summary.
 // Picking "the last row" blind silently clobbered it whenever alpha sorted last.
-const bump = names.filter(n => n !== 'alpha-deploy').pop();
+// epsilon-nospec is out for the same reason: it is the fixture for "no spec yet",
+// and POSTing a summary would move it to `ready` under the stale-doc check below.
+const bump = names.filter(n => n !== 'alpha-deploy' && n !== 'epsilon-nospec').pop();
 await press('g'); await press('j');
 const anchored = await cursorName();
 check('cursor sits on a row the re-sort will move', anchored, names[1]);
@@ -342,6 +614,602 @@ const after = await waitFor(rowNames, r => r[0] === bump, 8000, 'list re-sort');
 check('the list really did re-sort', after[0], bump);
 check('and the anchored run really changed index', after.indexOf(anchored) !== names.indexOf(anchored), true);
 check('cursor stayed on its run across the re-sort', await cursorName(), anchored);
+
+console.log('\n== session list: archive button ==');
+await goto('#/', LIST_READY);
+// Deterministic whether or not a real herdr is reachable from this machine: with
+// herdr up the fixtures report live:false, without it live:null, and only the
+// latter prompts. Stub the prompt so both paths proceed.
+const stubConfirm = () => evaluate(`
+  window.__confirms = 0;
+  window.confirm = function(){ window.__confirms++; return true; };
+  window.__alerts = [];
+  window.alert = function(m){ window.__alerts.push(m); };
+  return 1;`);
+const btnFor = name => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(name)}; });
+  return b ? b.textContent : null;`);
+const clickArchive = name => evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(name)}; }).click();
+  return 1;`);
+
+await stubConfirm();
+// End-to-end pin: the server's `live` must actually reach the button's dataset,
+// which is what gates the confirm. The gateProbe checks below call toggleArchive
+// with synthetic arguments, so they prove the gating logic but NOT this wiring —
+// a break here (field renamed, dataset mis-spelled) would leave every live run
+// silently archivable with no prompt. Environment-independent: it asserts the
+// row agrees with whatever /api/runs actually reported, live herdr or not.
+check('every row\'s data-live matches what the server reported', await evaluate(`
+  return fetch('/api/runs').then(function(r){return r.json();}).then(function(rows){
+    var bad = [];
+    rows.forEach(function(row) {
+      var b = Array.from(document.querySelectorAll('.run-archive'))
+        .find(function(x){ return x.dataset.run === row.name; });
+      if (!b) { bad.push(row.name + ':missing-button'); return; }
+      var want = row.live === null ? 'unknown' : (row.live ? '1' : '0');
+      if (b.dataset.live !== want) bad.push(row.name + ':' + b.dataset.live + '!=' + want);
+      if (b.dataset.archived !== (row.archived ? '1' : '0')) bad.push(row.name + ':archived-mismatch');
+    });
+    return bad;
+  });`), []);
+
+check('every row carries an archive control',
+  await evaluate(`return document.querySelectorAll('.run-archive').length > 0;`), true);
+check('an active run offers Archive', await btnFor('beta-cache'), 'Archive');
+
+// The control is a sibling of the <a>, not a child — clicking must not navigate.
+const beforeHash = await hash();
+await clickArchive('beta-cache');
+await waitFor(rowNames, r => r.indexOf('beta-cache') === -1, 6000, 'beta-cache leaves the list');
+check('archiving does not navigate away from the list', await hash(), beforeHash);
+check('the archived run leaves the active list', (await rowNames()).indexOf('beta-cache'), -1);
+check('...and is still present, under Completed',
+  (await allRowNames()).indexOf('beta-cache') !== -1, true);
+check('it persisted server-side', await evaluate(`
+  return fetch('/api/runs').then(function(r){return r.json();}).then(function(rows){
+    var row = rows.find(function(x){ return x.name === 'beta-cache'; });
+    return !!(row && row.archived && row.complete);
+  });`), true);
+
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open for restore');
+check('an archived run offers Restore', await btnFor('beta-cache'), 'Restore');
+await clickArchive('beta-cache');
+await waitFor(rowNames, r => r.indexOf('beta-cache') !== -1, 6000, 'beta-cache returns');
+check('restoring puts it back in the active list',
+  (await rowNames()).indexOf('beta-cache') !== -1, true);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed again');
+
+// The safety property the whole feature turns on: archiving a run that MAY have
+// live panes must prompt first, because closing the workspace destroys the
+// agent's context. Driven client-side with fetch stubbed — the fixtures record
+// no workspace (so a reachable herdr reports live:false and the branch would
+// never run), and stubbing keeps this from mutating server state, which made an
+// earlier state-cycling version order-dependent and wrong.
+const gateProbe = (archived, live) => evaluate(`
+  window.__confirms = 0;
+  window.__posted = 0;
+  window.confirm = function(){ window.__confirms++; return true; };
+  var realFetch = window.fetch;
+  window.fetch = function(u, o) {
+    if (String(u).indexOf('/archive') !== -1) {
+      window.__posted++;
+      return Promise.resolve({ok: true, json: function(){ return Promise.resolve({ok:true, workspace_closed:true}); }});
+    }
+    return realFetch(u, o);
+  };
+  return toggleArchive('probe-run', ${archived}, ${JSON.stringify(live)}).then(function(){
+    window.fetch = realFetch;
+    return {confirms: window.__confirms, posted: window.__posted};
+  });`);
+
+check('archiving a definitively-dead run does NOT prompt',
+  await gateProbe(false, '0'), {confirms: 0, posted: 1});
+check('archiving a LIVE run prompts first',
+  await gateProbe(false, '1'), {confirms: 1, posted: 1});
+check('archiving with UNKNOWN liveness also prompts',
+  await gateProbe(false, 'unknown'), {confirms: 1, posted: 1});
+check('restoring never prompts, whatever liveness says',
+  await gateProbe(true, '1'), {confirms: 0, posted: 1});
+
+// 'a' acts on the row under the nav cursor.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const aTarget = await cursorName();
+await press('a');
+await waitFor(rowNames, r => r.indexOf(aTarget) === -1, 6000, `'a' archives ${aTarget}`);
+check("'a' archives the row under the cursor", (await rowNames()).indexOf(aTarget), -1);
+check('...and the cursor did not strand on the now-hidden row',
+  (await cursorName()) !== aTarget && (await cursorName()) !== null, true);
+// Restore it so the sections below see the original fixture.
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === true, 4000, 'group open to restore');
+await clickArchive(aTarget);
+await waitFor(rowNames, r => r.indexOf(aTarget) !== -1, 6000, `${aTarget} restored`);
+await evaluate(`document.querySelector('.run-group > summary').click(); return 1;`);
+await waitFor(groupOpen, o => o === false, 4000, 'group collapsed after restore');
+
+// A failed workspace close leaves the run a ZOMBIE: archived, but its panes are
+// still alive, so the server forces `complete: false` and the row deliberately
+// stays in the active list. Advancing the cursor off it — as archiving normally
+// should — walks the selection onto a row that is still on screen, which is the
+// wrong-row class again by a third route.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const zTarget = await cursorName();
+await evaluate(`
+  window.__zArchived = false;
+  window.__zName = ${JSON.stringify(zTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    // The archive POST "succeeds" but reports the workspace could not be closed.
+    if (s.indexOf('/archive') !== -1) {
+      window.__zArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    // ...and the run comes back archived with live panes and complete:false —
+    // exactly what the server emits for a zombie.
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === window.__zName
+              ? Object.assign({}, x, {live: null, archived: window.__zArchived, complete: false})
+              : x;
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the zombie fixture reports unknown liveness', await evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.live : null;`), 'unknown');
+await press('a');
+await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
+await evaluate(`return renderRunList(routeGen);`);
+// The checks below assert the cursor did NOT move, so waiting for the expected
+// value would pass instantly whether or not the render landed. Wait for the
+// render's observable EFFECT instead — the row showing as archived — which is
+// what proves the state under test was actually reached.
+await waitFor(() => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.archived : null;`), v => v === '1', 6000, 'the archive to reach the row');
+check('a zombie row stays in the active list', (await rowNames()).indexOf(zTarget) !== -1, true);
+check('...so the cursor stays on it rather than walking to a neighbour',
+  await cursorName(), zTarget);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// The cursor decision must come from what ACTUALLY happened, not from the
+// client's cached `live` at click time — those disagree in both directions.
+
+// (1) Cached live '0' (so no confirm), but the run comes back a real zombie.
+// Predicting from the cached value advanced the cursor off a surviving row, and
+// silently: the "panes may still be running" alert did not fire either.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const staleTarget = await cursorName();
+await evaluate(`
+  window.__zArchived = false;
+  window.__zName = ${JSON.stringify(staleTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__zArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__zName) return x;
+            // Before the click the page is told "definitely not live", so the
+            // key does not prompt. Afterwards the truth: panes alive.
+            return window.__zArchived
+              ? Object.assign({}, x, {live: true, archived: true, complete: false})
+              : Object.assign({}, x, {live: false, archived: false, complete: false});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+check('the stale-liveness fixture reports not-live before the click', await evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.live : null;`), '0');
+await press('a');
+await waitFor(() => evaluate(`return window.__zArchived;`), v => v === true, 4000, 'the archive POST fired');
+await evaluate(`return renderRunList(routeGen);`);
+// Same reason as above: assert-a-negative needs the render's effect waited on.
+await waitFor(() => evaluate(`
+  var b = Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__zName; });
+  return b ? b.dataset.archived : null;`), v => v === '1', 6000, 'the archive to reach the row');
+check('a run that turns out to be a zombie stays in the active list',
+  (await rowNames()).indexOf(staleTarget) !== -1, true);
+check('...so the cursor stays on it even though cached liveness said otherwise',
+  await cursorName(), staleTarget);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (2) The converse. `workspace_closed:false` is overwhelmingly "the workspace was
+// already gone", so the row really does leave — the cursor must move on rather
+// than park on a row that is never coming back.
+await goto('#/', LIST_READY);
+await stubConfirm();
+await press('g');
+const goneTarget = await cursorName();
+await evaluate(`
+  window.__gArchived = false;
+  window.__gName = ${JSON.stringify(goneTarget)};
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__gArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__gName) return x;
+            return window.__gArchived
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : Object.assign({}, x, {live: null, archived: false, complete: false});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`return renderRunList(routeGen);`);
+await press('a');
+await waitFor(() => evaluate(`return window.__gArchived;`), v => v === true, 4000, 'the archive POST fired');
+// Wait for the row to go rather than asserting straight after dispatching a
+// render: `press` does not await toggleArchive, so its own render can be
+// dispatched after this one and win the staleness guard, leaving this one to bail
+// without painting. Asserting immediately made this check flake.
+await waitFor(rowNames, r => r.indexOf(goneTarget) === -1, 6000,
+  'the archived row to leave the active list');
+check('a run whose workspace was already gone really leaves the active list',
+  (await rowNames()).indexOf(goneTarget), -1);
+// `press` does not await toggleArchive — its own re-render, and the cursor
+// decision that follows it, land afterwards. Wait for that rather than probing
+// mid-flight; if the advance never happens this still fails, on the timeout.
+await waitFor(cursorName, n => n !== null && n !== goneTarget, 6000,
+  'the cursor to advance off the archived row');
+check('...so the cursor advances to a neighbour instead of stranding',
+  (await cursorName()) !== goneTarget, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (3) The render that decides must be the one that can answer. toggleArchive
+// used to decide right after awaiting its OWN render — but that render bails
+// without painting whenever a newer one has been dispatched (the 2s poll), while
+// its promise still resolves. The check then ran against pre-archive DOM, saw the
+// row still present, skipped the hand-off, and the later render parked the cursor
+// forever. Reproduced here by controlling resolution order explicitly.
+// A clean document: no leftover chains from earlier sections may touch the
+// cursor while this test is measuring who answers the hand-off.
+await reload(LIST_READY);
+await stubConfirm();
+await press('g');
+const raceTarget = await cursorName();
+await evaluate(`
+  window.__rArchived = false;
+  window.__rName = ${JSON.stringify(raceTarget)};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__rArchived = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === window.__rName && window.__rArchived
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      // Park every list fetch until the test releases it, in order.
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('a');
+// toggleArchive's own render is now in flight and held.
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'toggleArchive to dispatch its own render');
+// A second render — the 2s poll, in real use — is dispatched AFTER it, so it wins
+// the staleness guard and toggleArchive's render will bail without painting.
+await evaluate(`renderRunList(routeGen); return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the newer render to be dispatched');
+// Resolve the older one first: it bails, DOM still shows the pre-archive list.
+await evaluate(`window.__held[0](); return 1;`);
+// Then the newer one paints the truth.
+await evaluate(`window.__held[1](); return 1;`);
+await waitFor(cursorName, n => n !== null && n !== raceTarget, 6000,
+  'the cursor to advance despite the losing render');
+check('a render losing the staleness race cannot strand the cursor',
+  (await cursorName()) !== raceTarget, true);
+check('...and the cursor is on a real, visible row',
+  (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (4) Two archives before either repaints. `pendingAdvance` was a single slot, so
+// the second overwrote the first and nothing ever answered for row A — the cursor
+// stayed naming it, and since archived runs remain in knownRunNames, applyNavCursor
+// read that as merely hidden and parked forever. Two ordinary clicks, no
+// adversarial timing: batch-archiving finished sessions does it.
+await reload(LIST_READY);
+await stubConfirm();
+await press('g');
+const firstRow = await cursorName();
+const secondRow = (await rowNames()).filter(n => n !== firstRow)[0];
+await evaluate(`
+  window.__done = {};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    var m = s.match(/\\/api\\/runs\\/([^/]+)\\/archive/);
+    if (m) {
+      window.__done[decodeURIComponent(m[1])] = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return window.__done[x.name]
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+// Archive the row under the cursor, then a different row, before either repaints.
+await press('a');
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the first archive to dispatch its render');
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(secondRow)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the second archive to dispatch its render');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(rowNames, r => r.indexOf(firstRow) === -1, 6000, 'the first row to leave');
+// Both halves matter, and the first is deliberately not just `!== firstRow`: a
+// parked cursor reads as null, which satisfies that on its own.
+check('the first archive is still answered after a second one is started',
+  (await cursorName()) !== null && (await cursorName()) !== firstRow, true);
+check('...and the cursor is on a visible row, not parked',
+  (await cursorName()) !== null && (await rowNames()).indexOf(await cursorName()) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (5) An archive slower than one poll tick. `route()` bumps routeGen every 2s,
+// so gating the hand-off on `gen === routeGen` meant any archive whose herdr
+// round-trip outlasted a tick was dropped un-applied and the cursor stranded.
+// No double click, no adversarial timing — just a slow workspace close.
+await reload(LIST_READY);
+await stubConfirm();
+await press('g');
+const slowRow = await cursorName();
+await evaluate(`
+  window.__sDone = false;
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__sDone = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return x.name === ${JSON.stringify(slowRow)} && window.__sDone
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('a');
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the archive to dispatch its render');
+// Let the real 2s poll tick at least once while the archive is still in flight,
+// which is what used to invalidate the hand-off's generation.
+const genBefore = await evaluate(`return routeGen;`);
+await waitFor(() => evaluate(`return routeGen;`), g => g > genBefore, 8000,
+  'the poll to advance routeGen');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(cursorName, n => n !== null && n !== slowRow, 8000,
+  'the cursor to advance after a slow archive');
+check('an archive slower than a poll tick still hands the cursor on',
+  (await cursorName()) !== null && (await cursorName()) !== slowRow, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (6) The LAST two rows archived before either repaints. `neighbourKey` falls
+// back to the previous row when there is no next one, so those two name each
+// other — following a captured neighbour blindly put the cursor on the other
+// archived row. The neighbour has to be re-checked against what is on screen.
+await reload(LIST_READY);
+await stubConfirm();
+const allRows = await rowNames();
+const lastRow = allRows[allRows.length - 1];
+const secondLast = allRows[allRows.length - 2];
+await evaluate(`
+  window.__done2 = {};
+  window.__held = [];
+  window.__hold = true;
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; window.__hold = false; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    var m = s.match(/\\/api\\/runs\\/([^/]+)\\/archive/);
+    if (m) {
+      window.__done2[decodeURIComponent(m[1])] = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: true});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      var p = realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            return window.__done2[x.name]
+              ? Object.assign({}, x, {live: false, archived: true, complete: true})
+              : x;
+          }));
+        }};
+      });
+      if (window.__hold) return new Promise(function(res){ window.__held.push(function(){ res(p); }); });
+      return p;
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await evaluate(`
+  navCursorKey = ${JSON.stringify(secondLast)};
+  applyNavCursor(false);
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(secondLast)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 1, 4000,
+  'the first of the two archives');
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === ${JSON.stringify(lastRow)}; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__held.length;`), n => n >= 2, 4000,
+  'the second of the two archives');
+await evaluate(`window.__held.forEach(function(f){ f(); }); return 1;`);
+await waitFor(rowNames, r => r.indexOf(secondLast) === -1 && r.indexOf(lastRow) === -1,
+  8000, 'both rows to leave');
+const survivor = await cursorName();
+check('archiving the last two rows leaves the cursor on a surviving row',
+  survivor !== null && survivor !== secondLast && survivor !== lastRow, true);
+check('...and that row is actually visible',
+  (await rowNames()).indexOf(survivor) !== -1, true);
+await evaluate(`window.__restoreFetch(); return 1;`);
+
+// (7) A filter hides rows without their going anywhere. Answering "did it leave"
+// from whether a row is on screen therefore handed the cursor away from a run
+// that still exists — here a zombie, which stays active on purpose — just because
+// the filter stopped matching it. The answer has to come from the run data.
+//
+// The filter is applied BEFORE the archive: typing one deliberately resets the
+// anchor, so a filter typed afterwards could never observe the hand-off.
+await reload(LIST_READY);
+await stubConfirm();
+await evaluate(`
+  window.__kDone = false;
+  window.__kName = '';
+  var realFetch = window.fetch;
+  window.__restoreFetch = function(){ window.fetch = realFetch; };
+  window.fetch = function(u, o) {
+    var s = String(u);
+    if (s.indexOf('/archive') !== -1) {
+      window.__kDone = true;
+      return Promise.resolve({ok: true, json: function(){
+        return Promise.resolve({workspace_closed: false});
+      }});
+    }
+    if (s.indexOf('/api/runs') !== -1) {
+      return realFetch(u, o).then(function(r){ return r.json(); }).then(function(rows){
+        return {ok: true, json: function(){
+          return Promise.resolve(rows.map(function(x){
+            if (x.name !== window.__kName || !window.__kDone) return x;
+            // A zombie: archived, panes alive, so still ACTIVE — and its task text
+            // no longer matches the filter, so it is hidden without having left.
+            return Object.assign({}, x, {live: true, archived: true, complete: false, task: 'zzz'});
+          }));
+        }};
+      });
+    }
+    return realFetch(u, o);
+  };
+  return 1;`);
+await press('/');
+await typeText('task');
+await waitFor(rowNames, r => r.length >= 2, 4000, 'the filter to match several runs');
+const keepRow = await cursorName();
+await evaluate(`window.__kName = navCursorKey; return 1;`);
+check('the cursor is on a filtered row before archiving',
+  (await rowNames()).indexOf(keepRow) !== -1, true);
+await evaluate(`
+  Array.from(document.querySelectorAll('.run-archive'))
+    .find(function(x){ return x.dataset.run === window.__kName; }).click();
+  return 1;`);
+await waitFor(() => evaluate(`return window.__kDone;`), v => v === true, 4000, 'the archive POST');
+await evaluate(`return renderRunList(routeGen);`);
+// The cursor check below is an assert-a-negative, so wait for the render's
+// effect — the row leaving the filtered list — before trusting it.
+await waitFor(rowNames, r => r.indexOf(keepRow) === -1, 6000,
+  'the zombie to drop out of the filtered list');
+check('the zombie is hidden by the filter', (await rowNames()).indexOf(keepRow), -1);
+check('...but it is still active, so the cursor is not handed away from it',
+  await evaluate(`return navCursorKey;`), keepRow);
+await press('Escape');
+await evaluate(`window.__restoreFetch(); return 1;`);
 
 console.log('\n== opening a run ==');
 await goto('#/', LIST_READY);
@@ -575,6 +1443,186 @@ await goto('#/runs/alpha-deploy', QUESTIONS_READY);
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');
+
+console.log('\n== switching runs never leaves the previous run\'s spec on screen ==');
+// A run has no spec.md until its gate is first opened with `review summary`, so
+// /doc answers 200-with-an-empty-body. The doc panel was only ever WRITTEN when
+// the fetched doc was non-empty, so navigating from a run that has a spec to one
+// that does not left the old spec rendered under the new run's name — the
+// reviewer reads a stale document and believes it belongs to this run.
+// Gate on the panel being VISIBLE, not just on its text: leaving a run hides the
+// panel without emptying it, and textContent reads hidden nodes — so probing the
+// text alone is satisfied by the previous visit's leftovers and this goto() would
+// return before the navigation had happened at all.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec",
+});
+check('a run with a spec renders it', (await docText()).indexOf('Spec for alpha-deploy') !== -1, true);
+
+// In-page hash navigation, not a reload: a fresh page load would start with an
+// empty #doc-content and pass no matter what, proving nothing.
+const seqBefore = await evaluate(`return refreshSeq;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(hash, h => h === '#/runs/epsilon-nospec', 4000, 'nospec hash');
+// refreshSeq is monotonic and bumped only once a refresh's fetches have landed,
+// so "advanced past seqBefore" really does mean refresh() ran for THIS run.
+// currentDocText would not: it reads empty both after a spec-less refresh and
+// before anything has rendered at all, so a reload would satisfy it instantly.
+await waitFor(() => evaluate(`return currentRun + '|' + (refreshSeq > ${seqBefore});`),
+  v => v === 'epsilon-nospec|true', 8000, 'refresh for the spec-less run');
+check('a run with no spec shows no doc at all', await docText(), '');
+check('...and does not claim to be showing a spec',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+// The two checks above pass on route()'s defensive clear alone, so they do NOT
+// pin the invariant where it actually has to hold: refresh() re-runs on the poll
+// timer with no navigation, so IT must never leave a doc it did not fetch. Plant
+// a stale render, call refresh() directly, and require it to clean up.
+await evaluate(`
+  document.getElementById('doc-content').innerHTML = '<p>STALE DOC FROM ANOTHER RUN</p>';
+  document.getElementById('doc-panel').style.display = '';
+  return 1;`);
+check('the planted stale doc is really on screen', (await docText()).indexOf('STALE DOC') !== -1, true);
+// Surface a rejection as a check failure rather than an uncaught exception that
+// kills the driver before it prints its summary.
+check('refresh() completed without throwing', await evaluate(`
+  return refresh().then(function(){ return ''; }, function(e){ return String((e && e.message) || e); });`), '');
+check('refresh() alone clears a doc it did not fetch', await docText(), '');
+check('refresh() alone hides the panel it did not fill',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+
+console.log('\n== a refresh that never completes still leaves no stale doc ==');
+// route()'s own defensive clear is invisible on the happy path, because route()
+// awaits refresh() before any probe can sample the DOM — so the checks above pass
+// even with that clear reverted. What it actually defends is refresh() FAILING:
+// the reviewer navigates, the fetches reject, and nothing downstream ever runs.
+// Force that by rejecting every fetch, and require the old spec to be gone anyway.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`
+    var p = document.getElementById('doc-panel');
+    return p.style.display !== 'none' ? (document.getElementById('doc-content').textContent || '') : '';`),
+  ok: t => t.indexOf('Spec for alpha-deploy') !== -1,
+  label: "alpha's spec (again)",
+});
+// Plant a line comment on ALPHA first, so there is something real to leak: with
+// no annotations on the outgoing run this check would pass no matter what.
+await evaluate(`
+  annotations = { 1: { quote: 'Spec for alpha-deploy', comments: [{ id: 1, text: 'alpha-only comment' }] } };
+  return JSON.stringify(collectAnnotations()).indexOf('alpha-only') !== -1;`);
+check('the planted annotation is really submittable on alpha',
+  await evaluate(`return collectAnnotations().length;`), 1);
+await evaluate(`
+  window.__origFetch = window.fetch;
+  window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+  return 1;`);
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('a failed refresh leaves no stale doc behind', await docText(), '');
+check('...and no panel claiming to show one',
+  await evaluate(`return document.getElementById('doc-panel').style.display;`), 'none');
+// The same window is what let the previous run's line comments stay submittable:
+// loadAnnotations() runs after refresh()'s awaits, so a rejected fetch skips it
+// entirely and alpha's comment would still be in the payload POSTed for epsilon.
+check('...and no stale annotations to submit under this run',
+  await evaluate(`return JSON.stringify(collectAnnotations());`), '[]');
+await evaluate(`window.fetch = window.__origFetch; return 1;`);
+
+console.log('\n== the decision form does not carry across runs ==');
+// The decision radio and the feedback box are plain form fields, so nothing reset
+// them on navigation: prose typed for one run stayed in the box and the radio kept
+// its pick, and submitting on the next run wrote them into THAT run's
+// feedback.json — a decision the reviewer never made about a spec they never read.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'alpha-only feedback, must not follow me';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  return 1;`);
+check('the planted decision is really staged on alpha', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r.value + '|' + (document.getElementById('feedback').value.length > 0);`), 'approve|true');
+await evaluate(`location.hash = '#/runs/epsilon-nospec'; return 1;`);
+await waitFor(() => evaluate(`return currentRun;`), r => r === 'epsilon-nospec', 4000,
+  'route() to reach the spec-less run');
+check('the feedback box is empty on the next run',
+  await evaluate(`return document.getElementById('feedback').value;`), '');
+check('the decision falls back to request-changes, not the previous pick',
+  await evaluate(`
+    var r = document.querySelector('input[name="decision"]:checked');
+    return r ? r.value : null;`), 'request-changes');
+
+console.log('\n== staying on the same run keeps the reviewer\'s work ==');
+// The cross-run resets above must fire on a RUN CHANGE, not on every route().
+// `#/runs/<run>?task=<t>` is a supported URL (reviewTask(), and the router
+// comment documents it), so browser back/forward — or opening a task link while
+// already on that run — re-enters route() with the SAME run. Feedback is never
+// persisted anywhere, so clearing it there destroys the reviewer's typed prose
+// with no warning and no way back.
+await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await evaluate(`
+  document.getElementById('feedback').value = 'half-written feedback I am still editing';
+  document.querySelector('input[name="decision"][value="approve"]').checked = true;
+  annotations = { 2: { quote: 'Content.', comments: [{ id: 9, text: 'in-progress note' }] } };
+  saveAnnotations();   // every real mutation site does this, so match real usage
+  return 1;`);
+const sameRunGen = await evaluate(`return routeGen;`);
+await evaluate(`location.hash = '#/runs/alpha-deploy?task=task-1'; return 1;`);
+await waitFor(hash, h => h === '#/runs/alpha-deploy?task=task-1', 4000, 'same-run task hash');
+// Wait on routeGen, NOT refreshSeq: refreshSeq is also bumped by the background
+// pollState->refresh() loop that runs for a `ready` run, so it can advance before
+// route() has touched the hashchange at all — which made these checks pass whether
+// or not the reset block ran. routeGen is incremented only by route(), on entry,
+// in the same synchronous task as the reset block below it.
+await waitFor(() => evaluate(`return routeGen;`), g => g > sameRunGen, 8000,
+  'route() to process the same-run navigation');
+check('typed feedback survives a same-run navigation',
+  await evaluate(`return document.getElementById('feedback').value;`),
+  'half-written feedback I am still editing');
+check('the decision pick survives too', await evaluate(`
+  var r = document.querySelector('input[name="decision"]:checked');
+  return r ? r.value : null;`), 'approve');
+// Note this one holds via loadAnnotations() restoring from localStorage, not via
+// the run-change gate — it still passes with the gate removed. Kept because the
+// user-visible invariant is worth pinning (it would catch persistence breaking),
+// but it is not what proves the gate works: the two checks above are.
+check('and in-progress annotations survive',
+  await evaluate(`return collectAnnotations().length;`), 1);
+
+console.log('\n== a stale review panel cannot repaint over the session list ==');
+// refreshReview() is called fire-and-forget and awaits twice, so it outlives a
+// navigation. Without a routeGen guard its late resolution re-showed the panel —
+// on the session list, which had already hidden it once on the way out.
+await goto('#/runs/alpha-deploy?task=task-1', {
+  probe: () => evaluate(`return currentRun;`), ok: r => r === 'alpha-deploy', label: 'alpha detail',
+});
+// Hold the findings fetch open, navigate away, then release it: the resolution
+// lands with the reviewer already back on the list.
+await evaluate(`
+  window.__release = null;
+  window.__origFetch2 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('review/findings') !== -1) {
+      return new Promise(function(res) { window.__release = function() { res(window.__origFetch2(u)); }; });
+    }
+    return window.__origFetch2.apply(window, arguments);
+  };
+  refreshReview();
+  return 1;`);
+await waitFor(() => evaluate(`return !!window.__release;`), v => v === true, 4000, 'findings fetch parked');
+await evaluate(`location.hash = '#/'; return 1;`);
+await waitFor(rowNames, r => r.length > 0, 8000, 'back on the session list');
+await evaluate(`window.__release(); return 1;`);
+// Give the released promise a turn to resolve and (wrongly) paint.
+await waitFor(() => evaluate(`return 1;`), () => true, 500, 'tick');
+await sleep(300);
+check('the review panel stays hidden on the session list',
+  await evaluate(`return document.getElementById('review-panel').style.display;`), 'none');
+check('...and the session list is still what is on screen', (await rowNames()).length > 0, true);
+await evaluate(`window.fetch = window.__origFetch2; return 1;`);
 
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();

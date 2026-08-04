@@ -1,7 +1,9 @@
+mod brief;
 mod code_review;
 mod config;
 mod findings;
 mod herdr;
+mod mcp_findings;
 mod phase;
 mod reflex;
 mod review;
@@ -13,8 +15,9 @@ mod sha256;
 mod shell;
 mod worktree;
 
+use brief::compose_phase_brief;
 use clap::{Parser, Subcommand};
-use code_review::{ReviewOutcome, code_review_run, head_sha};
+use code_review::{ReviewOutcome, code_review_brief, code_review_run, head_sha};
 use herdr::{Herdr, SystemHerdr};
 use phase::{
     PhaseWaitOutcome, RehydrateOutcome, collect, diagnose_stuck_phase, phase_done,
@@ -96,6 +99,19 @@ enum Commands {
     /// Plumbing: collect the handoff doc for a finished phase.
     Collect { run: String, phase_name: String },
 
+    /// Write an empty `<phase>-HANDOFF.md` — the fixed seven sections and nothing
+    /// else — for the finishing agent to fill in from its own context.
+    ///
+    /// Structure only, by design: drovr does not guess which commits or files belong
+    /// to your session. Refuses to overwrite an existing handoff unless `--force`.
+    HandoffScaffold {
+        run: String,
+        phase_name: String,
+        /// Overwrite an existing `<phase>-HANDOFF.md`.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Plumbing: review subcommands.
     Review {
         #[command(subcommand)]
@@ -118,6 +134,24 @@ enum Commands {
         #[arg(long)]
         skill: PathBuf,
     },
+
+    /// Serve the review panel's one-tool MCP findings channel on stdio.
+    ///
+    /// Spawned by `code-review run` for each reviewer, never by a human. Reviewers run
+    /// read-only and so cannot write their own findings file; this exposes a single
+    /// `submit_findings` tool and performs that one write for them. The reviewer names
+    /// its angle, which is validated against the configured angles — it can never name
+    /// a path, so its one write always lands inside the run dir.
+    #[command(hide = true)]
+    McpFindings {
+        /// Run whose findings are being collected.
+        run: String,
+        /// Task under review, e.g. `task-3`.
+        task: String,
+        /// Review iteration this panel is serving. Scopes the findings file, so one
+        /// pass can never harvest another's verdicts.
+        iter: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -128,6 +162,18 @@ enum PhaseCmd {
         phase_name: String,
         #[arg(long)]
         seed: Option<PathBuf>,
+        /// Compose this phase's brief (see `phase brief`) and inject it once the
+        /// agent is at its composer. This is how a phase should be briefed: drovr
+        /// owns the frame, you supply only what it cannot know.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+        /// Spawn the agent WITHOUT a brief (the pre-brief behavior). For a phase
+        /// drovr has no template for, or when you will brief it by hand with
+        /// `phase send`.
+        #[arg(long)]
+        no_brief: bool,
     },
     /// Send text to a running phase pane. Waits for the agent to attach first;
     /// exit 2 = it never became ready within the readiness timeout (likely parked
@@ -135,6 +181,9 @@ enum PhaseCmd {
     Send {
         run: String,
         phase_name: String,
+        /// The text to send, or `-` to read it from stdin — which is how a composed
+        /// brief reaches an already-running phase:
+        /// `drovr phase brief <run> <phase> | drovr phase send <run> <phase> -`.
         text: String,
     },
     /// Wait for a phase to complete (polls for the `done` marker and the pane's
@@ -162,6 +211,23 @@ enum PhaseCmd {
     /// conversation. Refuses a phase that still holds a pane (attach to that
     /// instead) and never creates a phase that does not exist.
     Rehydrate { run: String, phase_name: String },
+    /// Print a phase's composed brief and exit, spawning nothing.
+    ///
+    /// This is the text a phase agent should be given: drovr's template for that
+    /// phase, its substitutions filled in, the run's task, and your `--context`.
+    /// Pipe it into `phase send` (or read it to see exactly what a phase is told).
+    /// Composed for `brainstorm`, `plan`, `implement-task-<N>` and `review`.
+    Brief {
+        run: String,
+        phase_name: String,
+        /// What this phase needs to know that drovr cannot compose: the task brief
+        /// from `plan.md`, accumulated interfaces, why the last attempt failed.
+        /// RECORDED, so a re-brief of this phase reuses it; `--context ''` clears it.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+    },
     /// Mark a phase complete. Run by the phase AGENT itself as its final action —
     /// it drops the completion marker `drovr phase wait` polls for. Refuses for a
     /// pipeline phase until that phase has authored its `<phase>-HANDOFF.md`.
@@ -209,6 +275,33 @@ enum CodeReviewCmd {
         /// diff you no longer care about.
         #[arg(long)]
         fresh: bool,
+        /// What this change is about, in your words. drovr composes the brief; this
+        /// is the one part of it you supply. Recorded in the run dir, so a resume
+        /// briefs its reviewers identically.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        /// Read `--context` from a file (use for anything longer than a sentence).
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+    },
+    /// Print one angle's reviewer brief and exit, spawning nothing.
+    ///
+    /// For whenever you spawn the reviewer yourself instead of through the panel: an
+    /// in-harness read-only subagent, a host with no herdr integration for the review
+    /// agent, or a wedged panel. Pass this text to that reviewer VERBATIM — it is the
+    /// same brief `code-review run` injects, so the frame stays drovr's rather than
+    /// one the driver improvised.
+    Brief {
+        run: String,
+        task: String,
+        #[arg(long)]
+        angle: String,
+        /// See `code-review run --context`. Supplying it here RECORDS it too, so a
+        /// later `run` or `brief` for this task reuses it; `--context ''` clears it.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
 }
 
@@ -916,31 +1009,72 @@ fn cmd_cleanup<H: Herdr>(name: &str, purge: bool, herdr: &H) {
     }
 }
 
-fn cmd_resurrect(name: &str) {
+/// `drovr resurrect`, minus the process plumbing: RESTORE the run — which means
+/// making its herdr workspace real again — and then report where to resume.
+///
+/// The order is the whole point. This command's help says it "reloads a stopped
+/// run and reports the resume point", and it used to print
+/// `To resume: drovr phase start …` having restored nothing, so the resume it
+/// advertised died on the next command with a raw `workspace_not_found`. A
+/// recovery command that reports success it did not achieve is worse than one
+/// that errors: it sends you looking for the fault somewhere else entirely.
+/// Either the workspace is there when this returns `Ok`, or this returns `Err`.
+fn resurrect_report<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<String> {
+    let Some(idx) = run.first_incomplete() else {
+        // Nothing to resume into, so nothing to provision: a finished run does
+        // not need a workspace conjured up to be told it is finished.
+        return Ok(format!(
+            "run '{}' is fully complete — nothing to resurrect",
+            run.name
+        ));
+    };
+
+    let mut out = String::new();
+    if let phase::WorkspaceHealing::Reprovisioned { orphaned } = phase::ensure_workspace(h, run)? {
+        // Shared wording, so a driver reading this and the stderr warning
+        // `phase_start` prints does not have to work out that they are the same
+        // event described twice.
+        out.push_str("restored: ");
+        out.push_str(&phase::healing_report(run, &orphaned));
+        out.push('\n');
+    }
+
+    // Re-read the resume point: the repair above may have demoted the phase that
+    // was `Running` to `Failed`, which does not move `first_incomplete` — but
+    // reading it again keeps this honest if that ever changes.
+    let idx = run.first_incomplete().unwrap_or(idx);
+    out.push_str(&format!(
+        "run '{}' — resume at phase {idx}: {}\n",
+        run.name, run.phases[idx].name
+    ));
+    // Print all phases for context
+    for (i, p) in run.phases.iter().enumerate() {
+        out.push_str(&format!(
+            "  [{i}] {} — {}\n",
+            p.name,
+            phase_status_str(&p.status)
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "To resume: drovr phase start {} {}",
+        shell_single_quote(&run.name),
+        shell_single_quote(&run.phases[idx].name)
+    ));
+    Ok(out)
+}
+
+fn cmd_resurrect<H: Herdr>(h: &H, name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
-    let run = load_run(name);
-    match run.first_incomplete() {
-        Some(idx) => {
-            println!(
-                "run '{name}' — resume at phase {idx}: {}",
-                run.phases[idx].name
-            );
-            // Print all phases for context
-            for (i, p) in run.phases.iter().enumerate() {
-                println!("  [{i}] {} — {}", p.name, phase_status_str(&p.status));
-            }
-            println!();
-            println!(
-                "To resume: drovr phase start {} {}",
-                shell_single_quote(name),
-                shell_single_quote(&run.phases[idx].name)
-            );
-        }
-        None => {
-            println!("run '{name}' is fully complete — nothing to resurrect");
+    let mut run = load_run(name);
+    match resurrect_report(h, &mut run) {
+        Ok(report) => println!("{report}"),
+        Err(e) => {
+            eprintln!("drovr: cannot resurrect run '{name}': {e}");
+            process::exit(1);
         }
     }
 }
@@ -979,17 +1113,90 @@ fn cmd_phase(sub: PhaseCmd) {
             run,
             phase_name,
             seed,
+            context,
+            context_file,
+            no_brief,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
+            let context = read_context_arg(context, context_file);
             let mut state = load_run(&run);
+
+            // Compose BEFORE spawning. A phase whose brief cannot be composed (no
+            // template for that name) must not end up as a live agent sitting at an
+            // empty composer waiting for a driver to improvise one — that is the
+            // failure mode this whole mechanism exists to remove.
+            let composed = if no_brief {
+                None
+            } else {
+                match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                    Ok(brief) => Some(brief),
+                    Err(e) => {
+                        eprintln!("drovr: {e}");
+                        eprintln!(
+                            "drovr: (or spawn it unbriefed with `drovr phase start {run} \
+                             {phase_name} --no-brief`)"
+                        );
+                        process::exit(1);
+                    }
+                }
+            };
+
             if let Err(e) = phase_start(&h, &mut state, &phase_name, seed.as_deref()) {
                 eprintln!("drovr: phase start failed: {e}");
                 process::exit(1);
             }
             println!("started phase '{phase_name}' for run '{run}'");
+
+            if let Some(brief) = composed {
+                if let Err(e) = phase_send(&h, &mut state, &phase_name, &brief) {
+                    // The pane is up but unbriefed. Say so precisely: the phase is
+                    // NOT running its task, and a driver that reads "started" alone
+                    // would wait forever on an agent that was never asked anything.
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
+                            eprintln!("drovr: {diag}");
+                        } else {
+                            eprintln!("drovr: {e}");
+                        }
+                    } else {
+                        eprintln!("drovr: could not deliver the brief: {e}");
+                    }
+                    // Mark it Failed, exactly as the reviewer path does for the same
+                    // condition. Left `Running`, a `phase wait` blocks forever on an
+                    // agent that was never asked anything, and a re-entry believes the
+                    // phase is live. The pane stays up (never closed mid-run) and is
+                    // still recorded, so `drovr cleanup` reclaims it.
+                    if let Some(i) = state.phases.iter().position(|p| p.name == phase_name) {
+                        state.phases[i].status = run::PhaseStatus::Failed;
+                        if let Err(e) = state.save() {
+                            // The phase is still `Running` ON DISK, so a later
+                            // `phase wait` would block forever on an agent that was never
+                            // briefed. That is a worse state than the send failure itself,
+                            // and it is not remediable by re-sending — exit 1, not the
+                            // exit 2 that means "re-brief it".
+                            eprintln!(
+                                "drovr: could not record the failed phase ({e}) — phase \
+                                 '{phase_name}' is still Running on disk with an UNBRIEFED \
+                                 agent; fix the run dir before anything waits on it"
+                            );
+                            process::exit(1);
+                        }
+                    }
+                    // The brief's context is recorded, so the remediation needs no
+                    // --context: `phase brief` reuses it.
+                    eprintln!(
+                        "drovr: phase '{phase_name}' marked FAILED — its pane is alive but the \
+                         agent was never briefed. Re-send with `drovr phase brief {run} \
+                         {phase_name} | drovr phase send {run} {phase_name} -` once the pane is \
+                         at its composer"
+                    );
+                    process::exit(2);
+                }
+                println!("briefed phase '{phase_name}' ({} bytes)", brief.len());
+            }
         }
         PhaseCmd::Send {
             run,
@@ -1001,6 +1208,40 @@ fn cmd_phase(sub: PhaseCmd) {
                 process::exit(1);
             }
             let mut state = load_run(&run);
+            // `-` reads stdin, so a brief drovr composed can be piped straight in
+            // without a driver retyping (or paraphrasing) it.
+            let text = if text == "-" {
+                // Bounded: a prompt is a message, and an accidental `cat huge.bin |` would
+                // otherwise be read wholly into memory and then typed into a pane.
+                //
+                // Deliberately LARGER than MAX_CONTEXT: the canonical use of `send -` is
+                // `drovr phase brief … | drovr phase send … -`, and a brief is the template
+                // frame PLUS up to MAX_CONTEXT of context. Reusing the context cap here
+                // would let a legitimate at-limit brief be rejected by the very remediation
+                // drovr prints.
+                const MAX_STDIN: u64 = 4 << 20; // 4 MiB
+                let mut buf = String::new();
+                if let Err(e) =
+                    io::Read::read_to_string(&mut io::Read::take(io::stdin(), MAX_STDIN), &mut buf)
+                {
+                    eprintln!("drovr: cannot read the message from stdin: {e}");
+                    process::exit(1);
+                }
+                if buf.trim().is_empty() {
+                    eprintln!("drovr: refusing to send an empty message read from stdin");
+                    process::exit(1);
+                }
+                if buf.len() as u64 == MAX_STDIN {
+                    eprintln!(
+                        "drovr: refusing to send {MAX_STDIN} bytes from stdin — that is not a \
+                         brief; check what you piped in"
+                    );
+                    process::exit(1);
+                }
+                buf
+            } else {
+                text
+            };
             if let Err(e) = phase_send(&h, &mut state, &phase_name, &text) {
                 // A readiness timeout (agent never attached) is not a plain send
                 // failure — the agent is almost certainly parked on a prompt with
@@ -1009,10 +1250,17 @@ fn cmd_phase(sub: PhaseCmd) {
                 // and a distinct exit code (2) so the driver can escalate rather
                 // than assume the seed landed.
                 if e.kind() == io::ErrorKind::TimedOut {
+                    // ALWAYS print the error itself. It names WHICH of the
+                    // failures happened — never attached, seed swallowed, would
+                    // not submit — and, for the swallowed one, why drovr refused
+                    // to press a key on the user's behalf. `diagnose_stuck_phase`
+                    // is additive context, a pane snapshot, not a replacement
+                    // diagnosis: it used to REPLACE this text, which both lost the
+                    // explanation and asserted the wrong cause, since it phrases
+                    // every verdict as a `phase wait` timeout.
+                    eprintln!("drovr: {e}");
                     if let Some(diag) = diagnose_stuck_phase(&h, &state, &phase_name) {
-                        eprintln!("drovr: {diag}");
-                    } else {
-                        eprintln!("drovr: {e}");
+                        eprintln!("drovr: pane context — {diag}");
                     }
                     process::exit(2);
                 }
@@ -1107,6 +1355,26 @@ fn cmd_phase(sub: PhaseCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: phase rehydrate failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        PhaseCmd::Brief {
+            run,
+            phase_name,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match compose_phase_brief(&state, &phase_name, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: {e}");
                     process::exit(1);
                 }
             }
@@ -1209,6 +1477,127 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+/// Resolve `--context` / `--context-file` into the context text. clap enforces that
+/// the two are mutually exclusive, so this only has to read the file. An unreadable
+/// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
+/// context to be in the brief, and silently reviewing without it is the failure this
+/// whole mechanism exists to prevent.
+/// Read `--context-file`: a regular file, not through a symlink, size-bounded.
+///
+/// The path is often inside the run dir, which agents write to (handoffs live there), so it
+/// gets the same treatment as a recorded context: a symlink there would inject an arbitrary
+/// readable file into the brief, a FIFO would hang the driver on `read_to_string`, and a
+/// metadata-only size check is a TOCTOU the read itself has to enforce.
+fn read_context_file(path: &std::path::Path) -> String {
+    use brief::MAX_CONTEXT;
+    let bail = |msg: String| -> ! {
+        eprintln!("drovr: {msg}");
+        process::exit(1);
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    if meta.file_type().is_symlink() {
+        bail(format!(
+            "--context-file {} is a symlink; pass the real path",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        bail(format!(
+            "--context-file {} is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
+             context; check what you passed",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        )),
+    };
+    let mut text = String::new();
+    if let Err(e) = io::Read::read_to_string(&mut io::Read::take(file, MAX_CONTEXT + 1), &mut text)
+    {
+        bail(format!(
+            "cannot read --context-file {}: {e}",
+            path.display()
+        ));
+    }
+    if text.len() as u64 > MAX_CONTEXT {
+        bail(format!(
+            "--context-file {} grew past the {MAX_CONTEXT}-byte limit while being read",
+            path.display()
+        ));
+    }
+    text
+}
+
+fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> Option<String> {
+    // One cap for every path context can arrive by, defined next to the record I/O that
+    // enforces it on reuse.
+    use brief::MAX_CONTEXT;
+    match (context, context_file) {
+        (Some(text), _) if text.len() as u64 > MAX_CONTEXT => {
+            eprintln!(
+                "drovr: --context is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not \
+                 a context; check what you passed",
+                text.len()
+            );
+            process::exit(1);
+        }
+        (Some(text), _) => Some(text),
+        (None, Some(path)) => Some(read_context_file(&path)),
+        (None, None) => None,
+    }
+}
+
+/// `drovr handoff-scaffold` — write the empty 7-section handoff for `phase`.
+///
+/// Never clobbers silently: a handoff already on disk is an agent's authored work (or a
+/// half-written draft), and losing it costs the whole compression pass that produced it.
+fn cmd_handoff_scaffold(run: &str, phase_name: &str, force: bool) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    if let Err(e) = validate_label("phase", phase_name) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    let dir = run::run_dir(run);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("drovr: cannot create run dir: {e}");
+        process::exit(1);
+    }
+    let path = dir.join(format!("{phase_name}-HANDOFF.md"));
+    if path.exists() && !force {
+        eprintln!(
+            "drovr: {} already exists — refusing to overwrite an authored handoff (pass \
+             --force to replace it)",
+            path.display()
+        );
+        process::exit(1);
+    }
+    if let Err(e) = std::fs::write(&path, brief::handoff_scaffold()) {
+        eprintln!("drovr: cannot write {}: {e}", path.display());
+        process::exit(1);
+    }
+    println!("scaffolded {}", path.display());
+}
+
 fn cmd_code_review(sub: CodeReviewCmd) {
     match sub {
         CodeReviewCmd::Base { run, task } => {
@@ -1225,10 +1614,7 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             // record; mirror `phase_start`'s guidance rather than recording a
             // base from the wrong directory.
             if state.project_dir.is_empty() {
-                eprintln!(
-                    "drovr: run '{run}' has no project_dir (created before this fix); \
-                     please recreate the run with `drovr new`"
-                );
+                eprintln!("drovr: {}", phase::missing_project_dir_error(&run));
                 process::exit(1);
             }
             let sha = head_sha(&state.project_dir).unwrap_or_else(|e| {
@@ -1250,11 +1636,42 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                 path.display()
             );
         }
+        CodeReviewCmd::Brief {
+            run,
+            task,
+            angle,
+            context,
+            context_file,
+        } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("task", &task) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            if let Err(e) = validate_label("angle", &angle) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            let context = read_context_arg(context, context_file);
+            let state = load_run(&run);
+            match code_review_brief(&state, &task, &angle, context.as_deref()) {
+                Ok(brief) => print!("{brief}"),
+                Err(e) => {
+                    eprintln!("drovr: cannot compose brief: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         CodeReviewCmd::Run {
             run,
             task,
             timeout_ms,
             fresh,
+            context,
+            context_file,
         } => {
             if let Err(e) = validate_run_name(&run) {
                 eprintln!("drovr: {e}");
@@ -1266,7 +1683,9 @@ fn cmd_code_review(sub: CodeReviewCmd) {
             }
             let h = SystemHerdr::new();
             let mut state = load_run(&run);
-            let outcome = code_review_run(&h, &mut state, &task, timeout_ms, fresh);
+            let context = read_context_arg(context, context_file);
+            let outcome =
+                code_review_run(&h, &mut state, &task, timeout_ms, fresh, context.as_deref());
             // Persist what the panel recorded, on EVERY path including the
             // `Err` early-exit below — `code_review_run` mutates state in memory
             // and can then fail with none of it saved.
@@ -1294,6 +1713,15 @@ fn cmd_code_review(sub: CodeReviewCmd) {
                         "code-review: reviewers did not finish for '{task}' within timeout (re-run to resume)"
                     );
                     process::exit(2);
+                }
+                // Exit 1 with `Error`: both are "stop and fix the setup", and the
+                // pipeline's failure model already routes 1 to STOP-and-diagnose. The
+                // variants stay distinct in the type so a caller reading the outcome
+                // (rather than the exit code) can tell an empty range from a broken one;
+                // the specific diagnosis is already on stderr.
+                ReviewOutcome::EmptyRange => {
+                    eprintln!("code-review: nothing to review for '{task}' (see message above)");
+                    process::exit(1);
                 }
                 ReviewOutcome::Error => {
                     eprintln!("code-review: could not run panel for '{task}' (see message above)");
@@ -1346,13 +1774,41 @@ fn main() {
         Commands::Status { name } => cmd_status(&name),
         Commands::Attach { name } => cmd_attach(&name),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
-        Commands::Resurrect { name } => cmd_resurrect(&name),
+        Commands::Resurrect { name } => cmd_resurrect(&herdr, &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
         Commands::Phase { sub } => cmd_phase(sub),
         Commands::Collect { run, phase_name } => cmd_collect(&run, &phase_name),
+        Commands::HandoffScaffold {
+            run,
+            phase_name,
+            force,
+        } => cmd_handoff_scaffold(&run, &phase_name, force),
         Commands::Review { sub } => cmd_review(sub),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::McpFindings { run, task, iter } => {
+            // Both reach the filesystem as path components. The panel always supplies
+            // names it has already validated, but this is a write-capable entrypoint
+            // and nothing stops it being invoked directly — so it validates its own
+            // inputs rather than trusting its only intended caller.
+            for (kind, value) in [("run name", &run), ("task", &task)] {
+                if let Err(e) = validate_label(kind, value) {
+                    eprintln!("drovr: mcp-findings: {e}");
+                    process::exit(1);
+                }
+            }
+            let angles = match config::load_config() {
+                Ok(c) => c.angles,
+                Err(e) => {
+                    eprintln!("drovr: mcp-findings could not load config: {e}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = mcp_findings::serve(&run_dir(&run), &task, iter, &angles) {
+                eprintln!("drovr: mcp-findings failed: {e}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -1480,6 +1936,134 @@ mod tests {
         };
         run.save().expect("seed run");
         run
+    }
+
+    // -- resurrect --------------------------------------------------------------
+
+    /// A run whose workspace is gone, mid-flight at `implement`.
+    #[cfg(test)]
+    fn seed_workspaceless_run(name: &str) -> RunState {
+        let run = RunState {
+            name: name.into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                {
+                    let mut p = run::Phase::new("brainstorm");
+                    p.status = PhaseStatus::Done;
+                    p
+                },
+                {
+                    let mut p = run::Phase::new("implement");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAG:p1"),
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("wAG".into()),
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.save().expect("seed run");
+        run
+    }
+
+    /// `resurrect`'s help says it "reloads a stopped run and reports the resume
+    /// point". It used to print `To resume: drovr phase start …` having restored
+    /// nothing at all, so the resume it advertised failed on the next command —
+    /// worse than an error, because it reads as success.
+    #[test]
+    fn resurrect_restores_the_workspace_it_advertises_a_resume_into() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-restores");
+        let mut run = seed_workspaceless_run("lost-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).expect("resurrect must restore or refuse");
+
+        assert!(
+            fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "resurrect must actually restore the workspace: {:?}",
+            fake.calls()
+        );
+        assert_ne!(
+            RunState::load("lost-ws").unwrap().workspace.as_deref(),
+            Some("wAG"),
+            "and persist the new one, or the next command hits the same dead id"
+        );
+        assert!(
+            report.contains("To resume: drovr phase start"),
+            "having restored it, it may say how to resume: {report}"
+        );
+        assert!(
+            report.contains("implement"),
+            "the phase whose agent died is where you resume: {report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The other half of "restore what you advertise, or refuse and say why".
+    #[test]
+    fn resurrect_that_cannot_restore_refuses_instead_of_advertising_a_resume() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-refuses");
+        let mut run = seed_workspaceless_run("unfixable-ws");
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+        fake.fail_workspace_create();
+
+        let err = resurrect_report(&fake, &mut run)
+            .expect_err("a resume it cannot deliver must be an error, not a printout");
+        assert!(
+            !err.to_string().contains("To resume"),
+            "it must not smuggle the resume instruction into the failure: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A finished run needs no workspace, and resurrect must not create one just
+    /// to tell you there is nothing to do.
+    #[test]
+    fn resurrect_of_a_finished_run_provisions_nothing() {
+        use crate::herdr::FakeHerdr;
+        use crate::test_util::ENV_LOCK;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = cleanup_scratch("resurrect-complete");
+        let mut run = seed_workspaceless_run("done-ws");
+        for p in run.phases.iter_mut() {
+            p.status = PhaseStatus::Done;
+        }
+        run.save().unwrap();
+        let fake = FakeHerdr::new();
+        fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
+
+        let report = resurrect_report(&fake, &mut run).unwrap();
+
+        assert!(report.contains("fully complete"), "{report}");
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("workspace_create")),
+            "no workspace is needed to say a run is finished: {:?}",
+            fake.calls()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The workspace drovr created for a run is still the human's to use — they
@@ -2159,6 +2743,7 @@ mod tests {
                         run,
                         phase_name,
                         seed,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -2304,6 +2889,7 @@ mod tests {
                         task,
                         timeout_ms,
                         fresh,
+                        ..
                     },
             } => {
                 assert_eq!(run, "myrun");
@@ -2317,6 +2903,147 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `--context` and `--context-file` are alternatives, not a pair. clap enforces
+    /// it, so a driver cannot supply two different contexts and leave drovr guessing.
+    /// A brief is composed by default now; `--no-brief` is the explicit opt-out, and
+    /// `--context` is the only part of the brief a driver supplies.
+    #[test]
+    fn parse_phase_start_context_and_no_brief() {
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "implement-task-2",
+            "--context",
+            "task brief from plan.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start {
+                    context, no_brief, ..
+                },
+            } => {
+                assert_eq!(context.as_deref(), Some("task brief from plan.md"));
+                assert!(!no_brief, "briefing is the default");
+            }
+            _ => panic!("wrong variant"),
+        }
+        let cli = parse(&[
+            "drovr",
+            "phase",
+            "start",
+            "myrun",
+            "verify-land",
+            "--no-brief",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Start { no_brief, .. },
+            } => assert!(no_brief),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "phase",
+                "start",
+                "myrun",
+                "plan",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_phase_brief() {
+        let cli = parse(&["drovr", "phase", "brief", "myrun", "plan"]).unwrap();
+        match cli.command {
+            Commands::Phase {
+                sub: PhaseCmd::Brief {
+                    run, phase_name, ..
+                },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(phase_name, "plan");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_code_review_context_args_are_mutually_exclusive() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "run",
+            "myrun",
+            "task-1",
+            "--context",
+            "the retry loop is new",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub: CodeReviewCmd::Run { context, .. },
+            } => assert_eq!(context.as_deref(), Some("the retry loop is new")),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&[
+                "drovr",
+                "code-review",
+                "run",
+                "myrun",
+                "task-1",
+                "--context",
+                "a",
+                "--context-file",
+                "/tmp/b",
+            ])
+            .is_err(),
+            "--context with --context-file must be rejected, not silently resolved"
+        );
+    }
+
+    #[test]
+    fn parse_code_review_brief() {
+        let cli = parse(&[
+            "drovr",
+            "code-review",
+            "brief",
+            "myrun",
+            "task-1",
+            "--angle",
+            "security",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeReview {
+                sub:
+                    CodeReviewCmd::Brief {
+                        run, task, angle, ..
+                    },
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(task, "task-1");
+                assert_eq!(angle, "security");
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&["drovr", "code-review", "brief", "myrun", "task-1"]).is_err(),
+            "an angle-less brief has no frame to compose"
+        );
     }
 
     #[test]
@@ -2398,6 +3125,31 @@ mod tests {
         assert!(validate_label("task", "a/b").is_err());
         assert!(validate_label("task", "a\\b").is_err());
         assert!(validate_label("task", "").is_err());
+    }
+
+    /// `mcp-findings` turns `run` and `task` into path components, and it is the one
+    /// write-capable entrypoint drovr exposes. It is spawned by the panel with names
+    /// already validated, but nothing stops it being invoked directly, so it must
+    /// enforce the same rule rather than inherit it from its intended caller.
+    #[test]
+    fn mcp_findings_run_and_task_are_the_labels_the_dispatch_validates() {
+        let cmd = Cli::parse_from(["drovr", "mcp-findings", "../escape", "task-1", "2"]);
+        let Commands::McpFindings { run, task, iter } = cmd.command else {
+            panic!("expected McpFindings");
+        };
+        assert_eq!(iter, 2, "the iteration scopes the findings file");
+        // Exactly the checks the dispatch arm applies before serving.
+        assert!(
+            validate_label("run name", &run).is_err(),
+            "a traversing run name must be refused"
+        );
+        assert!(validate_label("task", &task).is_ok());
+        for bad in ["../escape", "a/b", ".."] {
+            assert!(
+                validate_label("task", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
     }
 
     // -- format_progress helper -------------------------------------------------

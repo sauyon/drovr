@@ -225,6 +225,21 @@ impl Phase {
         self.reaped = Reaped(false);
     }
 
+    /// Drop a pane id that no longer names anything, WITHOUT claiming drovr
+    /// reaped it.
+    ///
+    /// The one caller is `ensure_workspace`'s repair path: the run's whole herdr
+    /// workspace is gone, so every recorded pane id in it is dangling — and a
+    /// stale id is exactly what `phase_send` would aim at and what `cleanup`
+    /// would try to close. That is a different fact from [`Phase::mark_reaped`],
+    /// which says drovr deliberately closed a pane it still wants `cleanup` to
+    /// account for. Here nothing was closed and there is nothing to retire; the
+    /// pane died with its workspace. Conflating the two would advertise a
+    /// rehydrate for a phase whose pane drovr never took.
+    pub fn forget_dangling_pane(&mut self) {
+        self.pane_id = None;
+    }
+
     /// Test-only: drop the agent record, to model a phase launched by a build
     /// that never recorded one. There is deliberately no production way to do
     /// this — a launch always records, and a relaunch REPLACES.
@@ -588,6 +603,62 @@ pub struct RunState {
     /// run that never finished its phases would otherwise display as live
     /// forever. `#[serde(default)]` + skip-if-false keeps pre-existing
     /// `state.json` files loading (and re-serializing) unchanged.
+    ///
+    /// # `state.json` IS THE AUTHORITY FOR THIS FIELD
+    ///
+    /// Unique among `RunState`'s fields: `archived` is set by a *different*
+    /// process from the one holding this struct — `drovr cleanup`, or the review
+    /// server's Archive/Restore button, both of which re-read and then
+    /// [`save`](RunState::save) — while every other field is owned by whoever
+    /// loaded the run. So an in-memory `archived` is a CACHE, and it can be stale
+    /// in either direction: `false` when the human has just archived, `true` when
+    /// they have just restored.
+    ///
+    /// The rule, and it has no exceptions:
+    ///
+    /// * **Consulting it means refreshing it** — call
+    ///   [`refresh_archived`](RunState::refresh_archived), which re-reads
+    ///   `state.json`, adopts what it finds, and returns it. Reading the field
+    ///   directly answers a question about your own copy, not about the run.
+    /// * **Writing it means owning it** — a caller that has *decided* to archive
+    ///   or restore sets the field and uses [`save`](RunState::save) /
+    ///   [`save_in`](RunState::save_in), which write it verbatim. Everyone else
+    ///   uses [`save_preserving_archived`](RunState::save_preserving_archived),
+    ///   which takes disk's value over its own.
+    ///
+    /// This was not always one rule, and the gap had teeth: a guard that read disk
+    /// while the save beside it merged with `|=` could refuse to repair a restored
+    /// run, or silently re-archive one. Two sources of truth for one bit is enough
+    /// to invert a human's decision.
+    ///
+    /// ## The rule is a CONVENTION — the type does not enforce it
+    ///
+    /// This field is `pub bool`, so nothing stops a new call site reading it
+    /// directly and acting on a stale value. Said plainly rather than left to be
+    /// inferred from the paragraphs above, which describe a discipline the
+    /// compiler knows nothing about.
+    ///
+    /// Not enforced because the obvious enforcement is worse than the gap. A
+    /// private field needs a constructor and rewrites at 17 struct literals across
+    /// 6 files (`RunState` has no `Default`), and an accessor that reads the
+    /// authority would put a `state.json` read behind every consultation —
+    /// including [`is_complete`](RunState::is_complete), which the review server
+    /// calls per row on a 2s poll. That trades a documented convention for a hot
+    /// disk read and a wide mechanical change.
+    ///
+    /// **Kept by these tests**, which fail if a site stops obeying it:
+    /// * `run::tests::refresh_archived_adopts_disk_in_both_directions`
+    /// * `run::tests::refresh_archived_fails_loudly_rather_than_picking_an_authority`
+    /// * `run::tests::a_save_never_re_archives_a_run_the_human_restored`
+    /// * `run::tests::a_stale_save_never_resurrects_an_archived_run`
+    /// * `run::tests::restore_can_still_clear_the_archived_flag`
+    /// * `phase::tests::repairing_a_restored_run_leaves_it_restored_on_disk`
+    /// * `phase::tests::a_restore_on_disk_beats_a_stale_archive_held_in_memory`
+    /// * `phase::tests::an_unreadable_state_json_refuses_the_repair_rather_than_guessing`
+    /// * `code_review::tests::archiving_mid_run_survives_every_save_the_review_makes`
+    ///
+    /// A reader added to that list is a reader that must go through
+    /// [`refresh_archived`](RunState::refresh_archived) first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
     /// Panes drovr opened that no longer belong to any phase, yet are still
@@ -734,6 +805,19 @@ impl RunState {
     ///   `read_dir` over a run root gates on a `state.json` child, and nothing
     ///   enumerates inside a run dir.
     pub fn save(&self) -> io::Result<()> {
+        self.save_in(&run_dir(&self.name))
+    }
+    /// Save into an explicitly given run directory.
+    ///
+    /// The always-on server is parameterised on a `runs_root` (a temp dir under
+    /// test), so its writers must not go through [`RunState::save`]: that
+    /// resolves `run_dir()` from the ambient `XDG_DATA_HOME` and would write to
+    /// the developer's real data dir instead of the root the server was handed.
+    ///
+    /// The atomicity described on `save` lives HERE, so it applies to the
+    /// server's writes too — they are the ones a reader is most likely to race,
+    /// being a button a human can hit mid-phase.
+    pub fn save_in(&self, dir: &std::path::Path) -> io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         // Refuse to WRITE what `load` would refuse to READ.
@@ -747,8 +831,7 @@ impl RunState {
         self.check_pane_lifecycle()?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
-        let dir = run_dir(&self.name);
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir)?;
         let body = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         let tmp = dir.join(format!(
             ".state.json.tmp.{}.{}",
@@ -766,6 +849,65 @@ impl RunState {
             return Err(e);
         }
         Ok(())
+    }
+    /// Re-read `archived` from `state.json`, adopt it, and return it.
+    ///
+    /// THE way to consult [`archived`](RunState::archived) — see that field for
+    /// why disk is the authority. Adopting rather than merely returning is the
+    /// load-bearing half: it leaves this copy agreeing with disk, so the next
+    /// [`save_preserving_archived`] cannot write a stale value back and quietly
+    /// invert the human's decision.
+    ///
+    /// A read failure is an `Err`, NOT a fallback to the copy in hand. Callers
+    /// gate destructive or infrastructure-creating work on this, and a torn read
+    /// or a permissions problem must fail closed rather than silently decide which
+    /// authority applies. The one exception is a `state.json` that is not there:
+    /// nothing has ever been recorded about the run, so there is no decision to
+    /// contradict, and the value in hand stands.
+    ///
+    /// [`save_preserving_archived`]: RunState::save_preserving_archived
+    pub fn refresh_archived(&mut self) -> io::Result<bool> {
+        match RunState::load(&self.name) {
+            Ok(disk) => self.archived = disk.archived,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(self.archived)
+    }
+
+    /// Save every field from this copy EXCEPT [`archived`](RunState::archived),
+    /// which is taken from disk — the authority rule that field documents, applied
+    /// at the moment of writing.
+    ///
+    /// Long-running commands hold a `RunState` loaded minutes ago — `code-review
+    /// run` blocks for up to its timeout (30 min by default) before writing back —
+    /// and the human can archive OR restore from the web UI inside that window.
+    /// A plain [`save`] would write whichever value this copy happens to hold over
+    /// their decision, in whichever direction: reviving a run they filed away, or
+    /// re-filing one they just restored.
+    ///
+    /// Adopts disk's value (`=`) rather than merging it (`|=`). The merge was a
+    /// half-rule — it rescued an Archive and lost a Restore — and a half-rule is
+    /// how one bit ends up with two sources of truth. There is no writer this
+    /// costs: a caller that has *decided* to archive or restore owns the field and
+    /// uses [`save`]/[`save_in`], which write it verbatim.
+    ///
+    /// This narrows the race; it does not close it. A concurrent write landing
+    /// between the re-read and the write is still lost (see docs/known-issues.md
+    /// — `state.json` has no locking or compare-and-swap). An unreadable
+    /// `state.json` leaves the value in hand and proceeds, because this is a WRITE
+    /// path: refusing to persist a phase's progress over an unrelated read failure
+    /// would lose more than it protects. Callers that must not act on a stale flag
+    /// gate on [`refresh_archived`](RunState::refresh_archived) first, which does
+    /// fail closed.
+    ///
+    /// [`save`]: RunState::save
+    /// [`save_in`]: RunState::save_in
+    pub fn save_preserving_archived(&mut self) -> io::Result<()> {
+        if let Ok(disk) = RunState::load(&self.name) {
+            self.archived = disk.archived;
+        }
+        self.save()
     }
     pub fn first_incomplete(&self) -> Option<usize> {
         self.phases
@@ -958,6 +1100,165 @@ mod tests {
         let round: RunState =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("round trip");
         assert!(round.archived);
+    }
+
+    #[test]
+    fn a_stale_save_never_resurrects_an_archived_run() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+
+        // A long-running command (`code-review run` blocks for up to its timeout)
+        // loads the run while it is still active...
+        let mut stale = completion_run(vec![running("implement")]);
+        stale.save().unwrap();
+
+        // ...the human archives it from the web UI meanwhile, which closes the
+        // workspace and destroys every pane...
+        let mut archiver = RunState::load("r").unwrap();
+        archiver.archived = true;
+        archiver.save().unwrap();
+
+        // ...and only then does the long-running command write its copy back.
+        stale.phases[0].status = PhaseStatus::Done;
+        stale.save_preserving_archived().unwrap();
+
+        let on_disk = RunState::load("r").unwrap();
+        assert!(
+            on_disk.archived,
+            "a save carrying a stale `archived: false` must not un-archive a run \
+             whose workspace has already been destroyed"
+        );
+        assert_eq!(
+            on_disk.phases[0].status,
+            PhaseStatus::Done,
+            "the writer's own progress must still land — only `archived` is rescued"
+        );
+    }
+
+    /// The authority rule, at the type that owns it: consulting `archived` means
+    /// re-reading it, and what is on disk is what the run is.
+    #[test]
+    fn refresh_archived_adopts_disk_in_both_directions() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![running("implement")]);
+        s.save().unwrap();
+
+        // The human archives from the web UI while we hold our copy.
+        let mut ui = RunState::load("r").unwrap();
+        ui.archived = true;
+        ui.save().unwrap();
+        assert!(s.refresh_archived().unwrap(), "must report disk's true");
+        assert!(s.archived, "and adopt it, so a later save cannot revert it");
+
+        // ...then restores. The stale `true` we just adopted must not survive it:
+        // this is the direction a one-way `|=` merge gets wrong.
+        ui.archived = false;
+        ui.save().unwrap();
+        assert!(!s.refresh_archived().unwrap(), "must report disk's false");
+        assert!(!s.archived, "a Restore is as authoritative as an Archive");
+    }
+
+    #[test]
+    fn refresh_archived_fails_loudly_rather_than_picking_an_authority() {
+        // A guard that refuses archived runs must FAIL CLOSED on an unreadable
+        // state.json. Folding a read error into "trust my own copy" would let a
+        // torn read or a permissions problem silently decide which authority is
+        // in force — the caller cannot even tell it happened.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![running("implement")]);
+        s.save().unwrap();
+        fs::write(run_dir("r").join("state.json"), b"{ this is not json").unwrap();
+
+        assert!(
+            s.refresh_archived().is_err(),
+            "an unreadable state.json is not evidence about the archive flag"
+        );
+
+        // A run with NO state.json is different in kind: nothing has ever been
+        // recorded about it, so there is no decision to contradict the copy in
+        // hand. That must not be an error — `ensure_workspace` runs before a
+        // brand-new run's first save in tests, and on a run mid-creation.
+        fs::remove_file(run_dir("r").join("state.json")).unwrap();
+        let mut fresh = completion_run(vec![running("implement")]);
+        fresh.archived = true;
+        assert!(
+            fresh.refresh_archived().expect("absent is not unreadable"),
+            "with nothing on disk, the copy in hand is all there is"
+        );
+    }
+
+    #[test]
+    fn a_save_never_re_archives_a_run_the_human_restored() {
+        // The mirror of `a_stale_save_never_resurrects_an_archived_run`, and the
+        // half that a one-way `|=` merge got wrong: a long-running command whose
+        // copy latched `archived: true` (from an Archive it observed) must not
+        // write that back over a Restore that has since landed.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut stale = completion_run(vec![running("implement")]);
+        stale.archived = true;
+        stale.save().unwrap();
+
+        // The human restores it.
+        let mut restore = RunState::load("r").unwrap();
+        restore.archived = false;
+        restore.save().unwrap();
+
+        // The long-running command writes its progress back, still holding `true`.
+        stale.phases[0].status = PhaseStatus::Done;
+        stale.save_preserving_archived().unwrap();
+
+        let on_disk = RunState::load("r").unwrap();
+        assert!(
+            !on_disk.archived,
+            "a save carrying a stale `archived: true` must not undo a Restore"
+        );
+        assert_eq!(
+            on_disk.phases[0].status,
+            PhaseStatus::Done,
+            "the writer's own progress must still land"
+        );
+        assert!(
+            !stale.archived,
+            "and the writer's copy must agree with what it just wrote"
+        );
+    }
+
+    #[test]
+    fn restore_can_still_clear_the_archived_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
+        }
+        let mut s = completion_run(vec![done("implement")]);
+        s.archived = true;
+        s.save().unwrap();
+
+        // Restore deliberately clears the flag and uses a plain `save`, which must
+        // NOT rescue the on-disk `true` — otherwise archiving would be one-way.
+        let mut restore = RunState::load("r").unwrap();
+        restore.archived = false;
+        restore.save().unwrap();
+
+        assert!(
+            !RunState::load("r").unwrap().archived,
+            "Restore must still be able to un-archive a run"
+        );
     }
 
     #[test]

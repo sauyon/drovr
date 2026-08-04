@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{AgentLaunch, load_config};
-use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, SessionId};
+use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, PromptOutcome, SessionId};
 use crate::run::{NotRehydratable, PassToken, Phase, PhaseStatus, RunState, run_dir};
 use crate::shell::shell_single_quote;
 
@@ -15,6 +15,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long `phase_send` waits for a freshly-spawned agent to reach its composer
 /// before delivering the prompt (see `wait_agent_ready`).
 const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `phase_send` gives herdr to confirm the agent actually started after
+/// a prompt (and again after the submit nudge).
+///
+/// Must stay >= 5s: herdr only returns its precise `agent_prompt_stalled` verdict
+/// once its own 5s no-state-change window has elapsed, and degrades to a bare
+/// `timeout` below that. The headroom above 5s absorbs a slow first turn on a
+/// cold agent without turning a healthy send into a spurious nudge.
+const SEND_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Path of the completion marker a phase agent drops via `drovr phase done`.
 /// `pub(crate)` so the code-review orchestrator can compute reviewer marker paths
@@ -369,6 +378,303 @@ fn discard_unlaunched_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace recovery
+// ---------------------------------------------------------------------------
+
+/// The herdr label drovr gives a run's workspace. One function so `drovr new`
+/// and the re-provisioning path here cannot drift — a replacement workspace
+/// under a different label would be indistinguishable from a human's own in the
+/// switcher, and in `cleanup`'s reasoning about whose panes are whose.
+pub fn workspace_label(run_name: &str) -> String {
+    format!("drovr:{run_name}")
+}
+
+/// The refusal for a run with no `project_dir` — the one piece of state drovr
+/// genuinely cannot rebuild, since without it there is no directory to launch an
+/// agent in and none to open a workspace in.
+///
+/// ONE function for every site that hits this, because the wording is the point.
+/// It used to read "please recreate the run with `drovr new`" — advice that would
+/// have discarded an approved spec, a plan and two tasks of committed work on the
+/// run that exposed all of this. A run is not disposable just because one field
+/// of it is missing, so this names the field and where to put it instead.
+pub fn missing_project_dir_error(run_name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "run '{run_name}' has no project_dir (created before that field was \
+             recorded), so drovr does not know which directory to work in. \
+             Everything else about the run is intact: add \"project_dir\": \
+             \"/path/to/checkout\" to {} and re-run this command.",
+            run_dir(run_name).join("state.json").display()
+        ),
+    )
+}
+
+/// The refusal for a run the human filed away.
+///
+/// A shared constructor for the same reason [`missing_project_dir_error`] is one:
+/// these are drovr's two hard refusals, both say "the run is fine, do this one
+/// thing first", and a second wording of either is a place for the guidance to
+/// drift. `code_review_run` reports it through its own outcome type but prints
+/// this text.
+pub fn archived_run_error(run_name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "run '{run_name}' is archived, and archiving destroyed its herdr \
+             workspace. drovr will not rebuild one for a run you filed away — \
+             nothing is lost, so Restore it (the Restore button in `drovr serve`'s \
+             run list) and re-run this command."
+        ),
+    )
+}
+
+/// The workspace [`ensure_workspace`] has just guaranteed.
+///
+/// Reachable only if that guarantee is broken, so it reports a bug in drovr
+/// rather than a state a user can be in — and specifically NOT the "recreate the
+/// run" advice this area exists to retire. Shared by the two launch paths so the
+/// one invariant is stated once.
+fn workspace_or_bug(run: &RunState) -> io::Result<String> {
+    run.workspace.clone().ok_or_else(|| {
+        io::Error::other(format!(
+            "internal: run '{}' still has no workspace after ensure_workspace",
+            run.name
+        ))
+    })
+}
+
+/// What [`ensure_workspace`] had to do.
+///
+/// `Reprovisioned` deliberately does NOT carry the new workspace id: it is in
+/// `run.workspace` by the time this is returned, and a copy beside it would be a
+/// second place for the same fact to live — one the caller could pass to
+/// [`healing_report`] mismatched with the run it is reporting on.
+#[derive(Debug)]
+pub enum WorkspaceHealing {
+    /// The recorded workspace answered — nothing was touched.
+    Intact,
+    /// There was no live workspace, so one was created. Carries the names of the
+    /// phases that were `Running` in the dead one, which the caller reports: their
+    /// agents are gone with their context, and that is a fact about the run, not a
+    /// detail of the repair.
+    Reprovisioned { orphaned: Vec<String> },
+}
+
+/// Guarantee `run` has a live herdr workspace, creating one if it does not.
+///
+/// A workspace is disposable infrastructure — herdr destroys one the moment its
+/// last pane closes, which `drovr cleanup` and ordinary pane-reaping both do —
+/// while a run's phases, handoffs, commits and approved spec are not. Tying the
+/// two together is what once made a 23-task run at task 3 unrecoverable through
+/// drovr's own commands. So a missing workspace is repaired here rather than
+/// reported as a terminal error, and "recreate the run" is never the advice.
+///
+/// HEALS AT THE POINT OF USE, not on load. `RunState::load` is a pure
+/// deserialize with no herdr in reach, and its callers include `drovr status`,
+/// `drovr list` and the always-on server's 2s list poll — none of which may
+/// create infrastructure as a side effect of being read. The launch paths
+/// (`phase_start`, `spawn_reviewer`, `resurrect`) are the ones that genuinely
+/// need a workspace, and they are few enough to enumerate.
+///
+/// Saves `run` when it changes anything, so a caller that fails afterwards still
+/// leaves the repair on disk instead of re-creating a second workspace next time.
+///
+/// NOT ATOMIC, deliberately. The check and the create are two calls with no lock
+/// between them, and `state.json` has neither locking nor compare-and-swap (see
+/// [`RunState::save`]). Two drovr processes acting on the same run at the same
+/// moment can therefore both see the workspace as gone and both create one; the
+/// loser's is never recorded, so nothing reaps it and it holds a live agent. That
+/// needs two concurrent writers on one run, which drovr's single-writer
+/// discipline forbids — and a lock here would close one instance of a race the
+/// rest of the file has everywhere else, which is worse than an honest gap. It is
+/// written up in `docs/known-issues.md`; the loser is labelled `drovr:<run>` like
+/// any other, so a human can spot the duplicate in herdr's switcher.
+pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<WorkspaceHealing> {
+    if let Some(ws) = run.workspace.as_deref()
+        && h.workspace_exists(ws)
+    {
+        return Ok(WorkspaceHealing::Intact);
+    }
+    // The human filed this run away, and `cleanup`/the Archive button destroyed
+    // its workspace on purpose. Repairing that would make the destruction the only
+    // thing that had been enforcing their decision — before re-provisioning
+    // existed, `phase start` on an archived run failed precisely because nothing
+    // recreated a closed workspace, and it would now succeed silently while the UI
+    // still shows the run archived. Recovering from an ACCIDENT is this function's
+    // job; overriding an intention is not.
+    //
+    // Checked after `workspace_exists`, so an archived run whose `workspace_close`
+    // failed — a zombie, with live panes — still starts exactly as it does today.
+    //
+    // EVERYTHING FROM HERE WORKS ON A COPY, and `*run` is overwritten only once
+    // the repair is safely on disk (see the commit point at the end).
+    //
+    // A half-repaired `RunState` — new workspace id, cleared pane ids, phases
+    // demoted — is a run that LOOKS repaired and is not one, and any `save`
+    // anywhere afterwards writes that fiction out. Returning `Err` beside a
+    // comment saying "drop this" does not prevent it: the caller who would get it
+    // wrong is exactly the one not reading the comment. Making the mutation
+    // unreachable until it is durable does. Pinned by
+    // `a_failed_repair_leaves_the_callers_run_state_untouched`.
+    //
+    // The clone costs one `RunState` per repair, and a repair only happens when a
+    // workspace has actually vanished.
+    let mut repaired = run.clone();
+
+    // `refresh_archived` is THE way to consult this flag (see `RunState::archived`
+    // for why disk is the authority). Adopting matters here specifically: the
+    // `save_preserving_archived` below writes the copy in hand, so a guard that
+    // read disk and left a stale `true` behind would re-archive, on its own
+    // success path, the run it had just decided was not archived.
+    if repaired.refresh_archived().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "run '{}': cannot read {} to check whether it was archived, so drovr \
+                 will not create a workspace for it: {e}",
+                run.name,
+                run_dir(&run.name).join("state.json").display()
+            ),
+        )
+    })? {
+        return Err(archived_run_error(&run.name));
+    }
+    // A workspace created without a cwd opens wherever herdr defaults to — the
+    // near-miss that nearly had a phase agent editing an unrelated repo — so a
+    // run with no project_dir gets no workspace at all.
+    if repaired.project_dir.is_empty() {
+        return Err(missing_project_dir_error(&run.name));
+    }
+    let ws = h.workspace_create(&workspace_label(&run.name), &repaired.project_dir)?;
+
+    // Every pane id in `run` named a pane in the workspace that is gone, so all
+    // of them are now dangling. Dropping them is not tidiness: a stale id is what
+    // `phase_send` would aim at and what `cleanup` would try to close.
+    let mut orphaned = Vec::new();
+    for phase in repaired
+        .phases
+        .iter_mut()
+        .chain(repaired.review_phases.iter_mut())
+    {
+        phase.forget_dangling_pane();
+        phase.herdr_session = None;
+        // A `Done` phase does not care — its work is in the handoff and in git.
+        // A `Running` one is the real question, and this is the answer: its agent
+        // died with the workspace, taking its context, so the phase is `Failed`
+        // and not `Running`. Silently respawning would present work nobody is
+        // doing as still in flight, which is the same class of lie as `resurrect`
+        // advertising a resume it never restored.
+        if phase.status == PhaseStatus::Running {
+            phase.status = PhaseStatus::Failed;
+            orphaned.push(phase.name.clone());
+        }
+    }
+    // Retired panes are drovr's to reap, and there is nothing left to reap.
+    repaired.retired_panes.clear();
+    repaired.workspace = Some(ws.id.clone());
+    // The replacement's root shell pane is handed to the next phase exactly as
+    // `drovr new`'s is, so recovery leaves no idle shell behind either.
+    repaired.root_pane = Some(ws.root_pane);
+
+    // ORDER: create, mutate a copy, save — and hand the workspace BACK if the save
+    // fails.
+    //
+    // Persisting first is not available: the id to persist only exists once herdr
+    // has created it. So the window between the two is real, and the question is
+    // only what a failure in it leaves behind. Without the reclaim it leaves the
+    // worst of both: `state.json` still names the DEAD workspace, so the next
+    // attempt creates a second replacement, while the first stands in the human's
+    // switcher labelled `drovr:<run>` with nothing pointing at it — the
+    // duplicate-workspace failure this file documents for concurrent writers, now
+    // reachable from a single one on a transient ENOSPC.
+    //
+    // Closing it is safe and exact: we created it microseconds ago, nothing has
+    // been launched into it (`ensure_workspace` runs before any `pane_run`), and
+    // it is not the id anything has recorded.
+    if let Err(save_err) = repaired.save_preserving_archived() {
+        return Err(reclaim_unrecorded_workspace(h, &ws.id, &run.name, save_err));
+    }
+
+    // THE COMMIT POINT. Everything above touched `repaired`, so until this line
+    // the caller's run is exactly what it handed in — including on every error
+    // path above, none of which can leave it looking repaired. Reached only once
+    // the repair is durable, which is what makes the two agree.
+    *run = repaired;
+    Ok(WorkspaceHealing::Reprovisioned { orphaned })
+}
+
+/// Give back a workspace drovr created but could not record, and describe what
+/// happened. Always returns an `Err` for the caller to propagate — this is a
+/// failure path, and the reclaim is cleanup, not recovery.
+///
+/// If the close ALSO fails there is nothing left to try, so the message names the
+/// id and the label so a human can close it by hand. Reporting the save failure as
+/// if nothing were left behind would be the lie this whole area exists to remove.
+fn reclaim_unrecorded_workspace<H: Herdr>(
+    h: &H,
+    workspace: &str,
+    run_name: &str,
+    cause: io::Error,
+) -> io::Error {
+    let stranded = match h.workspace_close(workspace) {
+        Ok(()) => String::new(),
+        Err(close_err) => format!(
+            " — and it could not be closed again either ({close_err}), so herdr still \
+             holds workspace {workspace} (labelled `{}`) with nothing pointing at it; \
+             close it by hand",
+            workspace_label(run_name)
+        ),
+    };
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "run '{run_name}': could not record the replacement herdr workspace \
+             ({cause}), so the repair did not stick and was rolled back{stranded}"
+        ),
+    )
+}
+
+/// What a repair cost, in the words every path reports it in.
+///
+/// One formatter rather than one per caller: `phase_start`/`spawn_reviewer` warn
+/// on stderr and `resurrect` returns a report on stdout, but a driver who reads
+/// both must not have to work out whether two differently-worded messages
+/// describe the same event. Lines are newline-terminated; the caller frames them.
+pub fn healing_report(run: &RunState, orphaned: &[String]) -> String {
+    let mut out = format!(
+        "run '{}' had no live herdr workspace; created {} in {}\n",
+        run.name,
+        run.workspace.as_deref().unwrap_or("(unrecorded)"),
+        run.project_dir
+    );
+    if !orphaned.is_empty() {
+        out.push_str(&format!(
+            "these phases were Running in the old workspace and their agents are gone \
+             with their context — marked FAILED, restart the one you want: {}\n",
+            orphaned.join(", ")
+        ));
+    }
+    out
+}
+
+/// Repair `run`'s workspace and warn on stderr about what the repair cost.
+///
+/// Split from [`ensure_workspace`] so the pure state transition stays testable
+/// without capturing output. `resurrect` does its own framing (the repair is its
+/// headline, not a warning beside a launch) but shares [`healing_report`], so the
+/// wording cannot drift between them.
+fn ensure_workspace_reporting<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<()> {
+    if let WorkspaceHealing::Reprovisioned { orphaned } = ensure_workspace(h, run)? {
+        for line in healing_report(run, &orphaned).lines() {
+            eprintln!("drovr: {line}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -396,17 +702,22 @@ pub fn phase_start<H: Herdr>(
     } else {
         require_phase_name(phase)?;
     }
+    // Checked here as well as inside `ensure_workspace`, and for a different
+    // reason: `project_dir` is this phase's cwd and its `--add-dir` guard, so it
+    // is required even when the recorded workspace is perfectly alive. Both sites
+    // raise the SAME error, so which one fires first is not something a reader has
+    // to know.
     if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
+        return Err(missing_project_dir_error(&run.name));
     }
     let cwd = run.project_dir.clone();
+
+    // BEFORE the pass is minted and this phase is marked Running: a repair
+    // demotes every Running phase to Failed, and running it afterwards would
+    // demote the one we are starting. It also clears this phase's `pane_id`, so
+    // the pane selection below correctly falls through to the new root pane
+    // instead of aiming at a pane in the destroyed workspace.
+    ensure_workspace_reporting(h, run)?;
 
     // Re-entering a phase means: mint a new pass, record it, and drop the previous
     // pass's completion marker — in that order (see the ORDER MATTERS note below).
@@ -467,7 +778,10 @@ pub fn phase_start<H: Herdr>(
             let (backend, profile) = (old.backend().to_owned(), old.profile().map(str::to_owned));
             run.phases[i].record_launch(backend, profile);
         }
-        run.save()?;
+        // Preserving, like every other writer holding a snapshot the human may
+        // have archived under: it only rescues `archived`, so it cannot disturb
+        // the pass-token write above.
+        run.save_preserving_archived()?;
     }
     remove_stale_marker(&run.name, phase)?;
 
@@ -495,25 +809,18 @@ pub fn phase_start<H: Herdr>(
     let mut created_pane = false;
     let target_pane = if let Some(pane) = existing_pane {
         pane
-    } else if let Some(ws) = run.workspace.as_deref() {
-        created_pane = true;
-        h.tab_create(ws, phase, &cwd)?
     } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace (creation failed at `drovr new`); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
+        created_pane = true;
+        // `ensure_workspace` above either found a live workspace or created one.
+        h.tab_create(&workspace_or_bug(run)?, phase, &cwd)?
     };
 
     // Use the backend captured by `drovr new`, so every phase stays on the
     // caller's agent even when later commands run from a plain shell.
     let cfg = load_config()?;
     let agent = run.agent.as_deref().unwrap_or("claude");
-    let launch = cfg.launch(agent, &cwd, false)?;
+    // No MCP config: the findings channel exists only for read-only reviewers.
+    let launch = cfg.launch(agent, &cwd, false, None)?;
     // Read ONCE: the profile inlined into the agent's environment and the one
     // recorded on the phase have to be the same value, or a later rehydrate
     // resumes under a profile this pane never authenticated with.
@@ -562,7 +869,12 @@ pub fn phase_start<H: Herdr>(
     // phase pane, each reviewer pane) is torn down at the end by `drovr cleanup`,
     // once the user confirms — which is why `pane_id` is recorded here: it is how
     // cleanup knows which panes are drovr's and which are the human's.
-    run.save()?;
+    //
+    // `save_preserving_archived`, not `save`: the caller has held this state since
+    // before the pane was launched, and the human may have archived the run from
+    // the web UI in between. Writing a stale `archived: false` back would
+    // un-archive a run whose workspace is already destroyed.
+    run.save_preserving_archived()?;
     Ok(())
 }
 
@@ -606,28 +918,15 @@ pub fn spawn_reviewer<H: Herdr>(
     // workspace-root guard (or the tab cwd), so refuse rather than launch a
     // reviewer with `--add-dir ''`.
     if run.project_dir.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no project_dir (created before this fix); \
-                 please recreate the run with `drovr new`",
-                run.name
-            ),
-        ));
+        return Err(missing_project_dir_error(&run.name));
     }
 
-    // Reviewers, like every pipeline phase, need their own tab — which requires
-    // a workspace. The root pane is not a fallback for anyone.
-    let ws = run.workspace.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "run '{}' has no herdr workspace; cannot spawn a reviewer \
-                 (reviewers need their own tab and never reuse the root pane)",
-                run.name
-            ),
-        )
-    })?;
+    // Reviewers can't reuse the pipeline root pane; they need their own tab, which
+    // requires a workspace — so a missing or destroyed one is repaired here too.
+    // `code-review run` spawns several reviewers in a loop, which is precisely
+    // when a workspace is most likely to have been emptied by pane-reaping.
+    ensure_workspace_reporting(h, run)?;
+    let ws = workspace_or_bug(run)?;
 
     // A fresh tab (with its auto shell pane) in the run workspace — never the root
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
@@ -691,7 +990,10 @@ pub fn spawn_reviewer<H: Herdr>(
     reviewer.pass = Some(pass);
     reviewer.record_launch(launch.backend(), profile);
     run.review_phases.push(reviewer);
-    run.save()?;
+    // Preserving, as in `phase_start`: this runs once per angle inside
+    // `code_review_run`'s spawn loop, each iteration a herdr round trip, so an
+    // Archive click lands here far more easily than the name suggests.
+    run.save_preserving_archived()?;
     Ok(())
 }
 
@@ -904,7 +1206,7 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
         match resumed {
             Some((launch, profile)) => (launch, profile, true, fresh_backend),
             None => (
-                cfg.launch(&fresh_backend, &cwd, readonly)?,
+                cfg.launch(&fresh_backend, &cwd, readonly, None)?,
                 fresh_profile,
                 false,
                 fresh_backend,
@@ -1515,6 +1817,104 @@ pub(crate) fn poll_phase_pane<H: Herdr>(
     info
 }
 
+/// What a handoff scan concluded. Two rules, no markdown model — and one variant per
+/// outcome, so "passes" is a state the type names rather than one a reader infers from an
+/// empty vec.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffShape {
+    /// Nothing beyond what drovr itself wrote: the agent never touched the scaffold.
+    ///
+    /// Carries the sections still holding a placeholder, when there are any. They do not
+    /// change the refusal — "the whole file is scaffold" is the useful thing to say — but
+    /// discarding a fact already computed leaves the variant unable to answer a question a
+    /// caller may reasonably ask.
+    Untouched { placeholders: Vec<String> },
+    /// The agent wrote something, but left the placeholder in these sections.
+    Placeholders(Vec<String>),
+    /// Written, with no placeholder left. Passes.
+    Complete,
+}
+
+/// Decide whether a handoff was actually written, WITHOUT parsing markdown.
+///
+/// Five rounds of review on a per-section body model produced seven bypasses and four false
+/// refusals — fence state, comment state, chained comments, indented headings, `#`-led
+/// lines, then verbatim guidance matching and heading-presence. Each fix's seams became the
+/// next round's findings. The lesson is that "did this section receive substance" is not
+/// decidable from markdown by any rule simple enough to be correct.
+///
+/// So the gate stops trying, and asks two things it CAN answer exactly:
+///
+/// 1. **Is the file nothing but what drovr wrote?** Every non-blank line appears in
+///    `handoff_scaffold()`'s output. That is the accident this gate exists for — scaffold,
+///    forget, signal done.
+/// 2. **Does any line still read exactly `TODO`, at column 0?** That is the placeholder
+///    drovr wrote, still sitting where a section's content belongs. An indented one is
+///    quoted text, which also makes indenting the escape from a false positive.
+///
+/// Both are cheap, neither can misread structure, and every refusal is escapable by editing
+/// the line the message names.
+///
+/// **What this deliberately does NOT catch**, because five rounds showed the cost of trying:
+/// an agent that fills one section and deletes the other six blocks; a body of
+/// `TODO: fill this in`, or a lookalike using non-ASCII characters. An agent set on evading
+/// the gate can; the gate is here for the one that forgot. `drovr collect` shows the next
+/// phase exactly what it inherited, which is the real check on a thin handoff.
+fn scan_handoff(contents: &str) -> HandoffShape {
+    // ONE generation of the scaffold, borrowed twice — the two helpers each built it
+    // separately, which was wasteful and, worse, two chances for them to disagree about
+    // what the scaffold contains.
+    let scaffold = crate::brief::handoff_scaffold();
+    let scaffold_lines: Vec<&str> = scaffold
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let headings: Vec<&str> = scaffold
+        .lines()
+        .filter_map(|l| l.strip_prefix("## ").map(str::trim))
+        .collect();
+
+    let mut wrote_something = false;
+    let mut placeholders = Vec::new();
+    let mut section: Option<&str> = None;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("## ")
+            && let Some(h) = headings.iter().find(|h| **h == rest.trim())
+        {
+            section = Some(h);
+        }
+        // Compared UNTRIMMED: the scaffold writes the placeholder at column 0, so an
+        // indented `TODO` is quoted text — and indenting is then a real escape from the
+        // refusal, which a trimmed comparison silently denied.
+        if line == crate::brief::SCAFFOLD_PLACEHOLDER {
+            let name = section.unwrap_or("(before the first section)").to_string();
+            if !placeholders.contains(&name) {
+                placeholders.push(name);
+            }
+            continue;
+        }
+        if !scaffold_lines.contains(&trimmed) {
+            wrote_something = true;
+        }
+    }
+
+    // Nothing outside drovr's own text — whether the placeholders are still there or the
+    // agent deleted them and wrote nothing, it is the same accident.
+    if !wrote_something {
+        return HandoffShape::Untouched { placeholders };
+    }
+    if placeholders.is_empty() {
+        return HandoffShape::Complete;
+    }
+    HandoffShape::Placeholders(placeholders)
+}
+
 /// Whether `status` (a pane's herdr `agent_status`) means the agent has STARTED
 /// AND is at its composer, so a prompt sent now will land. `idle`, `working`, and
 /// `done` qualify; `None` (unreadable), `"unknown"`, and `"blocked"` do not.
@@ -1579,17 +1979,121 @@ fn wait_agent_ready<H: Herdr>(
     }
 }
 
-/// Send `text` to the running phase pane, first waiting for the agent to attach
-/// (see `wait_agent_ready`) so a prompt sent right after `phase_start` isn't lost
-/// to a still-booting agent.
+/// Number of trailing non-empty pane lines treated as "the composer region".
+/// Every agent TUI puts its input box at the bottom, just above the status bar.
+/// Bounding the search there stops a payload echoed into SCROLLBACK by an earlier
+/// send from reading as evidence that THIS one landed.
+const COMPOSER_TAIL_LINES: usize = 8;
+
+/// What `claude` and `cursor` both render in place of a large pasted payload
+/// (`[Pasted text #1 +124 lines]`) instead of echoing it. Matched
+/// case-insensitively.
+const PASTE_PLACEHOLDER: &str = "pasted text";
+
+/// Shortest payload prefix accepted as verbatim evidence. Below this, a fragment
+/// is too generic to tell the payload apart from ordinary pane chrome.
+const MIN_VERBATIM_EVIDENCE: usize = 12;
+
+/// Longest payload prefix compared. Capped so a composer that truncates or wraps
+/// a long first line still matches it.
+const MAX_VERBATIM_EVIDENCE: usize = 40;
+
+/// Does `pane` show POSITIVE evidence that `text` reached the agent's composer?
 ///
-/// If the agent does not become ready within [`SEND_READY_TIMEOUT`], this does NOT
-/// send — it returns a `TimedOut` error naming the run/phase and suggesting
-/// `drovr attach`. A never-ready agent is almost always parked on a first-run or
-/// permission prompt with no human at the pane; sending a prompt it can't receive
-/// would silently swallow the seed and leave the phase to hang until its `phase
-/// wait` times out. Raising instead surfaces the stuck agent to the driver (the
-/// CLI enriches this with a pane snapshot via `diagnose_stuck_phase`).
+/// The caller uses this to decide whether pressing Enter is safe, so the test is
+/// deliberately one-sided: "not sure" must read as "no". A missed nudge is an
+/// error a human resolves; a wrong nudge answers whatever dialog is on screen.
+///
+/// Two shapes count as evidence, because they are what the two agents actually
+/// render for a pending prompt:
+///   * a bracketed-paste placeholder — how both collapse a large payload, which
+///     is the normal case for a phase briefing; and
+///   * a verbatim prefix of the payload's first line, for a prompt short enough
+///     to be echoed as typed.
+///
+/// A before/after pane DIFF is deliberately NOT used, and that is the whole
+/// reason this function exists. Agent UIs mutate their own chrome between reads —
+/// status bars, token counters, spinner frames, and a welcome screen that finishes
+/// painting seconds after launch. "Something changed" is therefore true even when
+/// the payload was swallowed whole by a modal, which made an earlier version of
+/// this check press Enter on claude's "New MCP server" approval and accept it.
+/// What one look at the composer region established about `text`.
+///
+/// Three states, not a `bool`, because the third one is a different FACT and it
+/// sends a human somewhere else: "I looked and the payload is not there" points
+/// at a dialog on the screen, while "I could not look" points at herdr. Both
+/// forbid the nudge — but a `bool` can only carry one of them, and whichever it
+/// borrows makes `phase_send` assert a cause it has no evidence for. That is the
+/// same confidently-wrong diagnosis this whole change exists to remove.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ComposerEvidence {
+    /// The payload's signature is in the composer region right now.
+    Present,
+    /// The pane was read, and the payload is not in the composer region.
+    Absent,
+    /// The pane could not be read at all, so nothing was established.
+    Unreadable,
+}
+
+/// Read `pane_id` once and classify what the composer region says about `text`.
+fn read_composer_evidence<H: Herdr>(h: &H, pane_id: &str, text: &str) -> ComposerEvidence {
+    match h.agent_read(pane_id) {
+        Ok(pane) if pane_shows_payload(&pane, text) => ComposerEvidence::Present,
+        Ok(_) => ComposerEvidence::Absent,
+        Err(_) => ComposerEvidence::Unreadable,
+    }
+}
+
+fn pane_shows_payload(pane: &str, text: &str) -> bool {
+    let tail = tail_snippet(pane, COMPOSER_TAIL_LINES);
+    if tail.to_lowercase().contains(PASTE_PLACEHOLDER) {
+        return true;
+    }
+    let Some(first_line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return false;
+    };
+    let fragment: String = first_line.chars().take(MAX_VERBATIM_EVIDENCE).collect();
+    fragment.chars().count() >= MIN_VERBATIM_EVIDENCE && tail.contains(&fragment)
+}
+
+/// Deliver `text` to the running phase pane and CONFIRM the agent actually
+/// started on it. Returns `Ok` only when herdr observed the agent move; every
+/// other path raises rather than reporting a success the seed never had.
+///
+/// Four things can go wrong, and they need different answers:
+///
+/// 1. **The agent never attaches.** Gated up front by `wait_agent_ready`; raises
+///    [`io::ErrorKind::TimedOut`] without sending, and without re-opening.
+/// 2. **The prompt cannot be delivered at all** — herdr is unreachable, the pane
+///    is gone. The transport error propagates.
+/// 3. **The prompt is swallowed.** `agent_status` is not trustworthy evidence
+///    that a pane is at its composer: a pane parked on a dialog herdr's detection
+///    manifest does not classify reports `idle`, not `blocked` (claude's "New MCP
+///    server" approval is the proven case). The readiness gate waves that
+///    through, `agent.prompt` reports success, and the payload vanishes.
+/// 4. **The prompt lands but is never submitted.** The payload sits in the
+///    composer indefinitely and the agent never starts. This is the common case
+///    on `cursor` and it happens on `claude` too; it is a race, not a function of
+///    the payload (see `docs/known-issues.md`).
+///
+/// Cases 3 and 4 both look like "herdr saw no state change", so
+/// [`Herdr::agent_prompt_confirm`] detects them together — and
+/// [`pane_shows_payload`] is what tells them apart, by looking for the payload in
+/// the composer. It is evaluated BEFORE and after the prompt, and only evidence
+/// that *appeared* counts: a long-lived pane can be sent to repeatedly, and an
+/// earlier briefing still sitting in the composer region must not be mistaken for
+/// this one arriving.
+///
+/// That distinction is load-bearing, not cosmetic: case 4 is fixed by pressing
+/// Enter, and case 3 must NEVER be, because the keystroke would land on whatever
+/// dialog is up and accept its highlighted option. So the nudge requires positive
+/// evidence the payload is in the composer; no evidence (including a pane that
+/// cannot be read) means raise, never guess.
+///
+/// Keep the guard and the recovery distinct. The observed state transition is the
+/// one authoritative verdict on whether the seed arrived. The composer-evidence
+/// check is NOT a second opinion on that — it only decides whether nudging is
+/// safe. Never use evidence to conclude "it probably worked".
 ///
 /// Takes `&mut RunState` because sending to a FINISHED phase re-opens it. This is
 /// the pipeline's documented re-entry path — `skills/pipeline/SKILL.md`: "Re-entry
@@ -1600,7 +2104,15 @@ fn wait_agent_ready<H: Herdr>(
 /// microseconds while the agent has not yet read the prompt, and the driver
 /// advances (and, once task 6 lands, reaps a pane it just messaged).
 pub fn phase_send<H: Herdr>(h: &H, run: &mut RunState, phase: &str, text: &str) -> io::Result<()> {
-    phase_send_with_timeout(h, run, phase, text, SEND_READY_TIMEOUT, POLL_INTERVAL)
+    phase_send_with_timeout(
+        h,
+        run,
+        phase,
+        text,
+        SEND_READY_TIMEOUT,
+        POLL_INTERVAL,
+        SEND_CONFIRM_TIMEOUT,
+    )
 }
 
 /// Mark a PIPELINE phase live again for work being requested NOW: drop any
@@ -1649,13 +2161,59 @@ fn reopen_for_re_entry(run: &mut RunState, phase: &str) -> io::Result<bool> {
     if run.phases[i].status != PhaseStatus::Running {
         run.phases[i].status = PhaseStatus::Running;
     }
-    run.save()?;
+    // Preserving: the re-open above is a blocking herdr round trip, so this
+    // snapshot can be older than an archive the human performed during it.
+    run.save_preserving_archived()?;
     Ok(true)
 }
 
-/// [`phase_send`] with an injectable readiness timeout + poll interval (so tests
-/// can exercise the not-ready path, and the poll loop, without waiting out the
-/// full production timeout or real 500ms poll cadence).
+/// What a failed `phase_send` LEFT BEHIND, given whether `reopen_for_re_entry`
+/// acted. Every failure after the re-open has to say this, not just the transport
+/// one: the previous pass's completion marker is already deleted and the status is
+/// back to `Running`, so a caller told only "the seed did not arrive" reads that
+/// phase as work in progress forever — the phantom-incomplete-phase state. Name
+/// the way out too (re-send; the re-open is idempotent).
+///
+/// When the re-open did NOT act — a reviewer phase, which lives in
+/// `review_phases` — nothing was touched and the message must not say otherwise.
+/// A reviewer that has finished and exited is precisely the pane a send fails
+/// against, and its marker is intact: telling its human it had been reset would be
+/// a false report about a phase that is correctly complete.
+fn send_failure_aftermath(reopened: bool) -> &'static str {
+    if reopened {
+        "but this phase had ALREADY been re-opened for it — its completion marker is deleted \
+         and its status is back to Running, so it now looks like work in progress that nobody \
+         was asked to do. Re-send once the pane is reachable (re-opening again is harmless), \
+         or mark the phase failed."
+    } else {
+        "nothing was changed — this phase is not one `phase send` re-opens, so its status and \
+         any completion it already recorded are untouched. Re-send once the pane is reachable."
+    }
+}
+
+/// Assemble a post-re-open send failure: what went wrong, then what it left
+/// behind. Shared by every failure path after `reopen_for_re_entry` so none of
+/// them can quietly omit the aftermath.
+fn send_failure(
+    run: &RunState,
+    phase: &str,
+    reopened: bool,
+    kind: io::ErrorKind,
+    what: &str,
+) -> io::Error {
+    io::Error::new(
+        kind,
+        format!(
+            "phase '{phase}' of run '{run_name}': {what}, {aftermath}",
+            run_name = run.name,
+            aftermath = send_failure_aftermath(reopened),
+        ),
+    )
+}
+
+/// [`phase_send`] with injectable timeouts + poll interval (so tests can exercise
+/// the not-ready and undelivered paths, and the poll loop, without waiting out the
+/// full production timeouts or the real 500ms poll cadence).
 fn phase_send_with_timeout<H: Herdr>(
     h: &H,
     run: &mut RunState,
@@ -1663,6 +2221,7 @@ fn phase_send_with_timeout<H: Herdr>(
     text: &str,
     ready_timeout: Duration,
     poll_interval: Duration,
+    confirm_timeout: Duration,
 ) -> io::Result<()> {
     require_phase_name(phase)?;
     let pane_id = require_pane_id(run, phase)?;
@@ -1691,37 +2250,154 @@ fn phase_send_with_timeout<H: Herdr>(
     // completion on every failed send (a phase parked on a permission prompt
     // would lose its `Done` and its marker without any new work being requested).
     let reopened = reopen_for_re_entry(run, phase)?;
-    // When the re-open ACTED, a send failure is NOT "nothing happened": the
-    // previous pass's completion marker has been deleted and the status is back
-    // to `Running`. A caller told only "agent_send failed" will read that phase
-    // as work in progress forever — the phantom-incomplete-phase state. Say what
-    // was left behind, and name the way out (re-send; the re-open is idempotent).
-    //
-    // When it did NOT act — a reviewer phase, which lives in `review_phases` —
-    // nothing was touched and the message must not say otherwise. A reviewer that
-    // has finished and exited is precisely the pane whose `agent_send` fails, and
-    // its marker is intact: telling its human that it had been reset would be a
-    // false report about a phase that is correctly complete.
-    h.agent_send(&pane_id, text).map_err(|e| {
-        let aftermath = if reopened {
-            "but this phase had ALREADY been re-opened for it — its completion marker is \
-             deleted and its status is back to Running, so it now looks like work in progress \
-             that nobody was asked to do. Re-send once the pane is reachable (re-opening again \
-             is harmless), or mark the phase failed."
-        } else {
-            "nothing was changed — this phase is not one `phase send` re-opens, so its status \
-             and any completion it already recorded are untouched. Re-send once the pane is \
-             reachable."
-        };
-        io::Error::new(
-            e.kind(),
-            format!(
-                "phase '{phase}' of run '{run_name}': the prompt could not be delivered ({e}), \
-                 {aftermath}",
-                run_name = run.name,
+
+    // Snapshot FIRST, so evidence found afterwards can be attributed to THIS send.
+    // A pane that already shows the payload's signature — a long-lived pane whose
+    // previous briefing is still in the composer region, or one the browser
+    // mirror's fire-and-forget `/send` typed into — cannot produce fresh evidence,
+    // and must not be nudged on the strength of someone else's paste.
+    let evidence_before = read_composer_evidence(h, &pane_id, text);
+
+    let outcome = h
+        .agent_prompt_confirm(&pane_id, text, confirm_timeout)
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!("the prompt could not be delivered ({e})"),
+            )
+        })?;
+    if outcome == PromptOutcome::Started {
+        return Ok(());
+    }
+
+    // The agent did not move. Only nudge if the payload is demonstrably sitting in
+    // the composer NOW and was not there before — see `pane_shows_payload` for why
+    // this must be positive evidence rather than "the pane changed".
+    let evidence_after = read_composer_evidence(h, &pane_id, text);
+    // Exactly ONE pairing licenses the keystroke: the composer was looked at
+    // before and did NOT hold the payload, and holds it now. Spelled as a match on
+    // both values rather than `after == Present && before != Present`, because
+    // that shorthand quietly admits `Unreadable` before — a look that never
+    // happened cannot establish that the marker is new, and the payload may have
+    // been sitting there the whole time.
+    let landed_in_composer = matches!(
+        (evidence_before, evidence_after),
+        (ComposerEvidence::Absent, ComposerEvidence::Present)
+    );
+
+    if !landed_in_composer {
+        // Same refusal, four different reasons — and the reason is the whole
+        // value of the message, because it is what tells the human where to look.
+        // Do not collapse these: asserting "it was swallowed" for a pane drovr
+        // could not read, or for one visibly holding a paste marker, is a
+        // confident diagnosis with nothing behind it.
+        //
+        // Deliberately NO `_` arm. A catch-all is what let `(Unreadable, Present)`
+        // inherit the swallow narrative in the first place; matching every pair
+        // means a new [`ComposerEvidence`] variant fails to compile here instead
+        // of silently acquiring whichever story happens to be last.
+        let why = match (evidence_before, evidence_after) {
+            (_, ComposerEvidence::Unreadable) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt, and \
+                 the pane could not be READ, so drovr cannot tell whether the payload is \
+                 sitting unsubmitted in the composer or was swallowed by a dialog. \
+                 Deliberately NOT pressing a key blind: on a dialog, Enter accepts its \
+                 highlighted option on your behalf. Check that herdr can see the pane, then \
+                 look at it: {attach}",
+                attach = attach_command(&run.name),
             ),
-        )
-    })
+            (ComposerEvidence::Present, ComposerEvidence::Present) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt. The \
+                 composer does hold a payload signature, but it was ALREADY there before this \
+                 prompt, so it is someone else's paste (an earlier send, or the browser \
+                 mirror) and proves nothing about this one. Deliberately NOT pressing a key: \
+                 stale text in the composer cannot rule out a dialog now on top of it. Clear \
+                 the composer, then re-send: {attach}",
+                attach = attach_command(&run.name),
+            ),
+            (ComposerEvidence::Unreadable, ComposerEvidence::Present) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt. The \
+                 composer DOES hold a payload signature, but the pane could not be read before \
+                 the prompt, so drovr cannot tell whether it is this one or something that was \
+                 already sitting there. Deliberately NOT pressing a key on an undated payload: \
+                 if it is not yours, Enter goes to whatever is actually on screen. Look at the \
+                 pane — if that is your seed, submit it by hand: {attach}",
+                attach = attach_command(&run.name),
+            ),
+            // Everything left has `after == Absent`: drovr looked, and the
+            // composer does not hold the payload. `(Absent, Present)` is the nudge
+            // path, returned above; it is named only to keep this match total.
+            (_, ComposerEvidence::Absent)
+            | (ComposerEvidence::Absent, ComposerEvidence::Present) => {
+                format!(
+                    "the seed was NOT delivered — herdr saw no state change after the prompt, \
+                     and the payload is nowhere in the agent's composer, so it was swallowed \
+                     rather than left unsubmitted. Deliberately NOT pressing a key: with \
+                     nothing visibly in the composer, drovr cannot tell a cleared input from a \
+                     dialog, and Enter on a dialog accepts its highlighted option on your \
+                     behalf (claude's \"New MCP server\" approval reports `idle`, not \
+                     `blocked`, so the readiness gate cannot rule it out). Read the pane, \
+                     clear whatever is on it, then re-send: {attach}",
+                    attach = attach_command(&run.name),
+                )
+            }
+        };
+        return Err(send_failure(
+            run,
+            phase,
+            reopened,
+            io::ErrorKind::TimedOut,
+            &why,
+        ));
+    }
+
+    // The payload is in the composer, not a menu, so Enter can only submit it.
+    h.agent_send_keys(&pane_id, &["enter".to_string()])
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!(
+                    "the seed landed in the agent's composer but the submit keystroke could \
+                     not be sent ({e})"
+                ),
+            )
+        })?;
+    let nudged = h
+        .agent_wait_started(&pane_id, confirm_timeout)
+        .map_err(|e| {
+            send_failure(
+                run,
+                phase,
+                reopened,
+                e.kind(),
+                &format!(
+                    "the seed landed in the agent's composer and was nudged, but herdr could \
+                     not be asked whether it took ({e})"
+                ),
+            )
+        })?;
+    if nudged == PromptOutcome::Started {
+        return Ok(());
+    }
+
+    Err(send_failure(
+        run,
+        phase,
+        reopened,
+        io::ErrorKind::TimedOut,
+        &format!(
+            "the seed landed in the agent's composer but would not submit — it was still \
+             unsent after a follow-up Enter and {secs}s. Submit it by hand: {attach}",
+            secs = confirm_timeout.as_secs(),
+            attach = attach_command(&run.name),
+        ),
+    ))
 }
 
 /// Mark a phase complete by dropping its completion marker. Run BY the phase
@@ -1746,10 +2422,24 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     // Reviewer phases (only in `review_phases`) author no handoff and are exempt.
     if run.phases.iter().any(|p| p.name == phase) {
         let handoff = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
-        let non_empty = std::fs::read_to_string(&handoff)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        if !non_empty {
+        // A read failure is NOT "missing or empty": permissions or IO on an existing
+        // handoff is a different problem with a different remedy, and reporting it as
+        // missing sends the agent to rewrite a file that is already there.
+        let contents = match std::fs::read_to_string(&handoff) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} exists but could \
+                         not be read: {e}",
+                        handoff.display()
+                    ),
+                ));
+            }
+        };
+        if contents.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -1759,6 +2449,39 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
                     handoff.display()
                 ),
             ));
+        }
+        // A scaffolded handoff whose sections have no body is the empty form wearing the
+        // shape of a handoff: non-empty by every check, carrying nothing the next phase can
+        // inherit. `drovr handoff-scaffold` writes one placeholder per section; what the
+        // gate asks is whether each section has substance, not whether that word is gone.
+        match scan_handoff(&contents) {
+            HandoffShape::Untouched { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} contains nothing \
+                         you wrote — every line is still drovr's scaffold. Write the seven \
+                         sections from your own context (nothing else will); if one genuinely \
+                         has nothing, say so in it (\"None.\"). THEN run `drovr phase done`.",
+                        handoff.display()
+                    ),
+                ));
+            }
+            HandoffShape::Placeholders(sections) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "phase '{phase}' cannot signal done: its handoff {} still has the \
+                         scaffold's `TODO` in {}. Replace {} with what you actually did; if a \
+                         section genuinely has nothing, say so in it (\"None.\"). THEN run \
+                         `drovr phase done`.",
+                        handoff.display(),
+                        sections.join(", "),
+                        if sections.len() == 1 { "it" } else { "them" },
+                    ),
+                ));
+            }
+            HandoffShape::Complete => {}
         }
     }
 
@@ -2656,6 +3379,546 @@ mod tests {
         run
     }
 
+    // -- workspace recovery ---------------------------------------------------
+
+    /// The live failure this whole area exists for: reaping the last pane in a
+    /// run's workspace makes herdr destroy the workspace, `state.json` goes on
+    /// naming it, and `phase start` used to die on the raw
+    /// `workspace_not_found`. A workspace is disposable infrastructure; the run's
+    /// phases, handoffs and commits are not.
+    #[test]
+    fn phase_start_reprovisions_a_workspace_that_vanished() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-gone-test", "wAG");
+        run.phases.push({
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Done;
+                p
+            }
+            .with_pane("wAG:p1"));
+        // The driver closed the last pane; herdr took the workspace with it.
+        h.kill_workspace("wAG", ["wAG:root".to_string(), "wAG:p1".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).expect("a dead workspace must be recoverable");
+
+        let calls = h.calls();
+        let created = calls
+            .iter()
+            .find(|c| c.contains("workspace_create"))
+            .unwrap_or_else(|| panic!("a vanished workspace must be re-created: {calls:?}"));
+        // The near-miss from the manual recovery: a workspace created without the
+        // run's cwd opens in whatever directory herdr defaults to, and briefing an
+        // agent there is silent. If drovr owns creation, drovr owns the cwd.
+        assert!(
+            created.contains("cwd=/tmp/drovr-proj-test"),
+            "the replacement workspace must open in the run's project_dir: {created}"
+        );
+        assert!(
+            created.contains("label=drovr:ws-gone-test"),
+            "the replacement must be labelled for the run, like `drovr new`'s: {created}"
+        );
+
+        assert_ne!(
+            run.workspace.as_deref(),
+            Some("wAG"),
+            "the new workspace id must be recorded, not the dead one"
+        );
+        let ws = run.workspace.clone().expect("a workspace must be recorded");
+        // And the phase really launched into the NEW workspace — recording the id
+        // while spawning into the corpse would be the same bug one level down.
+        //
+        // Asserted on the `tab_create` CALL, not on the shape of the pane id.
+        // Phases no longer reuse the workspace root pane (whose id embeds the
+        // workspace), so the only place the target workspace appears is the call
+        // that opened the tab.
+        let pane = run.phases.iter().find(|p| p.name == "implement").unwrap();
+        assert!(
+            pane.pane_id().is_some(),
+            "the phase must have a pane"
+        );
+        assert!(
+            h.calls()
+                .iter()
+                .any(|c| c.contains(&format!("tab_create workspace={ws}"))),
+            "the phase tab must be opened in the new workspace {ws}: {:?}",
+            h.calls()
+        );
+        assert_eq!(pane.status, PhaseStatus::Running);
+        // Persisted, not just in memory: the next command loads from disk.
+        assert_eq!(RunState::load("ws-gone-test").unwrap().workspace, Some(ws));
+    }
+
+    /// Open question 2, pinned. Every pane recorded in the dead workspace is
+    /// dangling, and a `Running` phase's agent is gone with its context. Marking
+    /// it `Failed` says that out loud; leaving it `Running` would advertise work
+    /// nobody is doing.
+    #[test]
+    fn reprovisioning_fails_the_phases_whose_agents_died_with_the_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-orphan-test", "wAG");
+        run.phases.push({
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Done;
+                p
+            }
+            .with_pane("wAG:p1"));
+        run.phases.push({
+                let mut p = Phase::new("brainstorm");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("wAG:p2"));
+        run.review_phases.push({
+                let mut p = Phase::new("review:plan:1:correctness");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("wAG:p3"));
+        run.retire_pane("wAG:p4");
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        let plan = run.phases.iter().find(|p| p.name == "plan").unwrap();
+        assert_eq!(
+            plan.status,
+            PhaseStatus::Done,
+            "a finished phase does not care that its pane is gone"
+        );
+        assert!(
+            plan.pane_id().is_none(),
+            "but its pane id names a pane that no longer exists and must be dropped"
+        );
+
+        let brainstorm = run.phases.iter().find(|p| p.name == "brainstorm").unwrap();
+        assert_eq!(
+            brainstorm.status,
+            PhaseStatus::Failed,
+            "a Running phase whose agent died with the workspace is Failed, not Running"
+        );
+        assert!(brainstorm.pane_id().is_none());
+        assert_eq!(
+            run.review_phases[0].status,
+            PhaseStatus::Failed,
+            "a reviewer is no more alive than a phase agent"
+        );
+        assert!(
+            run.retired_panes.is_empty(),
+            "retired panes died with the workspace too; cleanup must not chase them"
+        );
+    }
+
+    /// The regression this repair could quietly introduce, pinned.
+    ///
+    /// Before re-provisioning existed, `phase start` on an ARCHIVED run failed
+    /// because archiving destroys the workspace and nothing recreated one. That
+    /// accident was the only thing enforcing the human's decision to file the run
+    /// away — and repairing the workspace would remove it, so that `drovr phase
+    /// start <archived-run>` would launch a live agent while the UI still shows the
+    /// run as archived. Repair does not get to overrule the human.
+    #[test]
+    fn an_archived_run_is_not_quietly_brought_back_to_life() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-ws-test", "wAG");
+        run.archived = true;
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let err = phase_start(&h, &mut run, "implement", None)
+            .expect_err("an archived run must not be resurrected by a repair");
+        // The shared constructor, byte for byte — drovr's two hard refusals
+        // (`archived_run_error`, `missing_project_dir_error`) are each written
+        // once, so the guidance cannot drift between the sites that raise them.
+        assert_eq!(
+            err.to_string(),
+            archived_run_error("archived-ws-test").to_string()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("archived"), "say why it refused: {msg}");
+        assert!(
+            msg.contains("Restore"),
+            "and how to undo it, since the run itself is fine: {msg}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "no workspace may be created for a run the human filed away: {:?}",
+            h.calls()
+        );
+    }
+
+    /// A failed repair hands back the run EXACTLY as it was given.
+    ///
+    /// The orphan-workspace problem one level in: a caller holding a `RunState`
+    /// that has been half-repaired — new workspace id, cleared pane ids, phases
+    /// demoted — holds something that looks like a repaired run and is not one,
+    /// and the next `save` anywhere writes that fiction to disk. Nothing about the
+    /// type stops it, and the caller who would get it wrong is precisely the one
+    /// not reading a "do not save this" comment. So the mutation happens on a copy
+    /// that is committed only once it is on disk, and this pins it: every failure
+    /// mode, compared field by field through serde.
+    #[test]
+    fn a_failed_repair_leaves_the_callers_run_state_untouched() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        // 1. Refused because the run is archived.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-archived-test", "wAG");
+        run.phases.push({
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("wAG:p1"));
+        run.archived = true;
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("archived");
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            before,
+            "a refusal must not leave the caller holding a changed run"
+        );
+
+        // 2. Refused because there is no cwd to open a workspace in.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-nocwd-test", "wAG");
+        run.project_dir = String::new();
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("no project_dir");
+        assert_eq!(serde_json::to_string(&run).unwrap(), before);
+
+        // 3. herdr refused to make the workspace.
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("untouched-create-test", "wAG");
+        run.phases.push({
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("wAG:p1"));
+        run.retire_pane("wAG:p7");
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+        h.fail_workspace_create();
+        let before = serde_json::to_string(&run).unwrap();
+        ensure_workspace(&h, &mut run).expect_err("workspace_create fails");
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            before,
+            "the demotions and pane clearing must not survive a failed create"
+        );
+
+        // 4. THE case the other three do not reach: the workspace was created and
+        //    the run mutated, and only the SAVE failed. Cases 1-3 return before any
+        //    mutation, so they would pass even against a version that leaves a
+        //    half-repaired run behind — this is the one that pins it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let h = FakeHerdr::new();
+            let mut run = make_run_with_workspace("untouched-save-test", "wAG");
+            run.phases.push({
+                    let mut p = Phase::new("plan");
+                    p.status = PhaseStatus::Running;
+                    p
+                }
+                .with_pane("wAG:p1"));
+            run.retire_pane("wAG:p7");
+            run.save().unwrap();
+            h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+            let dir = run_dir("untouched-save-test");
+            let original = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let writable_anyway = std::fs::write(dir.join(".probe"), b"x").is_ok();
+            let _ = std::fs::remove_file(dir.join(".probe"));
+            if !writable_anyway {
+                let before = serde_json::to_string(&run).unwrap();
+                let err = ensure_workspace(&h, &mut run).expect_err("the save cannot succeed");
+                std::fs::set_permissions(&dir, original).unwrap();
+                assert_eq!(
+                    serde_json::to_string(&run).unwrap(),
+                    before,
+                    "a repair that could not be persisted must not leave the caller \
+                     holding a run that looks repaired: {err}"
+                );
+            } else {
+                std::fs::set_permissions(&dir, original).unwrap();
+            }
+        }
+    }
+
+    /// A workspace drovr creates but cannot RECORD is worse than one it never
+    /// created: `state.json` still names the dead one, so the next attempt makes a
+    /// second replacement, while the first sits in the human's switcher labelled
+    /// `drovr:<run>` with nothing pointing at it. The repair is only complete once
+    /// it is persisted, so a failed save gives the workspace back.
+    ///
+    /// Uses a read-only run directory to make the save fail — the failure this
+    /// models is a transient ENOSPC/EACCES, and there is no other deterministic
+    /// way to reach it. Skipped when the test user can write to a read-only
+    /// directory anyway (root), rather than asserting something untrue.
+    #[test]
+    #[cfg(unix)]
+    fn a_workspace_that_cannot_be_recorded_is_given_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-save-fails-test", "wAG");
+        run.save().unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let dir = run_dir("ws-save-fails-test");
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the mode bits, so the premise would be false there.
+        let writable_anyway = std::fs::write(dir.join(".probe"), b"x").is_ok();
+        let _ = std::fs::remove_file(dir.join(".probe"));
+        if writable_anyway {
+            std::fs::set_permissions(&dir, original).unwrap();
+            return;
+        }
+
+        let err = ensure_workspace(&h, &mut run).expect_err("the save cannot succeed");
+        std::fs::set_permissions(&dir, original).unwrap();
+
+        let calls = h.calls();
+        let created: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.contains("workspace_create"))
+            .collect();
+        assert_eq!(created.len(), 1, "one workspace was created: {calls:?}");
+        // Whatever id the fake handed out, the SAME one must be closed again.
+        // Read it out of the create call, NOT out of `run`: a failed repair leaves
+        // the caller's run untouched (`a_failed_repair_leaves_the_callers_run_state_untouched`),
+        // so `run.workspace` still names the dead one — which is the point.
+        let new_id = created[0]
+            .rsplit(" -> ")
+            .next()
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("the create call records the id it handed out")
+            .to_string();
+        assert_ne!(new_id, "wAG", "the fake handed out a fresh id");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("workspace_close id={new_id}")),
+            "the workspace it could not record must be handed back: {calls:?}"
+        );
+        assert_eq!(
+            run.workspace.as_deref(),
+            Some("wAG"),
+            "and the caller is left pointing at the dead workspace, not at one that \
+             no longer exists"
+        );
+        // And the error has to name the save failure, not the reclaim.
+        assert!(
+            err.to_string().contains("could not record"),
+            "the error must say the repair did not stick: {err}"
+        );
+        assert_eq!(
+            RunState::load("ws-save-fails-test")
+                .unwrap()
+                .workspace
+                .as_deref(),
+            Some("wAG"),
+            "nothing was persisted, so the next attempt starts from the same place"
+        );
+    }
+
+    /// Consulting `archived` means refreshing it, and refreshing means the copy in
+    /// hand now AGREES with disk. Reading disk for the guard while leaving the
+    /// stale flag in place is how a repair ends up re-archiving, on its success
+    /// path, the very run it just repaired: `save_preserving_archived` writes at
+    /// the end of `ensure_workspace`, and it writes what the copy holds.
+    #[test]
+    fn repairing_a_restored_run_leaves_it_restored_on_disk() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-writeback-test", "wAG");
+        run.archived = false;
+        run.save().unwrap();
+        // This caller's copy is latched `true` from an Archive it observed before
+        // the human changed their mind — exactly what `save_preserving_archived`
+        // used to leave behind.
+        run.archived = true;
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None).expect("a restored run is repairable");
+
+        assert!(
+            !RunState::load("archived-writeback-test").unwrap().archived,
+            "the repair must not write a stale `archived: true` back over a Restore"
+        );
+        assert!(
+            !run.archived,
+            "and the copy in hand must agree with what it consulted"
+        );
+    }
+
+    /// The guard is load-bearing, so it fails CLOSED. An unreadable `state.json`
+    /// is not evidence that the run is un-archived, and quietly falling back to
+    /// the caller's copy would let a torn read re-provision a run the human filed
+    /// away — the guard skipped by an error nobody sees.
+    #[test]
+    fn an_unreadable_state_json_refuses_the_repair_rather_than_guessing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-unreadable-test", "wAG");
+        run.save().unwrap();
+        std::fs::write(
+            run_dir("archived-unreadable-test").join("state.json"),
+            b"{ torn",
+        )
+        .unwrap();
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        let err = phase_start(&h, &mut run, "implement", None)
+            .expect_err("an unreadable state.json must not be read as 'not archived'");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "and nothing may be created on that non-answer: {:?}",
+            h.calls()
+        );
+        // The message has to point at the file, since that is what must be fixed.
+        assert!(err.to_string().contains("state.json"), "{err}");
+    }
+
+    /// The archive flag a caller holds in memory can be STALE IN BOTH DIRECTIONS,
+    /// and only one of them is the human's current decision.
+    ///
+    /// A caller acquires a stale `true` simply by observing an Archive: a
+    /// `code-review run` whose panel is archived mid-flight loads it from disk on
+    /// its next save (`archiving_mid_run_survives_every_save_the_review_makes`)
+    /// and then holds it for as long as it holds that `RunState`. If the human
+    /// then hits Restore, that copy must not be what decides whether the run may
+    /// be repaired. Disk is where Archive and Restore both land, so disk wins —
+    /// see `RunState::archived`, which states that rule for every site.
+    ///
+    /// (Until `4865d1d` `save_preserving_archived` also *merged* with `|=`, so
+    /// such a copy could additionally write its stale `true` back over the
+    /// Restore. That is fixed — it adopts disk's value now — but this test pins
+    /// the read side, which would still be wrong on its own.)
+    #[test]
+    fn a_restore_on_disk_beats_a_stale_archive_held_in_memory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-stale-test", "wAG");
+        // The human's current decision, as recorded by the Restore button.
+        run.archived = false;
+        run.save().unwrap();
+        // ...and this caller's copy, latched `true` by an Archive it saw earlier.
+        run.archived = true;
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a restored run must be repairable despite a caller's stale flag");
+        assert!(
+            h.calls().iter().any(|c| c.contains("workspace_create")),
+            "the workspace must be rebuilt: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The other side of that guard: an archived run whose `workspace_close`
+    /// FAILED still has live panes (drovr's "zombie"), and `phase_start` on one
+    /// has always been able to reuse them. The guard must not change that — it
+    /// exists to stop repair overruling the human, not to add a new refusal.
+    #[test]
+    fn an_archived_run_whose_workspace_survived_still_starts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("archived-zombie-test", "wAG");
+        run.archived = true;
+        run.save().unwrap();
+        // workspace_close failed, so wAG is still there.
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a zombie's live panes are still usable, as before");
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "nothing needed creating: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The other half of the same refusal: `drovr new` warns and records no
+    /// workspace when creation fails, and `phase start` used to answer that with
+    /// "please recreate the run" — for a run that may hold 23 tasks of work.
+    #[test]
+    fn phase_start_provisions_a_workspace_the_run_never_got() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("ws-null-test");
+        run.workspace = None;
+        run.root_pane = None;
+
+        phase_start(&h, &mut run, "implement", None)
+            .expect("a run whose workspace creation failed must still be startable");
+
+        assert!(run.workspace.is_some(), "a workspace must have been created");
+        let calls = h.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("workspace_create")),
+            "must create the missing workspace rather than refuse: {calls:?}"
+        );
+    }
+
+    /// The guard on all of the above: re-provisioning over a LIVE workspace would
+    /// orphan the run's own agents, which is worse than the bug being fixed.
+    #[test]
+    fn a_live_workspace_is_never_reprovisioned() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("ws-live-test", "wAG");
+
+        phase_start(&h, &mut run, "implement", None).unwrap();
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_create")),
+            "a live workspace must be left exactly as it is: {calls:?}"
+        );
+        assert_eq!(run.workspace.as_deref(), Some("wAG"));
+    }
+
+    /// Reviewers need their own tab, so they need a workspace just as much —
+    /// `code-review run` spawns several in a loop and must not be the one command
+    /// that still dies on a vanished one.
+    #[test]
+    fn spawn_reviewer_reprovisions_a_vanished_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-ws-gone-test", "wAG");
+        h.kill_workspace("wAG", ["wAG:root".to_string()]);
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
+        )
+        .expect("a reviewer must survive a vanished workspace");
+
+        let ws = run.workspace.clone().unwrap();
+        assert_ne!(ws, "wAG");
+        let calls = h.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains(&format!("tab_create workspace={ws}"))),
+            "the reviewer tab must be created in the new workspace: {calls:?}"
+        );
+    }
+
     // -- RED: write failing test first, then implement -----------------------
 
     #[test]
@@ -2808,19 +4071,36 @@ mod tests {
     /// A workspace is now the ONLY way to place a phase: without one there is
     /// no tab to create, and the root pane is not a fallback even when present.
     #[test]
-    fn no_workspace_errors_even_with_a_root_pane() {
+    fn a_workspace_that_cannot_be_opened_anywhere_says_which_state_is_missing() {
+        // The successor to "phase_start must error when there is no workspace": a
+        // missing workspace is now repaired (see
+        // `phase_start_provisions_a_workspace_the_run_never_got`), so the only
+        // remaining hard failure is the one piece of state that genuinely cannot
+        // be rebuilt — a cwd to open the workspace in. Even then the run is not
+        // sent back to `drovr new`: it names the missing field and where to put
+        // it, because everything else about the run is still good.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
-        let mut run = make_run("no-ws-test");
+        let mut run = make_run("no-cwd-test");
         run.workspace = None;
-        run.root_pane = Some("orphan:root".into());
+        run.root_pane = None;
+        run.project_dir = String::new();
 
-        let res = phase_start(&h, &mut run, "plan", None);
-        assert!(res.is_err(), "must error when there is no workspace");
-        assert!(res.unwrap_err().to_string().contains("workspace"));
+        let err = ensure_workspace(&h, &mut run)
+            .expect_err("no project_dir means no cwd for a workspace");
+        let msg = err.to_string();
         assert!(
-            !h.calls().iter().any(|c| c.contains("pane_run")),
-            "must not fall back to the root shell: {:?}",
+            msg.contains("project_dir"),
+            "must name what is missing: {msg}"
+        );
+        assert!(
+            !msg.contains("recreate the run"),
+            "a lost workspace must never be answered with 'start over': {msg}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("workspace_create")),
+            "must not create a workspace with no cwd — that is how a pane opens in \
+             an unrelated repo: {:?}",
             h.calls()
         );
     }
@@ -2875,6 +4155,67 @@ mod tests {
         let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
         assert_eq!(outcome, PhaseWaitOutcome::Done);
         assert_eq!(run.phases[0].status, PhaseStatus::Done);
+    }
+
+    // -- Neither `phase_start` nor `phase_wait` may un-archive a run ----------
+    //
+    // Both hold a `RunState` loaded before they block, and the human can archive
+    // from the web UI in between — which closes the run's herdr workspace. A
+    // plain `save` writes the stale `archived: false` back, so a run the human
+    // filed away comes back looking active while every one of its panes is gone.
+    // (Since 2026-08-02 the workspace itself is recoverable — `ensure_workspace`
+    // rebuilds one — but only after a Restore, which is exactly the decision this
+    // flag records.) These drive the real call sites: mutating either back to
+    // `save()` fails here.
+
+    /// Model the reviewer archiving `run` from the web UI: a separate load,
+    /// flag, save — exactly what the archive endpoint does — while `run`'s
+    /// in-memory copy still says `archived: false`.
+    fn archive_on_disk(name: &str) {
+        let mut disk = RunState::load(name).expect("run is on disk");
+        disk.archived = true;
+        disk.save().expect("archive it");
+    }
+
+    #[test]
+    fn phase_start_does_not_un_archive_a_run_archived_while_it_worked() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let mut run = make_run("phase-start-archived");
+        run.save().unwrap();
+        archive_on_disk("phase-start-archived");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+
+        assert!(
+            RunState::load("phase-start-archived").unwrap().archived,
+            "phase_start's save must not resurrect a run archived while it ran"
+        );
+    }
+
+    #[test]
+    fn phase_wait_does_not_un_archive_a_run_archived_while_it_blocked() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = FakeHerdr::new();
+        let mut run = make_run("phase-wait-archived");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        // The phase agent authors its handoff and signals completion from inside
+        // its pane, so the marker carries THIS pass's token — an untokenized one
+        // is now ignored, which would time out instead of completing.
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
+        // ...but the reviewer archived the run while the wait was blocked.
+        archive_on_disk("phase-wait-archived");
+
+        let outcome = phase_wait(&h, &mut run, "plan", 2000).unwrap();
+
+        assert_eq!(outcome, PhaseWaitOutcome::Done);
+        assert!(
+            RunState::load("phase-wait-archived").unwrap().archived,
+            "phase_wait's save must not resurrect a run archived while it blocked"
+        );
     }
 
     #[test]
@@ -3273,7 +4614,10 @@ mod tests {
         h.push_status(Some("idle"));
         phase_send(&h, &mut run, "review:t:1:correctness", "seed text").unwrap();
         let calls = h.calls();
-        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        let send_call = calls
+            .iter()
+            .find(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         assert!(
             send_call.contains("review-pane-9"),
             "must route to the reviewer pane: {send_call}"
@@ -3292,13 +4636,461 @@ mod tests {
         h.push_status(Some("idle"));
         phase_send(&h, &mut run, "code", "hello agent").unwrap();
 
-        // Last call should be agent_send
+        // The delivery-confirming prompt carries the text and the pane.
         let calls = h.calls();
-        let send_call = calls.iter().find(|c| c.contains("agent_send")).unwrap();
+        let send_call = calls
+            .iter()
+            .find(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         assert!(send_call.contains("hello agent"));
         // Target should match the pane_id recorded
         let pane_id = run.phases[0].pane_id().unwrap();
         assert!(send_call.contains(pane_id));
+    }
+
+    /// Confirm timeout for tests. `FakeHerdr` never actually waits, so this only
+    /// has to be a distinguishable value — it never costs wall-clock.
+    const CONFIRM: Duration = Duration::from_secs(15);
+
+    // -- pane_shows_payload: the swallowed-vs-unsubmitted discriminator ---------
+
+    // Captured verbatim from a real `cursor-agent` pane holding a briefing it had
+    // typed but not submitted.
+    const CURSOR_UNSUBMITTED_PANE: &str = "\
+  v2026.06.24-00-45-58-9f61de7
+  Tip: Try Cursor Grok 4.5 via /model.
+
+
+  → [Pasted text #1 +5 lines]
+
+
+  Composer 2.5                                        Run Everything
+  /tmp/scratchpad/e2e/proj";
+
+    // Captured verbatim from a real `claude` pane parked on the MCP approval menu
+    // that had just SWALLOWED a briefing whole.
+    const CLAUDE_MCP_MODAL_PANE: &str = "\
+  New MCP server found in this project: probe2
+
+  MCP servers may execute code or access system resources. All tool calls require approval.
+
+  ❯ 1. Use this MCP server
+    2. Use this and all future MCP servers in this project
+    3. Continue without using this MCP server
+
+  Enter to confirm · Esc to cancel";
+
+    #[test]
+    fn pane_shows_payload_accepts_a_collapsed_paste() {
+        assert!(pane_shows_payload(
+            CURSOR_UNSUBMITTED_PANE,
+            "# Briefing Alpha Marker\n\nlots of context"
+        ));
+    }
+
+    #[test]
+    fn pane_shows_payload_accepts_a_short_prompt_echoed_verbatim() {
+        let pane = "  → Reply with exactly: PONG\n\n  Composer 2.5";
+        assert!(pane_shows_payload(pane, "Reply with exactly: PONG"));
+    }
+
+    // The regression that matters most: a modal that swallowed the payload must
+    // NOT read as delivered, or `phase_send` presses Enter and accepts it. The
+    // pane here differs wildly from anything sent — which is exactly why a
+    // before/after DIFF cannot be the test.
+    #[test]
+    fn pane_shows_payload_rejects_a_modal_that_swallowed_the_seed() {
+        assert!(!pane_shows_payload(
+            CLAUDE_MCP_MODAL_PANE,
+            "# Briefing Alpha Marker\n\nlots of context"
+        ));
+    }
+
+    // A payload echoed by an EARLIER send, now scrolled up out of the composer,
+    // is not evidence that this one landed.
+    #[test]
+    fn pane_shows_payload_ignores_evidence_above_the_composer_region() {
+        let pane = format!(
+            "  ❯ [Pasted text #1 +99 lines]\n{}\n{}",
+            (0..COMPOSER_TAIL_LINES)
+                .map(|i| format!("  transcript line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "  Enter to confirm · Esc to cancel"
+        );
+        assert!(!pane_shows_payload(&pane, "# Briefing\n\nbody"));
+    }
+
+    // A first line too short to be distinctive must not count as evidence — it
+    // would match ordinary pane chrome by accident.
+    #[test]
+    fn pane_shows_payload_rejects_a_too_generic_fragment() {
+        let pane = "  Do you trust this?\n  ❯ [a] Trust\n  # Go";
+        assert!(!pane_shows_payload(pane, "# Go\n\nrest of the briefing"));
+    }
+
+    // -- delivery confirmation: the two ways a "successful" send loses the seed --
+
+    // The healthy path (a claude send that self-submits): the prompt takes on the
+    // first try, so no keystroke is sent and no second wait is needed.
+    #[test]
+    fn send_does_not_nudge_when_prompt_takes_first_try() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-healthy-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_send_keys")),
+            "a delivered prompt must not be nudged: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("agent_wait_started")),
+            "no second wait is needed once the prompt took: {calls:?}"
+        );
+    }
+
+    // The failure that motivated all of this: `agent.prompt` types the payload but
+    // it is never submitted, so it sits in the composer and the agent never
+    // starts. The payload is VISIBLY there, which is what licenses the Enter nudge
+    // — and once nudged, the send is a success, not an error.
+    #[test]
+    fn send_nudges_enter_when_payload_lands_unsubmitted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-unsubmitted-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // Pane before the prompt (no payload), then after the stall: the payload
+        // is visibly sitting in the composer, so it landed — just unsubmitted.
+        h.push_read("> Plan, search, build anything\n  Composer 2.5");
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+        // The prompt stalls; the follow-up Enter gets it moving.
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let pane_id = run.phases[0].pane_id().map(str::to_owned).unwrap();
+        let keys = calls
+            .iter()
+            .find(|c| c.contains("agent_send_keys"))
+            .unwrap_or_else(|| panic!("must nudge the composer with Enter: {calls:?}"));
+        assert!(
+            keys.contains("enter") && keys.contains(&pane_id),
+            "the Enter must go to the phase pane: {keys}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("agent_wait_started")),
+            "must confirm the nudge actually got the agent moving: {calls:?}"
+        );
+    }
+
+    // THE SAFETY PROPERTY. The prompt was swallowed whole, so the pane is
+    // unchanged. `phase_send` must RAISE and must NOT press a key: Enter on
+    // whatever dialog is up accepts its highlighted option on the user's behalf.
+    // Assert the ABSENCE of the keystroke, not merely the error.
+    #[test]
+    fn send_raises_without_keystroke_when_payload_is_swallowed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-swallowed-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        // A pane parked on an unclassified modal still reports `idle`, so the
+        // readiness gate waves it through — this is reachable, not hypothetical.
+        h.push_status(Some("idle"));
+        // The modal ate the prompt: before and after, the composer region shows
+        // the dialog and no trace of the payload.
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("send-swallowed-test") && err.to_string().contains("code"),
+            "error must name the run and phase: {err}"
+        );
+        assert!(
+            err.to_string().contains("drovr attach"),
+            "error must suggest attach: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must NOT answer the dialog on the user's behalf: {:?}",
+            h.calls()
+        );
+    }
+
+    // Evidence must have APPEARED. A long-lived pane still showing the previous
+    // briefing's paste marker offers no proof that THIS send arrived, so it must
+    // not license a keystroke — otherwise stale scrollback could mask a fresh
+    // dialog and re-create the exact false-Enter failure this check exists to
+    // stop.
+    #[test]
+    fn send_does_not_nudge_on_evidence_that_predates_the_prompt() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-stale-evidence-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // The paste marker is already there BEFORE the prompt, and still there
+        // after — unchanged, so it proves nothing about this send.
+        let stale = "> [Pasted text #1 +40 lines]\n  Composer 2.5";
+        h.push_read(stale);
+        h.push_read(stale);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("was NOT delivered"),
+            "stale evidence must read as undelivered, not as a stuck composer: {err}"
+        );
+        // And it must not tell the human the payload is "nowhere in the composer"
+        // while a paste marker is sitting there in plain sight — that is the same
+        // class of confidently-wrong diagnosis this change exists to remove.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "the swallow narrative is false when the composer visibly holds a \
+             payload signature; say it is stale instead: {err}"
+        );
+        assert!(
+            err.to_string().contains("before this prompt"),
+            "must explain that the evidence predates the send: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must not nudge on evidence that predates the prompt: {:?}",
+            h.calls()
+        );
+    }
+
+    // A pane we cannot read is a pane we cannot reason about: with no evidence to
+    // weigh, `phase_send` must fail safe (raise, no keystroke) rather than nudging
+    // blind into an unknown screen.
+    #[test]
+    fn send_raises_without_keystroke_when_pane_is_unreadable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-unreadable-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.fail_agent_read();
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "must not nudge a pane it cannot read: {:?}",
+            h.calls()
+        );
+        // "Could not look" is a different fact from "looked, found nothing", and
+        // they send the human somewhere different: one is a herdr problem, the
+        // other is a dialog on the screen. Asserting the swallow narrative here
+        // would be a confident diagnosis drovr has no evidence for.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "must not claim the composer is empty when the pane could not be read: {err}"
+        );
+        assert!(
+            err.to_string().contains("could not be READ"),
+            "must name the unreadable pane as the reason it will not guess: {err}"
+        );
+    }
+
+    // The nudge needs evidence that APPEARED, and "appeared" is only knowable if
+    // the BEFORE look succeeded. A pane that could not be read before the prompt
+    // and shows a paste marker after might have been showing it all along, so the
+    // marker is not attributable to this send and must not license a keystroke.
+    //
+    // This is the fail-safe the earlier `unwrap_or(true)` encoded, and the exact
+    // one a three-state refactor can drop by writing `before != Present`.
+    #[test]
+    fn send_does_not_nudge_when_the_before_look_failed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-blind-before-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // The pre-prompt read fails; the post-stall read succeeds and shows a
+        // paste marker of unknown age.
+        h.fail_agent_read();
+        h.push_outcome(PromptOutcome::Stalled);
+        h.allow_agent_read_after(1);
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_send_keys")),
+            "evidence is only fresh if the BEFORE look succeeded: {:?}",
+            h.calls()
+        );
+        // Refusing is right; saying the composer is empty is not. drovr can SEE a
+        // payload signature — it just cannot date it — and telling the human to
+        // clear the pane sends them past text they could submit by hand.
+        assert!(
+            !err.to_string().contains("nowhere in the agent's composer"),
+            "must not claim an empty composer while the after-read shows a payload: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot tell whether it is this one"),
+            "must say the visible payload cannot be dated, not that it is absent: {err}"
+        );
+    }
+
+    // A nudge that does not help must not be reported as a delivered seed.
+    #[test]
+    fn send_raises_when_nudge_does_not_submit() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-stuck-composer-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.push_read("> Plan, search, build anything\n  Composer 2.5");
+        h.push_read("> [Pasted text #1 +40 lines]\n  Composer 2.5");
+        // The prompt stalls, and so does the wait after the Enter.
+        h.push_outcome(PromptOutcome::Stalled);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("would not submit"),
+            "error must name the composer-stuck failure, not the swallow one: {err}"
+        );
+    }
+
+    // An undelivered seed leaves the SAME wreckage a transport failure does: the
+    // re-open already ran, so the phase is Running with its completion marker
+    // gone. Saying only "the seed did not arrive" leaves a phantom incomplete
+    // phase nobody knows to clean up.
+    #[test]
+    fn an_undelivered_seed_also_reports_the_re_open_it_left_behind() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-undelivered-reopen-test");
+
+        phase_start(&h, &mut run, "plan", None).unwrap();
+        write_handoff(&run, "plan");
+        let pass = run.phases[0].pass.clone().unwrap();
+        agent_signals_done(&run, "plan", &pass);
+        run.phases[0].status = PhaseStatus::Done;
+        run.save().unwrap();
+
+        h.push_status(Some("idle"));
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_read(CLAUDE_MCP_MODAL_PANE);
+        h.push_outcome(PromptOutcome::Stalled);
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "plan",
+            "next",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            !done_marker(&run.name, "plan").exists(),
+            "precondition: the re-open really did clear the marker"
+        );
+        assert!(
+            err.contains("was NOT delivered"),
+            "it must still name the delivery failure: {err}"
+        );
+        assert!(
+            err.contains("completion marker"),
+            "and report the state the re-open left behind: {err}"
+        );
     }
 
     // -- agent_has_started: which statuses mean "attached AND at the composer" -
@@ -3346,13 +5138,17 @@ mod tests {
             "hello agent",
             Duration::from_secs(5),
             Duration::from_millis(1),
+            CONFIRM,
         )
         .unwrap();
 
         let calls = h.calls();
         // Polled through all three un-ready states (incl. blocked) before the send,
         // and every poll came before the send.
-        let first_send = calls.iter().position(|c| c.contains("agent_send")).unwrap();
+        let first_send = calls
+            .iter()
+            .position(|c| c.contains("agent_prompt_confirm"))
+            .unwrap();
         let status_polls = calls
             .iter()
             .filter(|c| c.contains("agent_status"))
@@ -3425,6 +5221,7 @@ mod tests {
             "seed text",
             Duration::from_millis(50),
             POLL_INTERVAL,
+            CONFIRM,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "must be a TimedOut error");
@@ -3439,7 +5236,7 @@ mod tests {
         );
         // Crucially, no prompt was delivered.
         assert!(
-            !h.calls().iter().any(|c| c.contains("agent_send")),
+            !h.calls().iter().any(|c| c.contains("agent_prompt_confirm")),
             "must not send a prompt when the agent never became ready: {:?}",
             h.calls()
         );
@@ -3594,6 +5391,26 @@ mod tests {
         unsafe {
             std::env::remove_var(PASS_ENV);
         }
+    }
+
+    /// A saved run with `plan` registered as a pipeline phase — the shape `phase_done`'s
+    /// handoff gate applies to.
+    fn registered_phase_run(name: &str) -> RunState {
+        let mut run = make_run(name);
+        run.phases.push({
+                let mut p = Phase::new("plan");
+                p.status = PhaseStatus::Running;
+                p
+            }
+            .with_pane("p1"));
+        run.save().unwrap();
+        run
+    }
+
+    fn write_raw_handoff(run: &RunState, phase: &str, body: &str) {
+        let hp = run_dir(&run.name).join(format!("{phase}-HANDOFF.md"));
+        std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+        std::fs::write(&hp, body).unwrap();
     }
 
     fn write_handoff(run: &RunState, phase: &str) {
@@ -4215,6 +6032,7 @@ mod tests {
             "text",
             Duration::from_millis(50),
             POLL_INTERVAL,
+            CONFIRM,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -4313,6 +6131,180 @@ mod tests {
             PhaseWaitOutcome::Done
         );
     }
+
+
+
+
+
+
+    /// A handoff written by hand, with no `## ` sections at all, is not scaffolded and must
+    /// not be refused by a gate about scaffold sections.
+    #[test]
+    fn a_sectionless_hand_written_handoff_still_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-hand-written");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "Ported the parser to the new lexer; interfaces unchanged. Next agent: run the \
+             conformance suite before touching codegen.\n",
+        );
+
+        phase_done(&run, "plan").expect("prose without headings is a handoff too");
+    }
+
+
+
+
+
+
+
+
+
+
+
+    /// The accident the gate exists for: run `handoff-scaffold`, forget, signal done.
+    #[test]
+    fn an_untouched_scaffold_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-untouched");
+        write_raw_handoff(&run, "plan", &crate::brief::handoff_scaffold());
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains("nothing you wrote"),
+            "must say the file is all scaffold: {err}"
+        );
+    }
+
+    /// Deleting the placeholders is not writing a handoff either — every remaining line is
+    /// still drovr's.
+    #[test]
+    fn a_scaffold_with_the_placeholders_deleted_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-placeholders-deleted");
+        let stripped: String = crate::brief::handoff_scaffold()
+            .lines()
+            .filter(|l| l.trim() != crate::brief::SCAFFOLD_PLACEHOLDER)
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_raw_handoff(&run, "plan", &stripped);
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("nothing you wrote"), "{err}");
+    }
+
+    /// Rearranging drovr's own text — fencing the guidance, repeating a heading — is not
+    /// writing either.
+    #[test]
+    fn rearranged_scaffold_text_is_not_writing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-rearranged");
+        let scaffold = crate::brief::handoff_scaffold();
+        let lines: Vec<&str> = scaffold
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let body = format!("{}\n```\n{}\n```\n", lines.join("\n"), lines[0]);
+        write_raw_handoff(&run, "plan", &body);
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("TODO") || err.contains("nothing you wrote"), "{err}");
+    }
+
+    /// A partly-written handoff is refused, and the message names exactly the sections that
+    /// still hold the placeholder.
+    #[test]
+    fn a_partly_written_handoff_names_the_sections_still_holding_todo() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-partly-written");
+        let filled = crate::brief::handoff_scaffold().replacen(
+            &format!("\n{}\n", crate::brief::SCAFFOLD_PLACEHOLDER),
+            "\nPorted the parser to the new lexer; interfaces unchanged.\n",
+            1,
+        );
+        write_raw_handoff(&run, "plan", &filled);
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("State"), "names a section still at TODO: {err}");
+        assert!(
+            !err.contains("in Objective") && !err.contains(", Objective"),
+            "and not the one that was written: {err}"
+        );
+    }
+
+    /// A fully written handoff completes.
+    #[test]
+    fn a_written_handoff_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-written");
+        let written = crate::brief::handoff_scaffold().replace(
+            crate::brief::SCAFFOLD_PLACEHOLDER,
+            "Real content for this section.",
+        );
+        write_raw_handoff(&run, "plan", &written);
+
+        phase_done(&run, "plan").expect("a filled scaffold completes");
+    }
+
+    /// A hand-written handoff that never went through the scaffold is untouched by the gate.
+    #[test]
+    fn a_hand_written_handoff_still_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-hand-written");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "Ported the parser to the new lexer; interfaces unchanged. Next agent: run the \
+             conformance suite before touching codegen.\n",
+        );
+
+        phase_done(&run, "plan").expect("prose without the scaffold is a handoff too");
+    }
+
+    /// The accepted false positive, pinned so it is a decision rather than a surprise: a
+    /// handoff QUOTING a bare `TODO` line is refused. Escapable — the message names the
+    /// section, and any edit to that line (indent it, add text) clears it — and preferred
+    /// over the silent bypasses that chasing this case produced across five review rounds.
+    #[test]
+    fn a_quoted_bare_todo_is_refused_and_that_is_the_trade() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-quoted-todo");
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nShipped it. The upstream stub still reads:\n\n```rust\nTODO\n```\n",
+        );
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(err.contains("Objective"), "names where to look: {err}");
+        // Indenting the quoted line is enough to get past it.
+        write_raw_handoff(
+            &run,
+            "plan",
+            "## Objective\n\nShipped it. The upstream stub still reads:\n\n```rust\n  TODO\n```\n",
+        );
+        phase_done(&run, "plan").expect("the refusal is escapable by editing that line");
+    }
+
+    /// Review round 1 (nit): an unreadable handoff was reported as "missing or empty",
+    /// sending the agent to rewrite a file that is already there.
+    #[test]
+    fn an_unreadable_handoff_is_not_reported_as_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = registered_phase_run("handoff-unreadable");
+        // A directory at the handoff path: present, but not readable as a file.
+        let hp = run_dir(&run.name).join("plan-HANDOFF.md");
+        std::fs::create_dir_all(&hp).unwrap();
+
+        let err = phase_done(&run, "plan").unwrap_err().to_string();
+        assert!(
+            err.contains("could not be read"),
+            "must not claim it is missing: {err}"
+        );
+    }
+
 
     #[test]
     fn phase_done_refuses_to_stamp_a_token_onto_an_untokened_phase() {
@@ -4961,21 +6953,32 @@ mod tests {
     }
 
     #[test]
-    fn spawn_reviewer_errors_without_workspace() {
+    fn spawn_reviewer_provisions_a_workspace_the_run_never_got() {
+        // Was `spawn_reviewer_errors_without_workspace`. A reviewer needs a tab,
+        // a tab needs a workspace, and a workspace is now something drovr makes
+        // rather than something it refuses over.
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let mut run = make_run("rev-no-ws-test");
         run.workspace = None;
 
-        let res = spawn_reviewer(
+        spawn_reviewer(
             &h,
             &mut run,
             "review:t:1:correctness",
             None,
             &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
+        )
+        .expect("a reviewer must not be blocked by a missing workspace");
+
+        let ws = run.workspace.clone().expect("a workspace must be recorded");
+        assert!(
+            h.calls()
+                .iter()
+                .any(|c| c.contains(&format!("tab_create workspace={ws}"))),
+            "the reviewer tab belongs to the workspace just created: {:?}",
+            h.calls()
         );
-        assert!(res.is_err(), "must error when the run has no workspace");
-        assert!(res.unwrap_err().to_string().contains("workspace"));
     }
 
     #[test]
@@ -5017,7 +7020,7 @@ mod tests {
             .calls()
             .into_iter()
             .rev()
-            .find(|c| c.contains("agent_send"))
+            .find(|c| c.contains("agent_prompt_confirm"))
             .unwrap();
         let reviewer_pane = run.review_phases[0].pane_id().map(str::to_owned).unwrap();
         assert!(
@@ -5076,6 +7079,54 @@ mod tests {
             msg.contains("project_dir"),
             "error should mention project_dir: {msg}"
         );
+        // This guard fires BEFORE `ensure_workspace`, so it is the message a user
+        // actually sees for this cause — and it used to be the one telling a run
+        // with committed work to start over.
+        assert!(
+            !msg.contains("recreate the run"),
+            "no refusal may answer a repairable run with 'start over': {msg}"
+        );
+    }
+
+    /// Every refusal for a missing `project_dir` is one sentence, written once.
+    /// Pinned because the failure mode here is drift, not logic: three sites used
+    /// to say "please recreate the run with `drovr new`", and a fix that reworded
+    /// only the site it happened to touch would leave the other two contradicting
+    /// it — which is exactly what the first pass of this change did.
+    #[test]
+    fn every_missing_project_dir_refusal_names_the_field_instead_of_starting_over() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("proj-dir-wording-test");
+        run.project_dir = String::new();
+
+        let from_start = phase_start(&h, &mut run, "brainstorm", None).unwrap_err();
+        let from_reviewer = spawn_reviewer(
+            &h,
+            &mut run,
+            "review:t:1:correctness",
+            None,
+            &AgentLaunch::for_test("claude", "claude"),
+        )
+            .expect_err("a reviewer needs a project_dir too");
+        // `ensure_workspace` only needs a project_dir when it has to CREATE
+        // something — with a live workspace it never looks — so drop the
+        // workspace to reach its refusal.
+        run.workspace = None;
+        let from_ensure =
+            ensure_workspace(&h, &mut run).expect_err("no workspace and no cwd to open one in");
+        let canonical = missing_project_dir_error("proj-dir-wording-test").to_string();
+
+        for (site, msg) in [
+            ("phase_start", from_start.to_string()),
+            ("spawn_reviewer", from_reviewer.to_string()),
+            ("ensure_workspace", from_ensure.to_string()),
+        ] {
+            assert_eq!(msg, canonical, "{site} must raise the shared refusal");
+        }
+        // And the shared refusal says where to fix it, not to abandon the run.
+        assert!(canonical.contains("state.json"), "{canonical}");
+        assert!(!canonical.contains("recreate the run"), "{canonical}");
     }
 
     #[test]
