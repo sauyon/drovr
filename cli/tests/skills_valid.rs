@@ -3091,7 +3091,18 @@ fn phase_scoped_literals_in(contents: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Fix 1 (spec §3): no shipped skill scopes its trigger to a drovr phase.
+/// Fix 1 (spec §3): the **three literals** [`PHASE_SCOPED_LITERALS`] names are
+/// gone from every shipped skill, and stay gone.
+///
+/// **Read that scope literally — it is narrower than "no skill scopes its
+/// trigger to a phase", and saying the broader thing would be this run's own
+/// defect class.** What it catches is the regression of the exact wording fix 1
+/// removed. What it does **not** catch: a fresh phrasing of the same mistake
+/// (*"during a drovr phase"*, *"once a phase has started"*), or a sentence-initial
+/// *"In a drovr phase…"* that reintroduces a precondition rather than an
+/// additional consequence (see [`PHASE_SCOPED_LITERALS`] on why the match is
+/// case-sensitive). Those are caught by review, not by this test. Nothing here
+/// pretends otherwise.
 ///
 /// **This is an absence test, and an absence test is this run's recurring
 /// defect class wearing its most convincing costume** — it passes just as
