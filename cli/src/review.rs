@@ -1027,10 +1027,11 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
 ///   one** — and `phase_start` appends any name it is handed. Without the
 ///   membership test an unauthenticated caller could invent phases.
 /// * **409** — the phase is not in a state to be brought back: it still holds a
-///   pane, or it has never run ([`crate::run::Phase::has_run`] — `drovr new`
-///   pre-seeds `Pending` placeholders, and starting one is `phase start`'s job).
-///   Both are the same rules `phase_rehydrate` applies, read from the same
-///   `state.json`, so the status code and the CLI's refusal cannot disagree.
+///   pane, it has never run (`drovr new` pre-seeds `Pending` placeholders, and
+///   starting one is `phase start`'s job), it never got an agent, or it is a
+///   reviewer. Every one of them is [`RunState::rehydratable`], read from the
+///   same `state.json` the CLI reads, so the status code and the CLI's refusal
+///   cannot disagree.
 ///
 /// And one non-refusal worth its own line:
 ///
@@ -1038,6 +1039,42 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
 ///   agent in it was not confirmed to have the phase's context. Neither a 500
 ///   (which would claim nothing happened) nor a plain `ok: true` (which would
 ///   let a caller checking only the status treat it as fully recovered).
+///
+/// # ⚠️ This endpoint is unauthenticated and it starts agent processes
+///
+/// Recorded here because it is a real question with a considered answer, not
+/// an oversight — and because the next person to read this handler will ask it.
+///
+/// **It is not a new capability class.** This server is unauthenticated by
+/// design and already offers arbitrary code execution: `POST /send` types into
+/// a live claude pane, and a claude pane runs bash. Nothing here widens what a
+/// caller who can reach the port may do.
+///
+/// **What it does add is process creation** — talking to an existing agent
+/// versus starting a new one — so the question is resource consumption, and
+/// the answer is that it is bounded by the run's own shape rather than by the
+/// caller's persistence:
+///
+/// 1. A caller cannot invent a target. Rehydrate NEVER appends a phase (unlike
+///    `phase_start`), so the 404 above confines it to phases already in
+///    `state.json`, and the `NeverStarted` / `NoAgentEverRan` refusals confine
+///    it further to phases that have actually run.
+/// 2. A caller cannot multiply agents on one phase. `HoldsPane` refuses a phase
+///    that already has a pane, and a successful rehydrate records one — so the
+///    ceiling is one live agent per already-run phase, which is exactly the
+///    steady state the run has when nothing is reaped.
+/// 3. A flood cannot beat the check. `phase_rehydrate` takes an exclusive
+///    per-run lock and re-reads `state.json` under it, so concurrent requests
+///    serialize and every one after the first sees the pane the first recorded.
+///
+/// **The residual cost, accepted:** each request can occupy one server worker
+/// for up to `SEND_READY_TIMEOUT` (30s) while the agent comes up, and a caller
+/// may restart a reaped phase's agent once. The first is the same slow-handler
+/// exposure `GET /pane` has against a slow herdr; the second is one process for
+/// a phase that is supposed to have one. Neither justifies inventing an auth
+/// scheme for a server whose front door is already open by design — and a
+/// half-measure here would read as protection this endpoint does not have.
+/// `serve_host` defaults to `127.0.0.1`, which is the actual boundary.
 fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
     let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
         respond_str(req, 400, "text/plain", "missing phase".into());
@@ -3202,6 +3239,12 @@ mod tests {
         // has_run() is true, but no agent was ever recorded.
         let mut launch_failed = crate::run::Phase::new("launch-failed");
         launch_failed.status = crate::run::PhaseStatus::Running;
+        let mut reviewer = crate::run::Phase::new("review:task-1:1:security");
+        reviewer.status = crate::run::PhaseStatus::Done;
+        reviewer.set_pane("w:p2");
+        reviewer.record_launch("claude", None);
+        reviewer.mark_reaped();
+        run.review_phases = vec![reviewer];
         run.phases = vec![
             reaped,
             live,
@@ -3261,6 +3304,18 @@ mod tests {
         );
         assert_eq!(s, 409, "{body}");
         assert!(body.contains("no agent on record"), "{body}");
+
+        // A reviewer → 409. Its findings channel cannot be re-attached to a
+        // resumed session, so bringing it back would produce an agent unable to
+        // do the one thing it exists for.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=review%3Atask-1%3A1%3Asecurity",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("review-panel agent"), "{body}");
 
         assert_eq!(
             fs::read_to_string(dir.join("state.json")).unwrap(),
