@@ -62,7 +62,7 @@ stale status), and the live agent's next `drovr phase done` completes it normall
 To accept the old completion as-is, re-signal it deliberately from the run dir:
 
 ```
-: > "$(drovr path <run>)/<phase>.done"      # or: touch <run_dir>/<phase>.done
+touch ~/.local/share/drovr/runs/<run>/<phase>.done
 ```
 
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
@@ -962,7 +962,30 @@ So the cause is genuinely unknown, and guessing again would only produce another
 
 **What was done instead:** the test now reports, on every failure path, the lock path, the file's
 contents, and this process's pid — and which step failed (claim / pid record / re-claim after
-drop). Neither sighting left enough evidence to diagnose; the third will.
+drop).
+
+**The third sighting delivered that evidence (2026-08-02, run `phase-reap`, task 5's fixes).**
+The message was:
+
+```
+after drop: …/server.pid contains "1123224"; this pid is 1123224
+```
+
+Two things follow, and both narrow it:
+
+- **The pid file held OUR OWN pid.** So the step that failed is the re-claim after `drop(held)` —
+  `try_take_lock` returned `WouldBlock` on a path nothing but this test has ever named, against a
+  lock this very process had just released. It is not another writer and not a stale file from an
+  earlier run; there is no second claimant to find.
+- **The rate was measured at this branch's test count: 1 failure in 8 full `--bin drovr` runs.**
+  It fired twice in three consecutive runs at one point, which read as a regression and was not —
+  8 runs put it back on the documented 5–8%. Before calling a red suite a regression, measure;
+  three runs is not a sample.
+
+This is consistent with the `O_CLOEXEC` / fork-window hypothesis in the entry below (a concurrent
+`Command::spawn` elsewhere in the suite briefly duplicates the fd between fork and exec, and an
+inherited open file description holds the flock). It does not confirm it — confirming means
+correlating red runs with a spawn, which still has not been done.
 
 **If you hit it:** paste that message here rather than re-investigating from scratch.
 
@@ -1863,12 +1886,12 @@ main checkout for the rest of the run.
    path is already in hand.
 2. Add a `drovr path <run>` helper that emits the worktree path alone, so the instruction is
    copy-pasteable and scriptable rather than something the driver reconstructs from a sentence.
-   **The demand for this is already on the page, and so is the bug:** the pre-token `phase wait`
-   entry above offers `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in `5beb62f`),
-   but there is no `path` subcommand — `drovr path` exits with "unrecognized subcommand", and
-   `cli/src/main.rs`'s `Commands` enum has no `Path` variant — so that command does not run today.
-   Either add the helper or rewrite that line against `<run_dir>`. **Task 7's docs pass owns it**;
-   left unedited here because this change is scoped to the worktree gap.
+   **The demand for this was already on the page, and so was the bug:** the pre-token `phase wait`
+   entry above offered `: > "$(drovr path <run>)/<phase>.done"` as a workaround (added in
+   `5beb62f`), but there is no `path` subcommand — `drovr path` exits with "unrecognized
+   subcommand", and `cli/src/main.rs`'s `Commands` enum has no `Path` variant. **That line is now
+   written against the run dir directly**, so nothing on this page prescribes a command that does
+   not exist. The helper itself is still unbuilt, and still worth building.
 
 Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
 making the documented step harder to miss, not a substitute for it.
@@ -2879,3 +2902,139 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
   imply a guarantee the rest of the file does not make. If you suspect it: the orphan is
   labelled `drovr:<run>` like its twin, so look for two workspaces with the same label in
   herdr's switcher and close the one whose id is not in `state.json`.
+
+## A ONE-angle panel can reuse a review iteration, and inherit the dead reviewer's verdict
+
+**Severity:** low — unreachable with the default four angles, and it needs a failing
+`clear_findings_file` on top of that. Written down because it is a *decision* (not to widen the
+fix), not an oversight.
+**Found:** 2026-08-03, by analysis during task 6 of run `phase-reap`, while checking a claimed
+"`review_phases` is append-only" invariant. **The invariant is false**, which is the more useful
+half of the finding.
+
+### The claim that turned out to be wrong
+
+`next_iter` (`cli/src/code_review.rs`) is `max(existing iteration)+1` over `run.review_phases`,
+and it was believed safe because that list only grows. It does not: `code_review_run`'s resume
+path does `run.review_phases.retain(|p| p.name != phase)` before respawning an angle in place.
+
+What actually protects the counter is two other things.
+
+1. **Arity.** The retain removes ONE angle's entry immediately before its respawn. With ≥2
+   configured angles (the default is 4), the other entries of that iteration keep `max` where it
+   is even if the spawn then fails and `?` propagates.
+2. **Ordering.** `clear_findings_file` runs *before* `spawn_reviewer`, so on the one path that
+   prunes, that angle's findings file is already gone. Even where an iteration number were
+   reused, there would be no stale verdict left to harvest.
+
+### The residual hole
+
+With **exactly one** configured angle, a resume whose `clear_findings_file` **fails**:
+
+- `?` propagates with the entry already removed from `review_phases`;
+- the removal is persisted anyway — `main.rs`'s `merge_panel_progress` runs on every path
+  including the `Err` early-exit, and it *assigns* `review_phases` rather than merging it;
+- the old `<task>-review-<iter>-<angle>.json` is still on disk, because clearing it is what
+  failed.
+
+`next_iter` then returns that same iteration, and the replacement panel can be credited with the
+dead reviewer's verdict.
+
+### Working around it
+
+Configure more than one angle. `angles` defaults to four; a single-angle config is the only way
+in, and there is no reason to run a one-angle panel except to save tokens on a trivial change.
+
+### Why it was not fixed
+
+Both candidate fixes make the code worse than the hole. Retaining the entry until the respawn
+succeeds means a live pane no phase records if the respawn fails — the immortal-pane bug this
+branch spent three tasks closing. Deriving the iteration from something other than
+`review_phases` means a second source of truth for the counter. A test would either re-test
+`next_iter` (the multi-angle case) or enshrine the subtlety (the single-angle one). If it is ever
+worth closing, the shape to look at is making the counter monotonic on disk rather than derived.
+
+## herdr's "polling is degraded" diagnostic fires on a reap's EXPECTED path
+
+**Severity:** low (cosmetic, but it reads as a fault during a supported repair).
+**Found:** 2026-08-03, task 6 of run `phase-reap`.
+
+### Symptom
+
+Reaping a phase whose pane herdr has already lost — `drovr phase reap <run> <phase>`, or the
+retired-pane sweep re-probing a pane a previous sweep closed — prints:
+
+```
+drovr: herdr's pane.get failed for pane <id>: <err>. Agent status polling is degraded —
+phase sends and waits will run to their timeouts with no other explanation. (A pane that has
+been closed reports this too.)
+```
+
+Nothing is wrong. That is the `Gone` path, and `Gone` is exactly what authorises the reap to
+clear the registration. The command then succeeds.
+
+### Why
+
+`Herdr::pane_info` (`cli/src/herdr.rs`) reports a failed `pane.get` once per pane per process,
+because for its original caller — `phase_send`'s readiness gate and `phase_wait` — a silent
+`None` means an unexplained timeout on a healthy agent. Reaping asks the same question for the
+opposite reason: it *wants* to hear that the pane is gone. The diagnostic cannot tell the two
+callers apart, so it warns for both. The parenthetical was added for exactly this, and is not
+enough — the sentence before it still says "degraded".
+
+### What NOT to do
+
+Do not loosen the gate. It exists for a real failure (herdr unreachable, or a response shape
+drovr cannot read) that is otherwise invisible, and the reap path is the one place where its
+false positive is harmless. If it is worth fixing, the fix is a caller-supplied expectation —
+`pane_info` told that "gone" is an acceptable answer here — not a quieter diagnostic.
+
+## `cargo clippy -D warnings` is not a gate, and counting its findings is not straightforward
+
+**Severity:** medium as a process hazard — the task briefs on run `phase-reap` named
+`cargo clippy --all-targets -- -D warnings` as a per-task gate, and it has never passed on
+`main`, so every task either ignored the gate or would have had to fix unrelated code to meet it.
+**Found:** 2026-07-26 (task 1 of run `phase-reap`); decided 2026-08-04 (task 7).
+
+### The decision
+
+**The gate is PARITY, not zero: a branch must introduce no new finding.** Fixing the baseline is
+a separate, deliberate change and is not any task's to absorb — the same reasoning as the
+`cargo fmt` entry above, whose formatting-only commit conflicts with every branch in flight.
+`cargo fmt` is not run at all on this repo; clippy is run, and compared.
+
+Compare the **sets**, not the counts. Line numbers move as code does, so a finding is
+pre-existing if the same lint already fired in the same file at base. Measured for run
+`phase-reap`: base (`377dff0`) has **10**, the branch head has **8** — two fewer, because code
+carrying a `collapsible_if` and a dead-code warning was rewritten. Nothing new was added.
+
+### Measuring is subtler than it looks
+
+Two traps, and the naive count hits both.
+
+1. **Cargo does not re-emit warnings for targets it did not recompile.** A warm run silently
+   under-reports: on this branch, touching only `src/main.rs` reported **4** findings where a
+   cold run reports **8**. A number that changes with the cache is not a number.
+2. **One source-level warning is reported once per compilation target.** `cli/src/*.rs` compiles
+   as both `bin "drovr"` and `bin "drovr" test`, which is what the
+   `warning: drovr (bin "drovr") generated 1 warning (1 duplicate)` summary lines mean.
+
+Force a full re-check and dedupe by source location:
+
+```sh
+cd cli
+touch src/*.rs tests/*.rs        # or: CARGO_TARGET_DIR=$(mktemp -d)
+cargo clippy --all-targets --message-format=short 2>&1 |
+  grep ': warning: ' | sort -u
+```
+
+`--message-format=short` emits one `file:line:col: warning: …` line per finding, so `sort -u`
+collapses the per-target duplicates. Verified stable across a warm run and a cold one (fresh
+`CARGO_TARGET_DIR`), and against a scratch export of `main`.
+
+### Fix
+
+Land one clippy-only commit on `main`. Ten findings — four `manual_split_once`, two
+`chunks_exact`, two `collapsible_if`, one dead method, one `&PathBuf` — all mechanical, all with
+a suggested rewrite. Like the `cargo fmt` cleanup it wants a quiet moment rather than a branch
+that happens to notice, and until then the parity rule above is the gate.

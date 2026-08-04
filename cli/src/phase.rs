@@ -1172,7 +1172,7 @@ pub enum RehydrateOutcome {
     Incomplete(Unfinished),
 }
 
-/// Which of the four genuinely different things went wrong.
+/// Which of the five genuinely different things went wrong.
 ///
 /// This was a `String` note, and a `String` is the wrong type for it: the note
 /// is what a human reads, but the *classification* is what a caller acts on —
