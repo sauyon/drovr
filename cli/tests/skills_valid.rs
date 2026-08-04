@@ -32,16 +32,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-/// Body-size budget (bytes) for the methodology skills.
+/// Body-size budget (bytes) for the methodology skills
+/// ([`SkillName::methodology`]).
 const BODY_BUDGET: usize = 2200;
-
-/// Skills subject to the body-size budget.
-const METHODOLOGY_SKILLS: &[&str] = &[
-    "tdd",
-    "systematic-debugging",
-    "verification-before-completion",
-    "code-review",
-];
 
 fn skills_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../skills"))
@@ -1141,6 +1134,19 @@ skill_names! {
 impl SkillName {
     fn parse(raw: &str) -> Option<Self> {
         SkillName::ALL.iter().copied().find(|s| s.as_str() == raw)
+    }
+
+    /// The four discipline skills: every measured skill **except** the router.
+    ///
+    /// A real subset, and the only one — `using-drovr` is the always-on router
+    /// rather than a procedure an agent works through, so the body-size budget
+    /// that keeps a methodology readable under pressure does not apply to it.
+    /// Derived, not re-listed, so the exemption is the one thing stated here.
+    fn methodology() -> impl Iterator<Item = SkillName> {
+        SkillName::ALL
+            .iter()
+            .copied()
+            .filter(|skill| *skill != SkillName::UsingDrovr)
     }
 
     /// The accepted values, in `ALL` order — for error text that must name
@@ -2978,8 +2984,8 @@ fn no_verbatim_overlap_with_superpowers() {
 fn methodology_skills_within_body_budget() {
     let dir = skills_dir();
 
-    for skill_name in METHODOLOGY_SKILLS {
-        let path = dir.join(skill_name).join("SKILL.md");
+    for skill in SkillName::methodology() {
+        let path = dir.join(skill.as_str()).join("SKILL.md");
         assert!(
             path.is_file(),
             "expected methodology skill at {}",
