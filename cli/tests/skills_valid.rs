@@ -1139,10 +1139,10 @@ enum Tag {
 /// exists here to justify.
 ///
 /// **The body-size cap rides in this table too** (spec §2.4), for the same
-/// reason the names do: a per-skill budget written beside the variants would be
-/// a sixth spelling of the measured set, and the fifth one is what took a macro
-/// to remove. Here a new measured skill cannot be added without a cap, and a cap
-/// cannot be written for a skill that does not exist.
+/// reason the names do: a per-skill budget kept in a table of its own would be a
+/// fifth spelling of the measured set, and collapsing the previous four is what
+/// took a macro. Here a new measured skill cannot be added without a cap, and a
+/// cap cannot be written for a skill that does not exist.
 macro_rules! skill_names {
     ($($variant:ident => $wire:literal @ $budget:literal,)+) => {
         #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -3124,15 +3124,15 @@ fn budget_for_returns_per_skill_caps() {
     // other skill's (spec §2.4).
     assert_eq!(budget_for("using-drovr"), Some(BodyBudget::Bytes(9_000)));
 
-    // Declared unchecked — with a reason, not by omission.
+    // Declared unchecked — a recorded exemption, not an omission. That the
+    // reason is non-empty is `body_budgets_classify_every_skill`'s rule, held
+    // over the whole table rather than these four.
     for skill in ["handoff", "pipeline", "worktrees", "writing-skills"] {
-        match budget_for(skill) {
-            Some(BodyBudget::Unchecked { why }) => assert!(
-                !why.is_empty(),
-                "{skill} is unchecked with no reason recorded"
-            ),
-            other => panic!("{skill} should be declared unchecked, got {other:?}"),
-        }
+        assert!(
+            matches!(budget_for(skill), Some(BodyBudget::Unchecked { .. })),
+            "{skill} should be declared unchecked, got {:?}",
+            budget_for(skill)
+        );
     }
 
     // Not a skill. Distinguishable from "unchecked", which is the whole point.
@@ -3189,6 +3189,16 @@ fn body_budgets_classify_every_skill() {
         assert!(
             seen.insert(name),
             "`{name}` is budgeted twice — a skill has one budget or none"
+        );
+    }
+
+    // An exemption with no reason is an omission wearing a table entry. Held
+    // over the whole table, not spot-checked on today's four.
+    for (name, why) in UNCHECKED_SKILLS {
+        assert!(
+            !why.trim().is_empty(),
+            "`{name}` is exempt from the size check with no reason recorded — \
+             say why it is exempt, or give it a cap"
         );
     }
 }
