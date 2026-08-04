@@ -1,14 +1,16 @@
-//! Validates every `skills/*/SKILL.md` in the repo and enforces a body-size
-//! budget on the four `drovr:*` methodology skills.
+//! Validates every `skills/*/SKILL.md` in the repo and enforces a per-skill
+//! body-size budget on the five measured `drovr:*` skills.
 //!
 //! Five assertions:
 //!   1. **All** skills have valid frontmatter: a leading `---` block containing
 //!      non-empty `name:` and `description:`, and `name:` equals the directory
 //!      name.
-//!   2. The four methodology skills (tdd, systematic-debugging,
-//!      verification-before-completion, code-review) each have a
-//!      post-frontmatter body of at most 2200 bytes. The pre-existing skills
-//!      (using-drovr, handoff, pipeline) are NOT size-checked.
+//!   2. Every skill is budgeted or declared unchecked, and no checked skill
+//!      exceeds its own cap (spec §2.4). The four discipline skills get 12000
+//!      bytes of post-frontmatter body; `using-drovr` gets 9000, because it is
+//!      injected in full at every `SessionStart`. `handoff`, `pipeline`,
+//!      `worktrees` and `writing-skills` are recorded [`UNCHECKED_SKILLS`] with
+//!      the reason — an exemption, never an omission. See [`BodyBudget`].
 //!   3. The arm snapshots under `docs/skill-evidence/arms/<arm>/` still hash to
 //!      the values `arms/MANIFEST.md` records — arm A (pre-fix) and arm A′ (fix 1
 //!      alone). Each existed on disk for one moment and is unrecoverable without
@@ -35,10 +37,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-
-/// Body-size budget (bytes) for the methodology skills
-/// ([`SkillName::methodology`]).
-const BODY_BUDGET: usize = 2200;
 
 fn skills_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../skills"))
@@ -1139,8 +1137,14 @@ enum Tag {
 /// Consumers walk `SkillName::ALL`; none re-lists the names. Every use is the
 /// whole set — arms, scenarios and evidence each cover all five — so no subset
 /// exists here to justify.
+///
+/// **The body-size cap rides in this table too** (spec §2.4), for the same
+/// reason the names do: a per-skill budget written beside the variants would be
+/// a sixth spelling of the measured set, and the fifth one is what took a macro
+/// to remove. Here a new measured skill cannot be added without a cap, and a cap
+/// cannot be written for a skill that does not exist.
 macro_rules! skill_names {
-    ($($variant:ident => $wire:literal,)+) => {
+    ($($variant:ident => $wire:literal @ $budget:literal,)+) => {
         #[derive(Debug, PartialEq, Eq, Clone, Copy)]
         enum SkillName {
             $($variant,)+
@@ -1155,34 +1159,29 @@ macro_rules! skill_names {
                     $(SkillName::$variant => $wire,)+
                 }
             }
+
+            /// This skill's body-size cap in bytes (spec §2.4). Total: every
+            /// measured skill has one.
+            fn body_budget(self) -> usize {
+                match self {
+                    $(SkillName::$variant => $budget,)+
+                }
+            }
         }
     };
 }
 
 skill_names! {
-    Tdd => "tdd",
-    SystematicDebugging => "systematic-debugging",
-    VerificationBeforeCompletion => "verification-before-completion",
-    CodeReview => "code-review",
-    UsingDrovr => "using-drovr",
+    Tdd => "tdd" @ 12_000,
+    SystematicDebugging => "systematic-debugging" @ 12_000,
+    VerificationBeforeCompletion => "verification-before-completion" @ 12_000,
+    CodeReview => "code-review" @ 12_000,
+    UsingDrovr => "using-drovr" @ 9_000,
 }
 
 impl SkillName {
     fn parse(raw: &str) -> Option<Self> {
         SkillName::ALL.iter().copied().find(|s| s.as_str() == raw)
-    }
-
-    /// The four discipline skills: every measured skill **except** the router.
-    ///
-    /// A real subset, and the only one — `using-drovr` is the always-on router
-    /// rather than a procedure an agent works through, so the body-size budget
-    /// that keeps a methodology readable under pressure does not apply to it.
-    /// Derived, not re-listed, so the exemption is the one thing stated here.
-    fn methodology() -> impl Iterator<Item = SkillName> {
-        SkillName::ALL
-            .iter()
-            .copied()
-            .filter(|skill| *skill != SkillName::UsingDrovr)
     }
 
     /// The accepted values, in `ALL` order — for error text that must name
@@ -1194,6 +1193,74 @@ impl SkillName {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+/// What the body-size check (spec §2.4) does with a skill.
+///
+/// **Two states, not one state and a silence.** A skill this repo has decided
+/// not to size-check is `Unchecked` *with its reason*; a name that is not a
+/// skill here at all is `None` from [`budget_for`]. The predecessor of this
+/// type was a single `const BODY_BUDGET: usize` applied to a derived subset, so
+/// "deliberately exempt" and "nobody thought about it" were the same
+/// observation — the defect class this run exists to remove, and the one Task 8
+/// had to fix in `SiteState` for §5's sites.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BodyBudget {
+    /// Capped at this many bytes of post-frontmatter body.
+    Bytes(usize),
+    /// Deliberately not size-checked. The reason is recorded because an
+    /// unexplained exemption is indistinguishable from an oversight.
+    Unchecked { why: &'static str },
+}
+
+/// The skills that are deliberately **not** size-checked, and why.
+///
+/// The measured five carry their caps in [`skill_names!`]; these four are
+/// everything else under `skills/`. Both halves together are asserted to cover
+/// the tree exactly — see [`body_budgets_classify_every_skill`] — so a tenth
+/// skill reddens the suite until someone says which it is, rather than slipping
+/// in unbudgeted the way `using-drovr` did.
+///
+/// This is not a second copy of `SKILL_SITE_STATES`: that table records whether
+/// a file carries fix 3's directive, this one whether its length is bounded.
+/// The two are orthogonal — `handoff` is `Covered` there and `Unchecked` here.
+const UNCHECKED_SKILLS: &[(&str, &str)] = &[
+    (
+        "handoff",
+        "process documentation for running drovr, not a discipline an agent \
+         works through under pressure — no arm snapshots it and no probe scores \
+         it, so §2.4 sets no cap and nothing in this run depends on its length",
+    ),
+    (
+        "pipeline",
+        "same as `handoff` — and it is already longer than the discipline cap, \
+         so adopting one would be a rewrite decision, not a checkbox",
+    ),
+    (
+        "worktrees",
+        "same as `handoff` — the isolation discipline behind `drovr new \
+         --worktree`, read once when setting a run up",
+    ),
+    (
+        "writing-skills",
+        "the authoring reference (plan §1.2), consulted on demand by whoever \
+         writes a skill rather than injected into a working agent's context",
+    ),
+];
+
+/// How `skill` is budgeted, or `None` if it is not a skill in this repo.
+///
+/// The three answers are distinct on purpose: `Bytes` is a cap, `Unchecked` is
+/// a recorded exemption, `None` is *no such skill* — a typo or a rename, not a
+/// decision anyone made.
+fn budget_for(skill: &str) -> Option<BodyBudget> {
+    if let Some(measured) = SkillName::parse(skill) {
+        return Some(BodyBudget::Bytes(measured.body_budget()));
+    }
+    UNCHECKED_SKILLS
+        .iter()
+        .find(|(name, _)| *name == skill)
+        .map(|(_, why)| BodyBudget::Unchecked { why })
 }
 
 /// Which scenario class a file belongs to (plan §1.2).
@@ -3033,17 +3100,109 @@ fn no_verbatim_overlap_with_superpowers() {
     );
 }
 
+/// The budget is per skill, and every answer means exactly one thing.
+///
+/// `Bytes` is a cap; `Unchecked` is a skill this repo has decided not to
+/// size-check, carrying its reason; `None` is *not a skill in this repo at all*.
+/// Collapsing the middle two into a bare `None` is what the run has been paying
+/// for elsewhere — a deliberate exemption and a forgotten entry would again be
+/// the same observation.
 #[test]
-fn methodology_skills_within_body_budget() {
-    let dir = skills_dir();
+fn budget_for_returns_per_skill_caps() {
+    assert_eq!(budget_for("tdd"), Some(BodyBudget::Bytes(12_000)));
+    assert_eq!(
+        budget_for("systematic-debugging"),
+        Some(BodyBudget::Bytes(12_000))
+    );
+    assert_eq!(
+        budget_for("verification-before-completion"),
+        Some(BodyBudget::Bytes(12_000))
+    );
+    assert_eq!(budget_for("code-review"), Some(BodyBudget::Bytes(12_000)));
+    // The router is capped lower than the disciplines it routes to: it is
+    // injected in full at every SessionStart, so its bytes cost more than any
+    // other skill's (spec §2.4).
+    assert_eq!(budget_for("using-drovr"), Some(BodyBudget::Bytes(9_000)));
 
-    for skill in SkillName::methodology() {
-        let path = dir.join(skill.as_str()).join("SKILL.md");
+    // Declared unchecked — with a reason, not by omission.
+    for skill in ["handoff", "pipeline", "worktrees", "writing-skills"] {
+        match budget_for(skill) {
+            Some(BodyBudget::Unchecked { why }) => assert!(
+                !why.is_empty(),
+                "{skill} is unchecked with no reason recorded"
+            ),
+            other => panic!("{skill} should be declared unchecked, got {other:?}"),
+        }
+    }
+
+    // Not a skill. Distinguishable from "unchecked", which is the whole point.
+    assert_eq!(budget_for("no-such-skill"), None);
+}
+
+/// Every skill under `skills/` is classified, and every classification names a
+/// skill — the same both-directions rule `SKILL_SITE_STATES` is held to.
+///
+/// Without the first direction a new skill is unbudgeted and silent, which is
+/// how `using-drovr` — the most expensive document in the repo, injected in
+/// full at every `SessionStart` — went uncapped until spec §2.4. Without the
+/// second, a renamed skill leaves a budget asserting things about a file that
+/// is not there.
+#[test]
+fn body_budgets_classify_every_skill() {
+    let present: HashSet<String> = skill_files(&skills_dir())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut unclassified: Vec<&String> = present
+        .iter()
+        .filter(|name| budget_for(name).is_none())
+        .collect();
+    unclassified.sort();
+    assert!(
+        unclassified.is_empty(),
+        "skill(s) with no body budget: {unclassified:?}\n\
+         Every skill must either carry a cap in `skill_names!` or be listed in \
+         UNCHECKED_SKILLS with the reason it is exempt. Leaving one out makes \
+         `deliberately exempt` and `nobody noticed` the same thing.",
+    );
+
+    let declared = SkillName::ALL
+        .iter()
+        .map(|skill| skill.as_str())
+        .chain(UNCHECKED_SKILLS.iter().map(|(name, _)| *name));
+    let mut phantom: Vec<&str> = declared
+        .clone()
+        .filter(|name| !present.contains(*name))
+        .collect();
+    phantom.sort();
+    assert!(
+        phantom.is_empty(),
+        "budget entries naming no skill: {phantom:?}\n\
+         If a skill was renamed, rename its entry; if it was deleted, delete it.",
+    );
+
+    // A name in both tables would give `budget_for` two answers and hand the
+    // first one silently to every caller.
+    let mut seen = HashSet::new();
+    for name in declared {
         assert!(
-            path.is_file(),
-            "expected methodology skill at {}",
-            path.display()
+            seen.insert(name),
+            "`{name}` is budgeted twice — a skill has one budget or none"
         );
+    }
+}
+
+#[test]
+fn checked_skills_within_body_budget() {
+    let mut checked = 0;
+
+    for (name, path) in skill_files(&skills_dir()) {
+        let Some(BodyBudget::Bytes(budget)) = budget_for(&name) else {
+            // `Unchecked` needs nothing done to it, and `None` is
+            // `body_budgets_classify_every_skill`'s failure to report.
+            continue;
+        };
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let skill = parse_skill(&contents).unwrap_or_else(|| {
@@ -3056,11 +3215,21 @@ fn methodology_skills_within_body_budget() {
 
         let body_len = skill.body.len();
         assert!(
-            body_len <= BODY_BUDGET,
-            "{}: body is {body_len} bytes, exceeds budget of {BODY_BUDGET}",
+            body_len <= budget,
+            "{}: body is {body_len} bytes, exceeds budget of {budget}",
             path.display()
         );
+        checked += 1;
     }
+
+    // The corpus is walked from disk, so an empty walk would pass this test
+    // having measured nothing.
+    assert_eq!(
+        checked,
+        SkillName::ALL.len(),
+        "expected every measured skill ({}) to be size-checked, measured {checked}",
+        SkillName::accepted()
+    );
 }
 
 /// The three literals fix 1 exists to remove (spec §3).
