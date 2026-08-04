@@ -47,21 +47,20 @@ fn skills_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../skills"))
 }
 
-/// Root of the per-arm skill snapshots (`docs/skill-evidence/arms/`).
-fn arms_dir() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/skill-evidence/arms"
-    ))
-}
-
 /// Root of the evidence corpus (`docs/skill-evidence/`) — the per-skill records,
-/// the run ledger, and the arm snapshots beneath it.
+/// the run ledger, and the arm snapshots beneath it. The corpus root is spelled
+/// out in exactly one place so a future move needs one edit, not two that can
+/// drift apart.
 fn evidence_dir() -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../docs/skill-evidence"
     ))
+}
+
+/// Root of the per-arm skill snapshots (`docs/skill-evidence/arms/`).
+fn arms_dir() -> PathBuf {
+    evidence_dir().join("arms")
 }
 
 /// The evidence files that are not per-skill. Kept as a list so adding one is a
