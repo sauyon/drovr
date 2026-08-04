@@ -341,16 +341,39 @@ fn launch_in_pane<H: Herdr>(
 /// Resolve a phase's pane id, searching `phases` then `review_phases` (via
 /// `RunState::find_phase`) so `phase_send` can seed a reviewer pane registered in
 /// `review_phases`, not just a pipeline phase.
+///
+/// **A phase whose pane was REAPED gets its own message, and that is not a
+/// nicety.** `drovr phase send` into a finished phase is the pipeline's
+/// documented re-entry path, and reaping made "the phase has no pane" a state a
+/// driver reaches by doing the normal thing in the wrong order — starting the
+/// next phase, which supersedes this one, and only then sending. A bare "phase
+/// has no pane_id" names no cause and no way out; the recovery exists
+/// (`drovr phase rehydrate` brings the pane back, resuming the agent's own
+/// session where the backend offers one), so it is said here.
 fn require_pane_id(run: &RunState, phase: &str) -> io::Result<String> {
     let p = run.find_phase(phase).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("phase not found: {phase}"))
     })?;
-    p.pane_id().map(str::to_owned).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("phase has no pane_id: {phase}"),
-        )
-    })
+    if let Some(pane) = p.pane_id() {
+        return Ok(pane.to_owned());
+    }
+    let reaped = p.is_reaped();
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        if reaped {
+            format!(
+                "phase '{}/{phase}' has no pane: drovr closed it when the run moved \
+                 past this phase. Bring it back — resuming its agent's own session \
+                 where the backend offers one — with `drovr phase rehydrate {q_run} \
+                 {q_phase}`, then re-send.",
+                run.name,
+                q_run = shell_single_quote(&run.name),
+                q_phase = shell_single_quote(phase),
+            )
+        } else {
+            format!("phase has no pane_id: {phase}")
+        },
+    ))
 }
 
 /// Dispose of a pane this call opened but never managed to launch into.
@@ -8039,6 +8062,39 @@ mod tests {
     /// other half. Without the sweep the replacement reads as "finished without
     /// delivering" from its very first poll, and is failed before it has been
     /// asked anything.
+    /// Reaping made "this phase has no pane" a state a driver reaches by doing
+    /// the normal thing in the wrong order — starting the next phase (which
+    /// supersedes this one) and only then `phase send`ing back into it. The
+    /// refusal has to name the cause and the recovery, or the driver is left
+    /// with "phase has no pane_id" and no next move.
+    #[test]
+    fn sending_to_a_reaped_phase_says_it_was_reaped_and_how_to_get_it_back() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run("send-to-reaped");
+        let mut p = Phase::new("brainstorm");
+        p.status = PhaseStatus::Done;
+        p.set_pane("ws-mk:p1");
+        p.mark_reaped();
+        run.phases.push(p);
+        // A phase that never had a pane keeps the old, generic refusal: nothing
+        // was closed, so there is nothing to bring back.
+        run.phases.push(Phase::new("plan"));
+        run.save().unwrap();
+
+        let err = phase_send(&h, &mut run, "brainstorm", "hello").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("drovr closed it"), "{msg}");
+        assert!(msg.contains("drovr phase rehydrate 'send-to-reaped' 'brainstorm'"), "{msg}");
+
+        let other = phase_send(&h, &mut run, "plan", "hello").unwrap_err().to_string();
+        assert!(
+            !other.contains("rehydrate"),
+            "a phase that never held a pane must not be offered a recovery that \
+             would refuse it: {other}"
+        );
+    }
+
     #[test]
     fn spawn_reviewer_clears_a_marker_left_by_the_reviewer_it_replaces() {
         let _lock = ENV_LOCK.lock().unwrap();
