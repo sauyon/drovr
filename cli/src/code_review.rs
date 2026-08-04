@@ -66,7 +66,8 @@ use crate::findings::{Review, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
 use crate::phase::{
-    archived_run_error, done_marker, phase_send, poll_phase_pane, spawn_reviewer,
+    archived_run_error, marker_completes_current_pass, phase_send, poll_phase_pane,
+    spawn_reviewer,
 };
 use crate::run::{PhaseStatus, RunState, run_dir};
 
@@ -1216,8 +1217,21 @@ pub fn code_review_run<H: Herdr>(
             // Nothing delivered. NOW the pane matters — but only to answer a different
             // question: has this reviewer finished WITHOUT delivering? That is the one
             // thing the artifact cannot tell us, and the only reason to consult herdr.
-            let finished =
-                done_marker(&run.name, &phase).exists() || status == Some(AgentStatus::Done);
+            //
+            // THE MARKER IS READ THROUGH ITS PASS TOKEN, not by existence. A
+            // reviewer name is reused when a resume respawns an angle in place, so
+            // `done_marker(..).exists()` answered a question about the FILE — and the
+            // file the replaced reviewer left would fail its replacement before that
+            // replacement had been asked anything. `spawn_reviewer` sweeps the marker
+            // at the respawn and this checks the token; the sweep is the first line of
+            // defence, the token is what stays true where the sweep is not reached — an
+            // angle that was NOT respawned, and a marker written by something other
+            // than this pass's agent (`drovr phase done` from a plain shell, or any
+            // agent launched by a pre-token build).
+            let marker_done = run
+                .find_phase(&phase)
+                .is_some_and(|p| marker_completes_current_pass(&run.name, p));
+            let finished = marker_done || status == Some(AgentStatus::Done);
             if !finished {
                 still_pending.push((angle, phase));
                 continue;
@@ -1386,21 +1400,40 @@ mod tests {
         .unwrap();
     }
 
-    /// Pre-drop the done markers for iter=1's four default angles (the panel spawns
-    /// them, then the very first wait poll sees the markers and completes).
-    fn drop_markers(run: &RunState, task: &str, iter: u64) {
-        for a in ["correctness", "security", "error-handling", "type-design"] {
-            drop_marker(run, task, iter, a);
-        }
-    }
-
-    /// Drop the done marker for ONE angle — models a reviewer that finished while
-    /// its panel-mates are still working (the resume path's whole reason to exist).
-    fn drop_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
+    /// Drop the done marker a reviewer's OWN agent would write: `<phase>.done`
+    /// carrying that reviewer's current pass token.
+    ///
+    /// Only possible once the reviewer has been SPAWNED, because the token is
+    /// minted at launch — which is why every test modelling "this reviewer
+    /// finished without delivering" now runs the panel once to spawn it and drops
+    /// the marker between passes. They used to pre-drop an untokenized marker
+    /// before the first pass; that marker is precisely what `spawn_reviewer`'s
+    /// sweep and the wait loop's token check exist to reject, so pre-dropping one
+    /// no longer models a finished reviewer (see
+    /// `a_marker_that_carries_no_pass_token_does_not_finish_a_reviewer`).
+    ///
+    /// Every other test that used to pre-drop markers also seeds a findings file,
+    /// and delivery is the only thing that completes an angle — so those calls
+    /// were decorative and are gone rather than converted.
+    fn drop_pass_marker(run: &RunState, task: &str, iter: u64, angle: &str) {
         let name = crate::run::reviewer_phase_name(task, iter, angle);
+        let token = run
+            .find_phase(&name)
+            .unwrap_or_else(|| panic!("reviewer '{name}' must be spawned before its marker"))
+            .pass
+            .as_ref()
+            .unwrap_or_else(|| panic!("a spawned reviewer '{name}' holds a pass token"))
+            .to_string();
         let m = done_marker(&run.name, &name);
         std::fs::create_dir_all(m.parent().unwrap()).unwrap();
-        std::fs::write(&m, b"").unwrap();
+        std::fs::write(&m, token.as_bytes()).unwrap();
+    }
+
+    /// [`drop_pass_marker`] for every configured angle of `iter`.
+    fn drop_pass_markers(run: &RunState, task: &str, iter: u64) {
+        for a in ["correctness", "security", "error-handling", "type-design"] {
+            drop_pass_marker(run, task, iter, a);
+        }
     }
 
     /// Advance HEAD in the run's project dir, so a resume must notice the diff it
@@ -1634,7 +1667,6 @@ mod tests {
         // One commit is the entire difference between the refused case above and this
         // one; nothing else about the fixture changes.
         commit_more(&run);
-        drop_markers(&run, "task-1", 1);
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
@@ -1824,8 +1856,6 @@ mod tests {
         );
 
         // Two of the four reviewers have since finished.
-        drop_marker(&run, "task-1", 1, "correctness");
-        drop_marker(&run, "task-1", 1, "security");
         seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
         seed_angle_file(
             &run,
@@ -1889,8 +1919,6 @@ mod tests {
         );
 
         // First resume banks two angles, then times out on the other two.
-        drop_marker(&run, "task-1", 1, "correctness");
-        drop_marker(&run, "task-1", 1, "security");
         seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
         seed_angle_file(&run, "task-1", 1, "security", CLEAN);
         assert_eq!(
@@ -1900,8 +1928,6 @@ mod tests {
 
         // Second resume: the stragglers land. The merge must cover ALL FOUR angles,
         // including the two harvested during the earlier resume.
-        drop_marker(&run, "task-1", 1, "error-handling");
-        drop_marker(&run, "task-1", 1, "type-design");
         seed_angle_file(
             &run,
             "task-1",
@@ -2008,7 +2034,7 @@ mod tests {
         );
 
         // correctness finishes, but writes a file that is not a Review.
-        drop_marker(&run, "task-1", 1, "correctness");
+        drop_pass_marker(&run, "task-1", 1, "correctness");
         seed_angle_file(&run, "task-1", 1, "correctness", r#"{"not":"a review"}"#);
 
         let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
@@ -2021,6 +2047,49 @@ mod tests {
             PhaseStatus::Failed,
             "an angle whose output cannot be parsed must be Failed, so the next \
              resume respawns it rather than re-reading the same unusable file"
+        );
+    }
+
+    /// The token half of the marker fix, pinned where the sweep cannot mask it: an
+    /// angle that is NOT respawned (its pane is alive, so `spawn_reviewer` never
+    /// runs again and never sweeps) with a marker carrying no pass token at all.
+    ///
+    /// That marker is not hypothetical — it is what `drovr phase done` writes when
+    /// run from a plain shell instead of from inside the reviewer's own pane, and
+    /// what every agent launched by a pre-token build writes. It is evidence about
+    /// no pass in particular, so it must not answer "this reviewer finished without
+    /// delivering": doing so fails a live reviewer mid-review, and the next resume
+    /// then replaces it.
+    #[test]
+    fn a_marker_that_carries_no_pass_token_does_not_finish_a_reviewer() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-untokened-marker");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+
+        // Three angles deliver; correctness gets an UNTOKENIZED marker and no
+        // findings. Its reviewer is alive, so the resume waits on it rather than
+        // respawning it — the sweep is out of the picture, and the token is all that
+        // stands between a live reviewer and a `Failed` verdict.
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
+        }
+        let name = crate::run::reviewer_phase_name("task-1", 1, "correctness");
+        std::fs::write(done_marker(&run.name, &name), b"").unwrap();
+
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout,
+            "a marker that names no pass must leave the angle waiting, not finish it"
+        );
+        assert_eq!(
+            run.find_phase(&name).unwrap().status,
+            PhaseStatus::Running,
+            "and the live reviewer must not be marked Failed"
         );
     }
 
@@ -2082,7 +2151,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2255,7 +2323,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2288,8 +2355,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        // Simulate every reviewer having dropped its marker.
-        drop_markers(&run, "task-1", 1);
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Clean);
@@ -2317,7 +2382,7 @@ mod tests {
             run.review_phases
                 .iter()
                 .all(|p| p.status == PhaseStatus::Done),
-            "every reviewer whose marker landed must be marked Done"
+            "every reviewer that delivered must be marked Done"
         );
     }
 
@@ -2379,7 +2444,6 @@ mod tests {
         for a in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Findings);
@@ -2568,15 +2632,20 @@ mod tests {
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
         );
 
-        // Iteration 2 opens fresh (iteration 1 ran to completion). Its reviewers all
-        // finish, but not one of them calls `submit_findings`.
-        drop_markers(&run, "task-1", 2);
+        // Iteration 2 opens fresh (iteration 1 ran to completion) and times out with
+        // its reviewers live — which is what mints the pass tokens their markers have
+        // to carry.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        // They all finish, and not one of them calls `submit_findings`.
+        drop_pass_markers(&run, "task-1", 2);
         let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a pass where nobody submitted must fail, not inherit iter 1");
         assert!(
@@ -2603,14 +2672,19 @@ mod tests {
             ReviewOutcome::Timeout
         );
 
-        // The human forces a fresh panel. Iteration 2's reviewers finish having
-        // submitted nothing, while iteration 1's stragglers submit late.
-        drop_markers(&run, "task-1", 2);
+        // The human forces a fresh panel, which spawns iteration 2 and times out.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, true, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        // Iteration 2's reviewers finish having submitted nothing, while iteration
+        // 1's stragglers submit late.
+        drop_pass_markers(&run, "task-1", 2);
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
 
-        let err = code_review_run(&h, &mut run, "task-1", 5_000, true, None)
+        let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a late straggler's verdict must not complete a newer panel");
         assert!(
             err.to_string().contains("never called submit_findings"),
@@ -2634,7 +2708,6 @@ mod tests {
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Findings
@@ -2645,7 +2718,6 @@ mod tests {
         for a in load_config().unwrap().angles {
             seed_angle_file(&run, "task-1", 2, &a, CLEAN);
         }
-        drop_markers(&run, "task-1", 2);
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap(),
             ReviewOutcome::Clean
@@ -2786,7 +2858,6 @@ mod tests {
         // The reviewer finishes before the loop ever looks at it: its verdict is
         // already delivered and its marker already on disk when `code_review_run`
         // starts waiting.
-        drop_marker(&run, "task-1", 1, "correctness");
         seed_angle_file(&run, "task-1", 1, "correctness", CLEAN);
 
         let outcome = code_review_run(&h, &mut run, "task-1", 5000, false, None).unwrap();
@@ -2951,7 +3022,6 @@ mod tests {
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
         }
-        drop_markers(&run, "task-1", 1);
 
         code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
 
@@ -3345,8 +3415,13 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-file-only");
         write_base(&run, "task-1");
+        // Spawn the panel — and mint the pass tokens its markers must carry.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
         // Every reviewer finishes (markers land) but none ever called the tool.
-        drop_markers(&run, "task-1", 1);
+        drop_pass_markers(&run, "task-1", 1);
 
         let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
             .expect_err("a missing findings file must be an error, not a scrape");
@@ -3391,21 +3466,30 @@ mod tests {
         // crediting the replacement with a file it never wrote.
         let leftover = findings_path(&run_dir(&run.name), "task-1", 1, "correctness");
         std::fs::write(&leftover, r#"{"verdict":"changes","findings":[{"fi"#).unwrap();
-        drop_markers(&run, "task-1", 1);
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
 
-        // correctness is respawned, so its leftover is cleared and the replacement
-        // has written nothing — the pass must fail rather than reuse it.
-        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
-            .expect_err("a respawned angle with no file of its own must not succeed");
-        assert!(err.to_string().contains("correctness"), "{err}");
+        // The resume respawns correctness (its pane is gone), clearing the file the
+        // dead reviewer left; the other three bank. The replacement has not finished
+        // yet, so this pass times out.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
         assert_ne!(
             pane_of(&run, "review:task-1:1:correctness"),
             dead,
             "the angle should have been respawned into a new pane"
         );
+
+        // Now the REPLACEMENT finishes — under its own pass token, the only marker
+        // its wait loop accepts — having written nothing of its own. The pass must
+        // fail rather than reuse what the dead reviewer left.
+        drop_pass_marker(&run, "task-1", 1, "correctness");
+        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
+            .expect_err("a respawned angle with no file of its own must not succeed");
+        assert!(err.to_string().contains("correctness"), "{err}");
         assert!(
             !leftover.exists(),
             "the respawn must clear the outgoing reviewer's file, or the replacement \

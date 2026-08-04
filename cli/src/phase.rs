@@ -1024,16 +1024,23 @@ pub fn spawn_reviewer<H: Herdr>(
     ensure_workspace_reporting(h, run)?;
     let ws = workspace_or_bug(run)?;
 
+    // Sweep any `<phase>.done` this name already answers to, BEFORE launching —
+    // `phase_start` does the same, for the same reason, and the reviewer case is
+    // not hypothetical. `next_iter` keeps a FRESH reviewer's name unique, but a
+    // panel RESUME respawns an angle in place: same task, same iteration, same
+    // name, so the marker the reviewer being replaced left behind would make its
+    // replacement read as "finished without delivering" from the first poll.
+    // `code_review_run` already clears that reviewer's findings file for exactly
+    // this reason; this is the other half.
+    //
+    // `?`, never `let _ =`: the wait loop depends on the marker being absent, so
+    // a swallowed failure launches a reviewer that is complete before it starts.
+    // Before the `tab_create` below, so a sweep that fails leaves no pane behind.
+    remove_stale_marker(&run.name, phase)?;
+
     // A fresh tab (with its auto shell pane) in the run workspace — never the root
     // pane. `tab_create` is `--no-focus`; `launch_in_pane` handles focus around the
     // launch itself.
-    // NOTE: deliberately does NOT sweep a pre-existing marker for this name, the
-    // way `phase_start` does. Reviewer names embed an iteration counter
-    // (`next_iter` = max+1 over an append-only `review_phases`), so a fresh
-    // reviewer name never has a marker — and `code_review_run`'s own wait loop
-    // treats a pre-dropped marker as a legitimate "already finished" signal, which
-    // its tests rely on. Sweeping here is a sound hardening once that loop is
-    // token-aware; see the task-1 handoff's note for task 6.
     let pane = h.tab_create(&ws, phase, &run.project_dir)?;
     // Reviewers get a pass token too. They never collide with a previous pass
     // (their names embed `iter`, and `next_iter` takes max+1 over an append-only
@@ -3311,6 +3318,36 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
 /// across an upgrade would falsely complete off its old agent. The documented
 /// flow has the agent run `phase done` from inside its own pane, where the token
 /// is always present.
+/// Whether `<phase>.done` on disk completes the CURRENT pass of `phase` — the
+/// same question [`phase_wait`] asks of a pipeline phase, for the callers that
+/// poll a marker themselves.
+///
+/// The one such caller is `code_review_run`'s panel loop, which is
+/// `review_phases`-aware and never goes through `phase_wait`. It used to ask
+/// `done_marker(..).exists()`, which is a question about the FILE rather than
+/// about this pass: a reviewer name is reused when a resume respawns an angle in
+/// place, so the reviewer being replaced could complete its replacement with the
+/// marker it left behind. [`spawn_reviewer`] sweeps that marker and this checks
+/// the token, which are the two halves of the same fix — the sweep is the first
+/// line of defence, the token is what makes a marker attributable when the sweep
+/// is not reached (a reviewer that was NOT respawned, whose previous pass's
+/// agent is still alive in its pane).
+///
+/// **An unreadable marker answers `false`, deliberately and silently.** It is
+/// not evidence, and the alternatives are worse: failing the pass over a
+/// bookkeeping read, or a diagnostic inside a 500ms poll loop. It also keeps
+/// this consistent with the call beside it — `delivered_review` treats a
+/// findings file it cannot read as "nothing delivered yet" for the same reason —
+/// so both answers on that line degrade the same way, toward waiting. The panel
+/// then times out, which is resumable. `phase_wait` does report it, because a
+/// pipeline phase has no such fallback.
+pub(crate) fn marker_completes_current_pass(run_name: &str, phase: &Phase) -> bool {
+    match std::fs::read_to_string(done_marker(run_name, &phase.name)) {
+        Ok(token) => marker_completes_pass(token.trim(), phase.pass.as_ref()),
+        Err(_) => false,
+    }
+}
+
 fn marker_completes_pass(token: &str, expected: Option<&PassToken>) -> bool {
     match expected {
         // Legacy phase: no token was ever minted for it, so its agent had no
@@ -7598,6 +7635,121 @@ mod tests {
         assert!(
             run_call.contains("claude --permission-mode plan"),
             "pane_run must launch the full launch_command: {run_call}"
+        );
+    }
+
+    /// A reviewer name is REUSED when a panel resume respawns an angle in place
+    /// — same task, same iteration, same name — so the reviewer being replaced
+    /// can have left a `<phase>.done` behind. `code_review_run` already drops
+    /// that reviewer's findings file for exactly this reason; the marker is the
+    /// other half. Without the sweep the replacement reads as "finished without
+    /// delivering" from its very first poll, and is failed before it has been
+    /// asked anything.
+    #[test]
+    fn spawn_reviewer_clears_a_marker_left_by_the_reviewer_it_replaces() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-sweep-test", "ws-rs");
+        let phase = "review:task-1:1:correctness";
+        let marker = done_marker(&run.name, phase);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"old-pass").unwrap();
+
+        spawn_reviewer(
+            &h,
+            &mut run,
+            phase,
+            None,
+            &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
+        )
+        .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "the replaced reviewer's completion marker must not survive its replacement"
+        );
+    }
+
+    /// The sweep is `?`, not `let _ =`, for the same reason `phase_start`'s is:
+    /// the caller depends on the marker being ABSENT afterwards, so a swallowed
+    /// failure launches a reviewer that is complete before it starts.
+    #[test]
+    fn spawn_reviewer_refuses_to_launch_when_it_cannot_clear_a_stale_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePerms(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let mut run = make_run_with_workspace("rev-sweep-fail-test", "ws-rsf");
+        let phase = "review:task-1:1:correctness";
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(done_marker(&run.name, phase), b"").unwrap();
+        let orig = std::fs::metadata(&dir).unwrap().permissions();
+        let _restore = RestorePerms(dir.clone(), orig);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Running as root ignores directory permissions — skip rather than
+        // assert something the environment cannot produce.
+        let root = std::fs::write(dir.join(".probe"), b"").is_ok();
+        let res = spawn_reviewer(
+            &h,
+            &mut run,
+            phase,
+            None,
+            &AgentLaunch::for_test("claude", "claude --permission-mode plan"),
+        );
+        if root {
+            return;
+        }
+        let err = res.expect_err("an unremovable stale marker must fail spawn_reviewer");
+        assert!(
+            err.to_string().contains("stale completion marker"),
+            "the error must name what went wrong: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("pane_run")),
+            "the reviewer must not be launched when the marker could not be cleared: {:?}",
+            h.calls()
+        );
+    }
+
+    /// The panel's wait loop asks this, and it must answer about THIS pass —
+    /// a reviewer name is reused across a respawn, so a marker from the
+    /// reviewer that was replaced must not finish its replacement.
+    #[test]
+    fn a_marker_completes_only_the_pass_whose_token_it_carries() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let run = make_run("marker-pass-test");
+        std::fs::create_dir_all(run_dir(&run.name)).unwrap();
+        let marker = done_marker(&run.name, "plan");
+
+        let mut phase = Phase::new("plan");
+        phase.pass = PassToken::new("pass-2".into());
+
+        assert!(
+            !marker_completes_current_pass(&run.name, &phase),
+            "no marker at all completes nothing"
+        );
+        std::fs::write(&marker, b"pass-1\n").unwrap();
+        assert!(
+            !marker_completes_current_pass(&run.name, &phase),
+            "a marker from a previous pass must not complete this one"
+        );
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            !marker_completes_current_pass(&run.name, &phase),
+            "an untokenized marker must not complete a tokened pass"
+        );
+        std::fs::write(&marker, b"pass-2\n").unwrap();
+        assert!(
+            marker_completes_current_pass(&run.name, &phase),
+            "this pass's own token completes it"
         );
     }
 
