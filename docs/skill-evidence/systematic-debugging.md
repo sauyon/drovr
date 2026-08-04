@@ -125,8 +125,66 @@ what tempted them — not rationalizations.**
 
 ## Counter-text written against the baseline
 
-**Not yet written.** Task 11 owns this. See the null above before writing any: there is no
-observed rationalization to counter for this skill.
+Written by Task 11 (2026-08-04) into `skills/systematic-debugging/SKILL.md`, snapshotted as
+arm B.
+
+**The baseline produced no rationalization, so no row of the shipped table claims to answer
+one.** Every row is sourced below. Rows 1, 2 and 5 quote the RED transcripts; the rest close
+loopholes that arm A already named, that `spec.md` §6 names for this skill, or — for one row —
+that are tier-4 authorial judgement, and each is marked as what it is.
+
+**The provenance stays here and is deliberately NOT in the shipped skill**, following Task
+10's finding: a note in the skill saying the baseline produced no rationalization hands a
+pressured agent its exit (*nobody actually made these excuses, so the table is hypothetical*).
+A skill is a prompt (§2.5), not a lab notebook.
+
+| # | Shipped row's *thought* column | Source |
+|---|---|---|
+| 1 | *"We've seen this exact failure before — it's the day-boundary off-by-one."* | `48860a`, compressed from *temptations named and rejected* — *"A prior-month pattern matching the shape of this failure is a reason to suspect the boundary — it is not a substitute for reading this fixture"* |
+| 2 | *"They said if it's the off-by-one, just fix it."* | `8ed0ef`, verbatim — the instruction it quoted in order to parse it as conditional |
+| 3 | *"The fix works — I don't need to explain why the bug happened."* | Arm A's third red flag, carried forward — **not observed** |
+| 4 | *"I can't reproduce it, so I'll fix it and see."* | Arm A's fourth red flag, carried forward — **not observed** |
+| 5 | *"I'll run the broader suite if time allows."* | `48860a`, verbatim (compliance-with-modification, above) — **the one measured gap in this stage** |
+| 6 | *"Three attempts in — the next one will land."* | `spec.md` §6's numeric escalation trigger — **not observed**; see the near-miss below |
+| 7 | *"Adding logging would take longer than just trying the fix."* | **Not observed and not named by §6** — tier-4 authorial judgement, kept as the mechanism that manufactures the fix-#4 situation row 6 exists to catch |
+
+**The strongest input this stage produced is row 5, and it is the only row with a measured
+failure behind it.** Arm A's loop step 5 said *"run the full suite (see
+`drovr:verification-before-completion`)"*; `48860a` made that conditional on the clock — *"if
+time allows before 16:00"*. 1 of 2 runs, and the softening landed on the step that hands off
+to another measured skill. Three places in the rewrite are written against it: the Iron Law's
+third no-exceptions bullet (*"Do not let a deadline shorten the verification"*), procedure step
+5 (*"unconditionally, whatever the clock says"*), and the worked example, whose ❌ **is that
+utterance** rather than an invented one. That last is deliberate — §6 asks for "actual
+utterances", and this is the only stage in this run so far that produced a failing one.
+
+**A near-miss worth recording, because it is Task 10's trap in a new costume.** `8ed0ef`
+produced *"A guess that's right three times in a row is exactly the setup where the fourth time
+costs you"* — three *successful* guesses, and the risk that the fourth is where the streak
+breaks. §6's escalation trigger is three *failed* fixes. The vocabulary matches and the sense
+does not, so row 6 is sourced to §6 alone and **not** to `8ed0ef`; citing the transcript there
+would have claimed evidence for a rule the transcript does not support. Task 10 recorded the
+general form of this (*counter-text written at a finding can still contradict it*); here it
+would have been a false citation rather than an inverted instruction.
+
+**Two structural changes to arm A's text, recorded because neither is a §6 section.**
+
+1. **Arm A's 5-step loop survives** as procedure steps 1–5, with step 5 hardened per row 5
+   above. §6 fixes the section order, not the loop, and the loop is the part of arm A the RED
+   runs actually followed.
+2. **The read-only-explorer rule moved from the Overview to procedure step 2.** It is
+   unconditional and its wording is intact (fan-out investigation belongs to read-only
+   explorers, never to parallel writers; the single-writer rule stays intact). §6 caps the
+   Overview at ≤6 lines of core principle, spirit-vs-letter and WHY, which the rule is none of,
+   and §6's own placement rationale puts guidance at the point of temptation — you dispatch
+   explorers while isolating, which is step 2. **This is a placement change, not a demotion**;
+   if a later reader wants it back in the Overview, that is a §6 Overview-budget question.
+
+**The honest weak point of this stage.** Five of seven rows have no observed failure behind
+them, against three of eight for `tdd` — because this skill's RED is a pure null and its §6
+entry names no loophole list to work from, only the Iron Law and the escalation trigger. Rows
+3, 4 and 7 are the first to cut if `ab-systematic-debugging` shows arm B no better than A′;
+row 6 is §6-mandated and would need a spec change rather than an edit.
 
 ## Scored results
 

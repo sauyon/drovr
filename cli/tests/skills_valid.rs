@@ -3802,13 +3802,7 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("pipeline", SiteState::Covered),
     ("worktrees", SiteState::Covered),
     ("tdd", SiteState::Covered),
-    (
-        "systematic-debugging",
-        SiteState::Deferred {
-            task: "Task 11",
-            why: "§6 section 6 — lands inside the fix-4 rewrite",
-        },
-    ),
+    ("systematic-debugging", SiteState::Covered),
     (
         "verification-before-completion",
         SiteState::Deferred {
@@ -4496,10 +4490,11 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
     ),
     (
         "systematic-debugging",
-        ArmorState::Pending {
-            task: "Task 11",
-            why: "§6 section 6b — its rewrite carries the cycle flowchart",
-        },
+        ArmorState::Armored(Armor {
+            iron_law: "NO FIX BEFORE A REPRODUCTION AND A MECHANISTIC CAUSE.",
+            announce: "Using drovr:systematic-debugging — reproducing before fixing.",
+            conditional: ConditionalSection::CycleFlowchart,
+        }),
     ),
     (
         "verification-before-completion",
