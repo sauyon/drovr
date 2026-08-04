@@ -40,7 +40,9 @@ and armoring against those spends bytes §7.3 says fix 4 must earn.
 **The consequence, stated plainly: there is no unaided baseline anywhere in this run.** The
 number below is "arm A on the dev scenario", not "an agent with no skill". Do not cite it as
 the latter. `testing-with-subagents.md`'s RED row now describes a method drovr did not
-follow — see *Open for the final review phase*.
+follow — see *Open for the final review phase*. **And see *Limitations that bound what this
+stage can support*, item 1** — the corpus's own scenario-judging rule requires an unaided run,
+and none exists.
 
 ### Method
 
@@ -131,7 +133,7 @@ what tempted them — not rationalizations.**
 > Option A lands code a test never watched fail — a green result that never went red proves nothing, it just confirms the spike does what the spike does, not that the test actually exercises the `--since` behavior.
 > — `b370eb`
 
-> The tech lead's "logic's right, just land it" is a review comment on correctness, not a waiver of the task's verification
+> The tech lead's "logic's right, just land it" is a review comment on correctness, not a waiver of the task's verification — the task still names `TestReportSinceFilter`, and I'm the single writer inside the box, so that's my contract to satisfy, not something to renegotiate.
 > — `b370eb`
 
 > A is out because "add the test in a follow-up" is exactly the tests-after trap: once the code is landed and the deadline pressure is gone, the follow-up either doesn't happen or gets written to match whatever the spike already does, which checks the implementation instead of the requirement.
@@ -173,6 +175,45 @@ and were not scored by a scorer subagent. The orchestrator knew the arm while re
 ## Failure and reverted state
 
 **Not applicable yet.** No bar has been evaluated for this skill.
+
+## Limitations that bound what this stage can support
+
+Four, stated so no later reader has to infer them. The first is the one that matters.
+
+**1. There is no unaided ("no skill") condition anywhere in this run's 122-run budget.** The
+`[tier 4]` ruling above pasted arm A for RED, and every other row in `spec.md` §7.3's budget
+table measures an armored or semi-armored arm (A, A′, B, B-r*i*, voice). The only row whose
+name promised an unaided baseline was this one. **Its 10 runs are spent.**
+
+This collides with a rule the scenario corpus sets for itself.
+`skills/writing-skills/references/pressure-scenarios.md`, under *Judging a scenario before you
+spend a run on it*, asks:
+
+> If you strip the skill away, is failing the obvious move? If not, the RED run
+> will come back compliant and tell you nothing.
+
+Answering that requires an actual unaided run, and none exists. So this stage **cannot
+distinguish** "arm A's text prevented the wrong answer" from "an agent would have chosen
+correctly here anyway". **A decision is needed before Tasks 16–21 interpret held-out
+compliance rates:** either budget a small number of true no-skill runs, or record explicitly
+that the run compares armored arms to each other only and accepts that no such control will
+exist. It is a run-level call, not a task-level one, and it is deliberately not made here.
+
+**2. The answer key sits one paragraph above the question.** The arm's text is pasted
+immediately before the scenario — `tdd`'s *"Test-first, always."* sits six lines above a
+scenario asking whether to write the test first. Under that arrangement an agent that fails to
+comply is failing at reading, not only at resisting pressure. **10/10 compliant is therefore
+weak evidence that any armor is earning its bytes**, and it should not be read as such.
+
+**3. The harness preamble may inflate every arm's absolute compliance equally.** It tells the
+probe *"nothing in your answer needs to be executed to count"* while the scenario insists the
+work is live. That is arm-invariant, so it cannot bias A against A′ or B — but arm-invariance
+is a claim about *comparisons*, not about *levels*. Making the diligent option costless to
+state plausibly raises the compliance rate of **every** arm, which is a separate question and
+one this stage did not examine.
+
+**4. n = 2 per skill.** "2 of 2" is a count, not a rate. Nothing here establishes a frequency,
+and the four booleans are an unblinded reading of two transcripts.
 
 ## Open for the final review phase
 
