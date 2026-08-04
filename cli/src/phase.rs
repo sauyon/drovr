@@ -393,16 +393,40 @@ fn discard_unlaunched_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
 /// killed a second after it started is recoverable by retrying; a pane nothing
 /// can see or close is not.
 ///
-/// `retire_pane` still runs FIRST and is still saved, because it is the smaller
+/// The retirement is recorded FIRST and separately, because it is the smaller
 /// write: if it lands and the close then fails, cleanup can at least prove the
 /// pane was drovr's.
-fn surrender_unrecordable_pane<H: Herdr>(h: &H, run: &mut RunState, pane: &str) {
-    run.retire_pane(pane);
-    if let Err(e) = run.save() {
-        eprintln!(
-            "drovr: warning: could not record pane {pane} as drovr's ({e}); if closing it \
-             below also fails, `drovr cleanup` will treat it as yours and leave it open"
-        );
+///
+/// ⚠️ **It is written onto a FRESH read of `state.json`, not onto the caller's
+/// copy.** The caller's copy is exactly the one whose save just failed — it
+/// carries the phase pointing at this pane, a new pass and a replaced agent
+/// record. Saving that here would record a `pane_id` for a pane this function
+/// is about to close, and a phase that claims a pane which no longer exists is
+/// permanently unrehydratable: `rehydratable` answers `HoldsPane` forever and
+/// nothing clears the registration. Disk-as-it-was plus the retirement is the
+/// state that lets a retry start from the same place.
+///
+/// The caller's in-memory `RunState` is therefore left ahead of disk on
+/// purpose. Every caller returns `Err` immediately, and `phase_rehydrate`
+/// re-reads under its lock, so nothing acts on it.
+fn surrender_unrecordable_pane<H: Herdr>(h: &H, run: &RunState, pane: &str) {
+    match RunState::load(&run.name) {
+        Ok(mut fresh) => {
+            fresh.retire_pane(pane);
+            if let Err(e) = fresh.save() {
+                eprintln!(
+                    "drovr: warning: could not record pane {pane} as drovr's ({e}); if \
+                     closing it below also fails, `drovr cleanup` will treat it as yours \
+                     and leave it open"
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "drovr: warning: could not re-read run '{}' to record pane {pane} as drovr's \
+             ({e}); if closing it below also fails, `drovr cleanup` will treat it as yours \
+             and leave it open",
+            run.name
+        ),
     }
     if let Err(e) = h.pane_close(pane) {
         eprintln!(
@@ -9809,6 +9833,49 @@ mod rehydrate_tests {
         assert!(
             !pass.matches_marker(""),
             "an untokenized leftover cannot complete a tokened phase"
+        );
+    }
+
+    #[test]
+    fn surrendering_a_pane_records_the_retirement_and_not_the_phase() {
+        // The half of the unrecordable-pane fix that the read-only-directory
+        // test cannot reach: when the retirement DOES land, it must land on
+        // disk-as-it-was, never on the caller's copy.
+        //
+        // The caller's copy is the one whose save just failed, so it has the
+        // phase pointing at the pane this function is about to close. Writing
+        // that would leave a phase claiming a pane that no longer exists —
+        // `rehydratable` then answers `HoldsPane` forever and nothing clears
+        // the registration, which is a phase no rehydrate can ever recover.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (mut run, _cfg) = rehydrate_run("rh-surrender");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-s")));
+        run.save().unwrap();
+        // Mutate in memory ONLY — exactly the state a failed post-launch save
+        // leaves behind.
+        run.find_phase_mut("plan").unwrap().set_pane("ws-rh:doomed");
+        let h = FakeHerdr::new();
+
+        surrender_unrecordable_pane(&h, &run, "ws-rh:doomed");
+
+        let on_disk = RunState::load("rh-surrender").unwrap();
+        let p = on_disk.find_phase("plan").unwrap();
+        assert_eq!(
+            p.pane_id(),
+            None,
+            "a closed pane must never be recorded as the phase's: {p:?}"
+        );
+        assert!(p.is_reaped(), "and the phase is untouched, so a retry works");
+        assert!(
+            on_disk.retired_panes.iter().any(|x| x == "ws-rh:doomed"),
+            "but cleanup must still be able to prove the pane was drovr's: {:?}",
+            on_disk.retired_panes
+        );
+        assert!(
+            h.calls().iter().any(|c| c == "pane_close pane=ws-rh:doomed"),
+            "{:?}",
+            h.calls()
         );
     }
 

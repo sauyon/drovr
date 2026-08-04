@@ -718,13 +718,18 @@ impl Config {
         let Some(resume) = self.resume_surface(target.backend()) else {
             return Ok(None);
         };
-        // No `mcp_config`. A resumed agent is handed no MCP server, and for a
-        // resumed REVIEWER that means no `submit_findings` tool — so it has no
-        // way to deliver, and `delivered_review` would wait on a file that can
-        // never appear. Rehydrate is a pipeline-phase facility today; wiring the
-        // findings server through it needs the task name and the written config
-        // path, which this signature does not carry. Stated here rather than
-        // left to be discovered: a rehydrated reviewer cannot deliver findings.
+        // No `mcp_config`, deliberately, and the consequence is ENFORCED
+        // elsewhere rather than left as a warning here: a resumed agent is
+        // handed no MCP server, so a resumed REVIEWER would have no
+        // `submit_findings` tool and `delivered_review` would wait on a file
+        // that can never appear. `NotRehydratable::Reviewer` is where that is
+        // made unreachable — a reviewer is refused before it reaches this
+        // function at all.
+        //
+        // Wiring the server through would need the task name and iteration to
+        // rewrite the per-task MCP config for an OLD pass, which is the same
+        // file a currently running panel's reviewers were launched against. A
+        // panel is re-run, not rehydrated.
         self.compose(
             target.backend(),
             project_dir,
