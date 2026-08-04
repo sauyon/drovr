@@ -106,6 +106,33 @@ the window**, largest 5.1 MiB. Those emit a redundant card rather than suppressi
 fail-open direction again. Widening the window would cost I/O on every prompt to remove 0.6% of
 redundant cards.
 
+## Measured: what the transcript looks like when the hook fires
+
+The suppression rule reads the transcript to decide whether the previous turn ran the discipline, so
+it depends entirely on what is on disk **at fire time** — a different thing from what a completed
+transcript looks like, and the one a completed-transcript measurement cannot answer.
+
+Measured with a probe hook that dumps the transcript tail on each firing, across a live two-turn
+session:
+
+- **Turn 1** — `transcript_path` names a file that **does not exist yet**. The gate fails open and
+  emits, which is correct: there is no previous turn.
+- **Turn 2** — the tail is the *previous* turn's `assistant` record, then
+  `{"type":"last-prompt","lastPrompt":"…"}`, then `{"type":"mode","mode":"normal",…}`.
+
+**The submitting prompt is NOT written as a `type: "user"` record before the hook runs.** That is the
+fact the whole mechanism rests on. `skill_invoked_last_turn` only treats `type: "user"` records as
+turn boundaries and skips every other type, so the walk passes `last-prompt` and `mode` and reaches
+the previous turn — where the skill call is. Verified against the real binary on that exact shape:
+prior turn ran `drovr:tdd` → **suppressed**; prior turn ran no skill → **emitted**.
+
+**If Claude Code ever starts writing the prompt as a `user` record before the hook fires, suppression
+stops firing entirely** and the cumulative cost above becomes 547 bytes × every turn. That is a
+fail-*open* break (noise, not drift), but it removes the cost bound this mechanism advertises.
+`user_prompt_hook_suppresses_on_the_real_hook_time_tail` is the tripwire, and the `_ => {}` arm in
+`skill_invoked_last_turn` is the line that matters — mutating it to end the turn turns that test red
+and nothing else.
+
 ## Asymmetric suppression: the gate does NOT no-op inside a drovr phase
 
 `hooks/session-start` exits early when `DROVR_PHASE` is set, because a phase agent runs on its
