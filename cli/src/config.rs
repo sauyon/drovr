@@ -39,8 +39,17 @@ pub struct AgentSpec {
 /// yields both unchanged.
 ///
 /// Only `enabled` spans both. `preamble` and `sections` shape the SessionStart
-/// reflex alone, and `per_turn` governs the gate alone — a flat table over two
-/// consumers, which is worth knowing before adding a field here.
+/// reflex alone, and `per_turn` governs the gate alone.
+///
+/// **The table is flat on purpose and neither consumer sees all of it.** This
+/// type is the single deserialized surface — its shape is the public
+/// `config.toml` schema, so it cannot be split into nested tables without
+/// breaking every file already written. The consumer split lives one level up
+/// instead: [`ReflexConfig::session`] and [`ReflexConfig::gate`] hand each caller
+/// only its own fields, so applying the wrong one is a compile error rather than
+/// a convention. **A new field belongs in this struct and in exactly one view**
+/// (or both, if it genuinely spans them) — adding it here alone leaves it
+/// unreachable, which is the failure mode to expect.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct ReflexConfig {
     /// Master switch over both reflexes. `false` suppresses the SessionStart
