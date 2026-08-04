@@ -63,8 +63,8 @@ fn arms_dir() -> PathBuf {
     evidence_dir().join("arms")
 }
 
-/// The evidence files that are not per-skill. Kept as a list so adding one is a
-/// one-line change at the same site as the per-skill set.
+/// The one evidence file that is not per-skill: the append-only run ledger
+/// (plan §1.4). Named here so the corpus check spells it once.
 const EVIDENCE_LEDGER: &str = "run-ledger.md";
 
 /// The five skills snapshotted into every measurement arm.
@@ -1124,15 +1124,22 @@ enum SkillName {
 }
 
 impl SkillName {
+    /// The measured set, in manifest order — the typed spelling of it, for
+    /// consumers that need to walk all five rather than parse one.
+    ///
+    /// Nothing makes this exhaustive over the variants: a sixth skill compiles
+    /// fine while missing here. `as_str`'s match is the compiler-checked half —
+    /// a new variant must be named there — and this is the half a human keeps.
+    const ALL: &'static [SkillName] = &[
+        SkillName::Tdd,
+        SkillName::SystematicDebugging,
+        SkillName::VerificationBeforeCompletion,
+        SkillName::CodeReview,
+        SkillName::UsingDrovr,
+    ];
+
     fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "tdd" => Some(SkillName::Tdd),
-            "systematic-debugging" => Some(SkillName::SystematicDebugging),
-            "verification-before-completion" => Some(SkillName::VerificationBeforeCompletion),
-            "code-review" => Some(SkillName::CodeReview),
-            "using-drovr" => Some(SkillName::UsingDrovr),
-            _ => None,
-        }
+        SkillName::ALL.iter().copied().find(|s| s.as_str() == raw)
     }
 
     fn as_str(self) -> &'static str {
@@ -3018,12 +3025,12 @@ fn evidence_corpus_present() {
     );
 
     // Per-skill records first, then the ledger, so the failure names the file.
-    // `ARM_SNAPSHOT_SKILLS` is reused rather than re-listed: the set of skills
-    // under measurement is one fact, and a skill added to an arm without an
-    // evidence record is exactly what should fail here.
-    let mut expected: Vec<String> = ARM_SNAPSHOT_SKILLS
+    // Walked as `SkillName`, not as a re-listed set of strings: the measured
+    // skills are already a closed type in this file, and a skill added to it
+    // without an evidence record is exactly what should fail here.
+    let mut expected: Vec<String> = SkillName::ALL
         .iter()
-        .map(|skill| format!("{skill}.md"))
+        .map(|skill| format!("{}.md", skill.as_str()))
         .collect();
     expected.push(EVIDENCE_LEDGER.to_string());
 
