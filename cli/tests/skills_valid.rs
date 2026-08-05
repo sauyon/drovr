@@ -1113,6 +1113,83 @@ fn voice_variants_share_one_frontmatter() {
     }
 }
 
+/// The voice arm's drift tripwire — the counterpart of
+/// [`arm_b_snapshots_match_manifest`], written for the one arm whose layout is
+/// not per-skill.
+///
+/// [`assert_arm_snapshots_match_manifest`] cannot serve here: it iterates
+/// [`SkillName::ALL`] and holds every row to `skills/<skill>/SKILL.md`, and the
+/// voice arm has neither shape. **Its `source path` is the snapshot's own
+/// path**, because a variant has no live source elsewhere in the tree — it is
+/// authored as the measurement artifact it is, and never becomes a `skills/`
+/// file. `manifest_commits_contain_their_snapshots` then reads that cell as
+/// provenance exactly as it does for every other arm.
+#[test]
+fn voice_snapshots_match_manifest() {
+    let arms = arms_dir();
+    let manifest_path = arms.join("MANIFEST.md");
+    let contents = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
+    let rows =
+        parse_manifest(&contents).unwrap_or_else(|e| panic!("{}: {e}", manifest_path.display()));
+
+    let names = std::iter::once(VOICE_BASELINE).chain(VOICE_VARIANTS.iter().map(|v| v.name));
+
+    // Everything that does not need git runs first, so a git-less environment
+    // still reports a corrupt manifest rather than only "git is missing".
+    let mut to_verify = Vec::new();
+    for name in names {
+        let matches: Vec<&ManifestRow> = rows
+            .iter()
+            .filter(|r| r.arm == VOICE_ARM && r.skill == name)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{}: expected exactly one arm `{VOICE_ARM}` row for `{name}`, found {}",
+            manifest_path.display(),
+            matches.len()
+        );
+
+        let snapshot = arms.join(VOICE_ARM).join(format!("{name}.md"));
+        // Spelled from the repo root, which is what a manifest row records and
+        // what `git rev-parse <commit>:<path>` takes.
+        let expected_source = format!("docs/skill-evidence/arms/{VOICE_ARM}/{name}.md");
+        assert_eq!(
+            matches[0].source_path,
+            expected_source,
+            "{}: arm `{VOICE_ARM}` row for `{name}` records source path `{}`, expected \
+             `{expected_source}` — a voice variant is its own source",
+            manifest_path.display(),
+            matches[0].source_path
+        );
+        assert!(
+            snapshot.is_file(),
+            "missing arm `{VOICE_ARM}` snapshot {}",
+            snapshot.display()
+        );
+        to_verify.push((snapshot, matches[0].hash.clone()));
+    }
+
+    // Same rule as every other arm: git's absence FAILS rather than skips,
+    // because a skip prints `ok` having verified nothing.
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so the arm `{VOICE_ARM}` snapshot hashes cannot be verified"
+    );
+    for (snapshot, expected) in to_verify {
+        let actual = git_hash_object(&snapshot);
+        assert_eq!(
+            actual,
+            expected,
+            "{} has drifted: `git hash-object --no-filters` is {}, MANIFEST.md records {}",
+            snapshot.display(),
+            actual.as_str(),
+            expected.as_str(),
+        );
+    }
+}
+
 /// What this repository can say about one manifest row's `<commit>:<path>`.
 ///
 /// **`Undetermined` is a separate answer from the two absences, and that is the

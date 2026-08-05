@@ -54,7 +54,15 @@ Further rules follow from the parser being strict for the whole file at once:
   partial arm fails it. **Task 14 snapshotted the fifth skill (`using-drovr`) and added that
   test**, so arm B is now drift-checked on every run exactly like A and A′. A later arm filled
   incrementally — `B-r<i>`, `voice` — inherits the same rule: no per-arm tripwire until its last
-  row lands.
+  row lands. **Task 15 landed all four `voice` rows at once**, so its tripwire —
+  `voice_snapshots_match_manifest` — arrived with them.
+- **The `voice` arm is the one arm whose `source path` is the snapshot's own path**, and it needs
+  its own tripwire because of it. Every other arm is a copy of a live `skills/<skill>/SKILL.md`,
+  so `assert_arm_snapshots_match_manifest` iterates `SkillName::ALL` and holds each row to that
+  path. A voice variant has no live source: it is authored as the measurement artifact it is and
+  **never becomes a `skills/` file**, so the row records where it already lives.
+  `manifest_commits_contain_their_snapshots` reads that cell as provenance exactly as it does for
+  every other arm, and the four rows below were verified against `5cc7412` before being written.
 - **No cell may contain a literal `|`** — there is no escape handling.
 - **Every data row must have all six cells; the hash and commit cells must each be a 40-hex git
   object id.** Use the full SHA, not the short form. A malformed row for *any* arm fails the parse,
@@ -93,3 +101,7 @@ Further rules follow from the parser being strict for the whole file at once:
 | B | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `ae5ee2151738e37f6d0c15c2bbc01aa1e111cdd9` | `0b3ed4ba926ef60baca23b2ec3f5a098b29e2444` | 2026-08-04 |
 | B | code-review | `skills/code-review/SKILL.md` | `97ac19db7eeec054351683546288a6b1e99e2f47` | `9b236d0578b265aa15f7bd4c06bd9605b23b620a` | 2026-08-04 |
 | B | using-drovr | `skills/using-drovr/SKILL.md` | `63261398c2a166f4fea983fa068f6d3c402fa553` | `b8835c799b7f139e4ec41326cfbd603b3e28e7b2` | 2026-08-04 |
+| voice | V0 | `docs/skill-evidence/arms/voice/V0.md` | `c835dc8b42f96f956e8b85b381db831420d270d8` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
+| voice | V1 | `docs/skill-evidence/arms/voice/V1.md` | `84f693b90a7f79dd2a968e2279258210c5cf8284` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
+| voice | V2 | `docs/skill-evidence/arms/voice/V2.md` | `a8a3cb0292919aef53a3204a81b112991228e690` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
+| voice | V3 | `docs/skill-evidence/arms/voice/V3.md` | `24e204266831e89ccd8494ed0bb78aa50e304431` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
