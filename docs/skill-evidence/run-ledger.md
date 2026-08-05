@@ -21,6 +21,10 @@ The `runs this stage` cell records what was actually spent, not what was planned
 | 16 | Arm B on held-out (`tdd`) | 5 | 23 | 20 | no |
 | 16 | REFACTOR re-tests (`tdd`) | 0 | 23 | 20 | no |
 | 16 | **Unaided control (`tdd`) — not a §7.3 row** | 4 | 27 | 4 (this stage only) | n/a |
+| 17 | Arm A on held-out (`systematic-debugging`) | 4 | 31 | 20 | no |
+| 17 | Arm A′ on held-out (`systematic-debugging`) | 4 | 35 | 16 | no |
+| 17 | Arm B on held-out (`systematic-debugging`) | 4 | 39 | 21 | no |
+| 17 | REFACTOR re-tests (`systematic-debugging`) | 0 | 39 | 20 | no |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -81,6 +85,33 @@ does not transfer — discriminating power belongs to each scenario pair, and `t
 sharply (`tdd-2` produced the only failure; `tdd-3` was saturated at 2 of 2 even unaided).
 **Cumulative is now 27**, and the run's arithmetic totals ≈123 against a table §7.3 itself writes
 as "≈122".
+
+**Task 17's 12 runs, in detail:** 3 arms × 2 held-out scenarios × 2 samples = 12 planned,
+**zero retries** — every probe wrote its transcript and returned a well-formed confirmation on
+first dispatch, and every one appended its `## Meta-test` block on the follow-up turn. The phase
+total is **12**, not 13. Model `sonnet`, `general-purpose` subagents, per `plan.md` C5.
+
+**One scorer verdict was rejected and re-scored, and that is not a charged run.** `6c8221`'s
+`evidence` field was not verbatim in its `## Response` block (a hard-wrapped sentence un-wrapped
+into one line), so per `scoring-rubric.md` the phase agent rejected it and re-ran the scorer for
+that transcript rather than repairing it. This table counts **probe** subagents — the runs that
+produce measurements. A scorer re-reading an existing transcript produces no new measurement and
+selects nothing, which is exactly what the retry rule is there to prevent. Recorded here so the
+distinction is on the record and not inferred. Full account in
+`docs/skill-evidence/systematic-debugging.md` under *Protocol events, honestly*.
+
+The **REFACTOR row is 0 by construction, not by omission.** Arm A scored 4 of 4, so `plan.md`'s
+pre-registered branch **(a)** fired and evaluation stopped; REFACTOR is reachable only via branch
+(d). `systematic-debugging` reverts to A′ with its ≤4 REFACTOR allotment unspent.
+
+**Headroom after Task 17: 83 runs against the 122 global ceiling** — 39 spent. The arm-B raise
+above lifted one *stage* ceiling, not this one; it is why the stage ceilings now sum to ≈123
+while the global figure stays 122, as the resolution note records. Per-stage after this phase: *Arm A on held-out* **8 of 20 spent**, 12 left and 12
+needed (3 skills × 4) — **exactly zero slack**, unchanged. *Arm A′ on held-out* **8 of 16
+spent**, 8 left and 8 needed (2 discipline skills × 4) — **exactly zero slack**, unchanged.
+*Arm B on held-out* **9 of 21 spent**, 12 left and 12 needed — **exactly zero slack**, which is
+what the ceiling raise bought and no more. **Any retry in any of those three rows from here on
+crosses a ceiling**, and §7.3's rule then applies: halt and record a null.
 
 Two transcripts (`code-review/42a94a.md`, `code-review/d7006e.md`) needed their `## Scenario`
 block repaired after the fact — the probes abridged their copy of it. **This cost no runs**:

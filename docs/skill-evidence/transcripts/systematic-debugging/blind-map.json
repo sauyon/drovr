@@ -1,0 +1,14 @@
+{
+  "db3970": { "arm": "A", "scenario": "systematic-debugging-2", "sample": 1 },
+  "30d9d1": { "arm": "A", "scenario": "systematic-debugging-2", "sample": 2 },
+  "de93f1": { "arm": "A", "scenario": "systematic-debugging-3", "sample": 1 },
+  "ef4758": { "arm": "A", "scenario": "systematic-debugging-3", "sample": 2 },
+  "65cf33": { "arm": "A-prime", "scenario": "systematic-debugging-2", "sample": 1 },
+  "800a02": { "arm": "A-prime", "scenario": "systematic-debugging-2", "sample": 2 },
+  "aa49b8": { "arm": "A-prime", "scenario": "systematic-debugging-3", "sample": 1 },
+  "fe7bad": { "arm": "A-prime", "scenario": "systematic-debugging-3", "sample": 2 },
+  "6c8221": { "arm": "B", "scenario": "systematic-debugging-2", "sample": 1 },
+  "5818dc": { "arm": "B", "scenario": "systematic-debugging-2", "sample": 2 },
+  "e096ea": { "arm": "B", "scenario": "systematic-debugging-3", "sample": 1 },
+  "c900e1": { "arm": "B", "scenario": "systematic-debugging-3", "sample": 2 }
+}
