@@ -236,7 +236,16 @@ pub const GATE_CARD: &str = concat!(
 ///
 /// Seeded with phrases already present in the shipped router, so the guard is
 /// green the moment it lands; the task that writes the 1%-rule and per-turn
-/// phrases into the router adds them here.
+/// phrases into the router adds them here. **Task 14 did that** — the last
+/// three entries are §4.1 items 2 and 3, and they are now what makes this a
+/// real drift guard rather than three phrases that happened to already agree.
+///
+/// A phrase earns its place here only if changing it on one side would be a
+/// *substantive* divergence. The card is 600 bytes of terse clauses and the
+/// router is prose, so the shared text is necessarily short — but each entry
+/// below is the load-bearing fragment of its rule, not an incidental word: drop
+/// `even a 1% chance a drovr:* skill applies` from either text and the 1% rule
+/// is gone from it, not merely reworded.
 ///
 /// `drovr:using-drovr` is deliberately **not** in this list: the shipped router
 /// does not contain that literal anywhere outside its own frontmatter `name:`,
@@ -248,7 +257,21 @@ pub const GATE_CARD: &str = concat!(
 /// Test-only, like [`validate_markers`]: it is a contract between two texts,
 /// checked at build time by the suite, with nothing to consume at runtime.
 #[cfg(test)]
-const GATE_CARD_PHRASES: &[&str] = &["<SUBAGENT-STOP>", "Single writer", "drovr:code-review"];
+const GATE_CARD_PHRASES: &[&str] = &[
+    "<SUBAGENT-STOP>",
+    "Single writer",
+    "drovr:code-review",
+    // §4.1 item 2 — the 1% rule and its cost-lowering clause. Two entries, not
+    // one: the threshold and the reason it is cheap to be wrong are separable,
+    // and a router that keeps the threshold while dropping "it costs almost
+    // nothing to be wrong" is the version an agent argues its way out of.
+    "even a 1% chance a drovr:* skill applies",
+    "invoking costs almost nothing",
+    // §4.1 item 3 — the per-turn rule. The two clauses that make it per-turn
+    // rather than per-session are the clarifying question and the read-only
+    // look; without them the rule reads as "at the start of the session".
+    "including clarifying questions and read-only exploration",
+];
 
 /// The gate JSON, or `None` when the gate is off or the previous turn already
 /// ran the discipline.
@@ -1326,6 +1349,36 @@ mod tests {
         );
     }
 
+    /// Whitespace folded to single spaces, so a phrase is looked for in prose
+    /// rather than in one particular hard-wrapping of it.
+    ///
+    /// **Without this the checks below are line-break-sensitive, and that is a
+    /// false-negative machine.** `skills/using-drovr/SKILL.md` is hard-wrapped
+    /// at ~82 columns; every phrase in [`GATE_CARD_PHRASES`] is a whole clause,
+    /// so any edit that reflows a paragraph can put a newline inside one. The
+    /// resulting failure says the phrase *is not in the file at all* — which is
+    /// false, and which invites the repair of un-wrapping a line to appease a
+    /// test rather than looking at what changed. Twice while writing this task
+    /// a trim to a neighbouring sentence turned both checks red with the rule
+    /// itself fully intact.
+    ///
+    /// It only folds; it does not lowercase or drop punctuation. A phrase that
+    /// has been reworded still has to fail.
+    fn folded(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `skills/using-drovr/SKILL.md`, as the shipped file the checks below are
+    /// about. One reader, so the two tests cannot end up looking at the router
+    /// by two different paths.
+    fn router_skill_md() -> String {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../skills/using-drovr/SKILL.md"
+        );
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+    }
+
     #[test]
     fn gate_card_phrases_present_in_router_skill() {
         // The drift guard (§4.2, §9.2). TWO-SIDED on purpose: asserting only
@@ -1336,20 +1389,19 @@ mod tests {
             !GATE_CARD_PHRASES.is_empty(),
             "an empty phrase list makes this test vacuous"
         );
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../skills/using-drovr/SKILL.md"
-        );
-        let md =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let card = folded(GATE_CARD);
+        let md = folded(&router_skill_md());
         for phrase in GATE_CARD_PHRASES {
+            let phrase = folded(phrase);
             assert!(
-                GATE_CARD.contains(phrase),
+                card.contains(&phrase),
                 "GATE_CARD is missing shared phrase {phrase:?}"
             );
             assert!(
-                md.contains(phrase),
-                "skills/using-drovr/SKILL.md is missing shared phrase {phrase:?}"
+                md.contains(&phrase),
+                "skills/using-drovr/SKILL.md is missing shared phrase {phrase:?} \
+                 (whitespace is folded before comparing, so this is a rewording \
+                 or a deletion, not a line wrap)"
             );
         }
     }
@@ -1360,12 +1412,7 @@ mod tests {
         // be able to delete the routing core. The section list is READ FROM THE
         // FILE rather than hardcoded, so a section added later that happens to
         // wrap the core fails this test instead of slipping past it.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../skills/using-drovr/SKILL.md"
-        );
-        let md =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let md = router_skill_md();
         let names: Vec<String> = md
             .lines()
             .filter_map(|l| parse_open_marker(l.trim()).map(str::to_string))
@@ -1382,10 +1429,68 @@ mod tests {
             body.len() < render_body(&md, &BTreeMap::new()).len(),
             "subtracting every section removed nothing — the test proves nothing"
         );
-        for core in ["<SUBAGENT-STOP>", "# Using Drovr"] {
+        // §4.1: items 2–6 sit OUTSIDE every marker, so every one of them has to
+        // survive here. Each anchor is paired with the item it stands for, so a
+        // failure says *which* part of the router a config toggle just deleted
+        // rather than only quoting a string.
+        //
+        // The two assertions per anchor are not redundant. "Never written" and
+        // "written inside a marker and subtracted away" are different bugs with
+        // different fixes, and collapsing them into one `body.contains` would
+        // report the second as the first — which is how someone repairs this by
+        // pasting the text back in, still inside the marker.
+        const ROUTING_CORE: &[(&str, &str)] = &[
+            ("<SUBAGENT-STOP>", "§4.1 item 1 — the subagent stop"),
+            ("# Using Drovr", "the H1"),
+            (
+                "even a 1% chance a drovr:* skill applies",
+                "§4.1 item 2 — the 1% rule",
+            ),
+            (
+                "invoking costs almost nothing",
+                "§4.1 item 2 — the 1% rule's cost-lowering clause",
+            ),
+            (
+                "including clarifying questions and read-only exploration",
+                "§4.1 item 3 — the per-turn rule",
+            ),
+            (
+                "The human's explicit instructions",
+                "§4.1 item 4 — the instruction-priority ladder (rung 1)",
+            ),
+            (
+                "digraph drovr_gate",
+                "§4.1 item 5 — the gate-function flowchart",
+            ),
+            (
+                "one tracked item per step",
+                "§4.1 item 5's checklist branch — fix 3's canonical directive (§5 site 1)",
+            ),
+            (
+                "## Red flags — you are about to route nothing",
+                "§4.1 item 6 — the router's own red-flag table",
+            ),
+        ];
+        // Folded on both sides, for the reason [`folded`] gives: these anchors
+        // are whole clauses in a hard-wrapped file, and a line-break-sensitive
+        // comparison reports a reflow as a deletion.
+        let folded_md = folded(&md);
+        let folded_body = folded(&body);
+        for (core, item) in ROUTING_CORE {
+            let core = folded(core);
             assert!(
-                body.contains(core),
-                "subtracting every section deleted the routing core {core:?}:\n{body}"
+                folded_md.contains(&core),
+                "{item}: {core:?} is not in skills/using-drovr/SKILL.md at all — \
+                 this test can only tell you whether the routing core survives \
+                 subtraction, not write it for you"
+            );
+            assert!(
+                folded_body.contains(&core),
+                "subtracting every section deleted {item}: {core:?}. It is inside \
+                 a `<!-- reflex:section:NAME -->` pair, so `[reflex.sections]` can \
+                 remove it — which yields an agent that believes it is running \
+                 drovr and is not. Move it outside every marker; only \
+                 `[reflex] enabled = false` may remove the routing core.\n{body}"
             );
         }
     }

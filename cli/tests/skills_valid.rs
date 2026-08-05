@@ -3824,13 +3824,7 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("systematic-debugging", SiteState::Covered),
     ("verification-before-completion", SiteState::Covered),
     ("code-review", SiteState::Covered),
-    (
-        "using-drovr",
-        SiteState::Deferred {
-            task: "Task 14",
-            why: "§4.1 step 5 — the gate function's checklist branch",
-        },
-    ),
+    ("using-drovr", SiteState::Covered),
     (
         "writing-skills",
         SiteState::NotASite {
@@ -5388,6 +5382,50 @@ fn check_procedure(
         )),
         Some(_) => {}
     }
+}
+
+/// [`SiteState::Deferred`] still names both halves of a deferral, now that no
+/// site is in that state.
+///
+/// **Written because Task 14 covered the last `Deferred` site**, the exact
+/// situation [`pending_still_describes_a_deferral`] below was written for one
+/// task earlier — same lint, same variant-goes-unconstructed shape, and the same
+/// §7.3 reason the variant is still live: a skill whose arm B fails reverts to
+/// A′, which is fix-1-only, which puts its fix-3 directive back in the future
+/// and its entry back to `Deferred`.
+///
+/// **What it asserts is the thing that can actually rot.** The absence half of
+/// `Deferred` — that the extractor can see a directive when one is present, so
+/// "absent" is a reading and not a blind spot — is already pinned by
+/// [`task_binding_check_rejects_a_reworded_directive`], and asserting it twice
+/// would be duplication rather than coverage. What nothing else holds is the
+/// diagnostic: strip `why` out of [`SiteState::describe`] and every deferral in
+/// the failure text becomes "recorded as Deferred to Task 22", which reads as
+/// scheduling and hides the reason. That is the failure mode the variant carries
+/// a `why` field to prevent, and this is where it is checked.
+#[test]
+fn deferred_names_its_task_and_its_reason() {
+    let deferred = SiteState::Deferred {
+        task: "Task 22",
+        why: "arm B failed for this skill and it reverts to A-prime, which is fix-1-only",
+    };
+    let described = deferred.describe();
+    for half in [
+        "Task 22",
+        "arm B failed for this skill and it reverts to A-prime, which is fix-1-only",
+    ] {
+        assert!(
+            described.contains(half),
+            "a Deferred entry must name both its task and its reason in \
+             diagnostics, so a deferral reads as a decision and not as a gap; \
+             {half:?} is missing from: {described}"
+        );
+    }
+    assert!(
+        !deferred.must_carry(),
+        "a Deferred site is asserted ABSENT — flipping this would make the \
+         reverted skill's missing directive look like a pass"
+    );
 }
 
 /// [`ArmorState::Pending`] still means what its doc comment says, now that no
