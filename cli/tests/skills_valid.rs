@@ -4899,7 +4899,15 @@ fn is_delimiter_row(cells: &[String]) -> bool {
 fn claim_text(cell: &str) -> String {
     let bare: String = cell
         .chars()
-        .filter(|c| !matches!(c, '*' | '`' | '"' | '_' | '\u{201c}' | '\u{201d}'))
+        // Curly quotes included: a smart-quote autocorrect on either side of the
+        // comparison is a formatting edit, and failing on it would be noise that
+        // teaches an author to distrust the check.
+        .filter(|c| {
+            !matches!(
+                c,
+                '*' | '`' | '"' | '_' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}'
+            )
+        })
         .collect();
     normalize_ws(&bare)
 }
@@ -4917,6 +4925,16 @@ fn claim_text(cell: &str) -> String {
 /// The three columns are asserted too. A two-column table is not §6's section 7:
 /// dropping the `not sufficient` column deletes the half that closes loopholes,
 /// and that is a rewrite, not a formatting choice.
+///
+/// **Its non-vacuity rests on one assertion that lives elsewhere**, recorded
+/// rather than duplicated here: with an empty `claims`, an empty table would
+/// give `found == expected == []` and this function would pass in silence — the
+/// heading-only vacuity it exists to replace. [`armor_table_declares_well_formed_strings`]
+/// is what forbids that, because "the declaration is well-formed" is a property
+/// of [`SKILL_ARMOR_STATES`] and belongs where the other declaration checks are.
+/// A second guard here would be a backstop for an authoritative check, and the
+/// two would eventually disagree. **If that assertion is ever removed, this
+/// function stops asserting anything.**
 fn check_requirements_table(
     path: &Path,
     body: &str,
@@ -4940,18 +4958,43 @@ fn check_requirements_table(
         .find(|line| *line > start)
         .unwrap_or_else(|| body.lines().count());
 
-    let rows: Vec<(usize, Vec<String>)> = body
-        .lines()
-        .enumerate()
-        .filter(|(idx, _)| *idx > start && *idx < end)
-        .filter_map(|(idx, line)| table_row(line).map(|cells| (idx, cells)))
-        .collect();
+    // Fence-aware, for the reason [`headings`] and [`numbered_steps`] are: a
+    // table inside a fenced block is being *shown*, not declared. Reading one as
+    // this section's table does not fail open — the real table is still there
+    // and still compared — but it reports the wrong cause, which sends an author
+    // to fix a table that was already correct.
+    let mut rows: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut fence: Option<usize> = None;
+    for (idx, line) in body.lines().enumerate() {
+        if idx <= start || idx >= end {
+            continue;
+        }
+        if let Some((ticks, rest)) = fence_marker(line) {
+            match fence {
+                Some(opened_with) if ticks >= opened_with && rest.is_empty() => fence = None,
+                Some(_) => {}
+                None => fence = Some(ticks),
+            }
+            continue;
+        }
+        if fence.is_none()
+            && let Some(cells) = table_row(line)
+        {
+            rows.push((idx, cells));
+        }
+    }
 
-    let Some((header_line, header)) = rows.first().cloned() else {
+    // **The header is the row a delimiter follows**, not simply the first line
+    // starting with `|`. Anchoring on the delimiter is what stops a stray `|`
+    // above the table from being read as its header — and a run of cells with no
+    // delimiter under it is not a markdown table at all.
+    let header_at = (0..rows.len().saturating_sub(1)).find(|i| is_delimiter_row(&rows[i + 1].1));
+    let Some((header_line, header)) = header_at.map(|i| rows[i].clone()) else {
         wrong.push(format!(
-            "{}: §6 section 7 opens on line {} with no table under it. The \
-             heading is not the section — §6 section 7 is claim → required \
-             evidence → not sufficient, over {} claim(s).",
+            "{}: §6 section 7 opens on line {} with no table under it — no row \
+             with a `|---|` delimiter beneath it. The heading is not the \
+             section: §6 section 7 is claim → required evidence → not \
+             sufficient, over {} claim(s).",
             path.display(),
             at(start),
             claims.len(),
@@ -4986,7 +5029,7 @@ fn check_requirements_table(
 
     let data: Vec<&(usize, Vec<String>)> = rows
         .iter()
-        .skip(1)
+        .skip(header_at.expect("header_at is Some in this branch") + 2)
         .filter(|(_, cells)| !is_delimiter_row(cells))
         .collect();
 
@@ -5510,6 +5553,37 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
         "a third column that does not name what is insufficient must be \
          reported: {:?}",
         complaints(&mislabelled)
+    );
+
+    // Content that only LOOKS like the table must not be mistaken for it. Both
+    // shapes below left the real table intact, and both made the check report a
+    // defect that was not there — fail-closed, but naming the wrong cause, which
+    // sends an author to fix a table that is already correct.
+    let fenced_pipe = good.replace(
+        "| The claim | Required evidence | NOT sufficient |",
+        "```text\n| example | pipe | line |\n```\n\n| The claim | Required evidence | NOT sufficient |",
+    );
+    assert_ne!(
+        fenced_pipe, good,
+        "the fixture did not gain a fenced example"
+    );
+    assert!(
+        complaints(&fenced_pipe).is_empty(),
+        "a fenced example containing pipes is being SHOWN, not declared — it must \
+         not be read as §6 section 7's table: {:?}",
+        complaints(&fenced_pipe)
+    );
+
+    let stray_pipe = good.replace(
+        "| The claim | Required evidence | NOT sufficient |",
+        "|\n\n| The claim | Required evidence | NOT sufficient |",
+    );
+    assert_ne!(stray_pipe, good, "the fixture did not gain a stray pipe");
+    assert!(
+        complaints(&stray_pipe).is_empty(),
+        "a stray `|` line above the table must not be mistaken for its header — \
+         the header is the row a delimiter follows: {:?}",
+        complaints(&stray_pipe)
     );
 
     // A row whose evidence cell is blank states a claim and requires nothing —

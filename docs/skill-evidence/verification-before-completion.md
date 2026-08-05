@@ -331,7 +331,11 @@ Task 11's gate caught, and this is an invented *artifact*, marked.
    *open the named artifact, or re-run the check when there is none*; the red flag and
    rationalization row 7 said only *open what it named* — **impossible for a prose-only report,
    and it routes the reader straight to the summary the requirements row forbids.** All four now
-   read *open the file it names — or re-run the check yourself when it names none*. Verified by
+   state the same rule — *open the file it names; re-run the check yourself when it names none* —
+   in four wordings suited to their surfaces (a no-exceptions bullet, a table cell, a red flag, a
+   rationalization row). **They are four paraphrases of one rule, not one sentence repeated four
+   times, and the distinction is the point**: §6 puts a rule on several surfaces so it is met in
+   several reading modes, which only works if each surface carries the *whole* rule. Verified by
    grepping the finished file for every occurrence of `subagent` rather than by recalling where
    I had written it: this run has already shipped one-rule-two-wordings once
    (`skills/code-review/SKILL.md`, across two review rounds), and Task 11's gate found the
@@ -351,9 +355,19 @@ not *rows with a citation*:
 | Transcript-quoted, but from a **compliant** run | 1, 2, 3, 4, 5, 6 | The *instruction* column of each is a RED run's own reasoning. That is vocabulary and argument, which `testing-with-subagents.md` asks for — it is **not** evidence that the pull ever won. The *thought* column of each is scenario text, not an agent's words. |
 | No transcript at all | 7 | Tier-4 authorial judgement, retained because §6 mandates the requirements row it answers. |
 
-**No cross-skill comparison is made.** Task 11 recorded why: every skill's RED in this run is a
-null, so every skill's per-row citations are mostly temptations, and a ratio compared between
-them measures nothing.
+**No cross-skill comparison of MEASURED RESULTS is made**, and that is the whole of the rule.
+Task 11 recorded why: every skill's RED in this run is a null, so every skill's per-row citations
+are mostly temptations, and a compliance rate or citation ratio compared between them measures
+nothing.
+
+**What the rule does not forbid, stated because self-review caught this doc breaking its own
+absolute once already:** comparing the four skills' *structure* — which sections they carry, what
+their worked examples contain — is a reading of §6 and of files on disk, not of any measurement,
+and this section does it once (the note that both sibling ✅ examples embed real subprocess
+evidence). That comparison is checkable by opening two files; a compliance ratio is not. **The
+earlier absolute was cut rather than narrowed, and cutting it was wrong** — it left a rule that
+forbade more than anyone intended and that the next paragraph immediately violated. A rule stated
+wider than its reason is a rule that gets broken and then quietly ignored.
 
 The cause is structural, not sloppy authoring: this stage's RED is a pure null. No run failed,
 so there is no failure for any row to answer, and no claim that one does is made — not in the

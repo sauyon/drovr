@@ -153,7 +153,7 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 
 ❌ **What this looks like when it fails:**
 
-> Verification `./scripts/test-billing.sh` — 96 passing. Since that run: a
+> Verification `./scripts/test-billing.sh` — 96 passing at 18:31. Since then: a
 > rename and two comments, nothing that touches proration. Reporting done.
 
 ✅ **What it looks like when it holds:**
