@@ -20,6 +20,7 @@ The `runs this stage` cell records what was actually spent, not what was planned
 | 16 | Arm A′ on held-out (`tdd`) | 4 | 18 | 16 | no |
 | 16 | Arm B on held-out (`tdd`) | 5 | 23 | 20 | no |
 | 16 | REFACTOR re-tests (`tdd`) | 0 | 23 | 20 | no |
+| 16 | **Unaided control (`tdd`) — not a §7.3 row** | 4 | 27 | 4 (this stage only) | n/a |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -56,6 +57,30 @@ which; or rule that a protocol-failure retry producing no transcript is not a ch
 change to this table's stated rule, which would also retroactively rewrite the row above).
 **Escalated in `ab-tdd-HANDOFF.md` rather than decided by this phase.** The ledger records what
 was actually spent; it is not the place to resolve the shortfall by relabelling it.
+
+> **RESOLVED 2026-08-05 by the user, who authorized further measurement at this phase's
+> discretion.** The call taken is **option 1: the *Arm B on held-out* row's ceiling rises from 20
+> to 21**, so Tasks 17–20 have the 16 runs they need. Option 2 was rejected because accepting a
+> null would discard a whole skill's arm B measurement to pay for a protocol bug. Option 3 was
+> rejected because rewriting the retry rule would retroactively edit a spent row and weaken the
+> guard that stops a bad probe being re-rolled until it says something better.
+>
+> **This is a deviation from frozen `spec.md` §7.3, recorded as one rather than folded in
+> silently.** Tasks 17–20 must still read this table before starting and halt with a null rather
+> than extend any *other* row.
+
+**Task 16's unaided control (4 runs, 2026-08-05) is not a `spec.md` §7.3 stage.** §7.3's budget
+table has no unaided row — the gap Task 6 recorded as its first limitation — and the user
+authorized these runs after `ab-tdd` had shipped. They enter **no pre-registered bar** and do not
+change the ab-tdd verdict. 2 held-out scenarios × 2 samples, no skill text of any arm in the
+prompt, blind-scored like every other stage. Result: **3 of 4 compliant unaided**, against 4/4
+for each of A, A′ and B. Full record in `docs/skill-evidence/tdd.md` under *Unaided control*.
+
+**It is scoped to `tdd`.** The other four skills still have no unaided condition, and this result
+does not transfer — discriminating power belongs to each scenario pair, and `tdd`'s two differed
+sharply (`tdd-2` produced the only failure; `tdd-3` was saturated at 2 of 2 even unaided).
+**Cumulative is now 27**, and the run's arithmetic totals ≈123 against a table §7.3 itself writes
+as "≈122".
 
 Two transcripts (`code-review/42a94a.md`, `code-review/d7006e.md`) needed their `## Scenario`
 block repaired after the fact — the probes abridged their copy of it. **This cost no runs**:

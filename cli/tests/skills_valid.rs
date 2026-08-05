@@ -6894,6 +6894,20 @@ fn resolve_transcript(dir: &Path, id: &str, whence: &Path) -> PathBuf {
     resolved
 }
 
+/// Parse a verdict file, failing loudly on a shape violation or an empty array.
+fn read_verdicts(path: &Path) -> Vec<Verdict> {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+    let verdicts: Vec<Verdict> = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} does not match the verdict schema: {e}", path.display()));
+    assert!(
+        !verdicts.is_empty(),
+        "{} is an empty array — a scored stage records verdicts, not nothing",
+        path.display()
+    );
+    verdicts
+}
+
 /// Every scored `ab-*` stage's verdicts are well-formed **and obey the rubric's
 /// rules about what may be recorded where**.
 ///
@@ -6932,42 +6946,44 @@ fn scores_json_verdicts_obey_the_rubric() {
             }
         }
 
+        // `control-scores.json` holds the unaided (no-skill) control stage's
+        // verdicts. It is a separate file because it scores a separate stage that
+        // no pre-registered bar reads — but it is a verdict set produced by the
+        // same rubric and the same blind scorer, so it obeys the same rules. A
+        // second verdict-like file with no schema is the drift this corpus keeps
+        // finding.
+        for name in ["scores.json", "control-scores.json"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let verdicts = read_verdicts(&path);
+            let mut seen: HashSet<&str> = HashSet::new();
+            for v in &verdicts {
+                let id = v.0.transcript_id.as_str();
+                assert!(
+                    seen.insert(id),
+                    "{}: two verdicts for transcript {id}",
+                    path.display()
+                );
+                let transcript = resolve_transcript(&dir, id, &path);
+                let body = fs::read_to_string(&transcript).expect("transcript unreadable");
+                let response = response_block(&body);
+                assert!(
+                    !response.trim().is_empty(),
+                    "{}: transcript {id} has no `## Response` block to score",
+                    path.display()
+                );
+                v.check_rubric_rules(response, &path);
+                checked += 1;
+            }
+        }
+
         let path = dir.join("scores.json");
         if !path.is_file() {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let verdicts: Vec<Verdict> = serde_json::from_str(&text).unwrap_or_else(|e| {
-            panic!("{} does not match the verdict schema: {e}", path.display())
-        });
-        assert!(
-            !verdicts.is_empty(),
-            "{} is an empty array — a scored stage records verdicts, not nothing",
-            path.display()
-        );
-
-        let mut seen: HashSet<&str> = HashSet::new();
-        for v in &verdicts {
-            let id = v.0.transcript_id.as_str();
-            assert!(
-                seen.insert(id),
-                "{}: two verdicts for transcript {id}",
-                path.display()
-            );
-
-            let transcript = resolve_transcript(&dir, id, &path);
-            let body = fs::read_to_string(&transcript).expect("transcript unreadable");
-            let response = response_block(&body);
-            assert!(
-                !response.trim().is_empty(),
-                "{}: transcript {id} has no `## Response` block to score",
-                path.display()
-            );
-
-            v.check_rubric_rules(response, &path);
-            checked += 1;
-        }
+        let verdicts = read_verdicts(&path);
 
         // A re-adjudication, if one was needed, is evidence too.
         let adj = dir.join("adjudication.json");

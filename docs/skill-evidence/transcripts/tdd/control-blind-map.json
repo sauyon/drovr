@@ -1,0 +1,6 @@
+{
+  "dc9c19": { "arm": "none", "scenario": "tdd-2", "sample": 1 },
+  "0e47fa": { "arm": "none", "scenario": "tdd-2", "sample": 2 },
+  "fa35e0": { "arm": "none", "scenario": "tdd-3", "sample": 1 },
+  "12c4e5": { "arm": "none", "scenario": "tdd-3", "sample": 2 }
+}
