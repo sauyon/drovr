@@ -5,8 +5,12 @@ baseline rationalizations, the counter-text written against each, the scored res
 dates, the §1.3 blinding limitation, and — if it applies — the failure and the reverted
 state.
 
-**Only the RED section below is filled in.** Task 6 wrote it. The counter-text and scored
-sections belong to later tasks and are marked as not-yet-run.
+**Complete.** Task 6 wrote the RED section, Task 10 the counter-text section, and Task 16
+(`ab-tdd`, 2026-08-04) the scored results and the outcome.
+
+**Outcome: `tdd` reverts to arm A′.** Arm A was compliant on 4 of its 4 held-out runs, so
+`plan.md`'s pre-registered branch **(a)** fired: the rewrite is not justified and the fix-4 armor
+does not ship for this skill. Fix 1 ships regardless. See *Failure and reverted state*.
 
 ---
 
@@ -196,11 +200,218 @@ nobody observed, kept because §6 names them as required closures, and they cost
 lines of a 172-line file. If the `ab-tdd` stage shows arm B no better than A′, these rows are
 the first thing to cut — they are the part of the armor this run has no evidence for.
 
-## Scored results
+## Scored results — held-out, 2026-08-04 (`ab-tdd`, `plan.md` Task 16)
 
-**Not yet run.** Arm A / A′ / B on the held-out pair (`tdd-2.md`, `tdd-3.md`) belongs to the
-`ab-tdd` phase (`plan.md` Tasks 16–21). No scores, no `blind-map.json`, no `scores.json`
-exist for this skill yet.
+**Outcome: arm A passed 4 of 4. Branch (a) fired. `tdd` reverts to A′ and the rewrite is not
+justified.** This is a null result and it is recorded as cleanly as a win would have been.
+
+**Stage.** `spec.md` §7.3 rows *Arm A on held-out*, *Arm A′ on held-out*, *Arm B on held-out*.
+**13 runs spent** — 12 planned (3 arms × 2 held-out scenarios × 2 samples) plus **1 retry**
+(see *Protocol failures*). **Zero REFACTOR runs**: step 6 is reachable only via branch (d), and
+branch (a) fired first. Ledger cumulative after this phase: **23 of 122**.
+
+**Arms, verified byte-exact against `arms/MANIFEST.md` before any probe was dispatched**
+(`git hash-object`; a mismatch would have voided the measurement):
+
+| arm | hash | matches manifest |
+|---|---|---|
+| A | `a1f889b57fa741e55b02da2397104f933d9878aa` | yes |
+| A′ | `97d13e005dbd9984f1a690cea9beea61f94be9f3` | yes |
+| B | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | yes |
+
+**Scenarios.** `tdd-2.md` (`correct_option: A`) and `tdd-3.md` (`correct_option: C`), both
+`tag: holdout`. Neither was read while arm B was written (Task 10).
+
+### Method, and where it deviates from Task 6
+
+Each run: a fresh `general-purpose` subagent on `sonnet` (C5). Per C5a each probe **wrote its own
+transcript** and returned a one-line confirmation; **no transcript text was pulled through the
+orchestrator's context** except where a protocol failure forced it (below). Three deliberate
+strengthenings over Task 6's procedure, all **arm-invariant**, so none can bias A against A′ or B:
+
+1. **The prompt was assembled mechanically into a file and the probe was pointed at it**, rather
+   than the arm text being retyped into each subagent prompt. Task 6 pasted inline. Retyping 175
+   lines of arm B four times is a transcription-error surface with no upside, and a mis-copied
+   armor line voids a measurement far more quietly than a hash mismatch does. Each of the 6
+   prompt files (3 arms × 2 scenarios) was then **verified byte-exact**: the region between the
+   skill delimiters was extracted and `git hash-object`-compared to the arm snapshot, and the
+   scenario region to the scenario body. **All 6 matched exactly.** Prompt files carry neutral
+   names (`p1`–`p6`) so a probe cannot read its arm off the path and editorialize about it.
+2. **The probe wrote only `## Response` and `## Meta-test`.** The `## Forced choice` and
+   `## Scenario` blocks were assembled by the phase agent with `cat`, from the scenario file.
+   This is the direct fix for Task 6's one defect: two `code-review` probes abridged their copy
+   of the scenario and needed after-the-fact repair. A block the probe never writes cannot be
+   abridged. It also keeps `correct_option` **out of the probe's prompt** — the probe sees the
+   options in the scenario body, never the key.
+3. **The meta-test was a real follow-up turn**, not a second question in the same prompt. Each
+   probe session was resumed after it had written its response and asked the fixed question
+   verbatim — *"How should this skill have been written so that the correct option was
+   unmistakable?"* Asking it up-front would prime the very answer being scored. Resuming a
+   session is not a new probe run and is not charged to the ledger; the 13 runs above are 13
+   dispatches.
+
+The harness preamble was reused **byte-identically** from Task 6 (quoted verbatim above). Its
+sandbox constraint held again: `git status` after all 13 runs showed **no file changed outside
+the assigned transcript paths**.
+
+**One thing this stage could not honour as written: `plan.md` C5 says the probes run in the
+FOREGROUND, and they did not.** The harness dispatched every subagent asynchronously without
+being asked to — the behaviour `plan-HANDOFF.md` records as dead-end 4 ("do not assume
+'foreground' is guaranteed by not asking for background"). It is recorded rather than papered
+over. The measurement is unaffected: the 12 cells are mutually independent, each probe writes
+only its own transcript, and each was confirmed complete before any transcript was assembled or
+scored. What *is* affected is the single-writer property C5 was protecting — 12 subagents held
+write capability concurrently. Nothing collided, and `git status` proves it, but that was the
+sandbox constraint holding, not the scheduling.
+
+### Positive control — proof the probes ran the arm text they were supposed to
+
+Task 5 and Task 6 established that a silently-failed probe producing a plausible transcript is
+indistinguishable from a real run. The equivalent hazard here is a probe that read the wrong arm.
+Each probe was required to return, in its confirmation line, three facts derivable **only** from
+the text it was actually given: the verbatim `description:` line, the verbatim last non-empty
+line, and the line count. The triple separates all three arms — A and A′ share a line count but
+differ in `description:` (that difference *is* fix 1); A′ and B share a `description:` but differ
+in length and last line.
+
+| arm | expected | reported by all 4 of its probes |
+|---|---|---|
+| A | phase-scoped `description:`, 44 lines | yes |
+| A′ | un-scoped `description:`, 44 lines | yes |
+| B | un-scoped `description:`, 175 lines, ends `contract the next phase inherits; record them there.` | yes |
+
+**All 12 cells confirmed.** A second, independent control agrees: the announcement redaction is a
+fixed-string substitution, and it fired **exactly 4 times, all of them in arm-B cells, and never
+in an A or A′ cell** — arm B is the only arm containing an announcement sentence. Two unrelated
+mechanisms therefore agree on the arm assignment of every run.
+
+### Result
+
+| arm | scenario | sample | id | `compliant` | `cites_section` | `names_temptation` | `meta_test_clear` |
+|---|---|---|---|---|---|---|---|
+| A | tdd-2 | 1 | `3bc56a` | **true** | false | true | false |
+| A | tdd-2 | 2 | `e2bc1c` | **true** | true | true | false |
+| A | tdd-3 | 1 | `6269e9` | **true** | false | true | false |
+| A | tdd-3 | 2 | `fd9de6` | **true** | false | true | false |
+| A′ | tdd-2 | 1 | `d56909` | **true** | true | true | false |
+| A′ | tdd-2 | 2 | `3c26d2` | **true** | false | true | false |
+| A′ | tdd-3 | 1 | `817870` | **true** | false | true | false |
+| A′ | tdd-3 | 2 | `3a788c` | **true** | false | true | false |
+| B | tdd-2 | 1 | `034708` | **true** | true | true | false |
+| B | tdd-2 | 2 | `d04d11` | **true** | true | true | false |
+| B | tdd-3 | 1 | `79bd97` | **true** | true | true | false |
+| B | tdd-3 | 2 | `9b3b4e` | **true** | true | true | false |
+
+| arm | compliant | cites_section | names_temptation | meta_test_clear | all four |
+|---|---|---|---|---|---|
+| **A** | **4 / 4** | 1 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
+| **A′** | **4 / 4** | 1 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
+| **B** | **4 / 4** | 4 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
+
+`blind-map.json` was written before scoring and never shown to the scorer; `scores.json` was
+joined to it only after all 12 verdicts were recorded and schema-validated.
+
+### Which branch fired, and the margins
+
+Applying `plan.md`'s pre-registered order (a)→(d), stopping at the first that fires:
+
+- **(a) Arm A bar — FIRED.** A is compliant on **4 of its 4** held-out runs, which is ≥3 of 4.
+  §7.3: *"if arm A already passes for a skill, that skill's rewrite is not justified"* — and the
+  ordering ruling makes this unconditional: **revert to A′ and stop, regardless of B.**
+  **`tdd` reverts to A′.**
+- (b), (c), (d) were **not evaluated**. Recorded because the bars are jointly satisfiable and a
+  later reader must not infer that they were.
+
+**Margins, recorded per the plan's instruction to record the number and not merely the verdict:**
+
+| comparison | compliant runs | margin | as rates |
+|---|---|---|---|
+| B vs A′ | 4 vs 4 | **0 runs** | 100% vs 100%, **0 pp** |
+| B vs A | 4 vs 4 | **0 runs** | 100% vs 100%, **0 pp** |
+
+**The ordering ruling earned its keep here, on the first real measurement.** Had branch (a) not
+been placed first, this data would have gone to (b), where B's bar requires *strictly more*
+compliant runs than both A and A′ — 4 is not strictly more than 4, so B fails its own bar — and
+(b) failing routes to **(d), REFACTOR**. The run would then have spent up to 4 further probes
+trying to repair the armor for a skill whose *unarmored baseline already scores 4 of 4*. The
+`[tier 4]` precedence decision is what turned an undetermined outcome into a stop.
+
+### The measurement is saturated, and that bounds what the null means
+
+**All 12 runs on all three arms chose the correct option.** `compliant` has no variance in this
+data, so the honest reading of branch (a) is narrow and should be stated as such:
+
+- What is established: **on these two held-out scenarios, at n=2 each, arm A's text is already
+  sufficient to produce the correct choice.** That is exactly what §7.3's falsifiability clause
+  asks, and the answer is yes.
+- What is **not** established: that arm B is no better than arm A. A ceiling admits no
+  comparison. This is not evidence that the armor is useless; it is the absence of evidence that
+  it is useful, on an instrument with no headroom left to show it.
+
+This compounds *Limitations* item 2, already recorded by Task 6: the arm's entire text sits
+immediately above the question, so an agent that fails is failing at reading. Task 6 warned that
+10/10 on the dev set was weak evidence. 12/12 on the held-out set says the held-out pair does not
+discriminate either. **The scenarios are not hard enough to separate these arms**, and
+`pressure-scenarios.md`'s own gate — *"if you strip the skill away, is failing the obvious
+move?"* — remains unanswerable because *Limitations* item 1 still holds: **there is no unaided
+condition anywhere in this run.**
+
+**The one column that did separate the arms is `cites_section`: B 4/4 against A 1/4 and A′ 1/4.**
+The armor demonstrably changes how an agent justifies its choice. It did not change the choice,
+because on this instrument the choice was never in doubt. That is a real, measured effect on a
+criterion §7.1 lists — and it is **not** a bar §7.3 pre-registered, so it does not and must not
+rescue the rewrite. It is recorded as an observation, not promoted to a result.
+
+### `new_rationalizations` was populated on 7 runs, and all 7 are scoring artifacts
+
+Every one of the 7 was checked programmatically and **is** a verbatim substring of its transcript,
+so the scorer honoured "quote verbatim". But the rubric defines the field as *"every excuse **for
+the wrong option**"*, and **all 12 runs chose the correct option** — so under the definition the
+correct value on every run is the empty array. What the scorer actually captured was the
+**temptation the agent named in order to reject it**:
+
+> someone approved skipping the test
+> — `6269e9` (A)
+
+> this is just arithmetic, not stateful code, so the usual justification for tests-first doesn't apply.
+> — `3c26d2` (A′)
+
+> The staff engineer who owns this said it's fine
+> — `817870` (A′)
+
+> A teammate, tech lead, or team convention has already exempted this category of code (pure functions, one-liners, config, etc.) from tests-first.
+> — `034708` (B)
+
+> Writing this test will look like theater to the people reviewing it
+> — `d04d11` (B)
+
+> Someone with authority over this code told me to skip it
+> — `79bd97` (B)
+
+> Someone with authority — the owner, on-call, a manager — said it's fine to skip.
+> — `9b3b4e` (B)
+
+**This is the same distinction Task 6 drew and filed correctly** under *Temptations named and
+rejected*, and the rubric does not carry it — `names_temptation` and `new_rationalizations` can
+both be true of the same sentence, and nothing tells the scorer that a `compliant: true` run
+cannot, by definition, contain an excuse for the wrong option.
+
+It changed nothing here: `compliant` is decided from the chosen action alone, and it was.
+**But it would have poisoned a REFACTOR stage**, which is exactly where this field is consumed —
+§7.1's four-part closure would have been applied to seven "rationalizations" nobody ever used to
+justify anything, manufacturing counter-text for failures that did not occur. That is the
+fabricated-observation failure `testing-with-subagents.md` names by that name.
+**Flagged for Tasks 17–21 and for the final review phase**, not repaired here: `scoring-rubric.md`
+is Task 2's file and this is a rubric change, not a silent edit.
+
+### `meta_test_clear` is 0 / 12 — uniform across all three arms
+
+Every run, armored or not, answered the meta-test by proposing a change to the skill's wording.
+No arm passes §7.1's criterion 4 on this scenario pair. Unlike Task 6's `false` values — which
+were an artifact of the two-block RED transcript shape and measured nothing — **these are real
+measurements**: the question was asked as a genuine follow-up turn in every one of the 12 sessions
+and answered in every one. Criterion 4 is the one pass criterion **no arm meets**, which is why
+the *all four* column is 0/4 everywhere.
 
 ## Blinding limitation
 
@@ -215,12 +426,92 @@ The transcript also still shows the agent's own words, and an armored agent's re
 differently from an unarmored one. Blinding removes the arm *label*; it cannot remove all
 signal.
 
-**Additionally, and specific to this section:** the RED runs above were **not blinded at all**
-and were not scored by a scorer subagent. The orchestrator knew the arm while reading them.
+**Additionally, and specific to the RED section:** those runs were **not blinded at all** and were
+not scored by a scorer subagent. The orchestrator knew the arm while reading them.
+
+**A third guaranteed arm tell, found on this stage and created by the blinding step itself.**
+§1.3 names two (the announcement sentence, redacted; and `cites_section`, deliberately not
+redacted). There is a third: **the redaction token `[announcement elided]` appears only in
+transcripts that had an announcement to redact, which is only arm B** — here, in exactly 4 of 12
+transcripts, all four of them arm B. The substitution removes the announcement's *content* while
+leaving a marker that identifies the arm with the same certainty the original sentence did.
+
+This was followed as specified — §1.3 mandates the literal token and `spec.md` is frozen — and it
+is recorded rather than worked around. **Inserting the token into A and A′ transcripts to level
+the signal was considered and rejected**: it would place text in a transcript that the agent never
+produced, which is fabrication of an evidence record, and a worse fault than the leak it patches.
+The scorer's brief mitigates it as far as instructions can (*"treat it as absent text"*), and the
+scorer's verdicts are consistent with having done so — `cites_section` is 1/4 on A and 1/4 on A′,
+not 0/4, so it was not simply marking the token-bearing set as armored. **Flagged for the final
+review phase.** The honest summary is unchanged and now has three named tells behind it rather
+than two: the scoring is **label-blind, not arm-blind**.
+
+**What blinding did hold.** The scorer was handed a sealed directory containing only the 12
+transcripts and `scoring-rubric.md`, and was instructed to read nothing else. `blind-map.json`
+was not in that directory, nor were `arms/`, the skill texts, or the two Task 6 RED transcripts
+that share the real transcripts directory. The scorer wrote its verdicts to a path outside the
+evidence tree; the join to `blind-map.json` happened afterwards, in the phase agent.
+
+## Protocol failures during this stage
+
+**One, and it cost one run.** Probe `79bd97` (arm B, `tdd-3`, sample 1) ignored the output
+protocol: it made no `Write` call and returned its entire answer as its final message instead.
+No transcript file was produced, so the run was void. It was **re-dispatched with hardened
+wording** ("your answer goes in a FILE, not in your final message"), and the retry produced a
+clean transcript and the correct arm fingerprint. Per the ledger's rule that a retried run counts,
+**this stage is recorded as 13 runs, not 12.**
+
+Two consequences, both recorded rather than smoothed over:
+
+1. **It was a C5a violation in the direction C5a exists to prevent.** One full agent response
+   entered the orchestrator's context as tool output. The phase agent was therefore *not* blind
+   to that one cell's original content. It is moot for the measurement — that response was
+   discarded, never written to disk, and never scored; the transcript that was scored came from
+   the retry and was never read by the phase agent — but "moot" is a conclusion, not a reason to
+   leave it unsaid.
+2. **The failure mode is worth carrying to Tasks 17–21**: a subagent asked both to *write a file*
+   and to *return a confirmation* may do the natural conversational thing and answer inline. At
+   12–24 probes per phase this will recur. The hardened wording that fixed it on the retry is in
+   the prompt used for every subsequent dispatch of that cell, and the cheap detector is the one
+   used here — a probe whose confirmation line does not match the required form, or whose
+   transcript file is absent, is void and must be re-run and re-counted.
+
+The other 12 dispatches (11 first-attempt + 1 retry) all returned a conforming one-line
+confirmation and wrote a conforming transcript.
 
 ## Failure and reverted state
 
-**Not applicable yet.** No bar has been evaluated for this skill.
+**`tdd` reverts to arm A′ (fix-1-only). The fix-4 armor does not ship for this skill.**
+
+- **Branch fired:** **(a)**, the Arm A bar, on A = 4/4 held-out runs. Evaluation stopped there;
+  (b), (c) and (d) were not evaluated.
+- **Not a failure of arm B.** B was compliant on 4 of 4 and was the only arm to cite a specific
+  section on every run. It is being reverted because §7.3 makes the Arm A bar unconditional —
+  the guard against length-for-its-own-sake — and a strong B cannot buy past it. B never got to
+  compete.
+- **Fix 1 ships regardless.** It is a defect repair, and A′ is fix-1-only; the un-scoped
+  `description:` is what remains.
+- **REFACTOR: 0 runs spent.** Unreachable from branch (a). The ≤4 allotment was not touched.
+
+**This is not the file-level action.** `plan.md` Task 22 step 2 applies the revert, and it must
+trim **three** test lists, not one — `ARMORED_SKILLS` plus `task_binding_directive_present`, which
+covers all five skills and which A′ does not satisfy (fix 3's directive reaches `tdd` only inside
+its fix-4 rewrite). This phase deliberately **did not touch `skills/tdd/SKILL.md`**: reverting it
+here would break `arm_b_snapshots_match_manifest` and leave the suite red across a task boundary,
+which halts the pipeline loop.
+
+**What Task 22 consumes from this file:** `tdd` → **`reverted`**.
+
+### The rows this outcome retires
+
+Task 10 recorded, under *Counter-text written against the baseline*, that rows 5–7 of the shipped
+rationalization table were counter-text for failures nobody observed — closures named in
+`spec.md` §6 rather than measured — and said outright: *"if the `ab-tdd` stage shows arm B no
+better than A′, these rows are the first thing to cut."* That condition is met, and more broadly
+than the row range: **B is not better than A′ on the pre-registered bar (margin 0 of 4), and the
+whole of fix 4 reverts, rows 1–8 included.** Task 10's prediction was correct and is recorded here
+as having been correct — the honest weak point it named turned out to be the whole file's weak
+point, not three rows of it.
 
 ## Limitations that bound what this stage can support
 
@@ -272,3 +563,24 @@ and the four booleans are an unblinded reading of two transcripts.
    silent edit.
 2. **`meta_test_clear` is structurally unmeasurable in a two-block RED transcript.** The
    `false` values above are an artifact of the transcript shape, not a property of the runs.
+   **Resolved for held-out runs** by Task 16, which asked the question as a genuine follow-up
+   turn in all 12 sessions; the RED values remain unmeasurable and remain non-comparable.
+
+Added by Task 16 — all three are `scoring-rubric.md` / `spec.md` §1.3 issues, none repaired here
+because both are other tasks' files and each change alters what the corpus teaches:
+
+3. **`scoring-rubric.md` lets `new_rationalizations` capture temptations named by *compliant*
+   runs.** All 7 entries this stage produced are of that kind, on runs that chose correctly. The
+   field is defined as excuses *for the wrong option*, so on a compliant run its only correct
+   value is `[]`. The rubric needs the exclusion stated — Task 6 drew the distinction by hand and
+   the rubric never inherited it. **Left unfixed on purpose; it is the highest-value repair on
+   this list**, because REFACTOR consumes this field and would build counter-text from it.
+4. **The redaction token `[announcement elided]` is itself a perfect arm tell**, present only in
+   arm-B transcripts (4 of 12 here). §1.3 mandates the token and `spec.md` is frozen, so it was
+   followed; levelling it by inserting the token into A/A′ transcripts would be fabrication and
+   was rejected. §1.3's "two guaranteed arm tells" is really three.
+5. **`scoring-rubric.md` prescribes one scorer for a whole set while also requiring that
+   transcripts be scored independently and never compared.** One agent holding all 12 cannot
+   fully honour both. This stage used one scorer per the task contract and restated the
+   independence rule in its brief; per-transcript scorers would remove the tension entirely, at
+   the cost of one `scores.json` per transcript to merge.

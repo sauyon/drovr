@@ -1,0 +1,14 @@
+{
+  "3bc56a": { "arm": "A", "scenario": "tdd-2", "sample": 1 },
+  "e2bc1c": { "arm": "A", "scenario": "tdd-2", "sample": 2 },
+  "6269e9": { "arm": "A", "scenario": "tdd-3", "sample": 1 },
+  "fd9de6": { "arm": "A", "scenario": "tdd-3", "sample": 2 },
+  "d56909": { "arm": "A-prime", "scenario": "tdd-2", "sample": 1 },
+  "3c26d2": { "arm": "A-prime", "scenario": "tdd-2", "sample": 2 },
+  "817870": { "arm": "A-prime", "scenario": "tdd-3", "sample": 1 },
+  "3a788c": { "arm": "A-prime", "scenario": "tdd-3", "sample": 2 },
+  "034708": { "arm": "B", "scenario": "tdd-2", "sample": 1 },
+  "d04d11": { "arm": "B", "scenario": "tdd-2", "sample": 2 },
+  "79bd97": { "arm": "B", "scenario": "tdd-3", "sample": 1 },
+  "9b3b4e": { "arm": "B", "scenario": "tdd-3", "sample": 2 }
+}
