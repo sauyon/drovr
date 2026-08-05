@@ -499,11 +499,13 @@ express the rule does not close it.
 | file | what it is |
 |---|---|
 | `scores.raw.json` | the scorer's output, **byte-untouched**. Shape-checked only — it records what was returned, not a claim that it was right |
-| `scores.json` | the **adjudicated** verdicts the bars read: the 7 `new_rationalizations` lists emptied, **every other field identical** |
+| `scores.json` | the **adjudicated** verdicts the bars read: the 7 `new_rationalizations` lists emptied, **plus one corrected `evidence` field** (`817870`, a paraphrase replaced with the verbatim line). No other field differs |
 | `adjudication.json` | the blind re-read that confirmed `compliant` on all 12 |
 
-Verified mechanically: `new_rationalizations` is the **only** field that differs between the two,
-and **0 `compliant` values changed**. Preserving the raw file is why the semantic rules are not
+Verified mechanically, field by field: **two** fields differ between the two files —
+`new_rationalizations` on 7 verdicts (`9b3b4e`, `d04d11`, `6269e9`, `79bd97`, `817870`, `034708`,
+`3c26d2`) and `evidence` on 1 (`817870`). **0 `compliant` values changed**, which is why no bar
+was recomputed. Preserving the raw file is why the semantic rules are not
 applied to it — holding a raw record to a corrected rule would make preserving raw evidence
 impossible, and destroying it would destroy the evidence that the rule needed correcting.
 
@@ -757,3 +759,31 @@ Two findings from the ab-tdd close-out gate, recorded rather than fixed.
 **Reasoning to record, verbatim from the gate:** both are real, neither blocks tasks 17–20, and
 this file's findings have run 2 → 7 → 7 while the **measurement verdict** (arm A 4/4, branch (a),
 revert to A′) has been stable and survived two rounds of scrutiny on its own evidence.
+
+### Added at close-out
+
+3. **[important]** `cli/tests/skills_valid.rs:6723` — `Verdict`'s transparent newtype does not
+   encode the stronger rubric contract its comment claims.
+4. **[important]** `cli/tests/skills_valid.rs:6701` — `transcript_id` stays a plain `String`
+   despite a closed 6-hex format and an existing `GitObjectId` newtype pattern in the same file.
+5. **[nit]** `cli/tests/skills_valid.rs:6830` — `correct_option` returns `ChosenOption` though
+   ground truth is always A, B or C.
+6. **[nit]** `scoring-rubric.md:57` — "Who enforces that" lists only the `new_rationalizations`
+   rules, omitting the `evidence` verbatim check the test now runs.
+
+### The finding that matters most here, and it is about the process
+
+Recorded verbatim from the close-out gate:
+
+> This evidence document has now stated something false about its own artifacts in FOUR
+> consecutive gate rounds — the seven quotes' location (twice), open item 3's characterisation,
+> and now the `scores.raw.json`/`scores.json` difference. The MEASUREMENT held up under all of
+> it: arm A 4/4, branch (a), `tdd` reverts to A′, unchanged across every round and re-verified
+> against the transcripts. What kept being wrong was the prose describing it.
+>
+> That matters beyond this task. Task 22 consumes these documents to decide what ships, and the
+> final review reads them as the record of what happened. A verdict whose surrounding narrative
+> is unreliable is hard to reproduce and easy to mistrust for the wrong reasons. Tasks 17–20
+> produce four more of these documents on the same template. Recommend the final review phase
+> check each evidence document's factual claims against the transcripts and score files
+> directly, rather than reading the narrative as settled.
