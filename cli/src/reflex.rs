@@ -1362,8 +1362,20 @@ mod tests {
     /// a trim to a neighbouring sentence turned both checks red with the rule
     /// itself fully intact.
     ///
-    /// It only folds; it does not lowercase or drop punctuation. A phrase that
-    /// has been reworded still has to fail.
+    /// It only folds; it does not lowercase or drop punctuation, so an ordinary
+    /// rewording or deletion of an anchor still fails.
+    ///
+    /// **What it gives up, stated rather than glossed:** folding erases line and
+    /// sentence boundaries, so text that has been genuinely rewritten can still
+    /// contain an anchor's exact word run reassembled across a boundary the
+    /// unfolded comparison would have seen. A reviewer built the case — rewriting
+    /// the 1% rule's clause to *"Skipping one costs the discipline, silently,
+    /// invoking / costs almost nothing about that"* keeps both checks green,
+    /// because the folded run `invoking costs almost nothing` survives the
+    /// rewrite by accident. That is a narrower hole than the false negative it
+    /// replaces (a reflow reading as a deletion, which happened twice while this
+    /// task was written), but it is a hole, and these checks are a drift guard
+    /// rather than a proof that the two texts still say the same thing.
     fn folded(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }

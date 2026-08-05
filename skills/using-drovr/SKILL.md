@@ -33,12 +33,12 @@ a long one. Everything below serves that.
 ## Instruction priority — the human outranks this file
 
 1. **The human's explicit instructions** — what they tell you directly, and what
-   `CLAUDE.md` / `AGENTS.md` say on their behalf. Highest.
+   `CLAUDE.md` / `AGENTS.md` say for them. Highest.
 2. **drovr skills** — these outrank your defaults wherever the two disagree.
 3. **Your own default behaviour** — lowest.
 
-**Not optional.** Every MUST in drovr is aimed at your own defaults, never at the
-person you are working with. If they tell you to skip a skill, skip it: say once,
+**Not optional.** Every MUST in drovr is aimed at your defaults, never at the person
+you work with. If they tell you to skip a skill, skip it: say once,
 plainly, that you are setting it aside because they asked, and get on with their
 work. The 1% rule above is written hard enough to talk over a human; this ladder is
 what sits under it.
@@ -56,22 +56,23 @@ digraph drovr_gate {
   say [label="announce it:\n\"Using drovr:<skill> — <purpose>.\""];
   chk [label="numbered checklist\nin the skill?", shape=diamond, fillcolor=lightyellow];
   trk [label="one tracked item per step,\nbefore you start step 1"];
-  fol [label="follow it, ticking as you go"];
+  fol [label="follow it"];
   rsp [label="only now: respond", fillcolor=palegreen];
 
   msg -> any;
   any -> inv [label="yes, or you cannot rule it out"];
-  any -> rsp [label="no — and you could name\nwhat you ruled out"];
+  any -> rsp [label="no — and you say\nwhat you ruled out"];
   inv -> say; say -> chk;
   chk -> trk [label="yes"]; chk -> fol [label="no"];
   trk -> fol; fol -> rsp;
 }
 ```
 
-The *no* edge is real — the test is whether you could name what you ruled out.
-"Nothing came to mind" is not ruling out.
+The *no* edge is not free. **Say what you ruled out**, in the response: kept in your
+head it is indistinguishable from never having checked, including to you. "Nothing
+came to mind" is not ruling out.
 
-**The checklist branch binds, and this is the whole of it:**
+**The checklist branch binds, in full:**
 
 > When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
 > using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
@@ -90,7 +91,7 @@ wrong at the moment you skip. Catch these before you answer.
 |---|---|
 | *"I already know the shape of it."* · *"I'm fairly sure how this works."* | Familiarity is the trigger, not the exemption — a hunch from an earlier read is not knowing. Invoke the skill that governs finding out. |
 | *"I'll just do it quietly, as the first step of the fix."* | You have already decided a methodology applies. Doing it silently drops the invocation, the announcement and the tracked checklist — the three things that make it hold under pressure. Invoke it. |
-| *"Announcing which methodology I am following would read as process theatre."* | Announce it in the working record — this session — not the customer-facing thread. That distinction answers the objection; it is not a reason to skip. One sentence, not a speech. |
+| *"Announcing which methodology I am following would read as process theatre."* | Announce it in the working record — this session — not the customer-facing thread. That answers the objection; it is not a reason to skip. One sentence, not a speech. |
 | *"That is my call to make, not theirs."* · *"Asking just burns clock."* | That settles *who answers*, not *whether a skill applies*. Run the gate before you ask a clarifying question, and before you decide not to ask one. |
 
 ## The principle (always)
@@ -160,6 +161,6 @@ Revise loop: edit `spec.md` →
 
 **REQUIRED BACKGROUND:** the downstream skills assume this file's contracts —
 single-writer rule, the run dir at `~/.local/share/drovr/runs/<name>/`, and that
-`drovr phase start` spawns a plain `claude` and does **not** inject the seed
+`drovr phase start` spawns `claude` and does **not** inject the seed
 (injecting the briefing is the skill's job, via `drovr phase send`).
 <!-- /reflex:section:escalation -->

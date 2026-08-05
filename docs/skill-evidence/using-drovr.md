@@ -158,12 +158,69 @@ what tempted them — not rationalizations.**
 
 ## Counter-text written against the baseline
 
-**Not yet written.** Task 14 owns this — and it also still owes the router the 1%-rule and
-per-turn phrases, the `GATE_CARD_PHRASES` additions, and the extended
-`routing_core_survives_section_subtraction` anchors that Task 5's handoff records as
-outstanding. See the null above before writing counter-text: there is no observed
-rationalization to counter, and the announcement-refusal finding is the strongest measured
-input this stage produced.
+**Written by Task 14 — 2026-08-04.** The router's counter-text is the *Red flags — you are
+about to route nothing* table in `skills/using-drovr/SKILL.md`, plus the 1% rule, the
+per-turn rule and the instruction-priority ladder above it. Task 14 also landed the
+`GATE_CARD_PHRASES` additions and the extended `routing_core_survives_section_subtraction`
+anchors that Task 5's handoff recorded as outstanding.
+
+### The provenance problem this stage handed Task 14, and how it was resolved
+
+**RED is a null for rationalizations**, so there is no baseline excuse to answer. `spec.md`
+§4.1 nonetheless requires the red-flag table's *"final wording [to come] from RED (§7), not
+from this list"* — and §4.1's own candidate list is the thing it is telling Task 14 not to
+use. The resolution: the table is built from the two sections of this stage that *do* carry
+verbatim agent language — **Temptations named and rejected** and **the announcement-refusal
+finding** — both of which the RED author recorded here explicitly *"because Task 14 needs the
+agent's own vocabulary for the pull"*.
+
+**These are compliant runs naming what tempted them, not rationalizations for a wrong
+answer**, and the table is framed accordingly: things to catch in your own head, never
+attributed to anyone as a failure.
+
+### Row-by-row provenance
+
+The table's two columns have two provenances, as Task 12 predicted for a null RED: **column
+one is the transcript's own words**; **column two is prescription written against them**, not
+an observation. Recorded per row, keyed by row text rather than row number (Task 13's dead-end
+5 — deleting a row silently invalidated six by-number citations).
+
+| Row (column 1) | Source | Column 2's status |
+|---|---|---|
+| *"I already know the shape of it."* · *"I'm fairly sure how this works."* | Verbatim `9dfe02` (*"'I already know the shape of it' is exactly the moment a wrong fix gets committed"*) and `dcc2a8` (*"'Fairly sure' about a batch retry re-entering at the top isn't the same as confirmed"*) | Prescription |
+| *"I'll just do it quietly, as the first step of the fix."* | Near-verbatim `9dfe02`: *"I'm just going to do the diagnosis, quietly, as the first step of the fix"* | Prescription — **and it names mechanisms arm A did not have.** Arm A carries no announcement sentence and no checklist binding, so nothing was *observed* being dropped. The impulse is measured; the three-things consequence is this run's own claim about the mechanisms fix 2 and fix 3 add. Flagged by the evidence-grounding reviewer and left standing as prescription, marked here rather than reworded |
+| *"Announcing which methodology I am following would read as process theatre."* | Paraphrase of a **2-of-2 verbatim** result — `dcc2a8`: *"announcing that would read as process theatre"*; `9dfe02`: *"that would be the process theatre the finance lead already waved off"*. The *finding that matters most in this stage*, above | Prescription. Its *working record, not the customer-facing thread* distinction is Task 14's answer to the objection, not something a run said |
+| *"That is my call to make, not theirs."* · *"Asking just burns clock."* | Near-verbatim `9dfe02` (*"that's my call to make, not theirs, and asking just burns clock"*) and `dcc2a8` (*"'how much process this warrants' isn't their call to make"*) | Prescription |
+
+### Cut, and restorable
+
+**§4.1's fifth candidate row — *"I'm already mid-task, the router was for turn one"* — was
+drafted and then cut**, to bring the body under §2.4's 9000 B cap. It was the only row with
+**no RED grounding at all**: it came from §4.1's candidate list, which §4.1 itself says is not
+the source. Cutting it is therefore defensible on its merits *and* was forced by the cap; both
+are true and the second is why it happened first. The per-turn rule it guarded is still stated
+above the H1, in the `description:`, in the gate flowchart's entry edge, and in `GATE_CARD` —
+but it now has **no red-flag row**, which is the same gap Task 13 recorded for the `time`
+pressure on `code-review`. Restorable verbatim:
+
+> | *"I am already mid-task — the router was for turn one."* | It applies to this turn. Mid-task is where it is skipped most, and where a skipped skill costs most — the context is already long. |
+
+### One correction carried into arm B, named so it is not read as content vanishing
+
+Arm A's escalation section said `drovr phase start` *"spawns a **plain** `claude`"*. That word
+is false: `cli/src/config.rs:217` gives the built-in `claude` agent
+`system_prompt_flag: Some("--append-system-prompt")`, and `Config::launch` (`:406`) appends a
+workspace-boundary prompt on every `phase_start` (`cli/src/phase.rs:168`). Arm B drops the
+word *plain*; the sentence's actual claim — that the **briefing** is not injected, which
+`drovr phase send` does — was and remains true. **This is the third consecutive task to find a
+false claim about drovr's own CLI inside a skill doc** (Task 13 found two). A reader diffing
+A′ against B should see this one-word change here rather than infer it.
+
+**Arm B also introduces an announcement sentence to `using-drovr`, which arm A did not have.**
+This stage recorded *"announcement redaction is moot because arm A contains no announcement
+sentence"*. That is no longer true for arm B: the gate flowchart's `say` node carries
+`"Using drovr:<skill> — <purpose>."`. **Tasks 16–21 must redact it** under `plan.md` §1.3's
+rule, exactly as they do for the four discipline skills.
 
 ## Scored results
 
