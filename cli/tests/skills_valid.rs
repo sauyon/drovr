@@ -5057,7 +5057,7 @@ fn claim_text(cell: &str) -> String {
 }
 
 /// spec §6 section 7: *claim → required evidence → **not sufficient***, over the
-/// claims §6 names for this skill.
+/// rows this skill declares.
 ///
 /// **What this asserts that a heading cannot.** `required_sections` proves a
 /// `Requirements` heading exists and `check_armor` proves no `dot` fence does;
@@ -5067,6 +5067,14 @@ fn claim_text(cell: &str) -> String {
 /// makes for section 6's arity, applied to the section that had no analogue. §6
 /// names the five for `verification-before-completion` only; `code-review`'s
 /// four are its author's, which is why the row set rides on the variant.
+///
+/// **What the diagnostics below may and may not blame on §6.** §6 owns the
+/// *section*: that it exists, that it is three columns, that the third names
+/// what is not sufficient, that a row states something in every cell. Those
+/// messages cite §6. It does **not** own which rows a given skill states — only
+/// `verification-before-completion`'s five are §6's — so messages naming a row
+/// kind (`` `deferred` ``, `` `clean` ``) say "section 7" without the §6, or
+/// they send an author to a spec section that does not govern their row.
 ///
 /// The three columns are asserted too. A two-column table is not §6's section 7:
 /// dropping the `not sufficient` column deletes the half that closes loopholes,
@@ -5101,7 +5109,7 @@ fn check_requirements_table(
     for (kind, claim) in claims.rows().iter() {
         if claim_text(claim).is_empty() {
             wrong.push(format!(
-                "{}: §6 section 7's `{kind}` claim is declared blank, so the row \
+                "{}: section 7's `{kind}` claim is declared blank, so the row \
                  comparison below would be satisfied by a blank cell. Declare the \
                  wording this skill gives that row.",
                 path.display(),
@@ -5218,7 +5226,7 @@ fn check_requirements_table(
             .and_then(|i| kinds.get(i))
             .unwrap_or(&"(row count)");
         wrong.push(format!(
-            "{}: §6 section 7's table states the claims {found:?}, but this \
+            "{}: section 7's table states the claims {found:?}, but this \
              skill's Armor declares {expected:?} — first difference at the \
              `{at_kind}` row. Change the table and the declaration in the same \
              edit: a row dropped, reordered or reworded changes which claims the \
@@ -5466,7 +5474,7 @@ fn armor_table_declares_well_formed_strings() {
             assert_eq!(
                 unique.len(),
                 normalized.len(),
-                "{name}: §6 section 7's declared claims contain a duplicate: \
+                "{name}: section 7's declared claims contain a duplicate: \
                  {normalized:?}. A skill's section-7 rows are different claims; \
                  two spelled the same way means one of them is not being asked \
                  for."
