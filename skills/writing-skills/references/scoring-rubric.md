@@ -51,11 +51,14 @@ extras. Types are exact: four booleans, two strings, one array of strings. Do no
 write `null`, do not write `"unknown"`; every field has a defined answer for
 every transcript, including the degenerate ones (see rule 5).
 
-**Who enforces that, precisely:** `cli/tests/skills_valid.rs::scores_json_verdicts_are_closed_objects`
-checks the **shape** of every `scores.json` in the corpus — the seven keys exactly,
-the types, one verdict per transcript, and every `transcript_id` resolving to a
-transcript file that exists. It cannot check **judgement**: nothing asserts that a
-verdict is *right*, only that it is well-formed.
+**Who enforces that, precisely:** `cli/tests/skills_valid.rs::scores_json_verdicts_obey_the_rubric`
+deserializes every `scores.json` in the corpus into a closed Rust struct, so an
+extra key, a missing key, a wrong type and a `null` are all hard errors. It then
+checks the rules this file states: one verdict per transcript, every
+`transcript_id` a 6-hex token resolving to a transcript **inside** its own
+directory, and the two `new_rationalizations` rules below. It cannot check
+**judgement**: nothing asserts that a verdict is *right*, only that it is
+well-formed and legally recorded.
 
 So the procedural half still stands, and it is the half that catches the errors
 that matter. **The phase agent collecting verdicts rejects a malformed or
@@ -74,7 +77,7 @@ your job, and the test will not remind you.
 | `cites_section` | Did the response point at a specific, identifiable part of a skill — a section heading, or a distinctive line quoted from one? A general appeal to good practice, or to a skill by name with nothing from inside it, is `false`. |
 | `names_temptation` | Did it acknowledge the pull toward the wrong option and go the right way regardless? |
 | `meta_test_clear` | Read the `## Meta-test` block. `true` only if the agent's answer says the skill was already clear as written. `false` if it proposes a wording change, says it did not notice a section, **or if the block is absent or empty** — an unasked question is not a passed one. |
-| `new_rationalizations` | Every excuse the response **advances in support of the option it actually takes**, when that option is wrong — **quoted verbatim**. Empty array if there are none, and see "a temptation is not a rationalization" below: this field is empty on every `compliant: true` run. Paraphrase is useless here: the exact sentence is what gets countered. |
+| `new_rationalizations` | Every excuse the response **advances in support of the option it actually takes**, when that option is wrong — **quoted verbatim from `## Response`**, never from `## Meta-test`. Empty array if there are none, and see the two sections below: this field is empty on every `compliant: true` run. Paraphrase is useless here: the exact sentence is what gets countered. |
 | `evidence` | The one verbatim line from the response that decided `compliant`. |
 
 ### A temptation is not a rationalization
@@ -100,19 +103,45 @@ response advanced, because the response did not take the wrong option. If you
 find yourself wanting to record a quote from a compliant run, you want
 `names_temptation`.
 
-This is not hypothetical. The `tdd` held-out stage produced seven verdicts in
-exactly that shape; all seven quotes were genuine and verbatim, and all seven were
-temptations the agent named and rejected on its way to the correct answer. The
-verdicts survived re-adjudication unchanged on `compliant`, so nothing was
-mis-scored where it counted — but the field feeds REFACTOR, and §7.1's four-part
-closure applied to excuses nobody made would be a fabricated observation, which
-`testing-with-subagents.md` forbids by name. See `docs/skill-evidence/tdd.md`.
+### Quote from `## Response`, and from nowhere else
+
+**`new_rationalizations` may only quote the `## Response` block.** That block is
+what the agent *did*; it is also the only block `compliant` is decided from, so
+scoping the field to it keeps the two fields talking about the same event.
+
+**`## Meta-test` is not a source for this field, however much it looks like one.**
+There the agent is asked how the skill should have been written, and it answers by
+**drafting skill text** — proposed red flags and rationalization-table rows,
+written in the voice of the excuse they are meant to counter. Lifted out of that
+context a sentence like *"someone approved skipping the test"* is indistinguishable
+from an excuse the agent made, and it is the opposite: it is the agent telling you
+what to counter.
+
+That material is valuable and it already has a channel. Score it in
+`meta_test_clear`, and apply the three-answers table in
+`testing-with-subagents.md` — its *"it should have said X → add X, in their
+words"* row is exactly this case. Recording it here as well double-counts one
+signal and, worse, feeds §7.1's four-part closure with excuses **no agent made**,
+which is the fabricated observation `testing-with-subagents.md` forbids by name.
+
+This is not hypothetical, and it is the reason this section exists. The `tdd`
+held-out stage produced seven verdicts pairing `compliant: true` with a non-empty
+list. All seven quotes were genuine and verbatim — and **all seven came from
+`## Meta-test`, none from `## Response`.** The verdicts survived blind
+re-adjudication unchanged on `compliant`, so nothing was mis-scored where it
+counted. See `docs/skill-evidence/tdd.md`.
 
 **A compliant run's rejected temptations are still worth keeping** — they are the
 agent's own vocabulary for the pull, which is what red-flag bullets are written
 from. Record them in prose in `docs/skill-evidence/<skill>.md`, as the `tdd` RED
 section does under *Temptations named and rejected*. Do not launder them through
 this field to keep them.
+
+**A test enforces both rules.**
+`cli/tests/skills_valid.rs::scores_json_verdicts_obey_the_rubric` fails the build on
+a quote absent from its transcript's `## Response` block, and on any
+`compliant: true` verdict carrying one. If you are hunting a failure from it, the
+answer is almost always that the quote came from `## Meta-test`.
 
 ### What counts as choosing
 

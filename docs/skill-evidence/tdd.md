@@ -312,20 +312,24 @@ mechanisms therefore agree on the arm assignment of every run.
 joined to it only after all 12 verdicts were recorded and checked.
 
 **What "checked" means, precisely — stated because the first draft of this file said
-"schema-validated" and nothing enforced a schema.** `scoring-rubric.md` says outright that *no
-test* enforces the closed verdict object and that the phase agent must reject a malformed verdict
-by hand; the original check here was a one-off script that left no artifact, which is a claimed
-guarantee with nothing behind it. **That is now a real test**:
-`cli/tests/skills_valid.rs::scores_json_verdicts_are_closed_objects` validates every
-`scores.json` in the corpus — exactly seven keys, four booleans, two strings, an array of
-strings, one verdict per transcript, and every `transcript_id` resolving to a transcript file
-that exists. It was mutation-checked in both directions (an added key and a stringified boolean
-each turn it red) so it is not a vacuous pass, and it runs for every later `ab-*` phase without
-anyone remembering to.
+"schema-validated" and nothing enforced a schema.** `scoring-rubric.md` used to say outright that
+*no test* enforced the closed verdict object; the original check here was a one-off script that
+left no artifact, which is a claimed guarantee with nothing behind it. **That is now a real
+test**: `cli/tests/skills_valid.rs::scores_json_verdicts_obey_the_rubric` deserializes every
+`scores.json` in the corpus into a closed Rust struct — so an extra key, a missing key, a wrong
+type and a `null` are deserialization errors, not assertions someone remembered to write — and
+then checks the rubric's own rules: one verdict per transcript, every `transcript_id` a 6-hex
+token resolving to a transcript **inside** its own directory, `new_rationalizations` quoting only
+`## Response`, and no rationalizations on a `compliant: true` verdict.
 
-**What it does not check, said plainly:** whether a verdict is *right*. Shape is a type question;
-judgement is not. Nothing in the suite asserts that `compliant` matches the transcript — that is
-what the blind scorer, and the re-adjudication below, are for.
+Mutation-checked in five directions, each turning it red: a traversal `transcript_id`, a
+`compliant: true` verdict carrying a rationalization, a rationalization lifted from `## Meta-test`,
+an added key, and a `null` field. It is not a vacuous pass, and it runs for every later `ab-*`
+phase without anyone remembering to.
+
+**What it does not check, said plainly:** whether a verdict is *right*. Well-formedness and legal
+recording are type questions; judgement is not. Nothing in the suite asserts that `compliant`
+matches the transcript — that is what the blind scorer, and the re-adjudication below, are for.
 
 ### Which branch fired, and the margins
 
@@ -389,21 +393,56 @@ settle a scoring question would spend measurement budget on an accounting error.
 **Resolution: the scorer and the rubric disagree about what the field means. `compliant` is not
 affected, the counts are unchanged, and branch (a) still fires.**
 
-**What the scorer actually meant by those rows.** It read `new_rationalizations` as *"the pressure
-this response articulated"* rather than the rubric's *"excuse **for the wrong option**"*. All
-seven quotes are genuine — each was verified programmatically to be a verbatim substring of its
-own transcript, so "quote verbatim" was honoured — and each sits in a passage that commits to the
-keyed option and then names the pressure **in order to reject it** (*"…are all real, but none of
-them change what the Iron Law says"*; *"isn't a substitute for a red test"*; *"answers a question
-nobody needed answered"*). The scorer recorded the temptation and filed it in the rationalization
-field.
+**What the scorer actually meant by those rows — corrected, because the first version of this
+section got it wrong.** An earlier draft said the seven quotes sat in `## Response` passages that
+named a pressure in order to reject it. **That was false, and it was false about this stage's own
+transcripts.** The check behind it was a script that, when a quote was *not* found, silently
+printed the beginning of the response instead of the match — so it displayed a commit-then-reject
+passage for every quote regardless of whether the quote was in it. A verification step that
+produces plausible output when it finds nothing is the vacuous-pass defect this run has now hit
+eight times, and it produced a false statement in the evidence document for the run's first
+result.
+
+**Where the quotes actually come from — checked per block, with found/not-found reported
+explicitly this time:**
+
+| block | quotes found |
+|---|---|
+| `## Response` | **0 of 7** |
+| `## Meta-test` | **7 of 7** |
+
+**All seven are the agent drafting proposed skill text**, in answer to the meta-test question
+*"how should this skill have been written so that the correct option was unmistakable?"*. They are
+not excuses the agent made; they are the excuses the agent recommended the skill should
+pre-empt — quoted from inside its own proposed wording:
+
+> the skill has no red flag for authority substituting for evidence. […] The skill should add a
+> fifth red flag next to the other four: *"someone approved skipping the test → an approval is not
+> a test result; it reduces blame, not risk."*
+> — `6269e9`, the passage the quote was lifted from
+
+> To make the correct option unmistakable, I'd close that gap directly […] **Add a
+> rationalization-table row for exactly this case.** Something like: *"A teammate, tech lead, or
+> team convention has already exempted this category of code […] from tests-first."*
+> — `034708`, likewise
+
+So the scorer harvested the agents' **proposed counter-text targets** into the field meant for
+observed excuses.
+
+**The corrected location makes the verdict more defensible, not less.** `compliant` is decided
+from the chosen action in `## Response` alone. Nothing the scorer recorded in
+`new_rationalizations` came from `## Response` at all, so that field could not have been derived
+from — or have contaminated — the compliance judgement. It is drawn from a different block,
+answering a different question.
 
 **How that was established, and why it is not just this phase agent's reading.** By the time the
 question arose the phase agent knew the arm mapping and was no longer a blind party, so the
 adjudication was delegated: **a fresh blind subagent re-read all 12 transcripts in the same sealed
 directory** (no rubric, no arm labels, no `blind-map.json`) and was asked only which option each
 response commits to, and which quotes — if any — the response *advances in support of an option it
-does not take*. Results in `transcripts/tdd/adjudication.json`:
+does not take*. It was scoped to `## Response` explicitly, so its "0 excuses" result is a
+statement about the block `compliant` is decided from, and is unaffected by the block-location
+error corrected above. Results in `transcripts/tdd/adjudication.json`:
 
 | check | result |
 |---|---|
@@ -424,16 +463,53 @@ counter-text for failures that did not occur — the fabricated-observation fail
 `testing-with-subagents.md` names by that name. `tdd` reverts and spends no REFACTOR runs, so the
 damage was zero here and would not have been in a phase that reached branch (d).
 
+**The rule this settles — a `[tier 4]` ruling, because the rubric never said which block the field
+draws from and both readings are defensible.**
+
+- **Reading taken: `new_rationalizations` quotes `## Response` only.** The field records excuses
+  the agent *advanced for the option it took*; `## Meta-test` is the agent redesigning the skill,
+  and its proposed wording is not observed behaviour. Meta-test content already has its own
+  channel — `meta_test_clear` plus `testing-with-subagents.md`'s three-answers table, whose
+  *"it should have said X → add X, in their words"* row is exactly what these seven are. Routing
+  them twice would double-count one signal.
+- **Reading rejected: that `compliant: true` plus a non-empty list is legitimate when the quotes
+  come from the meta-test.** It is coherent, and it would have left `scores.json` untouched. It
+  was rejected because it feeds §7.1's four-part closure with excuses **no agent made** — the
+  fabricated-observation defect `testing-with-subagents.md` forbids by name — and because it
+  leaves the field meaning two different things depending on where a scorer happened to look.
+- **The bars are identical under both readings**, because neither touches `compliant`. This ruling
+  changes what may be recorded, not what was measured.
+
 **`scoring-rubric.md` is now fixed** so the next four phases cannot reproduce the ambiguity: a new
 *"A temptation is not a rationalization"* section gives the deciding question (is the response
-advancing this, or setting it aside?), states that the field is `[]` on every `compliant: true`
-run, and points compliant runs' rejected temptations at the per-skill evidence file's prose —
-where Task 6 already put `tdd`'s — instead of at this field. The earlier draft of this document
-left that repair to the final review phase; the review gate was right that it could not wait, and
-it did not.
+advancing this, or setting it aside?), scopes the field to `## Response`, states that it is `[]`
+on every `compliant: true` run, and points compliant runs' rejected temptations at the per-skill
+evidence file's prose — where Task 6 already put `tdd`'s. The earlier draft of this document left
+that repair to the final review phase; the review gate was right that it could not wait.
+
+**And it is now enforced, not merely written down.**
+`cli/tests/skills_valid.rs::scores_json_verdicts_obey_the_rubric` fails the build on a verdict
+whose `new_rationalizations` quote is not present verbatim in that transcript's `## Response`
+block, and on any `compliant: true` verdict carrying one. The first version of that test checked
+syntax only, which is exactly why these seven rows were build-passing; a shape check that cannot
+express the rule does not close it.
+
+**Both files are kept, and the difference between them is the point:**
+
+| file | what it is |
+|---|---|
+| `scores.raw.json` | the scorer's output, **byte-untouched**. Shape-checked only — it records what was returned, not a claim that it was right |
+| `scores.json` | the **adjudicated** verdicts the bars read: the 7 `new_rationalizations` lists emptied, **every other field identical** |
+| `adjudication.json` | the blind re-read that confirmed `compliant` on all 12 |
+
+Verified mechanically: `new_rationalizations` is the **only** field that differs between the two,
+and **0 `compliant` values changed**. Preserving the raw file is why the semantic rules are not
+applied to it — holding a raw record to a corrected rule would make preserving raw evidence
+impossible, and destroying it would destroy the evidence that the rule needed correcting.
 
 **The seven quotes, kept for what they are worth** — they are the agents' own vocabulary for the
-pull, which is what red-flag bullets get written from:
+pull, and `testing-with-subagents.md`'s meta-test table says to add such wording *in their words*.
+That makes them input to the skill's text, not measurements of its failure:
 
 > someone approved skipping the test
 > — `6269e9` (A)
@@ -456,11 +532,12 @@ pull, which is what red-flag bullets get written from:
 > Someone with authority — the owner, on-call, a manager — said it's fine to skip.
 > — `9b3b4e` (B)
 
-**This is the same distinction Task 6 drew and filed correctly** under *Temptations named and
-rejected* — where these seven belong, and where the repaired rubric now sends them. The rubric
-did not carry it: `names_temptation` and `new_rationalizations` can both look true of the same
-sentence, and nothing told the scorer that a `compliant: true` run cannot, by definition, contain
-an excuse for the wrong option. That gap is closed.
+**This is a near relative of the distinction Task 6 drew and filed correctly** under *Temptations
+named and rejected* — but not the same one, and the difference is worth keeping straight. Task 6's
+quotes were temptations named **inside the response**, on the way to the right answer. These seven
+are proposed **skill wording**, offered when the agent was asked to redesign the skill. Both
+belong in this file's prose rather than in `new_rationalizations`; only the first is evidence about
+what an agent under pressure did.
 
 ### `meta_test_clear` is 0 / 12 — uniform across all three arms
 
@@ -634,9 +711,12 @@ each is a `spec.md` §1.3 or corpus-shape change that alters what the corpus tea
    which gives the deciding question, states the field is `[]` on every `compliant: true` run, and
    routes compliant runs' rejected temptations to the evidence file's prose. The seven verdicts
    were re-adjudicated blind before the fix and `compliant` survived unchanged on all 12
-   (`transcripts/tdd/adjudication.json`). **`scores.json` was deliberately NOT rewritten** — it is
-   the primary record of what the scorer actually returned, and the adjudication is recorded
-   beside it rather than overwriting it.
+   (`transcripts/tdd/adjudication.json`). The scorer's untouched output is preserved as
+   **`scores.raw.json`**; `scores.json` carries the adjudicated verdicts the bars read, differing
+   only in the 7 emptied `new_rationalizations` lists — **0 `compliant` values changed**. A second
+   review round then found that the first version of this entry described the quotes' location
+   wrongly; see the corrected account in *Scored results*, and the `[tier 4]` ruling that scopes
+   the field to `## Response`.
 4. **The redaction token `[announcement elided]` is itself a perfect arm tell**, present only in
    arm-B transcripts (4 of 12 here). §1.3 mandates the token and `spec.md` is frozen, so it was
    followed; levelling it by inserting the token into A/A′ transcripts would be fabrication and

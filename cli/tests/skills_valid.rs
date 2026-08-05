@@ -6684,63 +6684,167 @@ fn headings_are_atx_headings() {
     );
 }
 
-/// Every `scores.json` under `docs/skill-evidence/transcripts/<skill>/` carries
-/// verdict objects in the **closed** shape `scoring-rubric.md` specifies: exactly
-/// seven keys, four booleans, two strings, one array of strings, no `null` and no
-/// `"unknown"`.
+/// A scorer's verdict object (`scoring-rubric.md`, plan §1.3).
 ///
-/// **What it closes:** the rubric says outright that *no test* enforces the closed
-/// object and that the phase agent must reject a malformed verdict by hand. Task 16
-/// then described its verdicts as "schema-validated" on the strength of a one-off
-/// script that left no artifact — a claimed guarantee with nothing behind it, which
-/// is the defect class this run has hit repeatedly. This is the mechanism that makes
-/// the claim true, and it runs for every later `ab-*` phase without anyone
-/// remembering to.
-///
-/// It deliberately checks **shape, not judgement**. Whether a given verdict is
-/// *correct* is a scoring question that a type cannot answer; whether it is
-/// *well-formed* is exactly what a type can. In particular this test does **not**
-/// assert that a `compliant: true` verdict has an empty `new_rationalizations` —
-/// that rule lives in `scoring-rubric.md`, and `tdd.md` records a scored set where
-/// the two disagreed. Encoding it here would make the evidence record fail the build
-/// instead of being adjudicated.
-///
-/// Skills whose `ab-*` phase has not run yet have no `scores.json` and are skipped,
-/// so this passes today and tightens as each phase lands.
-#[test]
-fn scores_json_verdicts_are_closed_objects() {
-    const REQUIRED: [&str; 7] = [
-        "transcript_id",
-        "compliant",
-        "cites_section",
-        "names_temptation",
-        "meta_test_clear",
-        "new_rationalizations",
-        "evidence",
-    ];
-    const BOOLS: [&str; 4] = [
-        "compliant",
-        "cites_section",
-        "names_temptation",
-        "meta_test_clear",
-    ];
+/// **The struct IS the schema.** `deny_unknown_fields` plus seven non-`Option`
+/// fields makes "extra key", "missing key", "wrong type" and `null` all
+/// deserialization errors rather than assertions someone remembered to write. An
+/// earlier version of this check walked an untyped `serde_json::Value` and
+/// re-implemented that by hand, which is both longer and weaker: the hand-rolled
+/// version could only reject what it thought to look for.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Verdict {
+    transcript_id: String,
+    compliant: bool,
+    #[allow(dead_code)]
+    cites_section: bool,
+    #[allow(dead_code)]
+    names_temptation: bool,
+    #[allow(dead_code)]
+    meta_test_clear: bool,
+    new_rationalizations: Vec<String>,
+    evidence: String,
+}
 
+/// A blind re-adjudication record (`transcripts/<skill>/adjudication.json`).
+///
+/// Written when a scored verdict is challenged and re-read by a fresh blind
+/// subagent. It is evidence in its own right, so it gets a schema for the same
+/// reason `scores.json` does — an unvalidated second verdict-like file is exactly
+/// the drift this corpus keeps finding.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adjudication {
+    transcript_id: String,
+    chosen_option: String,
+    matches_key: bool,
+    excuses_for_an_option_not_taken: Vec<String>,
+}
+
+/// The `## Response` block of a transcript — the agent's own words, and the only
+/// part of a transcript that records what it *did*.
+///
+/// `## Meta-test` is deliberately excluded. There the agent is asked how the skill
+/// should have been written, and it answers by drafting skill text: proposed red
+/// flags and table rows, phrased as the excuses they are meant to counter. That
+/// text reads exactly like a rationalization and is not one, which is precisely
+/// how seven of them reached `tdd`'s `scores.json`.
+fn response_block(transcript: &str) -> &str {
+    let after = transcript
+        .split_once("\n## Response")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    after
+        .split_once("\n## Meta-test")
+        .map(|(before, _)| before)
+        .unwrap_or(after)
+}
+
+/// Resolve `<id>.md` inside `dir`, refusing an id that escapes it.
+///
+/// **Why containment is checked rather than assumed:** the id comes out of a JSON
+/// file, and joining untrusted text into a path and then asking whether the result
+/// exists will happily confirm a file in an unrelated directory. `..%2f`-shaped ids
+/// are the obvious case; a bare `../../README` is enough. This run has fixed the
+/// same class twice already (`reachable_paths`, the panel-roles empty-range guard),
+/// so it is checked here at the third site rather than after a fourth.
+///
+/// Two independent gates, because they answer different questions: the id **format**
+/// is a schema rule (plan §1.3: a 6-hex-character opaque token), while
+/// **containment** is a path-safety rule that stays correct even if the id format
+/// is ever widened.
+fn resolve_transcript(dir: &Path, id: &str, whence: &Path) -> PathBuf {
+    assert!(
+        id.len() == 6 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{}: transcript_id {id:?} is not a 6-hex-character opaque token (plan §1.3)",
+        whence.display(),
+    );
+
+    let path = dir.join(format!("{id}.md"));
+    assert!(
+        path.is_file(),
+        "{}: verdict {id} has no transcript file at {}",
+        whence.display(),
+        path.display(),
+    );
+
+    let root = dir
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("{} not canonicalizable: {e}", dir.display()));
+    let resolved = path
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("{} not canonicalizable: {e}", path.display()));
+    assert!(
+        resolved.starts_with(&root),
+        "{}: transcript_id {id:?} resolves to {} which is outside {}",
+        whence.display(),
+        resolved.display(),
+        root.display(),
+    );
+    resolved
+}
+
+/// Every scored `ab-*` stage's verdicts are well-formed **and obey the rubric's
+/// rules about what may be recorded where**.
+///
+/// **What it closes.** `scoring-rubric.md` used to say outright that no test
+/// enforced the closed verdict object, leaving it to the phase agent; Task 16 then
+/// described its verdicts as "schema-validated" on the strength of a one-off script
+/// that left no artifact. Worse, the first version of *this* test checked syntax
+/// only — so the rubric's actual rules stayed build-passing, which is what let seven
+/// contradictory rows through in `tdd` unnoticed. A shape check that cannot express
+/// the rule does not close it, so the rules are checked here:
+///
+/// 1. **`new_rationalizations` quotes come from `## Response`.** The field records
+///    excuses the agent *advanced for the option it took*. `## Meta-test` is the
+///    agent redesigning the skill, and its proposed counter-text is not an observed
+///    excuse — feeding it to §7.1's four-part closure would manufacture counter-text
+///    for a failure nobody made, the fabricated-observation defect
+///    `testing-with-subagents.md` forbids by name.
+/// 2. **A `compliant: true` verdict carries no rationalizations**, which follows
+///    from rule 1: an excuse *for the wrong option* cannot have been advanced by a
+///    response that took the right one.
+///
+/// `scores.raw.json` — the scorer's untouched output, kept when an adjudication
+/// corrects a field — is checked for **shape only**. It is a record of what was
+/// returned, not a claim that it was right, so holding it to the semantic rules
+/// would make preserving raw evidence impossible.
+///
+/// Skills whose `ab-*` phase has not run have no verdicts and are skipped, so this
+/// passes today and tightens as each phase lands.
+#[test]
+fn scores_json_verdicts_obey_the_rubric() {
     let transcripts = evidence_dir().join("transcripts");
     let mut checked = 0usize;
 
     for skill in SkillName::ALL {
         let dir = transcripts.join(skill.as_str());
+
+        // The scorer's untouched output, when one was preserved: shape only.
+        let raw = dir.join("scores.raw.json");
+        if raw.is_file() {
+            let text = fs::read_to_string(&raw).expect("scores.raw.json unreadable");
+            let verdicts: Vec<Verdict> = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} does not match the verdict schema: {e}", raw.display()));
+            assert!(
+                !verdicts.is_empty(),
+                "{} is empty — a preserved raw record records verdicts",
+                raw.display()
+            );
+            for v in &verdicts {
+                resolve_transcript(&dir, &v.transcript_id, &raw);
+            }
+        }
+
         let path = dir.join("scores.json");
-        if !path.exists() {
+        if !path.is_file() {
             continue;
         }
-        let raw = fs::read_to_string(&path)
+        let text = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let parsed: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
-        let verdicts = parsed
-            .as_array()
-            .unwrap_or_else(|| panic!("{} must be a JSON array", path.display()));
+        let verdicts: Vec<Verdict> = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} does not match the verdict schema: {e}", path.display()));
         assert!(
             !verdicts.is_empty(),
             "{} is an empty array — a scored stage records verdicts, not nothing",
@@ -6748,78 +6852,108 @@ fn scores_json_verdicts_are_closed_objects() {
         );
 
         let mut seen: HashSet<&str> = HashSet::new();
-        for v in verdicts {
-            let obj = v
-                .as_object()
-                .unwrap_or_else(|| panic!("{}: every verdict must be an object", path.display()));
-
-            // Closed: exactly the seven keys, no more and no fewer. An extra key
-            // carries evidence no reader consumes; a missing one is a partial
-            // verdict, which the rubric says to reject rather than repair.
-            let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
-            let want: HashSet<&str> = REQUIRED.into_iter().collect();
-            assert_eq!(
-                keys,
-                want,
-                "{}: verdict has the wrong key set (extra: {:?}, missing: {:?})",
-                path.display(),
-                keys.difference(&want).collect::<Vec<_>>(),
-                want.difference(&keys).collect::<Vec<_>>(),
-            );
-
-            let id = obj["transcript_id"].as_str().unwrap_or_else(|| {
-                panic!("{}: `transcript_id` must be a string", path.display())
-            });
-            for key in BOOLS {
-                assert!(
-                    obj[key].is_boolean(),
-                    "{}: verdict {id} field `{key}` must be a boolean, got {}",
-                    path.display(),
-                    obj[key],
-                );
-            }
-            assert!(
-                obj["evidence"].is_string(),
-                "{}: verdict {id} field `evidence` must be a string",
-                path.display(),
-            );
-            let rats = obj["new_rationalizations"].as_array().unwrap_or_else(|| {
-                panic!(
-                    "{}: verdict {id} field `new_rationalizations` must be an array",
-                    path.display()
-                )
-            });
-            for r in rats {
-                assert!(
-                    r.is_string(),
-                    "{}: verdict {id} has a non-string rationalization {r} — the field is \
-                     verbatim quotes, and a paraphrase or an object is not one",
-                    path.display(),
-                );
-            }
-
-            // One verdict per transcript, and every id resolves to a transcript
-            // that exists. A verdict for a file that is not there is scoring
-            // something nobody can re-read.
+        for v in &verdicts {
+            let id = v.transcript_id.as_str();
             assert!(
                 seen.insert(id),
                 "{}: two verdicts for transcript {id}",
                 path.display()
             );
-            let transcript = dir.join(format!("{id}.md"));
+
+            let transcript = resolve_transcript(&dir, id, &path);
+            let body = fs::read_to_string(&transcript).expect("transcript unreadable");
+            let response = response_block(&body);
             assert!(
-                transcript.exists(),
-                "{}: verdict {id} has no transcript at {}",
+                !response.trim().is_empty(),
+                "{}: transcript {id} has no `## Response` block to score",
+                path.display()
+            );
+            assert!(
+                !v.evidence.trim().is_empty(),
+                "{}: verdict {id} records no `evidence` — the field names the line \
+                 that decided `compliant`",
+                path.display()
+            );
+
+            for quote in &v.new_rationalizations {
+                assert!(
+                    response.contains(quote.as_str()),
+                    "{}: verdict {id} records a rationalization that is not in the \
+                     `## Response` block: {quote:?}. If it came from `## Meta-test`, it is \
+                     the agent proposing skill wording, not an excuse it made — see \
+                     scoring-rubric.md, \"A temptation is not a rationalization\".",
+                    path.display(),
+                );
+            }
+            assert!(
+                !v.compliant || v.new_rationalizations.is_empty(),
+                "{}: verdict {id} is `compliant: true` with {} rationalization(s). An excuse \
+                 for the wrong option cannot have been advanced by a response that took the \
+                 right one; record rejected temptations in `names_temptation` and in the \
+                 skill's evidence file.",
                 path.display(),
-                transcript.display(),
+                v.new_rationalizations.len(),
             );
             checked += 1;
         }
+
+        // A re-adjudication, if one was needed, is evidence too.
+        let adj = dir.join("adjudication.json");
+        if adj.is_file() {
+            let text = fs::read_to_string(&adj).expect("adjudication.json unreadable");
+            let records: Vec<Adjudication> = serde_json::from_str(&text).unwrap_or_else(|e| {
+                panic!("{} does not match the adjudication schema: {e}", adj.display())
+            });
+            let scored: HashMap<&str, &Verdict> =
+                verdicts.iter().map(|v| (v.transcript_id.as_str(), v)).collect();
+            assert_eq!(
+                records.len(),
+                verdicts.len(),
+                "{}: adjudicates {} transcripts but {} were scored — a partial \
+                 re-adjudication cannot settle a challenged verdict",
+                adj.display(),
+                records.len(),
+                verdicts.len(),
+            );
+            for r in &records {
+                let id = r.transcript_id.as_str();
+                let transcript = resolve_transcript(&dir, id, &adj);
+                let v = scored.get(id).unwrap_or_else(|| {
+                    panic!("{}: adjudicates {id}, which was never scored", adj.display())
+                });
+                assert!(
+                    matches!(r.chosen_option.as_str(), "A" | "B" | "C" | "none"),
+                    "{}: {id} chose {:?}, which is not an option or `none`",
+                    adj.display(),
+                    r.chosen_option,
+                );
+                // The adjudication exists to confirm or overturn `compliant`. If the
+                // two disagree, a human decides which is right — the suite must not
+                // let the run proceed as though the question were settled.
+                assert_eq!(
+                    r.matches_key,
+                    v.compliant,
+                    "{}: {id} adjudicated matches_key={} against scores.json compliant={}. \
+                     Recompute the bars in order (a)-(d) before shipping either.",
+                    adj.display(),
+                    r.matches_key,
+                    v.compliant,
+                );
+                let body = fs::read_to_string(&transcript).expect("transcript unreadable");
+                let response = response_block(&body);
+                for quote in &r.excuses_for_an_option_not_taken {
+                    assert!(
+                        response.contains(quote.as_str()),
+                        "{}: {id} quotes {quote:?}, which is not in its `## Response` block",
+                        adj.display(),
+                    );
+                }
+            }
+        }
     }
 
-    // Seeded against what is already true: Task 16 scored `tdd`, so at least one
-    // set exists. Without this the test would pass vacuously the day someone
-    // moved or renamed the transcripts directory.
+    // Seeded against what is already true: Task 16 scored `tdd`. Without this the
+    // test passes vacuously the day the transcripts directory moves or is renamed.
     assert!(
         checked > 0,
         "no scores.json found under {} — expected at least the scored `tdd` set",
