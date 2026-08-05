@@ -4422,20 +4422,75 @@ enum ConditionalSection {
     /// §6 section 6b — the cycle as a fenced `dot` graph.
     CycleFlowchart,
     /// §6 section 7 — claim → required evidence → not sufficient — carrying the
-    /// claims §6 names this skill's table for.
+    /// wording this skill gives each of §6's five rows.
     ///
     /// **The claims ride here for the same reason [`Armor::procedure_steps`]
     /// records section 6's arity, and the omission had the same shape.** Section
     /// 6b is self-describing: a fenced `dot` block either is there or is not, so
-    /// `CycleFlowchart` needs no payload. Section 7 is not — §6 names five claims
-    /// for `verification-before-completion` and `code-review` (tests, build,
-    /// linter, bug-fixed, subagent-reported-success), and a heading-only check
+    /// `CycleFlowchart` needs no payload. Section 7 is not — a heading-only check
     /// confirms the table exists while saying nothing about whether it still
-    /// covers them. A row could be dropped, reordered or reworded and the suite
-    /// would stay green — the vacuous-pass class this run has hit repeatedly,
-    /// reached by *modelling* one conditional section as a marker because its
-    /// sibling could be one.
-    RequirementsTable { claims: &'static [&'static str] },
+    /// covers §6's rows. A row could be dropped, reordered or reworded and the
+    /// suite would stay green — the vacuous-pass class this run has hit
+    /// repeatedly, reached by *modelling* one conditional section as a marker
+    /// because its sibling could be one.
+    RequirementsTable { claims: RequirementClaims },
+}
+
+/// The wording a section-7 skill gives each of §6's five mandated rows.
+///
+/// **Five named fields, not a slice, because §6's five are a CLOSED set.** §6
+/// says the requirements table "covers tests / build / linter / bug-fixed /
+/// subagent-reported-success" for both skills it marks CONDITIONAL for — so
+/// which rows exist is the spec's decision and only their wording is the
+/// author's. Under `&[&str]` a skill could declare three internally consistent
+/// claims and pass every check while omitting `subagent-reported-success`, the
+/// row this run has the most reason to keep. Here that is a **compile error**:
+/// there is nowhere to put four claims.
+///
+/// It also removes an invariant that used to live in a neighbouring test. A
+/// slice could be empty, which would have made [`check_requirements_table`]
+/// compare `[] == []` and pass on a table with no rows — non-vacuity guaranteed
+/// by `armor_table_declares_well_formed_strings` happening to exist, with no
+/// link back from the function that depended on it. **A struct with five fields
+/// cannot be empty**, so the guarantee is now carried by the type rather than by
+/// a second test's continued existence.
+///
+/// Named fields rather than `[&'static str; 5]` for the last mile: the array
+/// binds each claim to §6's rows by position, and a positional binding is one an
+/// edit can silently permute. [`RequirementClaims::in_order`] fixes §6's order
+/// in exactly one place.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+struct RequirementClaims {
+    tests: &'static str,
+    build: &'static str,
+    linter: &'static str,
+    bug_fixed: &'static str,
+    subagent_reported_success: &'static str,
+}
+
+impl RequirementClaims {
+    /// §6's names for the five rows, in §6's order. Used to name the offending
+    /// row in a diagnostic — an author reading "row 5 differs" has to count.
+    const KINDS: [&'static str; 5] = [
+        "tests",
+        "build",
+        "linter",
+        "bug-fixed",
+        "subagent-reported-success",
+    ];
+
+    /// The declared claims in §6's order. **The order lives here and nowhere
+    /// else**, so the table, the check and the diagnostics cannot disagree
+    /// about it.
+    fn in_order(&self) -> [&'static str; 5] {
+        [
+            self.tests,
+            self.build,
+            self.linter,
+            self.bug_fixed,
+            self.subagent_reported_success,
+        ]
+    }
 }
 
 /// A skill that carries §6's armor, and the per-skill strings §6 fixes for it.
@@ -4540,15 +4595,13 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
             announce: "Using drovr:verification-before-completion — running the checks \
                        before claiming done.",
             conditional: ConditionalSection::RequirementsTable {
-                // §6: "Requirements table covers tests / build / linter /
-                // bug-fixed / subagent-reported-success", in that order.
-                claims: &[
-                    "The task's tests pass",
-                    "It builds",
-                    "The linter is clean",
-                    "The bug is fixed",
-                    "The subagent reported success",
-                ],
+                claims: RequirementClaims {
+                    tests: "The task's tests pass",
+                    build: "It builds",
+                    linter: "The linter is clean",
+                    bug_fixed: "The bug is fixed",
+                    subagent_reported_success: "The subagent reported success",
+                },
             },
             procedure_steps: 6,
         }),
@@ -4857,7 +4910,7 @@ fn check_armor(
     // §6 section 7's contents, for the same reason. The ordered pass sees a
     // `Requirements` heading; it cannot see whether anything is under it.
     if let ConditionalSection::RequirementsTable { claims } = armor.conditional {
-        check_requirements_table(path, body, claims, first_body_line, wrong);
+        check_requirements_table(path, body, &claims, first_body_line, wrong);
     }
 }
 
@@ -4926,22 +4979,36 @@ fn claim_text(cell: &str) -> String {
 /// dropping the `not sufficient` column deletes the half that closes loopholes,
 /// and that is a rewrite, not a formatting choice.
 ///
-/// **Its non-vacuity rests on one assertion that lives elsewhere**, recorded
-/// rather than duplicated here: with an empty `claims`, an empty table would
-/// give `found == expected == []` and this function would pass in silence — the
-/// heading-only vacuity it exists to replace. [`armor_table_declares_well_formed_strings`]
-/// is what forbids that, because "the declaration is well-formed" is a property
-/// of [`SKILL_ARMOR_STATES`] and belongs where the other declaration checks are.
-/// A second guard here would be a backstop for an authoritative check, and the
-/// two would eventually disagree. **If that assertion is ever removed, this
-/// function stops asserting anything.**
+/// **Everything its own soundness needs is asserted here**, which it once was
+/// not. An earlier version took `&[&str]` and documented that an empty slice
+/// would make it compare `[] == []` and pass on a table with no rows — naming
+/// `armor_table_declares_well_formed_strings` as the thing that prevented it.
+/// That is the vacuous-pass class one level up: a check that is only meaningful
+/// because a neighbour happens to exist, with nothing linking the two, so
+/// deleting the neighbour silently demotes this back to a heading check while it
+/// still reads as authoritative. [`RequirementClaims`] makes the empty case
+/// unrepresentable, and the one precondition a type cannot carry — a declared
+/// claim that is blank — is checked below rather than assumed.
 fn check_requirements_table(
     path: &Path,
     body: &str,
-    claims: &[&str],
+    claims: &RequirementClaims,
     first_body_line: usize,
     wrong: &mut Vec<String>,
 ) {
+    // The precondition this function's own comparison rests on. A blank claim
+    // matches a blank leading cell, so a hollow row would satisfy a hollow
+    // declaration — the comparison would run and mean nothing.
+    for (kind, claim) in RequirementClaims::KINDS.iter().zip(claims.in_order()) {
+        if claim_text(claim).is_empty() {
+            wrong.push(format!(
+                "{}: §6 section 7's `{kind}` claim is declared blank, so the row \
+                 comparison below would be satisfied by a blank cell. Declare the \
+                 wording this skill gives that row.",
+                path.display(),
+            ));
+        }
+    }
     let at = |line: usize| line + first_body_line + 1;
     let heads = headings(body);
     let Some((start, _)) = heads
@@ -4994,10 +5061,9 @@ fn check_requirements_table(
             "{}: §6 section 7 opens on line {} with no table under it — no row \
              with a `|---|` delimiter beneath it. The heading is not the \
              section: §6 section 7 is claim → required evidence → not \
-             sufficient, over {} claim(s).",
+             sufficient, over §6's five rows.",
             path.display(),
             at(start),
-            claims.len(),
         ));
         return;
     };
@@ -5037,14 +5103,26 @@ fn check_requirements_table(
         .iter()
         .map(|(_, cells)| claim_text(&cells[0]))
         .collect();
-    let expected: Vec<String> = claims.iter().map(|claim| claim_text(claim)).collect();
+    let expected: Vec<String> = claims
+        .in_order()
+        .iter()
+        .map(|claim| claim_text(claim))
+        .collect();
     if found != expected {
+        // Name the first row that differs. §6's five rows have names, and
+        // "row 5" makes an author count table rows to find out which.
+        let at_kind = expected
+            .iter()
+            .zip(found.iter().chain(std::iter::repeat(&String::new())))
+            .position(|(want, got)| want != got)
+            .and_then(|i| RequirementClaims::KINDS.get(i))
+            .unwrap_or(&"(row count)");
         wrong.push(format!(
             "{}: §6 section 7's table states the claims {found:?}, but this \
-             skill's Armor declares {expected:?}. Change the table and the \
-             declaration in the same edit — a row dropped, reordered or reworded \
-             changes which claims the skill sets a bar for, and nothing else here \
-             would notice.",
+             skill's Armor declares {expected:?} — first difference at §6's \
+             `{at_kind}` row. Change the table and the declaration in the same \
+             edit: a row dropped, reordered or reworded changes which claims the \
+             skill sets a bar for, and nothing else here would notice.",
             path.display(),
         ));
     }
@@ -5234,26 +5312,22 @@ fn armor_table_declares_well_formed_strings() {
             "{name}: the declared announcement sentence is empty, so §6 section 5 \
              would be satisfied by any file"
         );
+        // Cardinality and non-emptiness are [`RequirementClaims`]' job now — the
+        // first is a compile error and the second is unrepresentable. What is
+        // left is declaration hygiene that no type expresses, and it is
+        // deliberately NOT a precondition of `check_requirements_table`: that
+        // function compares positionally, so duplicates cannot mislead it. It is
+        // checked because two rows stating one claim is a spec-reading mistake
+        // worth catching, not because anything downstream depends on it.
         if let ConditionalSection::RequirementsTable { claims } = armor.conditional {
-            assert!(
-                !claims.is_empty(),
-                "{name}: §6 section 7 is declared with no claims, so \
-                 `check_requirements_table` would accept a table with no rows — \
-                 the heading-only check this payload exists to replace"
-            );
-            let normalized: Vec<String> = claims.iter().map(|claim| claim_text(claim)).collect();
+            let normalized: Vec<String> = claims.in_order().iter().map(|c| claim_text(c)).collect();
             let unique: HashSet<&String> = normalized.iter().collect();
             assert_eq!(
                 unique.len(),
                 normalized.len(),
                 "{name}: §6 section 7's declared claims contain a duplicate: \
-                 {normalized:?}. Two rows stating one claim cannot both be \
-                 matched, and the second silently sets the bar."
-            );
-            assert!(
-                normalized.iter().all(|claim| !claim.is_empty()),
-                "{name}: §6 section 7 declares an empty claim, which every row \
-                 would match"
+                 {normalized:?}. §6's five rows are five different claims; two \
+                 spelled the same way means one of them is not being asked for."
             );
         }
     }
@@ -5287,7 +5361,7 @@ fn synthetic_body(armor: &Armor) -> Vec<String> {
                 {
                     lines.push("| The claim | Required evidence | NOT sufficient |".to_string());
                     lines.push("|---|---|---|".to_string());
-                    lines.extend(claims.iter().map(|claim| {
+                    lines.extend(claims.in_order().iter().map(|claim| {
                         format!("| *\"{claim}\"* | what it takes | what it is not |")
                     }));
                 }
@@ -5411,7 +5485,13 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
     // case is held to `any` rather than `all`.
     let other_half = Armor {
         conditional: ConditionalSection::RequirementsTable {
-            claims: &["It works"],
+            claims: RequirementClaims {
+                tests: "It works",
+                build: "It builds",
+                linter: "It is clean",
+                bug_fixed: "It is fixed",
+                subagent_reported_success: "It was reported",
+            },
         },
         ..armor
     };
@@ -5464,11 +5544,13 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
         conditional: ConditionalSection::RequirementsTable {
-            claims: &[
-                "The tests pass",
-                "It builds",
-                "The subagent reported success",
-            ],
+            claims: RequirementClaims {
+                tests: "The tests pass",
+                build: "It builds",
+                linter: "The linter is clean",
+                bug_fixed: "The bug is fixed",
+                subagent_reported_success: "The subagent reported success",
+            },
         },
         procedure_steps: 3,
     };
@@ -5584,6 +5666,40 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
         "a stray `|` line above the table must not be mistaken for its header — \
          the header is the row a delimiter follows: {:?}",
         complaints(&stray_pipe)
+    );
+
+    // The precondition this function now owns instead of borrowing. A blank
+    // DECLARED claim matches a blank leading cell, so a hollow row would satisfy
+    // a hollow declaration and the comparison would run and mean nothing. The
+    // empty-`claims` case that used to sit beside this one is gone: with
+    // `RequirementClaims` there is nowhere to put fewer than five.
+    let blank_declared = Armor {
+        conditional: ConditionalSection::RequirementsTable {
+            claims: RequirementClaims {
+                linter: "",
+                ..match armor.conditional {
+                    ConditionalSection::RequirementsTable { claims } => claims,
+                    ConditionalSection::CycleFlowchart => unreachable!("declared above"),
+                }
+            },
+        },
+        ..armor
+    };
+    let mut blank_complaints = Vec::new();
+    check_armor(
+        path,
+        &good,
+        &FoldedBody::new(&good),
+        &blank_declared,
+        0,
+        &mut blank_complaints,
+    );
+    assert!(
+        blank_complaints
+            .iter()
+            .any(|c| c.contains("`linter` claim is declared blank")),
+        "a blank declared claim must be reported by this check itself, not left \
+         to a neighbouring test: {blank_complaints:?}"
     );
 
     // A row whose evidence cell is blank states a claim and requires nothing —
