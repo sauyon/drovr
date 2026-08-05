@@ -160,8 +160,10 @@ what tempted them — not rationalizations.** Both runs independently used the w
 
 ## Counter-text written against the baseline
 
-Written by Task 13 as the §6 rewrite of `skills/code-review/SKILL.md` (arm B snapshot:
-`arms/B/code-review.md`). **Provenance per surface**, so a later reader can tell authored text
+Written by Task 13 as the §6 rewrite of `skills/code-review/SKILL.md`. The arm B snapshot of
+that file — `arms/B/code-review.md` and its `MANIFEST.md` row — is appended in a follow-up
+commit, per `MANIFEST.md`'s rule that a row's commit cell must already contain the blob.
+**Provenance per surface**, so a later reader can tell authored text
 from sourced text without re-deriving it.
 
 ### The rationalization table's two columns have different provenances
@@ -171,23 +173,40 @@ option and neither offered an excuse. So there is no baseline rationalization to
 **thought** column, and inventing one would be a fabricated measurement (`spec.md` §2.1
 exception 1). The table is built the way Task 12 built its own under the same null:
 
+Keyed by each row's **thought text**, not by row number — an earlier draft of this section
+numbered them, self-review then deleted one row, and every number below it silently pointed at
+the wrong row. `spec.md` §2.1's honesty rule is about citations, and a citation that drifts
+when a neighbour is deleted is one nobody can check.
+
 - **The thought column** is the scenario's own pressure text
   (`skills/writing-skills/scenarios/code-review-1.md`), reduced to the first-person form an
-  agent would think it in. Row 1 is scenario lines 25–28; row 2 is line 20 (*"just send it,
-  I'll skim it live on the call with them."*); row 3 is forced-choice option C; row 8 is
-  lines 22–23 and 30. Rows 4–6 are §6's three named loophole closures, which are spec text,
-  not observations. Row 7 (*"the reviewer came back with no findings"*) is from **this run's
-  own operational history**, not from the probes — see *Sourced from this run, not from RED*.
+  agent would think it in:
+  - *"They are going to read it line by line anyway."* — scenario lines 25–28.
+  - *"The lead said just send it."* — scenario line 20, *"just send it, I'll skim it live on
+    the call with them."*
+  - *"I am out of time before the deadline."* — scenario lines 22–23 and 30.
+  - *"It is a two-line change."* · *"I already reviewed it myself."* · *"The pipeline's review
+    phase will catch it."* — §6's three named loophole closures. **Spec text, not
+    observations**, and quoted from §6 rather than from any transcript.
+  - *"The reviewer came back with no findings."* — **this run's own operational history**, not
+    the probes. See *Sourced from this run, not from RED*.
 - **The instruction column** is the RED runs' own reasoning, quoted or compressed from
-  *Temptations named and rejected* above. Row 1 compresses `42a94a`'s *"it conflates two
-  different kinds of reading: the client's read is for fit and understanding, the review's is
-  for correctness. Running one doesn't make the other redundant"* together with `d7006e`'s
-  *"three people reading 320 lines aloud … catches prose clarity and obvious gaps"*. Row 2 is
-  `42a94a`'s *"it reads like a scheduling reflex, not a sign-off"* plus `d7006e`'s *"the
-  account lead owns the relationship, not the technical correctness"*. Row 3 is `42a94a` on
-  option C: *"it ships the same unreviewed content and the same risk, just with a disclaimer
-  that doesn't change what the client does with it once they've read it … and moved toward
-  signature."* Rows 4–8 are authored.
+  *Temptations named and rejected* above:
+  - *"They are going to read it line by line anyway."* compresses `42a94a`'s *"it conflates
+    two different kinds of reading: the client's read is for fit and understanding, the
+    review's read is for correctness. Running one doesn't make the other redundant"* with
+    `d7006e`'s *"three people reading 320 lines aloud … catches prose clarity and obvious
+    gaps"*.
+  - *"The lead said just send it."* is `42a94a`'s *"it reads like a scheduling reflex, not a
+    sign-off"* plus `d7006e`'s *"the account lead owns the relationship, not the technical
+    correctness of retry semantics and reconciliation math"*.
+  - The remaining five instructions are **authored**.
+
+**`42a94a`'s verbatim argument against option C is recorded above but is no longer used.** It
+backed a row (*"I will send it flagged as not yet reviewed"*) that self-review cut to buy bytes
+for two Critical loophole fixes — so the strongest RED-sourced material in this stage now sits
+in the evidence file with nothing in the skill citing it. Recorded rather than quietly dropped;
+it is the first row to restore if the cap ever loosens.
 
 **These are compliant runs naming what tempted them, not rationalizations**, and the shipped
 skill does not claim otherwise. The null itself is **not** mentioned in `SKILL.md`: a note
@@ -196,13 +215,14 @@ decision 4).
 
 ### Sourced from this run, not from RED
 
-Three of the strongest bars answer failures this pipeline actually produced over ~40 panel
-runs, not anything the probes did: reviewers whose verdict never arrived, a panel that
+Three of the strongest bars answer failures this pipeline actually produced while running its
+own review panel, not anything the probes did: reviewers whose verdict never arrived, a panel that
 reviewed an **empty diff** and returned clean from all four angles, and self-run panels
 passing work a driver-run panel then failed. They are the origin of the `clean` requirements
 row, red flag 4, procedure step 4, and rationalization row 7. **Recorded as operational
 history, which is weaker evidence than a transcript**: it is the orchestrator's recollection
-of this session, with no run ids attached.
+of this session, with no run ids attached. Deliberately not quantified — a run count nobody
+can check would read as measurement.
 
 ### The worked example is CONDENSED, and the reviewer output is CONSTRUCTED
 
@@ -221,14 +241,24 @@ for — rather than an intention to dispatch.
 
 ### Structural changes to arm A′, named
 
-Nothing in arm A′ was deleted. `## How to run it` became procedure step 2 plus the
-FOREGROUND no-exceptions bullet; `## Check, in order` became step 2's angle list;
-`## Resolving findings` became steps 5–6 and the `resolved`/`deferred` requirements rows;
-`## Automatic panel` was demoted from a section to a clause in step 2 plus the exit-code rule
-in step 3 (**"only 0 is clean"** — arm A listed the codes without saying which ones are not a
-pass). The `drovr phase done` sentence is kept in A′'s demoted conditional form
-(`no_phase_scoped_description_literals` enforces the phrasing). `description:` is untouched:
+One sentence of arm A′ is deleted and it is named below; everything else moved. `## How to run
+it` became procedure step 2 plus the FOREGROUND no-exceptions bullet; `## Check, in order`
+became step 2's angle list; `## Resolving findings` became steps 5–6 and the
+`resolved`/`deferred` requirements rows; `## Automatic panel` was demoted from a section to a
+clause in step 2 — keeping both artifact names, `<task>-review-<angle>.json` and the merged
+`<task>-review.json` — plus the exit-code rule in step 3 (**"only 0 is clean"**: arm A listed
+the codes without saying which of them are not a pass). Step 6 keeps a `drovr phase done`
+reference in A′'s demoted conditional form, which
+`no_phase_scoped_description_literals` enforces the phrasing of. `description:` is untouched:
 §3-frozen, and it is the one thing arm A′ isolates.
+
+**The one deletion: arm A said each reviewer "runs `drovr phase done`, then exits".** That was
+already false when arm A was frozen — `cli/src/code_review.rs:168` seeds every reviewer with
+*"Do not modify any files or run `drovr phase done`"*, and `:822` asserts that seed. So this is
+a **correction**, not a restructuring loss, and it is recorded here because a reader diffing
+A′ against B would otherwise see content vanish with no reason attached. It also means arm A
+carried a factual error into the RED runs that measured it; neither RED transcript relied on
+that sentence.
 
 ## Scored results
 

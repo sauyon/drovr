@@ -4460,9 +4460,15 @@ enum ConditionalSection {
 /// `code-review`'s table to set bars for the linter and the build, subjects that
 /// skill has nothing to say about.
 ///
-/// What the split does **not** relax: both variants are five named fields, so
-/// neither skill can drop, omit or silently permute a row, and
-/// [`RequirementClaims::rows`] is the one place either order is written down.
+/// What the split does **not** relax: each variant's rows are **named fields**,
+/// so neither skill can drop, omit or silently permute one — a missing field is
+/// `E0063`, not a shorter table — and [`RequirementClaims::rows`] is the one
+/// place either order is written down. The two arities differ on purpose: §6
+/// fixes five rows for `verification-before-completion` and none for
+/// `code-review`, whose four are the four claims its Iron Law composes. Because
+/// arity is per variant rather than a `[_; 5]` in the return type,
+/// [`check_requirements_table`] asserts the row list is non-empty **itself**,
+/// rather than inheriting that guarantee from a signature.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum RequirementClaims {
     /// §6's five rows for `verification-before-completion`, in §6's order —
@@ -4474,18 +4480,18 @@ enum RequirementClaims {
         bug_fixed: &'static str,
         subagent_reported_success: &'static str,
     },
-    /// `code-review`'s five rows, in the order its table states them. §6 fixes
-    /// no row set here, so **these five are Task 13's reading of §6 section 7
-    /// for this skill**, recorded as a type so that a later edit dropping one is
-    /// a compile error rather than a quiet narrowing of what the skill guards.
-    /// They track the four claims the Iron Law composes — reviewed, clean,
-    /// resolved, deferred — plus the completion claim those four gate.
+    /// `code-review`'s rows, in the order its table states them. §6 fixes no row
+    /// set here, so **these are Task 13's reading of §6 section 7 for this
+    /// skill**, recorded as a type so that a later edit dropping one is a
+    /// compile error rather than a quiet narrowing of what the skill guards.
+    /// They are the four claims that skill's Iron Law composes: a reviewer has
+    /// seen it, it came back clean, the findings are resolved, or one is
+    /// recorded as deferred.
     Review {
         reviewed: &'static str,
         clean: &'static str,
         resolved: &'static str,
         deferred: &'static str,
-        done: &'static str,
     },
 }
 
@@ -4499,7 +4505,7 @@ impl RequirementClaims {
     /// every assertion stayed green. Pairing them here makes that
     /// unrepresentable, and leaves the order written down exactly once per
     /// skill.
-    fn rows(&self) -> [(&'static str, &'static str); 5] {
+    fn rows(&self) -> Vec<(&'static str, &'static str)> {
         match self {
             RequirementClaims::Verification {
                 tests,
@@ -4507,7 +4513,7 @@ impl RequirementClaims {
                 linter,
                 bug_fixed,
                 subagent_reported_success,
-            } => [
+            } => vec![
                 ("tests", tests),
                 ("build", build),
                 ("linter", linter),
@@ -4519,20 +4525,18 @@ impl RequirementClaims {
                 clean,
                 resolved,
                 deferred,
-                done,
-            } => [
+            } => vec![
                 ("reviewed", reviewed),
                 ("clean", clean),
                 ("resolved", resolved),
                 ("deferred", deferred),
-                ("done", done),
             ],
         }
     }
 
     /// The declared claims alone, in the table's order.
-    fn in_order(&self) -> [&'static str; 5] {
-        self.rows().map(|(_, claim)| claim)
+    fn in_order(&self) -> Vec<&'static str> {
+        self.rows().into_iter().map(|(_, claim)| claim).collect()
     }
 }
 
@@ -4659,14 +4663,12 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
                        before calling this done.",
             conditional: ConditionalSection::RequirementsTable {
                 // §6 names no rows for this skill (see `RequirementClaims`), so
-                // these five are the four claims the Iron Law composes plus the
-                // completion claim they gate.
+                // these four are the four claims this skill's Iron Law composes.
                 claims: RequirementClaims::Review {
                     reviewed: "This change has been reviewed",
                     clean: "The reviewer found nothing",
                     resolved: "Every Critical and Important finding is resolved",
                     deferred: "That finding does not apply here",
-                    done: "This change is done",
                 },
             },
             procedure_steps: 6,
@@ -5054,10 +5056,29 @@ fn check_requirements_table(
     first_body_line: usize,
     wrong: &mut Vec<String>,
 ) {
-    // The precondition this function's own comparison rests on. A blank claim
-    // matches a blank leading cell, so a hollow row would satisfy a hollow
-    // declaration — the comparison would run and mean nothing.
-    for (kind, claim) in claims.rows() {
+    // The two preconditions this function's own comparison rests on, asserted
+    // here rather than inherited from a signature or from a neighbouring test —
+    // the vacuous-pass class Task 12's gate closed, which the per-variant arity
+    // would otherwise have re-opened one level down.
+    //
+    // 1. A declared row list that is EMPTY would make the comparison below
+    //    `[] == []` and pass on a table with no rows. `[_; 5]` used to rule this
+    //    out; `Vec` does not, because §6 fixes five rows for one section-7 skill
+    //    and none for the other.
+    let rows = claims.rows();
+    if rows.is_empty() {
+        wrong.push(format!(
+            "{}: §6 section 7's claims are declared as an empty row list, so the \
+             comparison below would be satisfied by a table with no rows at all. \
+             Declare the rows this skill's table states.",
+            path.display(),
+        ));
+        return;
+    }
+    // 2. A blank claim matches a blank leading cell, so a hollow row would
+    //    satisfy a hollow declaration — the comparison would run and mean
+    //    nothing.
+    for (kind, claim) in rows {
         if claim_text(claim).is_empty() {
             wrong.push(format!(
                 "{}: §6 section 7's `{kind}` claim is declared blank, so the row \
@@ -5366,11 +5387,18 @@ fn pending_still_describes_a_deferral() {
         "a Pending entry must name both its task and its reason in diagnostics, \
          so a reverted skill reads as a decision and not as a gap: {described}"
     );
+    // The property that actually matters: `Pending` asserts the armor is
+    // ABSENT, so a file carrying the Iron Law under a Pending entry must be
+    // reported. Asserting `!matches!(pending, Armored(_))` instead would be a
+    // tautology — `pending` was built as `Pending` two statements ago — so this
+    // exercises the marker `armored_skills_have_required_sections` branches on.
+    let armored_page = "## The Iron Law\n\n```\nNEVER SHIP WITHOUT A RED TEST.\n```\n";
     assert!(
-        !matches!(pending, ArmorState::Armored(_)),
-        "Pending asserts the armor is ABSENT — `armored_skills_have_required_sections` \
-         takes the non-Armored branch for it and complains if the file carries \
-         {}",
+        ARMOR_MARKER
+            .find(armored_page, &FoldedBody::new(armored_page))
+            .is_some(),
+        "a page carrying {} must read as armored; otherwise the Pending branch \
+         can never fire and Task 22 could revert a skill on paper only",
         ARMOR_MARKER.describe(),
     );
 }
@@ -5836,7 +5864,6 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
                 clean: "The reviewer found nothing",
                 resolved: "The findings are resolved",
                 deferred: "That one does not apply",
-                done: "It is done",
             },
         },
         ..armor

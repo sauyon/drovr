@@ -11,8 +11,7 @@ description: Use when you have written any change, before calling it done or han
 reviewer satisfies the letter; one that read an empty diff, or that you never
 waited for, found nothing because it looked at nothing. The rule is that somebody
 who did not write the change has read it and said what is wrong with it — and
-you cannot be that somebody. You read the change you meant to make; the defect
-is in the gap between that and what is on disk.
+that cannot be you. You read the change you meant to make, not the one on disk.
 
 **Write for the agent who inherits this: the next phase agent is you, with your
 context gone.** A finding you settled in your head is one they meet again as a
@@ -25,9 +24,9 @@ NO CHANGE IS DONE UNTIL A READ-ONLY REVIEWER HAS SEEN IT AND
 EVERY CRITICAL AND IMPORTANT FINDING IS RESOLVED OR RECORDED AS DEFERRED.
 ```
 
-**Read-only** is a trust boundary, not a performance note: the reviewer may
-read and run anything, and never edits project source. You stay the single
-writer.
+**Read-only** is a trust boundary, not a performance note: the reviewer reads
+anything, runs read-only checks, and writes nothing — not source, not git, not
+run state. You stay the single writer.
 
 No exceptions:
 
@@ -43,7 +42,7 @@ No exceptions:
   someone who does not know your intent.
 - **Do not leave it for the pipeline's review phase.** That phase reads what
   you hand it, after later work is built on it. Dispatch here, while the change
-  is one commit and one context wide; that phase is the second look.
+  is one commit and one context wide.
 - **Do not close a finding by disagreeing with it.** When you will not fix one,
   quote it and write the reason in the report or handoff. An unrecorded
   decision reads downstream exactly like an unread finding.
@@ -53,7 +52,7 @@ No exceptions:
 
 ## Announce
 
-Say this out loud when you start, before dispatching anything:
+Say this out loud before you dispatch anything:
 
 ```
 Using drovr:code-review — dispatching read-only reviewers before calling this done.
@@ -77,8 +76,11 @@ Re-create those items for each change you review, not once for the session.
    reviewer reads an empty range and reports clean, having read nothing.
 2. **Dispatch read-only reviewers, blocking, one per angle.** Agent tool,
    `subagent_type: general-purpose`, model `sonnet`. Tell each to review as a
-   skeptic, not the author, and to say whether the tests exercise the behaviour
-   rather than only that they pass. The angles:
+   skeptic, not the author; to say whether the tests exercise the behaviour
+   rather than only that they pass; to rate every finding **Critical, Important
+   or nit**, which is what the Iron Law gates on, and say so when it found none;
+   and to write them to a path you name, so step 3 has something to open. The
+   angles:
    - **Spec compliance** — does it do what was agreed, no more, no less?
    - **Correctness** — real bugs, unhandled cases, broken invariants.
    - **Verification** — do the claimed tests exist, and would they fail if the
@@ -86,15 +88,16 @@ Re-create those items for each change you review, not once for the session.
    - **Quality** — reuse, simplification, consistency with the code around it.
 
    In a drovr run, `drovr code-review run <run> <task>` dispatches that panel
-   for you and merges its findings into `<task>-review.json`, tagged by angle.
+   for you: one reviewer per angle writing `<task>-review-<angle>.json`, merged
+   into `<task>-review.json` and tagged by angle.
 3. **Wait for every reviewer, then read what each wrote.** Open the findings
    file by path. Exit codes: 0 clean, 3 findings, 2 timeout, 1 error — **only 0
    is clean**, and a reviewer that returned no verdict is none of the four.
    Re-dispatch it rather than reporting its silence.
-4. **Check what the reviewer actually read.** The diff it names must be
-   non-empty and must be your change. A clean verdict on an empty range, or on
-   the tree before your last edit, is a clean verdict about a change nobody
-   read.
+4. **Check what the reviewer actually read.** The range it names must be the
+   whole of `<base>..HEAD` — every file you touched, not a subset you picked. A
+   clean verdict on an empty range, a subset, or the tree before your last edit
+   is clean about a change nobody read.
 5. **Resolve every Critical and Important finding, or record the deferral.**
    Per finding: quote it, then name the edit answering it by file or write down
    why you are not making it.
@@ -104,26 +107,25 @@ Re-create those items for each change you review, not once for the session.
 
 ## Requirements
 
-The middle column is what the claim takes; the right column is what gets
-accepted instead.
+The middle column is what the claim takes; the right is what gets accepted
+instead.
 
 | The claim | Required evidence | NOT sufficient |
 |---|---|---|
 | *"This change has been reviewed"* | A read-only reviewer dispatched over this change in the foreground, returned in this turn, and the range you handed it, written down | Your own re-read · a reviewer launched and not waited for · a review of the tree before your last edit |
-| *"The reviewer found nothing"* | Its findings file opened by path and read by you, **and** the diff it read shown to be non-empty and to be your change | Its summary · exit 1 or 2 · a clean verdict whose range you did not check · a verdict that never arrived |
+| *"The reviewer found nothing"* | The findings file it wrote, opened by path and read by you — or, when it reported in prose with no file, the review re-run by you — **and** the range it read shown to be the whole of `<base>..HEAD` | Its summary, however much it pastes into itself · exit 1 or 2 · a subset of your files · a clean verdict whose range you did not check · a verdict that never arrived |
 | *"Every Critical and Important finding is resolved"* | Each quoted, the edit answering it named by file, and the tests re-run after the last edit | A count · agreeing with one in prose · fixing the Criticals and leaving the Importants |
 | *"That finding does not apply here"* | The finding quoted, and the reason written where the next agent reads it | Deciding it in your head · *"out of scope"* with no scope named · silence, which downstream reads as resolved |
-| *"This change is done"* | The four rows above, satisfied for this change, in this message | Green tests, another skill's bar · the pipeline's later review phase, which reads what you hand it |
 
 ## Red flags — STOP
 
 Some are thoughts, some are things you have just written. Either way you are at
 the line, not past it.
 
-- *"They are going to read it line by line anyway."* · *"It is a two-line
-  change."* · *"I already reviewed it myself."* · *"The pipeline's review phase
-  will catch it."* — each opens a row in *Rationalizations* below, verbatim. Go
-  do the thing in its row.
+- *"They are going to read it line by line anyway."* · *"The lead said just
+  send it."* · *"It is a two-line change."* · *"I already reviewed it myself."*
+  · *"The pipeline's review phase will catch it."* — each opens a row in
+  *Rationalizations* below, verbatim. Go do the thing in its row.
 - *You are about to launch a reviewer in the background and keep working.* →
   Dispatch it blocking. No version of that ends with you reading its verdict in
   this turn.
@@ -131,11 +133,11 @@ the line, not past it.
   Silence is not a pass; a parked reviewer is not a finished one.
 - *The panel came back clean in seconds on a large diff.* → Check the range it
   read before repeating the verdict. Clean and empty look identical from here.
-- **Any sentence calling the change done, ready, shipped, or safe to hand off**
-  while a reviewer is unread, unreturned, or holding an unresolved Critical or
-  Important finding. If you cannot name the reviewer and point at what it
-  wrote, you have not earned the sentence. Change what you dispatched, not how
-  you word it.
+- **Anything that treats the change as finished** — any wording at all, and
+  also committing, opening a PR, or starting the next task — while a reviewer is
+  unread, unreturned, or holding an unresolved Critical or Important finding. If
+  you cannot name the reviewer and point at what it wrote, you have not earned
+  the move. Change what you dispatched, not how you word it.
 
 ## Rationalizations
 
@@ -145,8 +147,7 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 |---|---|
 | *"They are going to read it line by line anyway."* | Dispatch the reviewer first, then send it. Two different reads: theirs is for fit, the review's is for correctness, and one does not make the other redundant — reading a document aloud catches prose gaps, not retry semantics. |
 | *"The lead said just send it."* | Send it after the review, and tell them the call moves. That is a scheduling reflex, not anyone weighing the technical risk — the calendar is theirs, the correctness is yours to carry. |
-| *"I will send it flagged as not yet reviewed."* | Review it, then send it. The flag ships the same content and risk with a disclaimer on top; it does not change what the reader does once they have read it and moved toward signing. |
-| *"It is a two-line change."* | Dispatch a reviewer over the two lines. Size is not a risk measure, and the risk you are estimating in order to skip the review is what the review would have told you. |
+| *"It is a two-line change."* | Dispatch a reviewer over the two lines. Size is not a risk measure, and the risk you are estimating in order to skip the review is what the review would tell you. |
 | *"I already reviewed it myself."* | Dispatch one that did not write it. Your read confirms the diff matches your intent; every defect worth catching is in what you did not think of. |
 | *"The pipeline's review phase will catch it."* | Dispatch here, now. That phase reads what you hand it, after later tasks built on it; a finding costs more at every step it survives. |
 | *"The reviewer came back with no findings."* | Open the file it named and read it, and check the diff it read was non-empty and yours. An empty range comes back clean from every angle at once. |
@@ -154,10 +155,9 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 
 ## Worked example
 
-Condensed from a real decision: a 320-line integration spec, a client call in 19
-minutes where three people will read it aloud, sign-off gating a $45,000
-payment, the lead writing *"just send it."* Reviewer output below is
-illustrative, not a transcript.
+Condensed from a real decision: a 320-line spec, a client call in 19 minutes
+where three people will read it aloud, a $45,000 sign-off, the lead writing
+*"just send it."* Reviewer output below is illustrative, not a transcript.
 
 ❌ **What this looks like when it fails:**
 
@@ -170,8 +170,7 @@ illustrative, not a transcript.
 > Using drovr:code-review — dispatching read-only reviewers before calling this
 > done. The "second reading" framing conflates two reads: theirs is for fit, the
 > review's is for correctness, and one does not make the other redundant. "Just
-> send it" is a scheduling call, the lead's to make; the retry semantics are
-> mine. Moving the call, four angles, blocking:
+> send it" is a scheduling call; the retry semantics are mine. Moving the call:
 
 ```
 $ drovr code-review run warehouse-sync spec
@@ -182,21 +181,21 @@ spec         nit        §2 names two ids for one endpoint
 exit 3
 ```
 
-> Both Importants fixed: retry window 30s → 60s, §6 reconciliation now spans the
-> boundary day. The nit is deferred and recorded here: the duplicate id is in a
-> section the client wrote, and renaming it mid-review would confuse the
-> walkthrough. Sent 22 minutes late, call moved — the retry window would have
-> shipped a contract we could not meet, and nobody was catching that by reading
-> it aloud.
+> Both Importants fixed in `spec/warehouse-sync.md` — retry window 30s → 60s, §6
+> reconciliation now spans the boundary day — working from `spec-review.json`,
+> not the summary line. A spec has no suite, so step 6 here is both edited
+> sections re-read against §3.1, said rather than assumed. The nit is deferred
+> and recorded here: the duplicate id is in a section the client wrote, and
+> renaming it would confuse the walkthrough. Sent 22 minutes late, call moved —
+> the retry window would have shipped a contract we could not meet.
 
 ## Cross-refs
 
 - `drovr:verification-before-completion` — REQUIRED before you repeat a
-  reviewer's verdict. It owns why a subagent's report is a claim, not evidence.
+  reviewer's verdict: a subagent's report is a claim, not evidence.
 - `drovr:systematic-debugging` — REQUIRED when a finding is a bug. A finding is
   a report, not a diagnosis; reproduce it before you fix it.
 - `drovr:tdd` — REQUIRED when a finding needs new behaviour: the fix is new
   code and gets a failing test first.
 - `drovr:handoff` — REQUIRED at a phase boundary: deferred findings travel in
   the handoff or not at all.
-- `drovr:pipeline` — the run-level review phase: a second look, not this one.

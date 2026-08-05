@@ -25,10 +25,11 @@ You did not write this code — review it as a skeptic, not its author.
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the
    reports.
 2. **Review against the checklist — apply the check discipline from `drovr:code-review`
-   directly; do NOT dispatch review subagents.** You *are* the reviewer this phase, so work its
-   "Check, in order" list yourself — spec compliance → correctness → verification → quality —
-   as a skeptic, not the author, and run the claimed tests if you can. (That skill's "How to
-   run it" section is written for a phase that *launches* reviewers; it does not apply here.)
+   directly; do NOT dispatch review subagents.** You *are* the reviewer this phase, so work the
+   four angles in step 2 of that skill's procedure yourself — spec compliance → correctness →
+   verification → quality — as a skeptic, not the author, and run the claimed tests if you can.
+   (Its Iron Law and procedure are written for an agent that *dispatches* reviewers; here you
+   are the reviewer they would have dispatched, so steps 1–4 are yours to be, not to run.)
 3. **Write the verdict** to `~/.local/share/drovr/runs/<run>/verdict.md`:
    - an overall call: **approve / approve-with-fixes / changes-required**,
    - each finding with file:line, severity, and why it matters,
