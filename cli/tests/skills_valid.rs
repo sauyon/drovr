@@ -887,6 +887,13 @@ const VOICE_ARM: &str = "voice";
 /// row because it is the left-hand side of every comparison, not a case of one.
 const VOICE_BASELINE: &str = "V0";
 
+/// §6's section 2, spelled once — `V1`'s and `V3`'s device site.
+///
+/// Centralized for the same reason as [`VOICE_IRON_LAW_SECTION`]: two table
+/// rows naming the same section independently can be renamed apart, leaving one
+/// variant's separability check watching a section the other's does not.
+const VOICE_OVERVIEW_SECTION: &str = "Overview";
+
 /// §6's section 4, spelled once.
 ///
 /// Two checks depend on this exact heading and they must not drift apart: it is
@@ -914,6 +921,17 @@ struct VoiceVariant {
     /// The one `##` heading whose body may differ from [`VOICE_BASELINE`]'s.
     /// Every other section, and the frontmatter, must be byte-identical.
     device_site: &'static str,
+    /// A phrase carried by **this variant and no other**, which is what makes
+    /// the row a claim about *which* device the variant adds rather than only
+    /// about where it differs.
+    ///
+    /// **Without it, `V1` and `V3` are swappable.** They declare the same
+    /// [`Self::device_site`], so "exactly one section differs, and it is the
+    /// Overview" stays true if their two Overview paragraphs trade places — and
+    /// Task 21 would then run the moral arm under the unity label, score it, and
+    /// apply §7.4's rule 4 (escalate if unity loses) to the wrong arm entirely.
+    /// The identity of an arm cannot rest on its filename alone.
+    device_marker: &'static str,
 }
 
 /// §7.4's three non-baseline variants and where each one's single device sits.
@@ -933,15 +951,24 @@ struct VoiceVariant {
 const VOICE_VARIANTS: &[VoiceVariant] = &[
     VoiceVariant {
         name: "V1",
-        device_site: "Overview",
+        device_site: VOICE_OVERVIEW_SECTION,
+        // The unity line itself, which §6 section 3 and §2.3 both name.
+        device_marker: UNITY_LINE,
     },
     VoiceVariant {
         name: "V2",
         device_site: VOICE_IRON_LAW_SECTION,
+        // `MUST` in the *Fresh* definition. The bullets' `NEVER` would serve
+        // equally; this one is picked because it is the device at its least
+        // ambiguous — a modal verb in prose, not a shouted list item.
+        device_marker: "both halves MUST hold",
     },
     VoiceVariant {
         name: "V3",
-        device_site: "Overview",
+        device_site: VOICE_OVERVIEW_SECTION,
+        // The moral characterisation of the violation, which is the device:
+        // superpowers' register is *dishonesty*, not *cost*.
+        device_marker: "is a lie, not a shortcut",
     },
 ];
 
@@ -1097,6 +1124,55 @@ fn every_voice_variant_keeps_the_baselines_iron_law_line() {
              requires the same Iron Law across all four",
             variant.name
         );
+    }
+}
+
+/// Each variant carries **its own** device, and carries no other variant's.
+///
+/// [`voice_variants_differ_from_the_baseline_in_exactly_one_section`] pins
+/// *where* each variant differs from `V0`; this pins *what* it differs by, which
+/// is a separate claim and the one the labels rest on. `V1` and `V3` declare the
+/// same [`VoiceVariant::device_site`], so nothing else in this file notices if
+/// their two Overview paragraphs trade places — and Task 21 reads the arm labels
+/// off these filenames when it scores 24 runs and applies §7.4's decision rule.
+/// A silently transposed pair produces a confident, wrong conclusion about which
+/// register binds.
+///
+/// **The absence half is the load-bearing one.** Asserting only that `V1` holds
+/// the unity line would pass for a `V1` that held the moral framing too — which
+/// is a two-device variant, and not separable at n=6.
+#[test]
+fn each_voice_variant_carries_its_own_device_and_no_others() {
+    let baseline = normalize_ws(&read_voice_variant(VOICE_BASELINE).body);
+    // Folded before matching: these files are hard-wrapped, and every marker
+    // spans a line break in at least one of them. An unfolded substring search
+    // reports "the phrase is not in the file at all" for a paragraph that
+    // merely re-wrapped.
+    let bodies: Vec<(&str, String)> = VOICE_VARIANTS
+        .iter()
+        .map(|v| (v.name, normalize_ws(&read_voice_variant(v.name).body)))
+        .collect();
+
+    for variant in VOICE_VARIANTS {
+        let marker = normalize_ws(variant.device_marker);
+        assert!(
+            !baseline.contains(&marker),
+            "`{VOICE_BASELINE}` carries `{}`'s device marker \"{}\" — the baseline is defined by \
+             lacking it, so the arm measures nothing",
+            variant.name,
+            variant.device_marker
+        );
+        for (name, body) in &bodies {
+            let expected = *name == variant.name;
+            assert_eq!(
+                body.contains(&marker),
+                expected,
+                "voice variant `{name}` {} `{}`'s device marker \"{}\"",
+                if expected { "is missing" } else { "carries" },
+                variant.name,
+                variant.device_marker
+            );
+        }
     }
 }
 
