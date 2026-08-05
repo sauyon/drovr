@@ -87,3 +87,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | A-prime | using-drovr | `skills/using-drovr/SKILL.md` | `ae6b23b07ced4ebe2e606056001d5cdc9220cbe2` | `88753003de1550a20235498876881fe41bd1087d` | 2026-08-04 |
 | B | tdd | `skills/tdd/SKILL.md` | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | `30a99cd5667b0628fd278b8772ec42debff0c667` | 2026-08-04 |
 | B | systematic-debugging | `skills/systematic-debugging/SKILL.md` | `0d5fb63009789333d7d0a4849e61a7037962979e` | `21b26799e17b4f3ab8d781013ef13212eb351aeb` | 2026-08-04 |
+| B | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `236cf5557f3dc27178b50a40ad2a0f16fe0f9e13` | `a7a029f896aa5a2ffa207e6e414c07f57b2be0ab` | 2026-08-04 |
