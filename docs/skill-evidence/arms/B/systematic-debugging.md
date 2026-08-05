@@ -107,7 +107,7 @@ digraph debugging_loop {
   story  [label="no trigger —\nyou have a story,\nnot a bug"];
   cause  [label="mechanistic cause", shape=diamond, fillcolor=lightyellow];
   fix    [label="minimal fix,\nat the cause", fillcolor=palegreen];
-  verify [label="trigger + the suite\naround it", shape=diamond, fillcolor=lightyellow];
+  verify [label="trigger +\nthe full suite", shape=diamond, fillcolor=lightyellow];
   stop   [label="three failed fixes —\nquestion the design", fillcolor=lightpink];
   // "failed fix" is procedure step 6's unit: a change made, run, and seen to
   // leave the failure in place.
