@@ -7437,6 +7437,12 @@ fn blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts() {
 const RUN_CEILING: u32 = 122;
 
 /// One data row of `run-ledger.md`'s budget table.
+///
+/// The two counts are `u32` because they are the only cells this check computes
+/// on; `task` and `stage` are the cell text as written, because their only job is
+/// to name the offending row in a complaint. Nothing here is normalised — a row
+/// whose counts do not parse is rejected in [`parse_ledger`] rather than
+/// represented.
 struct LedgerRow {
     task: String,
     stage: String,
@@ -7444,17 +7450,18 @@ struct LedgerRow {
     cumulative: u32,
 }
 
-/// A header or data cell, reduced to something comparable: backticks and bold
-/// markers dropped, whitespace collapsed, case folded.
+/// Where each load-bearing column sits in the budget table.
 ///
-/// The same normalisation `arms/MANIFEST.md`'s parser applies, and for the same
-/// reason — a column may be renamed by a formatting pass without meaning to be.
-fn ledger_cell(cell: &str) -> String {
-    cell.replace(['`', '*'], "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+/// **A named field per column, not a positional list.** The columns are resolved
+/// by header text, so an index list would have to be read back in the same order
+/// it was built — and reordering that list would silently swap `runs` with
+/// `cumulative` while every type still checked. The whole point of resolving by
+/// header is that position carries no meaning; a `Vec<usize>` would put it back.
+struct LedgerColumns {
+    task: usize,
+    stage: usize,
+    runs: usize,
+    cumulative: usize,
 }
 
 /// Split one markdown table line into its cells.
@@ -7469,32 +7476,49 @@ fn ledger_cells(line: &str) -> Vec<&str> {
 
 /// The ledger's four load-bearing columns, resolved **by header text and never
 /// by position** — the columns may be reordered, but not renamed or dropped.
+///
+/// Header cells go through [`normalize_header`], the same function
+/// `arms/MANIFEST.md`'s parser uses, so the two tables agree on what counts as a
+/// renamed column. Data cells do not: the only ones this reads are the two run
+/// counts, which are bare integers in every row, so they are parsed as written
+/// rather than normalised into something that might parse when it should not.
 fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
-    const REQUIRED: [&str; 4] = ["task", "stage (§7.3 row)", "runs this stage", "cumulative"];
+    const TASK: &str = "task";
+    const STAGE: &str = "stage (§7.3 row)";
+    const RUNS: &str = "runs this stage";
+    const CUMULATIVE: &str = "cumulative";
 
     let mut lines = text.lines().peekable();
-    let mut index: Option<Vec<usize>> = None;
+    let mut columns: Option<LedgerColumns> = None;
     let mut width = 0usize;
     for line in lines.by_ref() {
         if !line.trim_start().starts_with('|') {
             continue;
         }
-        let cells: Vec<String> = ledger_cells(line).iter().map(|c| ledger_cell(c)).collect();
-        let resolved: Option<Vec<usize>> = REQUIRED
+        let cells: Vec<String> = ledger_cells(line)
             .iter()
-            .map(|want| cells.iter().position(|c| c == &ledger_cell(want)))
+            .map(|c| normalize_header(c))
             .collect();
-        if let Some(resolved) = resolved {
+        let at = |want: &str| cells.iter().position(|c| c == &normalize_header(want));
+        if let (Some(task), Some(stage), Some(runs), Some(cumulative)) =
+            (at(TASK), at(STAGE), at(RUNS), at(CUMULATIVE))
+        {
             width = cells.len();
-            index = Some(resolved);
+            columns = Some(LedgerColumns {
+                task,
+                stage,
+                runs,
+                cumulative,
+            });
             break;
         }
     }
-    let index = index.ok_or_else(|| {
+    let columns = columns.ok_or_else(|| {
         format!(
-            "no budget table found: no row carries all of {REQUIRED:?}. The ledger is the \
-             only mechanism tracking spec §7.3's {RUN_CEILING}-run ceiling, so a table this \
-             parser cannot find is a ceiling nothing tracks."
+            "no budget table found: no row carries all of [{TASK:?}, {STAGE:?}, {RUNS:?}, \
+             {CUMULATIVE:?}]. The ledger is the only mechanism tracking spec §7.3's \
+             {RUN_CEILING}-run ceiling, so a table this parser cannot find is a ceiling \
+             nothing tracks."
         )
     })?;
 
@@ -7522,20 +7546,19 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
                 cells.len()
             ));
         }
-        let num = |i: usize| -> Result<u32, String> {
-            let raw = ledger_cell(cells[index[i]]);
-            raw.parse::<u32>().map_err(|_| {
+        let count = |at: usize, column: &str| -> Result<u32, String> {
+            cells[at].parse::<u32>().map_err(|_| {
                 format!(
-                    "ledger row {line:?}: {:?} is not a run count",
-                    cells[index[i]]
+                    "ledger row {line:?}: {:?} is not a run count for column {column:?}",
+                    cells[at]
                 )
             })
         };
         rows.push(LedgerRow {
-            task: cells[index[0]].to_string(),
-            stage: cells[index[1]].to_string(),
-            runs: num(2)?,
-            cumulative: num(3)?,
+            task: cells[columns.task].to_string(),
+            stage: cells[columns.stage].to_string(),
+            runs: count(columns.runs, RUNS)?,
+            cumulative: count(columns.cumulative, CUMULATIVE)?,
         });
     }
     Ok(rows)
@@ -7661,7 +7684,11 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
         check_ledger(renamed)
     );
 
-    // Columns may be REORDERED, because they are resolved by header text.
+    // Columns may be REORDERED, because they are resolved by header text — and
+    // `cumulative` deliberately sits *before* `runs this stage` here, so a parser
+    // that bound the two counts positionally would read runs=10,cum=10 then
+    // runs=14,cum=4 and complain. A clean result is the assertion that each count
+    // reached its own field.
     let reordered = "| cumulative | task | runs this stage | stage (§7.3 row) |\n|---|---|---|---|\n| 10 | 6 | 10 | RED |\n| 14 | 16 | 4 | Arm A |\n";
     assert!(
         check_ledger(reordered).is_empty(),
