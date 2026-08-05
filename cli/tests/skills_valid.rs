@@ -7507,42 +7507,60 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
             .map(|c| normalize_header(c))
             .collect();
 
-        // Resolved by header text, so **exactly one** column may carry each key.
-        // `position()` alone takes the first match and reads the wrong cell for
-        // the rest of the file — the failure `parse_manifest` guards against by
-        // name, at the table that pins the arms. A duplicated load-bearing
-        // header is a corrupt table, not a row that merely is not the header, so
-        // it aborts rather than sending the scan looking for another one.
-        let at = |want: &str| -> Result<Option<usize>, String> {
+        // **Completeness first, then duplicates — the order `parse_manifest`
+        // uses, and the same reason.** A preamble that talks about a table grows
+        // illustrations of one, so a row is the header only if it carries the
+        // COMPLETE set of load-bearing columns; anything short of that is passed
+        // over rather than judged. Checking duplicates before completeness would
+        // let an incomplete fragment like `| cumulative | cumulative |` hard-fail
+        // a perfectly good ledger, and would make two parsers over one
+        // markdown-table dialect disagree about malformed input.
+        let hits = |want: &str| -> Vec<usize> {
             let key = normalize_header(want);
-            let hits: Vec<usize> = cells
+            cells
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| **c == key)
                 .map(|(i, _)| i)
-                .collect();
-            match hits.len() {
-                0 => Ok(None),
-                1 => Ok(Some(hits[0])),
-                n => Err(format!(
-                    "the budget table's header carries {n} columns named {want:?}; the \
-                     column is resolved by its name, so a duplicate makes every cell \
-                     under it ambiguous"
-                )),
-            }
+                .collect()
         };
-        if let (Some(task), Some(stage), Some(runs), Some(cumulative)) =
-            (at(TASK)?, at(STAGE)?, at(RUNS)?, at(CUMULATIVE)?)
-        {
-            width = cells.len();
-            columns = Some(LedgerColumns {
-                task,
-                stage,
-                runs,
-                cumulative,
-            });
-            break;
+        let (task, stage, runs, cumulative) =
+            (hits(TASK), hits(STAGE), hits(RUNS), hits(CUMULATIVE));
+        // Only for the two checks that treat all four alike. The struct below is
+        // still bound field-by-field from the named bindings, never from this
+        // list's order.
+        let named = [
+            (TASK, &task),
+            (STAGE, &stage),
+            (RUNS, &runs),
+            (CUMULATIVE, &cumulative),
+        ];
+        if named.iter().any(|(_, at)| at.is_empty()) {
+            continue;
         }
+
+        // Now it *is* the header, so a duplicate is corruption rather than a
+        // fragment: resolving by name cannot say which of two same-named columns
+        // a cell belongs to, and `position()` alone would silently take the first
+        // and read the wrong cell for the rest of the file.
+        for (want, at) in named {
+            if at.len() > 1 {
+                return Err(format!(
+                    "the budget table's header carries {} columns named {want:?}; the \
+                     column is resolved by its name, so a duplicate makes every cell \
+                     under it ambiguous",
+                    at.len()
+                ));
+            }
+        }
+        width = cells.len();
+        columns = Some(LedgerColumns {
+            task: task[0],
+            stage: stage[0],
+            runs: runs[0],
+            cumulative: cumulative[0],
+        });
+        break;
     }
     let columns = columns.ok_or_else(|| {
         format!(
@@ -7751,6 +7769,20 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
             .any(|c| c.contains("2 columns named") && c.contains("cumulative")),
         "{:?}",
         check_ledger(dup)
+    );
+
+    // ...but an INCOMPLETE row carrying that same duplicate is a fragment, not a
+    // corrupt header, and must be passed over — `parse_manifest`'s rule, checked
+    // here so the two parsers cannot drift apart on malformed input. Prose about
+    // a table grows illustrations of one, and an illustration must not be able to
+    // hard-fail a perfectly good ledger.
+    let illustrated = format!(
+        "Prose about the columns, e.g.\n\n| cumulative | cumulative |\n\n{header}| 6 | RED | 10 | 10 | 10 | no |\n"
+    );
+    assert!(
+        check_ledger(&illustrated).is_empty(),
+        "an incomplete fragment aborted the scan instead of being skipped: {:?}",
+        check_ledger(&illustrated)
     );
 
     // A non-numeric run count is refused rather than read as zero.
