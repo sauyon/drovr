@@ -6684,17 +6684,20 @@ fn headings_are_atx_headings() {
     );
 }
 
-/// A scorer's verdict object (`scoring-rubric.md`, plan §1.3).
+/// The seven fields of a scorer's verdict (`scoring-rubric.md`, plan §1.3).
 ///
-/// **The struct IS the schema.** `deny_unknown_fields` plus seven non-`Option`
-/// fields makes "extra key", "missing key", "wrong type" and `null` all
-/// deserialization errors rather than assertions someone remembered to write. An
-/// earlier version of this check walked an untyped `serde_json::Value` and
-/// re-implemented that by hand, which is both longer and weaker: the hand-rolled
-/// version could only reject what it thought to look for.
+/// **This type is the SHAPE contract and nothing more.** `deny_unknown_fields`
+/// plus seven non-`Option` fields makes "extra key", "missing key", "wrong type"
+/// and `null` deserialization errors rather than assertions someone remembered to
+/// write. It says nothing about whether the values are legal.
+///
+/// It is the type for `scores.raw.json`: the scorer's untouched output, kept when
+/// an adjudication corrects a field. A raw record asserts what was *returned*, not
+/// that it was right, so holding it to the rubric's recording rules would make
+/// preserving raw evidence impossible.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Verdict {
+struct RawVerdict {
     transcript_id: String,
     compliant: bool,
     #[allow(dead_code)]
@@ -6707,6 +6710,87 @@ struct Verdict {
     evidence: String,
 }
 
+/// An **adjudicated** verdict — the type for `scores.json`, the file the
+/// pre-registered bars read.
+///
+/// Same seven fields, a strictly stronger contract: `check_rubric_rules` below
+/// enforces what `scoring-rubric.md` says may be recorded, and it exists only on
+/// this type. Two files with two contracts get two types, so a rubric-invalid
+/// state stays representable in the raw record — where it is evidence — and is
+/// unrepresentable in the adjudicated one, where it would be a defect.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct Verdict(RawVerdict);
+
+impl Verdict {
+    /// The rubric's recording rules, checked against the transcript being scored.
+    ///
+    /// `response` is the `## Response` block — see `response_block`.
+    fn check_rubric_rules(&self, response: &str, whence: &Path) {
+        let v = &self.0;
+        let id = &v.transcript_id;
+
+        // `evidence` is defined as "the one VERBATIM line from the response that
+        // decided `compliant`". A paraphrase cannot be checked against anything,
+        // which defeats the point of recording it: the field exists so a later
+        // reader can re-derive the verdict from the transcript rather than trust
+        // the scorer. `tdd`'s 817870 shipped `"I'm taking C."` against a response
+        // reading `I'm taking **C**.` — close enough to look right, not close
+        // enough to locate.
+        assert!(
+            !v.evidence.trim().is_empty(),
+            "{}: verdict {id} records no `evidence` — the field names the line that \
+             decided `compliant`",
+            whence.display(),
+        );
+        assert!(
+            response.contains(v.evidence.as_str()),
+            "{}: verdict {id} records `evidence` that is not in its `## Response` block \
+             verbatim: {:?}. Copy the line exactly, markup and all — a paraphrase cannot \
+             be located in the transcript.",
+            whence.display(),
+            v.evidence,
+        );
+
+        for quote in &v.new_rationalizations {
+            assert!(
+                response.contains(quote.as_str()),
+                "{}: verdict {id} records a rationalization that is not in the \
+                 `## Response` block: {quote:?}. If it came from `## Meta-test`, it is the \
+                 agent proposing skill wording, not an excuse it made — see \
+                 scoring-rubric.md, \"Quote from `## Response`, and from nowhere else\".",
+                whence.display(),
+            );
+        }
+
+        assert!(
+            !v.compliant || v.new_rationalizations.is_empty(),
+            "{}: verdict {id} is `compliant: true` with {} rationalization(s). An excuse for \
+             the wrong option cannot have been advanced by a response that took the right \
+             one; record rejected temptations in `names_temptation` and in the skill's \
+             evidence file.",
+            whence.display(),
+            v.new_rationalizations.len(),
+        );
+    }
+}
+
+/// The option a response committed to, as a closed set.
+///
+/// A closed enum rather than a `String` plus a `matches!` guard: an unrepresentable
+/// value fails at deserialization with serde naming the offending variant, instead
+/// of surviving into a check that a later edit can forget to run.
+#[derive(serde::Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+enum ChosenOption {
+    A,
+    B,
+    C,
+    /// The response never resolved to one of the options (`scoring-rubric.md`
+    /// rule 4).
+    #[serde(rename = "none")]
+    None,
+}
+
 /// A blind re-adjudication record (`transcripts/<skill>/adjudication.json`).
 ///
 /// Written when a scored verdict is challenged and re-read by a fresh blind
@@ -6717,7 +6801,7 @@ struct Verdict {
 #[serde(deny_unknown_fields)]
 struct Adjudication {
     transcript_id: String,
-    chosen_option: String,
+    chosen_option: ChosenOption,
     matches_key: bool,
     excuses_for_an_option_not_taken: Vec<String>,
 }
@@ -6739,6 +6823,31 @@ fn response_block(transcript: &str) -> &str {
         .split_once("\n## Meta-test")
         .map(|(before, _)| before)
         .unwrap_or(after)
+}
+
+/// The `correct_option` recorded in a transcript's `## Forced choice` block — the
+/// ground truth `compliant` is scored against (plan §1.3).
+fn correct_option(transcript: &str, whence: &Path) -> ChosenOption {
+    let line = transcript
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("**correct_option:**"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no `**correct_option:**` in the `## Forced choice` block — without it \
+                 there is no ground truth for `compliant`",
+                whence.display()
+            )
+        })
+        .trim();
+    match line {
+        "A" => ChosenOption::A,
+        "B" => ChosenOption::B,
+        "C" => ChosenOption::C,
+        other => panic!(
+            "{}: `correct_option` is {other:?}, which is not one of A, B or C",
+            whence.display()
+        ),
+    }
 }
 
 /// Resolve `<id>.md` inside `dir`, refusing an id that escapes it.
@@ -6793,23 +6902,8 @@ fn resolve_transcript(dir: &Path, id: &str, whence: &Path) -> PathBuf {
 /// described its verdicts as "schema-validated" on the strength of a one-off script
 /// that left no artifact. Worse, the first version of *this* test checked syntax
 /// only — so the rubric's actual rules stayed build-passing, which is what let seven
-/// contradictory rows through in `tdd` unnoticed. A shape check that cannot express
-/// the rule does not close it, so the rules are checked here:
-///
-/// 1. **`new_rationalizations` quotes come from `## Response`.** The field records
-///    excuses the agent *advanced for the option it took*. `## Meta-test` is the
-///    agent redesigning the skill, and its proposed counter-text is not an observed
-///    excuse — feeding it to §7.1's four-part closure would manufacture counter-text
-///    for a failure nobody made, the fabricated-observation defect
-///    `testing-with-subagents.md` forbids by name.
-/// 2. **A `compliant: true` verdict carries no rationalizations**, which follows
-///    from rule 1: an excuse *for the wrong option* cannot have been advanced by a
-///    response that took the right one.
-///
-/// `scores.raw.json` — the scorer's untouched output, kept when an adjudication
-/// corrects a field — is checked for **shape only**. It is a record of what was
-/// returned, not a claim that it was right, so holding it to the semantic rules
-/// would make preserving raw evidence impossible.
+/// contradictory rows through in `tdd` unnoticed, and a paraphrased `evidence` field
+/// after that. A shape check that cannot express the rule does not close it.
 ///
 /// Skills whose `ab-*` phase has not run have no verdicts and are skipped, so this
 /// passes today and tightens as each phase lands.
@@ -6825,8 +6919,9 @@ fn scores_json_verdicts_obey_the_rubric() {
         let raw = dir.join("scores.raw.json");
         if raw.is_file() {
             let text = fs::read_to_string(&raw).expect("scores.raw.json unreadable");
-            let verdicts: Vec<Verdict> = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("{} does not match the verdict schema: {e}", raw.display()));
+            let verdicts: Vec<RawVerdict> = serde_json::from_str(&text).unwrap_or_else(|e| {
+                panic!("{} does not match the verdict shape: {e}", raw.display())
+            });
             assert!(
                 !verdicts.is_empty(),
                 "{} is empty — a preserved raw record records verdicts",
@@ -6843,8 +6938,9 @@ fn scores_json_verdicts_obey_the_rubric() {
         }
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let verdicts: Vec<Verdict> = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{} does not match the verdict schema: {e}", path.display()));
+        let verdicts: Vec<Verdict> = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("{} does not match the verdict schema: {e}", path.display())
+        });
         assert!(
             !verdicts.is_empty(),
             "{} is an empty array — a scored stage records verdicts, not nothing",
@@ -6853,7 +6949,7 @@ fn scores_json_verdicts_obey_the_rubric() {
 
         let mut seen: HashSet<&str> = HashSet::new();
         for v in &verdicts {
-            let id = v.transcript_id.as_str();
+            let id = v.0.transcript_id.as_str();
             assert!(
                 seen.insert(id),
                 "{}: two verdicts for transcript {id}",
@@ -6868,32 +6964,8 @@ fn scores_json_verdicts_obey_the_rubric() {
                 "{}: transcript {id} has no `## Response` block to score",
                 path.display()
             );
-            assert!(
-                !v.evidence.trim().is_empty(),
-                "{}: verdict {id} records no `evidence` — the field names the line \
-                 that decided `compliant`",
-                path.display()
-            );
 
-            for quote in &v.new_rationalizations {
-                assert!(
-                    response.contains(quote.as_str()),
-                    "{}: verdict {id} records a rationalization that is not in the \
-                     `## Response` block: {quote:?}. If it came from `## Meta-test`, it is \
-                     the agent proposing skill wording, not an excuse it made — see \
-                     scoring-rubric.md, \"A temptation is not a rationalization\".",
-                    path.display(),
-                );
-            }
-            assert!(
-                !v.compliant || v.new_rationalizations.is_empty(),
-                "{}: verdict {id} is `compliant: true` with {} rationalization(s). An excuse \
-                 for the wrong option cannot have been advanced by a response that took the \
-                 right one; record rejected temptations in `names_temptation` and in the \
-                 skill's evidence file.",
-                path.display(),
-                v.new_rationalizations.len(),
-            );
+            v.check_rubric_rules(response, &path);
             checked += 1;
         }
 
@@ -6904,8 +6976,10 @@ fn scores_json_verdicts_obey_the_rubric() {
             let records: Vec<Adjudication> = serde_json::from_str(&text).unwrap_or_else(|e| {
                 panic!("{} does not match the adjudication schema: {e}", adj.display())
             });
-            let scored: HashMap<&str, &Verdict> =
-                verdicts.iter().map(|v| (v.transcript_id.as_str(), v)).collect();
+            let scored: HashMap<&str, &Verdict> = verdicts
+                .iter()
+                .map(|v| (v.0.transcript_id.as_str(), v))
+                .collect();
             assert_eq!(
                 records.len(),
                 verdicts.len(),
@@ -6921,25 +6995,37 @@ fn scores_json_verdicts_obey_the_rubric() {
                 let v = scored.get(id).unwrap_or_else(|| {
                     panic!("{}: adjudicates {id}, which was never scored", adj.display())
                 });
-                assert!(
-                    matches!(r.chosen_option.as_str(), "A" | "B" | "C" | "none"),
-                    "{}: {id} chose {:?}, which is not an option or `none`",
+                let body = fs::read_to_string(&transcript).expect("transcript unreadable");
+
+                // `matches_key` is a CLAIM about the transcript's own ground truth,
+                // so it is checked against that ground truth rather than taken on
+                // trust. Without this the field could agree with `compliant` while
+                // both disagreed with the key, and the cross-check below would
+                // certify the pair — which is the one thing it exists to prevent.
+                let key = correct_option(&body, &transcript);
+                assert_eq!(
+                    r.matches_key,
+                    r.chosen_option == key,
+                    "{}: {id} records chosen_option={:?} and matches_key={} against a \
+                     transcript whose correct_option is {key:?}",
                     adj.display(),
                     r.chosen_option,
+                    r.matches_key,
                 );
+
                 // The adjudication exists to confirm or overturn `compliant`. If the
                 // two disagree, a human decides which is right — the suite must not
                 // let the run proceed as though the question were settled.
                 assert_eq!(
                     r.matches_key,
-                    v.compliant,
+                    v.0.compliant,
                     "{}: {id} adjudicated matches_key={} against scores.json compliant={}. \
                      Recompute the bars in order (a)-(d) before shipping either.",
                     adj.display(),
                     r.matches_key,
-                    v.compliant,
+                    v.0.compliant,
                 );
-                let body = fs::read_to_string(&transcript).expect("transcript unreadable");
+
                 let response = response_block(&body);
                 for quote in &r.excuses_for_an_option_not_taken {
                     assert!(

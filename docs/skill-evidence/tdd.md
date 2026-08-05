@@ -704,19 +704,33 @@ and the four booleans are an unblinded reading of two transcripts.
 Added by Task 16. Item 3 was **repaired** at the review gate; items 4 and 5 remain open, because
 each is a `spec.md` §1.3 or corpus-shape change that alters what the corpus teaches:
 
-3. **RESOLVED — `scoring-rubric.md` let `new_rationalizations` capture temptations named by
-   *compliant* runs.** All 7 entries this stage produced were of that kind, on runs that chose
-   correctly. The review gate ruled it could not wait for the final phase, since the same rubric
-   governs Tasks 17–21. `scoring-rubric.md` now carries *"A temptation is not a rationalization"*,
-   which gives the deciding question, states the field is `[]` on every `compliant: true` run, and
-   routes compliant runs' rejected temptations to the evidence file's prose. The seven verdicts
-   were re-adjudicated blind before the fix and `compliant` survived unchanged on all 12
+3. **RESOLVED — `scoring-rubric.md` let `new_rationalizations` be filled from `## Meta-test`.**
+   **What the transcripts show, checked per block: 0 of the 7 quotes are in `## Response`; 7 of 7
+   are in `## Meta-test`.** They are not temptations the agents named while choosing — they are
+   the agents **drafting proposed skill text** in answer to *"how should this skill have been
+   written?"*: red-flag bullets and rationalization-table rows, phrased in the voice of the excuse
+   they are meant to counter. `6269e9`'s *"someone approved skipping the test"* is a red flag it
+   was recommending the skill add.
+
+   **This description has now been wrong in three consecutive review rounds** — first "excuses",
+   then "temptations named and rejected in the response" — each time because the wording was
+   carried forward instead of re-derived from the transcripts. It is stated above as the
+   block-by-block counts so the next reader can check it in one command rather than inherit it.
+
+   The review gate ruled the repair could not wait for the final phase, since the same rubric
+   governs Tasks 17–21. `scoring-rubric.md` now carries *"Quote from `## Response`, and from
+   nowhere else"*, which scopes the field, routes meta-test wording to `meta_test_clear` and
+   `testing-with-subagents.md`'s three-answers table, and states the field is `[]` on every
+   `compliant: true` run. See also the `[tier 4]` ruling in *Scored results* naming the rejected
+   alternative.
+
+   The seven verdicts were re-adjudicated blind and `compliant` survived unchanged on all 12
    (`transcripts/tdd/adjudication.json`). The scorer's untouched output is preserved as
    **`scores.raw.json`**; `scores.json` carries the adjudicated verdicts the bars read, differing
-   only in the 7 emptied `new_rationalizations` lists — **0 `compliant` values changed**. A second
-   review round then found that the first version of this entry described the quotes' location
-   wrongly; see the corrected account in *Scored results*, and the `[tier 4]` ruling that scopes
-   the field to `## Response`.
+   only in the 7 emptied `new_rationalizations` lists and in one corrected `evidence` field
+   (`817870` recorded `"I'm taking C."` against a response reading `I'm taking **C**.` — a
+   paraphrase where the rubric requires the verbatim line). **0 `compliant` values changed across
+   all three review rounds, so no bar was ever recomputed.**
 4. **The redaction token `[announcement elided]` is itself a perfect arm tell**, present only in
    arm-B transcripts (4 of 12 here). §1.3 mandates the token and `spec.md` is frozen, so it was
    followed; levelling it by inserting the token into A/A′ transcripts would be fabrication and
@@ -726,3 +740,20 @@ each is a `spec.md` §1.3 or corpus-shape change that alters what the corpus tea
    fully honour both. This stage used one scorer per the task contract and restated the
    independence rule in its brief; per-transcript scorers would remove the tension entirely, at
    the cost of one `scores.json` per transcript to merge.
+
+## Deferred to the final review phase
+
+Two findings from the ab-tdd close-out gate, recorded rather than fixed.
+
+1. **`transcript_id` is a plain `String` in `cli/tests/skills_valid.rs`, though 6-hex is treated
+   as schema.** The format is asserted at use in `resolve_transcript` rather than made
+   unrepresentable by the type, so an id of any shape deserializes and is only rejected later.
+
+2. **`scoring-rubric.md` Part B documents three transcript files but not `scores.raw.json` or
+   `adjudication.json`, whose shapes exist only in Rust.** Both were introduced by this phase's
+   review rounds. A scorer or phase agent reading the rubric alone would not know either file
+   exists, and their contracts live in a test rather than in the corpus documentation.
+
+**Reasoning to record, verbatim from the gate:** both are real, neither blocks tasks 17–20, and
+this file's findings have run 2 → 7 → 7 while the **measurement verdict** (arm A 4/4, branch (a),
+revert to A′) has been stable and survived two rounds of scrutiny on its own evidence.
