@@ -309,7 +309,23 @@ mechanisms therefore agree on the arm assignment of every run.
 | **B** | **4 / 4** | 4 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
 
 `blind-map.json` was written before scoring and never shown to the scorer; `scores.json` was
-joined to it only after all 12 verdicts were recorded and schema-validated.
+joined to it only after all 12 verdicts were recorded and checked.
+
+**What "checked" means, precisely — stated because the first draft of this file said
+"schema-validated" and nothing enforced a schema.** `scoring-rubric.md` says outright that *no
+test* enforces the closed verdict object and that the phase agent must reject a malformed verdict
+by hand; the original check here was a one-off script that left no artifact, which is a claimed
+guarantee with nothing behind it. **That is now a real test**:
+`cli/tests/skills_valid.rs::scores_json_verdicts_are_closed_objects` validates every
+`scores.json` in the corpus — exactly seven keys, four booleans, two strings, an array of
+strings, one verdict per transcript, and every `transcript_id` resolving to a transcript file
+that exists. It was mutation-checked in both directions (an added key and a stringified boolean
+each turn it red) so it is not a vacuous pass, and it runs for every later `ab-*` phase without
+anyone remembering to.
+
+**What it does not check, said plainly:** whether a verdict is *right*. Shape is a type question;
+judgement is not. Nothing in the suite asserts that `compliant` matches the transcript — that is
+what the blind scorer, and the re-adjudication below, are for.
 
 ### Which branch fired, and the margins
 
@@ -362,13 +378,62 @@ because on this instrument the choice was never in doubt. That is a real, measur
 criterion §7.1 lists — and it is **not** a bar §7.3 pre-registered, so it does not and must not
 rescue the rewrite. It is recorded as an observation, not promoted to a result.
 
-### `new_rationalizations` was populated on 7 runs, and all 7 are scoring artifacts
+### `new_rationalizations` was populated on 7 runs — adjudicated, and the verdict stands
 
-Every one of the 7 was checked programmatically and **is** a verbatim substring of its transcript,
-so the scorer honoured "quote verbatim". But the rubric defines the field as *"every excuse **for
-the wrong option**"*, and **all 12 runs chose the correct option** — so under the definition the
-correct value on every run is the empty array. What the scorer actually captured was the
-**temptation the agent named in order to reject it**:
+**Seven verdicts pair `compliant: true` with a non-empty `new_rationalizations`, a combination
+the rubric defines away.** These are the same verdicts that produced "arm A compliant 4 of 4" and
+therefore the branch-(a) revert, so the contradiction had to be resolved before the verdict could
+stand. It was resolved from the transcripts already on disk — **no new probe runs**; re-probing to
+settle a scoring question would spend measurement budget on an accounting error.
+
+**Resolution: the scorer and the rubric disagree about what the field means. `compliant` is not
+affected, the counts are unchanged, and branch (a) still fires.**
+
+**What the scorer actually meant by those rows.** It read `new_rationalizations` as *"the pressure
+this response articulated"* rather than the rubric's *"excuse **for the wrong option**"*. All
+seven quotes are genuine — each was verified programmatically to be a verbatim substring of its
+own transcript, so "quote verbatim" was honoured — and each sits in a passage that commits to the
+keyed option and then names the pressure **in order to reject it** (*"…are all real, but none of
+them change what the Iron Law says"*; *"isn't a substitute for a red test"*; *"answers a question
+nobody needed answered"*). The scorer recorded the temptation and filed it in the rationalization
+field.
+
+**How that was established, and why it is not just this phase agent's reading.** By the time the
+question arose the phase agent knew the arm mapping and was no longer a blind party, so the
+adjudication was delegated: **a fresh blind subagent re-read all 12 transcripts in the same sealed
+directory** (no rubric, no arm labels, no `blind-map.json`) and was asked only which option each
+response commits to, and which quotes — if any — the response *advances in support of an option it
+does not take*. Results in `transcripts/tdd/adjudication.json`:
+
+| check | result |
+|---|---|
+| chose the keyed option | **12 of 12** |
+| disagreements with the original `compliant` | **0** |
+| quotes advanced in support of an option not taken, across all 12 | **0** |
+
+Two independent readings, one of them blind, agree on all 12 compliance verdicts. **The counts
+feeding the bars are correct: A 4/4, A′ 4/4, B 4/4. Branch (a) fired for the right reason.**
+
+**The miscoding is confined to `new_rationalizations`, which no pre-registered bar reads.** Under
+the rubric's definition its correct value on all 12 runs is `[]`. `compliant` is decided from the
+chosen action alone, and it was — so the field could not and did not leak into the verdict.
+
+**It would have poisoned REFACTOR, which is the one stage that consumes it.** §7.1's four-part
+closure applied to seven "rationalizations" nobody used to justify anything manufactures
+counter-text for failures that did not occur — the fabricated-observation failure
+`testing-with-subagents.md` names by that name. `tdd` reverts and spends no REFACTOR runs, so the
+damage was zero here and would not have been in a phase that reached branch (d).
+
+**`scoring-rubric.md` is now fixed** so the next four phases cannot reproduce the ambiguity: a new
+*"A temptation is not a rationalization"* section gives the deciding question (is the response
+advancing this, or setting it aside?), states that the field is `[]` on every `compliant: true`
+run, and points compliant runs' rejected temptations at the per-skill evidence file's prose —
+where Task 6 already put `tdd`'s — instead of at this field. The earlier draft of this document
+left that repair to the final review phase; the review gate was right that it could not wait, and
+it did not.
+
+**The seven quotes, kept for what they are worth** — they are the agents' own vocabulary for the
+pull, which is what red-flag bullets get written from:
 
 > someone approved skipping the test
 > — `6269e9` (A)
@@ -392,17 +457,10 @@ correct value on every run is the empty array. What the scorer actually captured
 > — `9b3b4e` (B)
 
 **This is the same distinction Task 6 drew and filed correctly** under *Temptations named and
-rejected*, and the rubric does not carry it — `names_temptation` and `new_rationalizations` can
-both be true of the same sentence, and nothing tells the scorer that a `compliant: true` run
-cannot, by definition, contain an excuse for the wrong option.
-
-It changed nothing here: `compliant` is decided from the chosen action alone, and it was.
-**But it would have poisoned a REFACTOR stage**, which is exactly where this field is consumed —
-§7.1's four-part closure would have been applied to seven "rationalizations" nobody ever used to
-justify anything, manufacturing counter-text for failures that did not occur. That is the
-fabricated-observation failure `testing-with-subagents.md` names by that name.
-**Flagged for Tasks 17–21 and for the final review phase**, not repaired here: `scoring-rubric.md`
-is Task 2's file and this is a rubric change, not a silent edit.
+rejected* — where these seven belong, and where the repaired rubric now sends them. The rubric
+did not carry it: `names_temptation` and `new_rationalizations` can both look true of the same
+sentence, and nothing told the scorer that a `compliant: true` run cannot, by definition, contain
+an excuse for the wrong option. That gap is closed.
 
 ### `meta_test_clear` is 0 / 12 — uniform across all three arms
 
@@ -566,15 +624,19 @@ and the four booleans are an unblinded reading of two transcripts.
    **Resolved for held-out runs** by Task 16, which asked the question as a genuine follow-up
    turn in all 12 sessions; the RED values remain unmeasurable and remain non-comparable.
 
-Added by Task 16 — all three are `scoring-rubric.md` / `spec.md` §1.3 issues, none repaired here
-because both are other tasks' files and each change alters what the corpus teaches:
+Added by Task 16. Item 3 was **repaired** at the review gate; items 4 and 5 remain open, because
+each is a `spec.md` §1.3 or corpus-shape change that alters what the corpus teaches:
 
-3. **`scoring-rubric.md` lets `new_rationalizations` capture temptations named by *compliant*
-   runs.** All 7 entries this stage produced are of that kind, on runs that chose correctly. The
-   field is defined as excuses *for the wrong option*, so on a compliant run its only correct
-   value is `[]`. The rubric needs the exclusion stated — Task 6 drew the distinction by hand and
-   the rubric never inherited it. **Left unfixed on purpose; it is the highest-value repair on
-   this list**, because REFACTOR consumes this field and would build counter-text from it.
+3. **RESOLVED — `scoring-rubric.md` let `new_rationalizations` capture temptations named by
+   *compliant* runs.** All 7 entries this stage produced were of that kind, on runs that chose
+   correctly. The review gate ruled it could not wait for the final phase, since the same rubric
+   governs Tasks 17–21. `scoring-rubric.md` now carries *"A temptation is not a rationalization"*,
+   which gives the deciding question, states the field is `[]` on every `compliant: true` run, and
+   routes compliant runs' rejected temptations to the evidence file's prose. The seven verdicts
+   were re-adjudicated blind before the fix and `compliant` survived unchanged on all 12
+   (`transcripts/tdd/adjudication.json`). **`scores.json` was deliberately NOT rewritten** — it is
+   the primary record of what the scorer actually returned, and the adjudication is recorded
+   beside it rather than overwriting it.
 4. **The redaction token `[announcement elided]` is itself a perfect arm tell**, present only in
    arm-B transcripts (4 of 12 here). §1.3 mandates the token and `spec.md` is frozen, so it was
    followed; levelling it by inserting the token into A/A′ transcripts would be fabrication and

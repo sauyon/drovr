@@ -6683,3 +6683,146 @@ fn headings_are_atx_headings() {
         vec!["Real".to_string()],
     );
 }
+
+/// Every `scores.json` under `docs/skill-evidence/transcripts/<skill>/` carries
+/// verdict objects in the **closed** shape `scoring-rubric.md` specifies: exactly
+/// seven keys, four booleans, two strings, one array of strings, no `null` and no
+/// `"unknown"`.
+///
+/// **What it closes:** the rubric says outright that *no test* enforces the closed
+/// object and that the phase agent must reject a malformed verdict by hand. Task 16
+/// then described its verdicts as "schema-validated" on the strength of a one-off
+/// script that left no artifact — a claimed guarantee with nothing behind it, which
+/// is the defect class this run has hit repeatedly. This is the mechanism that makes
+/// the claim true, and it runs for every later `ab-*` phase without anyone
+/// remembering to.
+///
+/// It deliberately checks **shape, not judgement**. Whether a given verdict is
+/// *correct* is a scoring question that a type cannot answer; whether it is
+/// *well-formed* is exactly what a type can. In particular this test does **not**
+/// assert that a `compliant: true` verdict has an empty `new_rationalizations` —
+/// that rule lives in `scoring-rubric.md`, and `tdd.md` records a scored set where
+/// the two disagreed. Encoding it here would make the evidence record fail the build
+/// instead of being adjudicated.
+///
+/// Skills whose `ab-*` phase has not run yet have no `scores.json` and are skipped,
+/// so this passes today and tightens as each phase lands.
+#[test]
+fn scores_json_verdicts_are_closed_objects() {
+    const REQUIRED: [&str; 7] = [
+        "transcript_id",
+        "compliant",
+        "cites_section",
+        "names_temptation",
+        "meta_test_clear",
+        "new_rationalizations",
+        "evidence",
+    ];
+    const BOOLS: [&str; 4] = [
+        "compliant",
+        "cites_section",
+        "names_temptation",
+        "meta_test_clear",
+    ];
+
+    let transcripts = evidence_dir().join("transcripts");
+    let mut checked = 0usize;
+
+    for skill in SkillName::ALL {
+        let dir = transcripts.join(skill.as_str());
+        let path = dir.join("scores.json");
+        if !path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        let verdicts = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("{} must be a JSON array", path.display()));
+        assert!(
+            !verdicts.is_empty(),
+            "{} is an empty array — a scored stage records verdicts, not nothing",
+            path.display()
+        );
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for v in verdicts {
+            let obj = v
+                .as_object()
+                .unwrap_or_else(|| panic!("{}: every verdict must be an object", path.display()));
+
+            // Closed: exactly the seven keys, no more and no fewer. An extra key
+            // carries evidence no reader consumes; a missing one is a partial
+            // verdict, which the rubric says to reject rather than repair.
+            let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
+            let want: HashSet<&str> = REQUIRED.into_iter().collect();
+            assert_eq!(
+                keys,
+                want,
+                "{}: verdict has the wrong key set (extra: {:?}, missing: {:?})",
+                path.display(),
+                keys.difference(&want).collect::<Vec<_>>(),
+                want.difference(&keys).collect::<Vec<_>>(),
+            );
+
+            let id = obj["transcript_id"].as_str().unwrap_or_else(|| {
+                panic!("{}: `transcript_id` must be a string", path.display())
+            });
+            for key in BOOLS {
+                assert!(
+                    obj[key].is_boolean(),
+                    "{}: verdict {id} field `{key}` must be a boolean, got {}",
+                    path.display(),
+                    obj[key],
+                );
+            }
+            assert!(
+                obj["evidence"].is_string(),
+                "{}: verdict {id} field `evidence` must be a string",
+                path.display(),
+            );
+            let rats = obj["new_rationalizations"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "{}: verdict {id} field `new_rationalizations` must be an array",
+                    path.display()
+                )
+            });
+            for r in rats {
+                assert!(
+                    r.is_string(),
+                    "{}: verdict {id} has a non-string rationalization {r} — the field is \
+                     verbatim quotes, and a paraphrase or an object is not one",
+                    path.display(),
+                );
+            }
+
+            // One verdict per transcript, and every id resolves to a transcript
+            // that exists. A verdict for a file that is not there is scoring
+            // something nobody can re-read.
+            assert!(
+                seen.insert(id),
+                "{}: two verdicts for transcript {id}",
+                path.display()
+            );
+            let transcript = dir.join(format!("{id}.md"));
+            assert!(
+                transcript.exists(),
+                "{}: verdict {id} has no transcript at {}",
+                path.display(),
+                transcript.display(),
+            );
+            checked += 1;
+        }
+    }
+
+    // Seeded against what is already true: Task 16 scored `tdd`, so at least one
+    // set exists. Without this the test would pass vacuously the day someone
+    // moved or renamed the transcripts directory.
+    assert!(
+        checked > 0,
+        "no scores.json found under {} — expected at least the scored `tdd` set",
+        transcripts.display(),
+    );
+}

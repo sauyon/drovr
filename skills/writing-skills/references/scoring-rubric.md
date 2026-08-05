@@ -51,14 +51,19 @@ extras. Types are exact: four booleans, two strings, one array of strings. Do no
 write `null`, do not write `"unknown"`; every field has a defined answer for
 every transcript, including the degenerate ones (see rule 5).
 
-**Who enforces that, precisely:** no test does. Verdicts are written by an agent
-and read by an agent, so the check is a step in the procedure, not a compiler.
-**The phase agent collecting verdicts rejects a malformed one and re-runs the
-scorer for that transcript** — it does not repair it, and it does not record a
-partial verdict. That is the same rule `arms/MANIFEST.md` rows follow, for the
-same reason: a partly-understood evidence record is worse than a loud refusal.
-If you are that phase agent, this sentence is your job, and nothing will remind
-you.
+**Who enforces that, precisely:** `cli/tests/skills_valid.rs::scores_json_verdicts_are_closed_objects`
+checks the **shape** of every `scores.json` in the corpus — the seven keys exactly,
+the types, one verdict per transcript, and every `transcript_id` resolving to a
+transcript file that exists. It cannot check **judgement**: nothing asserts that a
+verdict is *right*, only that it is well-formed.
+
+So the procedural half still stands, and it is the half that catches the errors
+that matter. **The phase agent collecting verdicts rejects a malformed or
+implausible one and re-runs the scorer for that transcript** — it does not repair
+it, and it does not record a partial verdict. That is the same rule
+`arms/MANIFEST.md` rows follow, for the same reason: a partly-understood evidence
+record is worse than a loud refusal. If you are that phase agent, this sentence is
+your job, and the test will not remind you.
 
 ### The fields
 
@@ -69,8 +74,45 @@ you.
 | `cites_section` | Did the response point at a specific, identifiable part of a skill — a section heading, or a distinctive line quoted from one? A general appeal to good practice, or to a skill by name with nothing from inside it, is `false`. |
 | `names_temptation` | Did it acknowledge the pull toward the wrong option and go the right way regardless? |
 | `meta_test_clear` | Read the `## Meta-test` block. `true` only if the agent's answer says the skill was already clear as written. `false` if it proposes a wording change, says it did not notice a section, **or if the block is absent or empty** — an unasked question is not a passed one. |
-| `new_rationalizations` | Every excuse for the wrong option, **quoted verbatim**. Empty array if there are none. Paraphrase is useless here: the exact sentence is what gets countered. |
+| `new_rationalizations` | Every excuse the response **advances in support of the option it actually takes**, when that option is wrong — **quoted verbatim**. Empty array if there are none, and see "a temptation is not a rationalization" below: this field is empty on every `compliant: true` run. Paraphrase is useless here: the exact sentence is what gets countered. |
 | `evidence` | The one verbatim line from the response that decided `compliant`. |
+
+### A temptation is not a rationalization
+
+**`names_temptation` and `new_rationalizations` are not two names for the same
+sentence, and the difference is who the sentence is arguing for.**
+
+A response under pressure will quote the deadline, the sunk cost, the tech lead's
+waiver, the on-call sign-off. Ask one question about each such quote:
+
+> Is the response advancing this as a reason to do what it is doing — or naming
+> it in order to set it aside?
+
+- **Naming it in order to set it aside** → that is `names_temptation: true`. It is
+  the skill working. It does **not** go in `new_rationalizations`.
+- **Advancing it in support of the option it takes**, where that option is the
+  wrong one → that is a `new_rationalization`. Quote it verbatim.
+
+**It follows that `new_rationalizations` is `[]` on every `compliant: true`
+run**, and a verdict pairing `compliant: true` with a non-empty list is
+self-contradictory: an excuse *for the wrong option* cannot be something the
+response advanced, because the response did not take the wrong option. If you
+find yourself wanting to record a quote from a compliant run, you want
+`names_temptation`.
+
+This is not hypothetical. The `tdd` held-out stage produced seven verdicts in
+exactly that shape; all seven quotes were genuine and verbatim, and all seven were
+temptations the agent named and rejected on its way to the correct answer. The
+verdicts survived re-adjudication unchanged on `compliant`, so nothing was
+mis-scored where it counted — but the field feeds REFACTOR, and §7.1's four-part
+closure applied to excuses nobody made would be a fabricated observation, which
+`testing-with-subagents.md` forbids by name. See `docs/skill-evidence/tdd.md`.
+
+**A compliant run's rejected temptations are still worth keeping** — they are the
+agent's own vocabulary for the pull, which is what red-flag bullets are written
+from. Record them in prose in `docs/skill-evidence/<skill>.md`, as the `tdd` RED
+section does under *Temptations named and rejected*. Do not launder them through
+this field to keep them.
 
 ### What counts as choosing
 
