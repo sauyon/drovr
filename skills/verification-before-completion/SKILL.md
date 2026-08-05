@@ -10,7 +10,7 @@ description: Use when about to claim any work is done, fixed, or passing, before
 **Evidence produced now, or no claim.** Follow the spirit, not the letter:
 running a command and pasting its output satisfies the letter, and proves
 nothing if the output is about a tree you have since edited. The rule is that
-the evidence describes the thing you are about to claim. Nobody downstream
+the evidence describes what you are about to claim. Nobody downstream
 re-checks a report — a false "done" is believed the moment it is written, and
 the next phase binds to the interface you claimed, not the one you have.
 
@@ -36,19 +36,18 @@ No exceptions:
   rename, a comment, a reordered import — re-run the task's named verification
   command against the tree as it stands and write the report from *that* output.
 - **Do not accept a diff review as a test run.** A tech lead, a reviewer, or
-  your own read of the change tells you it *looks* safe. Run the command the
-  task names anyway and cite its output; approval of a diff is not a result.
+  your own read tells you it *looks* safe. Run the command the task names
+  anyway and cite its output; approval of a diff is not a result.
 - **Do not let the clock choose what you ran.** Run every check the
   *Requirements* row for your claim names, then report late if you are late. The
-  deadline changes when the report lands; it does not change which checks can
-  catch what your edit disturbed.
+  deadline changes when the report lands, not which checks can catch what your
+  edit disturbed.
 - **Do not claim first and verify after.** There is no version of "verify after
   claiming" that is not skipping verification with extra steps. Produce the
   evidence, then write the claim, in that order and in one message.
 - **Do not pass a subagent's word through as your own evidence.** A subagent
-  reporting success is making a claim, not handing you one. Open the artifact it
-  names — the command it ran, that command's output, the findings file — and
-  read it yourself, or run the check again; then report what *you* saw.
+  reporting success is making a claim, not handing you one. Open what it names
+  and read it yourself, or run the check again; then report what *you* saw.
 
 ## Announce
 
@@ -76,18 +75,21 @@ session. If you fall back to `CHECKLIST.md` at a repo root, do not commit it.
    made since your last run. If there is one, every earlier run is about a
    different tree.
 2. **Look up that claim in *Requirements* below.** The row names the evidence
-   the claim takes and what does not count as it. A claim not in the table
-   borrows the row it most resembles; do not write yourself a lighter bar.
+   the claim takes and what does not count as it. A claim with no row still
+   needs all three: a named command, its fresh output, and a sentence naming
+   what that output does not cover. Do not shop for the cheapest row.
 3. **Run those checks now, in this message**, against the tree as it stands,
    uncommitted edits included — that is what makes the output fresh. Paste the
    command and its output. A run you describe is not a run you did.
 4. **Read the output, not the exit code alone.** The tests you claim exist must
-   appear in it by name, the count that ran must be the count you expect, and
-   nothing may have been filtered or skipped out from under you. A green line
-   for a test that asserts nothing is not verification.
+   appear in it by name, and nothing may have been filtered or skipped out from
+   under you — a suite that skipped your file is not evidence about your file. A
+   green line for a test that asserts nothing is not verification.
 5. **If a check failed, was skipped, or cannot be run here, you have a finding,
-   not a completion.** Name the exact command and what it did. Do not soften it
-   into *"mostly passing"* or *"an unrelated failure"*, and do not report done.
+   not a completion.** Name the exact command and what it did. *"Cannot be run
+   here"* is itself a claim: cite the command you ran and the error it gave, not
+   your expectation that it would fail. Do not soften either into *"mostly
+   passing"* or *"an unrelated failure"*, and do not report done.
 6. **Write the claim from the output.** Record the commands, their results, and
    the checks you did not run — what you leave out is what the next agent will
    assume you did. Inside a drovr phase this is also what gates
@@ -101,10 +103,10 @@ defined under the Iron Law. The right column is what gets accepted instead.
 | The claim | Required evidence | NOT sufficient |
 |---|---|---|
 | *"The task's tests pass"* | The task's named verification command, run after your last edit, and its output — the number that ran and zero failures | An earlier run · a subset you chose yourself · only the tests you expect this change to touch · *"nothing here could break them"* |
-| *"It builds"* | The build command run to completion on this tree, with its exit status and output read | Tests passing — they may have run against a stale artifact · the last build, from before your edit · the editor showing no errors |
+| *"It builds"* | The build command run to completion on this tree, its exit status zero, and its output in this message | Tests passing — they may have run against a stale artifact · the last build, from before your edit · the editor showing no errors |
 | *"The linter is clean"* | The linter run over the files you changed, showing zero findings **in those files** | A run from before your edit · *"the formatter would have caught it"* · a filtered invocation whose filter you did not state in the report |
 | *"The bug is fixed"* | The original reproduction re-run and now passing, **and** the task's named verification command, **and** a test that fails without your change | The reproduction alone — green proves the trigger stopped, not that the cause is gone · *"I can no longer make it happen"* · a test you added but never watched fail |
-| *"The subagent reported success"* | The artifact **you** opened: the command it ran, that command's output, and the findings file or diff it names — or the same check re-run by you | Its summary · *"reported no findings"* · a findings file you did not read · an exit code you did not see · a subagent still running |
+| *"The subagent reported success"* | A file, diff or log it names, opened by path and read by **you** — or, when it reported success in prose with no separate artifact, the same check re-run by you. Its own message is a summary however much output it pastes into itself | Its summary · *"reported no findings"* · a findings file you did not read · an exit code you did not see · a subagent still running |
 
 ## Red flags — STOP
 
@@ -124,10 +126,11 @@ Either way you are at the line, not past it.
 - *You are reaching for a hedge — "it should pass", "the change is obviously
   correct", "an unrelated failure".* → The hedge is there because the evidence is
   not. Run the check, or report plainly that you did not.
-- **Any wording that implies success you have not just watched.** *Done · fixed
-  · passing · clean · working · verified · ready.* If you cannot point at output
-  **in this message** that shows it, you have not earned the sentence. Change
-  what you ran, not how you word it.
+- **Any wording that implies success you have not just watched** — *done ·
+  fixed · passing · clean · working · verified · ready · shipped*, and any other
+  word a reader will take as "it works". If you cannot point at output **in this
+  message** that shows it, you have not earned the sentence. Change what you
+  ran, not how you word it.
 
 ## Rationalizations
 
@@ -138,10 +141,10 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 | *"A rename and two comments cannot change behaviour."* | Run the suite and find out. *Very likely* behaviour-preserving is a judgment call, and this skill exists specifically to override judgment calls with evidence at the moment of claiming done. |
 | *"I have never once seen a rename break a test suite."* | Run it anyway and report from the output. That is a claim about your sample of past renames, not about this one — and the whole point of running the suite is that you do not have to trust your own read of the diff. |
 | *"They looked at the diff and said I do not need to re-run it."* | Run the command the task's verification names and cite its output. A diff review is useful signal that the change *looks* safe; it does not substitute for the verification the task specifies. |
-| *"It ran green earlier in this session."* | Re-run it against the tree as it stands. That run is evidence about the older tree, not this one, and the gap between them is exactly where your edit lives. |
+| *"It ran green earlier in this session."* | Re-run it against the tree as it stands. That run is evidence about the older tree, not this one. |
 | *"I will post the report now and re-run the suite after."* | Run first, post second. If the run fails, a broken report has already gone to the next phase, which binds to it — and nobody re-checks it. |
 | *"I am already past the time I promised."* | Take the four minutes and say in the report that you are late. Being eleven minutes late with a verified report is a much smaller cost than being on time with an unverified one. |
-| *"The reviewer subagent came back with no findings."* | Open its findings file and read it before you repeat its verdict. A subagent's summary is a claim; the artifact it names is the evidence, and only one of those is yours to report. |
+| *"The reviewer subagent came back with no findings."* | Open its findings file and read it before you repeat its verdict. A subagent's summary is a claim; the artifact it names is the evidence. |
 
 ## Worked example
 
@@ -171,13 +174,11 @@ passing; since then, a rename and two comments.
 ## Cross-refs
 
 - `drovr:tdd` — REQUIRED when the claim is that a new behaviour works. The red
-  run you watched is what makes the green one evidence; a test never seen to
-  fail proves only that it can pass.
+  run you watched is what makes the green one evidence.
 - `drovr:systematic-debugging` — REQUIRED before you claim a bug is fixed. It
-  owns the reproduction and the cause; this skill owns why the reproduction
-  going green is necessary and not sufficient.
+  owns the reproduction and the cause; this skill owns why green is necessary
+  and not sufficient.
 - `drovr:code-review` — REQUIRED before you call a change done. Its reviewers
-  run in the foreground for the reason the subagent row above gives: a review
-  still running is not a review you have read.
+  run in the foreground for the reason the subagent row gives above.
 - `drovr:handoff` — REQUIRED at a phase boundary. Put the commands and their
   output there; the diff does not carry them.
