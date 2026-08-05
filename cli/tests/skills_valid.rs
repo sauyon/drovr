@@ -3822,13 +3822,7 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("worktrees", SiteState::Covered),
     ("tdd", SiteState::Covered),
     ("systematic-debugging", SiteState::Covered),
-    (
-        "verification-before-completion",
-        SiteState::Deferred {
-            task: "Task 12",
-            why: "§6 section 6 — lands inside the fix-4 rewrite",
-        },
-    ),
+    ("verification-before-completion", SiteState::Covered),
     (
         "code-review",
         SiteState::Deferred {
@@ -4528,10 +4522,13 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
     ),
     (
         "verification-before-completion",
-        ArmorState::Pending {
-            task: "Task 12",
-            why: "§6 section 7 — its rewrite carries the requirements table",
-        },
+        ArmorState::Armored(Armor {
+            iron_law: "NO COMPLETION CLAIM WITHOUT FRESH EVIDENCE PRODUCED IN THIS MESSAGE.",
+            announce: "Using drovr:verification-before-completion — running the checks \
+                       before claiming done.",
+            conditional: ConditionalSection::RequirementsTable,
+            procedure_steps: 6,
+        }),
     ),
     (
         "code-review",
