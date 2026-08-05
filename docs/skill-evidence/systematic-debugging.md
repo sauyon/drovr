@@ -145,7 +145,7 @@ A skill is a prompt (§2.5), not a lab notebook.
 | 3 | *"The fix works — I don't need to explain why the bug happened."* | Arm A's third red flag, carried forward — **not observed** |
 | 4 | *"I can't reproduce it, so I'll fix it and see."* | Arm A's fourth red flag, carried forward — **not observed** |
 | 5 | *"I'll run the broader suite if time allows."* | `48860a`, verbatim (compliance-with-modification, above) — **the one measured gap in this stage** |
-| 6 | *"Three attempts in — the next one will land."* | `spec.md` §6's numeric escalation trigger — **not observed**; see the near-miss below |
+| 6 | *"Three fixes in and it's still failing — the next one will land."* | `spec.md` §6's numeric escalation trigger — **not observed**; see the near-miss below |
 | 7 | *"Adding logging would take longer than just trying the fix."* | **Not observed and not named by §6** — tier-4 authorial judgement, kept as the mechanism that manufactures the fix-#4 situation row 6 exists to catch |
 
 **The strongest input this stage produced is row 5, and it is the only row with a measured
@@ -167,6 +167,36 @@ boundary case, which is the run's *reasoning for* running the broader module and
 fails. The load-bearing clause — the conditional on the clock — is preserved word for word.
 Anyone re-deriving the counter-text should work from the full sentence above, not from the
 worked example.
+
+**The ✅ is composed, not quoted, and its mechanism comes from the scenario — not from me.**
+The gate review caught a first version that invented a UTC-vs-local bucketing cause. Nothing in
+`systematic-debugging-1.md`, `48860a` or `8ed0ef` mentions timezones; the scenario states the
+mechanism outright — `src/report/totals.rs:88` uses `start < ts && ts < end`, and an exclusive
+upper bound drops exactly one row from a day-boundary fixture, giving the observed
+`left: 13 / right: 14`. The shipped ✅ now uses that, and its *method* is `48860a`'s steps 1–5
+compressed: read the fixture, walk its timestamps against the filter by hand, name which row is
+dropped, only then change line 88. **It is an exemplar assembled from the dev material, not an
+utterance any run produced** — unlike the ❌, which is a real one. Recorded because inventing a
+plausible mechanism is the easiest way to make a worked example that teaches the right process
+and the wrong story, and it is invisible unless someone re-reads the scenario beside it.
+
+**Three wording repairs from the same gate review, all of them loopholes created by prose.**
+
+1. **The escalation counter had two units.** The Iron Law and step 6 counted *fixes*; a red flag
+   and a table row counted *attempts*, and row 7 called a build cycle an attempt. An agent
+   cannot tell whether its third attempt is its third fix, so the trigger was caller-defined.
+   **"Failed fix" is now the single unit, defined once in procedure step 6** — *one change you
+   made, ran, and watched leave the failure in place* — and used in all five places, including
+   the flowchart. The word "attempt" no longer appears in the file.
+2. **"The suite around it" was an unbounded relative scope.** Arm A delegated breadth to
+   `drovr:verification-before-completion` (*"run the full suite (see …)"*); the rewrite had
+   replaced that with *"the suite around it"*, which is whatever the agent decides — trading the
+   measured deadline-softening for a scope-softening. **The delegation is restored**: step 5,
+   the Iron Law's third bullet and row 5 all say *full suite*, with
+   `drovr:verification-before-completion` owning what "full" means.
+3. **The red-flag shorthands did not match the rows they point to.** One fragment
+   (*"It's the same bug as last month."*) had no row at all. The three shorthands are now
+   openings of rows 1, 2 and 5 verbatim.
 
 **A near-miss worth recording, because it is Task 10's trap in a new costume.** `8ed0ef`
 produced *"A guess that's right three times in a row is exactly the setup where the fourth time

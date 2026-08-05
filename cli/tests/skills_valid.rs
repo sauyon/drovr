@@ -3707,21 +3707,40 @@ fn canonical_directive() -> Quote {
 /// a scraper that joined every `>` line in the file reported that file as
 /// divergent when it was correct. The bug was in the checker, not the file.
 fn block_quotes(contents: &str) -> Vec<Quote> {
+    block_quotes_with_lines(contents)
+        .into_iter()
+        .map(|(_, quote)| quote)
+        .collect()
+}
+
+/// [`block_quotes`], keeping each quote's first line.
+///
+/// §6 section 6 constrains where fix 3's directive sits, not only that it is
+/// somewhere in the file, and the position is what [`block_quotes`] discards.
+/// The two are one parser rather than two so a quirk of quote-splitting cannot
+/// be fixed in the check that reads positions and left in the one that does not.
+fn block_quotes_with_lines(contents: &str) -> Vec<(usize, Quote)> {
     let mut out = Vec::new();
     let mut current: Vec<&str> = Vec::new();
-    for line in contents.lines() {
+    let mut start = 0usize;
+    for (idx, line) in contents.lines().enumerate() {
         match line.trim_start().strip_prefix('>') {
-            Some(rest) => current.push(rest),
+            Some(rest) => {
+                if current.is_empty() {
+                    start = idx;
+                }
+                current.push(rest);
+            }
             None => {
                 if !current.is_empty() {
-                    out.push(Quote::new(&current.join(" ")));
+                    out.push((start, Quote::new(&current.join(" "))));
                     current.clear();
                 }
             }
         }
     }
     if !current.is_empty() {
-        out.push(Quote::new(&current.join(" ")));
+        out.push((start, Quote::new(&current.join(" "))));
     }
     out
 }
@@ -4428,6 +4447,15 @@ struct Armor {
     announce: &'static str,
     /// Which of §6's two CONDITIONAL sections this skill carries — exactly one.
     conditional: ConditionalSection,
+    /// How many numbered steps §6 section 6's procedure has.
+    ///
+    /// **Recorded rather than derived, because fix 3's directive binds to it.**
+    /// The directive tells an agent to create *one tracked item per step*, so a
+    /// step silently added or dropped changes what the agent is told to track
+    /// while every check stays green. Requiring the arity to be edited here too
+    /// makes that a decision someone made rather than a diff nobody read — the
+    /// same argument [`SiteState`] makes for not spelling a state as silence.
+    procedure_steps: usize,
 }
 
 /// What a `skills/<name>/SKILL.md` is, with respect to fix 4.
@@ -4486,6 +4514,7 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
             iron_law: "NO IMPLEMENTATION CODE BEFORE A TEST YOU HAVE WATCHED FAIL.",
             announce: "Using drovr:tdd — writing the failing test before the implementation.",
             conditional: ConditionalSection::CycleFlowchart,
+            procedure_steps: 7,
         }),
     ),
     (
@@ -4494,6 +4523,7 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
             iron_law: "NO FIX BEFORE A REPRODUCTION AND A MECHANISTIC CAUSE.",
             announce: "Using drovr:systematic-debugging — reproducing before fixing.",
             conditional: ConditionalSection::CycleFlowchart,
+            procedure_steps: 6,
         }),
     ),
     (
@@ -4799,6 +4829,153 @@ fn check_armor(
         }
         last = Some((label, line));
     }
+
+    // §6 section 6's internal composition, which the ordered pass above cannot
+    // express: it checks that sections appear in order, not that one section's
+    // two required parts stand in the right relation to each other.
+    check_procedure(path, body, armor, first_body_line, wrong);
+}
+
+/// §6 section 6's numbered steps in `text`, as (0-based line, the step's number).
+///
+/// Fence-aware for the reason [`headings`] is: a numbered list inside a worked
+/// example is being *shown*, not issued. Blockquote lines are skipped for the
+/// same reason — fix 3's directive is itself a blockquote, and a list quoted
+/// inside one is an illustration of a checklist, not this skill's checklist.
+fn numbered_steps(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut fence: Option<usize> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if let Some((ticks, rest)) = fence_marker(line) {
+            match fence {
+                Some(opened_with) if ticks >= opened_with && rest.is_empty() => fence = None,
+                Some(_) => {}
+                None => fence = Some(ticks),
+            }
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        // Same indent rule the fence and heading scanners use: four spaces is an
+        // indented code block, and a list nested under a step is not a step.
+        if line.len() - trimmed.len() > MAX_FENCE_INDENT || trimmed.starts_with('>') {
+            continue;
+        }
+        let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || !trimmed[digits.len()..].starts_with(". ") {
+            continue;
+        }
+        if let Ok(number) = digits.parse::<usize>() {
+            out.push((idx, number));
+        }
+    }
+    out
+}
+
+/// spec §6 section 6 as ONE requirement: "the procedure, **numbered**, preceded
+/// by fix 3's task-binding directive".
+///
+/// **This is the composition, and nothing else was checking it.**
+/// [`required_sections`] can only see that a `The procedure` heading exists;
+/// [`task_binding_directive_present`] can only see that the directive appears
+/// somewhere in the file, exactly once. A page carrying the heading, the
+/// directive four sections lower, and no numbering at all satisfies both of them
+/// and satisfies §6 section 6 not at all — two facts about one section, checked
+/// apart, with the relation between them asserted nowhere.
+///
+/// The relation is the part that does the work: the directive says *one tracked
+/// item per step*, which an agent cannot act on if it meets the directive after
+/// working the list, or if there are no steps to enumerate.
+fn check_procedure(
+    path: &Path,
+    body: &str,
+    armor: &Armor,
+    first_body_line: usize,
+    wrong: &mut Vec<String>,
+) {
+    let at = |body_line: usize| body_line + first_body_line + 1;
+    let heads = headings(body);
+    let Some((start, _)) = heads
+        .iter()
+        .find(|(_, text)| text == "The procedure")
+        .cloned()
+    else {
+        // `required_sections` already reported the heading as missing. Saying so
+        // twice sends an author looking for two defects.
+        return;
+    };
+    // §6 places section 6b directly after the procedure, so the next heading of
+    // any level bounds the numbered steps.
+    let end = heads
+        .iter()
+        .map(|(line, _)| *line)
+        .find(|line| *line > start)
+        .unwrap_or_else(|| body.lines().count());
+    let section: Vec<&str> = body
+        .lines()
+        .enumerate()
+        .filter(|(idx, _)| *idx > start && *idx < end)
+        .map(|(_, line)| line)
+        .collect();
+    let section = section.join("\n");
+    // Section line -> body line.
+    let to_body = |idx: usize| idx + start + 1;
+
+    let steps = numbered_steps(&section);
+    let Some((first_step, _)) = steps.first().copied() else {
+        wrong.push(format!(
+            "{}: §6 section 6 requires a NUMBERED procedure, and the section \
+             opening on line {} has no numbered steps. Fix 3's directive binds \
+             one tracked item per step, so an unnumbered procedure leaves it \
+             nothing to bind to.",
+            path.display(),
+            at(start),
+        ));
+        return;
+    };
+
+    let numbers: Vec<usize> = steps.iter().map(|(_, number)| *number).collect();
+    let expected: Vec<usize> = (1..=armor.procedure_steps).collect();
+    if numbers != expected {
+        wrong.push(format!(
+            "{}: §6 section 6's procedure is numbered {numbers:?}, but this \
+             skill's Armor records {} step(s), so {expected:?} was expected. \
+             Change the checklist and the recorded arity in the same edit — the \
+             directive binds one tracked item per step, so a step added or \
+             dropped silently changes what an agent is told to track.",
+            path.display(),
+            armor.procedure_steps,
+        ));
+    }
+
+    let canon = canonical_directive();
+    match block_quotes_with_lines(&section)
+        .into_iter()
+        .find(|(_, quote)| *quote == canon)
+    {
+        None => wrong.push(format!(
+            "{}: §6 section 6 requires fix 3's task-binding directive INSIDE the \
+             procedure section (lines {}–{}), preceding its numbered steps. \
+             Quoting it elsewhere in the file satisfies \
+             `task_binding_directive_present` and not this: that check asks \
+             whether the directive is present, this one asks whether it is where \
+             the agent reads the checklist.",
+            path.display(),
+            at(start),
+            at(end),
+        )),
+        Some((line, _)) if line >= first_step => wrong.push(format!(
+            "{}: fix 3's task-binding directive is on line {}, below the first \
+             numbered step on line {}. §6 section 6 says PRECEDED by — a \
+             directive an agent meets after working the list cannot bind it.",
+            path.display(),
+            at(to_body(line)),
+            at(to_body(first_step)),
+        )),
+        Some(_) => {}
+    }
 }
 
 /// The declared strings are well-formed — a property of [`SKILL_ARMOR_STATES`]
@@ -4841,7 +5018,22 @@ fn synthetic_body(armor: &Armor) -> Vec<String> {
     let mut lines = Vec::new();
     for (_, marker) in required_sections(armor) {
         match marker {
-            SectionMarker::Heading(text) => lines.push(format!("## {text}")),
+            SectionMarker::Heading(text) => {
+                lines.push(format!("## {text}"));
+                // §6 section 6 is the one section with required *contents*, so
+                // the control fixture has to carry them or every negative case
+                // below is measured against a body that never passed.
+                if text == "The procedure" {
+                    lines.extend(
+                        TASK_BINDING_DIRECTIVE
+                            .trim()
+                            .lines()
+                            .map(|quoted| format!("> {quoted}")),
+                    );
+                    lines.push(String::new());
+                    lines.extend((1..=armor.procedure_steps).map(|n| format!("{n}. Step {n}.")));
+                }
+            }
             SectionMarker::Line(text) => lines.push(text.to_string()),
             SectionMarker::FencedLiteral(text) => {
                 lines.extend(["```".to_string(), text.to_string(), "```".to_string()]);
@@ -4870,6 +5062,7 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
         conditional: ConditionalSection::CycleFlowchart,
+        procedure_steps: 3,
     };
     let path = Path::new("fixture/SKILL.md");
     let complaints = |body: &str, armor: &Armor| -> Vec<String> {
@@ -4997,6 +5190,113 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
     );
 }
 
+/// [`check_procedure`]'s five refusals, each built by breaking exactly one part
+/// of a body that passes.
+///
+/// §6 section 6 is the section whose parts were previously checked apart —
+/// heading here, directive there, numbering nowhere — so every case below is a
+/// page that the *old* pair of checks accepted. Written because a composed check
+/// that has only ever been green is a check nobody knows composes anything.
+#[test]
+fn armor_check_refuses_a_procedure_the_directive_cannot_bind() {
+    let armor = Armor {
+        iron_law: "NEVER SHIP WITHOUT A RED TEST.",
+        announce: "Using drovr:example — doing the thing before the other thing.",
+        conditional: ConditionalSection::CycleFlowchart,
+        procedure_steps: 3,
+    };
+    let path = Path::new("fixture/SKILL.md");
+    let complaints = |body: &str| -> Vec<String> {
+        let mut wrong = Vec::new();
+        check_armor(path, body, &FoldedBody::new(body), &armor, 0, &mut wrong);
+        wrong
+    };
+
+    let good = synthetic_body(&armor).join("\n");
+    assert!(
+        complaints(&good).is_empty(),
+        "control: a page built from required_sections must pass: {:?}",
+        complaints(&good)
+    );
+
+    let directive: String = TASK_BINDING_DIRECTIVE
+        .trim()
+        .lines()
+        .map(|quoted| format!("> {quoted}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let steps: String = (1..=armor.procedure_steps)
+        .map(|n| format!("{n}. Step {n}."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bound = format!("{directive}\n\n{steps}");
+    assert!(
+        good.contains(&bound),
+        "the fixture no longer has the shape these cases rewrite"
+    );
+
+    // Each case: (what was broken, the replacement, the substring that must be
+    // reported). The `assert_ne!` below is what stops a stale fixture from
+    // turning any of these into a vacuous pass.
+    let cases = [
+        (
+            "directive below the steps",
+            format!("{steps}\n\n{directive}"),
+            "below the first numbered step",
+        ),
+        (
+            "procedure not numbered",
+            format!("{directive}\n\n- Step one.\n- Step two.\n- Step three."),
+            "has no numbered steps",
+        ),
+        (
+            "a step added without updating the recorded arity",
+            format!("{bound}\n4. Step 4."),
+            "records 3 step(s)",
+        ),
+        (
+            "steps renumbered so one is skipped",
+            format!("{directive}\n\n1. Step 1.\n2. Step 2.\n4. Step 4."),
+            "records 3 step(s)",
+        ),
+        (
+            // The list is shown, not issued — so the section has no procedure.
+            "the numbered steps fenced as an example",
+            format!("{directive}\n\n```\n{steps}\n```"),
+            "has no numbered steps",
+        ),
+    ];
+    for (case, replacement, expected) in cases {
+        let broken = good.replace(&bound, &replacement);
+        assert_ne!(broken, good, "{case}: the fixture did not change");
+        assert!(
+            complaints(&broken).iter().any(|c| c.contains(expected)),
+            "{case}: expected a complaint containing {expected:?}, got {:?}",
+            complaints(&broken)
+        );
+    }
+
+    // The case the old split checks could not see at all: the directive is in
+    // the file, exactly once, just not in the section it has to bind.
+    let elsewhere = format!("{}\n\n{directive}\n", good.replace(&bound, &steps));
+    assert_eq!(
+        block_quotes(&elsewhere)
+            .iter()
+            .filter(|quote| **quote == canonical_directive())
+            .count(),
+        1,
+        "this case is only meaningful while `task_binding_directive_present`'s \
+         own rule — present exactly once — still holds for the fixture"
+    );
+    assert!(
+        complaints(&elsewhere)
+            .iter()
+            .any(|c| c.contains("INSIDE the procedure section")),
+        "a directive quoted outside the procedure section must be refused: {:?}",
+        complaints(&elsewhere)
+    );
+}
+
 /// The page this check exists to refuse: one that **documents** §6's armor
 /// without carrying it.
 ///
@@ -5012,6 +5312,7 @@ fn a_page_that_documents_the_armor_does_not_carry_it() {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
         conditional: ConditionalSection::CycleFlowchart,
+        procedure_steps: 3,
     };
     let documented = "\
 ## Overview
