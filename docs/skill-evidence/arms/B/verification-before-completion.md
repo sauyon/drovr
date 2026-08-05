@@ -11,8 +11,8 @@ description: Use when about to claim any work is done, fixed, or passing, before
 running a command and pasting its output satisfies the letter, and proves
 nothing if the output is about a tree you have since edited. The rule is that
 the evidence describes what you are about to claim. Nobody downstream
-re-checks a report — a false "done" is believed the moment it is written, and
-the next phase binds to the interface you claimed, not the one you have.
+re-checks a report: a false "done" binds the next phase to the interface you
+claimed, not the one you have.
 
 **Write for the agent who inherits this: the next phase agent is you, with your
 context gone.** They cannot see your terminal — only the commands you wrote down
@@ -33,8 +33,8 @@ No exceptions:
 
 - **Do not report on a tree you did not run the checks against.** An earlier
   green run is evidence about the tree it ran on. If you have edited since — a
-  rename, a comment, a reordered import — re-run the task's named verification
-  command against the tree as it stands and write the report from *that* output.
+  rename, a comment — re-run the task's named verification command against the
+  tree as it stands and write the report from *that* output.
 - **Do not accept a diff review as a test run.** A tech lead, a reviewer, or
   your own read tells you it *looks* safe. Run the command the task names
   anyway and cite its output; approval of a diff is not a result.
@@ -46,8 +46,9 @@ No exceptions:
   claiming" that is not skipping verification with extra steps. Produce the
   evidence, then write the claim, in that order and in one message.
 - **Do not pass a subagent's word through as your own evidence.** A subagent
-  reporting success is making a claim, not handing you one. Open what it names
-  and read it yourself, or run the check again; then report what *you* saw.
+  reporting success is making a claim, not handing you one. Open the file it
+  names and read it yourself — or re-run the check when it names none — then
+  report what *you* saw.
 
 ## Announce
 
@@ -97,8 +98,8 @@ session. If you fall back to `CHECKLIST.md` at a repo root, do not commit it.
 
 ## Requirements
 
-The middle column is the **fresh** evidence that claim takes, in the sense
-defined under the Iron Law. The right column is what gets accepted instead.
+The middle column is the **fresh** evidence that claim takes — *fresh* as
+defined above. The right column is what gets accepted instead.
 
 | The claim | Required evidence | NOT sufficient |
 |---|---|---|
@@ -119,10 +120,12 @@ Either way you are at the line, not past it.
   verbatim. Go do the thing in its row.
 - *You are typing "all tests pass" and your last run predates your last edit.* →
   Re-run first. The old output is evidence about a tree that no longer exists.
-- *You are about to post the report and re-run the checks afterwards.* → Reverse
-  the order. Nobody re-reads the report, so a wrong one is already downstream.
-- *A subagent said it passed and you are about to repeat that.* → Open what it
-  named and read it. Hearsay does not become evidence by being forwarded.
+- *A subagent said it passed and you are about to repeat that.* → Open the file
+  it named, or re-run the check yourself when it named none. Hearsay does not
+  become evidence by being forwarded.
+- *A review subagent is still running and you are writing the report.* → Block
+  on it first. A parked agent is not a finished one, and its silence is not a
+  pass.
 - *You are reaching for a hedge — "it should pass", "the change is obviously
   correct", "an unrelated failure".* → The hedge is there because the evidence is
   not. Run the check, or report plainly that you did not.
@@ -143,19 +146,15 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 | *"They looked at the diff and said I do not need to re-run it."* | Run the command the task's verification names and cite its output. A diff review is useful signal that the change *looks* safe; it does not substitute for the verification the task specifies. |
 | *"It ran green earlier in this session."* | Re-run it against the tree as it stands. That run is evidence about the older tree, not this one. |
 | *"I will post the report now and re-run the suite after."* | Run first, post second. If the run fails, a broken report has already gone to the next phase, which binds to it — and nobody re-checks it. |
-| *"I am already past the time I promised."* | Take the four minutes and say in the report that you are late. Being eleven minutes late with a verified report is a much smaller cost than being on time with an unverified one. |
-| *"The reviewer subagent came back with no findings."* | Open its findings file and read it before you repeat its verdict. A subagent's summary is a claim; the artifact it names is the evidence. |
+| *"I am already past the time I promised."* | Take the four minutes and say in the report that you are late. A late verified report costs less than an on-time unverified one. |
+| *"The reviewer subagent came back with no findings."* | Open the findings file it names and read it before you repeat its verdict — or re-run the check yourself when it names no file. A subagent's summary is a claim; the artifact it names is the evidence. |
 
 ## Worked example
 
-The task's verification is `./scripts/test-billing.sh`, last run at 18:31 at 96
-passing; since then, a rename and two comments.
-
 ❌ **What this looks like when it fails:**
 
-> Verification `./scripts/test-billing.sh` — 96 passing. Since that run it has
-> been a rename and two comments, nothing that touches proration, so the task is
-> done and I am reporting it green.
+> Verification `./scripts/test-billing.sh` — 96 passing at 18:31. Since then: a
+> rename and two comments, nothing that touches proration. Reporting done.
 
 ✅ **What it looks like when it holds:**
 
@@ -165,19 +164,29 @@ passing; since then, a rename and two comments.
 > it. A rename plus comments is very likely behaviour-preserving, but "very
 > likely" is a judgment call, and this skill exists to override judgment calls
 > with evidence at the moment of claiming done. The tech lead read the diff —
-> that is a diff review, not a test run. So: `./scripts/test-billing.sh` against
-> the tree as it stands, four minutes, and the report written from its output. I
-> am past 19:00 and the report will say so; being eleven minutes late with a
-> verified report is a much smaller cost than being on time with an unverified
-> one.
+> that is a diff review, not a test run. So, against the tree as it stands, four
+> minutes:
+
+```
+$ ./scripts/test-billing.sh
+96 passing (4m 01s)
+0 failing
+$ echo $?
+0
+```
+
+> Report: verification `./scripts/test-billing.sh`, re-run after the rename —
+> 96 passing, 0 failing, exit 0. I did not run the linter; this task's
+> verification does not name one. I am eleven minutes past the time I promised
+> and this report says so: being eleven minutes late with a verified report is a
+> much smaller cost than being on time with an unverified one.
 
 ## Cross-refs
 
 - `drovr:tdd` — REQUIRED when the claim is that a new behaviour works. The red
   run you watched is what makes the green one evidence.
 - `drovr:systematic-debugging` — REQUIRED before you claim a bug is fixed. It
-  owns the reproduction and the cause; this skill owns why green is necessary
-  and not sufficient.
+  owns the reproduction; this skill owns why green is not sufficient.
 - `drovr:code-review` — REQUIRED before you call a change done. Its reviewers
   run in the foreground for the reason the subagent row gives above.
 - `drovr:handoff` — REQUIRED at a phase boundary. Put the commands and their
