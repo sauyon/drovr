@@ -88,4 +88,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | B | tdd | `skills/tdd/SKILL.md` | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | `30a99cd5667b0628fd278b8772ec42debff0c667` | 2026-08-04 |
 | B | systematic-debugging | `skills/systematic-debugging/SKILL.md` | `0d5fb63009789333d7d0a4849e61a7037962979e` | `21b26799e17b4f3ab8d781013ef13212eb351aeb` | 2026-08-04 |
 | B | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `ae5ee2151738e37f6d0c15c2bbc01aa1e111cdd9` | `0b3ed4ba926ef60baca23b2ec3f5a098b29e2444` | 2026-08-04 |
-| B | code-review | `skills/code-review/SKILL.md` | `27827ea54c5a4858b8b4ee92da3575c2b9a9d79f` | `8395d0962876604a23b59614b819ccb02d6b9ac4` | 2026-08-04 |
+| B | code-review | `skills/code-review/SKILL.md` | `c571ab27d7ad824b03856dad053ff1b2bc3bcf37` | `3eff78f3644b6043a48828197b9ee2d600a626e5` | 2026-08-04 |
