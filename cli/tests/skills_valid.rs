@@ -1580,6 +1580,17 @@ fn forced_choice_options(raw: &str) -> Vec<ChoiceOption> {
 ///
 /// The body wraps an option across lines that `forced_choice` keeps on one, so
 /// the two are compared flattened. Wrapping is formatting; rewording is drift.
+///
+/// **`cli/src/reflex.rs`'s test module carries a second copy of this, named
+/// `folded`.** The duplication is structural, not careless: `drovr` is a
+/// bin-only crate with no library target, so an integration test like this file
+/// has no public API to import from `reflex.rs`, and `reflex.rs`'s
+/// `#[cfg(test)]` module cannot reach into a test binary either — neither
+/// direction is expressible today. **If this function gains normalisation
+/// (apostrophe folding, case folding, punctuation stripping), change `folded`
+/// too, or the two "folded" vocabularies stop being one.** This copy is the
+/// canonical one, because it backs [`Quote`] and [`FoldedBody`]; whoever gives
+/// `drovr` a lib target for some other reason should collapse the two.
 fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

@@ -838,17 +838,35 @@ mod tests {
         // §4.2's card-content bullet — all six, none optional. Checked on the
         // rendered context so a future framing change cannot drop one.
         let ctx = gate_context(&ReflexConfig::default(), None).expect("default config must emit");
-        for (item, needle) in [
-            ("the 1% rule", "1%"),
-            ("the per-turn check", "before every response"),
-            ("the announcement string", "Using drovr:"),
-            ("the checklist-binding line", "tracked task"),
-            ("the subagent-stop line", "<SUBAGENT-STOP>"),
-            ("the router pointer", "drovr:using-drovr"),
+        for Anchor { label, needle } in [
+            Anchor {
+                label: "the 1% rule",
+                needle: "1%",
+            },
+            Anchor {
+                label: "the per-turn check",
+                needle: "before every response",
+            },
+            Anchor {
+                label: "the announcement string",
+                needle: "Using drovr:",
+            },
+            Anchor {
+                label: "the checklist-binding line",
+                needle: "tracked task",
+            },
+            Anchor {
+                label: "the subagent-stop line",
+                needle: "<SUBAGENT-STOP>",
+            },
+            Anchor {
+                label: "the router pointer",
+                needle: "drovr:using-drovr",
+            },
         ] {
             assert!(
                 ctx.contains(needle),
-                "gate card is missing {item} (no {needle:?}):\n{ctx}"
+                "gate card is missing {label} (no {needle:?}):\n{ctx}"
             );
         }
     }
@@ -1376,8 +1394,53 @@ mod tests {
     /// replaces (a reflow reading as a deletion, which happened twice while this
     /// task was written), but it is a hole, and these checks are a drift guard
     /// rather than a proof that the two texts still say the same thing.
+    ///
+    /// **This is a second copy of `skills_valid.rs`'s `normalize_ws`, and the
+    /// duplication is structural rather than careless.** `drovr` is a
+    /// **bin-only** crate — there is no library target, which is why
+    /// `cargo test --lib` reports *"no library targets found in package
+    /// `drovr`"* — so `cli/tests/skills_valid.rs`, an integration test, has no
+    /// public API to import this from, and this `#[cfg(test)]` module cannot
+    /// reach into a test binary either. Neither direction is expressible today.
+    ///
+    /// So the gap is recorded instead of papered over: **if either side gains
+    /// normalisation — apostrophe folding, case folding, punctuation stripping —
+    /// change both, or the two "folded" vocabularies stop being one.**
+    /// `skills_valid.rs`'s copy is the richer one (it backs the `Quote` and
+    /// `FoldedBody` newtypes) and is the one to copy *from*. Giving `drovr` a
+    /// lib target purely to share four tokens would be the larger change;
+    /// whoever adds one for another reason should collapse these two.
     fn folded(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// A literal this module searches for, paired with the thing it stands for.
+    ///
+    /// **A named struct rather than a `(&str, &str)`, because this module had
+    /// two such tuple tables with their fields in OPPOSITE order** —
+    /// [`ROUTING_CORE`] read `(anchor, label)` while
+    /// `gate_card_carries_every_required_item` read `(label, anchor)`. Both are
+    /// `(&str, &str)`, so nothing distinguished them to the compiler: a row
+    /// copied between the tables, or a new row written from memory of the wrong
+    /// one, transposes silently and surfaces as a baffling assertion failure
+    /// rather than as a type error. Named fields make the transposition
+    /// unwriteable — a struct literal must spell both names, and spelling them
+    /// is the check.
+    ///
+    /// The asymmetry is the whole point and is stated once, here: **`needle` is
+    /// the only field ever searched for; `label` is diagnostic only.** Asserting
+    /// on `label` would be asserting that this table describes itself.
+    ///
+    /// It guards the routing core — the invariant whose quiet failure produces
+    /// an agent that believes it is running drovr and is not — so it is the last
+    /// place in the run where two same-shaped tuples should be left to mean two
+    /// different things.
+    struct Anchor {
+        /// What this stands for, for the failure message. **Never searched.**
+        label: &'static str,
+        /// The literal text searched for. Whitespace-folded before comparison
+        /// wherever the target is hard-wrapped prose.
+        needle: &'static str,
     }
 
     /// `skills/using-drovr/SKILL.md`, as the shipped file the checks below are
@@ -1451,54 +1514,60 @@ mod tests {
         // different fixes, and collapsing them into one `body.contains` would
         // report the second as the first — which is how someone repairs this by
         // pasting the text back in, still inside the marker.
-        const ROUTING_CORE: &[(&str, &str)] = &[
-            ("<SUBAGENT-STOP>", "§4.1 item 1 — the subagent stop"),
-            ("# Using Drovr", "the H1"),
-            (
-                "even a 1% chance a drovr:* skill applies",
-                "§4.1 item 2 — the 1% rule",
-            ),
-            (
-                "invoking costs almost nothing",
-                "§4.1 item 2 — the 1% rule's cost-lowering clause",
-            ),
-            (
-                "including clarifying questions and read-only exploration",
-                "§4.1 item 3 — the per-turn rule",
-            ),
-            (
-                "The human's explicit instructions",
-                "§4.1 item 4 — the instruction-priority ladder (rung 1)",
-            ),
-            (
-                "digraph drovr_gate",
-                "§4.1 item 5 — the gate-function flowchart",
-            ),
-            (
-                "one tracked item per step",
-                "§4.1 item 5's checklist branch — fix 3's canonical directive (§5 site 1)",
-            ),
-            (
-                "## Red flags — you are about to route nothing",
-                "§4.1 item 6 — the router's own red-flag table",
-            ),
+        const ROUTING_CORE: &[Anchor] = &[
+            Anchor {
+                label: "§4.1 item 1 — the subagent stop",
+                needle: "<SUBAGENT-STOP>",
+            },
+            Anchor {
+                label: "the H1",
+                needle: "# Using Drovr",
+            },
+            Anchor {
+                label: "§4.1 item 2 — the 1% rule",
+                needle: "even a 1% chance a drovr:* skill applies",
+            },
+            Anchor {
+                label: "§4.1 item 2 — the 1% rule's cost-lowering clause",
+                needle: "invoking costs almost nothing",
+            },
+            Anchor {
+                label: "§4.1 item 3 — the per-turn rule",
+                needle: "including clarifying questions and read-only exploration",
+            },
+            Anchor {
+                label: "§4.1 item 4 — the instruction-priority ladder (rung 1)",
+                needle: "The human's explicit instructions",
+            },
+            Anchor {
+                label: "§4.1 item 5 — the gate-function flowchart",
+                needle: "digraph drovr_gate",
+            },
+            Anchor {
+                label: "§4.1 item 5's checklist branch — fix 3's canonical directive (§5 site 1)",
+                needle: "one tracked item per step",
+            },
+            Anchor {
+                label: "§4.1 item 6 — the router's own red-flag table",
+                needle: "## Red flags — you are about to route nothing",
+            },
         ];
         // Folded on both sides, for the reason [`folded`] gives: these anchors
         // are whole clauses in a hard-wrapped file, and a line-break-sensitive
         // comparison reports a reflow as a deletion.
         let folded_md = folded(&md);
         let folded_body = folded(&body);
-        for (core, item) in ROUTING_CORE {
-            let core = folded(core);
+        for Anchor { label, needle } in ROUTING_CORE {
+            let core = folded(needle);
             assert!(
                 folded_md.contains(&core),
-                "{item}: {core:?} is not in skills/using-drovr/SKILL.md at all — \
+                "{label}: {core:?} is not in skills/using-drovr/SKILL.md at all — \
                  this test can only tell you whether the routing core survives \
                  subtraction, not write it for you"
             );
             assert!(
                 folded_body.contains(&core),
-                "subtracting every section deleted {item}: {core:?}. It is inside \
+                "subtracting every section deleted {label}: {core:?}. It is inside \
                  a `<!-- reflex:section:NAME -->` pair, so `[reflex.sections]` can \
                  remove it — which yields an agent that believes it is running \
                  drovr and is not. Move it outside every marker; only \
