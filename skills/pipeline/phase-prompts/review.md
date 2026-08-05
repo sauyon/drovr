@@ -26,10 +26,12 @@ You did not write this code — review it as a skeptic, not its author.
    reports.
 2. **Review against the checklist — apply the check discipline from `drovr:code-review`
    directly; do NOT dispatch review subagents.** You *are* the reviewer this phase, so work the
-   four angles in step 2 of that skill's procedure yourself — spec compliance → correctness →
-   verification → quality — as a skeptic, not the author, and run the claimed tests if you can.
-   (Its Iron Law and procedure are written for an agent that *dispatches* reviewers; here you
-   are the reviewer they would have dispatched, so steps 1–4 are yours to be, not to run.)
+   four **lenses** in step 2 of that skill's procedure yourself — spec compliance → correctness
+   → verification → quality — as a skeptic, not the author, and run the claimed tests if you
+   can. (Those four are not `config.angles`, which is what `drovr code-review run` dispatches.
+   That skill's Iron Law and procedure are written for an agent that *dispatches* reviewers;
+   here you are the reviewer they would have dispatched, so steps 1–4 are yours to be, not to
+   run.)
 3. **Write the verdict** to `~/.local/share/drovr/runs/<run>/verdict.md`:
    - an overall call: **approve / approve-with-fixes / changes-required**,
    - each finding with file:line, severity, and why it matters,

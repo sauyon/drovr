@@ -4465,10 +4465,10 @@ enum ConditionalSection {
 /// `E0063`, not a shorter table — and [`RequirementClaims::rows`] is the one
 /// place either order is written down. The two arities differ on purpose: §6
 /// fixes five rows for `verification-before-completion` and none for
-/// `code-review`, whose four are the four claims its Iron Law composes. Because
-/// arity is per variant rather than a `[_; 5]` in the return type,
-/// [`check_requirements_table`] asserts the row list is non-empty **itself**,
-/// rather than inheriting that guarantee from a signature.
+/// `code-review`, whose four are the four claims its Iron Law composes.
+/// [`RequirementClaims::rows`] returns a [`Rows`], which is non-empty by
+/// construction, so the differing arities cost nothing: no caller has to check
+/// for an empty row list, because there is no way to build one.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum RequirementClaims {
     /// §6's five rows for `verification-before-completion`, in §6's order —
@@ -4505,7 +4505,7 @@ impl RequirementClaims {
     /// every assertion stayed green. Pairing them here makes that
     /// unrepresentable, and leaves the order written down exactly once per
     /// skill.
-    fn rows(&self) -> Vec<(&'static str, &'static str)> {
+    fn rows(&self) -> Rows {
         match self {
             RequirementClaims::Verification {
                 tests,
@@ -4513,30 +4513,61 @@ impl RequirementClaims {
                 linter,
                 bug_fixed,
                 subagent_reported_success,
-            } => vec![
-                ("tests", tests),
-                ("build", build),
-                ("linter", linter),
-                ("bug-fixed", bug_fixed),
-                ("subagent-reported-success", subagent_reported_success),
-            ],
+            } => Rows {
+                first: ("tests", tests),
+                rest: vec![
+                    ("build", build),
+                    ("linter", linter),
+                    ("bug-fixed", bug_fixed),
+                    ("subagent-reported-success", subagent_reported_success),
+                ],
+            },
             RequirementClaims::Review {
                 reviewed,
                 clean,
                 resolved,
                 deferred,
-            } => vec![
-                ("reviewed", reviewed),
-                ("clean", clean),
-                ("resolved", resolved),
-                ("deferred", deferred),
-            ],
+            } => Rows {
+                first: ("reviewed", reviewed),
+                rest: vec![
+                    ("clean", clean),
+                    ("resolved", resolved),
+                    ("deferred", deferred),
+                ],
+            },
         }
     }
 
     /// The declared claims alone, in the table's order.
     fn in_order(&self) -> Vec<&'static str> {
-        self.rows().into_iter().map(|(_, claim)| claim).collect()
+        self.rows().iter().map(|(_, claim)| claim).collect()
+    }
+}
+
+/// A section-7 skill's rows, in table order — **non-empty by construction**.
+///
+/// A head and a tail rather than a `Vec`, for one reason: an empty row list
+/// would make [`check_requirements_table`]'s comparison `[] == []` and pass on a
+/// table with no rows at all — the vacuous-pass class this run has hit
+/// repeatedly. `[_; 5]` used to rule that out, and stopped being available when
+/// §6 turned out to fix five rows for one section-7 skill and none for the
+/// other, so the two variants have different arities.
+///
+/// The `Vec` that replaced the array pushed the invariant onto the checker as a
+/// runtime `is_empty()` guard on a branch no variant could reach — **an
+/// unreachable check standing in for a type**, which is exactly the trade Task
+/// 12's gate refused one level up. `first` is not an `Option`, so there is
+/// nothing left to check and nothing left to forget to check.
+struct Rows {
+    first: (&'static str, &'static str),
+    rest: Vec<(&'static str, &'static str)>,
+}
+
+impl Rows {
+    /// Every row, head first. Arity-agnostic, so callers never learn how many
+    /// rows a given skill declares.
+    fn iter(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
     }
 }
 
@@ -5031,18 +5062,21 @@ fn claim_text(cell: &str) -> String {
 /// **What this asserts that a heading cannot.** `required_sections` proves a
 /// `Requirements` heading exists and `check_armor` proves no `dot` fence does;
 /// between them, a page carrying the heading and nothing else satisfies both.
-/// §6 names five claims for the two skills it marks CONDITIONAL for, and this is
-/// the only place that says so — the same argument [`Armor::procedure_steps`]
-/// makes for section 6's arity, applied to the section that had no analogue.
+/// Which rows a section-7 skill states is recorded in [`RequirementClaims`] and
+/// asserted here, and nowhere else — the same argument [`Armor::procedure_steps`]
+/// makes for section 6's arity, applied to the section that had no analogue. §6
+/// names the five for `verification-before-completion` only; `code-review`'s
+/// four are its author's, which is why the row set rides on the variant.
 ///
 /// The three columns are asserted too. A two-column table is not §6's section 7:
 /// dropping the `not sufficient` column deletes the half that closes loopholes,
 /// and that is a rewrite, not a formatting choice.
 ///
-/// **Everything its own soundness needs is asserted here**, which it once was
-/// not. An earlier version took `&[&str]` and documented that an empty slice
-/// would make it compare `[] == []` and pass on a table with no rows — naming
-/// `armor_table_declares_well_formed_strings` as the thing that prevented it.
+/// **Everything its own soundness needs is asserted here or carried by a type**,
+/// which it once was not. An earlier version took `&[&str]` and documented that
+/// an empty slice would make it compare `[] == []` and pass on a table with no
+/// rows — naming `armor_table_declares_well_formed_strings` as the thing that
+/// prevented it. [`Rows`] now makes that state unrepresentable.
 /// That is the vacuous-pass class one level up: a check that is only meaningful
 /// because a neighbour happens to exist, with nothing linking the two, so
 /// deleting the neighbour silently demotes this back to a heading check while it
@@ -5056,29 +5090,15 @@ fn check_requirements_table(
     first_body_line: usize,
     wrong: &mut Vec<String>,
 ) {
-    // The two preconditions this function's own comparison rests on, asserted
-    // here rather than inherited from a signature or from a neighbouring test —
-    // the vacuous-pass class Task 12's gate closed, which the per-variant arity
-    // would otherwise have re-opened one level down.
+    // The precondition this function's own comparison rests on, asserted here
+    // rather than borrowed from a neighbouring test. The OTHER precondition — a
+    // non-empty row list, without which the comparison below would be
+    // `[] == []` on a table with no rows — is carried by [`Rows`] and needs no
+    // check here.
     //
-    // 1. A declared row list that is EMPTY would make the comparison below
-    //    `[] == []` and pass on a table with no rows. `[_; 5]` used to rule this
-    //    out; `Vec` does not, because §6 fixes five rows for one section-7 skill
-    //    and none for the other.
-    let rows = claims.rows();
-    if rows.is_empty() {
-        wrong.push(format!(
-            "{}: §6 section 7's claims are declared as an empty row list, so the \
-             comparison below would be satisfied by a table with no rows at all. \
-             Declare the rows this skill's table states.",
-            path.display(),
-        ));
-        return;
-    }
-    // 2. A blank claim matches a blank leading cell, so a hollow row would
-    //    satisfy a hollow declaration — the comparison would run and mean
-    //    nothing.
-    for (kind, claim) in rows {
+    // A blank claim matches a blank leading cell, so a hollow row would satisfy
+    // a hollow declaration: the comparison would run and mean nothing.
+    for (kind, claim) in claims.rows().iter() {
         if claim_text(claim).is_empty() {
             wrong.push(format!(
                 "{}: §6 section 7's `{kind}` claim is declared blank, so the row \
@@ -5140,7 +5160,7 @@ fn check_requirements_table(
             "{}: §6 section 7 opens on line {} with no table under it — no row \
              with a `|---|` delimiter beneath it. The heading is not the \
              section: §6 section 7 is claim → required evidence → not \
-             sufficient, over §6's five rows.",
+             sufficient, over the rows this skill declares.",
             path.display(),
             at(start),
         ));
@@ -5188,14 +5208,14 @@ fn check_requirements_table(
         .map(|claim| claim_text(claim))
         .collect();
     if found != expected {
-        // Name the first row that differs. The five rows have names, and
-        // "row 5" makes an author count table rows to find out which.
-        let kinds = claims.rows();
+        // Name the first row that differs. Rows have names, and "row 5" makes
+        // an author count table rows to find out which.
+        let kinds: Vec<&'static str> = claims.rows().iter().map(|(kind, _)| kind).collect();
         let at_kind = expected
             .iter()
             .zip(found.iter().chain(std::iter::repeat(&String::new())))
             .position(|(want, got)| want != got)
-            .and_then(|i| kinds.get(i).map(|(kind, _)| kind))
+            .and_then(|i| kinds.get(i))
             .unwrap_or(&"(row count)");
         wrong.push(format!(
             "{}: §6 section 7's table states the claims {found:?}, but this \
@@ -5447,8 +5467,9 @@ fn armor_table_declares_well_formed_strings() {
                 unique.len(),
                 normalized.len(),
                 "{name}: §6 section 7's declared claims contain a duplicate: \
-                 {normalized:?}. §6's five rows are five different claims; two \
-                 spelled the same way means one of them is not being asked for."
+                 {normalized:?}. A skill's section-7 rows are different claims; \
+                 two spelled the same way means one of them is not being asked \
+                 for."
             );
         }
     }

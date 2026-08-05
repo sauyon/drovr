@@ -184,7 +184,6 @@ when a neighbour is deleted is one nobody can check.
   - *"They are going to read it line by line anyway."* — scenario lines 25–28.
   - *"The lead said just send it."* — scenario line 20, *"just send it, I'll skim it live on
     the call with them."*
-  - *"I am out of time before the deadline."* — scenario lines 22–23 and 30.
   - *"It is a two-line change."* · *"I already reviewed it myself."* · *"The pipeline's review
     phase will catch it."* — §6's three named loophole closures. **Spec text, not
     observations**, and quoted from §6 rather than from any transcript.
@@ -202,11 +201,22 @@ when a neighbour is deleted is one nobody can check.
     correctness of retry semantics and reconciliation math"*.
   - The remaining five instructions are **authored**.
 
-**`42a94a`'s verbatim argument against option C is recorded above but is no longer used.** It
-backed a row (*"I will send it flagged as not yet reviewed"*) that self-review cut to buy bytes
-for two Critical loophole fixes — so the strongest RED-sourced material in this stage now sits
-in the evidence file with nothing in the skill citing it. Recorded rather than quietly dropped;
-it is the first row to restore if the cap ever loosens.
+**Two scenario-sourced rows were cut for bytes and are recorded here rather than quietly
+dropped.** Both are the first to restore if the cap ever loosens:
+
+- *"I will send it flagged as not yet reviewed"* — cut in self-review to pay for two Critical
+  loophole fixes. It carried `42a94a`'s verbatim argument against forced-choice option C
+  (*"it ships the same unreviewed content and the same risk, just with a disclaimer…"*), which
+  is the strongest RED-sourced material in this stage and now has nothing in the skill citing
+  it.
+- *"I am out of time before the deadline"* (scenario lines 22–23 and 30) — cut in the gate
+  round to pay for the angle-list correction and step 6's scoping. **This leaves the
+  scenario's `time` pressure with no rationalization row of its own**; it is answered only by
+  the worked example, which moves the call and reports sending 22 minutes late. The `authority`
+  and `pragmatic` pressures each still have a row.
+
+**Both cuts were forced by the 12000 B cap, not chosen on the merits**, and that is the
+honest characterisation. See the report's open question on the cap.
 
 **These are compliant runs naming what tempted them, not rationalizations**, and the shipped
 skill does not claim otherwise. The null itself is **not** mentioned in `SKILL.md`: a note
@@ -232,7 +242,7 @@ compresses the two RED runs' own arguments (above). **The fenced panel output is
 No RED run produced reviewer output: the probes were asked for a forced choice, not for a
 review, so there is no transcript to take findings from. The two `IMPORTANT` findings and the
 `nit` are invented to be typical of the artifact the scenario describes, and the preamble in
-`SKILL.md` says so in the shipped text (*"Reviewer output below is illustrative, not a
+`SKILL.md` says so in the shipped text (*"Reviewer output is illustrative, not a
 transcript"*) rather than only here. This is Task 12's problem in the same shape: its gate
 found a ✅ that showed only a *plan* to verify, under an Iron Law forbidding exactly that. The
 ✅ here therefore shows the panel **dispatched**, its findings **quoted**, both Importants
@@ -246,11 +256,23 @@ it` became procedure step 2 plus the FOREGROUND no-exceptions bullet; `## Check,
 became step 2's angle list; `## Resolving findings` became steps 5–6 and the
 `resolved`/`deferred` requirements rows; `## Automatic panel` was demoted from a section to a
 clause in step 2 — keeping both artifact names, `<task>-review-<angle>.json` and the merged
-`<task>-review.json` — plus the exit-code rule in step 3 (**"only 0 is clean"**: arm A listed
-the codes without saying which of them are not a pass). Step 6 keeps a `drovr phase done`
-reference in A′'s demoted conditional form, which
+`<task>-review.json`, **and arm A's "per configured angle"** — plus the exit-code rule in step
+3 (**"only 0 is clean"**: arm A listed the codes without saying which of them are not a pass).
+Step 6 keeps a `drovr phase done` reference in A′'s demoted conditional form, which
 `no_phase_scoped_description_literals` enforces the phrasing of. `description:` is untouched:
 §3-frozen, and it is the one thing arm A′ isolates.
+
+**A restructuring error the gate caught, worth recording because arm A was RIGHT and the
+rewrite made it wrong.** Arm A said the panel runs *"one read-only reviewer per **configured**
+angle"*. The first draft replaced that with *"dispatches that panel for you"* placed directly
+under the four lenses inherited from `## Check, in order` — asserting that
+`drovr code-review run` dispatches spec-compliance / correctness / verification / quality. It
+does not: `cli/src/code_review.rs:305` iterates `cfg.angles`, whose default
+(`cli/src/config.rs` `default_angles()`) is correctness / security / error-handling /
+type-design. **Two independent lists were fused into one claim that was false about drovr's own
+command, in drovr's own skill.** The word arm A used to keep them apart was *configured*, and
+dropping one word did it. Restored, with the default named and the config pointed at; the
+worked example's fenced output now shows real angle names too.
 
 **The one deletion: arm A said each reviewer "runs `drovr phase done`, then exits".** That was
 already false when arm A was frozen — `cli/src/code_review.rs:168` seeds every reviewer with
