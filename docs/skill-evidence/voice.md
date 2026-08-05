@@ -48,12 +48,25 @@ verifies them against the manifest before running anything.
 
 **Identical in structure — same Iron Law, same Announce, same procedure, same tables, same
 placement.** At n=6 the factors are separable only if nothing else differs, so this is enforced
-mechanically rather than by inspection: `cli/tests/skills_valid.rs` has
-`voice_variants_differ_from_the_baseline_in_exactly_one_section` (identical section set and
-order; exactly one section's body differs, and it is the section the variant's device is
-declared to live in), `voice_variants_share_one_frontmatter`, and
-`every_voice_variant_keeps_the_baselines_iron_law_line`. A later edit to one variant that
-desynchronises the set turns the suite red.
+mechanically rather than by inspection. `cli/tests/skills_valid.rs` carries five checks, and a
+later edit that desynchronises the set turns the suite red:
+
+- `voice_variants_differ_from_the_baseline_in_exactly_one_section` — identical section set and
+  order, and exactly one section's body differs: the one that variant's device is *declared* to
+  live in.
+- `each_voice_variant_carries_its_own_device_and_no_others` — the *identity* half, which is a
+  separate claim from the location half. V1 and V3 differ from V0 in the same section, so nothing
+  else notices if their two Overview paragraphs trade places — and Task 21 reads the arm labels
+  off these filenames. Each variant declares a marker phrase asserted present in it and **absent
+  from V0 and from every sibling**; the absence half is what rejects a variant carrying two
+  devices.
+- `every_voice_variant_keeps_the_baselines_iron_law_line` — the fenced line is byte-identical in
+  all four, V0 included. See the next section.
+- `voice_variants_share_one_frontmatter` — one `name:` and one `description:` across the arm.
+- `voice_snapshots_match_manifest` — the arm's drift tripwire, checked in both directions: the
+  `voice` rows are exactly these four, and the directory holds exactly these four files. **Task 21
+  pastes what it finds in that directory into a probe run**, so an unregistered fifth variant is
+  the dangerous case.
 
 **V1 and V3 add their paragraph at the same slot** — the end of the Overview — so their diffs
 against V0 are the same shape. A reader comparing them is comparing registers, not positions.
