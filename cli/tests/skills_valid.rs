@@ -1012,12 +1012,29 @@ fn md_sections(body: &str) -> Vec<MdSection> {
 
 /// Read one voice variant, parsed as the skill document it is pasted into a
 /// probe run as.
+///
+/// **Fence termination is checked here, before any caller splits the body into
+/// sections.** [`headings`] treats an unterminated fence as swallowing the rest
+/// of the file, so a missing closing ``` would reach the separability check as
+/// *"different section set"* or *"must differ in Overview"* — a true statement
+/// about a document nobody meant to write, and one that sends the reader to
+/// audit prose instead of to the fence. Checking once at the read point names
+/// the real fault and names it for every voice test at the same time.
 fn read_voice_variant(name: &str) -> Skill {
     let path = arms_dir().join(VOICE_ARM).join(format!("{name}.md"));
     let contents = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read voice variant {}: {e}", path.display()));
-    parse_skill(&contents)
-        .unwrap_or_else(|| panic!("{}: no frontmatter — a variant is a skill document, and its `description:` is part of what the probe measures", path.display()))
+    let skill = parse_skill(&contents)
+        .unwrap_or_else(|| panic!("{}: no frontmatter — a variant is a skill document, and its `description:` is part of what the probe measures", path.display()));
+    if let Err(line) = fenced_blocks(&skill.body) {
+        panic!(
+            "{}: the fence opened at body line {line} never closes, so every section below it \
+             reads as code. Fix the fence; the section checks cannot say anything useful until \
+             you do.",
+            path.display()
+        );
+    }
+    skill
 }
 
 /// §7.4's separability invariant: each variant differs from `V0` in **exactly
