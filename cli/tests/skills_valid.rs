@@ -6710,14 +6710,22 @@ struct RawVerdict {
     evidence: String,
 }
 
-/// An **adjudicated** verdict — the type for `scores.json`, the file the
-/// pre-registered bars read.
+/// An **adjudicated** verdict — the type for every verdict set held to the
+/// rubric's recording rules.
 ///
-/// Same seven fields, a strictly stronger contract: `check_rubric_rules` below
-/// enforces what `scoring-rubric.md` says may be recorded, and it exists only on
-/// this type. Two files with two contracts get two types, so a rubric-invalid
-/// state stays representable in the raw record — where it is evidence — and is
-/// unrepresentable in the adjudicated one, where it would be a defect.
+/// Same seven fields as [`RawVerdict`], a strictly stronger contract:
+/// `check_rubric_rules` below enforces what `scoring-rubric.md` says may be
+/// recorded, and it exists only on this type. Two files with two contracts get
+/// two types, so a rubric-invalid state stays representable in the raw record —
+/// where it is evidence — and is unrepresentable here, where it would be a defect.
+///
+/// **The split this type marks is raw-vs-adjudicated, not bar-vs-auxiliary.**
+/// Both `scores.json` and `control-scores.json` deserialize through it: they came
+/// from the same rubric and the same blind scorer, so they obey the same recording
+/// rules, and only one of them feeds a pre-registered bar. That second axis is
+/// [`VerdictBundle`], which carries the per-file rules this type deliberately does
+/// not — which arm the paired blind map may name, and which file the vacuity guard
+/// counts.
 #[derive(serde::Deserialize)]
 #[serde(transparent)]
 struct Verdict(RawVerdict);
@@ -6789,6 +6797,93 @@ enum ChosenOption {
     /// rule 4).
     #[serde(rename = "none")]
     None,
+}
+
+/// Which verdict set a file holds, and the rules that follow from that — a closed
+/// set, so "which file is this?" is answered once instead of at each use site.
+///
+/// The two files are validated identically as *verdicts* ([`Verdict`]) and differ
+/// in two ways that a `&str` filename cannot carry: whether a pre-registered bar
+/// reads them, and which arm their blind map may name. Keeping both in a parallel
+/// `["scores.json", "control-scores.json"]` list is how the vacuity guard came to
+/// count control verdicts toward a message that promised `scores.json`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerdictBundle {
+    /// `scores.json` — the verdicts `spec.md` §7.3's pre-registered bars read.
+    /// A skill directory with any verdicts at all must have this one.
+    Bar,
+    /// `control-scores.json` — the unaided (no-skill) control stage. Same rubric,
+    /// same blind scorer, **no bar**. Supplementary to a scored `ab-*` stage, so
+    /// it may not stand alone.
+    Control,
+}
+
+impl VerdictBundle {
+    const ALL: [VerdictBundle; 2] = [VerdictBundle::Bar, VerdictBundle::Control];
+
+    fn scores_file(self) -> &'static str {
+        match self {
+            VerdictBundle::Bar => "scores.json",
+            VerdictBundle::Control => "control-scores.json",
+        }
+    }
+
+    fn blind_map_file(self) -> &'static str {
+        match self {
+            VerdictBundle::Bar => "blind-map.json",
+            VerdictBundle::Control => "control-blind-map.json",
+        }
+    }
+
+    /// Whether this stage's blind map records `arm: "none"`.
+    ///
+    /// Total on purpose: the control stage pastes no arm's text, and every other
+    /// stage pastes exactly one. A map that disagrees has been joined to the wrong
+    /// verdict file, which is the one error blinding cannot survive.
+    fn is_unaided(self) -> bool {
+        match self {
+            VerdictBundle::Bar => false,
+            VerdictBundle::Control => true,
+        }
+    }
+}
+
+/// Which arm a blind-map entry assigns a transcript to, as a closed set.
+///
+/// The arm vocabulary is `plan.md` §1.1's: the three measured arms, the two
+/// REFACTOR iterations, and `none` for the unaided control. A closed enum rather
+/// than a `String`, for [`ChosenOption`]'s reason — and because `"arm": "none"`
+/// arriving in a bar-facing map would silently turn a measured cell into a control
+/// one.
+#[derive(serde::Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+enum BlindArm {
+    A,
+    #[serde(rename = "A-prime")]
+    APrime,
+    B,
+    #[serde(rename = "B-r1")]
+    BR1,
+    #[serde(rename = "B-r2")]
+    BR2,
+    /// The unaided control: no arm's text was pasted at all.
+    #[serde(rename = "none")]
+    None,
+}
+
+/// One `blind-map.json` / `control-blind-map.json` entry.
+///
+/// `scoring-rubric.md` Part B makes the map the thing written **before** scoring
+/// and never shown to the scorer, then joined to the verdicts afterwards. It is
+/// therefore what makes a blind score attributable at all, and it had no schema
+/// while the file it joins to had one — half a validated pair.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlindMapEntry {
+    arm: BlindArm,
+    #[allow(dead_code)]
+    scenario: String,
+    #[allow(dead_code)]
+    sample: u32,
 }
 
 /// A blind re-adjudication record (`transcripts/<skill>/adjudication.json`).
@@ -6908,6 +7003,90 @@ fn read_verdicts(path: &Path) -> Vec<Verdict> {
     verdicts
 }
 
+/// The blind map paired with a verdict set: schema, arm vocabulary, and — the
+/// point of the whole file — that it names **exactly** the transcripts that were
+/// scored.
+///
+/// A verdict set says what each transcript did; only the map says which arm did
+/// it. A missing entry leaves a scored run unattributable, a surplus entry claims
+/// a run that was never scored, and either one is a silently wrong join rather
+/// than a loud failure — which is why key-set equality is checked here and is not
+/// left a convention.
+///
+/// Returns complaints rather than asserting, following [`check_armor`]: a check
+/// that panics can only be shown to *pass*, and this corpus has shipped nine
+/// guards that passed without ever being able to fire. See
+/// `blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts`.
+fn check_blind_map(dir: &Path, bundle: VerdictBundle, verdicts: &[Verdict]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let path = dir.join(bundle.blind_map_file());
+    if !path.is_file() {
+        wrong.push(format!(
+            "{} exists but {} does not — a scored stage's arm assignment is what makes \
+             its verdicts attributable (scoring-rubric.md Part B)",
+            dir.join(bundle.scores_file()).display(),
+            path.display(),
+        ));
+        return wrong;
+    }
+
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+    let map: HashMap<String, BlindMapEntry> = match serde_json::from_str(&text) {
+        Ok(map) => map,
+        Err(e) => {
+            wrong.push(format!(
+                "{} does not match the blind-map schema: {e}. Entries are \
+                 {{\"<6-hex id>\": {{\"arm\", \"scenario\", \"sample\"}}}} and `arm` is one of \
+                 A / A-prime / B / B-r1 / B-r2 / none.",
+                path.display()
+            ));
+            return wrong;
+        }
+    };
+
+    let scored: HashSet<&str> = verdicts
+        .iter()
+        .map(|v| v.0.transcript_id.as_str())
+        .collect();
+    for id in map.keys() {
+        resolve_transcript(dir, id, &path);
+        if !scored.contains(id.as_str()) {
+            wrong.push(format!(
+                "{}: maps transcript {id}, which {} does not score",
+                path.display(),
+                bundle.scores_file(),
+            ));
+        }
+    }
+    for id in &scored {
+        if !map.contains_key(*id) {
+            wrong.push(format!(
+                "{}: {} scores transcript {id}, which this map does not assign to an arm",
+                path.display(),
+                bundle.scores_file(),
+            ));
+        }
+    }
+
+    // The one cross-file invariant a schema cannot state: an unaided map records
+    // `none` and nothing else, and a measured map records anything **but** `none`.
+    // Violating it means the two files were joined to each other by mistake, and
+    // every arm-level count downstream is then drawn from the wrong stage.
+    for (id, entry) in &map {
+        if (entry.arm == BlindArm::None) != bundle.is_unaided() {
+            wrong.push(format!(
+                "{}: transcript {id} is recorded as arm {:?} in the {} stage's map",
+                path.display(),
+                entry.arm,
+                bundle.scores_file(),
+            ));
+        }
+    }
+
+    wrong
+}
+
 /// Every scored `ab-*` stage's verdicts are well-formed **and obey the rubric's
 /// rules about what may be recorded where**.
 ///
@@ -6925,6 +7104,7 @@ fn read_verdicts(path: &Path) -> Vec<Verdict> {
 fn scores_json_verdicts_obey_the_rubric() {
     let transcripts = evidence_dir().join("transcripts");
     let mut checked = 0usize;
+    let mut bar_checked = 0usize;
 
     for skill in SkillName::ALL {
         let dir = transcripts.join(skill.as_str());
@@ -6946,18 +7126,35 @@ fn scores_json_verdicts_obey_the_rubric() {
             }
         }
 
-        // `control-scores.json` holds the unaided (no-skill) control stage's
-        // verdicts. It is a separate file because it scores a separate stage that
-        // no pre-registered bar reads — but it is a verdict set produced by the
-        // same rubric and the same blind scorer, so it obeys the same rules. A
-        // second verdict-like file with no schema is the drift this corpus keeps
-        // finding.
-        for name in ["scores.json", "control-scores.json"] {
-            let path = dir.join(name);
+        // Both verdict bundles, held to the same rubric — see [`VerdictBundle`] for
+        // the two things that differ. `control-scores.json` scores a stage no
+        // pre-registered bar reads, but it came from the same rubric and the same
+        // blind scorer, and a second verdict-like file with no schema is the drift
+        // this corpus keeps finding.
+        for bundle in VerdictBundle::ALL {
+            let path = dir.join(bundle.scores_file());
             if !path.is_file() {
                 continue;
             }
+
+            // The control stage is supplementary to a scored `ab-*` stage: it
+            // re-runs that stage's held-out scenarios with no skill text, to say
+            // what the scenarios do unaided. Standing alone it describes a
+            // measurement that never happened — and, before this assertion, it
+            // also satisfied the vacuity guard at the bottom of this test.
+            if bundle == VerdictBundle::Control {
+                assert!(
+                    dir.join(VerdictBundle::Bar.scores_file()).is_file(),
+                    "{} exists without {} — a control is supplementary to a scored \
+                     stage, never a stage on its own",
+                    path.display(),
+                    dir.join(VerdictBundle::Bar.scores_file()).display(),
+                );
+            }
+
             let verdicts = read_verdicts(&path);
+            let wrong = check_blind_map(&dir, bundle, &verdicts);
+            assert!(wrong.is_empty(), "{}", wrong.join("\n"));
             let mut seen: HashSet<&str> = HashSet::new();
             for v in &verdicts {
                 let id = v.0.transcript_id.as_str();
@@ -6975,17 +7172,22 @@ fn scores_json_verdicts_obey_the_rubric() {
                     path.display()
                 );
                 v.check_rubric_rules(response, &path);
+                if bundle == VerdictBundle::Bar {
+                    bar_checked += 1;
+                }
                 checked += 1;
             }
         }
 
-        let path = dir.join("scores.json");
+        let path = dir.join(VerdictBundle::Bar.scores_file());
         if !path.is_file() {
             continue;
         }
         let verdicts = read_verdicts(&path);
 
-        // A re-adjudication, if one was needed, is evidence too.
+        // A re-adjudication, if one was needed, is evidence too. It adjudicates the
+        // bar-facing set specifically — `VerdictBundle::Bar` here is the assertion
+        // that a control set can never be what an `adjudication.json` answers to.
         let adj = dir.join("adjudication.json");
         if adj.is_file() {
             let text = fs::read_to_string(&adj).expect("adjudication.json unreadable");
@@ -7056,9 +7258,173 @@ fn scores_json_verdicts_obey_the_rubric() {
 
     // Seeded against what is already true: Task 16 scored `tdd`. Without this the
     // test passes vacuously the day the transcripts directory moves or is renamed.
+    //
+    // **It counts bar-facing verdicts only, and that is the whole point.** When
+    // `control-scores.json` joined the loop above, the guard started counting its
+    // verdicts too — so a tree holding nothing but control verdicts satisfied a
+    // check whose message promises a scored stage. The guard against a vacuous pass
+    // must not itself be satisfiable by the absence of the measurement. `checked`
+    // stays, one line down, for the same reason at the other bundle's scale.
     assert!(
-        checked > 0,
-        "no scores.json found under {} — expected at least the scored `tdd` set",
+        bar_checked > 0,
+        "no scores.json verdicts found under {} — expected at least the scored `tdd` \
+         set. {checked} verdict(s) were checked in total, so if that number is \
+         non-zero the tree holds control verdicts with no scored stage behind them.",
         transcripts.display(),
+    );
+}
+
+/// [`check_blind_map`] rejects each way a map can fail to attribute the verdicts
+/// it is paired with.
+///
+/// **Why this test exists at all.** The check above is new, and every artifact in
+/// the tree it runs against is already legal — so on the real corpus it can only
+/// be observed to pass. That is the shape of the nine vacuous guards this run has
+/// now found, one of which was the `checked > 0` counter directly above. A guard
+/// ships with a demonstration that it fires, or it is a comment.
+#[test]
+fn blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path();
+
+    // Two transcripts on disk, because `check_blind_map` resolves every id it maps.
+    for id in ["aaaaaa", "bbbbbb"] {
+        fs::write(
+            dir.join(format!("{id}.md")),
+            "## Response\n\nI'm taking A.\n",
+        )
+        .expect("write transcript");
+    }
+    let verdict = |id: &str| {
+        serde_json::json!({
+            "transcript_id": id, "compliant": true, "cites_section": false,
+            "names_temptation": true, "meta_test_clear": false,
+            "new_rationalizations": [], "evidence": "I'm taking A."
+        })
+    };
+    let verdicts: Vec<Verdict> =
+        serde_json::from_value(serde_json::json!([verdict("aaaaaa"), verdict("bbbbbb")]))
+            .expect("fixture verdicts parse");
+
+    let write_map = |name: &str, value: serde_json::Value| {
+        fs::write(dir.join(name), value.to_string()).expect("write map");
+    };
+    let entry = |arm: &str| serde_json::json!({"arm": arm, "scenario": "tdd-2", "sample": 1});
+    let complaints =
+        |bundle: VerdictBundle| -> Vec<String> { check_blind_map(dir, bundle, &verdicts) };
+
+    // Control. If this ever fails, every negative case below is meaningless.
+    write_map(
+        "blind-map.json",
+        serde_json::json!({"aaaaaa": entry("A"), "bbbbbb": entry("B")}),
+    );
+    assert!(
+        complaints(VerdictBundle::Bar).is_empty(),
+        "a complete, correctly-armed map must satisfy the check: {:?}",
+        complaints(VerdictBundle::Bar)
+    );
+
+    // 1. A scored transcript with no entry — the run is unattributable.
+    write_map("blind-map.json", serde_json::json!({"aaaaaa": entry("A")}));
+    let wrong = complaints(VerdictBundle::Bar);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the missing-entry complaint: {wrong:?}"
+    );
+    assert!(
+        wrong[0].contains("bbbbbb") && wrong[0].contains("does not assign"),
+        "{wrong:?}"
+    );
+
+    // 2. An entry for a transcript nobody scored — a claimed run that never was.
+    write_map(
+        "blind-map.json",
+        serde_json::json!({"aaaaaa": entry("A"), "bbbbbb": entry("B"), "cccccc": entry("B")}),
+    );
+    fs::write(dir.join("cccccc.md"), "## Response\n\nI'm taking A.\n").expect("write transcript");
+    let wrong = complaints(VerdictBundle::Bar);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the surplus-entry complaint: {wrong:?}"
+    );
+    assert!(
+        wrong[0].contains("cccccc") && wrong[0].contains("does not score"),
+        "{wrong:?}"
+    );
+
+    // 3. `arm: "none"` in a bar-facing map — a control cell posing as a measured
+    //    one, which is the join error that would corrupt every arm-level count.
+    write_map(
+        "blind-map.json",
+        serde_json::json!({"aaaaaa": entry("none"), "bbbbbb": entry("B")}),
+    );
+    let wrong = complaints(VerdictBundle::Bar);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the wrong-arm complaint: {wrong:?}"
+    );
+    assert!(
+        wrong[0].contains("aaaaaa") && wrong[0].contains("None"),
+        "{wrong:?}"
+    );
+
+    // 4. …and the mirror: a measured arm inside the unaided control's map.
+    write_map(
+        "control-blind-map.json",
+        serde_json::json!({"aaaaaa": entry("none"), "bbbbbb": entry("A-prime")}),
+    );
+    let wrong = complaints(VerdictBundle::Control);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the wrong-arm complaint: {wrong:?}"
+    );
+    assert!(
+        wrong[0].contains("bbbbbb") && wrong[0].contains("APrime"),
+        "{wrong:?}"
+    );
+
+    // 5. An arm outside `plan.md` §1.1's vocabulary fails at deserialization, so a
+    //    typo cannot become a fifth silent arm.
+    write_map(
+        "control-blind-map.json",
+        serde_json::json!({"aaaaaa": entry("A-Prime"), "bbbbbb": entry("none")}),
+    );
+    let wrong = complaints(VerdictBundle::Control);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the schema complaint: {wrong:?}"
+    );
+    assert!(wrong[0].contains("blind-map schema"), "{wrong:?}");
+
+    // 6. An extra key fails the same way — `deny_unknown_fields` is load-bearing.
+    write_map(
+        "control-blind-map.json",
+        serde_json::json!({"aaaaaa": {"arm": "none", "scenario": "tdd-2", "sample": 1, "note": "x"}}),
+    );
+    let wrong = complaints(VerdictBundle::Control);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the schema complaint: {wrong:?}"
+    );
+    assert!(wrong[0].contains("blind-map schema"), "{wrong:?}");
+
+    // 7. No map at all beside a verdict file that exists.
+    fs::remove_file(dir.join("control-blind-map.json")).expect("remove map");
+    fs::write(dir.join("control-scores.json"), "[]").expect("write scores");
+    let wrong = complaints(VerdictBundle::Control);
+    assert_eq!(
+        wrong.len(),
+        1,
+        "expected exactly the missing-map complaint: {wrong:?}"
+    );
+    assert!(
+        wrong[0].contains("control-blind-map.json") && wrong[0].contains("attributable"),
+        "{wrong:?}"
     );
 }
