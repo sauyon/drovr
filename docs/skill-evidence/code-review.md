@@ -160,8 +160,75 @@ what tempted them — not rationalizations.** Both runs independently used the w
 
 ## Counter-text written against the baseline
 
-**Not yet written.** Task 13 owns this. See the null above before writing any: there is no
-observed rationalization to counter for this skill.
+Written by Task 13 as the §6 rewrite of `skills/code-review/SKILL.md` (arm B snapshot:
+`arms/B/code-review.md`). **Provenance per surface**, so a later reader can tell authored text
+from sourced text without re-deriving it.
+
+### The rationalization table's two columns have different provenances
+
+The *Verbatim rationalizations* section above is a **null**: both RED runs chose the keyed
+option and neither offered an excuse. So there is no baseline rationalization to quote in the
+**thought** column, and inventing one would be a fabricated measurement (`spec.md` §2.1
+exception 1). The table is built the way Task 12 built its own under the same null:
+
+- **The thought column** is the scenario's own pressure text
+  (`skills/writing-skills/scenarios/code-review-1.md`), reduced to the first-person form an
+  agent would think it in. Row 1 is scenario lines 25–28; row 2 is line 20 (*"just send it,
+  I'll skim it live on the call with them."*); row 3 is forced-choice option C; row 8 is
+  lines 22–23 and 30. Rows 4–6 are §6's three named loophole closures, which are spec text,
+  not observations. Row 7 (*"the reviewer came back with no findings"*) is from **this run's
+  own operational history**, not from the probes — see *Sourced from this run, not from RED*.
+- **The instruction column** is the RED runs' own reasoning, quoted or compressed from
+  *Temptations named and rejected* above. Row 1 compresses `42a94a`'s *"it conflates two
+  different kinds of reading: the client's read is for fit and understanding, the review's is
+  for correctness. Running one doesn't make the other redundant"* together with `d7006e`'s
+  *"three people reading 320 lines aloud … catches prose clarity and obvious gaps"*. Row 2 is
+  `42a94a`'s *"it reads like a scheduling reflex, not a sign-off"* plus `d7006e`'s *"the
+  account lead owns the relationship, not the technical correctness"*. Row 3 is `42a94a` on
+  option C: *"it ships the same unreviewed content and the same risk, just with a disclaimer
+  that doesn't change what the client does with it once they've read it … and moved toward
+  signature."* Rows 4–8 are authored.
+
+**These are compliant runs naming what tempted them, not rationalizations**, and the shipped
+skill does not claim otherwise. The null itself is **not** mentioned in `SKILL.md`: a note
+saying the baseline produced no rationalization hands a pressured agent its exit (Task 10
+decision 4).
+
+### Sourced from this run, not from RED
+
+Three of the strongest bars answer failures this pipeline actually produced over ~40 panel
+runs, not anything the probes did: reviewers whose verdict never arrived, a panel that
+reviewed an **empty diff** and returned clean from all four angles, and self-run panels
+passing work a driver-run panel then failed. They are the origin of the `clean` requirements
+row, red flag 4, procedure step 4, and rationalization row 7. **Recorded as operational
+history, which is weaker evidence than a transcript**: it is the orchestrator's recollection
+of this session, with no run ids attached.
+
+### The worked example is CONDENSED, and the reviewer output is CONSTRUCTED
+
+The ❌ and the ✅ are built from the dev scenario — the 320-line spec, the 17:00 call, the
+19 minutes, the $45,000 sign-off, the lead's *"just send it"* — and the ✅'s reasoning
+compresses the two RED runs' own arguments (above). **The fenced panel output is authored.**
+No RED run produced reviewer output: the probes were asked for a forced choice, not for a
+review, so there is no transcript to take findings from. The two `IMPORTANT` findings and the
+`nit` are invented to be typical of the artifact the scenario describes, and the preamble in
+`SKILL.md` says so in the shipped text (*"Reviewer output below is illustrative, not a
+transcript"*) rather than only here. This is Task 12's problem in the same shape: its gate
+found a ✅ that showed only a *plan* to verify, under an Iron Law forbidding exactly that. The
+✅ here therefore shows the panel **dispatched**, its findings **quoted**, both Importants
+**fixed**, and the nit **recorded as deferred** — the four things this skill's Iron Law asks
+for — rather than an intention to dispatch.
+
+### Structural changes to arm A′, named
+
+Nothing in arm A′ was deleted. `## How to run it` became procedure step 2 plus the
+FOREGROUND no-exceptions bullet; `## Check, in order` became step 2's angle list;
+`## Resolving findings` became steps 5–6 and the `resolved`/`deferred` requirements rows;
+`## Automatic panel` was demoted from a section to a clause in step 2 plus the exit-code rule
+in step 3 (**"only 0 is clean"** — arm A listed the codes without saying which ones are not a
+pass). The `drovr phase done` sentence is kept in A′'s demoted conditional form
+(`no_phase_scoped_description_literals` enforces the phrasing). `description:` is untouched:
+§3-frozen, and it is the one thing arm A′ isolates.
 
 ## Scored results
 

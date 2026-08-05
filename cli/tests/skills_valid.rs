@@ -3823,13 +3823,7 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("tdd", SiteState::Covered),
     ("systematic-debugging", SiteState::Covered),
     ("verification-before-completion", SiteState::Covered),
-    (
-        "code-review",
-        SiteState::Deferred {
-            task: "Task 13",
-            why: "§6 section 6 — lands inside the fix-4 rewrite",
-        },
-    ),
+    ("code-review", SiteState::Covered),
     (
         "using-drovr",
         SiteState::Deferred {
@@ -4422,74 +4416,123 @@ enum ConditionalSection {
     /// §6 section 6b — the cycle as a fenced `dot` graph.
     CycleFlowchart,
     /// §6 section 7 — claim → required evidence → not sufficient — carrying the
-    /// wording this skill gives each of §6's five rows.
+    /// rows this skill states and the wording it gives each one.
     ///
     /// **The claims ride here for the same reason [`Armor::procedure_steps`]
     /// records section 6's arity, and the omission had the same shape.** Section
     /// 6b is self-describing: a fenced `dot` block either is there or is not, so
     /// `CycleFlowchart` needs no payload. Section 7 is not — a heading-only check
     /// confirms the table exists while saying nothing about whether it still
-    /// covers §6's rows. A row could be dropped, reordered or reworded and the
+    /// covers this skill's rows. A row could be dropped, reordered or reworded and the
     /// suite would stay green — the vacuous-pass class this run has hit
     /// repeatedly, reached by *modelling* one conditional section as a marker
     /// because its sibling could be one.
     RequirementsTable { claims: RequirementClaims },
 }
 
-/// The wording a section-7 skill gives each of §6's five mandated rows.
+/// The rows a section-7 skill's requirements table states, and the wording it
+/// gives each one — one variant per skill §6 marks CONDITIONAL for section 7.
 ///
-/// **Five named fields, not a slice, because §6's five are a CLOSED set.** §6
-/// says the requirements table "covers tests / build / linter / bug-fixed /
-/// subagent-reported-success" for both skills it marks CONDITIONAL for — so
-/// which rows exist is the spec's decision and only their wording is the
-/// author's. Under `&[&str]` a skill could declare three internally consistent
-/// claims and pass every check while omitting `subagent-reported-success`, the
-/// row this run has the most reason to keep. Here that is a **compile error**:
-/// there is nowhere to put four claims.
+/// **Named fields, not a slice, because each skill's row set is CLOSED.** Under
+/// `&[&str]` a skill could declare three internally consistent claims, pass
+/// every check, and never mention the row this run has the most reason to keep.
+/// Here that is a **compile error**: there is nowhere to put four claims.
 ///
 /// It also removes an invariant that used to live in a neighbouring test. A
 /// slice could be empty, which would have made [`check_requirements_table`]
 /// compare `[] == []` and pass on a table with no rows — non-vacuity guaranteed
 /// by `armor_table_declares_well_formed_strings` happening to exist, with no
-/// link back from the function that depended on it. **A struct with five fields
-/// cannot be empty**, so the guarantee is now carried by the type rather than by
-/// a second test's continued existence.
+/// link back from the function that depended on it. **Five named fields cannot
+/// be empty**, so the guarantee is carried by the type rather than by a second
+/// test's continued existence.
 ///
-/// Named fields rather than `[&'static str; 5]` for the last mile: the array
-/// binds each claim to §6's rows by position, and a positional binding is one an
-/// edit can silently permute. [`RequirementClaims::in_order`] fixes §6's order
-/// in exactly one place.
+/// **Why two variants rather than one shared struct.** The first version of this
+/// type had one struct — `tests` / `build` / `linter` / `bug_fixed` /
+/// `subagent_reported_success` — and a doc comment saying §6 "covers" those five
+/// "for both skills it marks CONDITIONAL for". §6 does not say that. Its
+/// section-7 line reads *claim → required evidence → not sufficient · ONLY:
+/// verification-before-completion, code-review*, and the five row names appear
+/// exactly once in §6, inside `verification-before-completion`'s own per-skill
+/// bullet. `code-review`'s bullet names an Iron Law, three loophole closures and
+/// the FOREGROUND promotion, and no rows at all. So the row set is **the spec's
+/// decision for one skill and the author's for the other**, and a single struct
+/// asserted a §6 fact that §6 does not state — which would have forced
+/// `code-review`'s table to set bars for the linter and the build, subjects that
+/// skill has nothing to say about.
+///
+/// What the split does **not** relax: both variants are five named fields, so
+/// neither skill can drop, omit or silently permute a row, and
+/// [`RequirementClaims::rows`] is the one place either order is written down.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-struct RequirementClaims {
-    tests: &'static str,
-    build: &'static str,
-    linter: &'static str,
-    bug_fixed: &'static str,
-    subagent_reported_success: &'static str,
+enum RequirementClaims {
+    /// §6's five rows for `verification-before-completion`, in §6's order —
+    /// quoted from its per-skill bullet, which is the only place they are named.
+    Verification {
+        tests: &'static str,
+        build: &'static str,
+        linter: &'static str,
+        bug_fixed: &'static str,
+        subagent_reported_success: &'static str,
+    },
+    /// `code-review`'s five rows, in the order its table states them. §6 fixes
+    /// no row set here, so **these five are Task 13's reading of §6 section 7
+    /// for this skill**, recorded as a type so that a later edit dropping one is
+    /// a compile error rather than a quiet narrowing of what the skill guards.
+    /// They track the four claims the Iron Law composes — reviewed, clean,
+    /// resolved, deferred — plus the completion claim those four gate.
+    Review {
+        reviewed: &'static str,
+        clean: &'static str,
+        resolved: &'static str,
+        deferred: &'static str,
+        done: &'static str,
+    },
 }
 
 impl RequirementClaims {
-    /// §6's names for the five rows, in §6's order. Used to name the offending
-    /// row in a diagnostic — an author reading "row 5 differs" has to count.
-    const KINDS: [&'static str; 5] = [
-        "tests",
-        "build",
-        "linter",
-        "bug-fixed",
-        "subagent-reported-success",
-    ];
+    /// Each row as (the name §6 or this skill gives it, the wording the shipped
+    /// table uses), in the order the table states them.
+    ///
+    /// **One method, not a `KINDS` constant beside an `in_order`.** Those were
+    /// two lists bound to each other by position, so a row inserted into one and
+    /// not the other would have mislabelled every diagnostic below it while
+    /// every assertion stayed green. Pairing them here makes that
+    /// unrepresentable, and leaves the order written down exactly once per
+    /// skill.
+    fn rows(&self) -> [(&'static str, &'static str); 5] {
+        match self {
+            RequirementClaims::Verification {
+                tests,
+                build,
+                linter,
+                bug_fixed,
+                subagent_reported_success,
+            } => [
+                ("tests", tests),
+                ("build", build),
+                ("linter", linter),
+                ("bug-fixed", bug_fixed),
+                ("subagent-reported-success", subagent_reported_success),
+            ],
+            RequirementClaims::Review {
+                reviewed,
+                clean,
+                resolved,
+                deferred,
+                done,
+            } => [
+                ("reviewed", reviewed),
+                ("clean", clean),
+                ("resolved", resolved),
+                ("deferred", deferred),
+                ("done", done),
+            ],
+        }
+    }
 
-    /// The declared claims in §6's order. **The order lives here and nowhere
-    /// else**, so the table, the check and the diagnostics cannot disagree
-    /// about it.
+    /// The declared claims alone, in the table's order.
     fn in_order(&self) -> [&'static str; 5] {
-        [
-            self.tests,
-            self.build,
-            self.linter,
-            self.bug_fixed,
-            self.subagent_reported_success,
-        ]
+        self.rows().map(|(_, claim)| claim)
     }
 }
 
@@ -4595,7 +4638,7 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
             announce: "Using drovr:verification-before-completion — running the checks \
                        before claiming done.",
             conditional: ConditionalSection::RequirementsTable {
-                claims: RequirementClaims {
+                claims: RequirementClaims::Verification {
                     tests: "The task's tests pass",
                     build: "It builds",
                     linter: "The linter is clean",
@@ -4608,11 +4651,26 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
     ),
     (
         "code-review",
-        ArmorState::Pending {
-            task: "Task 13",
-            why: "§6 section 7 — its rewrite carries the requirements table, and \
-                  promotes the FOREGROUND rule into the no-exceptions list",
-        },
+        ArmorState::Armored(Armor {
+            iron_law: "NO CHANGE IS DONE UNTIL A READ-ONLY REVIEWER HAS SEEN IT AND \
+                       EVERY CRITICAL AND IMPORTANT FINDING IS RESOLVED OR RECORDED \
+                       AS DEFERRED.",
+            announce: "Using drovr:code-review — dispatching read-only reviewers \
+                       before calling this done.",
+            conditional: ConditionalSection::RequirementsTable {
+                // §6 names no rows for this skill (see `RequirementClaims`), so
+                // these five are the four claims the Iron Law composes plus the
+                // completion claim they gate.
+                claims: RequirementClaims::Review {
+                    reviewed: "This change has been reviewed",
+                    clean: "The reviewer found nothing",
+                    resolved: "Every Critical and Important finding is resolved",
+                    deferred: "That finding does not apply here",
+                    done: "This change is done",
+                },
+            },
+            procedure_steps: 6,
+        }),
     ),
     (
         "using-drovr",
@@ -4999,7 +5057,7 @@ fn check_requirements_table(
     // The precondition this function's own comparison rests on. A blank claim
     // matches a blank leading cell, so a hollow row would satisfy a hollow
     // declaration — the comparison would run and mean nothing.
-    for (kind, claim) in RequirementClaims::KINDS.iter().zip(claims.in_order()) {
+    for (kind, claim) in claims.rows() {
         if claim_text(claim).is_empty() {
             wrong.push(format!(
                 "{}: §6 section 7's `{kind}` claim is declared blank, so the row \
@@ -5109,17 +5167,18 @@ fn check_requirements_table(
         .map(|claim| claim_text(claim))
         .collect();
     if found != expected {
-        // Name the first row that differs. §6's five rows have names, and
+        // Name the first row that differs. The five rows have names, and
         // "row 5" makes an author count table rows to find out which.
+        let kinds = claims.rows();
         let at_kind = expected
             .iter()
             .zip(found.iter().chain(std::iter::repeat(&String::new())))
             .position(|(want, got)| want != got)
-            .and_then(|i| RequirementClaims::KINDS.get(i))
+            .and_then(|i| kinds.get(i).map(|(kind, _)| kind))
             .unwrap_or(&"(row count)");
         wrong.push(format!(
             "{}: §6 section 7's table states the claims {found:?}, but this \
-             skill's Armor declares {expected:?} — first difference at §6's \
+             skill's Armor declares {expected:?} — first difference at the \
              `{at_kind}` row. Change the table and the declaration in the same \
              edit: a row dropped, reordered or reworded changes which claims the \
              skill sets a bar for, and nothing else here would notice.",
@@ -5280,6 +5339,40 @@ fn check_procedure(
         )),
         Some(_) => {}
     }
+}
+
+/// [`ArmorState::Pending`] still means what its doc comment says, now that no
+/// skill is in that state.
+///
+/// **Written because Task 13 armored the last `Pending` skill**, which made the
+/// variant unconstructed anywhere in the file — a `dead_code` warning, and worse
+/// than a warning: `Pending`'s whole contract is that it asserts the armor is
+/// *absent*, and with no entry in that state, nothing exercised or documented
+/// that contract any more. §7.3 lets Task 22 move a skill back to `Pending` when
+/// its arm B fails, so the variant is live machinery in a state nobody is
+/// currently using, not leftovers. This pins the two things that task will rely
+/// on: the variant is constructible with a named task and a reason, and it
+/// describes itself as a deferral rather than as a decision.
+#[test]
+fn pending_still_describes_a_deferral() {
+    let pending = ArmorState::Pending {
+        task: "Task 22",
+        why: "arm B failed for this skill and it reverts to A′",
+    };
+    let described = pending.describe();
+    assert!(
+        described.contains("Pending on Task 22")
+            && described.contains("arm B failed for this skill and it reverts to A′"),
+        "a Pending entry must name both its task and its reason in diagnostics, \
+         so a reverted skill reads as a decision and not as a gap: {described}"
+    );
+    assert!(
+        !matches!(pending, ArmorState::Armored(_)),
+        "Pending asserts the armor is ABSENT — `armored_skills_have_required_sections` \
+         takes the non-Armored branch for it and complains if the file carries \
+         {}",
+        ARMOR_MARKER.describe(),
+    );
 }
 
 /// The declared strings are well-formed — a property of [`SKILL_ARMOR_STATES`]
@@ -5485,7 +5578,7 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
     // case is held to `any` rather than `all`.
     let other_half = Armor {
         conditional: ConditionalSection::RequirementsTable {
-            claims: RequirementClaims {
+            claims: RequirementClaims::Verification {
                 tests: "It works",
                 build: "It builds",
                 linter: "It is clean",
@@ -5544,7 +5637,7 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
         iron_law: "NEVER SHIP WITHOUT A RED TEST.",
         announce: "Using drovr:example — doing the thing before the other thing.",
         conditional: ConditionalSection::RequirementsTable {
-            claims: RequirementClaims {
+            claims: RequirementClaims::Verification {
                 tests: "The tests pass",
                 build: "It builds",
                 linter: "The linter is clean",
@@ -5675,12 +5768,27 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
     // `RequirementClaims` there is nowhere to put fewer than five.
     let blank_declared = Armor {
         conditional: ConditionalSection::RequirementsTable {
-            claims: RequirementClaims {
-                linter: "",
-                ..match armor.conditional {
-                    ConditionalSection::RequirementsTable { claims } => claims,
-                    ConditionalSection::CycleFlowchart => unreachable!("declared above"),
-                }
+            // Rebuilt from `armor`'s own declaration rather than re-typed, so
+            // this case cannot start testing a different table than the one the
+            // control above passed on.
+            claims: match armor.conditional {
+                ConditionalSection::RequirementsTable {
+                    claims:
+                        RequirementClaims::Verification {
+                            tests,
+                            build,
+                            bug_fixed,
+                            subagent_reported_success,
+                            ..
+                        },
+                } => RequirementClaims::Verification {
+                    tests,
+                    build,
+                    linter: "",
+                    bug_fixed,
+                    subagent_reported_success,
+                },
+                _ => unreachable!("declared above"),
             },
         },
         ..armor
@@ -5715,6 +5823,50 @@ fn armor_check_refuses_a_requirements_table_that_says_nothing() {
             .any(|c| c.contains("empty or missing cell")),
         "a row with an empty required-evidence cell must be reported: {:?}",
         complaints(&hollow)
+    );
+
+    // The OTHER variant, exercised here rather than only against the shipped
+    // `code-review` file: `RequirementClaims::Review` states a different row set,
+    // and every case above must hold for it identically. Without this, the
+    // variant that ships with no §6-mandated rows is the one nothing pins.
+    let review = Armor {
+        conditional: ConditionalSection::RequirementsTable {
+            claims: RequirementClaims::Review {
+                reviewed: "It was reviewed",
+                clean: "The reviewer found nothing",
+                resolved: "The findings are resolved",
+                deferred: "That one does not apply",
+                done: "It is done",
+            },
+        },
+        ..armor
+    };
+    let review_complaints = |body: &str| -> Vec<String> {
+        let mut wrong = Vec::new();
+        check_armor(path, body, &FoldedBody::new(body), &review, 0, &mut wrong);
+        wrong
+    };
+    let review_good = synthetic_body(&review).join("\n");
+    assert!(
+        review_complaints(&review_good).is_empty(),
+        "control: a `Review` page built from required_sections must pass: {:?}",
+        review_complaints(&review_good)
+    );
+    // The two variants are not interchangeable: each table states its own rows.
+    assert!(
+        !review_complaints(&good).is_empty(),
+        "a `Verification` table read against a `Review` declaration must be \
+         reported — otherwise the row set is decorative"
+    );
+    // And the diagnostic names THIS variant's row name, not §6's five.
+    let reworded_review =
+        review_good.replace("*\"That one does not apply\"*", "*\"Not applicable\"*");
+    assert_ne!(reworded_review, review_good, "the fixture did not change");
+    let named = review_complaints(&reworded_review);
+    assert!(
+        named.iter().any(|c| c.contains("`deferred` row")),
+        "the first differing row must be named with this variant's own row name: \
+         {named:?}"
     );
 }
 
