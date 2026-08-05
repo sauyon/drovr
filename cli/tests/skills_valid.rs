@@ -7428,3 +7428,254 @@ fn blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts() {
         "{wrong:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The run ledger's arithmetic
+// ---------------------------------------------------------------------------
+
+/// spec §7.3's hard ceiling on probe runs across the whole run.
+const RUN_CEILING: u32 = 122;
+
+/// One data row of `run-ledger.md`'s budget table.
+struct LedgerRow {
+    task: String,
+    stage: String,
+    runs: u32,
+    cumulative: u32,
+}
+
+/// A header or data cell, reduced to something comparable: backticks and bold
+/// markers dropped, whitespace collapsed, case folded.
+///
+/// The same normalisation `arms/MANIFEST.md`'s parser applies, and for the same
+/// reason — a column may be renamed by a formatting pass without meaning to be.
+fn ledger_cell(cell: &str) -> String {
+    cell.replace(['`', '*'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Split one markdown table line into its cells.
+fn ledger_cells(line: &str) -> Vec<&str> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect()
+}
+
+/// The ledger's four load-bearing columns, resolved **by header text and never
+/// by position** — the columns may be reordered, but not renamed or dropped.
+fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
+    const REQUIRED: [&str; 4] = ["task", "stage (§7.3 row)", "runs this stage", "cumulative"];
+
+    let mut lines = text.lines().peekable();
+    let mut index: Option<Vec<usize>> = None;
+    let mut width = 0usize;
+    for line in lines.by_ref() {
+        if !line.trim_start().starts_with('|') {
+            continue;
+        }
+        let cells: Vec<String> = ledger_cells(line).iter().map(|c| ledger_cell(c)).collect();
+        let resolved: Option<Vec<usize>> = REQUIRED
+            .iter()
+            .map(|want| cells.iter().position(|c| c == &ledger_cell(want)))
+            .collect();
+        if let Some(resolved) = resolved {
+            width = cells.len();
+            index = Some(resolved);
+            break;
+        }
+    }
+    let index = index.ok_or_else(|| {
+        format!(
+            "no budget table found: no row carries all of {REQUIRED:?}. The ledger is the \
+             only mechanism tracking spec §7.3's {RUN_CEILING}-run ceiling, so a table this \
+             parser cannot find is a ceiling nothing tracks."
+        )
+    })?;
+
+    // The separator row, then data rows until the table ends.
+    if let Some(next) = lines.peek() {
+        if next.trim_start().starts_with('|')
+            && ledger_cells(next)
+                .iter()
+                .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            lines.next();
+        }
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        let cells = ledger_cells(line);
+        if cells.len() != width {
+            return Err(format!(
+                "ledger row {line:?} has {} cells, not the header's {width} — a short row \
+                 would read as a stage that was never spent",
+                cells.len()
+            ));
+        }
+        let num = |i: usize| -> Result<u32, String> {
+            let raw = ledger_cell(cells[index[i]]);
+            raw.parse::<u32>().map_err(|_| {
+                format!(
+                    "ledger row {line:?}: {:?} is not a run count",
+                    cells[index[i]]
+                )
+            })
+        };
+        rows.push(LedgerRow {
+            task: cells[index[0]].to_string(),
+            stage: cells[index[1]].to_string(),
+            runs: num(2)?,
+            cumulative: num(3)?,
+        });
+    }
+    Ok(rows)
+}
+
+/// The invariant the ledger states about itself and nothing checked:
+/// `cumulative` is the running total of `runs this stage`, and no row crosses
+/// spec §7.3's global ceiling.
+///
+/// Returns complaints rather than asserting, following [`check_blind_map`]: a
+/// check that panics can only ever be observed to *pass* on a legal corpus, and
+/// this run has now found nine guards that could not fire. See
+/// `ledger_check_refuses_a_table_that_does_not_add_up`.
+///
+/// **Why it is worth checking at all.** Tasks 16–21 each read this table's
+/// cumulative before starting and halt with a null rather than cross the
+/// ceiling. That decision is made from a hand-maintained markdown column: one
+/// mis-added row and a phase either halts on a ceiling it has not reached or
+/// spends past one it has.
+fn check_ledger(text: &str) -> Vec<String> {
+    let rows = match parse_ledger(text) {
+        Ok(rows) => rows,
+        Err(e) => return vec![e],
+    };
+    let mut wrong = Vec::new();
+    if rows.is_empty() {
+        wrong.push(
+            "the budget table has a header and no data rows — a ledger recording no runs \
+             passes a presence check while tracking nothing"
+                .to_string(),
+        );
+        return wrong;
+    }
+    let mut running = 0u32;
+    for row in &rows {
+        running += row.runs;
+        if row.cumulative != running {
+            wrong.push(format!(
+                "task {} / {:?}: cumulative is {} but the running total of `runs this stage` \
+                 is {running}",
+                row.task, row.stage, row.cumulative,
+            ));
+        }
+    }
+    let last = rows[rows.len() - 1].cumulative;
+    if last > RUN_CEILING {
+        wrong.push(format!(
+            "the ledger's final cumulative is {last}, over spec §7.3's {RUN_CEILING}-run \
+             ceiling — §7.3's rule is to halt and record a null, not to extend"
+        ));
+    }
+    wrong
+}
+
+/// `run-ledger.md` adds up, and stays inside spec §7.3's ceiling.
+#[test]
+fn run_ledger_cumulative_is_a_running_total() {
+    let path = evidence_dir().join(EVIDENCE_LEDGER);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let wrong = check_ledger(&text);
+    assert!(wrong.is_empty(), "{}: {}", path.display(), wrong.join("\n"));
+}
+
+/// [`check_ledger`] rejects each way the table can stop tracking the ceiling.
+///
+/// The real ledger is legal, so on it the check above can only be observed to
+/// pass — the shape of every vacuous guard this run has found.
+#[test]
+fn ledger_check_refuses_a_table_that_does_not_add_up() {
+    let header = "| task | stage (§7.3 row) | runs this stage | cumulative | stage ceiling | ceiling hit? |\n|---|---|---|---|---|---|\n";
+
+    // Sound: a running total that closes, and prose after the table is not a row.
+    let ok = format!(
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n| 16 | Arm A | 4 | 14 | 20 | no |\n\nSome prose.\n"
+    );
+    assert!(check_ledger(&ok).is_empty(), "{:?}", check_ledger(&ok));
+
+    // The arithmetic does not close.
+    let drifted =
+        format!("{header}| 6 | RED | 10 | 10 | 10 | no |\n| 16 | Arm A | 4 | 13 | 20 | no |\n");
+    assert!(
+        check_ledger(&drifted)
+            .iter()
+            .any(|c| c.contains("cumulative is 13") && c.contains("14")),
+        "{:?}",
+        check_ledger(&drifted)
+    );
+
+    // The ceiling is crossed.
+    let over = format!("{header}| 6 | RED | 200 | 200 | 10 | no |\n");
+    assert!(
+        check_ledger(&over).iter().any(|c| c.contains("122")),
+        "{:?}",
+        check_ledger(&over)
+    );
+
+    // A header with no data rows tracks nothing.
+    assert!(
+        check_ledger(header)
+            .iter()
+            .any(|c| c.contains("no data rows")),
+        "{:?}",
+        check_ledger(header)
+    );
+
+    // No table at all — the failure this must not pass silently.
+    assert!(
+        check_ledger("# Run ledger\n\nnothing here.\n")
+            .iter()
+            .any(|c| c.contains("no budget table found")),
+        "{:?}",
+        check_ledger("# Run ledger\n\nnothing here.\n")
+    );
+
+    // A renamed column is a parse error, not a silently rebound field.
+    let renamed = "| task | stage (§7.3 row) | runs | cumulative | stage ceiling | ceiling hit? |\n|---|---|---|---|---|---|\n| 6 | RED | 10 | 10 | 10 | no |\n";
+    assert!(
+        check_ledger(renamed)
+            .iter()
+            .any(|c| c.contains("no budget table found")),
+        "{:?}",
+        check_ledger(renamed)
+    );
+
+    // Columns may be REORDERED, because they are resolved by header text.
+    let reordered = "| cumulative | task | runs this stage | stage (§7.3 row) |\n|---|---|---|---|\n| 10 | 6 | 10 | RED |\n| 14 | 16 | 4 | Arm A |\n";
+    assert!(
+        check_ledger(reordered).is_empty(),
+        "{:?}",
+        check_ledger(reordered)
+    );
+
+    // A non-numeric run count is refused rather than read as zero.
+    let fuzzy = format!("{header}| 6 | RED | ten | 10 | 10 | no |\n");
+    assert!(
+        check_ledger(&fuzzy)
+            .iter()
+            .any(|c| c.contains("is not a run count")),
+        "{:?}",
+        check_ledger(&fuzzy)
+    );
+}
