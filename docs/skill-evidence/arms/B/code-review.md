@@ -14,8 +14,8 @@ somebody who did not write the change has said what is wrong with it — and tha
 cannot be you. You read the change you meant to make, not the one on disk.
 
 **Write for the agent who inherits this: the next phase agent is you, with your
-context gone.** A finding you settled in your head is one they meet again as a
-bug, with nothing saying anyone saw it.
+context gone.** A finding you settled in your head is one they meet as a bug,
+with nothing saying anyone saw it.
 
 ## The Iron Law
 
@@ -37,12 +37,12 @@ No exceptions:
   verdict in the turn you dispatched it.
 - **Do not judge a change too small to review.** A one-line edit to a condition
   is the size this skill exists for. Dispatch a reviewer over it.
-- **Do not count your own read as the review.** Re-reading your own diff tells
-  you it matches what you intended — the one thing never in doubt. Dispatch
-  someone who does not know it.
-- **Do not leave it for the pipeline's review phase.** That phase reads what
-  you hand it, after later work is built on it. Dispatch here, while the change
-  is one commit wide.
+- **Do not count your own read as the review.** Re-reading your diff tells you
+  it matches what you intended — the one thing never in doubt. Dispatch someone
+  who does not know it.
+- **Do not leave it for the pipeline's review phase.** That phase reads what you
+  hand it, after later work is built on it. Dispatch here, while the change is
+  one commit wide.
 - **Do not close a finding by disagreeing with it.** When you will not fix one,
   quote it and write the reason in the report or handoff. An unrecorded
   decision reads downstream like an unread finding.
@@ -73,33 +73,34 @@ Re-create those items for each change you review, not once for the session.
 1. **Write down the change and the exact range to review.** Name the files and
    the range — in a drovr run, `<base>..HEAD` with `<base>` from
    `<task>-base.sha`, recorded before your first edit. Get it wrong and the
-   reviewer reports clean on a range holding nothing.
+   reviewer reports clean on nothing.
 2. **Dispatch read-only reviewers, blocking, one per angle.** Agent tool,
    `subagent_type: general-purpose`, model `sonnet`. Tell each to review as a
    skeptic, not the author; to say whether the tests exercise the behaviour, not
    just that they pass; to rate every finding **Critical, Important or nit** —
    what the Iron Law gates on — and say so when it found none; and to write them
-   to a path you name, so step 3 has something to open. The lenses to cover,
-   however they get dispatched:
-   - **Spec compliance** — does it do what was agreed, no more, no less?
+   to a path you name, so step 3 has something to open. The lenses to cover:
+   - **Spec compliance** — what was agreed, no more, no less?
    - **Correctness** — real bugs, unhandled cases, broken invariants.
-   - **Verification** — do the claimed tests exist, and would they fail if the
-     behaviour regressed?
+   - **Verification** — do the claimed tests exist, and would they fail on a
+     regression?
    - **Quality** — reuse, simplification, consistency with the code around it.
 
    In a drovr run, `drovr code-review run <run> <task>` dispatches one reviewer
-   per **configured** angle — `config.angles`, not the list above; it defaults to
-   correctness, security, error-handling, type-design — each writing
+   per **configured** angle — `config.angles`, which defaults to correctness,
+   security, error-handling, type-design, not the list above — each writing
    `<task>-review-<angle>.json`, merged into `<task>-review.json`. **Read the
    config, not this page**, and cover any lens it omits yourself.
 3. **Wait for every reviewer, then read what each wrote.** Open the findings
    file by path. Exit codes: 0 clean, 3 findings, 2 timeout, 1 error — **only 0
    is clean**, and a reviewer that returned no verdict is none of the four.
-   Re-dispatch it rather than report its silence.
-4. **Check what the reviewer actually read.** The range it names must be the
-   whole of `<base>..HEAD` — every file you touched, not a subset you picked. A
-   clean verdict on an empty range, a subset, or a stale tree is about a change
-   nobody read.
+   Re-dispatch rather than report its silence.
+4. **Check what the reviewer actually read — range *and* working tree.** The
+   range must be the whole of `<base>..HEAD`, every file you touched, not a
+   subset you picked; **and uncommitted work is in scope, not exempt** — drovr's
+   panel reviews the diff *plus the current working tree*. A verdict covers what
+   is on disk only if the reviewer saw both. Clean on an empty range, a subset,
+   or a tree with unreviewed edits in it is about a change nobody read.
 5. **Resolve every Critical and Important finding, or record the deferral.**
    Per finding: quote it, then name the edit answering it by file or write down
    why you are not making it.
@@ -117,7 +118,7 @@ instead.
 | The claim | Required evidence | NOT sufficient |
 |---|---|---|
 | *"This change has been reviewed"* | A read-only reviewer dispatched over this change in the foreground, returned in this turn, and the range you handed it, written down | Your own re-read · a reviewer launched and not waited for · a review of the tree before your last edit |
-| *"The reviewer found nothing"* | The findings file it wrote, opened by path and read by you — or the review re-run by you when it wrote none — **and** the range it read shown to be the whole of `<base>..HEAD` | Its summary, however much it pastes into itself · exit 1 or 2 · a subset of your files · a range you did not check · a verdict that never arrived |
+| *"The reviewer found nothing"* | The findings file it wrote, opened by path and read by you — or the review re-run by you when it wrote none — **and** what it read shown to be the whole of `<base>..HEAD` **plus your working tree** | Its summary, however much output it pastes · exit 1 or 2 · a subset of your files · uncommitted edits nobody looked at · a verdict that never arrived |
 | *"Every Critical and Important finding is resolved"* | Each quoted, the edit answering it named by file, and step 6's checks re-run after the last edit | A count · agreeing with one in prose · fixing the Criticals and leaving the Importants |
 | *"That finding does not apply here"* | The finding quoted, and the reason written where the next agent reads it | Deciding it in your head · *"out of scope"* with no scope named · silence, which downstream reads as resolved |
 
@@ -131,12 +132,12 @@ the line.
   · *"The pipeline's review phase will catch it."* — each opens a row in
   *Rationalizations*, verbatim. Go do the thing in its row.
 - *You are about to launch a reviewer in the background and keep working.* →
-  Dispatch it blocking. No version of that ends with you reading its verdict in
+  Dispatch it blocking. No version of that ends with you reading its verdict
   this turn.
 - *A reviewer has not come back and you are writing the report.* → Block on it.
   Silence is not a pass; a parked reviewer is not a finished one.
-- *The panel came back clean in seconds on a large diff.* → Check the range it
-  read. Clean and empty look identical from here.
+- *The panel came back clean in seconds on a large diff.* → Check what it read.
+  Clean and empty look identical from here.
 - **Anything that treats the change as finished** — any wording at all, and
   also committing, opening a PR, or starting the next task — while a reviewer is
   unread, unreturned, or holding an unresolved Critical or Important finding. If
@@ -154,12 +155,12 @@ The right column is an instruction, not an argument. Do the thing in it.
 | *"It is a two-line change."* | Dispatch a reviewer over the two lines. Size is not a risk measure, and the risk you estimate in order to skip the review is what it would have told you. |
 | *"I already reviewed it myself."* | Dispatch one that did not write it. Your read confirms the diff matches your intent; the defects worth catching are in what you did not think of. |
 | *"The pipeline's review phase will catch it."* | Dispatch here, now. That phase reads what you hand it, after later tasks built on it; a finding costs more at every step it survives. |
-| *"The reviewer came back with no findings."* | Open the file it named, and check the range it read was your whole change. An empty range comes back clean from every angle at once. |
+| *"The reviewer came back with no findings."* | Open the file it named, and check it read your whole change, working tree included. An empty range comes back clean from every angle at once. |
 
 ## Worked example
 
 Condensed from a real decision: a 320-line spec, a client call in 19 minutes
-where three people will read it aloud, a $45,000 sign-off, the lead writing
+where three people read it aloud, a $45,000 sign-off, the lead writing
 *"just send it."* Reviewer output is illustrative, not a transcript.
 
 ❌ **What this looks like when it fails:**
@@ -188,7 +189,7 @@ exit 3
 > Both Importants fixed in `spec/warehouse-sync.md` — retry window 30s → 60s, §6
 > reconciliation now spans the boundary day — from `spec-review.json`, not the
 > summary line. A spec has no suite, so step 6 here is both edited
-> sections re-read against §3.1, said rather than assumed. The nit is deferred
+> sections re-read against §3.1, not assumed. The nit is deferred
 > and recorded here: the duplicate id is in a section the client wrote, and
 > renaming it would confuse the walkthrough. Sent 22 minutes late, call moved:
 > that window would have shipped a contract we could not meet.
