@@ -880,6 +880,239 @@ fn assert_arm_snapshots_match_manifest(arm: &str) {
     }
 }
 
+/// The arm whose rows are the voice probe's four register variants (§7.4).
+const VOICE_ARM: &str = "voice";
+
+/// The variant every other one is diffed against. It is not a [`VoiceVariant`]
+/// row because it is the left-hand side of every comparison, not a case of one.
+const VOICE_BASELINE: &str = "V0";
+
+/// One register variant of the voice probe (§7.4, plan Task 15), named with the
+/// single section its device is allowed to live in.
+///
+/// **The site is data, not something the test discovers.** A check that looked
+/// for whichever section happened to differ would pass for a variant that
+/// differed *somewhere* — which is exactly the failure this table exists to
+/// catch, because a device that leaked into a second section still leaves "one
+/// section differs" true once you go looking for it afterwards. Naming the site
+/// up front turns a leak into a named mismatch.
+struct VoiceVariant {
+    /// File stem under `arms/voice/`, and the variant's `skill` cell in
+    /// `MANIFEST.md`.
+    name: &'static str,
+    /// The one `##` heading whose body may differ from [`VOICE_BASELINE`]'s.
+    /// Every other section, and the frontmatter, must be byte-identical.
+    device_site: &'static str,
+}
+
+/// §7.4's three non-baseline variants and where each one's single device sits.
+///
+/// - `V1` adds the **unity** line to the Overview.
+/// - `V2` adds the **authority** register — `MUST`/`NEVER` prose and the
+///   absolutist "No exceptions:" framing — to the Iron Law. It does **not** add
+///   the fenced all-caps line: `V0` already carries that, per plan Task 15's
+///   ruling, so the `V0`→`V2` diff is two named devices and not §7.4's three.
+///   [`every_voice_variant_keeps_the_baselines_iron_law_line`] is what holds
+///   that ruling in place.
+/// - `V3` adds **moral** framing to the Overview.
+///
+/// `V1` and `V3` deliberately share a site: two devices in the same slot make
+/// their diffs against `V0` the same shape, so a reader comparing them is
+/// comparing registers rather than positions.
+const VOICE_VARIANTS: &[VoiceVariant] = &[
+    VoiceVariant {
+        name: "V1",
+        device_site: "Overview",
+    },
+    VoiceVariant {
+        name: "V2",
+        device_site: "The Iron Law",
+    },
+    VoiceVariant {
+        name: "V3",
+        device_site: "Overview",
+    },
+];
+
+/// One heading-delimited section of a markdown body.
+struct MdSection {
+    /// The heading text, or empty for the run of lines before the first
+    /// heading.
+    heading: String,
+    /// Everything under that heading up to the next one, verbatim.
+    body: String,
+}
+
+/// Split a body into its heading-delimited sections, in document order.
+///
+/// Built on [`headings`], so it is fence-aware: a `##` line inside a fenced
+/// block does not open a section.
+///
+/// **The text before the first heading is returned as a section too**, with an
+/// empty heading. It is usually the blank line after the frontmatter and easy to
+/// dismiss, but dropping it would let a variant grow a paragraph above its H1
+/// that no comparison ever looked at — a register device hiding in the one place
+/// the checker was not.
+fn md_sections(body: &str) -> Vec<MdSection> {
+    let lines: Vec<&str> = body.lines().collect();
+    let heads = headings(body);
+    let first = heads.first().map_or(lines.len(), |(line, _)| *line);
+
+    let mut out = vec![MdSection {
+        heading: String::new(),
+        body: lines[..first].join("\n"),
+    }];
+    for (idx, (line, text)) in heads.iter().enumerate() {
+        let end = heads.get(idx + 1).map_or(lines.len(), |(l, _)| *l);
+        out.push(MdSection {
+            heading: text.clone(),
+            body: lines[line + 1..end].join("\n"),
+        });
+    }
+    out
+}
+
+/// Read one voice variant, parsed as the skill document it is pasted into a
+/// probe run as.
+fn read_voice_variant(name: &str) -> Skill {
+    let path = arms_dir().join(VOICE_ARM).join(format!("{name}.md"));
+    let contents = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read voice variant {}: {e}", path.display()));
+    parse_skill(&contents)
+        .unwrap_or_else(|| panic!("{}: no frontmatter — a variant is a skill document, and its `description:` is part of what the probe measures", path.display()))
+}
+
+/// §7.4's separability invariant: each variant differs from `V0` in **exactly
+/// one** section, and the section set and order are identical across all four.
+///
+/// This is the whole probe. Four variants that differ in more than their one
+/// register device do not measure that device at n=6 — they measure the sum of
+/// whatever else drifted, and no amount of care in Task 21's scoring recovers
+/// the difference. The plan asks for the four diffs by hand; this is the same
+/// question asked on every `cargo test`, so a later edit to one variant cannot
+/// quietly desynchronise the set.
+///
+/// **The differing section is asserted present, not merely bounded.** A variant
+/// byte-identical to `V0` would satisfy "at most one section differs" while
+/// being a silently null arm: six runs of the baseline reported as six runs of
+/// the device.
+#[test]
+fn voice_variants_differ_from_the_baseline_in_exactly_one_section() {
+    let baseline = read_voice_variant(VOICE_BASELINE);
+    let baseline_sections = md_sections(&baseline.body);
+    let baseline_headings: Vec<&str> = baseline_sections
+        .iter()
+        .map(|s| s.heading.as_str())
+        .collect();
+
+    for variant in VOICE_VARIANTS {
+        let file = read_voice_variant(variant.name);
+        let sections = md_sections(&file.body);
+        let variant_headings: Vec<&str> = sections.iter().map(|s| s.heading.as_str()).collect();
+
+        // Structure before content: a differing section *set* is reported as
+        // itself, rather than as a pile of differing bodies that sends a reader
+        // hunting for prose changes when a whole section moved.
+        assert_eq!(
+            variant_headings, baseline_headings,
+            "voice variant `{}` has a different section set or order than `{VOICE_BASELINE}` — \
+             §7.4 requires the four variants to be identical in structure",
+            variant.name
+        );
+
+        let differing: Vec<&str> = baseline_sections
+            .iter()
+            .zip(sections.iter())
+            .filter(|(base, var)| base.body != var.body)
+            .map(|(_, var)| var.heading.as_str())
+            .collect();
+        assert_eq!(
+            differing,
+            vec![variant.device_site],
+            "voice variant `{}` must differ from `{VOICE_BASELINE}` in `{}` and nowhere else",
+            variant.name,
+            variant.device_site
+        );
+    }
+}
+
+/// The Iron Law's fenced all-caps line is byte-identical in all four variants —
+/// including `V0`.
+///
+/// **This is the trap plan Task 15 disarmed, held open.** §7.4 lists "all-caps
+/// Iron Law" among `V2`'s added devices, while §6 makes the fenced all-caps line
+/// unconditional structure; the plan ruled that the *format* is §6 structure and
+/// survives every §7.4 outcome, and that only the surrounding `MUST`/`NEVER`
+/// prose is the register device. If `V0` ever loses the fenced line, the
+/// measured baseline stops matching the text that actually ships under §7.4
+/// outcome 2 and the probe's result no longer transfers to the documents it
+/// governs — a failure that is invisible in the scores and fatal to their
+/// meaning.
+#[test]
+fn every_voice_variant_keeps_the_baselines_iron_law_line() {
+    let iron_law = |name: &str| -> String {
+        let file = read_voice_variant(name);
+        let section = md_sections(&file.body)
+            .into_iter()
+            .find(|s| s.heading == "The Iron Law")
+            .unwrap_or_else(|| panic!("voice variant `{name}` has no `## The Iron Law` section"));
+        let blocks = fenced_blocks(&section.body).unwrap_or_else(|line| {
+            panic!("voice variant `{name}`: unterminated fence in the Iron Law, body line {line}")
+        });
+        let block = blocks.first().unwrap_or_else(|| {
+            panic!(
+                "voice variant `{name}` has no fenced block in `## The Iron Law` — §6 makes the \
+                 fenced all-caps line unconditional structure, and plan Task 15 rules that it \
+                 survives every §7.4 outcome, `V0` included"
+            )
+        });
+        block.body.clone()
+    };
+
+    let baseline = iron_law(VOICE_BASELINE);
+    assert_eq!(
+        baseline,
+        baseline.to_uppercase(),
+        "`{VOICE_BASELINE}`'s Iron Law line must stay all-caps: it is §6 structure, not the \
+         register device §7.4 attributes to `V2`"
+    );
+    for variant in VOICE_VARIANTS {
+        assert_eq!(
+            iron_law(variant.name),
+            baseline,
+            "voice variant `{}` states a different Iron Law than `{VOICE_BASELINE}` — §7.4 \
+             requires the same Iron Law across all four",
+            variant.name
+        );
+    }
+}
+
+/// Every variant carries the same frontmatter as `V0`.
+///
+/// The `description:` is the trigger and is itself under test elsewhere in this
+/// run, so a variant that reworded it would be running a second experiment
+/// inside the first. The `name:` matters for a different reason: it is what the
+/// Announce sentence and the cross-refs spell, so four different names would
+/// make four different documents rather than one document in four registers.
+#[test]
+fn voice_variants_share_one_frontmatter() {
+    let baseline = read_voice_variant(VOICE_BASELINE);
+    for variant in VOICE_VARIANTS {
+        let file = read_voice_variant(variant.name);
+        assert_eq!(
+            file.name, baseline.name,
+            "voice variant `{}` renames the skill",
+            variant.name
+        );
+        assert_eq!(
+            file.description, baseline.description,
+            "voice variant `{}` rewords the `description:` — that is the §3 trigger, and varying \
+             it would run a second experiment inside the voice probe",
+            variant.name
+        );
+    }
+}
+
 /// What this repository can say about one manifest row's `<commit>:<path>`.
 ///
 /// **`Undetermined` is a separate answer from the two absences, and that is the
