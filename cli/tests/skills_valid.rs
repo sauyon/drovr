@@ -765,6 +765,28 @@ fn arm_a_prime_snapshots_match_manifest() {
     assert_arm_snapshots_match_manifest("A-prime");
 }
 
+/// Arm B is fix 3 + fix 4: the armored discipline skills and the router's
+/// per-turn gate. Filled in one skill at a time by Tasks 10–14.
+///
+/// **This test could not exist until now, and that is why it is here.**
+/// [`assert_arm_snapshots_match_manifest`] requires a row for every
+/// [`SkillName::ALL`] entry, so a partially-filled arm fails it — which is why
+/// `MANIFEST.md` reserves this test for the task that lands arm B's fifth
+/// skill. Task 14 is that task.
+///
+/// **What it closes:** until now nothing hashed `docs/skill-evidence/arms/B/`,
+/// so a byte appended to any arm B snapshot — or a live `SKILL.md` edited after
+/// its arm was frozen — passed the entire suite in silence.
+/// [`manifest_commits_contain_their_snapshots`] covered arm B's *provenance*
+/// (does history hold the recorded text) but not its *drift* (does the file on
+/// disk still hash to what the manifest says), and those failed independently
+/// once already: an arm B row matched its snapshot perfectly while naming a
+/// commit where the source path still held arm A′.
+#[test]
+fn arm_b_snapshots_match_manifest() {
+    assert_arm_snapshots_match_manifest("B");
+}
+
 /// The shared body of the per-arm tripwires above.
 ///
 /// Every arm in this run is the same shape — the five measured skills, copied

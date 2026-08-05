@@ -47,11 +47,14 @@ Further rules follow from the parser being strict for the whole file at once:
   your rewrite is still uncommitted, the cell names a commit where the source path still holds
   the *previous* arm's text. Task 10 made exactly that mistake; nothing caught it, because until
   now nothing checked.
-- **Arm `B` is filled in one skill at a time**, by Tasks 10–14, because each fix-4 rewrite is its
-  own task with its own context. Until the last of them lands, `B` has fewer than five rows. Do
-  **not** add an `arm_b_snapshots_match_manifest` test before then:
+- **Arm `B` was filled in one skill at a time**, by Tasks 10–14, because each fix-4 rewrite is its
+  own task with its own context. Until the last of them landed, `B` had fewer than five rows, and
+  an `arm_b_snapshots_match_manifest` test could not exist:
   `assert_arm_snapshots_match_manifest` requires a row for every `SkillName::ALL` entry, so a
-  partial arm fails it. The task that snapshots the fifth skill is the one that may add it.
+  partial arm fails it. **Task 14 snapshotted the fifth skill (`using-drovr`) and added that
+  test**, so arm B is now drift-checked on every run exactly like A and A′. A later arm filled
+  incrementally — `B-r<i>`, `voice` — inherits the same rule: no per-arm tripwire until its last
+  row lands.
 - **No cell may contain a literal `|`** — there is no escape handling.
 - **Every data row must have all six cells; the hash and commit cells must each be a 40-hex git
   object id.** Use the full SHA, not the short form. A malformed row for *any* arm fails the parse,
@@ -89,3 +92,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | B | systematic-debugging | `skills/systematic-debugging/SKILL.md` | `0d5fb63009789333d7d0a4849e61a7037962979e` | `21b26799e17b4f3ab8d781013ef13212eb351aeb` | 2026-08-04 |
 | B | verification-before-completion | `skills/verification-before-completion/SKILL.md` | `ae5ee2151738e37f6d0c15c2bbc01aa1e111cdd9` | `0b3ed4ba926ef60baca23b2ec3f5a098b29e2444` | 2026-08-04 |
 | B | code-review | `skills/code-review/SKILL.md` | `97ac19db7eeec054351683546288a6b1e99e2f47` | `9b236d0578b265aa15f7bd4c06bd9605b23b620a` | 2026-08-04 |
+| B | using-drovr | `skills/using-drovr/SKILL.md` | `63261398c2a166f4fea983fa068f6d3c402fa553` | `b8835c799b7f139e4ec41326cfbd603b3e28e7b2` | 2026-08-04 |
