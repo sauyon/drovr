@@ -37,12 +37,15 @@ No exceptions:
   cause is confirmed — it never waives confirming it. Establish the antecedent
   yourself, then take the permission it grants.
 - **Do not let a deadline shorten the verification.** After the fix, re-run the
-  original trigger **and** the broader suite around it. The clock does not
-  change which tests can catch what this fix disturbed. If you truly cannot run
-  them, name the ones you did not run and do not report the bug as fixed.
-- **Do not attempt fix #4.** Three fixes that did not work means your model of
-  the system is wrong, not that the fourth guess is due. Stop, say so, and
-  question the design with whoever owns it before changing another line.
+  original trigger **and** the full suite — the scope
+  `drovr:verification-before-completion` defines, not one you pick under time
+  pressure. The clock does not change which tests can catch what this fix
+  disturbed. If the full suite genuinely cannot be run here, name the exact
+  command you did not run and do not report the bug as fixed.
+- **Do not start fix #4.** Three *failed fixes* — the unit is defined in step 6 —
+  means your model of the system is wrong, not that the fourth guess is due.
+  Stop, say so, and question the design with whoever owns it before changing
+  another line.
 - **Do not substitute reasoning for a reproduction.** If you cannot trigger the
   failure on demand, that is the finding to report. Keep narrowing — smaller
   input, more logging, a read-only explorer — and stop before shipping a fix
@@ -82,12 +85,16 @@ fall back to `CHECKLIST.md` at a repo root, do not commit it.
    the observed behavior exactly — including the parts you were not chasing.
 4. **Fix.** Make the minimal change that addresses the cause, not the symptom.
 5. **Verify.** Re-run your original trigger and confirm it is gone, then run the
-   suite around it — unconditionally, whatever the clock says. Add or fix a test
-   that would have caught it.
-6. **Escalate at three.** Keep a count of fixes you have made that did not
-   remove the failure. At three, stop and question the design with whoever owns
-   it. Do not attempt fix #4 without that conversation — a run of wrong guesses
-   is evidence about your model, not about the next guess.
+   **full suite** — unconditionally, whatever the clock says.
+   `drovr:verification-before-completion` owns what "full" means here and what
+   evidence it takes; do not substitute a narrower scope you picked yourself.
+   Add or fix a test that would have caught it.
+6. **Escalate at three failed fixes.** A **failed fix** is one change you made,
+   ran, and watched leave the failure in place. That is the unit — not edits, not
+   builds, not ideas you considered and dropped. Count them for this one failure.
+   At three, stop and question the design with whoever owns it; do not start fix
+   #4 without that conversation. A run of wrong fixes is evidence about your
+   model of the system, not about the next fix.
 
 ### The cycle
 
@@ -102,6 +109,8 @@ digraph debugging_loop {
   fix    [label="minimal fix,\nat the cause", fillcolor=palegreen];
   verify [label="trigger + the suite\naround it", shape=diamond, fillcolor=lightyellow];
   stop   [label="three failed fixes —\nquestion the design", fillcolor=lightpink];
+  // "failed fix" is procedure step 6's unit: a change made, run, and seen to
+  // leave the failure in place.
   done   [label="fixed, with a test\nthat would have caught it"];
 
   repro  -> story  [label="cannot"];
@@ -111,8 +120,8 @@ digraph debugging_loop {
   cause  -> fix    [label="predicts the\nobserved behavior"];
   fix    -> verify;
   verify -> done   [label="gone, suite green"];
-  verify -> cause  [label="still failing —\ncount this fix"];
-  verify -> stop   [label="that was the third"];
+  verify -> cause  [label="still failing —\ncount one failed fix"];
+  verify -> stop   [label="that was the\nthird failed fix"];
 }
 ```
 
@@ -121,9 +130,9 @@ digraph debugging_loop {
 Some of these are thoughts and some are things you have just observed. Either
 way you are at the line, not past it — stop here and the loop is still intact.
 
-- *"We've seen this before."* · *"It's the same bug as last month."* · *"If it's
-  X, just fix it."* · *"I'll run the broader suite if there's time."* — each of
-  these has a row in *Rationalizations* below. Go do the thing in its row.
+- *"We've seen this exact failure before."* · *"They said if it's the off-by-one,
+  just fix it."* · *"I'll run the broader suite if time allows."* — each of these
+  opens a row in *Rationalizations* below. Go do the thing in its row.
 - *You are editing code and have not yet run the failing command yourself.* →
   Run it first. What you are fixing is a description of the bug, not the bug.
 - *The failure went away and you cannot say why.* → Put the change back and
@@ -132,8 +141,8 @@ way you are at the line, not past it — stop here and the loop is still intact.
 - *The failure is intermittent, so you will "fix it and watch".* → You have no
   trigger, so you will have no proof. Narrow until it is on demand, or report
   that you could not.
-- *You are about to make your fourth attempt at the same failure.* → Stop.
-  That is the escalation trigger, not a streak to break.
+- *You are about to start a fourth fix for the same failure.* → Stop. Three
+  failed fixes is the escalation trigger, not a streak to break.
 - **Any thought that ends with an edit landing before you can state the cause in
   one sentence.** The reason does not matter and the quality of the reasoning
   does not matter — if you are explaining why the cause can wait, that is the
@@ -149,9 +158,9 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 | *"They said if it's the off-by-one, just fix it."* | Confirm the antecedent, then take the permission. The conditional waives re-litigating the fix once you have the cause; it does not waive getting the cause. |
 | *"The fix works — I don't need to explain why the bug happened."* | State the mechanism now, in one sentence, before you move on. If you cannot, you have a change that correlates with green, and the next agent inherits nothing they can reason from. |
 | *"I can't reproduce it, so I'll fix it and see."* | Report that you cannot reproduce it and keep narrowing. Shipping a fix for a failure you never triggered spends someone else's next debugging session on your guess. |
-| *"I'll run the broader suite if time allows."* | Run it before you report. The deadline changes what you can finish; it does not change which tests can catch what this fix disturbed. Cut scope somewhere it is visible instead. |
-| *"Three attempts in — the next one will land."* | Stop at three and question the design. Three wrong fixes is a measurement of your model of the system, and the fourth guess is drawn from the same wrong model. |
-| *"Adding logging would take longer than just trying the fix."* | Add the logging. "Just trying it" is one attempt per compile with no residue; instrumentation is what makes the next attempt cheaper and the cause visible. |
+| *"I'll run the broader suite if time allows."* | Run the full suite before you report — the scope `drovr:verification-before-completion` defines, not one you pick now. The deadline changes what you can finish; it does not change which tests can catch what this fix disturbed. Cut scope somewhere it is visible instead. |
+| *"Three fixes in and it's still failing — the next one will land."* | Stop at three failed fixes and question the design. Three wrong fixes is a measurement of your model of the system, and the fourth is drawn from the same wrong model. |
+| *"Adding logging would take longer than just trying the fix."* | Add the logging. "Just trying it" burns a build cycle and leaves no residue; instrumentation is what makes the next fix cheaper and the cause visible. |
 
 ## Worked example
 
@@ -163,13 +172,15 @@ The right-hand column is an instruction, not an argument. Do the thing in it.
 ✅ **What it looks like when it holds:**
 
 > Using drovr:systematic-debugging — reproducing before fixing. Trigger:
-> `cargo test report::tests::totals_by_day`, red on every run. Cause, read out
-> of the fixture: entries after 23:00 are bucketed by UTC date while the totals
-> are summed by local date, so each day's last hour lands in the next day —
-> which predicts the exact off-by-one in the assertion. Minimal fix: bucket by
-> the calendar the totals use. Re-running the one test — green — and the whole
-> `report` module now, before I report anything. The 16:00 deadline does not
-> decide which tests can catch what this fix disturbed.
+> `cargo test report::tests::totals_by_day`, red every run — `left: 13`,
+> `right: 14`. I have a guess, `totals.rs:88` filtering `start < ts && ts < end`,
+> but I read the fixture before acting on it: walking its timestamps against that
+> filter by hand gives 13, and the row it drops is the one stamped exactly at
+> `end`. That is the mechanism, and it predicts the assertion exactly — an
+> exclusive upper bound on a day-boundary fixture. Minimal fix: make the upper
+> bound inclusive at line 88. Re-running the one test — green — then the full
+> suite before I report anything. The 16:00 deadline does not decide which tests
+> can catch what this fix disturbed.
 
 ## Cross-refs
 
