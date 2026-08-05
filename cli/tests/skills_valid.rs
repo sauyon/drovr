@@ -887,6 +887,17 @@ const VOICE_ARM: &str = "voice";
 /// row because it is the left-hand side of every comparison, not a case of one.
 const VOICE_BASELINE: &str = "V0";
 
+/// §6's section 4, spelled once.
+///
+/// Two checks depend on this exact heading and they must not drift apart: it is
+/// `V2`'s declared [`VoiceVariant::device_site`] — the one section `V2` may
+/// differ from `V0` in — and it is where
+/// [`every_voice_variant_keeps_the_baselines_iron_law_line`] looks for the
+/// fenced line that all four share. Spelled twice, a rename could leave the
+/// separability check watching one section while the fence-identity check
+/// watched another, and both would still pass.
+const VOICE_IRON_LAW_SECTION: &str = "The Iron Law";
+
 /// One register variant of the voice probe (§7.4, plan Task 15), named with the
 /// single section its device is allowed to live in.
 ///
@@ -926,7 +937,7 @@ const VOICE_VARIANTS: &[VoiceVariant] = &[
     },
     VoiceVariant {
         name: "V2",
-        device_site: "The Iron Law",
+        device_site: VOICE_IRON_LAW_SECTION,
     },
     VoiceVariant {
         name: "V3",
@@ -1054,14 +1065,16 @@ fn every_voice_variant_keeps_the_baselines_iron_law_line() {
         let file = read_voice_variant(name);
         let section = md_sections(&file.body)
             .into_iter()
-            .find(|s| s.heading == "The Iron Law")
-            .unwrap_or_else(|| panic!("voice variant `{name}` has no `## The Iron Law` section"));
+            .find(|s| s.heading == VOICE_IRON_LAW_SECTION)
+            .unwrap_or_else(|| {
+                panic!("voice variant `{name}` has no `## {VOICE_IRON_LAW_SECTION}` section")
+            });
         let blocks = fenced_blocks(&section.body).unwrap_or_else(|line| {
             panic!("voice variant `{name}`: unterminated fence in the Iron Law, body line {line}")
         });
         let block = blocks.first().unwrap_or_else(|| {
             panic!(
-                "voice variant `{name}` has no fenced block in `## The Iron Law` — §6 makes the \
+                "voice variant `{name}` has no fenced block in `## {VOICE_IRON_LAW_SECTION}` — §6 makes the \
                  fenced all-caps line unconditional structure, and plan Task 15 rules that it \
                  survives every §7.4 outcome, `V0` included"
             )
@@ -1124,16 +1137,61 @@ fn voice_variants_share_one_frontmatter() {
 /// authored as the measurement artifact it is, and never becomes a `skills/`
 /// file. `manifest_commits_contain_their_snapshots` then reads that cell as
 /// provenance exactly as it does for every other arm.
+///
+/// **The four names are a closed set, and the arm is checked in both directions
+/// against it** — every expected row present, no `voice` row that is not one of
+/// them, and no `.md` in the directory without a row. Walking the expected names
+/// alone is what [`SkillName`] exists to prevent for the per-skill arms: a fifth
+/// `voice` row, or a fifth variant file, would otherwise sit in the tree
+/// unhashed and unnoticed, and Task 21 pastes whatever it finds in this
+/// directory into a probe run.
 #[test]
 fn voice_snapshots_match_manifest() {
     let arms = arms_dir();
+    let voice = arms.join(VOICE_ARM);
     let manifest_path = arms.join("MANIFEST.md");
     let contents = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest_path.display()));
     let rows =
         parse_manifest(&contents).unwrap_or_else(|e| panic!("{}: {e}", manifest_path.display()));
 
-    let names = std::iter::once(VOICE_BASELINE).chain(VOICE_VARIANTS.iter().map(|v| v.name));
+    let names: Vec<&str> = std::iter::once(VOICE_BASELINE)
+        .chain(VOICE_VARIANTS.iter().map(|v| v.name))
+        .collect();
+
+    // Direction 1: the manifest holds these rows and no other `voice` row.
+    // Sorted rather than compared in document order — `MANIFEST.md`'s key is
+    // `(arm, skill)`, not position, and a re-snapshotted row that moved would
+    // otherwise read as a corrupt arm.
+    let mut recorded: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.arm == VOICE_ARM)
+        .map(|r| r.skill.as_str())
+        .collect();
+    recorded.sort_unstable();
+    let mut expected = names.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        recorded,
+        expected,
+        "{}: the arm `{VOICE_ARM}` rows are not the four registered variants",
+        manifest_path.display()
+    );
+
+    // Direction 2: the directory holds these files and no other markdown. An
+    // unregistered variant is the dangerous one — it is indistinguishable from
+    // a registered one at the point Task 21 reads the directory.
+    let mut present: Vec<String> = markdown_files(&voice)
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+    present.sort();
+    assert_eq!(
+        present,
+        expected,
+        "{} holds markdown that is not one of the four registered variants",
+        voice.display()
+    );
 
     // Everything that does not need git runs first, so a git-less environment
     // still reports a corrupt manifest rather than only "git is missing".
