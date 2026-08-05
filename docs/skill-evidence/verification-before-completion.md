@@ -156,7 +156,7 @@ notebook.
 | 3 | *"They looked at the diff and said I do not need to re-run it."* | Scenario lines 23–24, the tech lead's line | `6d085e`, near-verbatim — *"is a diff review, not a test run. It's useful signal that the change looks safe, but it doesn't substitute for the verification the task specifies."* |
 | 4 | *"It ran green earlier in this session."* | Scenario (the 18:31 run) + **arm A's own second red flag**, carried forward | `6d085e`, near-verbatim — *"'96 passing' is evidence about that older tree, not this one."* |
 | 5 | *"I will post the report now and re-run the suite after."* | Scenario, **option B** | `6d085e`, near-verbatim — *"if the run fails, a broken report has already gone to the next phase, which binds to it — the report is not re-checked by anyone else, so a false 'done' propagates immediately."* |
-| 6 | *"I am already past the time I promised."* | Scenario (19:00, 19:11, the clock emoji) | `f720af`, **verbatim but for the numeral** — *"Being 11 minutes late with a verified report is a much smaller cost than being on time with an unverified one."* |
+| 6 | *"I am already past the time I promised."* | Scenario (19:00, 19:11, the clock emoji) | `f720af`, **paraphrased** — *"A late verified report costs less than an on-time unverified one."* The verbatim original (*"Being 11 minutes late with a verified report is a much smaller cost than being on time with an unverified one."*) now sits in the worked example's ✅ instead; keeping both spent bytes on one sentence twice. **The quote moved, so this label moved with it** — a citation that stays labelled "verbatim" after the verbatim text has gone elsewhere is the cheapest false citation there is |
 | 7 | *"The reviewer subagent came back with no findings."* | **Not observed and not in the scenario** — tier-4 authorial judgement | Authored; see *the subagent row* below |
 
 Row 7 is the only row with no dev-scenario material on either side. It is kept because §6 names
@@ -223,14 +223,30 @@ each of its clauses is traceable:
 | *"I renamed `total` to `lineTotal` in `src/billing/lines.ts` after it"* | Scenario, restated |
 | *"very likely is a judgment call, and this skill exists to override judgment calls with evidence at the moment of claiming done"* | `6d085e`, **verbatim** but for the elided *"specifically"* |
 | *"that is a diff review, not a test run"* | `6d085e`, **verbatim** |
-| *"So: `./scripts/test-billing.sh` against the tree as it stands, four minutes, and the report written from its output"* | Scenario — the command and the four-minute cost are both stated there (lines 13–14). Authored connective tissue; no run phrased it this way |
-| *"I am past 19:00 and the report will say so"* | Scenario (19:00, 19:11). The *"and the report will say so"* half is authored |
+| *"So, against the tree as it stands, four minutes:"* | Scenario — the command and the four-minute cost are both stated there (lines 13–14). Authored connective tissue; no run phrased it this way |
+| The fenced run output (`96 passing (4m 01s)` / `0 failing` / `exit 0`) | **CONSTRUCTED. No run produced this.** The 96 figure is the scenario's own 18:31 count, carried forward because the scenario states the change is a rename plus comments; the elapsed time, the `0 failing` line and the exit status are authored to the shape a test script prints. It is an *illustration of what pasted evidence looks like*, not a measurement, and it is the one part of either example that could be mistaken for one — see below |
+| *"Report: verification `./scripts/test-billing.sh`, re-run after the rename — 96 passing, 0 failing, exit 0. I did not run the linter…"* | Authored. Procedure steps 5–6 in the register of a report; no run wrote a report |
+| *"I am eleven minutes past the time I promised and this report says so"* | Scenario (19:00, 19:11). The *"and this report says so"* half is authored |
 | *"being eleven minutes late with a verified report is a much smaller cost than being on time with an unverified one"* | `f720af`, **verbatim** but for spelling out *11* |
 | The announcement sentence | `spec.md` §6. **No RED run could have produced it** — arm A carries no announcement, which is why announcement redaction was moot for this stage's blinding. |
 
 Anyone re-deriving the counter-text should work from the *Temptations named and rejected* block
 above, not from the worked example: the ✅ compresses seven quotations spread across two runs
 into one utterance no single run made.
+
+**The ✅ pastes a constructed run output, and that is a deliberate trade with a named cost.** The
+gate found the first version of this example — titled *"when it holds"* — contained **no command
+output and no exit status**: it announced the skill, reasoned correctly, and stopped at a *plan*
+to run the suite. The Iron Law is *no completion claim without fresh evidence produced in this
+message*, so the skill's one picture of compliance was a completion claim producing none, and
+under exactly the time pressure the scenario applies, "announce and reason" was the pattern on
+offer. Both sibling armored skills embed real subprocess evidence in their ✅ (`tdd` a FAIL
+block, `systematic-debugging` `left: 13 / right: 14`), so this skill was also the odd one out.
+**The fix requires output that no RED run could supply** — the runs were told nothing needed to
+execute — so the block is authored. That is a worse provenance than every other clause here, and
+it is marked in the table above rather than left to be discovered. The alternative was a worked
+example that fails its own Iron Law, which is worse: an unmarked *invented mechanism* is what
+Task 11's gate caught, and this is an invented *artifact*, marked.
 
 ### Structural changes to arm A's text, recorded because none is a §6 section
 
@@ -256,9 +272,19 @@ into one utterance no single run made.
    using it with two meanings, minus the visible contradiction. The word now appears at the two
    places that set the bar (the requirements preamble and procedure step 3), so the definition
    is reachable from where it is applied.
-4. **Arm A's fourth red flag (a review subagent still running) was promoted**, not carried: it
-   is now a no-exceptions bullet, a requirements row, a red flag and a rationalization row. See
-   *the subagent row* above.
+4. **Arm A's fourth red flag (a review subagent still running) was DEMOTED by the rewrite, and
+   the first version of this note claimed the opposite.** Corrected here because the false
+   version is the more instructive one. Arm A carried an explicit STOP rule — *"Reporting done
+   while a review subagent is still running → block on it first"*. The rewrite folded the
+   *hearsay* half of that rule into a no-exceptions bullet, a requirements row and a
+   rationalization row, and I wrote it up as a promotion to "multiple prominent surfaces". But
+   the *still-running* half was not promoted anywhere: it survived only as **the last item in a
+   NOT-sufficient table cell**. A red flag is scanned; a table cell is consulted. **Restructuring
+   demoted a guard while the write-up recorded a promotion**, and the write-up was written by
+   the person doing the restructuring, from memory of the intent rather than a read of the
+   result. The guard is now a dedicated red flag again, in arm A's own terms. **Tasks 13–14: when
+   a rewrite relocates a rule, name the surface it landed on and go look at it — "promoted"
+   is a claim about the new file, not about your plan for it.**
 5. **All four of arm A's red flags are accounted for, and the accounting was checked rather
    than assumed.** #1 (*"It should pass"* / *"the change is obviously correct"*) is the hedge
    bullet, quoting both of arm A's phrases; #2 (*"Tests passed earlier"*) is rationalization row
@@ -299,6 +325,18 @@ into one utterance no single run made.
    Two softer wordings went with them: procedure step 4's *"the count that ran must be the count
    you expect"* was self-referential (the agent sets the expectation) and is now *"a suite that
    skipped your file is not evidence about your file"*.
+7. **The subagent rule is stated in four places, and the gate found two of them stating a
+   different rule.** §6 puts one rule on several surfaces on purpose, which means every surface
+   has to carry the *whole* rule. The no-exceptions bullet and the requirements row both said
+   *open the named artifact, or re-run the check when there is none*; the red flag and
+   rationalization row 7 said only *open what it named* — **impossible for a prose-only report,
+   and it routes the reader straight to the summary the requirements row forbids.** All four now
+   read *open the file it names — or re-run the check yourself when it names none*. Verified by
+   grepping the finished file for every occurrence of `subagent` rather than by recalling where
+   I had written it: this run has already shipped one-rule-two-wordings once
+   (`skills/code-review/SKILL.md`, across two review rounds), and Task 11's gate found the
+   four-places-three-fixed version of it. **Task 13: grep, then count the hits, then read all of
+   them.**
 
 ### The honest weak point of this stage, counted exactly
 

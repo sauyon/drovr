@@ -4421,8 +4421,21 @@ fn headings(text: &str) -> Vec<(usize, String)> {
 enum ConditionalSection {
     /// §6 section 6b — the cycle as a fenced `dot` graph.
     CycleFlowchart,
-    /// §6 section 7 — claim → required evidence → not sufficient.
-    RequirementsTable,
+    /// §6 section 7 — claim → required evidence → not sufficient — carrying the
+    /// claims §6 names this skill's table for.
+    ///
+    /// **The claims ride here for the same reason [`Armor::procedure_steps`]
+    /// records section 6's arity, and the omission had the same shape.** Section
+    /// 6b is self-describing: a fenced `dot` block either is there or is not, so
+    /// `CycleFlowchart` needs no payload. Section 7 is not — §6 names five claims
+    /// for `verification-before-completion` and `code-review` (tests, build,
+    /// linter, bug-fixed, subagent-reported-success), and a heading-only check
+    /// confirms the table exists while saying nothing about whether it still
+    /// covers them. A row could be dropped, reordered or reworded and the suite
+    /// would stay green — the vacuous-pass class this run has hit repeatedly,
+    /// reached by *modelling* one conditional section as a marker because its
+    /// sibling could be one.
+    RequirementsTable { claims: &'static [&'static str] },
 }
 
 /// A skill that carries §6's armor, and the per-skill strings §6 fixes for it.
@@ -4526,7 +4539,17 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
             iron_law: "NO COMPLETION CLAIM WITHOUT FRESH EVIDENCE PRODUCED IN THIS MESSAGE.",
             announce: "Using drovr:verification-before-completion — running the checks \
                        before claiming done.",
-            conditional: ConditionalSection::RequirementsTable,
+            conditional: ConditionalSection::RequirementsTable {
+                // §6: "Requirements table covers tests / build / linter /
+                // bug-fixed / subagent-reported-success", in that order.
+                claims: &[
+                    "The task's tests pass",
+                    "It builds",
+                    "The linter is clean",
+                    "The bug is fixed",
+                    "The subagent reported success",
+                ],
+            },
             procedure_steps: 6,
         }),
     ),
@@ -4602,7 +4625,7 @@ fn required_sections(armor: &Armor) -> Vec<(&'static str, SectionMarker)> {
     ];
     out.push(match armor.conditional {
         ConditionalSection::CycleFlowchart => ("6b Cycle flowchart", SectionMarker::Fence("dot")),
-        ConditionalSection::RequirementsTable => {
+        ConditionalSection::RequirementsTable { .. } => {
             ("7 Requirements", SectionMarker::Heading("Requirements"))
         }
     });
@@ -4787,7 +4810,7 @@ fn check_armor(
             }
         }
         // §6 names this skill for 7, so the flowchart must be absent.
-        ConditionalSection::RequirementsTable => {
+        ConditionalSection::RequirementsTable { .. } => {
             if let Some(block) = blocks.iter().find(|b| b.lang() == "dot") {
                 wrong.push(format!(
                     "{}: line {} opens a fenced `dot` block, but §6 marks section \
@@ -4831,6 +4854,169 @@ fn check_armor(
     // express: it checks that sections appear in order, not that one section's
     // two required parts stand in the right relation to each other.
     check_procedure(path, body, armor, first_body_line, wrong);
+    // §6 section 7's contents, for the same reason. The ordered pass sees a
+    // `Requirements` heading; it cannot see whether anything is under it.
+    if let ConditionalSection::RequirementsTable { claims } = armor.conditional {
+        check_requirements_table(path, body, claims, first_body_line, wrong);
+    }
+}
+
+/// The cells of a markdown table row, or `None` if `line` is not one.
+///
+/// Leading and trailing pipes are optional, matching how the shipped tables are
+/// written. There is no escape handling, exactly as `arms/MANIFEST.md`'s parser
+/// has none — a cell containing a literal `|` is a table nobody can read back.
+fn table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') {
+        return None;
+    }
+    let inner = trimmed.trim_start_matches('|').trim_end_matches('|');
+    Some(
+        inner
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect(),
+    )
+}
+
+/// Is this the `|---|---|---|` row that separates a header from its data?
+fn is_delimiter_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let bare = cell.trim().trim_start_matches(':').trim_end_matches(':');
+            !bare.is_empty() && bare.chars().all(|c| c == '-')
+        })
+}
+
+/// A requirements-table cell reduced to its words: markdown emphasis, quote
+/// marks and backticks dropped, whitespace folded.
+///
+/// The shipped table writes its claims as `*"The task's tests pass"*` because
+/// they are utterances; [`SKILL_ARMOR_STATES`] declares them as prose. Comparing
+/// the markup instead would make the declaration a copy of the rendering, which
+/// is the shape that drifts — and would fail on a row someone merely italicised.
+fn claim_text(cell: &str) -> String {
+    let bare: String = cell
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '"' | '_' | '\u{201c}' | '\u{201d}'))
+        .collect();
+    normalize_ws(&bare)
+}
+
+/// spec §6 section 7: *claim → required evidence → **not sufficient***, over the
+/// claims §6 names for this skill.
+///
+/// **What this asserts that a heading cannot.** `required_sections` proves a
+/// `Requirements` heading exists and `check_armor` proves no `dot` fence does;
+/// between them, a page carrying the heading and nothing else satisfies both.
+/// §6 names five claims for the two skills it marks CONDITIONAL for, and this is
+/// the only place that says so — the same argument [`Armor::procedure_steps`]
+/// makes for section 6's arity, applied to the section that had no analogue.
+///
+/// The three columns are asserted too. A two-column table is not §6's section 7:
+/// dropping the `not sufficient` column deletes the half that closes loopholes,
+/// and that is a rewrite, not a formatting choice.
+fn check_requirements_table(
+    path: &Path,
+    body: &str,
+    claims: &[&str],
+    first_body_line: usize,
+    wrong: &mut Vec<String>,
+) {
+    let at = |line: usize| line + first_body_line + 1;
+    let heads = headings(body);
+    let Some((start, _)) = heads
+        .iter()
+        .find(|(_, text)| text == "Requirements")
+        .cloned()
+    else {
+        // `required_sections` already reported the heading as missing.
+        return;
+    };
+    let end = heads
+        .iter()
+        .map(|(line, _)| *line)
+        .find(|line| *line > start)
+        .unwrap_or_else(|| body.lines().count());
+
+    let rows: Vec<(usize, Vec<String>)> = body
+        .lines()
+        .enumerate()
+        .filter(|(idx, _)| *idx > start && *idx < end)
+        .filter_map(|(idx, line)| table_row(line).map(|cells| (idx, cells)))
+        .collect();
+
+    let Some((header_line, header)) = rows.first().cloned() else {
+        wrong.push(format!(
+            "{}: §6 section 7 opens on line {} with no table under it. The \
+             heading is not the section — §6 section 7 is claim → required \
+             evidence → not sufficient, over {} claim(s).",
+            path.display(),
+            at(start),
+            claims.len(),
+        ));
+        return;
+    };
+
+    if header.len() != 3 {
+        wrong.push(format!(
+            "{}: §6 section 7's table has {} column(s) on line {}, not 3. The \
+             section is claim → required evidence → NOT sufficient; the third \
+             column is the half that closes loopholes.",
+            path.display(),
+            header.len(),
+            at(header_line),
+        ));
+        return;
+    }
+    if !claim_text(&header[2])
+        .to_lowercase()
+        .contains("not sufficient")
+    {
+        wrong.push(format!(
+            "{}: §6 section 7's third column is headed `{}` on line {} — it must \
+             name what is NOT sufficient, so a reader can tell the two evidence \
+             columns apart.",
+            path.display(),
+            header[2],
+            at(header_line),
+        ));
+    }
+
+    let data: Vec<&(usize, Vec<String>)> = rows
+        .iter()
+        .skip(1)
+        .filter(|(_, cells)| !is_delimiter_row(cells))
+        .collect();
+
+    let found: Vec<String> = data
+        .iter()
+        .map(|(_, cells)| claim_text(&cells[0]))
+        .collect();
+    let expected: Vec<String> = claims.iter().map(|claim| claim_text(claim)).collect();
+    if found != expected {
+        wrong.push(format!(
+            "{}: §6 section 7's table states the claims {found:?}, but this \
+             skill's Armor declares {expected:?}. Change the table and the \
+             declaration in the same edit — a row dropped, reordered or reworded \
+             changes which claims the skill sets a bar for, and nothing else here \
+             would notice.",
+            path.display(),
+        ));
+    }
+
+    for (idx, cells) in data {
+        if cells.len() != 3 || cells.iter().any(|cell| cell.trim().is_empty()) {
+            wrong.push(format!(
+                "{}: §6 section 7's row on line {} has an empty or missing cell. \
+                 A claim with no required-evidence cell, or none saying what is \
+                 not sufficient, is a row that requires nothing.",
+                path.display(),
+                at(*idx),
+            ));
+        }
+    }
 }
 
 /// §6 section 6's numbered steps in `text`, as (0-based line, the step's number).
@@ -5005,6 +5191,28 @@ fn armor_table_declares_well_formed_strings() {
             "{name}: the declared announcement sentence is empty, so §6 section 5 \
              would be satisfied by any file"
         );
+        if let ConditionalSection::RequirementsTable { claims } = armor.conditional {
+            assert!(
+                !claims.is_empty(),
+                "{name}: §6 section 7 is declared with no claims, so \
+                 `check_requirements_table` would accept a table with no rows — \
+                 the heading-only check this payload exists to replace"
+            );
+            let normalized: Vec<String> = claims.iter().map(|claim| claim_text(claim)).collect();
+            let unique: HashSet<&String> = normalized.iter().collect();
+            assert_eq!(
+                unique.len(),
+                normalized.len(),
+                "{name}: §6 section 7's declared claims contain a duplicate: \
+                 {normalized:?}. Two rows stating one claim cannot both be \
+                 matched, and the second silently sets the bar."
+            );
+            assert!(
+                normalized.iter().all(|claim| !claim.is_empty()),
+                "{name}: §6 section 7 declares an empty claim, which every row \
+                 would match"
+            );
+        }
     }
 }
 
@@ -5029,6 +5237,16 @@ fn synthetic_body(armor: &Armor) -> Vec<String> {
                     );
                     lines.push(String::new());
                     lines.extend((1..=armor.procedure_steps).map(|n| format!("{n}. Step {n}.")));
+                }
+                // Section 7 is the other section with required *contents*.
+                if text == "Requirements"
+                    && let ConditionalSection::RequirementsTable { claims } = armor.conditional
+                {
+                    lines.push("| The claim | Required evidence | NOT sufficient |".to_string());
+                    lines.push("|---|---|---|".to_string());
+                    lines.extend(claims.iter().map(|claim| {
+                        format!("| *\"{claim}\"* | what it takes | what it is not |")
+                    }));
                 }
             }
             SectionMarker::Line(text) => lines.push(text.to_string()),
@@ -5149,7 +5367,9 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
     // missing `Requirements` heading is a second, expected complaint, so this
     // case is held to `any` rather than `all`.
     let other_half = Armor {
-        conditional: ConditionalSection::RequirementsTable,
+        conditional: ConditionalSection::RequirementsTable {
+            claims: &["It works"],
+        },
         ..armor
     };
     let complained = complaints(&good, &other_half);
@@ -5184,6 +5404,127 @@ fn armor_check_refuses_a_page_that_only_looks_armored() {
             .iter()
             .any(|c| c.contains("never closes")),
         "an unterminated fence must be reported as itself"
+    );
+}
+
+/// [`check_requirements_table`]'s refusals, each built by breaking exactly one
+/// part of a body that passes.
+///
+/// **Written because the check it pins was missing entirely**, and the way it
+/// was missing is the point: `verification-before-completion` shipped as the
+/// first `RequirementsTable` skill with its section 7 checked by heading alone,
+/// so the suite confirmed the table existed and asserted nothing about what it
+/// said. Every case below is a page the old check accepted.
+#[test]
+fn armor_check_refuses_a_requirements_table_that_says_nothing() {
+    let armor = Armor {
+        iron_law: "NEVER SHIP WITHOUT A RED TEST.",
+        announce: "Using drovr:example — doing the thing before the other thing.",
+        conditional: ConditionalSection::RequirementsTable {
+            claims: &[
+                "The tests pass",
+                "It builds",
+                "The subagent reported success",
+            ],
+        },
+        procedure_steps: 3,
+    };
+    let path = Path::new("fixture/SKILL.md");
+    let complaints = |body: &str| -> Vec<String> {
+        let mut wrong = Vec::new();
+        check_armor(path, body, &FoldedBody::new(body), &armor, 0, &mut wrong);
+        wrong
+    };
+
+    let good = synthetic_body(&armor).join("\n");
+    assert!(
+        complaints(&good).is_empty(),
+        "control: a page built from required_sections must pass: {:?}",
+        complaints(&good)
+    );
+
+    // The defect that motivated the check: the heading with nothing under it.
+    let heading_only = good
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('|'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(heading_only, good, "the fixture must have lost its table");
+    assert!(
+        complaints(&heading_only)
+            .iter()
+            .any(|c| c.contains("no table under it")),
+        "a `Requirements` heading with no table must be reported: {:?}",
+        complaints(&heading_only)
+    );
+
+    // A row dropped, a row reordered, a row reworded — the three drift shapes a
+    // heading check cannot see. Each must name the claims it found.
+    let dropped = good.replace("| *\"It builds\"* | what it takes | what it is not |\n", "");
+    let reordered = good
+        .replace("*\"The tests pass\"*", "@@A@@")
+        .replace("*\"It builds\"*", "*\"The tests pass\"*")
+        .replace("@@A@@", "*\"It builds\"*");
+    let reworded = good.replace("*\"It builds\"*", "*\"It compiles\"*");
+    for (name, broken) in [
+        ("dropped", dropped),
+        ("reordered", reordered),
+        ("reworded", reworded),
+    ] {
+        assert_ne!(broken, good, "{name}: the fixture did not change");
+        assert!(
+            complaints(&broken)
+                .iter()
+                .any(|c| c.contains("but this skill's Armor declares")),
+            "{name}: a table that no longer states §6's claims must be reported: \
+             {:?}",
+            complaints(&broken)
+        );
+    }
+
+    // Two columns is not §6 section 7. Dropping the NOT-sufficient column
+    // deletes the half that closes loopholes.
+    let two_columns = good
+        .replace(
+            "| The claim | Required evidence | NOT sufficient |",
+            "| The claim | Required evidence |",
+        )
+        .replace("|---|---|---|", "|---|---|")
+        .replace(" | what it is not |", " |");
+    assert_ne!(two_columns, good, "the fixture did not lose a column");
+    assert!(
+        complaints(&two_columns)
+            .iter()
+            .any(|c| c.contains("column(s)") && c.contains("not 3")),
+        "a two-column requirements table must be reported: {:?}",
+        complaints(&two_columns)
+    );
+
+    // Three columns, but the third is no longer the NOT-sufficient one.
+    let mislabelled = good.replace("| NOT sufficient |", "| Notes |");
+    assert_ne!(mislabelled, good, "the fixture did not change");
+    assert!(
+        complaints(&mislabelled)
+            .iter()
+            .any(|c| c.contains("must name what is NOT sufficient")),
+        "a third column that does not name what is insufficient must be \
+         reported: {:?}",
+        complaints(&mislabelled)
+    );
+
+    // A row whose evidence cell is blank states a claim and requires nothing —
+    // which is what the whole section exists to prevent.
+    let hollow = good.replace(
+        "| *\"It builds\"* | what it takes | what it is not |",
+        "| *\"It builds\"* |  | what it is not |",
+    );
+    assert_ne!(hollow, good, "the fixture did not change");
+    assert!(
+        complaints(&hollow)
+            .iter()
+            .any(|c| c.contains("empty or missing cell")),
+        "a row with an empty required-evidence cell must be reported: {:?}",
+        complaints(&hollow)
     );
 }
 
