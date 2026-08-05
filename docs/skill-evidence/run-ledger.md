@@ -13,6 +13,16 @@ silently extend.
 returned nothing, or wrote a bad transcript, that is two runs against the ceiling, not one.
 The `runs this stage` cell records what was actually spent, not what was planned.
 
+**The table's arithmetic is checked**, by
+`cli/tests/skills_valid.rs::run_ledger_cumulative_is_a_running_total`: `cumulative` must be the
+running total of `runs this stage`, and the last one must be at or under 122. Two rules follow
+from how it reads this file, and they are stated here because breaking either is silent
+otherwise. **The four load-bearing columns are resolved by their header text, never by position**
+— `task`, `stage (§7.3 row)`, `runs this stage`, `cumulative` — so they may be reordered but not
+renamed, dropped or duplicated. And **no line after the table may begin with `|`**: every such
+line is read as a data row, exactly as `arms/MANIFEST.md` requires of its own table, so that a
+blank line between two rows cannot quietly end the table and leave the check validating a prefix.
+
 | task | stage (§7.3 row) | runs this stage | cumulative | stage ceiling | ceiling hit? |
 |---|---|---|---|---|---|
 | 6 | RED / baseline on dev set | 10 | 10 | 10 | no |

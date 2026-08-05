@@ -7488,7 +7488,14 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
     const RUNS: &str = "runs this stage";
     const CUMULATIVE: &str = "cumulative";
 
-    let mut lines = text.lines().peekable();
+    // A markdown alignment row (`|---|---|`), which carries no data.
+    let is_separator = |cells: &[&str]| {
+        cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+    };
+
+    let mut lines = text.lines();
     let mut columns: Option<LedgerColumns> = None;
     let mut width = 0usize;
     for line in lines.by_ref() {
@@ -7499,9 +7506,33 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
             .iter()
             .map(|c| normalize_header(c))
             .collect();
-        let at = |want: &str| cells.iter().position(|c| c == &normalize_header(want));
+
+        // Resolved by header text, so **exactly one** column may carry each key.
+        // `position()` alone takes the first match and reads the wrong cell for
+        // the rest of the file — the failure `parse_manifest` guards against by
+        // name, at the table that pins the arms. A duplicated load-bearing
+        // header is a corrupt table, not a row that merely is not the header, so
+        // it aborts rather than sending the scan looking for another one.
+        let at = |want: &str| -> Result<Option<usize>, String> {
+            let key = normalize_header(want);
+            let hits: Vec<usize> = cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c == key)
+                .map(|(i, _)| i)
+                .collect();
+            match hits.len() {
+                0 => Ok(None),
+                1 => Ok(Some(hits[0])),
+                n => Err(format!(
+                    "the budget table's header carries {n} columns named {want:?}; the \
+                     column is resolved by its name, so a duplicate makes every cell \
+                     under it ambiguous"
+                )),
+            }
+        };
         if let (Some(task), Some(stage), Some(runs), Some(cumulative)) =
-            (at(TASK), at(STAGE), at(RUNS), at(CUMULATIVE))
+            (at(TASK)?, at(STAGE)?, at(RUNS)?, at(CUMULATIVE)?)
         {
             width = cells.len();
             columns = Some(LedgerColumns {
@@ -7522,23 +7553,26 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
         )
     })?;
 
-    // The separator row, then data rows until the table ends.
-    if let Some(next) = lines.peek() {
-        if next.trim_start().starts_with('|')
-            && ledger_cells(next)
-                .iter()
-                .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
-        {
-            lines.next();
-        }
-    }
-
+    // **Every remaining line that begins with `|` is a data row**, and a line
+    // that does not is skipped rather than treated as the end of the table.
+    //
+    // The obvious alternative — stop at the first non-`|` line — makes a blank
+    // line between two rows silently truncate the ledger, and the check then
+    // validates a *prefix*: the arithmetic closes, no complaint is raised, and a
+    // 200-run stage recorded below the gap is never read. A guard that passes on
+    // part of the file is worse than no guard, and this run has already found
+    // nine of that shape. `arms/MANIFEST.md` states the same rule for the same
+    // reason — "no line after the table may begin with `|`" — so a stray table
+    // below is a loud parse failure here, never a silent drop.
     let mut rows = Vec::new();
     for line in lines {
         if !line.trim_start().starts_with('|') {
-            break;
+            continue;
         }
         let cells = ledger_cells(line);
+        if is_separator(&cells) {
+            continue;
+        }
         if cells.len() != width {
             return Err(format!(
                 "ledger row {line:?} has {} cells, not the header's {width} — a short row \
@@ -7694,6 +7728,29 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
         check_ledger(reordered).is_empty(),
         "{:?}",
         check_ledger(reordered)
+    );
+
+    // A blank line between rows must NOT end the table. This is the one case
+    // that could make the check pass on a strict prefix: without it, the 200-run
+    // row below the gap is never read and the arithmetic closes on the two rows
+    // above it.
+    let gapped = format!(
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n\n| 16 | Arm A | 200 | 210 | 20 | no |\n"
+    );
+    assert!(
+        check_ledger(&gapped).iter().any(|c| c.contains("122")),
+        "a blank line inside the table truncated it: {:?}",
+        check_ledger(&gapped)
+    );
+
+    // A duplicated load-bearing header is ambiguous, not first-match-wins.
+    let dup = "| task | stage (§7.3 row) | runs this stage | cumulative | cumulative |\n|---|---|---|---|---|\n| 6 | RED | 10 | 10 | 99 |\n";
+    assert!(
+        check_ledger(dup)
+            .iter()
+            .any(|c| c.contains("2 columns named") && c.contains("cumulative")),
+        "{:?}",
+        check_ledger(dup)
     );
 
     // A non-numeric run count is refused rather than read as zero.
