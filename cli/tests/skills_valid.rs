@@ -1536,6 +1536,313 @@ fn manifest_commits_contain_their_snapshots() {
     );
 }
 
+/// Repository root — one directory above `cli/`.
+///
+/// Spelled once so the git invocations below all ask their questions from the
+/// same place. `git -C` is used rather than the test harness's cwd because a
+/// test's cwd is the package directory, not the repo, and a pathspec resolved
+/// against the wrong root silently matches nothing — which for an ordering
+/// check would read as "no arms to verify".
+fn repo_root() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+}
+
+/// The spec-length A/B's candidate arms
+/// (`docs/skill-evidence/arms/spec-length/`).
+fn spec_length_arms_dir() -> PathBuf {
+    arms_dir().join("spec-length")
+}
+
+/// The spec-length A/B's freeze record
+/// (`docs/skill-evidence/spec-length/FREEZE.md`).
+fn spec_length_freeze_path() -> PathBuf {
+    evidence_dir().join("spec-length").join("FREEZE.md")
+}
+
+/// What this repository can say about the commit that **introduced** a path.
+///
+/// The same three-way shape as [`Provenance`], for the same reason: "git says
+/// nothing added this path" and "git could not be asked" are different facts,
+/// and collapsing them lets a broken toolchain read as a clean history. The
+/// question differs — [`Provenance`] asks *what does this commit hold*, this
+/// asks *which commit first held it* — so it is a separate type rather than a
+/// variant bolted onto that one.
+enum Introduced {
+    /// `git log --diff-filter=A` named the commit that added the path.
+    At(GitObjectId),
+    /// git answered, and no commit adds this path. The file may be on disk;
+    /// history does not know about it yet.
+    NotCommitted,
+    /// git could not be asked, or answered something unusable. Not an absence —
+    /// an absence of evidence.
+    Undetermined { how: String },
+}
+
+/// The commit that introduced `path`, as `git log --diff-filter=A` reports it.
+///
+/// An untracked path is not an error to git: it prints nothing and exits 0, so
+/// "no output" is the [`Introduced::NotCommitted`] answer and a non-zero exit is
+/// a real failure to ask.
+fn introducing_commit(path: &Path) -> Introduced {
+    let args = [
+        "-C".to_string(),
+        repo_root().display().to_string(),
+        "log".to_string(),
+        "--diff-filter=A".to_string(),
+        "--format=%H".to_string(),
+        "-1".to_string(),
+        "--".to_string(),
+        path.display().to_string(),
+    ];
+    let out = match git_output(&args) {
+        Ok(out) => out,
+        Err(how) => return Introduced::Undetermined { how },
+    };
+    if !out.status.success() {
+        return Introduced::Undetermined {
+            how: format!(
+                "`git log --diff-filter=A -- {}` failed: {}",
+                path.display(),
+                git_stderr(&out)
+            ),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Introduced::NotCommitted;
+    }
+    match GitObjectId::parse(&stdout) {
+        Ok(id) => Introduced::At(id),
+        Err(e) => Introduced::Undetermined {
+            how: format!(
+                "`git log --diff-filter=A -- {}` printed {e}",
+                path.display()
+            ),
+        },
+    }
+}
+
+/// Does `descendant` have `ancestor` in its history?
+///
+/// Three-way for the same reason as [`Introduced`]: `git merge-base
+/// --is-ancestor` exits 0 for yes and 1 for no, and **anything else is git
+/// refusing the question**, not a no.
+enum Descent {
+    Yes,
+    No,
+    Undetermined { how: String },
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>`.
+///
+/// Reflexive: a commit is its own ancestor, so an arm introduced by the very
+/// commit that introduced the freeze record passes. That is the right answer —
+/// such an arm did not exist before the freeze either.
+fn descends_from(ancestor: &GitObjectId, descendant: &GitObjectId) -> Descent {
+    let args = [
+        "-C".to_string(),
+        repo_root().display().to_string(),
+        "merge-base".to_string(),
+        "--is-ancestor".to_string(),
+        ancestor.as_str().to_string(),
+        descendant.as_str().to_string(),
+    ];
+    let out = match git_output(&args) {
+        Ok(out) => out,
+        Err(how) => return Descent::Undetermined { how },
+    };
+    match out.status.code() {
+        Some(0) => Descent::Yes,
+        Some(1) => Descent::No,
+        other => Descent::Undetermined {
+            how: format!(
+                "`git merge-base --is-ancestor {} {}` exited {} ({})",
+                ancestor.as_str(),
+                descendant.as_str(),
+                other.map_or_else(|| "on a signal".to_string(), |c| c.to_string()),
+                git_stderr(&out),
+            ),
+        },
+    }
+}
+
+/// Candidate arms of the spec-length A/B: every `S<n>.md` with `n >= 1` under
+/// `docs/skill-evidence/arms/spec-length/`, sorted by `n`.
+///
+/// `S0.md` is excluded by the `n >= 1` rule, not by name: it is the **control**,
+/// the text that was already in `brainstorm.md` before the experiment, so it
+/// necessarily predates the freeze and has nothing to be ordered against.
+///
+/// A missing directory yields an empty list rather than a panic — see
+/// [`freeze_precedes_every_candidate_arm`] on why zero arms is a correct state.
+/// Anything not matching `S<digits>.md` is passed over, so the directory can
+/// hold a README without becoming unparseable; the naming convention is the one
+/// `FREEZE.md` and `MANIFEST.md` both record.
+fn spec_length_candidate_arms() -> Vec<(u32, PathBuf)> {
+    let dir = spec_length_arms_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.expect("read_dir entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(digits) = stem.strip_prefix('S') else {
+            continue;
+        };
+        let Ok(n) = digits.parse::<u32>() else {
+            continue;
+        };
+        if n >= 1 {
+            out.push((n, path));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every candidate arm of the spec-length A/B was introduced **after** the
+/// key-point ledger was frozen.
+///
+/// This is the ordering gate the whole experiment rests on. The ledger under
+/// `docs/skill-evidence/spec-length/ledger/` is derived from the *control*
+/// specs and hashed in `FREEZE.md` before any arm text exists; an arm written
+/// first — or a ledger revised once an arm's weaknesses were visible — is the
+/// experiment grading itself, and the result is void. Prose in the plan cannot
+/// enforce that. Git history can: an arm's introducing commit must descend from
+/// `FREEZE.md`'s.
+///
+/// **Three outcomes, not two**, the same distinction [`Provenance`] draws:
+///   - *pass* — the arm's commit descends from the freeze commit;
+///   - *ordering violation* — git answered, and it does not. Both commits are
+///     named, because the fix depends on which one moved;
+///   - *undetermined* — the arm is on disk with no introducing commit. `git
+///     log` prints nothing, and feeding that to `merge-base` would be a usage
+///     error dressed as a verdict. It fails, so a draft cannot sit indefinitely
+///     in a state this check cannot speak to.
+///
+/// **Zero arms on disk is a correct state and must not fail.** That is a
+/// deliberate divergence from [`manifest_commits_contain_their_snapshots`],
+/// which hard-fails on `rows.is_empty()` because an empty MANIFEST is never
+/// right. Here the freeze lands one task before the first arm is written, so a
+/// hard-fail on an empty directory would be red for a whole task's worth of
+/// legitimate state — and a test that is red while nothing is wrong teaches
+/// people to ignore it. Do not "fix" this into hard-failing.
+///
+/// **It is still never vacuous**, because the first assertion does not depend on
+/// any arm existing: `FREEZE.md` must itself resolve to an introducing commit.
+/// That is a real fact about a real file, checked from the freeze task onward,
+/// and it is exactly the failure that would otherwise pass unnoticed — an
+/// uncommitted `FREEZE.md` makes every descent check below it unanswerable and
+/// the whole scheme silently inert. The anti-vacuity has to live in an
+/// assertion rather than a message because an `assert!` message is never
+/// printed on success.
+#[test]
+fn freeze_precedes_every_candidate_arm() {
+    // Same rule as every other check in this file that consults history: git's
+    // absence FAILS rather than skips, because a skip prints `ok` having
+    // verified nothing.
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no arm's position relative to the freeze can be verified"
+    );
+
+    let freeze = spec_length_freeze_path();
+    assert!(
+        freeze.is_file(),
+        "{} does not exist. It is the freeze record every candidate arm is ordered \
+         against; without it this check has nothing to compare to.",
+        freeze.display()
+    );
+    let freeze_commit = match introducing_commit(&freeze) {
+        Introduced::At(commit) => commit,
+        Introduced::NotCommitted => panic!(
+            "{} exists on disk but no commit introduces it.\n\n\
+             Every candidate arm is measured as a descendant of the freeze record's \
+             introducing commit, so an uncommitted freeze makes this check — and the \
+             ordering guarantee the whole spec-length A/B rests on — silently inert. \
+             Commit it before writing any arm text.",
+            freeze.display()
+        ),
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when {} was introduced: {how}\n\n\
+             This is NOT a finding about the freeze — it is this check reporting that it \
+             could not run. A check that cannot run must refuse rather than conclude.",
+            freeze.display()
+        ),
+    };
+
+    let mut violations = Vec::new();
+    let mut uncommitted = Vec::new();
+    let mut unreadable = Vec::new();
+    for (n, path) in spec_length_candidate_arms() {
+        let at = format!("arm `S{n}` (`{}`)", path.display());
+        let arm_commit = match introducing_commit(&path) {
+            Introduced::At(commit) => commit,
+            Introduced::NotCommitted => {
+                uncommitted.push(format!("  {at}: not yet committed — not verifiable"));
+                continue;
+            }
+            Introduced::Undetermined { how } => {
+                unreadable.push(format!("  {at}: {how}"));
+                continue;
+            }
+        };
+        match descends_from(&freeze_commit, &arm_commit) {
+            Descent::Yes => {}
+            Descent::No => violations.push(format!(
+                "  {at}: introduced by {}, which does NOT descend from the freeze commit {}",
+                arm_commit.as_str(),
+                freeze_commit.as_str(),
+            )),
+            Descent::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
+        }
+    }
+
+    // Reported before the other two, because it changes what they are worth: if
+    // any arm could not be read, this run did not verify the ordering, and
+    // listing the rest would imply they were the only problems.
+    assert!(
+        unreadable.is_empty(),
+        "{} candidate arm(s) could not be checked at all:\n{}\n\n\
+         This is NOT a finding about the arms — it is this check reporting that it could \
+         not run. Fix the environment and re-run; do not read a green elsewhere as a \
+         verdict on these.",
+        unreadable.len(),
+        unreadable.join("\n"),
+    );
+
+    assert!(
+        uncommitted.is_empty(),
+        "{} candidate arm(s) are on disk with no introducing commit:\n{}\n\n\
+         An arm that is not in history cannot be shown to postdate the freeze, so this \
+         check can say nothing about it — which is not the same as it being fine. Commit \
+         the arm (or delete the draft); do not leave it parked here.",
+        uncommitted.len(),
+        uncommitted.join("\n"),
+    );
+
+    assert!(
+        violations.is_empty(),
+        "{} candidate arm(s) predate the freeze record {}:\n{}\n\n\
+         The key-point ledger is derived from the CONTROL specs and frozen before any arm \
+         text exists. An arm written first — or a ledger revised once an arm's weaknesses \
+         were visible — is the experiment grading itself, and every measurement taken \
+         against it is void.",
+        violations.len(),
+        spec_length_freeze_path().display(),
+        violations.join("\n"),
+    );
+}
+
 /// A URL is an address, not a sentence.
 ///
 /// spec §10 requires drovr to cite its sources, and superpowers cites some of
