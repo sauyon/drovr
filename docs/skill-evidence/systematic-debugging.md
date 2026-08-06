@@ -887,11 +887,27 @@ question was asked as a genuine follow-up turn in all 12 sessions and answered i
 being scored are the ones the probes wrote before the question was asked. These are real
 measurements, not the by-rule `false` of a two-block transcript.
 
-**Three independent scenario pairs now agree on it** — `tdd`'s superseded pair, `tdd`'s rewritten
-pair, and this one. Criterion 4 is the one pass criterion **no arm meets on any instrument**, which
-is why the *all four* column is 0/4 everywhere in every stage. That makes it a finding about the
-criterion or the question rather than about any pair — `tdd.md` flags it as its open item 8, and
-this stage is the third agreeing measurement.
+**The corpus-wide count, taken from the files rather than from memory, is 0 of 60.** A draft of
+this paragraph said *"three independent scenario pairs now agree"*; there are **five**, and
+undercounting the agreement is as much a misstatement as overcounting it. Every scored A/A′/B stage
+in the corpus is `meta_test_clear` **0 of 12**, and every one asked the question as a genuine
+follow-up turn:
+
+| stage | pair | `meta_test_clear` |
+|---|---|---|
+| `ab-tdd` (Task 16) | `tdd` superseded | 0 / 12 |
+| `ab-systematic-debugging` (Task 17) | `systematic-debugging` superseded | 0 / 12 |
+| `ab-verification-before-completion` (Task 18) | `verification-before-completion` | 0 / 12 |
+| `remeasure-tdd` | `tdd` rewritten | 0 / 12 |
+| **this stage** | `systematic-debugging` rewritten | 0 / 12 |
+
+**Five stages, five distinct scenario pairs, 60 aided runs, zero passes.** The unaided and control
+stages are deliberately excluded — their `false` is by rule (no skill to ask about), so pooling them
+would inflate a real finding with a definitional one. Criterion 4 is the one pass criterion **no arm
+meets on any instrument**, which is why the *all four* column is 0/4 everywhere in every stage. That
+makes it a finding about the criterion or the question rather than about any pair — `tdd.md` flags
+it as its open item 8, and **five agreeing measurements is past the point where the pair can be
+blamed.**
 
 ### `new_rationalizations`, and the blind re-read
 
