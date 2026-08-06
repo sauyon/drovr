@@ -20,11 +20,18 @@
 //! - an **ask** record if it carries `question` — plus `id`, `seq`, and optionally
 //!   `context`, `options`, `recommend`. It never carries `answer` or `answered_at`.
 //! - an **answer** record if it carries `answer` — plus `id`, `seq`, `answered_at`, and
-//!   nothing else. Its `seq` is the `seq` of the ask it answers, not a line counter: that
-//!   is what makes the raw log, and not merely the folded view, reproducible.
+//!   nothing else. All four are required. Its `seq` is the `seq` of the ask it answers, not
+//!   a line counter: that is what makes the raw log, and not merely the folded view,
+//!   reproducible.
 //!
 //! A line carrying **both** (or neither) is malformed and is skipped, which keeps the
-//! discriminator unambiguous rather than resolving a contradiction silently.
+//! discriminator unambiguous rather than resolving a contradiction silently. That also
+//! catches the one mistake the shared [`Ask`] type invites: a serialized `Ask` carries
+//! `question` AND a null `answer`, so writing one into the log is rejected by the fold
+//! rather than quietly corrupting it.
+//!
+//! Hand-editing the log is therefore possible but exacting — a record missing a field its
+//! kind requires is dropped, silently, by design.
 //!
 //! # Reader semantics
 //!
@@ -48,13 +55,30 @@
 // nothing in here should be unreachable, and a fresh warning would be a real finding.
 #![allow(dead_code)]
 
+use crate::brief::MAX_CONTEXT;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The log's filename inside a run dir.
 pub const LOG_FILE: &str = "interview.jsonl";
+
+/// Cap on any single caller-supplied field — a question, a context, a recommendation, an
+/// option's value or label, an answer.
+///
+/// This is [`MAX_CONTEXT`] deliberately, not a second number: `drovr ask --context <file>`
+/// is the same class of input the brief cap already governs, and two limits for one kind of
+/// text is how they drift apart.
+pub const MAX_FIELD: u64 = MAX_CONTEXT;
+
+/// Cap on the whole log. Only drovr writes it, and each record is bounded by [`MAX_FIELD`],
+/// so reaching this needs either a pathological interview or a hand-planted file — and past
+/// it, every [`read`] would slurp the lot, on every append.
+///
+/// Over the cap is an ERROR, not a truncated read: silently dropping the tail of an
+/// append-only log would lose exactly the answers the log exists to keep.
+pub const MAX_LOG: u64 = 16 << 20;
 
 /// One selectable answer: the `value` recorded if it is chosen, and the `label` shown.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -92,12 +116,28 @@ pub fn log_path(run_dir: &Path) -> PathBuf {
 /// A malformed line is SKIPPED, not fatal. Missing file => `Ok(vec![])`; any other IO
 /// error propagates, because an unreadable-but-present log is a real failure and
 /// reporting it as "no questions" would silently lose the interview.
+///
+/// A symlink, a non-regular file, or a log over [`MAX_LOG`] is refused — see
+/// [`open_no_follow`].
 pub fn read(run_dir: &Path) -> io::Result<Vec<Ask>> {
-    let raw = match std::fs::read_to_string(log_path(run_dir)) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let path = log_path(run_dir);
+    let file = match open_no_follow(&path)? {
+        Some(f) => f,
+        None => return Ok(Vec::new()),
     };
+    // Bound the READ, not just the metadata check: the file can grow between the two, so a
+    // metadata-only cap is a TOCTOU that lets an oversized log through.
+    let mut raw = String::new();
+    file.take(MAX_LOG + 1).read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_LOG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past the {MAX_LOG}-byte interview-log limit while being read",
+                path.display()
+            ),
+        ));
+    }
 
     let mut asks: Vec<Ask> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
@@ -121,7 +161,7 @@ pub fn read(run_dir: &Path) -> io::Result<Vec<Ask>> {
             }) => {
                 if let Some(&i) = at.get(&id) {
                     asks[i].answer = Some(answer);
-                    asks[i].answered_at = answered_at;
+                    asks[i].answered_at = Some(answered_at);
                 }
             }
             None => continue,
@@ -139,7 +179,7 @@ enum Record {
     Answer {
         id: String,
         answer: String,
-        answered_at: Option<String>,
+        answered_at: String,
     },
 }
 
@@ -162,10 +202,14 @@ fn parse_record(line: &str) -> Option<Record> {
     let seq = u32::try_from(obj.get("seq")?.as_u64()?).ok()?;
 
     match (obj.contains_key("question"), obj.contains_key("answer")) {
+        // `answered_at` is REQUIRED, not optional: [`append_answer`] always writes it, so
+        // accepting a record without one would only admit a hand-edited line — at the cost
+        // of making `answer: Some(_)` with `answered_at: None` representable in a folded
+        // [`Ask`], an inconsistency nothing downstream should have to reason about.
         (false, true) => Some(Record::Answer {
             id: id.to_string(),
             answer: obj.get("answer")?.as_str()?.to_string(),
-            answered_at: opt_str(obj.get("answered_at"))?,
+            answered_at: obj.get("answered_at")?.as_str()?.to_string(),
         }),
         (true, false) => {
             let options = match obj.get("options") {
@@ -207,13 +251,85 @@ fn opt_str(v: Option<&serde_json::Value>) -> Option<Option<String>> {
     }
 }
 
-/// Append one line. `O_APPEND` + a single `write_all` — never a truncating open.
+/// Open the log for reading, refusing to follow a symlink and refusing anything that is
+/// not a regular file of at most [`MAX_LOG`] bytes. `Ok(None)` if it does not exist.
+///
+/// The same hardening `brief::read_record_no_follow` carries, and for the same reasons: a
+/// link planted at the path would make drovr read (or, at [`append_line`], write) an
+/// arbitrary file; a FIFO passes a symlink check and then blocks the reader forever. There
+/// is no `O_NOFOLLOW` in std, so this is a `symlink_metadata` check — racy in principle,
+/// decisive against a planted link in practice, and the run dir is not a contested
+/// directory. Same mechanism, same caveat as `brief::read_record_no_follow`; keep them
+/// together if either changes.
+fn open_no_follow(path: &Path) -> io::Result<Option<std::fs::File>> {
+    match check_no_follow(path)? {
+        Some(()) => Ok(Some(std::fs::File::open(path)?)),
+        None => Ok(None),
+    }
+}
+
+/// The metadata half of [`open_no_follow`]: `Ok(None)` if absent, `Ok(Some(()))` if it is a
+/// regular file within [`MAX_LOG`], `Err` otherwise. Split out because the append path
+/// needs the check without the read-only handle.
+fn check_no_follow(path: &Path) -> io::Result<Option<()>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is a symlink; refusing to read or append the interview through it",
+                path.display()
+            ),
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a regular file; refusing to use it as the interview log",
+                path.display()
+            ),
+        ));
+    }
+    if meta.len() > MAX_LOG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, over the {MAX_LOG}-byte interview-log limit",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    Ok(Some(()))
+}
+
+/// Append one line. `O_APPEND` + a single `write_all` — never a truncating open, and never
+/// through a symlink ([`check_no_follow`] runs first, so a planted link is refused rather
+/// than written through).
 fn append_line(run_dir: &Path, line: &str) -> io::Result<()> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path(run_dir))?;
+    let path = log_path(run_dir);
+    check_no_follow(&path)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     f.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Reject a caller-supplied field over [`MAX_FIELD`]. Named, so the error says which one.
+fn check_field(name: &str, text: &str) -> io::Result<()> {
+    if text.len() as u64 > MAX_FIELD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "interview {name} is {} bytes, over the {MAX_FIELD}-byte limit",
+                text.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Append an ask record; returns the assigned [`Ask`] (id + seq).
@@ -221,7 +337,9 @@ fn append_line(run_dir: &Path, line: &str) -> io::Result<()> {
 /// `seq` is the count of existing ask records (0-based) and `id` is `ask-<seq>`, so ids
 /// are unique under the single-writer discipline and are `safe_component`-clean.
 /// A blank `question` is rejected with `ErrorKind::InvalidInput`: an unanswerable record
-/// is worse than an error, because it occupies a `seq` and renders as an empty prompt.
+/// is worse than an error, because it occupies a `seq` and renders as an empty prompt. So
+/// is any field over [`MAX_FIELD`] — the log is append-only, so an oversized record is
+/// permanent, and every later `read` pays for it.
 pub fn append_ask(
     run_dir: &Path,
     question: &str,
@@ -234,6 +352,17 @@ pub fn append_ask(
             io::ErrorKind::InvalidInput,
             "drovr ask: --question is empty",
         ));
+    }
+    check_field("question", question)?;
+    if let Some(c) = context {
+        check_field("context", c)?;
+    }
+    if let Some(r) = recommend {
+        check_field("recommend", r)?;
+    }
+    for o in options {
+        check_field("option value", &o.value)?;
+        check_field("option label", &o.label)?;
     }
 
     let existing = read(run_dir)?;
@@ -286,8 +415,10 @@ pub fn append_ask(
 /// disk and stay there.
 ///
 /// An empty `answer` is accepted: "I have nothing to add" is a decision the human is
-/// entitled to make, and the fold treats the id as answered from then on.
+/// entitled to make, and the fold treats the id as answered from then on. One over
+/// [`MAX_FIELD`] is not, for the reason in [`append_ask`].
 pub fn append_answer(run_dir: &Path, id: &str, answer: &str) -> io::Result<()> {
+    check_field("answer", answer)?;
     let asks = read(run_dir)?;
     let ask = asks.iter().find(|a| a.id == id).ok_or_else(|| {
         io::Error::new(
@@ -648,6 +779,86 @@ mod tests {
         assert!(rec["answer"].is_null());
         assert!(rec["answered_at"].is_null());
         assert_eq!(rec["options"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_answer_without_a_timestamp_is_skipped() {
+        // Keeps `answer.is_some() <=> answered_at.is_some()` true for every folded Ask.
+        let d = tempfile::tempdir().unwrap();
+        append_ask(d.path(), "q?", None, &[], None).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(log_path(d.path()))
+            .unwrap();
+        f.write_all(b"{\"id\":\"ask-0\",\"seq\":0,\"answer\":\"untimed\"}\n")
+            .unwrap();
+        drop(f);
+
+        let folded = read(d.path()).unwrap();
+        assert_eq!(folded[0].answer, None, "{folded:?}");
+        assert_eq!(folded[0].answered_at, None);
+        assert_eq!(pending(&folded), vec!["ask-0"], "still pending");
+    }
+
+    #[test]
+    fn a_wire_shaped_ask_is_not_a_valid_log_line() {
+        // The one mistake the shared `Ask` type invites: serializing the wire view back
+        // into the log. It carries `question` and a null `answer`, so the fold rejects it.
+        let d = tempfile::tempdir().unwrap();
+        let ask = append_ask(d.path(), "real?", None, &[], None).unwrap();
+        let mut wire = ask.clone();
+        wire.id = "ask-1".into();
+        wire.seq = 1;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(log_path(d.path()))
+            .unwrap();
+        f.write_all(format!("{}\n", serde_json::to_string(&wire).unwrap()).as_bytes())
+            .unwrap();
+        drop(f);
+
+        let folded = read(d.path()).unwrap();
+        assert_eq!(
+            folded.len(),
+            1,
+            "the wire-shaped line is skipped: {folded:?}"
+        );
+        assert_eq!(folded[0].id, "ask-0");
+    }
+
+    #[test]
+    fn a_symlinked_log_is_refused_by_both_read_and_append() {
+        // A link planted at the path would make an append write through to its target.
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("elsewhere.txt");
+        fs::write(&target, "secrets\n").unwrap();
+        let run = d.path().join("run");
+        fs::create_dir(&run).unwrap();
+        std::os::unix::fs::symlink(&target, log_path(&run)).unwrap();
+
+        let read_err = read(&run).expect_err("read through a symlink");
+        assert_eq!(read_err.kind(), io::ErrorKind::InvalidData, "{read_err}");
+        let write_err = append_ask(&run, "q?", None, &[], None).expect_err("append");
+        assert_eq!(write_err.kind(), io::ErrorKind::InvalidData, "{write_err}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "secrets\n",
+            "the link's target was not written through"
+        );
+    }
+
+    #[test]
+    fn an_oversized_field_is_refused_rather_than_appended_forever() {
+        let d = tempfile::tempdir().unwrap();
+        let huge = "x".repeat(MAX_FIELD as usize + 1);
+        let err = append_ask(d.path(), &huge, None, &[], None).expect_err("oversized");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(!log_path(d.path()).exists(), "nothing was appended");
+
+        let ask = append_ask(d.path(), "q?", None, &[], None).unwrap();
+        let err = append_answer(d.path(), &ask.id, &huge).expect_err("oversized answer");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(read_lines(d.path()).len(), 1, "still just the ask");
     }
 
     #[test]
