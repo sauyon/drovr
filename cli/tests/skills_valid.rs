@@ -2498,6 +2498,29 @@ fn parse_scenario(stem: &str, contents: &str) -> Result<Scenario, String> {
     })
 }
 
+/// The `n` the development scenario carries, and the two the held-out pair does.
+///
+/// **The split is positional, and until now only half of that was enforced.**
+/// `check_scenario_corpus` counted one `dev` and two `holdout` per skill and
+/// never asked which number carried which, while [`parse_held_out_bodies`] reads
+/// the pair as `{skill}-2` and `{skill}-3` — a numbering, not a tag lookup. So a
+/// file tagged `holdout` at `n: 1` (with `dev` at `n: 2`) satisfied the count
+/// while moving the held-out pair onto files nobody intended: the corpus check
+/// passes, the provenance guard resolves the wrong pair, and a measurement runs,
+/// scores and reports against different scenarios than the report names, with
+/// nothing red anywhere. One fact, in one place, so the two cannot disagree.
+const DEV_SCENARIO_N: u32 = 1;
+const HELD_OUT_NS: [u32; 2] = [2, 3];
+
+/// Which tag `n` must carry in the numbered class.
+fn tag_for_n(n: u32) -> Tag {
+    if n == DEV_SCENARIO_N {
+        Tag::Dev
+    } else {
+        Tag::Holdout
+    }
+}
+
 /// Corpus-level rules: the count, and the development/held-out split.
 ///
 /// Takes `(stem, contents)` pairs rather than reading the directory, so every
@@ -2533,6 +2556,27 @@ fn check_scenario_corpus(files: &[(String, String)]) -> Result<(), String> {
                 "`{skill}` has {dev} dev and {holdout} holdout scenario(s); §7.3's held-out design \
                  requires exactly 1 and 2. Authoring against a scenario that then grades the text \
                  makes the pass bar unfailable"
+            ));
+        }
+
+        // The counts being right does not make the *positions* right, and the
+        // held-out pair is resolved by number elsewhere (`parse_held_out_bodies`),
+        // never by tag. A corpus with `holdout` at n=1 and `dev` at n=2 satisfies
+        // the counts above and silently redirects every held-out run.
+        let mut actual: Vec<(u32, Tag)> = numbered.iter().map(|s| (s.n, s.tag)).collect();
+        actual.sort_by_key(|(n, _)| *n);
+        let expected: Vec<(u32, Tag)> = std::iter::once(DEV_SCENARIO_N)
+            .chain(HELD_OUT_NS)
+            .map(|n| (n, tag_for_n(n)))
+            .collect();
+        if actual != expected {
+            let skill = skill.as_str();
+            return Err(format!(
+                "`{skill}` numbers its scenarios {actual:?}, and plan §1.2 fixes them at \
+                 {expected:?}. The split is positional: `n: {DEV_SCENARIO_N}` is the development \
+                 scenario and `n:` {HELD_OUT_NS:?} are the held-out pair, because that pair is \
+                 resolved by number and not by tag. A tag that disagrees with its number moves \
+                 the measurement onto files nobody chose, and nothing else would fail"
             ));
         }
     }
@@ -3048,6 +3092,13 @@ fn scenario_corpus_requires_one_dev_and_two_holdout() {
     let err =
         check_scenario_corpus(&mistagged).expect_err("a dev-tagged noskill file must be rejected");
     assert!(err.contains("must be tagged `holdout`"), "got: {err}");
+
+    // The counts are right here and the positions are not: one `dev`, two
+    // `holdout`, with the `dev` at n=2. `parse_held_out_bodies` would resolve
+    // the pair as `-2` and `-3` and read the development scenario as half of it.
+    let err = check_scenario_corpus(&full(["holdout", "dev", "holdout"]))
+        .expect_err("a dev scenario at n=2 must be rejected even though the counts add up");
+    assert!(err.contains("The split is positional"), "got: {err}");
 }
 
 /// plan §1.2's corpus, checked against the schema above.
@@ -3224,9 +3275,10 @@ impl HeldOutBodies {
     /// The pair as `(scenario stem, row)`, in plan §1.2 order. The stem is
     /// derived here, once, from the skill the pair was parsed for.
     fn pair(&self) -> [(String, &HeldOutBody); 2] {
+        let [second, third] = HELD_OUT_NS;
         [
-            (format!("{}-2", self.skill.as_str()), &self.second),
-            (format!("{}-3", self.skill.as_str()), &self.third),
+            (format!("{}-{second}", self.skill.as_str()), &self.second),
+            (format!("{}-{third}", self.skill.as_str()), &self.third),
         ]
     }
 }
@@ -3282,8 +3334,13 @@ fn held_out_body_rows(contents: &str) -> Result<Vec<(String, HeldOutBody)>, Stri
 /// The held-out pair `skill`'s evidence file records, or why it is not a pair.
 fn parse_held_out_bodies(contents: &str, skill: SkillName) -> Result<HeldOutBodies, String> {
     let rows = held_out_body_rows(contents)?;
-    let found: Vec<&str> = rows.iter().map(|(stem, _)| stem.as_str()).collect();
-    let expected = [format!("{}-2", skill.as_str()), format!("{}-3", skill.as_str())];
+    let found: Vec<String> = rows.iter().map(|(stem, _)| stem.clone()).collect();
+    // The same `HELD_OUT_NS` the corpus check binds tags to, so "which files are
+    // the held-out pair" is one fact rather than two that can drift apart.
+    let expected: Vec<String> = HELD_OUT_NS
+        .iter()
+        .map(|n| format!("{}-{n}", skill.as_str()))
+        .collect();
     if found != expected {
         return Err(format!(
             "held-out rows are {found:?}, and plan §1.2's pair is {expected:?} in that order. \
