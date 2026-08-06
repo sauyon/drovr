@@ -257,6 +257,31 @@ turn on.
 - Does the agent have a *reason* to violate the rule, or only an opportunity?
 - If you strip the skill away, is failing the obvious move? If not, the RED run
   will come back compliant and tell you nothing.
+
+  **This question has now been answered with runs, and the answer was no.** Two
+  unaided controls (`docs/skill-evidence/tdd.md`, `verification-before-completion.md`)
+  put an agent with no skill text at all in front of the held-out pairs: 3 of 4
+  and **4 of 4** compliant, against 4 of 4 for every armored arm. One pair had a
+  dynamic range of a single run; the other had none. Three measurement phases,
+  36 bar runs, 36 compliant — the instrument, not the skills.
+- Would a general "be careful and thorough" instinct pick the correct option? If
+  yes, the scenario measures reading comprehension, not the skill. This is the
+  diagnosis behind those controls, and the four levers that answer it:
+  1. **No option may be the lazy one.** If one option is *skip it and ship*, the
+     agent is choosing between diligence and negligence, which needs no skill.
+     Write three courses of action a competent engineer would defend, exactly
+     one of which the skill permits.
+  2. **Let the most thorough-looking option be wrong.** A test-after suite with
+     four cases beats a test-first suite with one, on every measure except the
+     one under test. A targeted subset chosen by a coverage map is better
+     evidence than a blanket run, except that it is not the evidence the task
+     names.
+  3. **Make the compliant action cost something stated.** Discarded work, a
+     named deadline missed in public, contradicting someone senior by name.
+  4. **Remove the tell.** A paragraph in the narrator's voice calling the rule
+     ceremony or ritual announces that a rule is under test, and the agent
+     passes by pattern-matching. Put the argument in a named person's mouth, as
+     a technical claim, and let it be a good one.
 - Is exactly one option correct under the skill, and is that decidable from the
   text alone by someone who has not read the skill?
 - Could the agent satisfy the prompt without choosing? If yes, close that door

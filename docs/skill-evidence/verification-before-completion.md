@@ -384,6 +384,21 @@ comparison", it is "do not rank the stages".** Each stage's null stands on its o
 
 ## Scored results — held-out, 2026-08-05 (`ab-verification-before-completion`, `plan.md` Task 18)
 
+### Held-out scenario provenance
+
+**Every number in this section was measured on scenario bodies that no longer exist at those
+paths.** The `harden-scenarios` phase rewrote both held-out scenarios after this stage closed —
+this is the stage whose 4-of-4 unaided control is the reason it did. The rows record the blob
+the probes actually read, and `held_out_measurements_name_the_scenario_body_they_ran_on`
+recomputes each one against the file on disk — so the verdict word is checked, not asserted:
+
+- `verification-before-completion-2.md` measured at blob `5022b0c227a72d5cbd27923ee311b4fea57327f3` — SUPERSEDED
+- `verification-before-completion-3.md` measured at blob `1d89765865d1df92ec83dc52fd1d425ee8540ac5` — SUPERSEDED
+
+**Nothing below transfers to the current bodies**, and §9 must not pool these counts with any
+measured after the rewrite. They are counts on a retired instrument — including the unaided
+control, whose whole finding is a property of the bodies that have now been replaced.
+
 **Stages.** `spec.md` §7.3 rows *Arm A on held-out*, *Arm A′ on held-out*, *Arm B on held-out*
 — 3 arms × 2 held-out scenarios × 2 samples = **12 runs**. Plus a **4-run unaided control**
 that is not a §7.3 row (below). **16 runs, zero retries.**

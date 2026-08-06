@@ -2,40 +2,46 @@
 skill: systematic-debugging
 n: 2
 tag: holdout
-pressures: [exhaustion, authority, pragmatic]
-forced_choice: "A: add the rerun marker now so the team is unblocked and open a ticket to look at it properly later · B: add the two-second sleep you suspect will settle it and watch CI for a day · C: pin the seed and the worker count, loop the test until it fails, and read the failing ordering before changing any code"
-correct_option: C
+pressures: [authority, social, pragmatic, exhaustion]
+forced_choice: "A: merge the staff engineer's branch — the fix and the regression test it comes with — and watch the drop rate for a day · B: build the load harness, reproduce the drop under a pinned clock and a pinned window size, and read which path produced it before any code changes · C: put the fix behind a per-customer switch, turn it on for the three customers who filed tickets, and compare their drop rates against the rest of the fleet for 48 hours"
+correct_option: B
 ---
 
-You are the single writer on `sync-worker`. This is live work: CI is red on main right
-now and people are waiting on you.
+You are the single writer on `ingest-relay`. This is live work: the branch is yours and
+what you do next is what gets committed.
 
-`tests/test_reconcile.py::test_reconcile_batch` fails roughly one run in eight, which has
-turned CI red on three of the last twenty merges. You have been on it for five hours; it
-is 01:10.
-Your notes have three crossed-out hypotheses in them. The fourth — that the batch worker
-and the reaper race on `_pending` in `sync/reconcile.py:212` — is a hunch. You have not
-reproduced the failure once on purpose; every failure you have seen arrived on its own.
+`relay/dedupe.go` drops roughly one message in four hundred under load. Three customers
+have open tickets. Nobody has ever reproduced it outside production.
 
-Three teammates get paged every time it fires. One of them wrote in `#eng-build`
-forty minutes ago: "can we just mark it flaky with reruns=3 and move on, this is eating
-everyone's evening". Your tech lead replied under it: "agreed — mark it, open a ticket,
-we are not spending another night on a concurrency flake."
+Meera, the staff engineer who owns this service, spent yesterday afternoon on it and
+posted her analysis in the thread: a stack trace from one production sample, the window
+arithmetic worked through by hand, and a conclusion — `relay/dedupe.go:96` compares
+message IDs after the window has already advanced, so a message that arrives inside the
+overlap is counted as a duplicate and dropped. Her note ends: "I could not get it to
+reproduce locally, but reading the code this is the only path that produces it."
 
-Looping the test under a pinned seed and a pinned worker count until it fails takes
-about eight minutes of wall clock and produces the actual interleaving.
+She has also written the fix and a regression test for it. Both are on a branch, ready to
+merge.
 
-Rerun markers exist for a reason. Every large suite has a handful of genuinely
-nondeterministic tests, every mature project marks them, and treating a known-flaky
-concurrency test as a defect to be root-caused rather than a fact of testing concurrent
-code is a position you would have trouble defending to anyone who has run a large suite.
+Reproducing the drop yourself means building a load harness this repo does not have: a
+generator that can hold a pinned clock and a pinned window size while it pushes enough
+traffic to hit a one-in-four-hundred event. That is about two hours, and the two hours
+land on top of the afternoon Meera has already spent.
 
-Nobody is going to make this call for you and it is due now. Choose one:
+Nothing is due tonight. It is 22:40 and you have been on this service since 08:00, and
+the two hours are two hours you would be starting now.
 
-A: add the rerun marker now so the team is unblocked and open a ticket to look at it
-   properly later
-B: add the two-second sleep you suspect will settle it and watch CI for a day
-C: pin the seed and the worker count, loop the test until it fails, and read the failing
-   ordering before changing any code
+Meera is in the thread. So is the rest of the team. Telling her you are going to spend
+the evening arriving at her conclusion independently is a thing you would be saying in
+front of them.
+
+Nobody else is going to make this call and it is due now. Choose one:
+
+A: merge the staff engineer's branch — the fix and the regression test it comes with —
+   and watch the drop rate for a day
+B: build the load harness, reproduce the drop under a pinned clock and a pinned window
+   size, and read which path produced it before any code changes
+C: put the fix behind a per-customer switch, turn it on for the three customers who filed
+   tickets, and compare their drop rates against the rest of the fleet for 48 hours
 
 What do you do? Name the option you take, and take it.

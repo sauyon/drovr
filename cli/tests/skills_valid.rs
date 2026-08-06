@@ -3115,6 +3115,163 @@ fn scenarios_are_well_formed() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A scored held-out stage names the scenario body it ran on
+// ---------------------------------------------------------------------------
+
+/// The skills whose evidence file carries a scored held-out stage.
+///
+/// `code-review` and `using-drovr` are absent because their `## Scored results`
+/// sections read *"Not yet run"* — there is no count yet to attach a body to. A
+/// skill that gains one has to gain its provenance rows in the same phase, and
+/// adding its name here is what makes that fail rather than pass quietly.
+const SKILLS_WITH_HELD_OUT_SCORES: &[&str] = &[
+    "tdd",
+    "systematic-debugging",
+    "verification-before-completion",
+];
+
+/// One held-out provenance row: which blob a recorded measurement read.
+struct ProvenanceRow {
+    stem: String,
+    hash: GitObjectId,
+    verdict: String,
+}
+
+/// The two words a provenance row may end in.
+const PROVENANCE_VERDICTS: &[&str] = &["CURRENT", "SUPERSEDED"];
+
+/// Parse `- `<stem>.md` measured at blob `<sha>` — <VERDICT>` lines.
+///
+/// Lines that do not carry the `measured at blob` marker are skipped rather than
+/// rejected: every evidence file is full of ordinary backticked bullets, and a
+/// parser that tried to claim them would make prose an error. Once a line *does*
+/// carry the marker, every remaining part of it is required — a half-formed row
+/// is a row nobody checks, which is the shape of defect this whole record exists
+/// to stop.
+fn parse_provenance_rows(contents: &str) -> Result<Vec<ProvenanceRow>, String> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let Some(rest) = line.trim().strip_prefix("- `") else {
+            continue;
+        };
+        let Some((stem_md, rest)) = rest.split_once('`') else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(" measured at blob `") else {
+            continue;
+        };
+        let (raw_hash, tail) = rest
+            .split_once('`')
+            .ok_or_else(|| format!("blob id is never closed: {line}"))?;
+        let stem = stem_md
+            .strip_suffix(".md")
+            .ok_or_else(|| format!("`{stem_md}` is not a `<stem>.md`: {line}"))?;
+        let verdict = tail.trim().trim_start_matches('—').trim();
+        if !PROVENANCE_VERDICTS.contains(&verdict) {
+            return Err(format!(
+                "verdict `{verdict}` must be one of {PROVENANCE_VERDICTS:?}: {line}"
+            ));
+        }
+        out.push(ProvenanceRow {
+            stem: stem.to_string(),
+            hash: GitObjectId::parse(raw_hash)?,
+            verdict: verdict.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+#[test]
+fn provenance_rows_are_parsed_and_their_verdict_is_closed() {
+    let good = "prose about `tdd-2.md` that is not a row\n\
+                - `tdd-2.md` measured at blob `b8b4b71709bfc022c58b73b1d256d88938db5993` — SUPERSEDED\n\
+                - some other bullet\n\
+                - `tdd-3.md` measured at blob `7bc482a72cdf9747b57473e0360de98c3d4b567c` — CURRENT\n";
+    let rows = parse_provenance_rows(good).expect("both rows parse, prose is skipped");
+    assert_eq!(rows.len(), 2, "prose and unrelated bullets are not rows");
+    assert_eq!(rows[0].stem, "tdd-2");
+    assert_eq!(rows[1].verdict, "CURRENT");
+
+    let bad_verdict = good.replace("— SUPERSEDED", "— probably fine");
+    assert!(
+        parse_provenance_rows(&bad_verdict).is_err(),
+        "the verdict is a closed set; free text would make the check unfalsifiable"
+    );
+
+    let short_hash = good.replace("b8b4b71709bfc022c58b73b1d256d88938db5993", "b8b4b71");
+    assert!(
+        parse_provenance_rows(&short_hash).is_err(),
+        "an abbreviated blob id cannot be compared against `git hash-object` output"
+    );
+}
+
+/// A recorded held-out count must name the scenario text it was measured on, and
+/// say whether that text is still the text on disk.
+///
+/// The `harden-scenarios` phase rewrote all ten held-out scenario bodies after
+/// three stages had already scored against them. Nothing in this repo tied a
+/// recorded count to the body it came from, so those numbers and any measured
+/// after the rewrite would pool into §9 as if they were one instrument. This
+/// makes the question computable: the row records the blob the probes read, and
+/// the verdict word is **recomputed here** rather than trusted, so a later phase
+/// that re-measures on the current bodies — or one that reverts them — is told
+/// its note is now wrong instead of discovering it in the write-up.
+#[test]
+fn held_out_measurements_name_the_scenario_body_they_ran_on() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, and the provenance rows are `git hash-object` blob SHAs. \
+         Skipping would turn this into a check that passes when it cannot run"
+    );
+    let evidence = evidence_dir();
+    let scenarios = scenarios_dir();
+
+    for skill in SKILLS_WITH_HELD_OUT_SCORES {
+        let path = evidence.join(format!("{skill}.md"));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let rows = parse_provenance_rows(&contents)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+        // The held-out pair is `-2` and `-3` for every skill (plan §1.2), so
+        // both rows are required and their order is the pair's order — a file
+        // that records one of the two is a file whose other count is unattached.
+        let found: Vec<&str> = rows.iter().map(|r| r.stem.as_str()).collect();
+        let expected = [format!("{skill}-2"), format!("{skill}-3")];
+        assert_eq!(
+            found, expected,
+            "{} must carry one provenance row per held-out scenario, in order. A scored \
+             held-out stage whose scenario body is not named is a count that cannot be \
+             compared against any later one",
+            path.display()
+        );
+
+        for row in &rows {
+            let file = scenarios.join(format!("{}.md", row.stem));
+            let current = git_hash_object(&file);
+            let computed = if current.as_str() == row.hash.as_str() {
+                "CURRENT"
+            } else {
+                "SUPERSEDED"
+            };
+            assert_eq!(
+                row.verdict,
+                computed,
+                "{} says `{}.md` is {} at blob {}, but {} now hashes to {}. The verdict is \
+                 recomputed, not read: fix the row, and do not pool counts across a change of \
+                 body",
+                path.display(),
+                row.stem,
+                row.verdict,
+                row.hash.as_str(),
+                file.display(),
+                current.as_str()
+            );
+        }
+    }
+}
+
 #[test]
 fn all_skills_have_valid_frontmatter() {
     let dir = skills_dir();

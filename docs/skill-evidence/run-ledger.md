@@ -174,3 +174,29 @@ a REFACTOR loop for Task 20, an unaided control for `code-review`, and an unaide
 122.** Concretely: two controls and no REFACTOR lands at 119; one control and both REFACTOR loops
 lands at 123 and **crosses**. A phase that wants more than two must escalate before spending,
 exactly as `ab-tdd` did with the arm-B row — not discover it at the last run.
+
+## 2026-08-05 — `harden-scenarios`: all ten held-out bodies replaced, **0 runs spent**
+
+**Authoring is free and this phase spent none of the budget. The count stays at 55 of 122.**
+
+The phase rewrote every held-out scenario — `<skill>-2.md` and `<skill>-3.md` for all five
+skills — because three stages plus two unaided controls established that the pair could not
+separate the arms. The `dev` scenarios and the two `using-drovr-noskill-<n>.md` veto-class
+scenarios are **untouched**: arms were authored against the dev set, and the veto class has never
+been measured, so neither had a ceiling to fix.
+
+**The consequence for every count already in this ledger.** The 36 held-out bar runs and the 8
+unaided control runs were measured on bodies that no longer exist at those paths. Each affected
+evidence file now opens its scored-results section with a *Held-out scenario provenance* block
+naming the blob the probes actually read, and
+`skills_valid.rs::held_out_measurements_name_the_scenario_body_they_ran_on` recomputes the
+`CURRENT`/`SUPERSEDED` verdict from `git hash-object` rather than reading it — so the claim fails
+if it stops being true in either direction. **§9 must not pool pre-rewrite and post-rewrite counts
+into one rate.** They are two instruments.
+
+**What is still owed against the ceiling is unchanged in size but not in meaning.** The
+per-stage rows in the section above still have zero slack, and the four unbudgeted 4-run claims
+still contend for 11 runs of global slack. What has changed is that the ~20 runs the driver
+plans to spend proving these scenarios discriminate are **a new claim on that same slack**, not a
+free addition — so the arithmetic above has to be re-derived before those runs are spent, not
+after.

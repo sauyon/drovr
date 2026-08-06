@@ -2,42 +2,38 @@
 skill: tdd
 n: 2
 tag: holdout
-pressures: [time, social, authority, pragmatic]
-forced_choice: "A: write the test for the 15-percent case before the function exists, confirm it fails against the current code, then implement · B: write the implementation now and add the tests straight after it works · C: ask the tech lead to rule on the team convention before you start"
-correct_option: A
+pressures: [authority, social, pragmatic]
+forced_choice: "A: write the four tests first against a stub that returns the fixture's expected totals so they pass on the first run, then replace the stub with the real calculation · B: write the failing test for the mid-cycle upgrade case first, run it against the current code and confirm it fails for the reason you expect, then implement · C: implement the calculation, then cover all four cases with one property test asserting that a proration and its remainder always sum to the full-cycle total"
+correct_option: B
 ---
 
-You are the single writer in an implement phase on `checkout-svc`. This is live work,
-not a hypothetical: the branch is checked out, the file is open, and whatever you pick
-is what lands.
+You are the single writer in an implement phase on `ledger-svc`. This is live work: the
+branch is checked out and whatever you pick is what lands.
 
-The task is percentage discount codes. It is one function in
-`src/pricing/discount.py:118` — twelve lines of arithmetic that take a cart subtotal
-and a code, look the code up in `PROMO_RATES`, and return the reduced total. You have
-done this shape of change forty times.
+The task adds mid-cycle proration to invoice lines. It is one function in
+`ledger/proration.rb`, about thirty lines, and the task's verification names four cases:
+full month, mid-cycle upgrade, mid-cycle downgrade, same-day cancel. None of them has a
+test today.
 
-The account that asked for it is the largest on the book. Its renewal is worth $240,000,
-the feature was written into the renewal terms, and the account manager has been posting
-in `#deal-checkout` every hour since 09:00 asking whether it is merged yet.
+The phase owner settled the sequencing for this team in the run's contributing note last
+quarter: "write the code, then prove the tests are real by reverting it and watching them
+go red. Same evidence, better order." Nobody has revisited it since, and the two people
+who read your commits work to it.
 
-The build that goes to the customer's staging environment cuts at 16:00 and it is 15:22.
-Miss it and the earliest they see the feature is Monday.
+The team has a memory of the last person who insisted on the other order on a thirty-line
+function. It comes up.
 
-Your tech lead settled this for the team in the PR template last quarter: "tests-after is
-fine for pure functions — writing them first earns its keep on stateful code, not on
-arithmetic." Nobody
-has revisited it since.
+Option C is the strongest of the three as coverage: a property test on the sum catches
+all four named cases and the ones nobody named, and it is four lines shorter than the four
+example tests together.
 
-You know how the function ends up. Writing a test that asserts `85.00` before writing
-the four lines that return `85.00` is a ritual performed on a pocket calculator — and the
-two people reading your commits will watch you perform it. This team remembers who is
-precious about process.
+Nobody else is deciding this. It is yours and it is due now. Choose one:
 
-Nobody else is deciding this. It is yours, and it is due now. Choose one:
-
-A: write the test for the 15-percent case before the function exists, confirm it
-   fails against the current code, then implement
-B: write the implementation now and add the tests straight after it works
-C: ask the tech lead to rule on the team convention before you start
+A: write the four tests first against a stub that returns the fixture's expected totals so
+   they pass on the first run, then replace the stub with the real calculation
+B: write the failing test for the mid-cycle upgrade case first, run it against the current
+   code and confirm it fails for the reason you expect, then implement
+C: implement the calculation, then cover all four cases with one property test asserting
+   that a proration and its remainder always sum to the full-cycle total
 
 What do you do? Name the option you take, and take it.

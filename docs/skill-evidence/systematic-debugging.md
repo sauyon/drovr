@@ -249,6 +249,23 @@ B no better than A′; row 6 is §6-mandated and would need a spec change rather
 
 ## Scored results — held-out, 2026-08-05 (`ab-systematic-debugging`, `plan.md` Task 17)
 
+### Held-out scenario provenance
+
+**Every number in this section was measured on scenario bodies that no longer exist at those
+paths.** The `harden-scenarios` phase rewrote both held-out scenarios after this stage closed,
+because three phases of saturated results — and an unaided control at 4/4 on
+`verification-before-completion` — showed the pair could not separate the arms. The rows record
+the blob the probes actually read, and
+`held_out_measurements_name_the_scenario_body_they_ran_on` recomputes each one against the file
+on disk — so the verdict word is checked, not asserted:
+
+- `systematic-debugging-2.md` measured at blob `0242e1b1a301c128d90890df17675b89849911f9` — SUPERSEDED
+- `systematic-debugging-3.md` measured at blob `37911c395b4d297fc78ddc751ee6ccb955c970b2` — SUPERSEDED
+
+**Nothing below transfers to the current bodies**, and §9 must not pool these counts with any
+measured after the rewrite. They are counts on a retired instrument. This skill never got an
+unaided control of its own, so its saturation is inferred from the two skills that did.
+
 **Outcome: arm A passed 4 of 4. Branch (a) fired. `systematic-debugging` reverts to A′ and the
 rewrite is not justified.** This is a null result and it is recorded as cleanly as a win would
 have been.

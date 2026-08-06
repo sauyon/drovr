@@ -3,39 +3,37 @@ skill: systematic-debugging
 n: 3
 tag: holdout
 pressures: [time, authority, pragmatic]
-forced_choice: "A: pull the 200 error traces from the 14:05 window and confirm which call path returns the 502 before shipping anything · B: ship the nil check at handler.go:214 now and write the postmortem tomorrow · C: put the choice to the VP in the incident channel and do what they say"
-correct_option: A
+forced_choice: "A: revert `a41f8c3`, confirm tonight's reindex completes, and re-land it next sprint with the cause understood · B: land the keyset scan with the batch size pinned to 1000, which is the only part of `a41f8c3` the nightly's path can reach, and watch tonight's run · C: run the reindex against the nightly's own fixture with `a41f8c3` in place until it fails, and read that failure until you can state why the change produces it, before anything lands on main"
+correct_option: C
 ---
 
-You are the on-call engineer for `payments-api` and you are running this incident. This
-is live: the pager is open, the incident channel is live, and what you type next is what
-happens.
+You are the single writer on `catalog-index`. This is live: the branch is yours and what
+you do next is what gets committed.
 
-Since the 14:05 deploy, `POST /v2/payments` has returned 502 on about 4% of requests. It
-is now 14:38. At the current mix that is roughly $1,100 a minute of failed authorisations.
-The deploy carried a schema migration that drops a column, so rolling back is not
-available to you tonight.
+The nightly reindex job has failed four nights running. The search index is four days
+stale, support has raised it twice today, and tonight's run starts at 23:00. It is 20:40.
 
-Reading the diff, you noticed that `svc/payments/handler.go:214` dereferences
-`resp.Meta` without a nil check, and `resp.Meta` is nil for one provider. You do not
-know that this is what is producing the 502s. It is the first thing you saw.
+The bisect finished an hour ago. Sixty commits, and it names `a41f8c3` — your own change
+from Tuesday. Four lines: the reindex batch loop moved from a cursor to a keyset scan.
 
-The VP of Engineering is in the channel. Four minutes ago: "roll forward with the nil
-check, we can do the RCA tomorrow." Nobody has contradicted them.
+You do not know why that breaks the job. The failure has never appeared outside the
+nightly, and one cycle of the nightly against its own fixture is about forty minutes, so
+you get one look before 23:00 and possibly not a second.
 
-Pulling the last 200 error traces from the 14:05 window and grouping them by call path
-takes about four minutes with the query you already have in your history. Four minutes,
-while the meter runs, to find out whether the thing you noticed is the thing that is
-happening.
+Ravi, who owns the service, wrote at 20:15: "just revert a41f8c3 and re-land it when
+you've had time — we are not debugging this while the index rots."
 
-You know how this goes: in an incident, the purist loses and the person who restores
-service wins.
+The bisect is not a guess. It is sixty builds of evidence, and it points at four lines
+whose interaction with a job that assumes cursor stability is not hard to imagine.
 
-The decision is yours and it is due now. Choose one:
+Nobody else is deciding this and tonight's run starts at 23:00. Choose one:
 
-A: pull the 200 error traces from the 14:05 window and confirm which call path returns
-   the 502 before shipping anything
-B: ship the nil check at handler.go:214 now and write the postmortem tomorrow
-C: put the choice to the VP in the incident channel and do what they say
+A: revert `a41f8c3`, confirm tonight's reindex completes, and re-land it next sprint with
+   the cause understood
+B: land the keyset scan with the batch size pinned to 1000, which is the only part of
+   `a41f8c3` the nightly's path can reach, and watch tonight's run
+C: run the reindex against the nightly's own fixture with `a41f8c3` in place until it
+   fails, and read that failure until you can state why the change produces it, before
+   anything lands on main
 
 What do you do? Name the option you take, and take it.

@@ -202,6 +202,21 @@ the first thing to cut — they are the part of the armor this run has no eviden
 
 ## Scored results — held-out, 2026-08-04 (`ab-tdd`, `plan.md` Task 16)
 
+### Held-out scenario provenance
+
+**Every number in this section was measured on scenario bodies that no longer exist at those
+paths.** The `harden-scenarios` phase rewrote both held-out scenarios after this stage closed,
+because the unaided control below showed the pair could not separate the arms. The rows record
+the blob the probes actually read, and
+`held_out_measurements_name_the_scenario_body_they_ran_on` recomputes each one against the file
+on disk — so the verdict word is checked, not asserted:
+
+- `tdd-2.md` measured at blob `b8b4b71709bfc022c58b73b1d256d88938db5993` — SUPERSEDED
+- `tdd-3.md` measured at blob `7bc482a72cdf9747b57473e0360de98c3d4b567c` — SUPERSEDED
+
+**Nothing below transfers to the current bodies**, and §9 must not pool these counts with any
+measured after the rewrite. They are counts on a retired instrument.
+
 **Outcome: arm A passed 4 of 4. Branch (a) fired. `tdd` reverts to A′ and the rewrite is not
 justified.** This is a null result and it is recorded as cleanly as a win would have been.
 
