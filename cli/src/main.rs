@@ -183,9 +183,15 @@ enum Commands {
         /// The question. `@<path>` reads it from a file; `@@` escapes a leading `@`.
         #[arg(long)]
         question: Option<String>,
+        /// Text shown alongside the question. Mutually exclusive with
+        /// `--context-file`; the pair means the same here as on `phase brief` and
+        /// `code-review run`, deliberately — `--context` naming a PATH in exactly one
+        /// command is how `--context "some text"` becomes a confusing failure.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
         /// File whose contents are shown alongside the question.
         #[arg(long)]
-        context: Option<PathBuf>,
+        context_file: Option<PathBuf>,
         /// A selectable answer, as `<value>=<label>`. Repeatable.
         #[arg(long = "option")]
         options: Vec<String>,
@@ -2046,7 +2052,8 @@ fn cmd_review(sub: ReviewCmd) {
 
 /// The bare form, spelled out. Printed under every usage error, because the errors
 /// exist to say which of these parts was wrong.
-const ASK_USAGE: &str = "usage: drovr ask <run> --question <text|@file> [--context <file>] \
+const ASK_USAGE: &str = "usage: drovr ask <run> --question <text|@file> \
+                         [--context <text> | --context-file <path>] \
                          [--option <value>=<label>]... [--recommend <value>]";
 
 /// Where `--question`'s text comes from.
@@ -2111,12 +2118,13 @@ fn validate_ask_request(
 
     let mut options = Vec::with_capacity(option_specs.len());
     for spec in option_specs {
-        // Split on the FIRST `=` so a label may contain one; both halves must be
-        // non-empty, since the value is what gets recorded as the answer and the
-        // label is the only thing the human sees.
+        // Split on the FIRST `=`, so a label may contain one. Only the SHAPE of the
+        // argument string is checked here — that is the one part of an option that
+        // exists solely at the CLI. Whether the halves are usable is
+        // `interview::check_options`'s call, below, so a caller reaching the module
+        // any other way meets the same rule.
         let (value, label) = spec
             .split_once('=')
-            .filter(|(v, l)| !v.is_empty() && !l.is_empty())
             .ok_or_else(|| usage(format!("--option {spec:?} is not <value>=<label>")))?;
         options.push(interview::AskOption {
             value: value.to_string(),
@@ -2132,13 +2140,7 @@ fn validate_ask_request(
     // what keeps the CLI from being stricter or laxer than the writer it goes through;
     // `ask_recommend_rule_is_one_implementation_not_two` and
     // `ask_option_values_must_be_distinct_and_the_cli_says_so_first` hold them in step.
-    if !interview::option_values_are_unique(&options) {
-        return Err(usage(
-            "two --options share a value; the value is what an answer records, so a \
-             repeat leaves no way to say which was chosen"
-                .to_string(),
-        ));
-    }
+    interview::check_options(&options).map_err(usage)?;
     if !interview::recommend_is_offered(recommend, &options) {
         return Err(usage(format!(
             "--recommend {:?} names no offered --option",
@@ -2179,7 +2181,8 @@ fn cmd_ask(
     sub: Option<AskCmd>,
     run: Option<String>,
     question: Option<String>,
-    context: Option<PathBuf>,
+    context: Option<String>,
+    context_file: Option<PathBuf>,
     options: Vec<String>,
     recommend: Option<String>,
 ) {
@@ -2219,7 +2222,10 @@ fn cmd_ask(
         QuestionSource::Literal(text) => text,
         QuestionSource::File(path) => read_bounded_file("--question @<file>", &path),
     };
-    let context = context.map(|p| read_bounded_file("--context", &p));
+    // The CLI-wide resolver, not a private one: clap has already enforced that the
+    // two are exclusive, and this applies the same cap and the same guarded read that
+    // every other command's context gets.
+    let context = read_context_arg(context, context_file);
 
     let ask = interview::append_ask(
         &dir,
@@ -2738,9 +2744,10 @@ fn main() {
             run,
             question,
             context,
+            context_file,
             options,
             recommend,
-        } => cmd_ask(sub, run, question, context, options, recommend),
+        } => cmd_ask(sub, run, question, context, context_file, options, recommend),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill, gate } => match ReflexMode::from_flags(skill.as_deref(), gate) {
             Some(mode) => cmd_reflex(mode),
@@ -4035,6 +4042,7 @@ mod tests {
                 run,
                 question,
                 context,
+                context_file,
                 options,
                 recommend,
             } => {
@@ -4042,6 +4050,7 @@ mod tests {
                 assert_eq!(run.as_deref(), Some("myrun"));
                 assert_eq!(question.as_deref(), Some("which arm?"));
                 assert_eq!(context, None);
+                assert_eq!(context_file, None);
                 assert_eq!(options, vec!["a=Arm A".to_string()]);
                 assert_eq!(recommend.as_deref(), Some("a"));
             }
@@ -4111,14 +4120,24 @@ mod tests {
 
     #[test]
     fn ask_option_without_equals_is_a_usage_error() {
-        for bad in ["justavalue", "=Label", "value="] {
-            let e = validate_ask_request(Some("r"), Some("q"), &[bad.to_string()], None)
-                .expect_err(bad);
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-            assert!(
-                e.to_string().contains("<value>=<label>"),
-                "message must name the form: {e}"
-            );
+        // The `=` is the CLI's own concern: it is about the shape of the ARGUMENT
+        // STRING, which only the CLI ever sees.
+        let e = validate_ask_request(Some("r"), Some("q"), &["justavalue".to_string()], None)
+            .expect_err("no =");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            e.to_string().contains("<value>=<label>"),
+            "message must name the form: {e}"
+        );
+        // Emptiness is NOT the CLI's concern — `interview` refuses a blank value or
+        // label, and the CLI only relays that, so a caller reaching the module some
+        // other way (the server, a later task) gets the same refusal rather than a
+        // rule that lived in this function's string-splitting all along.
+        for blank in ["=Label", "value=", " =Label"] {
+            let e = validate_ask_request(Some("r"), Some("q"), &[blank.to_string()], None)
+                .expect_err(blank);
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{blank}: {e}");
+            assert!(e.to_string().contains("empty"), "{blank}: {e}");
         }
         let ok = validate_ask_request(
             Some("r"),
@@ -4149,8 +4168,10 @@ mod tests {
         assert!(validate_ask_request(Some("r"), Some("q"), &ok, None).is_ok());
 
         // And, as with recommend, the CLI is neither stricter nor laxer than the
-        // module it writes through.
-        for specs in [&dup, &ok] {
+        // module it writes through — for every rule about the options themselves, not
+        // just uniqueness.
+        let blank = ["=Arm".to_string(), "a=".to_string()];
+        for specs in [&dup, &ok, &blank] {
             let parsed: Vec<interview::AskOption> = specs
                 .iter()
                 .map(|s| {
@@ -4163,7 +4184,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 validate_ask_request(Some("r"), Some("q"), specs, None).is_ok(),
-                interview::option_values_are_unique(&parsed),
+                interview::check_options(&parsed).is_ok(),
                 "CLI and module disagree on {specs:?}"
             );
         }
@@ -4251,6 +4272,73 @@ mod tests {
         // And neither form is broken by the switch.
         assert!(parse(&["drovr", "ask", "wait", "myrun"]).is_ok());
         assert!(parse(&["drovr", "ask", "myrun", "--question", "q"]).is_ok());
+    }
+
+    #[test]
+    fn ask_context_follows_the_cli_wide_text_or_file_convention() {
+        // `--context <text>` + `--context-file <path>`, as `phase brief` and every
+        // `code-review` subcommand already spell it. `ask` briefly had `--context`
+        // typed as a PATH, which is the one thing that flag never means anywhere else
+        // in this CLI: `drovr ask r --question q --context "the spec is 791 lines"`
+        // would have failed with "cannot read --context the spec is 791 lines".
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "q?",
+            "--context",
+            "inline text",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                context,
+                context_file,
+                ..
+            } => {
+                assert_eq!(context.as_deref(), Some("inline text"));
+                assert_eq!(context_file, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "q?",
+            "--context-file",
+            "/tmp/c.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                context,
+                context_file,
+                ..
+            } => {
+                assert_eq!(context, None);
+                assert_eq!(context_file, Some(PathBuf::from("/tmp/c.md")));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Mutually exclusive, as everywhere else — clap enforces it, not `cmd_ask`.
+        assert!(
+            parse(&[
+                "drovr",
+                "ask",
+                "myrun",
+                "--question",
+                "q?",
+                "--context",
+                "t",
+                "--context-file",
+                "/tmp/c.md",
+            ])
+            .is_err(),
+            "the two context forms must conflict, as they do on `phase brief`"
+        );
     }
 
     #[test]
