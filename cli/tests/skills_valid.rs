@@ -9308,7 +9308,49 @@ struct CrossModelEntry {
     #[allow(dead_code)]
     sample: u32,
     model: ProbeModel,
+    /// **Validated against [`SkillName`] on the way in, not left a free string.**
+    /// `arm` and `model` reject a typo at deserialization; a `skill` that did not
+    /// would deserialize cleanly and surface later as an opaque grid-join
+    /// mismatch, which pushes the invariant onto this type's callers.
+    #[serde(deserialize_with = "de_skill_name")]
     skill: String,
+}
+
+fn de_skill_name<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde::Deserialize as _;
+    let raw = String::deserialize(d)?;
+    match SkillName::parse(&raw) {
+        Some(_) => Ok(raw),
+        None => Err(D::Error::custom(format!(
+            "{raw:?} is not a measured skill; accepted: {}",
+            SkillName::accepted()
+        ))),
+    }
+}
+
+/// One record of `transcripts/cross-model/cross-model-adjudication.json`: the
+/// second, independent scoring pass over a transcript the primary pass scored.
+///
+/// A **third** adjudication shape beside [`Adjudication`], because it answers a
+/// different question. `Adjudication` records what option a blind re-reader
+/// thought a response committed to; this records whether a second *scorer*,
+/// dispatched by a different mechanism, reached the same `compliant` verdict.
+/// Two shapes get two types rather than one loose one, so neither file can be
+/// deserialized as the other.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossModelAdjudication {
+    transcript_id: String,
+    second_pass_compliant: bool,
+    primary_compliant: bool,
+    /// Carried, and then **recomputed** rather than trusted — the same treatment
+    /// the `remeasure-*` stages gave `matches_key`. A stored boolean that agrees
+    /// with nothing is how a count in prose drifts from the record behind it.
+    agrees: bool,
 }
 
 /// One row of `cross-model.md`'s measured grid.
@@ -9344,14 +9386,26 @@ fn parse_grid(text: &str) -> Result<Vec<GridRow>, String> {
     const COLS: [&str; 5] = ["model", "skill", "condition", "compliant", "runs"];
     let mut rows = Vec::new();
     let mut at: Option<[usize; 5]> = None;
+    // **There is exactly ONE measured grid, and a second one is corruption.**
+    // The first version cleared `at` on prose and then happily re-latched onto any
+    // later table with a matching header, appending its rows — while the comment
+    // claimed the complete-header match prevented exactly that. Only the absence
+    // of a second such table in `cross-model.md` kept it green, and this
+    // function's own unit test asserted the relatched row count, so the test
+    // encoded the defect instead of catching it. Two tables both claiming to be
+    // the measured grid is not a case with an obvious right answer — silently
+    // concatenating them is the worst of the available answers — so it is an
+    // error, the way `parse_ledger` and `parse_manifest` treat their own
+    // ambiguities.
+    let mut closed = false;
     for line in text.lines() {
         if !line.trim_start().starts_with('|') {
             // Unlike the ledger and the manifest, this table MAY be followed by
             // prose and by other tables, so a non-row line ends it rather than
-            // being an error. The complete-header match above is what keeps that
-            // from silently reading a later table's rows.
+            // being an error.
             if at.is_some() && !line.trim().is_empty() {
                 at = None;
+                closed = true;
             }
             continue;
         }
@@ -9361,14 +9415,44 @@ fn parse_grid(text: &str) -> Result<Vec<GridRow>, String> {
         }
         if at.is_none() {
             let normalized: Vec<String> = cells.iter().map(|c| normalize_header(c)).collect();
-            let found: Vec<Option<usize>> = COLS
-                .iter()
-                .map(|want| normalized.iter().position(|c| c == &normalize_header(want)))
-                .collect();
-            if found.iter().all(Option::is_some) {
+            let hits = |want: &str| -> Vec<usize> {
+                let key = normalize_header(want);
+                normalized
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c == key)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let found: Vec<Vec<usize>> = COLS.iter().map(|want| hits(want)).collect();
+            if found.iter().all(|f| !f.is_empty()) {
+                // Completeness first, then duplicates — `parse_ledger`'s order and
+                // its reason. Now that this IS the header, a duplicated
+                // load-bearing column is corruption rather than a fragment:
+                // resolving by name cannot say which of two same-named columns a
+                // cell belongs to, and taking the first silently reads the wrong
+                // cell for every row.
+                for (want, f) in COLS.iter().zip(found.iter()) {
+                    if f.len() > 1 {
+                        return Err(format!(
+                            "the measured grid's header carries {} {want:?} columns; \
+                             they are resolved by name, so a duplicate has no \
+                             authoritative cell",
+                            f.len()
+                        ));
+                    }
+                }
+                if closed {
+                    return Err(
+                        "two tables carry the measured grid's header — there is one \
+                         measured grid, and concatenating a second would report runs \
+                         nothing measured"
+                            .to_string(),
+                    );
+                }
                 let mut idx = [0usize; 5];
                 for (i, f) in found.iter().enumerate() {
-                    idx[i] = f.unwrap();
+                    idx[i] = f[0];
                 }
                 at = Some(idx);
             }
@@ -9553,12 +9637,25 @@ fn cross_model_grid_matches_its_own_verdicts() {
 
     // Every transcript file in the directory is scored. Key-set equality against
     // the map is checked below; this catches a transcript that is in neither.
+    //
+    // **A `.md` whose stem is not a transcript id is an error, not a skip.** The
+    // first version `continue`d past it while the comment claimed every
+    // transcript file was checked, so an orphan probe output under a mistyped
+    // name would be neither scored nor reported — and the redaction scan uses
+    // the same predicate, so it would go unredacted too.
     for entry in fs::read_dir(&dir).expect("cannot read cross-model dir") {
         let path = entry.expect("dir entry").path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if path.extension().and_then(|e| e.to_str()) != Some("md") || !is_transcript_id(stem) {
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(
+            is_transcript_id(stem),
+            "{} is a .md file in the transcript directory whose stem is not a 6-hex \
+             transcript id, so every id-keyed check here and `check_redaction` both \
+             skip it silently",
+            path.display(),
+        );
         assert!(
             seen.contains(stem),
             "{} exists but {} does not score it — an unscored transcript is a run that \
@@ -9567,6 +9664,69 @@ fn cross_model_grid_matches_its_own_verdicts() {
             scores_path.display(),
         );
     }
+
+    // The second blind pass is evidence in its own right, and `cross-model.md`
+    // quotes its agreement count. An unvalidated verdict-like file beside a
+    // validated one is the drift this corpus keeps finding, so it gets the same
+    // treatment: a closed schema, a recomputed `agrees`, and a join back to the
+    // primary verdicts rather than a `primary_compliant` taken on trust.
+    let adj_path = dir.join("cross-model-adjudication.json");
+    assert!(
+        adj_path.is_file(),
+        "{} is missing — `cross-model.md` reports a second-pass agreement count, and \
+         deleting its record must not leave that claim standing with nothing behind it",
+        adj_path.display(),
+    );
+    let adjudications: Vec<CrossModelAdjudication> =
+        serde_json::from_str(&fs::read_to_string(&adj_path).expect("adjudication unreadable"))
+            .unwrap_or_else(|e| panic!("{} does not match the schema: {e}", adj_path.display()));
+    assert!(
+        !adjudications.is_empty(),
+        "{} is empty — a preserved second pass records verdicts",
+        adj_path.display()
+    );
+    let primary: HashMap<&str, bool> = pairs.iter().map(|(i, c)| (i.as_str(), *c)).collect();
+    let mut agreed = 0usize;
+    for a in &adjudications {
+        let got = primary.get(a.transcript_id.as_str()).unwrap_or_else(|| {
+            panic!(
+                "{}: re-reads {}, which {} does not score",
+                adj_path.display(),
+                a.transcript_id,
+                scores_path.display()
+            )
+        });
+        assert_eq!(
+            a.primary_compliant,
+            *got,
+            "{}: records primary_compliant={} for {}, but the primary verdict says {got}",
+            adj_path.display(),
+            a.primary_compliant,
+            a.transcript_id,
+        );
+        // Recomputed, never trusted — the same rule the `remeasure-*` stages
+        // applied to `matches_key`.
+        assert_eq!(
+            a.agrees,
+            a.primary_compliant == a.second_pass_compliant,
+            "{}: {} records agrees={} against {} vs {}",
+            adj_path.display(),
+            a.transcript_id,
+            a.agrees,
+            a.primary_compliant,
+            a.second_pass_compliant,
+        );
+        agreed += usize::from(a.agrees);
+    }
+    let claim = format!("**{agreed} of {} agree on\n`compliant`.**", adjudications.len());
+    let claim_flat = format!("**{agreed} of {} agree on `compliant`.**", adjudications.len());
+    assert!(
+        text.contains(&claim) || text.contains(&claim_flat),
+        "{} must state the recomputed second-pass result verbatim ({agreed} of {}); \
+         the prose and this record are one fact",
+        doc.display(),
+        adjudications.len(),
+    );
 
     let declared = parse_grid(&text).unwrap_or_else(|e| panic!("{}: {e}", doc.display()));
     let wrong = check_cross_model_grid(&declared, &pairs, &map);
@@ -9761,16 +9921,37 @@ Prose after the table, which ends it.\n\
 | model | skill | condition | compliant | runs |\n\
 |---|---|---|---|---|\n\
 | qwen | systematic-debugging | A | 2 | 8 |\n";
-    let rows = parse_grid(doc).expect("the grid must parse");
+    // A SECOND table with the grid's header is an error, not extra rows. The
+    // first version of this assertion expected 3 — the two real rows plus the
+    // trap table's — which encoded the relatch defect as the contract. The
+    // reviewer caught the test, not just the parser.
+    let err = parse_grid(doc).expect_err("a second measured grid must be refused");
+    assert!(err.contains("two tables"), "{err:?}");
+
+    // Without the trap table, the same document parses to exactly its two rows:
+    // the reused-`sonnet` table and the design table (whose `runs` column holds
+    // PLANNED counts, and which would read 64 qwen runs as a measurement) are
+    // both passed over.
+    let single = doc.split("Prose after the table").next().unwrap();
+    let rows = parse_grid(single).expect("the grid must parse");
     assert_eq!(
         rows.len(),
-        3,
-        "expected the three grid rows and neither of the other tables' rows: {rows:?}"
+        2,
+        "expected the two grid rows and neither other table's rows: {rows:?}"
     );
     assert_eq!(rows[0], GridRow {
         model: "qwen".into(), skill: "tdd".into(), condition: "unaided".into(),
         compliant: 3, runs: 8,
     });
+    assert_eq!(rows[1].skill, "systematic-debugging");
+
+    // A duplicated load-bearing column is a parse error, not a first-match-wins
+    // silent rebind — the rule `parse_ledger` and `parse_manifest` already hold.
+    let dup = "| model | skill | condition | compliant | runs | runs |\n\
+               |---|---|---|---|---|---|\n\
+               | qwen | tdd | unaided | 3 | 8 | 9 |\n";
+    let err = parse_grid(dup).expect_err("a duplicated column must be refused");
+    assert!(err.contains("runs") && err.contains("2"), "{err:?}");
 
     // A document with no grid is an error, not an empty result — an empty vec
     // would make every downstream check pass on a document that reports nothing.
