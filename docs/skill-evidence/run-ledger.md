@@ -532,6 +532,16 @@ overrun — it is the same one
 **this stage does not resolve it**. Global: **99 of 122, 23 remain**; remaining planned work is
 Task 19 (12) + Task 20 (20) + Task 21 `ab-voice` (24) = **56**, landing at **155 of 122**.
 
+> **The two global figures in the paragraph above are superseded — the per-row facts are not.**
+> `cross-model-arm` raised the global ceiling to **191** (metered **119**) later on 2026-08-06; see
+> *The ceiling was RAISED on 2026-08-06* at the head of this file, which derives its numbers from
+> the **99** this stage left. **"99 of 122, 23 remain" and "155 of 122" record what was true when
+> this stage closed** and are kept rather than restated, because a phase's ledger entry is what it
+> spent and knew, not a running edit. **What does NOT change with the raise:** all three §7.3 arm
+> rows are still closed at their ceilings, and Tasks 19 and 20 still have zero runs on any of them.
+> A larger global budget does not reopen a stage row — that is a separate escalation, and it is
+> still owed.
+
 ### Method
 
 Tasks 16–18's method with `remeasure-tdd`'s five strengthenings, copied rather than reinvented,
