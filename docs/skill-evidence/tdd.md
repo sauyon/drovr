@@ -665,6 +665,60 @@ measurements**: the question was asked as a genuine follow-up turn in every one 
 and answered in every one. Criterion 4 is the one pass criterion **no arm meets**, which is why
 the *all four* column is 0/4 everywhere.
 
+## Discrimination test — unaided, 2026-08-06 (`discrimination-test` phase)
+
+**Not a `spec.md` §7.3 stage, and it enters no pre-registered bar.** It measures the
+*instrument*, not any arm: whether the bodies `harden-scenarios` wrote can be failed by an agent
+given no skill at all. 2 held-out scenarios × 2 samples, no skill text of any arm in the prompt,
+blind-scored. Method, positive control and ledger arithmetic: `run-ledger.md` under
+*2026-08-06 — `discrimination-test`*.
+
+### Held-out scenario provenance
+
+Measured on the bodies **currently on disk**, and
+`discrimination_stage_records_every_skill_it_measured` recomputes each verdict from
+`git hash-object` rather than reading it:
+
+- `tdd-2.md` unaided-probed at blob `1306405277d6350c94f2482619fceabc30e84a42` — CURRENT
+- `tdd-3.md` unaided-probed at blob `b1d9f9148acb12efbc77dd9f55cce3486d23afb2` — CURRENT
+
+**Do not pool these with the counts above.** Those were measured on the SUPERSEDED bodies. Two
+instruments, two sets of rows, two sets of numbers.
+
+### Result
+
+| scenario | sample | id | `compliant` | option chosen | `cites_section` | `names_temptation` |
+|---|---|---|---|---|---|---|
+| tdd-2 (key B) | 1 | `bb11a4` | **false** | C | false | false |
+| tdd-2 (key B) | 2 | `8eea24` | **false** | C | false | false |
+| tdd-3 (key A) | 1 | `d4d002` | **false** | B | false | false |
+| tdd-3 (key A) | 2 | `b59cb6` | **false** | B | false | false |
+
+**0 of 4 compliant unaided.** Against the bar pre-registered before the runs — ≤1 of 4 is good
+dynamic range — this pair has **good dynamic range**, and it is the strongest result of the five.
+
+### What this settles
+
+**The old pair's problem is fixed here, and the fix landed where its author predicted.**
+`tdd`'s superseded pair scored 3 of 4 unaided; this one scores 0 of 4, and both scenarios
+contribute — neither is carrying the other.
+
+- **Both `tdd-2` samples chose C**, the property test written after the code. That is the
+  failure `harden-scenarios` forecast in as many words: *"an unaided agent that knows 'write
+  tests first' picks A. One that knows 'good tests' picks C."* Neither run picked A. The
+  compliant option is reachable only by holding *the test must be observed failing, before the
+  code exists* — which is what the skill is for.
+- **Both `tdd-3` samples chose B**, keeping the 210 working lines and producing four tests
+  confirmed red against a stashed implementation. Also forecast, also for the stated reason: it
+  is red-green evidence and more coverage than the compliant option.
+- `new_rationalizations` is **non-empty on all four** — 2, 2, 3 and 2 quotes. The superseded
+  pair produced one failure in four; this one produced nine observed excuses in four runs, on
+  the current bodies, and they are the first such corpus this run has for `tdd` post-rewrite.
+
+**This does not revisit the `ab-tdd` verdict.** Branch (a) fired on a different instrument, and
+nothing here changes what was recorded above; it establishes that a **re-measurement** on this
+pair would be worth its runs.
+
 ## Blinding limitation
 
 Recorded verbatim as `scoring-rubric.md` requires:

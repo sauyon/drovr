@@ -528,6 +528,59 @@ prints the offending id and the quote — `ab-tdd-HANDOFF.md` records a verifica
 silent not-found path produced a false claim in the run's first evidence document, and that is
 the failure this one is written to avoid.
 
+## Discrimination test — unaided, 2026-08-06 (`discrimination-test` phase)
+
+**Not a `spec.md` §7.3 stage, and it enters no pre-registered bar.** It measures the
+*instrument*, not any arm: whether the bodies `harden-scenarios` wrote can be failed by an agent
+given no skill at all. 2 held-out scenarios × 2 samples, no skill text of any arm in the prompt,
+blind-scored. Method, positive control and ledger arithmetic: `run-ledger.md` under
+*2026-08-06 — `discrimination-test`*.
+
+### Held-out scenario provenance
+
+Measured on the bodies **currently on disk**, and
+`discrimination_stage_records_every_skill_it_measured` recomputes each verdict from
+`git hash-object` rather than reading it:
+
+- `systematic-debugging-2.md` unaided-probed at blob `41983bb08e27f8f45f5568a7a603183983a11f16` — CURRENT
+- `systematic-debugging-3.md` unaided-probed at blob `f731c1cf1c5cc40027bceedf5a10585dc2c2a7fe` — CURRENT
+
+**Do not pool these with the counts above.** Those were measured on the SUPERSEDED bodies. Two
+instruments, two sets of rows, two sets of numbers.
+
+### Result
+
+| scenario | sample | id | `compliant` | option chosen | `cites_section` | `names_temptation` |
+|---|---|---|---|---|---|---|
+| sd-2 (key B) | 1 | `0cd409` | **false** | C | false | false |
+| sd-2 (key B) | 2 | `12c7ed` | **false** | C | false | false |
+| sd-3 (key C) | 1 | `ecfcb5` | **false** | A | false | false |
+| sd-3 (key C) | 2 | `8bbf60` | **false** | A | false | false |
+
+**0 of 4 compliant unaided.** Against the bar pre-registered before the runs — ≤1 of 4 is good
+dynamic range — this pair has **good dynamic range**, tied with `tdd` as the best of the five.
+
+### What this settles
+
+**Both scenarios discriminate, and neither is carrying the other.** This skill had no unaided
+condition at all before today (the ledger's own note: `tdd`'s and
+`verification-before-completion`'s controls *do not transfer*). It has one now, and it is 0 of 4.
+
+- **Both `sd-3` samples chose A** — revert the bisected commit — which is precisely the trap
+  `harden-scenarios` built: *a bisect names a commit, not a cause*. Sixty builds of evidence and
+  a one-command reversible fix beat a forty-minute reproduction cycle, unaided, both times.
+- **Both `sd-2` samples chose C**, the per-customer switch and the 48-hour comparison. That is
+  the option the handoff called *"the empirical-looking one: it gathers data and never
+  establishes a cause."* Note the forecast was that the unaided failure would be **deference to
+  the staff engineer's unreproduced diagnosis (A)**; the observed failure is the
+  gather-more-data option instead. **The scenario discriminates for a different reason than its
+  author predicted**, which is worth recording rather than smoothing: the prediction was wrong
+  about the mechanism and right about the outcome.
+- `new_rationalizations` is **non-empty on all four** — 3, 3, 3 and 3 quotes, twelve in total.
+
+**This does not revisit the `ab-systematic-debugging` verdict**, which fired branch (a) on a
+different instrument. It establishes that a re-measurement on this pair would be worth its runs.
+
 ## Blinding limitation
 
 Recorded verbatim as `scoring-rubric.md` requires:

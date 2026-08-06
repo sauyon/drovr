@@ -3209,6 +3209,79 @@ impl SkillName {
     }
 }
 
+/// Whether a skill's evidence file carries the `discrimination-test` stage's
+/// unaided counts, and how many runs it owes.
+///
+/// A second state machine beside [`HeldOutScores`] rather than a reuse of it,
+/// because the two answer different questions about the same pair: `held_out_scores`
+/// says whether an **arm** was measured, this says whether the pair was measured
+/// with **no skill at all**. `code-review` and `using-drovr` are `NotYetRun` in the
+/// first and `Recorded` in the second, so one field cannot carry both.
+///
+/// `runs` is carried rather than left implicit: the defect this run keeps finding is
+/// an artifact set that grew without its guard growing, and "the file exists" is
+/// satisfied by a file holding one verdict out of four.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DiscriminationScores {
+    /// The `discrimination-test` stage probed this skill's held-out pair unaided.
+    /// `runs` is what `run-ledger.md` charged, and the verdict file owes exactly
+    /// that many verdicts — no more, and no fewer.
+    Recorded { runs: usize },
+    /// Not probed unaided yet, and why. Checked in both directions, like
+    /// [`HeldOutScores`]: such a skill may carry no discrimination rows at all.
+    #[allow(dead_code)]
+    NotYetRun { why: &'static str },
+}
+
+impl SkillName {
+    /// Total over the measured five, for [`SkillName::held_out_scores`]'s reason: a
+    /// sixth skill cannot compile without declaring which state it is in.
+    ///
+    /// All five are `Recorded` because the `discrimination-test` phase probed the
+    /// whole corpus at once — it was measuring the instrument, not any one skill.
+    /// **The veto class (`using-drovr-noskill-{1,2}`) is not covered by this**: it
+    /// is not part of §1.2's held-out pair, and it has still never been measured.
+    fn discrimination_scores(self) -> DiscriminationScores {
+        match self {
+            SkillName::Tdd
+            | SkillName::SystematicDebugging
+            | SkillName::VerificationBeforeCompletion
+            | SkillName::CodeReview
+            | SkillName::UsingDrovr => DiscriminationScores::Recorded { runs: 4 },
+        }
+    }
+}
+
+/// Which stage's probes a provenance row describes.
+///
+/// Two stages now measure the same held-out pair for different purposes, and each
+/// owes its own row: the `ab-*` stages read an arm, the `discrimination-test` stage
+/// read no skill at all. They ran on **different bodies** — `harden-scenarios`
+/// replaced all ten between them — so one row per scenario cannot serve both, and
+/// [`held_out_body_rows`]'s whole-file scan would otherwise read four rows as a
+/// malformed pair.
+///
+/// The marker is the discriminator, and it is a closed set for the reason every
+/// other closed set in this file is one: a third stage must add a variant here
+/// rather than invent a fourth sentence shape nothing parses.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ProvenanceStage {
+    /// The `ab-<skill>` held-out bar runs: an arm's text was pasted above the body.
+    BarHeldOut,
+    /// The `discrimination-test` unaided probes: no skill text at all.
+    Discrimination,
+}
+
+impl ProvenanceStage {
+    /// The row marker, which is also the English of what the row claims.
+    fn marker(self) -> &'static str {
+        match self {
+            ProvenanceStage::BarHeldOut => " measured at blob `",
+            ProvenanceStage::Discrimination => " unaided-probed at blob `",
+        }
+    }
+}
+
 /// Whether the body a recorded measurement ran on is still the body on disk.
 ///
 /// A closed two-value domain, so it is an enum rather than a `String` checked
@@ -3283,18 +3356,23 @@ impl HeldOutBodies {
     }
 }
 
-/// Parse a skill's `- `<stem>.md` measured at blob `<sha>` — <STATUS>` rows.
+/// Parse a skill's `- `<stem>.md` <marker> `<sha>` — <STATUS>` rows, for one stage.
 ///
-/// Lines that do not carry the `measured at blob` marker are skipped rather than
-/// rejected: every evidence file is full of ordinary backticked bullets, and a
-/// parser that tried to claim them would make prose an error. Once a line *does*
-/// carry the marker, every remaining part of it is required — a half-formed row
-/// is a row nobody checks, which is the shape of defect this whole record exists
-/// to stop.
+/// Lines that do not carry `stage`'s marker are skipped rather than rejected: every
+/// evidence file is full of ordinary backticked bullets, and a parser that tried to
+/// claim them would make prose an error. **That is also what keeps the two stages
+/// apart** — a bar row and a discrimination row for the same scenario are both
+/// legal, in the same file, saying different things about different bodies, and
+/// each parse sees only its own. Once a line *does* carry the marker, every
+/// remaining part of it is required — a half-formed row is a row nobody checks,
+/// which is the shape of defect this whole record exists to stop.
 ///
 /// Returns the rows found, in file order, paired with the stem each names.
 /// Binding them to the §1.2 pair is [`parse_held_out_bodies`]'s job.
-fn held_out_body_rows(contents: &str) -> Result<Vec<(String, HeldOutBody)>, String> {
+fn held_out_body_rows(
+    contents: &str,
+    stage: ProvenanceStage,
+) -> Result<Vec<(String, HeldOutBody)>, String> {
     let mut out = Vec::new();
     for line in contents.lines() {
         let Some(rest) = line.trim().strip_prefix("- `") else {
@@ -3303,7 +3381,7 @@ fn held_out_body_rows(contents: &str) -> Result<Vec<(String, HeldOutBody)>, Stri
         let Some((stem_md, rest)) = rest.split_once('`') else {
             continue;
         };
-        let Some(rest) = rest.strip_prefix(" measured at blob `") else {
+        let Some(rest) = rest.strip_prefix(stage.marker()) else {
             continue;
         };
         let (raw_hash, tail) = rest
@@ -3331,9 +3409,14 @@ fn held_out_body_rows(contents: &str) -> Result<Vec<(String, HeldOutBody)>, Stri
     Ok(out)
 }
 
-/// The held-out pair `skill`'s evidence file records, or why it is not a pair.
-fn parse_held_out_bodies(contents: &str, skill: SkillName) -> Result<HeldOutBodies, String> {
-    let rows = held_out_body_rows(contents)?;
+/// The held-out pair `skill`'s evidence file records for `stage`, or why it is not
+/// a pair.
+fn parse_held_out_bodies(
+    contents: &str,
+    skill: SkillName,
+    stage: ProvenanceStage,
+) -> Result<HeldOutBodies, String> {
+    let rows = held_out_body_rows(contents, stage)?;
     let found: Vec<String> = rows.iter().map(|(stem, _)| stem.clone()).collect();
     // The same `HELD_OUT_NS` the corpus check binds tags to, so "which files are
     // the held-out pair" is one fact rather than two that can drift apart.
@@ -3364,7 +3447,8 @@ fn held_out_bodies_parse_as_a_pair_with_a_closed_status() {
                 - `tdd-2.md` measured at blob `b8b4b71709bfc022c58b73b1d256d88938db5993` — SUPERSEDED\n\
                 - some other bullet\n\
                 - `tdd-3.md` measured at blob `7bc482a72cdf9747b57473e0360de98c3d4b567c` — CURRENT\n";
-    let pair = parse_held_out_bodies(good, SkillName::Tdd).expect("the pair parses, prose is skipped");
+    let pair = parse_held_out_bodies(good, SkillName::Tdd, ProvenanceStage::BarHeldOut)
+        .expect("the pair parses, prose is skipped");
     assert_eq!(pair.second.claimed, ScenarioBodyStatus::Superseded);
     assert_eq!(pair.third.claimed, ScenarioBodyStatus::Current);
     let stems: Vec<String> = pair.pair().into_iter().map(|(stem, _)| stem).collect();
@@ -3392,7 +3476,7 @@ fn held_out_bodies_parse_as_a_pair_with_a_closed_status() {
         ),
     ] {
         assert!(
-            parse_held_out_bodies(&mutated, SkillName::Tdd).is_err(),
+            parse_held_out_bodies(&mutated, SkillName::Tdd, ProvenanceStage::BarHeldOut).is_err(),
             "should have been rejected: {why}"
         );
     }
@@ -3400,8 +3484,35 @@ fn held_out_bodies_parse_as_a_pair_with_a_closed_status() {
     // A pair belongs to the skill it was parsed for, not to whichever stems the
     // file happens to carry.
     assert!(
-        parse_held_out_bodies(good, SkillName::CodeReview).is_err(),
+        parse_held_out_bodies(good, SkillName::CodeReview, ProvenanceStage::BarHeldOut).is_err(),
         "`tdd`'s rows are not `code-review`'s pair"
+    );
+
+    // The two stages measured different bodies of the same pair, and both sets of
+    // rows live in one file. Each parse must see only its own marker: if the scan
+    // were marker-blind it would read four rows where §1.2 defines two, and the
+    // pair check would reject a file that is exactly right.
+    let both = format!(
+        "{good}\
+         - `tdd-2.md` unaided-probed at blob `41d3a0dbe5e0c6f6ee11d2e0d4e0f7a2c8b91a55` — CURRENT\n\
+         - `tdd-3.md` unaided-probed at blob `9e1a7c0dd2f4b3a6c5e8079b1d4f6a2c3e5b7d90` — CURRENT\n"
+    );
+    let bar = parse_held_out_bodies(&both, SkillName::Tdd, ProvenanceStage::BarHeldOut)
+        .expect("the bar pair still parses beside the discrimination rows");
+    assert_eq!(bar.second.claimed, ScenarioBodyStatus::Superseded);
+    let disc = parse_held_out_bodies(&both, SkillName::Tdd, ProvenanceStage::Discrimination)
+        .expect("the discrimination pair parses beside the bar rows");
+    assert_eq!(disc.second.claimed, ScenarioBodyStatus::Current);
+    assert_ne!(
+        bar.second.recorded.as_str(),
+        disc.second.recorded.as_str(),
+        "the two stages ran on different bodies — that is the whole reason for two rows"
+    );
+
+    // And neither stage may satisfy its own check with the other's rows.
+    assert!(
+        parse_held_out_bodies(good, SkillName::Tdd, ProvenanceStage::Discrimination).is_err(),
+        "bar rows are not evidence that an unaided stage ran"
     );
 }
 
@@ -3438,7 +3549,7 @@ fn held_out_measurements_name_the_scenario_body_they_ran_on() {
 
         let pair = match skill.held_out_scores() {
             HeldOutScores::NotYetRun { why } => {
-                let rows = held_out_body_rows(&contents)
+                let rows = held_out_body_rows(&contents, ProvenanceStage::BarHeldOut)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 assert!(
                     rows.is_empty(),
@@ -3451,8 +3562,10 @@ fn held_out_measurements_name_the_scenario_body_they_ran_on() {
                 );
                 continue;
             }
-            HeldOutScores::Recorded => parse_held_out_bodies(&contents, skill)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+            HeldOutScores::Recorded => {
+                parse_held_out_bodies(&contents, skill, ProvenanceStage::BarHeldOut)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            }
         };
 
         for (stem, row) in pair.pair() {
@@ -3473,6 +3586,118 @@ fn held_out_measurements_name_the_scenario_body_they_ran_on() {
             );
         }
     }
+}
+
+/// The `discrimination-test` stage's artifacts exist, are complete, and name the
+/// bodies they were probed on — for **every** skill it claims to have measured.
+///
+/// This stage is the reason the guard is here at all. `harden-scenarios`'s handoff
+/// records nine vacuous-pass defects in this run, every one from an artifact set
+/// that grew without its guard growing; the stage that measured whether the
+/// rewritten corpus discriminates added a verdict file, a blind map and four
+/// transcripts per skill, and none of that was reachable from any assertion. The
+/// three failures it forecloses, in the order they would actually happen:
+///
+/// 1. **A skill quietly drops out.** `scores_json_verdicts_obey_the_rubric` walks
+///    whichever files are on disk, so deleting `using-drovr`'s verdicts removes its
+///    result rather than failing. [`DiscriminationScores`] is the declaration that
+///    makes an absence loud.
+/// 2. **A partial file passes as a whole one.** Four cells is what "≤1 of 4" is a
+///    fraction of. One verdict in the file satisfies every existing check and turns
+///    a per-skill count into a number with no denominator.
+/// 3. **The counts outlive the bodies.** This is `harden-scenarios`'s own defect,
+///    one generation on: these numbers are only comparable to a later stage's if
+///    the pair still hashes to what the probes read.
+#[test]
+fn discrimination_stage_records_every_skill_it_measured() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, and these rows are `git hash-object` blob SHAs. \
+         Skipping would turn this into a check that passes when it cannot run"
+    );
+    let evidence = evidence_dir();
+    let scenarios = scenarios_dir();
+    let transcripts = evidence.join("transcripts");
+    let mut measured = 0usize;
+
+    for skill in SkillName::ALL.iter().copied() {
+        let path = evidence.join(format!("{}.md", skill.as_str()));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let dir = transcripts.join(skill.as_str());
+        let scores = dir.join(VerdictBundle::Discrimination.scores_file());
+
+        let runs = match skill.discrimination_scores() {
+            DiscriminationScores::NotYetRun { why } => {
+                let rows = held_out_body_rows(&contents, ProvenanceStage::Discrimination)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let verdicts_exist = scores.is_file();
+                assert!(
+                    rows.is_empty() && !verdicts_exist,
+                    "`{}` is declared as never probed unaided ({why}), but {} carries {} \
+                     discrimination row(s) and {} exists={verdicts_exist}. Whichever is now \
+                     wrong, the artifacts and `discrimination_scores` have to move together",
+                    skill.as_str(),
+                    path.display(),
+                    rows.len(),
+                    scores.display(),
+                );
+                continue;
+            }
+            DiscriminationScores::Recorded { runs } => runs,
+        };
+
+        // (1) and (2): the file exists and holds every cell, not merely some.
+        assert!(
+            scores.is_file(),
+            "`{}` is declared as probed unaided over {runs} runs, but {} does not exist",
+            skill.as_str(),
+            scores.display(),
+        );
+        let verdicts = read_verdicts(&scores);
+        assert_eq!(
+            verdicts.len(),
+            runs,
+            "{} holds {} verdict(s) against {runs} declared runs. A per-skill count is a \
+             fraction of its denominator, and a partial file silently changes it",
+            scores.display(),
+            verdicts.len(),
+        );
+        let wrong = check_blind_map(&dir, VerdictBundle::Discrimination, &verdicts);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // (3): the pair is named, and the status is recomputed rather than read.
+        let pair = parse_held_out_bodies(&contents, skill, ProvenanceStage::Discrimination)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for (stem, row) in pair.pair() {
+            let file = scenarios.join(format!("{stem}.md"));
+            let on_disk = git_hash_object(&file);
+            let computed = ScenarioBodyStatus::recompute(&row.recorded, &on_disk);
+            assert_eq!(
+                row.claimed,
+                computed,
+                "{} says the unaided probes read `{stem}.md` at blob {} and calls that {}, \
+                 but {} now hashes to {}. The status is recomputed, not read: fix the row, \
+                 and do not pool counts across a change of body",
+                path.display(),
+                row.recorded.as_str(),
+                row.claimed.as_str(),
+                file.display(),
+                on_disk.as_str(),
+            );
+        }
+        measured += 1;
+    }
+
+    // Seeded against what is true: the `discrimination-test` phase probed all five.
+    // Without it the loop passes on a tree where every skill is `NotYetRun`, which
+    // is the vacuous shape the three failures above are each a version of.
+    assert_eq!(
+        measured, 5,
+        "{measured} skill(s) carry discrimination results — the stage probed all five \
+         held-out pairs unaided, so anything less means a result went missing rather \
+         than a measurement never happening",
+    );
 }
 
 #[test]
@@ -7176,15 +7401,25 @@ enum VerdictBundle {
     /// same blind scorer, **no bar**. Supplementary to a scored `ab-*` stage, so
     /// it may not stand alone.
     Control,
+    /// `discrimination-scores.json` — the `discrimination-test` stage. Also
+    /// unaided, and **not** supplementary: it measures the scenario pair itself,
+    /// so it is the one bundle that is meaningful with no arm ever measured. Two
+    /// of the five skills it covers have no `ab-*` stage at all.
+    Discrimination,
 }
 
 impl VerdictBundle {
-    const ALL: [VerdictBundle; 2] = [VerdictBundle::Bar, VerdictBundle::Control];
+    const ALL: [VerdictBundle; 3] = [
+        VerdictBundle::Bar,
+        VerdictBundle::Control,
+        VerdictBundle::Discrimination,
+    ];
 
     fn scores_file(self) -> &'static str {
         match self {
             VerdictBundle::Bar => "scores.json",
             VerdictBundle::Control => "control-scores.json",
+            VerdictBundle::Discrimination => "discrimination-scores.json",
         }
     }
 
@@ -7192,17 +7427,34 @@ impl VerdictBundle {
         match self {
             VerdictBundle::Bar => "blind-map.json",
             VerdictBundle::Control => "control-blind-map.json",
+            VerdictBundle::Discrimination => "discrimination-blind-map.json",
         }
     }
 
     /// Whether this stage's blind map records `arm: "none"`.
     ///
-    /// Total on purpose: the control stage pastes no arm's text, and every other
-    /// stage pastes exactly one. A map that disagrees has been joined to the wrong
-    /// verdict file, which is the one error blinding cannot survive.
+    /// Total on purpose: the two unaided stages paste no arm's text, and every
+    /// other stage pastes exactly one. A map that disagrees has been joined to the
+    /// wrong verdict file, which is the one error blinding cannot survive.
     fn is_unaided(self) -> bool {
         match self {
             VerdictBundle::Bar => false,
+            VerdictBundle::Control | VerdictBundle::Discrimination => true,
+        }
+    }
+
+    /// Whether this bundle is meaningless without a scored `ab-*` stage beside it.
+    ///
+    /// The distinction the `discrimination-test` stage forced into the type. A
+    /// *control* re-runs a bar stage's cells with the skill removed, so standing
+    /// alone it describes a comparison against nothing. A *discrimination* set has
+    /// no comparison to make: its question is whether the scenario can be failed
+    /// at all, which is answerable — and worth answering — before any arm is
+    /// written. Left as an `is_unaided()` check, the second would have inherited
+    /// the first's rule and made the guard reject the correct tree.
+    fn requires_a_scored_stage(self) -> bool {
+        match self {
+            VerdictBundle::Bar | VerdictBundle::Discrimination => false,
             VerdictBundle::Control => true,
         }
     }
@@ -7502,7 +7754,7 @@ fn scores_json_verdicts_obey_the_rubric() {
             // what the scenarios do unaided. Standing alone it describes a
             // measurement that never happened — and, before this assertion, it
             // also satisfied the vacuity guard at the bottom of this test.
-            if bundle == VerdictBundle::Control {
+            if bundle.requires_a_scored_stage() {
                 assert!(
                     dir.join(VerdictBundle::Bar.scores_file()).is_file(),
                     "{} exists without {} — a control is supplementary to a scored \

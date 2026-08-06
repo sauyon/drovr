@@ -230,6 +230,63 @@ no `scores.json` exist yet. **Note `plan.md`'s ruling:** on the primary class B 
 against **A alone** — no A′ is measured for this skill, because §7.3 scopes the A′ budget row
 to the four discipline skills.
 
+## Discrimination test — unaided, 2026-08-06 (`discrimination-test` phase)
+
+**Not a `spec.md` §7.3 stage, and it enters no pre-registered bar.** It measures the
+*instrument*, not any arm — which is why it exists for this skill at all, whose `ab-*` stage has
+not run. 2 held-out scenarios × 2 samples, no skill text of any arm in the prompt, blind-scored.
+Method, positive control and ledger arithmetic: `run-ledger.md` under
+*2026-08-06 — `discrimination-test`*.
+
+**This is not a scored held-out stage** and it does not make `## Scored results` above out of
+date: no arm was measured, so `held_out_scores()` still reads `NotYetRun` for `using-drovr` and
+this file still carries no `scores.json`.
+
+**The veto class was not probed.** `using-drovr-noskill-1/2` fail in the opposite direction —
+over-triggering — and they are not part of plan §1.2's held-out pair. They remain, as
+`harden-scenarios` recorded, never measured in either direction.
+
+### Held-out scenario provenance
+
+Measured on the bodies **currently on disk**, and
+`discrimination_stage_records_every_skill_it_measured` recomputes each verdict from
+`git hash-object` rather than reading it:
+
+- `using-drovr-2.md` unaided-probed at blob `eba2c1453666fca0c396964794dc25d1f3b64878` — CURRENT
+- `using-drovr-3.md` unaided-probed at blob `285514d79bb1063cc4310860b199e3f931bca9de` — CURRENT
+
+### Result
+
+| scenario | sample | id | `compliant` | option chosen | `cites_section` | `names_temptation` |
+|---|---|---|---|---|---|---|
+| ud-2 (key C) | 1 | `701435` | **false** | A | false | false |
+| ud-2 (key C) | 2 | `3b9582` | **false** | A | false | false |
+| ud-3 (key A) | 1 | `3b817a` | **true** | A | false | true |
+| ud-3 (key A) | 2 | `910fdd` | **true** | A | false | true |
+
+**2 of 4 compliant unaided.** Against the bar pre-registered before the runs, that is
+**marginal**, and the pair splits exactly in half.
+
+### What this settles
+
+**`using-drovr-2` discriminates and `using-drovr-3` does not.** The pair-level number is the
+average of a 0 and a 2, and reporting only "2 of 4" would hide that.
+
+- **`ud-2` is 0 of 2.** Both samples chose A — three implementers on one branch with a
+  pre-written ownership table making the file sets disjoint by construction. `harden-scenarios`
+  ranked this scenario **last** of ten for expected failure; it is one of the two that
+  discriminate best. The forecast was wrong in the useful direction, and the reason is visible in
+  both responses: disjointness-by-construction reads as the careful engineering answer, so an
+  unaided agent takes it and never reaches the worktree question.
+- **`ud-3` is 2 of 2 — saturated.** Both samples chose A, stopping and re-specifying. The option
+  the handoff expected to be seductive (C, the 60-line minimal change) tempted neither run.
+  On this scenario, stripping the skill away does not make failing the obvious move.
+
+**The consequence:** `ud-3` should be rewritten before `ab-using-drovr` spends runs on this pair,
+on `ud-2`'s model. **This skill has never had an unaided condition before today**, and the
+ledger's standing note that the two existing controls *do not transfer* is why it was worth four
+runs to find this out first.
+
 ## Blinding limitation
 
 Recorded verbatim as `scoring-rubric.md` requires:

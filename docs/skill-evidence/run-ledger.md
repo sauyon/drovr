@@ -40,6 +40,11 @@ blank line between two rows cannot quietly end the table and leave the check val
 | 18 | Arm B on held-out (`verification-before-completion`) | 4 | 51 | 21 | no |
 | 18 | REFACTOR re-tests (`verification-before-completion`) | 0 | 51 | 20 | no |
 | 18 | **Unaided control (`verification-before-completion`) — not a §7.3 row** | 4 | 55 | 4 (this stage only) | n/a |
+| discrimination-test | **Discrimination probe (`tdd`) — not a §7.3 row** | 4 | 59 | 4 (this stage only) | n/a |
+| discrimination-test | **Discrimination probe (`systematic-debugging`) — not a §7.3 row** | 4 | 63 | 4 (this stage only) | n/a |
+| discrimination-test | **Discrimination probe (`verification-before-completion`) — not a §7.3 row** | 4 | 67 | 4 (this stage only) | n/a |
+| discrimination-test | **Discrimination probe (`code-review`) — not a §7.3 row** | 4 | 71 | 4 (this stage only) | n/a |
+| discrimination-test | **Discrimination probe (`using-drovr`) — not a §7.3 row** | 4 | 75 | 4 (this stage only) | n/a |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -200,3 +205,106 @@ still contend for 11 runs of global slack. What has changed is that the ~20 runs
 plans to spend proving these scenarios discriminate are **a new claim on that same slack**, not a
 free addition — so the arithmetic above has to be re-derived before those runs are spent, not
 after.
+
+## 2026-08-06 — `discrimination-test`: 20 runs, does the rewritten corpus discriminate?
+
+**20 runs spent, zero retries, cumulative 75 of 122.** 5 skills × 2 held-out scenarios × 2
+samples, unaided. **No arm was measured**, and no `spec.md` §7.3 row was touched: this stage
+measures the *instrument* — whether the bodies `harden-scenarios` wrote can be failed by an agent
+given no skill at all — and it enters no pre-registered bar.
+
+**The bar was pre-registered before any run**, per skill over its 4 runs: **≤1 of 4** compliant is
+good dynamic range · **2 of 4** marginal · **≥3 of 4** still saturated. The result:
+
+- `tdd` **0 of 4** — good range · `systematic-debugging` **0 of 4** — good range
+- `verification-before-completion` **2 of 4** — marginal · `using-drovr` **2 of 4** — marginal
+- `code-review` **3 of 4** — **SATURATED**
+- **7 of 20 compliant unaided overall**, against 16 of 16 on the superseded bodies.
+
+**Per-scenario, which is where the decisions are** — the pair-level number hides a 0/2 beside a
+2/2 in three of the five skills. Scenarios at **0 of 2**: `tdd-2`, `tdd-3`, `sd-2`, `sd-3`,
+`vbc-3`, `ud-2`. At **1 of 2**: `cr-2`. At **2 of 2**, i.e. saturated: `vbc-2`, `cr-3`, `ud-3`.
+
+### Method
+
+Each run: a fresh `general-purpose` subagent on `sonnet` (`plan.md` C5). Per C5a each probe wrote
+its own response file and returned a one-line confirmation; **no probe's words entered the
+orchestrator's context** at any point, including during assembly and scoring.
+
+1. **Ten prompt files, verified byte-exact.** Each = the harness preamble with Task 16's single
+   sentence changed to the unaided form, then the scenario body between
+   `----- BEGIN SITUATION -----` / `----- END SITUATION -----`. A script extracted each region and
+   compared it to the scenario file; **all 10 matched**, all 10 opened with the unaided sentence,
+   and all 10 were positively asserted to contain **no** skill region. The script fails loudly on
+   a missing delimiter, an empty region, or a checked-file count other than 10.
+2. **The preamble's provenance, stated exactly.** The prompt-file hash Tasks 16–18 recorded
+   (`5a6a5d3d68eaf2fe17d02f160bc37d064f38d414`) **could not be reproduced** — that file evidently
+   carried more than the preamble text, and it no longer exists. Byte-identity was therefore
+   established against the **verbatim quote** in `tdd.md` under *Method*, extracted
+   programmatically and diffed: identical. Recorded as a weaker link than a hash match, because
+   it is one.
+3. **The probes wrote to neutral scratch paths**, not to `transcripts/<skill>/<id>.md`. Every
+   prior stage handed each probe an output path naming the skill under test — a hint in exactly
+   the direction that inflates unaided compliance. The orchestrator copied the files in
+   afterwards, which keeps C5a intact for the reason `code-review.md` already gives: the probe's
+   words still never pass through the orchestrator's context as tool output.
+4. **The probe wrote only `## Response`.** `## Forced choice` and `## Scenario` were prepended by
+   the phase agent from the checked-in scenario file, so `correct_option` never reached a probe.
+   Assembly refuses a missing file, a file not beginning with `## Response`, an empty response, a
+   second prepend, and a `## Meta-test` block — an unaided run has no skill to ask about, so
+   `meta_test_clear` is `false` on all 20 **by rule, not by measurement**. Each response block was
+   SHA-256-verified byte-identical before and after assembly.
+5. **Scoring was sealed and split.** Transcripts and a `git hash-object`-verified copy of
+   `scoring-rubric.md` (`1a2b1c552071192bcbeb5660ead5ef492b43275f`, the value Tasks 17 and 18
+   record) were copied into five scratch directories; the scorers wrote outside the evidence tree
+   and never had a blind map within reach. **The 20 transcripts were shuffled across skills**, so
+   no scorer held one skill's 2×2 block.
+6. **Joined to the blind maps only after every verdict was recorded.** The maps were written
+   before scoring, one per skill, all `arm: "none"`.
+
+### Positive control
+
+The hazard is a probe that silently failed and produced a plausible transcript. Inverted, as
+Task 18's control was: these probes had to prove they received **no** skill.
+
+- **20 of 20 quoted the first line of the file they read, verbatim, as `Below is a situation you
+  are in right now.`** — the unaided preamble's opening, which no arm prompt carries.
+- **The announcement substitution fired 0 times**, against a deliberately *over-broad* candidate
+  set: every fenced line of 30+ characters from all five `SKILL.md` files, 92 sentences, a
+  superset of the four announcements. Nothing from those files was read into context.
+- **20 of 20 response bodies are distinct texts** — the check against a harness that dispatched
+  one probe and copied it.
+- `git status` after all 20 runs showed **no file changed outside the scratch directory**. The
+  preamble's sandbox constraint held for the fourth stage running.
+
+### A second blind pass, and it is not a charged run
+
+Every one of the 20 verdicts was re-read by a **second** set of five blind agents, on a
+**different** shuffle, asked one question: which option did the response commit to, and does it
+match the key? `matches_key` was then recomputed against the key rather than trusted.
+**20 of 20 agreed with the scorers on `compliant`, and 20 of 20 recomputed correctly.** Per this
+table's own distinction — it counts **probe** dispatches, and an agent re-reading an existing
+transcript produces no new measurement and selects nothing — the second pass is not charged.
+
+### `plan.md` C5's FOREGROUND rule was again not honoured
+
+The harness dispatched every subagent asynchronously without being asked to, for the fourth stage
+running (`plan-HANDOFF.md` dead-end 4). Recorded rather than papered over. The measurement is
+unaffected — the 20 cells are mutually independent, each probe wrote only its own file, and every
+one was confirmed complete before any transcript was assembled or scored — but the single-writer
+property C5 protects was again held by the sandbox, not by the scheduling.
+
+### What the global ceiling now permits — re-derived, and it does not close
+
+**75 of 122 spent. 47 remain.** Remaining planned work is unchanged in size: Task 19 (12) +
+Task 20 (4 + 4 + 12 = 20) + Task 21 `ab-voice` (24) = **56**. That lands at **131 of 122** and
+**crosses the global ceiling by 9 runs**, before any of the four unbudgeted 4-run claims the
+section above already records as contending for slack that no longer exists.
+
+**This phase does not resolve that, and must not.** It is the run-level call the ledger's standing
+rule reserves — *decide what gets dropped before spending, not at the last run*. What this stage
+contributes is evidence that bears directly on the cheapest way out: **`code-review`'s held-out
+pair came back saturated at 3 of 4**, so Task 19's 12 runs would be spent on an instrument already
+shown unable to separate the arms. Deferring Task 19 until `code-review-3` is rewritten lands the
+run at **119 of 122** and needs nothing else cut. **Escalated in `discrimination-test-HANDOFF.md`
+rather than decided here.**

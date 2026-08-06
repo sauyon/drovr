@@ -1,0 +1,22 @@
+{
+  "0cd409": {
+    "arm": "none",
+    "scenario": "systematic-debugging-2",
+    "sample": 1
+  },
+  "12c7ed": {
+    "arm": "none",
+    "scenario": "systematic-debugging-2",
+    "sample": 2
+  },
+  "ecfcb5": {
+    "arm": "none",
+    "scenario": "systematic-debugging-3",
+    "sample": 1
+  },
+  "8bbf60": {
+    "arm": "none",
+    "scenario": "systematic-debugging-3",
+    "sample": 2
+  }
+}
