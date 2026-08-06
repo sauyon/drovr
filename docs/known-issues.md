@@ -3433,3 +3433,64 @@ If a state poll is ever genuinely needed, the doc must say to match the terminal
 (`approved`/`cancelled`/`waiting`), never `ready` alone. But the better fix is that a driver should
 not be hand-rolling a poll for a state machine the CLI already exposes a blocking call for — that is
 the class of mistake this entry is about, and it should not be reachable from following the skill.
+
+
+## Every cold `opencode` reviewer pane swallows its seed, so the panel cannot converge (2026-08-06)
+
+**Severity:** high (blocks `code-review run` entirely under `review_agent = "opencode"`; retries
+cannot help, because each one mints another cold pane that fails identically).
+**Found:** 2026-08-06, run `hakobiya-accounts` task-2, against opencode 1.18.3.
+**Caveat — verify before acting on this:** observed on a **nix build of 0.2.0** that predates
+`da99190` and the `drovr/opencode-agent` merges. The newer opencode work may already address it.
+
+This is the sequel to *"`drovr code-review run` panel never completes (reviewer panes don't
+attach)"* above. That entry's readiness gate fix (`c12adb0`, `wait_agent_ready` inside
+`phase::phase_send`, which `code_review.rs` calls after `spawn_reviewer`) is what made the
+"agent target not found" symptom go away. **For opencode the gate passes and the seed still
+does not land** — so `agent_status` is not sufficient evidence that this TUI will accept input.
+
+### Symptom
+
+`drovr code-review run <run> <task>` exits 1 with the standard undelivered-seed diagnostic
+("herdr saw no state change after the prompt, and the payload is nowhere in the agent's
+composer"). Observed on iterations 2 and 3 back-to-back; each attempt left a **new** pane
+behind (`wJ:p2`, `wJ:p3`) and each new pane failed the same way. No `task-2-review-*-*.json`
+was ever written.
+
+### Not the cursor trust-dialog case, and not the paste-not-submitted case
+
+The error text is shared with both, but the pane state distinguishes them:
+
+- **cursor:** a `Do you trust the contents of this directory?` dialog sits on the pane.
+  Answering once persists, so the *next* spawn succeeds — retrying converges.
+- **paste-not-submitted:** the seed is visible in the composer as `→ [Pasted text #1 +N lines]`.
+- **opencode (this entry):** the composer is **clean** — no dialog, no pasted payload. The pane
+  is otherwise correctly wired: `Plan` agent selected (read-only wiring good) and `⊙ 1 MCP`
+  connected (findings channel good). Nothing persists between spawns, so retrying never
+  converges.
+
+Purely a delivery-timing failure; the rest of the opencode integration works.
+
+### Working around it
+
+The failure leaves a live, MCP-connected pane, and the per-angle seed files are already on
+disk. Deliver one by hand:
+
+```
+herdr agent prompt <pane> "$(cat "$(drovr path <run>)/task-<N>-review-<angle>-seed.md)"
+```
+
+The reviewer then runs and calls `submit_findings` through its own MCP connection exactly as
+designed. `code-review run` is no longer supervising, so the driver must poll for
+`task-<N>-review-<iter>-<angle>.json` and merge angles by hand. One warm pane serves one angle;
+minting more means letting `code-review run` fail again for each.
+
+### Fix ideas
+
+1. Gate on something opencode-specific that proves the composer is live rather than on herdr's
+   generic `agent_status` — the TUI prints its footer (`~/path:branch  ⊙ N MCP`) once
+   interactive.
+2. Re-send once after a short delay when the payload is absent from the composer *and* no
+   dialog is detected. drovr deliberately refuses to key into that state, but
+   absent-payload-plus-no-dialog is the signature of a cold TUI, not of a prompt awaiting an
+   answer.
