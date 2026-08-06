@@ -250,25 +250,17 @@ const BLOCKED_TTL: Duration = Duration::from_secs(5);
 /// fine".
 const BLOCKED_RETRY_TTL: Duration = Duration::from_secs(1);
 
-/// A run's blocked agents AND how much the sweep that found them knew.
-///
-/// The two travel together because the interesting answer is a pair: an empty
-/// `agents` means "nothing is blocked" only when the sweep was conclusive, and
-/// separating them is how a herdr outage came to render as a clean row.
-#[derive(Clone, Default)]
-struct BlockedSnapshot {
-    agents: Vec<crate::blocked::BlockedAgent>,
-    /// The sweep could not reach a single one of the run's panes
-    /// ([`crate::blocked::RunScan::inconclusive`]).
-    inconclusive: bool,
-}
-
 /// One run's last blocked sweep, and when it was taken. How long it stands in
 /// depends on what it was: [`BLOCKED_TTL`] for an answer, the much shorter
 /// [`BLOCKED_RETRY_TTL`] for a sweep that learned nothing.
+///
+/// The whole [`crate::blocked::RunScan`] is kept, not a projection of it: the
+/// blocked list means one thing when the sweep reached the run's panes and
+/// another when it did not, and a cache that stored only the list is exactly how
+/// a herdr outage came to render as a clean row.
 struct BlockedCache {
     at: Option<Instant>,
-    snapshot: BlockedSnapshot,
+    scan: crate::blocked::RunScan,
 }
 
 impl Ctx {
@@ -286,14 +278,14 @@ impl Ctx {
     ///
     /// Takes the herdr client rather than making one so a test can drive it with
     /// a `FakeHerdr`; the client is never stored, only the plain-data result is.
-    fn blocked_of<H: Herdr>(&self, h: &H, run: &str, state: &RunState) -> BlockedSnapshot {
+    fn blocked_of<H: Herdr>(&self, h: &H, run: &str, state: &RunState) -> crate::blocked::RunScan {
         let cell = {
             let mut map = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
             map.entry(run.to_string())
                 .or_insert_with(|| {
                     Arc::new(Mutex::new(BlockedCache {
                         at: None,
-                        snapshot: BlockedSnapshot::default(),
+                        scan: crate::blocked::RunScan::default(),
                     }))
                 })
                 .clone()
@@ -304,21 +296,17 @@ impl Ctx {
         // comes back — but the retry floor keeps a hung herdr from being swept
         // once per request per tab. Both halves matter, and which TTL applies is
         // decided by the CACHED sweep, not the incoming one.
-        let ttl = if cache.snapshot.inconclusive {
+        let ttl = if cache.scan.inconclusive() {
             BLOCKED_RETRY_TTL
         } else {
             BLOCKED_TTL
         };
         let fresh = cache.at.is_some_and(|at| at.elapsed() < ttl);
         if !fresh {
-            let scan = crate::blocked::scan_run(h, state);
-            cache.snapshot = BlockedSnapshot {
-                inconclusive: scan.inconclusive(),
-                agents: scan.blocked,
-            };
+            cache.scan = crate::blocked::scan_run(h, state);
             cache.at = Some(Instant::now());
         }
-        cache.snapshot.clone()
+        cache.scan.clone()
     }
 
     fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
@@ -1341,8 +1329,9 @@ fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
 /// [`blocked_json`] already spends that name on a bool, and the same name
 /// holding a bool on one endpoint and a number on a neighbouring one is a shape
 /// no typed client can share.
-fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
-    let agents = &snapshot.agents;
+fn blocked_summary_json(scan: &crate::blocked::RunScan) -> serde_json::Value {
+    let agents = &scan.blocked;
+    let inconclusive = scan.inconclusive();
     let human_phases: Vec<&str> = agents
         .iter()
         .filter(|a| a.class.needs_human())
@@ -1357,7 +1346,7 @@ fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
         // run's panes. `null` is what the browser reads as "this run is fine",
         // including as permission to CLEAR an alarm it already raised, so a
         // sweep that reached nothing must answer something else.
-        return if snapshot.inconclusive {
+        return if inconclusive {
             serde_json::json!({
                 "count": 0,
                 "phase": serde_json::Value::Null,
@@ -1377,7 +1366,7 @@ fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
         // Blocks WERE found, so the row has something true to say; `unknown`
         // still travels because some other pane of the run went unread and a
         // further block may be hiding behind it.
-        "inconclusive": snapshot.inconclusive,
+        "inconclusive": inconclusive,
     })
 }
 
@@ -1413,9 +1402,9 @@ fn handle_get_agents(req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths) {
     // run with no agents, it is a run we could not read.
     let tree = match load_run_state(&p.dir) {
         Some(state) => {
-            let blocked = ctx.blocked_of(&crate::herdr::SystemHerdr::new(), run, &state);
-            let mut tree = build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked.agents);
-            tree["inconclusive"] = serde_json::Value::Bool(blocked.inconclusive);
+            let scan = ctx.blocked_of(&crate::herdr::SystemHerdr::new(), run, &state);
+            let mut tree = build_agent_tree(&state, &cfg, config_error.as_deref(), &scan.blocked);
+            tree["inconclusive"] = serde_json::Value::Bool(scan.inconclusive());
             tree
         }
         None => serde_json::json!({
@@ -1858,9 +1847,12 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
             // is read as exactly that, including as permission to clear an alarm
             // already raised. `list_runs_in` only checks the file EXISTS, so
             // such rows really are listed.
-            None => blocked_summary_json(&BlockedSnapshot {
-                agents: Vec::new(),
-                inconclusive: true,
+            // One unreadable pane's worth of "we do not know", which is what
+            // `RunScan::inconclusive` reads: no pane answered, and one did not.
+            None => blocked_summary_json(&crate::blocked::RunScan {
+                blocked: Vec::new(),
+                attached: 0,
+                unreadable: 1,
             }),
             // Workspace confirmed gone: its panes went with it, and there is
             // genuinely nothing that can be blocked.

@@ -2375,9 +2375,6 @@ var completedOpen = (function() {
   try { return localStorage.getItem('drovr.completedOpen') === '1'; } catch (e) { return false; }
 })();
 
-// One list row. `complete` runs are dimmed and led by a check instead of the gate
-// dot, and their meta reports phase progress rather than the gate state — for a
-// finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
 // ---------------------------------------------------------------------------
 // Blocked-agent alarms: the tab title, and the desktop notification
 // ---------------------------------------------------------------------------
@@ -2410,12 +2407,13 @@ var baseTitle = document.title;
 /// happened to see would strand the alarm of a run that has since been purged:
 /// its key is in neither the feed nor the scope, so nothing would ever clear it
 /// and the tab title would carry a phantom count for the rest of the session.
+///
 /// `uncertain` names the runs whose sweep could not reach their panes (the
-/// server's `blocked.inconclusive`, or the agent tree's). Their alarms are HELD, never cleared: a poll
-/// that succeeded while herdr was down carries no evidence that a block went
-/// away, and clearing on it would silently drop the notification for an agent
-/// that is still stuck — the opposite of what a failed fetch does two frames
-/// later.
+/// server's `blocked.inconclusive`, or the agent tree's own). Their alarms are
+/// HELD, never cleared: a poll that succeeded while herdr was down carries no
+/// evidence that a block went away, and clearing on it would silently drop the
+/// notification for an agent that is still stuck — the opposite of what a failed
+/// fetch does two frames later.
 function syncBlockedAlarms(alarms, scope, uncertain) {
   var inScope = null;
   if (scope) {
@@ -2436,8 +2434,11 @@ function syncBlockedAlarms(alarms, scope, uncertain) {
   alarms.forEach(function(a) {
     blockedAlarms[a.key] = a.label;
     if (blockedNotified[a.key]) return;
-    blockedNotified[a.key] = true;
-    notifyBlocked(a.label);
+    // Marked notified only if the notification actually went out. Setting it
+    // first meant a constructor that threw (some browsers refuse one outside a
+    // service worker) lost the desktop alert for the whole episode, with the
+    // next poll believing it had already been sent.
+    blockedNotified[a.key] = notifyBlocked(a.label);
   });
   applyBlockedTitle();
 }
@@ -2458,14 +2459,22 @@ function applyBlockedTitle() {
   document.title = n ? '⚠ (' + n + ') ' + baseTitle : baseTitle;
 }
 
+/// Fire the desktop notification. Returns whether the alarm can be considered
+/// announced — false both when notifications are unavailable (the tab title
+/// still carries it, and there is nothing to retry) and when the constructor
+/// threw, where the next poll SHOULD try again rather than assume it landed.
 function notifyBlocked(label) {
-  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  if (typeof Notification === 'undefined') return true;   // nothing to retry
+  if (Notification.permission !== 'granted') return true; // ditto: not a failure
   try {
     new Notification('drovr — agent blocked', { body: label, tag: label });
+    return true;
   } catch (e) {
-    // Some browsers throw on constructing a Notification outside a service
-    // worker. The title badge above already carried the fact; a failed
-    // nice-to-have must not break the poll that called us.
+    // Some browsers refuse a Notification constructed outside a service worker.
+    // The title count already carried the fact, so this must not break the poll
+    // that called us — but it must not be recorded as delivered either.
+    console.warn('[drovr] desktop notification failed', e);
+    return false;
   }
 }
 
@@ -2485,6 +2494,9 @@ function syncNotifyButton() {
   btn.style.display = askable ? '' : 'none';
 }
 
+// One list row. `complete` runs are dimmed and led by a check instead of the gate
+// dot, and their meta reports phase progress rather than the gate state — for a
+// finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
 function runRow(run) {
   // Archived AND the workspace still open. Two ways to get here, and the row means
   // the same in both: filed away with something still live in it.

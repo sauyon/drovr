@@ -2109,7 +2109,10 @@ await goto('#/', LIST_READY);
 await evaluate(`
   window.__notes = [];
   window.__origNotifyBlocked = notifyBlocked;
-  notifyBlocked = function(label) { window.__notes.push(label); };
+  // Returns true, as the real one does when the notification went out —
+  // syncBlockedAlarms records "announced" from that answer.
+  notifyBlocked = function(label) { window.__notes.push(label); return window.__notifyOk; };
+  window.__notifyOk = true;
   blockedAlarms = {}; blockedNotified = {};
   applyBlockedTitle();
   return 1;`);
@@ -2140,6 +2143,7 @@ check('the title goes back to normal when nothing is stuck',
 check('a block that recurs after clearing notifies again',
   (await sync([A], ['zz-one']), (await notes()).length), 3);
 
+
 // A null scope is the session list's: it fetched every run there is, so it can
 // clear a key whose run has since been purged. Scoped to the names it happened
 // to SEE, such a key would be in neither the feed nor the scope, and the count
@@ -2151,6 +2155,20 @@ const C = { key: 'zz-one/review:task-1:1:security', label: 'zz-one · panel is s
 check('two blocks in one run are two alarms, not one',
   (await sync([A, C], null)).slice(0, 6), '⚠ (2) ');
 check('...and both are notified', (await notes()).length, 5);
+
+// A notification the browser refused is not a notification delivered: the next
+// poll must try again rather than record it as sent.
+await evaluate(`window.__notifyOk = false; return 1;`);
+await sync([], ['zz-one']);
+await sync([A], ['zz-one']);
+const afterRefusal = (await notes()).length;
+await sync([A], ['zz-one']);
+check('a refused notification is retried on the next poll',
+  (await notes()).length, afterRefusal + 1);
+// Put back the two zz-one alarms this check cleared — the sections below count
+// on them.
+await evaluate(`window.__notifyOk = true; return 1;`);
+await sync([A, C], null);
 
 // A poll that SUCCEEDED while herdr was down carries no evidence that a block
 // went away. Clearing on it would drop the notification for an agent that is

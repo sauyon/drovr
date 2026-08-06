@@ -79,13 +79,18 @@ enum Commands {
     /// unrecognised prompts raise the alarm; routine permission dialogs do not
     /// (a `drovr phase wait` answers those itself).
     ///
-    /// With no run name it watches every run that still has an agent attached.
+    /// With no run name it watches every run whose state reads — including ones
+    /// that have not started a phase yet, so it is safe to background BEFORE
+    /// `drovr phase start`.
     ///
-    /// Exit codes: 4 = an agent needs a human (same code `phase wait` uses for a
-    /// blocked pane), 0 = nothing left to watch (every agent has exited AND every run finished its phases), 2 =
-    /// timeout (re-run to resume), 1 = error.
+    /// Exit codes: 4 = an agent needs a human (the same code `phase wait` uses
+    /// for a blocked pane); 0 = nothing left to watch (every agent has exited
+    /// AND every run has finished its phases); 2 = timeout, meaning only that no
+    /// agent needed a human in that window — re-run to keep watching; 1 = error,
+    /// including a run whose state could not be read, since nothing can be
+    /// claimed about a run that was never watched.
     Watch {
-        /// The run to watch. Omit to watch every run with a live agent.
+        /// The run to watch. Omit to watch every run drovr can read.
         name: Option<String>,
         #[arg(long, default_value_t = 1_800_000)]
         timeout_ms: u64,
@@ -1007,27 +1012,38 @@ fn blocked_report(run: &str, a: &blocked::BlockedAgent) -> String {
     )
 }
 
-/// Every run `drovr watch` should sweep: the one named, or every run whose herdr
-/// workspace is still live.
+/// Every run `drovr watch` should consider: the one named, or every run whose
+/// `state.json` reads.
 ///
-/// Liveness is the only filter, archiving deliberately not among them: an
-/// archived run whose workspace is still open is one whose close FAILED, so an
-/// agent is running in panes drovr believes it shut — the last place a block
-/// should go unwatched.
+/// **No liveness filter here, deliberately.** `watch_tick` applies liveness
+/// itself, to decide what to SWEEP — filtering the list first made the no-name
+/// form exit 0 with "none has phases outstanding" on the first poll, having
+/// never read any run's phases, whenever herdr listed no matching workspace.
 ///
 /// A run whose `state.json` will not parse is skipped rather than fatal — one
 /// broken run must not stop a watch over all the others — but it is COUNTED, so
-/// the caller can tell "there is nothing to watch" apart from "everything I was
-/// asked to watch is unreadable". A run named EXPLICITLY is loaded through
+/// the caller can tell "there is nothing to watch" apart from "some of what I
+/// was asked to watch is unreadable". A run named EXPLICITLY is loaded through
 /// `load_run`, which exits 1 and says why.
-fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> WatchScope {
+///
+/// `warned` carries the run names already reported, across polls: this runs
+/// every `interval_ms` for the life of the watch, and a permanently broken
+/// `state.json` would otherwise repeat its diagnostic every five seconds until
+/// the error it is trying to preserve has scrolled away.
+///
+/// It is stricter than `drovr list`'s own parse on purpose. `RunState::load`
+/// enforces the pane/reaped lifecycle; `cmd_list` takes anything serde accepts.
+/// A display surface should show what it can, while this one decides an exit
+/// code a harness acts on, and a run whose recorded state contradicts itself is
+/// not one to make claims about.
+fn runs_to_watch(name: Option<&str>, warned: &mut std::collections::HashSet<String>) -> WatchScope {
     let Some(name) = name else {
         // Only runs whose workspace herdr still has: a run whose panes died
         // long ago holds their ids forever, and sweeping them would both cost a
         // failed `pane.get` each and print a "polling is degraded" line per
         // sweep, every interval, for the life of the watch.
-        let mut unreadable = 0;
-        let all: Vec<RunState> = run::list_runs_in(&run::runs_dir())
+        let mut unparseable_runs = 0;
+        let runs: Vec<RunState> = run::list_runs_in(&run::runs_dir())
             .into_iter()
             .filter_map(|n| match RunState::load(&n) {
                 Ok(s) => Some(s),
@@ -1035,15 +1051,19 @@ fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> WatchScope {
                 // the watch — but it must not be silent either: that run is now
                 // unwatched, and a blocked agent in it can never wake anyone.
                 Err(e) => {
-                    eprintln!("drovr: not watching run '{n}' — its state could not be read: {e}");
-                    unreadable += 1;
+                    if warned.insert(n.clone()) {
+                        eprintln!(
+                            "drovr: not watching run '{n}' — its state could not be read: {e}"
+                        );
+                    }
+                    unparseable_runs += 1;
                     None
                 }
             })
             .collect();
         return WatchScope {
-            runs: blocked::with_live_workspace(h, all),
-            unreadable,
+            runs,
+            unparseable_runs,
         };
     };
     if let Err(e) = validate_run_name(name) {
@@ -1052,19 +1072,26 @@ fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> WatchScope {
     }
     WatchScope {
         runs: vec![load_run(name)],
-        unreadable: 0,
+        unparseable_runs: 0,
     }
 }
 
 /// What a watch found to watch, and what it could not read while looking.
 ///
-/// The two are separate because the empty case is ambiguous without them:
-/// "every agent has exited" (exit 0, the normal end of a run) and "every run I
-/// was asked to watch is unreadable" (an error) are the same empty list, and a
-/// harness that treats exit 0 as all-clear would stop monitoring on the second.
+/// The two are separate because the watch's exit code turns on the difference:
+/// "every agent has exited and every run finished" (exit 0, the normal end) and
+/// "some of what I was asked to watch is unreadable" (exit 1) can otherwise
+/// present identically, and a harness that treats exit 0 as all-clear stops
+/// monitoring on the second.
+///
+/// `unparseable_runs` counts RUNS whose `state.json` would not load — named
+/// apart from [`crate::blocked::RunScan::unreadable`], which counts PANES herdr
+/// would not answer for. They are different units in the same feature, and one
+/// `unreadable` for both is how an exit-code predicate comes to be written
+/// against the wrong one.
 struct WatchScope {
     runs: Vec<RunState>,
-    unreadable: usize,
+    unparseable_runs: usize,
 }
 
 /// `drovr watch` — block until an agent needs a human, then exit 4.
@@ -1075,22 +1102,15 @@ struct WatchScope {
 fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let interval = std::time::Duration::from_millis(interval_ms);
+    // Runs already reported as unreadable. The scope is rebuilt every poll, so
+    // without this a permanently broken `state.json` prints its diagnostic every
+    // `interval_ms` until the context it was meant to preserve has scrolled off.
+    let mut warned = std::collections::HashSet::new();
     loop {
         // Re-read every sweep: a phase that starts (or is reaped) while the watch
         // runs changes what there is to watch, and a watch holding the state it
         // booted with would keep polling a pane nobody records any more.
-        let scope = runs_to_watch(h, name);
-        // Nothing to watch AND something we could not read: the empty list is
-        // the failure, not the answer. Exiting 0 here would tell a driver every
-        // agent had finished.
-        if scope.runs.is_empty() && scope.unreadable > 0 {
-            eprintln!(
-                "drovr: nothing to watch — {} run(s) could not be read (see above) and no \
-                 readable run has a live herdr workspace",
-                scope.unreadable
-            );
-            process::exit(1);
-        }
+        let scope = runs_to_watch(name, &mut warned);
         match blocked::watch_tick(h, &scope.runs) {
             blocked::WatchTick::Alarm(findings) => {
                 for f in &findings {
@@ -1099,6 +1119,19 @@ fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: 
                 process::exit(4);
             }
             blocked::WatchTick::NothingToWatch => {
+                // Exit 0 is a CLAIM — "this is over, stop monitoring" — and a
+                // run we could not read is a run we cannot make it about. It
+                // does not matter that other runs finished cleanly: the
+                // unreadable one could be sitting on a destructive prompt, and
+                // nothing here would ever wake anyone for it.
+                if scope.unparseable_runs > 0 {
+                    eprintln!(
+                        "drovr: every run this watch could READ has finished, but {} could not \
+                         be read (see above) and was never watched — so this is not an all-clear",
+                        scope.unparseable_runs
+                    );
+                    process::exit(1);
+                }
                 // Not a failure and not an alarm: a finished run with every
                 // agent gone is the normal end, and saying so beats sitting out
                 // the timeout while the driver assumes work is still happening.

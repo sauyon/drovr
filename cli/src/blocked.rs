@@ -31,7 +31,7 @@
 //! itself), routine ones do not (a waiting driver answers them, and a badge that
 //! fires on every file-edit permission dialog is a badge nobody reads).
 
-use crate::herdr::{AgentStatus, Herdr};
+use crate::herdr::{AgentStatus, Herdr, PaneState};
 use crate::phase::{classify_blocked_prompt, tail_snippet, BlockedClass};
 use crate::run::RunState;
 
@@ -116,17 +116,23 @@ pub fn scan_run<H: Herdr>(h: &H, run: &RunState) -> RunScan {
         let Some(pane_id) = phase.pane_id() else {
             continue;
         };
-        let Some(info) = h.pane_info(pane_id) else {
-            scan.unreadable += 1;
-            continue;
-        };
-        if info.has_agent_session() {
-            scan.attached += 1;
+        let info = h.pane_info(pane_id);
+        // Through `PaneState` rather than re-deriving the three cases from
+        // `Option` + `has_agent_session`: it exists precisely so a caller cannot
+        // conflate "could not read the pane" with "the agent has exited", and
+        // this scan turns on exactly that distinction.
+        match PaneState::from_poll(info.as_ref()) {
+            PaneState::Unreadable => {
+                scan.unreadable += 1;
+                continue;
+            }
+            PaneState::AgentAttached => scan.attached += 1,
+            PaneState::NoAgentSession => {}
         }
         // Narrowing `pane_info` to the status at the site that wants it, as the
         // trait's own docs require. A pane with no status at all is not evidence
         // of a block — herdr answering short must not paint a run as stuck.
-        if info.agent_status != Some(AgentStatus::Blocked) {
+        if info.and_then(|i| i.agent_status) != Some(AgentStatus::Blocked) {
             continue;
         }
         scan.blocked.push(classify_pane(h, &phase.name, pane_id));
@@ -169,6 +175,25 @@ fn classify_pane<H: Herdr>(h: &H, phase: &str, pane_id: &str) -> BlockedAgent {
     }
 }
 
+/// Whether this run's herdr workspace is one herdr currently has — i.e. whether
+/// sweeping its panes can tell us anything.
+///
+/// `live` is `workspace_list`'s answer, and `None` (herdr could not be asked)
+/// means EVERY run is worth sweeping: "unknown" must not read as "gone", or a
+/// herdr blip would quietly stop watching everything.
+///
+/// One definition, because two callers need the same answer for opposite
+/// reasons — `drovr list` uses it to decide what to sweep, `watch_tick` to
+/// decide what a failed sweep means.
+fn workspace_is_live(run: &RunState, live: Option<&[String]>) -> bool {
+    let Some(live) = live else {
+        return true;
+    };
+    run.workspace
+        .as_deref()
+        .is_some_and(|ws| live.iter().any(|id| id == ws))
+}
+
 /// Drop the runs whose herdr workspace is gone, in ONE herdr call.
 ///
 /// This is not an optimisation, it is what makes a sweep over EVERY run usable.
@@ -177,19 +202,14 @@ fn classify_pane<H: Herdr>(h: &H, phase: &str, pane_id: &str) -> BlockedAgent {
 /// `pane.get` failures prints herdr's "agent status polling is degraded"
 /// diagnostic. On a data dir with thirty old runs, `drovr list` drowned in it.
 ///
-/// `workspace_list` returning `None` means herdr could not be asked, and then
-/// EVERY run is kept: "unknown" must not read as "gone", or a herdr blip would
-/// quietly stop watching everything.
+/// **For deciding what to SWEEP only.** A run filtered out here is not a run
+/// that can be declared over: `watch_tick` applies the same predicate itself,
+/// precisely so a run whose workspace is absent still counts as watchable while
+/// its phases are outstanding.
 pub fn with_live_workspace<H: Herdr>(h: &H, runs: Vec<RunState>) -> Vec<RunState> {
-    let Some(live) = h.workspace_list() else {
-        return runs;
-    };
+    let live = h.workspace_list();
     runs.into_iter()
-        .filter(|run| {
-            run.workspace
-                .as_deref()
-                .is_some_and(|ws| live.iter().any(|id| id == ws))
-        })
+        .filter(|run| workspace_is_live(run, live.as_deref()))
         .collect()
 }
 
@@ -229,8 +249,20 @@ pub enum WatchTick {
 pub fn watch_tick<H: Herdr>(h: &H, runs: &[RunState]) -> WatchTick {
     let mut findings = Vec::new();
     let mut anything_live = false;
+    // Liveness gates the SWEEP, never the verdict, and that separation is the
+    // whole reason it is applied here rather than by the caller filtering the
+    // list. A run whose workspace herdr does not list has no panes worth asking
+    // about — but it is still a run, and if its phases are outstanding it can be
+    // handed an agent at any moment. Filtering it away before the tick made the
+    // no-name `drovr watch` exit 0 with "none has phases outstanding" without
+    // ever having read a single run's phases.
+    let live = h.workspace_list();
     for run in runs {
-        let scan = scan_run(h, run);
+        let scan = if workspace_is_live(run, live.as_deref()) {
+            scan_run(h, run)
+        } else {
+            RunScan::default()
+        };
         // `!is_complete()` is the third term, and it exists because of a race a
         // driver hits constantly: the documented use is to background this watch
         // ALONGSIDE `drovr phase start`, and between `drovr new` and the pane
@@ -276,6 +308,16 @@ mod tests {
     use crate::run::{Phase, PhaseStatus, RunState};
 
     /// A run with two phase panes and one review panel pane, all live.
+    /// A fake herdr that reports [`run_with_panes`]'s workspaces as open, which
+    /// is what makes `watch_tick` sweep them at all. The default fake reports NO
+    /// live workspace, and a watch deliberately does not sweep a run herdr has
+    /// no workspace for.
+    fn fake_watching() -> FakeHerdr {
+        let h = FakeHerdr::new();
+        h.set_live_workspaces(Some(vec!["w".into(), "x".into()]));
+        h
+    }
+
     fn run_with_panes() -> RunState {
         let phase = |name: &str, pane: &str| {
             let mut p = Phase::new(name);
@@ -480,7 +522,7 @@ mod tests {
 
     #[test]
     fn a_watch_alarms_on_the_first_agent_that_needs_a_human() {
-        let h = FakeHerdr::new();
+        let h = fake_watching();
         h.push_status_for("w:p2", Some("blocked"));
         h.push_read_for("w:p2", "Dangerous rm operation\n1. Yes\n2. No");
         let WatchTick::Alarm(found) = watch_tick(&h, &[run_with_panes()]) else {
@@ -493,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_watch_keeps_watching_through_a_routine_prompt() {
-        let h = FakeHerdr::new();
+        let h = fake_watching();
         h.push_status_for("w:p2", Some("blocked"));
         h.push_read_for("w:p2", "Do you want to read Cargo.toml?\n1. Yes");
         assert_eq!(
@@ -505,7 +547,7 @@ mod tests {
 
     #[test]
     fn a_watch_ends_when_every_agent_has_exited_and_the_run_is_finished() {
-        let h = FakeHerdr::new();
+        let h = fake_watching();
         for pane in ["w:p1", "w:p2", "w:p3"] {
             h.push_status_for(pane, Some("unknown"));
         }
@@ -574,7 +616,7 @@ mod tests {
 
     #[test]
     fn a_watch_spans_every_run_it_was_given() {
-        let h = FakeHerdr::new();
+        let h = fake_watching();
         let mut other = run_with_panes();
         other.name = "second".into();
         other.phases[0].set_pane("x:p1");
