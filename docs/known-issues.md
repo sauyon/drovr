@@ -710,6 +710,107 @@ Have `code-review brief` take a flag (or detect the absence of the MCP server) a
 prose-output instruction instead of the `submit_findings` one — the brief already owns the
 findings schema, so only the delivery sentence differs.
 
+## Concurrent writers lose whole phases from `state.json` — OPEN
+
+**Status:** open. Reported by the `skill-stickiness` driver on 2026-08-06 and **verified from
+this worktree**: `cross-model-arm` is absent from the run's `phases` array while its agent is
+mid-measurement, and `run.lock` exists beside it.
+
+**Severity:** high (silent, and it desynchronises drovr's record from reality in the direction
+that loses work — the run believes a phase does not exist while that phase is writing to the
+repository).
+**Found:** 2026-08-06, run `skill-stickiness`, phase `cross-model-arm`.
+
+### Symptom
+
+A phase added by `drovr phase start` disappears from
+`~/.local/share/drovr/runs/<run>/state.json` while other phases in the same run are running.
+Downstream, every command that resolves the phase by name fails: `drovr phase wait` reports
+`phase not found` and exits 1, `drovr phase done` refuses, and the completion marker is never
+written. The phase's agent is unaffected and keeps working, which is what makes this worse
+than a crash — **work proceeds while drovr believes it does not exist**, and the driver has to
+poll the pane instead.
+
+### Root cause
+
+A lost-update race between concurrent state writers. `run.lock` exists but did not serialise
+the update: the writer appears to read-modify-write from an in-memory copy of `state.json`
+taken *before* the new phase was appended, so its write reinstates the older phases array over
+the newer one. Nothing detects it because both writes succeed and the resulting file is
+well-formed — the phase is simply not in it.
+
+### Fix direction
+
+Hold `run.lock` across the **whole** read-modify-write rather than around the write alone, or
+re-read and merge immediately before writing. The second is the safer of the two if any writer
+is outside the lock's reach.
+
+## Externally-closed panes leave stale refs that degrade polling — OPEN
+
+**Status:** open. Reported by the `skill-stickiness` driver on 2026-08-06.
+
+**Severity:** low (noisy rather than wrong, but the warning misdirects triage).
+**Found:** 2026-08-06, run `skill-stickiness`, after finished review panes were reaped.
+
+### Symptom
+
+Closing a phase pane outside drovr leaves its id in `state.json`. A later `drovr phase start`
+on the same run then emits, once per stale pane:
+
+> `herdr's pane.get failed for pane <id>: pane not found ... Agent status polling is degraded —
+> phase sends and waits will run to their timeouts`
+
+Observed for `wCG:pB8`, `wCG:pB9` and `wCG:pBA`.
+
+### Root cause
+
+Pane refs are never dropped for phases in a terminal state, so a `pane_not_found` is treated as
+a live-pane failure. The warning then generalises from one dead pane to the whole run: it
+claims polling is degraded for *"phase sends and waits"* in general, when only the phases whose
+panes are gone are affected. A reader triaging a slow phase is pointed at a healthy mechanism.
+
+### Fix direction
+
+Drop the pane ref when a phase reaches a terminal state, or prune on `pane_not_found` rather
+than warning on every subsequent invocation. Either way, scope the warning's wording to the
+panes that are actually missing.
+
+## `drovr attach` panics under a non-tty — OPEN
+
+**Status:** open. Reported by the `skill-stickiness` driver on 2026-08-06 and **reproduced from
+this worktree** with `drovr attach skill-stickiness < /dev/null`.
+
+**Severity:** low (loud, and the workaround is to read `state.json`) — but the failure mode is
+a panic where a message belongs.
+**Found:** 2026-08-06, run `skill-stickiness`.
+
+### Symptom
+
+```
+drovr: attaching to phase 'implement-task-8' of run 'skill-stickiness'
+thread 'main' panicked at ratatui-0.30.0/src/init.rs:299:16:
+failed to initialize terminal: Os { code: 6, kind: Uncategorized, message: "No such device or address" }
+```
+
+`drovr attach <run>` initialises a ratatui terminal unconditionally and panics when stdout is
+not a tty. It matters because `attach` is the natural command an *agent* reaches for to find a
+run's pane, and an agent never has a tty — so the command most likely to be run headless is the
+one that cannot be.
+
+### Root cause
+
+No tty check before `ratatui::init`. The panic is inside the vendored ratatui rather than in
+drovr's own code, so the message names a dependency's line number and says nothing about what
+the caller should do instead.
+
+### Fix direction
+
+Detect a non-tty on stdout and print the resolved pane id plus a hint (how to attach from a
+terminal, or where the run's state lives) instead of initialising the TUI. Note the command
+also picks a phase to attach to before failing — it announced `implement-task-8` on a run whose
+latest phases are far later — so whatever replaces the TUI path should make the phase-selection
+rule visible rather than inheriting it silently.
+
 ## Follow-ups
 
 Wanted work that is not a defect — nothing here is broken today.
