@@ -72,6 +72,11 @@ pub const LOG_FILE: &str = "interview.jsonl";
 /// text is how they drift apart.
 pub const MAX_FIELD: u64 = MAX_CONTEXT;
 
+/// Cap on an ask id a caller hands in. Ids are minted as `ask-<u32>`, so 64 bytes is
+/// generous; the bound exists because in T4 the id arrives in an HTTP body, and an
+/// unbounded string should reach neither a lookup nor an error message.
+pub const MAX_ID: usize = 64;
+
 /// Cap on the whole log. Only drovr writes it, and each record is bounded by [`MAX_FIELD`],
 /// so reaching this needs either a pathological interview or a hand-planted file — and past
 /// it, every [`read`] would slurp the lot, on every append.
@@ -263,15 +268,15 @@ fn opt_str(v: Option<&serde_json::Value>) -> Option<Option<String>> {
 /// together if either changes.
 fn open_no_follow(path: &Path) -> io::Result<Option<std::fs::File>> {
     match check_no_follow(path)? {
-        Some(()) => Ok(Some(std::fs::File::open(path)?)),
+        Some(_len) => Ok(Some(std::fs::File::open(path)?)),
         None => Ok(None),
     }
 }
 
-/// The metadata half of [`open_no_follow`]: `Ok(None)` if absent, `Ok(Some(()))` if it is a
-/// regular file within [`MAX_LOG`], `Err` otherwise. Split out because the append path
-/// needs the check without the read-only handle.
-fn check_no_follow(path: &Path) -> io::Result<Option<()>> {
+/// The metadata half of [`open_no_follow`]: `Ok(None)` if absent, `Ok(Some(len))` if it is
+/// a regular file within [`MAX_LOG`], `Err` otherwise. Split out because the append path
+/// needs the check, and the current size, without the read-only handle.
+fn check_no_follow(path: &Path) -> io::Result<Option<u64>> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -305,17 +310,47 @@ fn check_no_follow(path: &Path) -> io::Result<Option<()>> {
             ),
         ));
     }
-    Ok(Some(()))
+    Ok(Some(meta.len()))
 }
 
 /// Append one line. `O_APPEND` + a single `write_all` — never a truncating open, and never
 /// through a symlink ([`check_no_follow`] runs first, so a planted link is refused rather
 /// than written through).
+///
+/// [`MAX_LOG`] is enforced on the RESULT, not just on what is already there. Per-field caps
+/// bound a field, not a record — enough in-bounds options make one line bigger than the
+/// whole cap — and since [`read`] refuses an over-cap log, an append that crossed it would
+/// brick the interview permanently. The cap is therefore a precondition on every write: a
+/// log drovr can read stays a log drovr can read.
 fn append_line(run_dir: &Path, line: &str) -> io::Result<()> {
     let path = log_path(run_dir);
-    check_no_follow(&path)?;
+    let have = check_no_follow(&path)?.unwrap_or(0);
+    let adding = line.len() as u64 + 1; // the newline
+    if have + adding > MAX_LOG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "appending {adding} bytes would put the interview log over its \
+                 {MAX_LOG}-byte limit ({have} bytes already)"
+            ),
+        ));
+    }
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     f.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Reject a caller-supplied id over [`MAX_ID`], without echoing it.
+fn check_id(id: &str) -> io::Result<()> {
+    if id.len() > MAX_ID {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "interview id is {} bytes, over the {MAX_ID}-byte limit",
+                id.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Reject a caller-supplied field over [`MAX_FIELD`]. Named, so the error says which one.
@@ -418,6 +453,7 @@ pub fn append_ask(
 /// entitled to make, and the fold treats the id as answered from then on. One over
 /// [`MAX_FIELD`] is not, for the reason in [`append_ask`].
 pub fn append_answer(run_dir: &Path, id: &str, answer: &str) -> io::Result<()> {
+    check_id(id)?;
     check_field("answer", answer)?;
     let asks = read(run_dir)?;
     let ask = asks.iter().find(|a| a.id == id).ok_or_else(|| {
@@ -859,6 +895,41 @@ mod tests {
         let err = append_answer(d.path(), &ask.id, &huge).expect_err("oversized answer");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert_eq!(read_lines(d.path()).len(), 1, "still just the ask");
+    }
+
+    #[test]
+    fn an_append_that_would_exceed_the_log_cap_is_refused() {
+        // Round 2: per-field caps did not bound a RECORD. Enough in-bounds options make one
+        // line larger than the whole-log cap, and since `read` refuses an over-cap log, the
+        // append would have bricked the interview — permanently, the log being append-only.
+        let d = tempfile::tempdir().unwrap();
+        let good = append_ask(d.path(), "q?", None, &[], None).unwrap();
+        let big = "x".repeat(MAX_FIELD as usize);
+        let options: Vec<AskOption> = (0..=(MAX_LOG / MAX_FIELD))
+            .map(|i| AskOption {
+                value: format!("v{i}"),
+                label: big.clone(),
+            })
+            .collect();
+
+        let err = append_ask(d.path(), "too big?", None, &options, None).expect_err("over cap");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(read_lines(d.path()).len(), 1, "nothing was appended");
+        assert_eq!(read(d.path()).unwrap()[0].id, good.id, "log still readable");
+    }
+
+    #[test]
+    fn append_answer_rejects_an_over_long_id_before_looking_it_up() {
+        // The id reaches this module from an HTTP body (T4). An unbounded one has no
+        // business being carried into a lookup, let alone into an error message.
+        let d = tempfile::tempdir().unwrap();
+        append_ask(d.path(), "q?", None, &[], None).unwrap();
+        let err = append_answer(d.path(), &"a".repeat(MAX_ID + 1), "x").expect_err("long id");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().len() < 200,
+            "the id must not be echoed whole: {err}"
+        );
     }
 
     #[test]
