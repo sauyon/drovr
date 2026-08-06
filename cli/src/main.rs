@@ -4,6 +4,7 @@ mod code_review;
 mod config;
 mod findings;
 mod herdr;
+mod interview;
 mod mcp_findings;
 mod phase;
 mod reflex;
