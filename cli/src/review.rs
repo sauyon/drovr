@@ -209,6 +209,11 @@ impl RunPaths {
 struct Ctx {
     runs_root: PathBuf,
     cells: Mutex<HashMap<String, Arc<Mutex<ReviewState>>>>,
+    /// Per-run cache of the blocked-agent scan, on the same shape as `cells`:
+    /// the outer lock is held only long enough to hand out the run's cell, and
+    /// the scan itself — which talks to herdr — happens under that run's own
+    /// lock, so one wedged run cannot stall the session list.
+    blocked: Mutex<HashMap<String, Arc<Mutex<BlockedCache>>>>,
     /// `host:port` values this server will answer state-changing requests for.
     /// Empty means "reject every write" — fail closed, so a construction path
     /// that forgets to populate it cannot silently disable the guard.
@@ -221,14 +226,62 @@ struct Ctx {
     wildcard_port: Option<u16>,
 }
 
+/// How long a blocked-agent scan stands in for the live answer.
+///
+/// The page polls every 2s and a scan costs a herdr round-trip per live pane, so
+/// scanning per poll would put a permanent load on herdr for a fact that changes
+/// on human timescales. Five seconds decouples the two: the browser keeps its 2s
+/// rhythm, herdr sees at most one scan per run per 5s however many tabs are
+/// open, and the worst case is that a badge appears 5s after the agent stopped.
+const BLOCKED_TTL: Duration = Duration::from_secs(5);
+
+/// One run's last blocked scan, and when it was taken.
+struct BlockedCache {
+    at: Option<Instant>,
+    agents: Vec<crate::blocked::BlockedAgent>,
+}
+
 impl Ctx {
     fn new(runs_root: PathBuf, allowed_hosts: Vec<String>) -> Self {
         Ctx {
             runs_root,
             cells: Mutex::new(HashMap::new()),
+            blocked: Mutex::new(HashMap::new()),
             allowed_hosts,
             wildcard_port: None,
         }
+    }
+
+    /// This run's blocked agents, re-scanned at most once per [`BLOCKED_TTL`].
+    ///
+    /// Takes the herdr client rather than making one so a test can drive it with
+    /// a `FakeHerdr`; the client is never stored, only the plain-data result is.
+    fn blocked_of<H: Herdr>(
+        &self,
+        h: &H,
+        run: &str,
+        state: &RunState,
+    ) -> Vec<crate::blocked::BlockedAgent> {
+        let cell = {
+            let mut map = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(run.to_string())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(BlockedCache {
+                        at: None,
+                        agents: Vec::new(),
+                    }))
+                })
+                .clone()
+        };
+        let mut cache = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = cache
+            .at
+            .is_some_and(|at| at.elapsed() < BLOCKED_TTL);
+        if !fresh {
+            cache.agents = crate::blocked::scan_run(h, state).blocked;
+            cache.at = Some(Instant::now());
+        }
+        cache.agents.clone()
     }
 
     fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
@@ -586,8 +639,14 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
     // GET /api/runs — the session list view.
     if method == Method::Get && path == "/api/runs" {
         // One herdr call answers liveness for every row (see `workspace_list`).
-        let live = crate::herdr::SystemHerdr::new().workspace_list();
-        respond_str(req, 200, "application/json", list_runs_json(ctx, live.as_deref()));
+        let h = crate::herdr::SystemHerdr::new();
+        let live = h.workspace_list();
+        respond_str(
+            req,
+            200,
+            "application/json",
+            list_runs_json(ctx, &h, live.as_deref()),
+        );
         return;
     }
 
@@ -683,7 +742,7 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         (Method::Post, "summary") => handle_post_summary(req, ctx, run, &p),
 
         // GET agents — the tree of agents (phases + nested review panels).
-        (Method::Get, "agents") => handle_get_agents(req, &p),
+        (Method::Get, "agents") => handle_get_agents(req, ctx, run, &p),
 
         // GET pane[?pane=<id>] — snapshot of a run agent's session (herdr read).
         (Method::Get, "pane") => handle_get_pane(req, &p, url),
@@ -1216,10 +1275,46 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
     }
 }
 
+/// One blocked agent as the browser sees it: what it is blocked on, the pane
+/// tail so the reviewer can read the prompt without attaching, and whether it
+/// needs a human (a routine prompt does not — see
+/// [`crate::blocked::BlockedAgent::needs_human`]).
+fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
+    serde_json::json!({
+        "class": a.class.as_str(),
+        "needs_human": a.needs_human(),
+        "excerpt": a.excerpt,
+        "pane_id": a.pane_id,
+    })
+}
+
+/// The session list's one-line verdict on a run: `null` when nothing is blocked,
+/// otherwise the counts plus the phase to name in the badge.
+///
+/// The named phase is the first one NEEDING A HUMAN where there is one, because
+/// that is the row the badge is asking someone to act on; it falls back to the
+/// first blocked phase so a run held up only by routine prompts still says which
+/// agent is sitting there.
+fn blocked_summary_json(agents: &[crate::blocked::BlockedAgent]) -> serde_json::Value {
+    let Some(lead) = agents
+        .iter()
+        .find(|a| a.needs_human())
+        .or_else(|| agents.first())
+    else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "count": agents.len(),
+        "needs_human": agents.iter().filter(|a| a.needs_human()).count(),
+        "phase": lead.phase,
+        "class": lead.class.as_str(),
+    })
+}
+
 /// `GET /api/runs/<run>/agents` — the tree of spawned agents: each phase pane
 /// with its per-task review panels nested beneath it. Only agents that actually
 /// have a pane appear (unstarted placeholder phases are omitted).
-fn handle_get_agents(req: Request, p: &RunPaths) {
+fn handle_get_agents(req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths) {
     // A config that fails to load must not blank the tree — but it must not be
     // SILENT either. `resumable` is computed from the agent map, so a config
     // drovr could not read means every ⟳ on this page is decided by the
@@ -1238,7 +1333,10 @@ fn handle_get_agents(req: Request, p: &RunPaths) {
         ),
     };
     let tree = match load_run_state(&p.dir) {
-        Some(run) => build_agent_tree(&run, &cfg, config_error.as_deref()),
+        Some(state) => {
+            let blocked = ctx.blocked_of(&crate::herdr::SystemHerdr::new(), run, &state);
+            build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked)
+        }
         None => serde_json::json!({
             "workspace": serde_json::Value::Null,
             "nodes": [],
@@ -1287,8 +1385,18 @@ fn build_agent_tree(
     run: &RunState,
     cfg: &crate::config::Config,
     config_error: Option<&str>,
+    blocked: &[crate::blocked::BlockedAgent],
 ) -> serde_json::Value {
     use std::collections::BTreeMap;
+    // Keyed by PHASE NAME, not pane id: the tree node knows its phase, and a
+    // pane id can be recycled by a rehydrate between the scan and this render.
+    let blocked_for = |name: &str| {
+        blocked
+            .iter()
+            .find(|a| a.phase == name)
+            .map(blocked_json)
+            .unwrap_or(serde_json::Value::Null)
+    };
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
         // A placeholder is not an agent — see `Phase::has_run`, the same
@@ -1310,6 +1418,7 @@ fn build_agent_tree(
                 "status": status_str(&rp.status), "pane_id": rp.pane_id(),
                 "reaped": rp.is_reaped(), "rehydratable": run.rehydratable(&rp.name).is_ok(),
                 "resumable": has_resumable_session(rp, cfg),
+                "blocked": blocked_for(&rp.name),
             }));
     }
     let mut nodes = Vec::new();
@@ -1324,6 +1433,7 @@ fn build_agent_tree(
             "status": status_str(&ph.status), "pane_id": ph.pane_id(),
             "reaped": ph.is_reaped(), "rehydratable": run.rehydratable(&ph.name).is_ok(),
             "resumable": has_resumable_session(ph, cfg),
+            "blocked": blocked_for(&ph.name),
             "children": children,
         }));
     }
@@ -1558,7 +1668,12 @@ fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths
 /// `None` when herdr could not be reached. Each row reports `live` as
 /// `true`/`false`/`null` accordingly — `null` is "unknown", and the UI must treat
 /// it with the same caution as `true` (it gates a workspace-closing archive).
-fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String {
+///
+/// `h` is the herdr client the blocked scan runs on. Passed in rather than made
+/// here so a test can drive the scan with a `FakeHerdr`, and so the ONE
+/// `workspace_list` the caller already made and this scan come from the same
+/// client.
+fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[String]>) -> String {
     let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
     for name in list_runs_in(&ctx.runs_root) {
         let dir = ctx.runs_root.join(&name);
@@ -1633,6 +1748,22 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
         let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
             || rs.state == LoopState::Cancelled)
             && !zombie;
+        // Blocked agents, for the row's badge. Scanned only for runs where the
+        // answer can be anything but "no": a finished or archived run holds no
+        // working agent, and a workspace herdr says is gone holds no panes. The
+        // scan is TTL-cached (`Ctx::blocked_of`), so the 2s list poll costs at
+        // most one herdr sweep per run per `BLOCKED_TTL`.
+        //
+        // `live == None` (herdr unreachable) still scans: the scan's own reads
+        // fail closed to "nothing blocked", which is the same answer skipping
+        // gives, and the moment herdr comes back the badge is right again
+        // without waiting for a liveness poll to agree.
+        let blocked = match run_state.as_ref() {
+            Some(st) if !complete && !archived && live != Some(false) => {
+                blocked_summary_json(&ctx.blocked_of(h, &name, st))
+            }
+            _ => serde_json::Value::Null,
+        };
         // Sort key: most-recently-touched review artifact (fall back to 0).
         let updated = fs::metadata(dir.join("review.state.json"))
             .or_else(|_| fs::metadata(dir.join("state.json")))
@@ -1664,6 +1795,11 @@ fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String 
                     None => serde_json::Value::Null,
                     Some(b) => serde_json::Value::Bool(b),
                 },
+                // `null` when no agent of this run is parked on a prompt.
+                // Otherwise `{count, needs_human, phase, class}` — and it is
+                // `needs_human`, not `count`, that earns the alarm: a routine
+                // permission dialog is answered by whatever driver is waiting.
+                "blocked": blocked,
             }),
         ));
     }
@@ -2218,6 +2354,14 @@ mod tests {
         dir
     }
 
+    /// `/api/runs` as parsed rows, swept by a herdr that reports every pane
+    /// `idle` — the shape every list test below wants, where the run's agents
+    /// are healthy and nothing is blocked. Tests about the blocked column script
+    /// their own `FakeHerdr` and call `list_runs_json` directly.
+    fn rows_of(ctx: &Arc<Ctx>, live: Option<&[String]>) -> Vec<serde_json::Value> {
+        serde_json::from_str(&list_runs_json(ctx, &crate::herdr::FakeHerdr::new(), live)).unwrap()
+    }
+
     fn row_for<'a>(rows: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         rows.iter()
             .find(|r| r["name"] == name)
@@ -2241,7 +2385,7 @@ mod tests {
         fs::write(broken.join("state.json"), b"{ not json").unwrap();
 
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+        let rows: Vec<serde_json::Value> = rows_of(&ctx, Some(&[]));
 
         // An unreadable state.json means the run's workspace id was never read, so
         // liveness is UNKNOWN. Reporting `false` asserts "no live panes", which is
@@ -2455,7 +2599,7 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let live = vec!["wAG".to_string()];
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+            rows_of(&ctx, Some(&live));
         let row = row_for(&rows, "finished");
         assert_eq!(row["live"], true, "precondition: the workspace really is open");
         assert_eq!(row["archived"], false);
@@ -2486,7 +2630,7 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let live = vec!["wAG".to_string()];
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+            rows_of(&ctx, Some(&live));
         let row = row_for(&rows, "zombie");
         assert_eq!(row["archived"], true);
         assert_eq!(row["live"], true);
@@ -2498,7 +2642,7 @@ mod tests {
 
         // Once the workspace really is gone, it files away normally.
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+            rows_of(&ctx, Some(&[]));
         assert_eq!(row_for(&rows, "zombie")["complete"], true);
 
         // Herdr unreachable: liveness is unknown, and the row does NOT claim
@@ -2508,7 +2652,7 @@ mod tests {
         // herdr blip. `live: null` is what tells the UI to say liveness is
         // unknown instead of presenting the grouping as verified.
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+            rows_of(&ctx, None);
         let row = row_for(&rows, "zombie");
         assert!(row["live"].is_null(), "herdr unreachable is unknown, not false");
         assert_eq!(
@@ -2523,7 +2667,7 @@ mod tests {
         let dir = make_run_with_phases(&tmp, "done-zombie", &[Done, Done], true);
         set_workspace(&dir, "wAG");
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+            rows_of(&ctx, Some(&live));
         assert_eq!(
             row_for(&rows, "done-zombie")["complete"],
             false,
@@ -2654,7 +2798,7 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let live = vec!["w1".to_string(), "wAG".to_string()];
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+            rows_of(&ctx, Some(&live));
         assert_eq!(row_for(&rows, "alive")["live"], true);
         assert_eq!(row_for(&rows, "dead")["live"], false);
         assert_eq!(
@@ -2666,7 +2810,7 @@ mod tests {
         // herdr unreachable: liveness is UNKNOWN, never silently "false" — the UI
         // gates a pane-closing archive on this.
         let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+            rows_of(&ctx, None);
         assert!(
             row_for(&rows, "alive")["live"].is_null(),
             "unknown liveness must not be reported as not-live"
@@ -2777,7 +2921,7 @@ mod tests {
         .unwrap();
 
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+        let rows: Vec<serde_json::Value> = rows_of(&ctx, Some(&[]));
         assert_eq!(
             row_for(&rows, "abandoned")["complete"],
             true,
@@ -3035,7 +3179,7 @@ mod tests {
                 ph("review:task-1:1:security", Done, Some("w:p5")),
             ],
         );
-        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None, &[]);
         assert_eq!(tree["workspace"], "w");
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "placeholder omitted: {tree}");
@@ -3446,7 +3590,7 @@ mod tests {
             ],
             vec![],
         );
-        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None, &[]);
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(
             nodes.len(),
@@ -3489,14 +3633,14 @@ mod tests {
         let run = tree_run(vec![p], vec![]);
 
         let cfg = crate::config::Config::default();
-        let tree = build_agent_tree(&run, &cfg, None);
+        let tree = build_agent_tree(&run, &cfg, None, &[]);
         assert_eq!(tree["nodes"][0]["resumable"], false);
 
         // …and it flips the moment the user opts codex in.
         let mut cfg = cfg;
         cfg.agents.get_mut("codex").unwrap().resume =
             Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
-        let tree = build_agent_tree(&run, &cfg, None);
+        let tree = build_agent_tree(&run, &cfg, None, &[]);
         assert_eq!(tree["nodes"][0]["resumable"], true);
     }
 
@@ -3519,7 +3663,7 @@ mod tests {
             vec![reaped("review:task-1:1:security")],
         );
         let cfg = crate::config::Config::default();
-        let tree = build_agent_tree(&run, &cfg, None);
+        let tree = build_agent_tree(&run, &cfg, None, &[]);
         assert_eq!(tree["nodes"][0]["rehydratable"], true);
         assert_eq!(
             tree["nodes"][0]["children"][0]["rehydratable"],
@@ -3532,7 +3676,7 @@ mod tests {
 
         let mut no_ws = tree_run(vec![reaped("implement-task-1")], vec![]);
         no_ws.workspace = None;
-        let tree = build_agent_tree(&no_ws, &cfg, None);
+        let tree = build_agent_tree(&no_ws, &cfg, None, &[]);
         assert_eq!(
             tree["nodes"][0]["rehydratable"], false,
             "no workspace means nowhere to open the tab: {tree}"
@@ -3582,10 +3726,10 @@ mod tests {
         let run = tree_run(vec![ph("plan", Done, Some("w:p1"))], vec![]);
         let cfg = crate::config::Config::default();
 
-        let clean = build_agent_tree(&run, &cfg, None);
+        let clean = build_agent_tree(&run, &cfg, None, &[]);
         assert_eq!(clean["config_error"], serde_json::Value::Null);
 
-        let broken = build_agent_tree(&run, &cfg, Some("expected a value at line 3"));
+        let broken = build_agent_tree(&run, &cfg, Some("expected a value at line 3"), &[]);
         assert!(
             broken["config_error"]
                 .as_str()
@@ -4483,5 +4627,193 @@ mod tests {
         let addr = start_server(runs_root);
         let (status, _) = http_get(&addr, "/api/runs/r/review/diff?task=t");
         assert_eq!(status, 204);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocked agents on the session list and in the agent tree
+    // -----------------------------------------------------------------------
+
+    /// A fixture run whose first phase is Running in pane `w:p0`, with a live
+    /// workspace. The shape a blocked agent actually occurs in.
+    fn make_running_run(root: &Path, run: &str, pane: &str) -> PathBuf {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let dir = make_run_with_phases(root, run, &[Running, Pending], false);
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some("wB".into());
+        s.phases[0].set_pane(pane);
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+        dir
+    }
+
+    fn blocked_rows(ctx: &Arc<Ctx>, h: &crate::herdr::FakeHerdr) -> Vec<serde_json::Value> {
+        let live = vec!["wB".to_string()];
+        serde_json::from_str(&list_runs_json(ctx, h, Some(&live))).unwrap()
+    }
+
+    #[test]
+    fn a_destructive_prompt_raises_the_session_list_badge() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "stuck", "w:p0");
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("blocked"));
+        h.push_read_for("w:p0", "Dangerous rm operation\n  rm -rf /\n1. Yes\n2. No");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(row["blocked"]["needs_human"], 1);
+        assert_eq!(row["blocked"]["count"], 1);
+        assert_eq!(row["blocked"]["phase"], "phase0");
+        assert_eq!(row["blocked"]["class"], "destructive");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A routine permission dialog is reported but does NOT ask for a human:
+    /// whatever driver is waiting on the phase answers it. A badge that fires on
+    /// every file-edit prompt is a badge nobody reads.
+    #[test]
+    fn a_routine_prompt_is_reported_without_asking_for_a_human() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "polite", "w:p0");
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("blocked"));
+        h.push_read_for("w:p0", "Do you want to make this edit to lib.rs?\n1. Yes");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(row["blocked"]["count"], 1);
+        assert_eq!(row["blocked"]["needs_human"], 0);
+        assert_eq!(row["blocked"]["class"], "routine");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_run_with_nothing_blocked_reports_null() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "busy", "w:p0");
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("working"));
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert!(row["blocked"].is_null(), "{}", row["blocked"]);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The list poll runs every 2s against every run. Scanning a run that cannot
+    /// have a working agent is pure herdr load for a foregone answer.
+    #[test]
+    fn a_finished_or_archived_run_is_never_scanned() {
+        use crate::run::PhaseStatus::Done;
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let done = make_run_with_phases(&tmp, "done", &[Done, Done], false);
+        set_workspace(&done, "wB");
+        let filed = make_run_with_phases(&tmp, "filed", &[Done, Done], true);
+        set_workspace(&filed, "wB");
+
+        let h = crate::herdr::FakeHerdr::new();
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let rows = blocked_rows(&ctx, &h);
+        assert!(row_for(&rows, "done")["blocked"].is_null());
+        assert!(row_for(&rows, "filed")["blocked"].is_null());
+        let polls: Vec<String> = h
+            .calls()
+            .into_iter()
+            .filter(|c| c.contains("agent_status"))
+            .collect();
+        assert!(polls.is_empty(), "herdr was polled anyway: {polls:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The whole reason the scan is affordable behind a 2s poll: the second poll
+    /// inside `BLOCKED_TTL` is served from the cache, so herdr sees one sweep
+    /// however many browser tabs are open.
+    #[test]
+    fn a_second_poll_inside_the_ttl_does_not_re_scan() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "cached", "w:p0");
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("blocked"));
+        h.push_read_for("w:p0", "Dangerous rm operation\n1. Yes");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let first = &blocked_rows(&ctx, &h)[0].clone();
+        let polls_after_first = h.calls().iter().filter(|c| c.contains("agent_status")).count();
+        let second = &blocked_rows(&ctx, &h)[0].clone();
+        let polls_after_second = h.calls().iter().filter(|c| c.contains("agent_status")).count();
+
+        assert_eq!(polls_after_first, 1, "the first poll scans");
+        assert_eq!(
+            polls_after_second, 1,
+            "the second poll inside the TTL must reuse the first scan"
+        );
+        assert_eq!(
+            first["blocked"], second["blocked"],
+            "and it must answer the same thing"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_agent_tree_carries_the_prompt_the_pane_is_parked_on() {
+        use crate::run::PhaseStatus::Running;
+        let mut run = RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: Some("claude".into()),
+            phases: vec![crate::run::Phase::new("implement-task-1")],
+            review_phases: vec![crate::run::Phase::new("review:task-1:1:security")],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: None,
+            project_dir: "/tmp/p".into(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.phases[0].status = Running;
+        run.phases[0].set_pane("w:p1");
+        run.review_phases[0].status = Running;
+        run.review_phases[0].set_pane("w:p2");
+
+        let blocked = vec![crate::blocked::BlockedAgent {
+            phase: "review:task-1:1:security".into(),
+            pane_id: "w:p2".into(),
+            class: crate::phase::BlockedClass::Unknown,
+            excerpt: "Trust the files in this folder?\n1. Yes".into(),
+        }];
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None, &blocked);
+        let phase = &tree["nodes"][0];
+        assert!(
+            phase["blocked"].is_null(),
+            "a phase nobody reported blocked stays null: {}",
+            phase["blocked"]
+        );
+        let panel = &phase["children"][0];
+        assert_eq!(panel["blocked"]["class"], "unknown");
+        assert_eq!(panel["blocked"]["needs_human"], true);
+        assert!(
+            panel["blocked"]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("Trust the files"),
+            "the tree quotes the prompt so the reviewer need not attach"
+        );
     }
 }

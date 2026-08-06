@@ -1,3 +1,4 @@
+mod blocked;
 mod brief;
 mod code_review;
 mod config;
@@ -69,6 +70,30 @@ enum Commands {
 
     /// Attach to the current phase's pane.
     Attach { name: String },
+
+    /// Block until one of a run's agents is stuck on a prompt only a human can
+    /// answer, then exit reporting it.
+    ///
+    /// The push half of `drovr list`'s blocked column: run it in the background
+    /// and the harness wakes the driver when an agent stops. Destructive and
+    /// unrecognised prompts raise the alarm; routine permission dialogs do not
+    /// (a `drovr phase wait` answers those itself).
+    ///
+    /// With no run name it watches every run that still has an agent attached.
+    ///
+    /// Exit codes: 4 = an agent needs a human (same code `phase wait` uses for a
+    /// blocked pane), 0 = nothing left to watch (every agent has exited), 2 =
+    /// timeout (re-run to resume), 1 = error.
+    Watch {
+        /// The run to watch. Omit to watch every run with a live agent.
+        name: Option<String>,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+        /// How often to sweep herdr. The default is deliberately slow: a human
+        /// answering a prompt is not a millisecond-scale event.
+        #[arg(long, default_value_t = 5_000)]
+        interval_ms: u64,
+    },
 
     /// Stop the herdr session; optionally remove the run dir.
     Cleanup {
@@ -404,7 +429,7 @@ fn format_progress(run: &RunState) -> String {
 // Porcelain command handlers
 // ---------------------------------------------------------------------------
 
-fn cmd_list() {
+fn cmd_list<H: Herdr>(h: &H) {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
@@ -434,8 +459,29 @@ fn cmd_list() {
     }
 
     runs.sort_by(|a, b| a.name.cmp(&b.name));
+    // Which runs are worth sweeping for blocked agents: not archived (`cleanup`
+    // closed those panes) and still holding a live herdr workspace. Computed as
+    // a SET first, in one herdr call, because the alternative — asking about
+    // every recorded pane — means a `pane.get` failure, and a "polling is
+    // degraded" diagnostic on stderr, for every pane of every run that ever
+    // finished.
+    let live: std::collections::HashSet<String> = blocked::with_live_workspace(
+        h,
+        runs.iter().filter(|r| !r.archived).cloned().collect(),
+    )
+    .into_iter()
+    .map(|r| r.name)
+    .collect();
     for run in &runs {
-        println!("{:20}  {}", run.name, format_progress(run));
+        let column = if live.contains(&run.name) {
+            blocked_column(&blocked::scan_run(h, run).blocked)
+        } else {
+            None
+        };
+        match column {
+            Some(col) => println!("{:20}  {}  {col}", run.name, format_progress(run)),
+            None => println!("{:20}  {}", run.name, format_progress(run)),
+        }
     }
 }
 
@@ -591,12 +637,17 @@ fn cmd_new(
     println!("created run '{}' at {}", name, run_dir(name).display());
 }
 
-fn cmd_status(name: &str) {
+fn cmd_status<H: Herdr>(h: &H, name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
+    // Swept once, read twice: the phase table marks which lines are stuck, and
+    // the report below them says what they are stuck ON. Review panels are in
+    // the same sweep, and they have no row in the table — the report is the only
+    // place a blocked reviewer can surface.
+    let blocked = blocked::scan_run(h, &run).blocked;
     println!("run: {}", run.name);
     println!("task: {}", run.task);
     for (i, p) in run.phases.iter().enumerate() {
@@ -605,18 +656,27 @@ fn cmd_status(name: &str) {
         } else {
             ""
         };
+        let stuck = match blocked.iter().find(|a| a.phase == p.name) {
+            Some(a) if a.needs_human() => format!("  BLOCKED ({})", a.class.as_str()),
+            Some(_) => "  blocked (routine)".to_string(),
+            None => String::new(),
+        };
         println!(
-            "  [{:2}] {:15} {}{}",
+            "  [{:2}] {:15} {}{}{}",
             i,
             p.name,
             phase_status_str(&p.status),
-            marker
+            marker,
+            stuck
         );
     }
     if let Some(idx) = run.first_incomplete() {
         println!("resume at phase {idx}: {}", run.phases[idx].name);
     } else {
         println!("all phases complete");
+    }
+    for a in &blocked {
+        println!("\n{}", blocked_report(&run.name, a));
     }
 }
 
@@ -860,6 +920,133 @@ fn cmd_attach(name: &str) {
         });
     if !status.success() {
         process::exit(status.code().unwrap_or(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked agents on the CLI surfaces
+// ---------------------------------------------------------------------------
+
+/// The blocked column `drovr list` appends to a run's row. `None` when nothing
+/// in the run is parked on a prompt.
+///
+/// Case carries the verdict, so the column is greppable and skimmable at once:
+/// **BLOCKED** is asking the reader to do something, lowercase `blocked` is
+/// telling them why a run looks slow. A routine permission dialog is answered by
+/// whatever `drovr phase wait` is running, so it is news, not an alarm.
+fn blocked_column(blocked: &[blocked::BlockedAgent]) -> Option<String> {
+    let lead = blocked
+        .iter()
+        .find(|a| a.needs_human())
+        .or_else(|| blocked.first())?;
+    let word = if lead.needs_human() {
+        "BLOCKED"
+    } else {
+        "blocked"
+    };
+    let extra = match blocked.len() {
+        1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    Some(format!(
+        "{word} {} ({}){extra}",
+        lead.phase,
+        lead.class.as_str()
+    ))
+}
+
+/// The escalation block for one blocked agent: what it is parked on, the prompt
+/// itself, and the command that answers it.
+///
+/// Shared by `drovr status` and `drovr watch` so the two never describe the same
+/// pane differently — the whole point of a watcher is that what wakes you and
+/// what you then read say the same thing.
+fn blocked_report(run: &str, a: &blocked::BlockedAgent) -> String {
+    let verdict = if a.needs_human() {
+        format!(
+            "phase '{}' is BLOCKED on a {} prompt drovr will not answer itself",
+            a.phase,
+            a.class.as_str()
+        )
+    } else {
+        format!(
+            "phase '{}' is blocked on a routine permission prompt — a running \
+             `drovr phase wait` answers this one",
+            a.phase
+        )
+    };
+    format!(
+        "{verdict}\nPane {}:\n{}\nAnswer it: drovr attach {}",
+        a.pane_id,
+        a.excerpt,
+        shell_single_quote(run)
+    )
+}
+
+/// Every run `drovr watch` should sweep: the one named, or every run that has
+/// not been archived (archiving closed its panes, so nothing there can block).
+///
+/// A run whose `state.json` will not parse is skipped rather than fatal — one
+/// broken run must not stop a watch over all the others. A run named
+/// EXPLICITLY is loaded through `load_run`, which exits 1 and says why.
+fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> Vec<RunState> {
+    let Some(name) = name else {
+        // Only runs whose workspace herdr still has: a run whose panes died
+        // long ago holds their ids forever, and sweeping them would both cost a
+        // failed `pane.get` each and print a "polling is degraded" line per
+        // sweep, every interval, for the life of the watch.
+        let all = run::list_runs_in(&run::runs_dir())
+            .into_iter()
+            .filter_map(|n| RunState::load(&n).ok())
+            .filter(|s| !s.archived)
+            .collect();
+        return blocked::with_live_workspace(h, all);
+    };
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    vec![load_run(name)]
+}
+
+/// `drovr watch` — block until an agent needs a human, then exit 4.
+///
+/// The push half of the blocked column. Backgrounded, its exit is the driver's
+/// wake-up, the same shape `drovr review wait` uses for the spec gate: the
+/// harness reports the process ending, so nothing has to hot-poll `drovr list`.
+fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let interval = std::time::Duration::from_millis(interval_ms);
+    loop {
+        // Re-read every sweep: a phase that starts (or is reaped) while the watch
+        // runs changes what there is to watch, and a watch holding the state it
+        // booted with would keep polling a pane nobody records any more.
+        let runs = runs_to_watch(h, name);
+        match blocked::watch_tick(h, &runs) {
+            blocked::WatchTick::Alarm(findings) => {
+                for f in &findings {
+                    eprintln!("drovr: run '{}' — {}", f.run, blocked_report(&f.run, &f.agent));
+                }
+                process::exit(4);
+            }
+            blocked::WatchTick::NothingToWatch => {
+                // Not a failure and not an alarm: every agent being gone is the
+                // normal end of a run, and saying so beats sitting out the
+                // timeout while the driver assumes work is still happening.
+                println!("drovr: nothing left to watch — no run has an agent attached");
+                process::exit(0);
+            }
+            blocked::WatchTick::Watching => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "drovr: watch timed out after {timeout_ms}ms with agents still \
+                         running and nothing blocked — re-run to keep watching"
+                    );
+                    process::exit(2);
+                }
+                std::thread::sleep(interval);
+            }
+        }
     }
 }
 
@@ -1899,7 +2086,7 @@ fn main() {
     let herdr = SystemHerdr::new();
 
     match cli.command {
-        Commands::List => cmd_list(),
+        Commands::List => cmd_list(&herdr),
         Commands::New {
             name,
             task,
@@ -1907,8 +2094,13 @@ fn main() {
             worktree,
             no_worktree,
         } => cmd_new(&name, task, dir, worktree, no_worktree, &herdr),
-        Commands::Status { name } => cmd_status(&name),
+        Commands::Status { name } => cmd_status(&herdr, &name),
         Commands::Attach { name } => cmd_attach(&name),
+        Commands::Watch {
+            name,
+            timeout_ms,
+            interval_ms,
+        } => cmd_watch(&herdr, name.as_deref(), timeout_ms, interval_ms),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
         Commands::Resurrect { name } => cmd_resurrect(&herdr, &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
@@ -2874,6 +3066,93 @@ mod tests {
     fn parse_status() {
         let cli = parse(&["drovr", "status", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Status { name } if name == "myrun"));
+    }
+
+    #[test]
+    fn parse_watch_takes_an_optional_run() {
+        let all = parse(&["drovr", "watch"]).unwrap();
+        assert!(matches!(
+            all.command,
+            Commands::Watch {
+                name: None,
+                timeout_ms: 1_800_000,
+                interval_ms: 5_000,
+            }
+        ));
+        let one = parse(&["drovr", "watch", "myrun", "--timeout-ms", "60000"]).unwrap();
+        assert!(matches!(
+            one.command,
+            Commands::Watch { name: Some(n), timeout_ms: 60_000, .. } if n == "myrun"
+        ));
+    }
+
+    fn blocked_agent(phase: &str, class: crate::phase::BlockedClass) -> blocked::BlockedAgent {
+        blocked::BlockedAgent {
+            phase: phase.into(),
+            pane_id: "w:p2".into(),
+            class,
+            excerpt: "1. Yes\n2. No".into(),
+        }
+    }
+
+    /// Case is the signal: uppercase asks the reader to act, lowercase explains
+    /// why a run looks slow. A routine prompt is answered by whatever
+    /// `drovr phase wait` is running, so shouting about it trains people to stop
+    /// reading the column.
+    #[test]
+    fn the_list_column_shouts_only_when_a_human_is_needed() {
+        use crate::phase::BlockedClass::{Destructive, Routine, Unknown};
+        assert_eq!(blocked_column(&[]), None);
+        assert_eq!(
+            blocked_column(&[blocked_agent("implement", Destructive)]).unwrap(),
+            "BLOCKED implement (destructive)"
+        );
+        assert_eq!(
+            blocked_column(&[blocked_agent("plan", Unknown)]).unwrap(),
+            "BLOCKED plan (unknown)"
+        );
+        assert_eq!(
+            blocked_column(&[blocked_agent("implement", Routine)]).unwrap(),
+            "blocked implement (routine)"
+        );
+    }
+
+    /// With several blocked panes the column names the one that needs a human —
+    /// not the first one found. A row that led with a routine prompt would hide
+    /// the destructive one behind a "+1 more".
+    #[test]
+    fn the_list_column_leads_with_the_pane_that_needs_a_human() {
+        use crate::phase::BlockedClass::{Destructive, Routine};
+        let col = blocked_column(&[
+            blocked_agent("plan", Routine),
+            blocked_agent("implement", Destructive),
+        ])
+        .unwrap();
+        assert_eq!(col, "BLOCKED implement (destructive) (+1 more)");
+    }
+
+    #[test]
+    fn the_report_quotes_the_prompt_and_names_the_way_in() {
+        use crate::phase::BlockedClass::Destructive;
+        let r = blocked_report("my run", &blocked_agent("implement", Destructive));
+        assert!(r.contains("BLOCKED on a destructive prompt"), "{r}");
+        assert!(r.contains("Pane w:p2"), "{r}");
+        assert!(r.contains("1. Yes"), "{r}");
+        assert!(
+            r.contains("drovr attach 'my run'"),
+            "the attach command must be pasteable: {r}"
+        );
+    }
+
+    /// A routine prompt says who WILL answer it, so a human reading `drovr
+    /// status` does not go and answer a prompt drovr was about to handle.
+    #[test]
+    fn the_report_says_when_nobody_needs_to_act() {
+        use crate::phase::BlockedClass::Routine;
+        let r = blocked_report("r", &blocked_agent("implement", Routine));
+        assert!(r.contains("routine permission prompt"), "{r}");
+        assert!(r.contains("drovr phase wait"), "{r}");
+        assert!(!r.contains("BLOCKED"), "no alarm for a routine prompt: {r}");
     }
 
     #[test]

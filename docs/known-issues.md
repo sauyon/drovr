@@ -3433,3 +3433,114 @@ If a state poll is ever genuinely needed, the doc must say to match the terminal
 (`approved`/`cancelled`/`waiting`), never `ready` alone. But the better fix is that a driver should
 not be hand-rolling a poll for a state machine the CLI already exposes a blocking call for — that is
 the class of mistake this entry is about, and it should not be reachable from following the skill.
+
+## A routine permission prompt notifies nobody when no `phase wait` is running (2026-08-06)
+
+**Severity:** medium — the run stalls indefinitely and every alarm surface stays deliberately quiet.
+**Found:** 2026-08-06, designing the blocked-agent watchers.
+
+### Symptom
+
+A phase agent hits an ordinary tool-permission prompt ("Do you want to make this edit to `x.rs`?").
+Nothing raises an alarm: `drovr watch` keeps watching, the session-list badge renders in the quiet
+weight, no notification fires, and `drovr list` shows a lowercase `blocked`. The run makes no
+progress until someone happens to look.
+
+### Root cause
+
+Deliberate, and only half-true in the state that produces this. Alarms are gated on
+`BlockedAgent::needs_human`, which is false for `BlockedClass::Routine` because
+`phase::triage_blocked_phase` AUTO-ANSWERS routine prompts — a badge firing on every file-edit
+dialog would train people to dismiss the one that matters.
+
+But that triage only runs from inside `drovr phase wait`. A phase nobody is waiting on — the driver
+was compacted, the wait timed out and was never re-armed, the phase was driven by hand — has no
+auto-answerer, so the prompt drovr classified as "someone else will handle this" is handled by no
+one. Same shape as "A finished phase reports `running` forever unless the driver happens to run
+`phase wait`": a fact that is true only on the path where a wait exists.
+
+### Impact
+
+Bounded but real. The run is visibly stalled to anyone reading `drovr list` or the session list (the
+quiet badge names the phase), so it is a *notification* gap rather than an invisible one. The
+severity is that the quiet weight is the honest rendering when a wait IS running, and the two states
+are indistinguishable from the scan alone.
+
+### Fix ideas
+
+Make the distinction observable rather than assumed. `drovr phase wait` could stamp the run dir with
+a liveness marker (a `<phase>.waiting` file it removes on exit), letting the scan ask "is anyone
+actually going to answer this?" instead of assuming someone is. A cheaper version: escalate a
+routine prompt that has been sitting for more than N sweeps, which needs the scan to remember when
+it first saw a block. Do not simply alarm on every routine prompt — the noise is what the split
+exists to avoid.
+
+## An unreachable herdr silently drops the blocked column from `drovr list` (2026-08-06)
+
+**Severity:** low — degrades to "no worse than before the feature", but does it without saying so.
+**Found:** 2026-08-06, same work.
+
+### Symptom
+
+With herdr down (or a pane it will not answer for), `drovr list` prints exactly the rows it printed
+before blocked columns existed. A run whose agent IS stuck on a destructive prompt shows nothing.
+
+### Root cause
+
+`blocked::scan_run` counts panes herdr could not answer for in `RunScan::unreadable`, precisely so
+"we do not know" stays distinguishable from "nothing is blocked" — `drovr watch` reads it and keeps
+watching rather than declaring the run over. `cmd_list` ignores that count and renders only the
+`blocked` vector, so unknown collapses into absent.
+
+### Impact
+
+Fails closed, which is the right direction: nothing is ever claimed to be fine when it is not known
+to be, and a missing column is the same information the command carried a release ago. It is listed
+because the collapse is invisible — the row does not say the sweep failed — and because `drovr
+watch` and the review UI's `live: null` banner both take the opposite, louder approach to the same
+ambiguity.
+
+### Fix idea
+
+Render a distinct marker (`?`) when `unreadable > 0 && blocked.is_empty()`, matching the session
+list's "liveness unknown" banner. Cheap; left out of the first cut to keep one rendering rule per
+column.
+
+## Viewing a finished run's page logs a herdr diagnostic every blocked sweep (2026-08-06)
+
+**Severity:** low — noise in `drovr serve`'s own log, bounded and self-limiting.
+**Found:** 2026-08-06, live-checking the blocked scan against a run whose workspace was gone.
+
+### Symptom
+
+With a run's page open in the review UI, the server's stderr grows a line per dead pane per sweep:
+
+```
+drovr: herdr's pane.get failed for pane wZZ:p9: pane wZZ:p9 not found …
+Agent status polling is degraded — phase sends and waits will run to their timeouts …
+```
+
+### Root cause
+
+A run keeps its recorded `pane_id`s forever — nothing clears them when a session ends — so
+`blocked::scan_run` asks herdr about panes that no longer exist, and `SystemHerdr::pane_info`
+reports every failed `pane.get` on stderr. `GET /api/runs/<run>/agents` scans unconditionally,
+unlike `/api/runs` and `drovr list`, which skip runs whose workspace herdr no longer lists.
+
+That asymmetry is deliberate: the session list sweeps EVERY run (so the noise is multiplied by the
+whole data dir), while the agent tree sweeps the one run a human deliberately opened and should say
+what it can about it, even if the workspace id reads oddly.
+
+### Impact
+
+Bounded by the 5s scan cache — at most one burst per run per 5s however many tabs are open — and it
+lands in the daemon's log rather than in front of anyone. The diagnostic's own wording is also
+misleading here: nothing is waiting on those panes, so nothing will "run to its timeout".
+
+### Fix idea
+
+Herdr's diagnostic is the thing that is wrong for this caller, not the scan: a poll whose whole
+purpose is to find out whether a pane is still there does not need to be told, loudly, that it is
+not. See also "herdr's 'polling is degraded' diagnostic fires on a reap's EXPECTED path" — the same
+diagnostic, the same mismatch, a different caller. One fix (a quiet form of the poll for callers
+that treat a missing pane as an answer) covers both.

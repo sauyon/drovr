@@ -1461,6 +1461,10 @@ pub struct FakeHerdr {
     /// transcripts belong to a specific pane; a test that cares which pane it is
     /// reading uses `push_read_for` so the fake cannot mask a wrong-pane bug.
     read_by_pane: RefCell<std::collections::HashMap<String, VecDeque<String>>>,
+    /// Per-pane `pane_info` status queues, consulted before `pane_info_queue` and
+    /// `status_queue`. Written by `push_status_for`; the same wrong-pane argument
+    /// as `read_by_pane`, for the callers that poll several panes in one pass.
+    status_by_pane: RefCell<std::collections::HashMap<String, VecDeque<Option<String>>>>,
     /// `(call substring, run name)`. The first recorded call containing the
     /// substring writes `archived: true` into that run's `state.json`, then
     /// disarms. This models the human clicking Archive in the web UI *while* a
@@ -1502,6 +1506,7 @@ impl FakeHerdr {
             panes_by_workspace: RefCell::new(std::collections::HashMap::new()),
             fail_workspace_panes: RefCell::new(false),
             read_by_pane: RefCell::new(std::collections::HashMap::new()),
+            status_by_pane: RefCell::new(std::collections::HashMap::new()),
             archive_on_call: RefCell::new(None),
             on_tab_create: RefCell::new(None),
         }
@@ -1558,18 +1563,33 @@ impl FakeHerdr {
 
     /// Queue a transcript for one specific pane, taking priority over `push_read`.
     ///
-    /// Unused since the panel stopped reading findings out of pane transcripts —
-    /// its last callers were the scraping tests main's findings-file switch
-    /// deleted. Kept rather than removed: `read_by_pane` is still consulted by
-    /// `agent_read`, and per-pane scripting is the only way to write a test that
-    /// cannot mask a wrong-pane bug.
-    #[allow(dead_code)]
+    /// Per-pane scripting is the only way to write a test that cannot mask a
+    /// wrong-pane bug — the pane-agnostic queue answers whichever pane asks
+    /// first. `blocked::scan_run`, which reads several panes in one pass, is its
+    /// caller.
     pub fn push_read_for(&self, pane_id: impl Into<String>, text: impl Into<String>) {
         self.read_by_pane
             .borrow_mut()
             .entry(pane_id.into())
             .or_default()
             .push_back(text.into());
+    }
+
+    /// Declare the status `pane_info` reports for ONE pane, the per-pane twin of
+    /// [`FakeHerdr::push_status`].
+    ///
+    /// A FIFO queue cannot express "these three panes are in three different
+    /// states", which is exactly the shape a multi-pane scan reads: the queue
+    /// order is the scan's iteration order, so a test written against it asserts
+    /// the iteration order by accident and breaks when a phase is added. Panes
+    /// with no entry here fall through to the pane-agnostic queue, so existing
+    /// tests are untouched.
+    pub fn push_status_for(&self, pane_id: impl Into<String>, status: Option<impl Into<String>>) {
+        self.status_by_pane
+            .borrow_mut()
+            .entry(pane_id.into())
+            .or_default()
+            .push_back(status.map(Into::into));
     }
 
     /// Declare which workspace ids herdr should report as live.
@@ -1579,6 +1599,28 @@ impl FakeHerdr {
 
     pub fn set_fail_workspace_close(&self, fail: bool) {
         *self.fail_workspace_close.borrow_mut() = fail;
+    }
+
+    /// Build the `PaneInfo` a scripted status stands for. `None` means the pane
+    /// could not be read at all, which is a different answer from "read fine,
+    /// status unknown" — see [`PaneInfo`].
+    ///
+    /// One function for both status queues so the per-pane and pane-agnostic
+    /// forms cannot drift into modelling herdr differently (the session/status
+    /// tie-up below is exactly the kind of fidelity that gets copied wrong).
+    fn info_for_status(pane_id: &str, status: Option<String>) -> Option<PaneInfo> {
+        status.map(|status| {
+            let status = AgentStatus::from_herdr(&status);
+            let agent_session = match status {
+                AgentStatus::Unknown => None,
+                _ => Some(Self::session_for(pane_id)),
+            };
+            PaneInfo {
+                tab_id: Self::tab_id_for(pane_id),
+                agent_status: Some(status),
+                agent_session,
+            }
+        })
     }
 
     /// The tab the fake reports for `pane_id` when a test has not scripted a
@@ -1960,10 +2002,13 @@ impl Herdr for FakeHerdr {
     }
 
     fn pane_info(&self, pane_id: &str) -> Option<PaneInfo> {
-        // Resolution order: a scripted failure, then a whole scripted `PaneInfo`,
-        // then a scripted status, then the default. A scripted status (pushed via
-        // `push_status`) is consumed FIFO; when both queues are empty the fake
-        // models a booted, ready agent parked at its composer — `Some("idle")` —
+        // Resolution order: a scripted failure, then a status scripted for THIS
+        // pane, then a whole scripted `PaneInfo`, then a pane-agnostic scripted
+        // status, then the default. Per-pane wins for the same reason it does in
+        // `agent_read`: a value named for this pane cannot be answering for
+        // another one. A scripted status (pushed via
+        // `push_status`) is consumed FIFO; when all three queues are empty the
+        // fake models a booted, ready agent parked at its composer — `Some("idle")` —
         // so a test that does not care about status (the common case) sails
         // through `phase_send`'s readiness gate instead of waiting out its
         // timeout. Tests that need a different status (blocked, done, or an
@@ -1976,8 +2021,15 @@ impl Herdr for FakeHerdr {
         // together the same way, because reaping classifies on the SESSION, and
         // a session-less "live" pane here would teach every later test the
         // opposite of what herdr does.
+        let per_pane = self
+            .status_by_pane
+            .borrow_mut()
+            .get_mut(pane_id)
+            .and_then(|q| q.pop_front());
         let info = if *self.fail_pane_info.borrow() {
             None
+        } else if let Some(scripted) = per_pane {
+            Self::info_for_status(pane_id, scripted)
         } else if let Some(scripted) = self.pane_info_queue.borrow_mut().pop_front() {
             scripted
         } else {
@@ -1985,19 +2037,7 @@ impl Herdr for FakeHerdr {
                 Some(scripted) => scripted,
                 None => Some("idle".to_string()),
             };
-            // A scripted `None` status means the pane could not be read at all.
-            status.map(|status| {
-                let status = AgentStatus::from_herdr(&status);
-                let agent_session = match status {
-                    AgentStatus::Unknown => None,
-                    _ => Some(Self::session_for(pane_id)),
-                };
-                PaneInfo {
-                    tab_id: Self::tab_id_for(pane_id),
-                    agent_status: Some(status),
-                    agent_session,
-                }
-            })
+            Self::info_for_status(pane_id, status)
         };
         // `pane_info` IS the status poll, so the recorded line names the status:
         // assertions that count (or forbid) status polls match on `agent_status`.

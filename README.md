@@ -149,6 +149,42 @@ all produce a warning on stderr and leave the phase untouched — the command th
 triggered the reap still succeeds. `drovr phase start` exiting 0 therefore means
 the phase started, not that anything was reaped. See `run.lock` below.
 
+### Blocked agents
+
+An agent that hits a Claude Code safety/permission prompt stops and waits. herdr
+reports the pane as `blocked`, but a phase's *status* is still `Running` and its
+progress is still `2/4` — so a stuck run looks exactly like a working one. Drovr
+surfaces it on every watching surface instead:
+
+| Surface | What it shows |
+|---|---|
+| `drovr list` | a `BLOCKED <phase> (<class>)` column on the run's row |
+| `drovr status <run>` | the marker on the phase's line, plus the prompt itself and the `drovr attach` that answers it |
+| `drovr watch [<run>]` | blocks until an agent needs a human, then exits 4 — the push form, for a driver |
+| the review UI's session list | a ⚠ badge on the run's row |
+| the review UI's agent tree | a badge on the node, the prompt in its tooltip |
+| the browser tab | `⚠ (n)` in the title, and a desktop notification if you granted permission (**Notify me**, top right) |
+
+**Only prompts drovr will not answer itself raise an alarm.** The prompt is
+classified by the same function `drovr phase wait` triages with:
+
+- **destructive** (`rm -rf`, `reset --hard`, force-push, …) — never auto-answered,
+- **unknown** — not on the safe allow-list, so escalated rather than guessed,
+- **routine** — an ordinary tool-permission dialog, which a running `drovr phase
+  wait` accepts on its own.
+
+Routine prompts are *reported* (quietly, so a run that looks slow explains
+itself) but never notified: a badge that fires on every file-edit dialog is a
+badge nobody reads. The corollary — a routine prompt with **no** `phase wait`
+running notifies nobody — is in `docs/known-issues.md`.
+
+The scan is read-only: it polls each live pane, and reads a pane's contents only
+when that pane came back `blocked`. Unlike the triage inside `phase wait`, it
+never sends the accept keystroke — it runs off a browser poll and off `drovr
+list`, from processes that are only looking. The review server caches it for 5
+seconds, so however many tabs are open, herdr sees at most one sweep per run per
+5s and a badge can lag the block by that much.
+
 ### Resuming an agent's session
 
 `drovr phase rehydrate` relaunches a phase and asks the backend to resume the
@@ -212,6 +248,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr list` | List all runs with phase progress and current phase. |
 | `drovr status <name>` | Print each phase, its status, and the resume point. |
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
+| `drovr watch [<name>]` | Block until one of the run's agents stops on a prompt only a human can answer, then exit reporting it. Omit the name to watch every unarchived run. Run it in the background — its exit is the driver's wake-up, like `drovr review wait`. Exit 4 = an agent needs a human, 0 = nothing left to watch (every agent has exited), 2 = timeout, 1 = error. |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
 | `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, retired panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |

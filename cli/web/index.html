@@ -665,6 +665,26 @@
   .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
 
+  /* ---- Blocked agents ----
+     Two weights, because the two facts are not equally urgent: `needs-human` is
+     a prompt drovr will NEVER answer itself (destructive, or unrecognised), and
+     nothing moves until a person acts. The plain badge is a routine permission
+     dialog, which a running `drovr phase wait` answers — worth explaining a
+     stalled-looking run, not worth alarming anyone. */
+  .run-blocked, .agent-blocked {
+    font-size: 11px; font-weight: 600; border-radius: 4px;
+    padding: 1px 6px; white-space: nowrap;
+    background: rgba(127,127,127,0.18); color: var(--muted, #999);
+  }
+  .run-blocked.needs-human, .agent-blocked.needs-human {
+    background: rgba(229,83,75,0.18); color: #e5534b;
+  }
+  .agent-blocked { margin-left: 6px; cursor: help; }
+  /* The badge must survive the .is-complete dimming: a run that finished its
+     phases while a review panel sits on a prompt is exactly the case nobody
+     notices. */
+  .run-row.is-complete .run-blocked.needs-human { color: #e5534b; opacity: 1; }
+
   /* ---- Completion ---- */
   .run-row.is-complete { opacity: 0.55; }
   .run-row.is-complete:hover { opacity: 1; }
@@ -887,7 +907,14 @@
       <h1>Drovr Review</h1>
       <span class="turn-badge" id="turn-badge"></span>
     </div>
-    <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <!-- Browsers only grant notification permission from a user gesture, so
+           this cannot be requested on load. Hidden once the answer is in:
+           granted needs no button, and denied cannot be re-asked from script. -->
+      <button id="notify-btn" style="display:none" onclick="enableBlockedNotifications()"
+              title="Get a desktop notification when one of your agents stops on a prompt only you can answer">Notify me</button>
+      <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+    </div>
   </div>
 
   <!-- Session list (landing view): every run under the drovr data dir. -->
@@ -2351,6 +2378,96 @@ var completedOpen = (function() {
 // One list row. `complete` runs are dimmed and led by a check instead of the gate
 // dot, and their meta reports phase progress rather than the gate state — for a
 // finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
+// ---------------------------------------------------------------------------
+// Blocked-agent alarms: the tab title, and the desktop notification
+// ---------------------------------------------------------------------------
+//
+// The badges above are only seen by someone LOOKING at the page. These two are
+// for the reviewer who left the tab open and went to do something else — which
+// is the whole situation a stuck agent creates.
+//
+// Only `needs_human` blocks get here. A routine permission dialog is answered by
+// whatever `drovr phase wait` is running, and notifying about it would train the
+// reviewer to dismiss the notification that matters.
+
+// key ("<run>/<phase>") -> label, for everything currently stuck.
+var blockedAlarms = {};
+// key -> true, for blocks already announced. Kept separately from the set above
+// so a block that clears and recurs announces itself again, while a block that
+// merely persists across polls does not re-fire every 2s.
+var blockedNotified = {};
+var baseTitle = document.title;
+
+/// Fold one feed's view of the world into the alarm set.
+///
+/// `scope` is the runs this feed can speak for — the session list speaks for
+/// every row it fetched, the agent tree only for the run being viewed. Keys
+/// outside the scope are LEFT ALONE rather than treated as cleared: the run
+/// detail view knows nothing about the other runs, and dropping them would
+/// re-announce every one of them on the way back to the list.
+function syncBlockedAlarms(alarms, scope) {
+  var inScope = {};
+  (scope || []).forEach(function(name) { inScope[name] = true; });
+  var seen = {};
+  alarms.forEach(function(a) { seen[a.key] = true; });
+  Object.keys(blockedAlarms).forEach(function(key) {
+    if (inScope[keyRun(key)] && !seen[key]) {
+      delete blockedAlarms[key];
+      delete blockedNotified[key];
+    }
+  });
+  alarms.forEach(function(a) {
+    blockedAlarms[a.key] = a.label;
+    if (blockedNotified[a.key]) return;
+    blockedNotified[a.key] = true;
+    notifyBlocked(a.label);
+  });
+  applyBlockedTitle();
+}
+
+/// The run half of a "<run>/<phase>" key. Phase names carry `:` (review panels)
+/// but never `/`, and `validate_run_name` keeps `/` out of run names too, so the
+/// FIRST separator is the boundary.
+function keyRun(key) {
+  var i = key.indexOf('/');
+  return i < 0 ? key : key.slice(0, i);
+}
+
+/// Put the count in the tab title. This is the notification that always works:
+/// it needs no permission, and it is what a reviewer with the tab in a
+/// background window actually sees.
+function applyBlockedTitle() {
+  var n = Object.keys(blockedAlarms).length;
+  document.title = n ? '⚠ (' + n + ') ' + baseTitle : baseTitle;
+}
+
+function notifyBlocked(label) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try {
+    new Notification('drovr — agent blocked', { body: label, tag: label });
+  } catch (e) {
+    // Some browsers throw on constructing a Notification outside a service
+    // worker. The title badge above already carried the fact; a failed
+    // nice-to-have must not break the poll that called us.
+  }
+}
+
+/// Ask for notification permission. Only reachable from the button, because
+/// browsers ignore (and Chrome permanently holds against you) a request that did
+/// not come from a user gesture.
+function enableBlockedNotifications() {
+  if (typeof Notification === 'undefined') return;
+  Notification.requestPermission().then(syncNotifyButton).catch(function() {});
+}
+
+/// Show the button only while asking is both possible and useful.
+function syncNotifyButton() {
+  var btn = document.getElementById('notify-btn');
+  if (!btn) return;
+  var askable = typeof Notification !== 'undefined' && Notification.permission === 'default';
+  btn.style.display = askable ? '' : 'none';
+}
+
 function runRow(run) {
   // Archived AND the workspace still open. Two ways to get here, and the row means
   // the same in both: filed away with something still live in it.
@@ -2403,9 +2520,31 @@ function runRow(run) {
       dot +
       '<span class="run-name">' + escHtml(run.name) + '</span>' +
       '<span class="run-state">' + escHtml(meta) + '</span>' +
+      blockedBadge(run.blocked) +
       '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
     '</a>' + btn +
   '</div>';
+}
+
+/// The session-list badge for `/api/runs`' `blocked` object (null when nothing
+/// in the run is parked on a prompt).
+///
+/// `needs_human` — not `count` — decides the weight. A run can be "blocked" on a
+/// file-edit permission dialog that a `drovr phase wait` is about to accept; a
+/// badge that shouts about those is a badge people learn to ignore, and then the
+/// destructive one goes unread too.
+function blockedBadge(blocked) {
+  if (!blocked) return '';
+  var urgent = blocked.needs_human > 0;
+  var extra = blocked.count > 1 ? ' +' + (blocked.count - 1) : '';
+  var title = urgent
+    ? 'Phase ' + blocked.phase + ' is stopped on a ' + blocked.class +
+      ' prompt — drovr will not answer it. Open the session to see it.'
+    : 'Phase ' + blocked.phase + ' is on a routine permission prompt; a running ' +
+      'drovr phase wait answers those.';
+  return '<span class="run-blocked' + (urgent ? ' needs-human' : '') +
+    '" title="' + escHtml(title) + '">' + (urgent ? '⚠ blocked' : 'blocked') +
+    escHtml(extra) + '</span>';
 }
 
 /// Archive or restore `name`. Confirms first whenever archiving could close live
@@ -2588,6 +2727,22 @@ async function renderRunList(gen, resetAnchor) {
     // Pre-filter, for the same reason `knownRunNames` is.
     var stillActive = runs.filter(function(x) { return !x.complete; })
                           .map(function(x) { return x.name; });
+    // Alarms are raised HERE — above the `/` filter and above the empty-list
+    // early return — because both of those are about what the reviewer chose to
+    // READ, and an agent stuck in a run they filtered out is still stuck.
+    // Running last, after the render, would also mean a filter matching nothing
+    // silently froze the alarm set at whatever it was.
+    syncBlockedAlarms(
+      runs.filter(function(x) { return x.blocked && x.blocked.needs_human > 0; })
+          .map(function(x) {
+            return {
+              key: x.name + '/' + x.blocked.phase,
+              label: x.name + ' · ' + x.blocked.phase + ' is stopped on a ' +
+                     x.blocked.class + ' prompt',
+            };
+          }),
+      knownRunNames
+    );
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       resolvePendingAdvances(seq, stillActive);
@@ -2740,9 +2895,18 @@ function agentNodeHtml(node) {
     : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
+  // The node's `status` is the PHASE status (Running / Done) — a phase parked on
+  // a permission prompt is still "Running", which is exactly why a stuck agent
+  // used to be invisible here. `blocked` is the live herdr answer beside it.
+  var blocked = '';
+  if (node.blocked) {
+    blocked = '<span class="agent-blocked' + (node.blocked.needs_human ? ' needs-human' : '')
+      + '" title="' + escHtml(node.blocked.excerpt || '') + '">'
+      + (node.blocked.needs_human ? '⚠ ' : '') + escHtml(node.blocked.class) + '</span>';
+  }
   return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
     + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
-    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + rehydrate
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + blocked + rehydrate
     + '</div>' + kids;
 }
 
@@ -2754,6 +2918,21 @@ function agentsNote(text, bad) {
   el.textContent = text || '';
   el.classList.toggle('bad', !!bad);
   el.style.display = text ? '' : 'none';
+}
+
+// Every node in the tree, at any depth, that is blocked on something a human
+// must answer. Nested review panels count: a reviewer stuck on a prompt strands
+// the panel exactly as a phase agent strands the pipeline, and it has no row of
+// its own anywhere else.
+function treeBlocked(nodes) {
+  var out = [];
+  (function walk(list) {
+    (list || []).forEach(function(n) {
+      if (n.blocked && n.blocked.needs_human) out.push(n);
+      walk(n.children);
+    });
+  })(nodes);
+  return out;
 }
 
 // Every pane id currently in the tree, at any depth.
@@ -2783,6 +2962,19 @@ async function pollAgents(gen) {
     var cfgErr = document.getElementById('agents-config-error');
     cfgErr.textContent = (tree && tree.config_error) || '';
     cfgErr.style.display = cfgErr.textContent ? '' : 'none';
+    // The run view's feed into the alarm set. Scoped to this run alone — it is
+    // the only one this endpoint knows anything about, and claiming otherwise
+    // would clear every other run's alarm the moment someone opened a session.
+    syncBlockedAlarms(
+      treeBlocked(nodes).map(function(n) {
+        return {
+          key: currentRun + '/' + n.name,
+          label: currentRun + ' · ' + n.name + ' is stopped on a ' +
+                 n.blocked.class + ' prompt',
+        };
+      }),
+      [currentRun]
+    );
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
       : '<div class="review-empty">No agents spawned yet.</div>';
@@ -3455,6 +3647,8 @@ document.getElementById('session-text').addEventListener('keydown', function(e){
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPane(); }
 });
 window.addEventListener('hashchange', function(){ route().catch(console.error); });
+// Reveal "Notify me" only while the browser would still take the question.
+syncNotifyButton();
 route().catch(console.error);
 initKeyNav();
 

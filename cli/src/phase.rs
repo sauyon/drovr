@@ -4429,7 +4429,11 @@ fn detect_stuck_prompt(pane: &str) -> Option<&'static str> {
 
 /// The last `n` non-blank lines of `pane`, joined — a compact snippet to quote
 /// in the diagnostic so the human can recognize the prompt without attaching.
-fn tail_snippet(pane: &str, n: usize) -> String {
+///
+/// Shared with [`crate::blocked`], which quotes the same tail into the browser
+/// badge and `drovr watch`, so every surface that shows a human "what is your
+/// agent stuck on" shows them the same lines.
+pub(crate) fn tail_snippet(pane: &str, n: usize) -> String {
     let lines: Vec<&str> = pane
         .lines()
         .map(str::trim_end)
@@ -4502,6 +4506,19 @@ pub enum BlockedClass {
     /// A prompt that is neither recognizably destructive nor on the routine
     /// allow-list. Escalate to a human rather than guessing.
     Unknown,
+}
+
+impl BlockedClass {
+    /// The wire name, as the review server's JSON and the CLI's watcher output
+    /// spell it. One spelling for both so a badge and a log line about the same
+    /// pane never disagree about what it is blocked on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedClass::Destructive => "destructive",
+            BlockedClass::Routine => "routine",
+            BlockedClass::Unknown => "unknown",
+        }
+    }
 }
 
 /// Substrings that mark a blocked pane as a DESTRUCTIVE / dangerous confirmation.

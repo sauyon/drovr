@@ -2096,6 +2096,72 @@ check('the review panel stays hidden on the session list',
 check('...and the session list is still what is on screen', (await rowNames()).length > 0, true);
 await evaluate(`window.fetch = window.__origFetch2; return 1;`);
 
+console.log('\n== blocked-agent alarms ==');
+// The badge is server-fed and needs a herdr with a genuinely stuck agent, which
+// this harness has no way to produce. What IS testable — and is where the bugs
+// live — is the page's own bookkeeping: notify once per block, restore the title
+// when it clears, and never let one view's feed clear another view's alarms.
+//
+// The run names below are deliberately absent from the fixture, so the 2s
+// session-list poll (which syncs with the real, unblocked runs) cannot clear
+// them mid-section.
+await goto('#/', LIST_READY);
+await evaluate(`
+  window.__notes = [];
+  window.__origNotifyBlocked = notifyBlocked;
+  notifyBlocked = function(label) { window.__notes.push(label); };
+  blockedAlarms = {}; blockedNotified = {};
+  applyBlockedTitle();
+  return 1;`);
+const sync = (alarms, scope) => evaluate(
+  `syncBlockedAlarms(${JSON.stringify(alarms)}, ${JSON.stringify(scope)}); return document.title;`);
+const notes = () => evaluate(`return window.__notes.slice();`);
+
+const A = { key: 'zz-one/implement', label: 'zz-one · implement is stopped on a destructive prompt' };
+check('a new block puts a count in the tab title',
+  (await sync([A], ['zz-one'])).slice(0, 6), '⚠ (1) ');
+check('...and fires exactly one notification', await notes(), [A.label]);
+await sync([A], ['zz-one']);
+check('a block that persists across polls does not re-notify', (await notes()).length, 1);
+
+const B = { key: 'zz-two/plan', label: 'zz-two · plan is stopped on an unknown prompt' };
+check('a second stuck run raises the count',
+  (await sync([A, B], ['zz-one', 'zz-two'])).slice(0, 6), '⚠ (2) ');
+check('...and notifies only about the new one', (await notes()).length, 2);
+
+// The scope rule: the run detail view can only speak for the run it is showing.
+check('a feed scoped to one run leaves the others alone',
+  (await sync([A], ['zz-one'])).slice(0, 6), '⚠ (2) ');
+check('a feed that CAN speak for a run clears it',
+  (await sync([A], ['zz-one', 'zz-two'])).slice(0, 6), '⚠ (1) ');
+check('the title goes back to normal when nothing is stuck',
+  await sync([], ['zz-one', 'zz-two']), 'Drovr Review Loop');
+check('a block that recurs after clearing notifies again',
+  (await sync([A], ['zz-one']), (await notes()).length), 3);
+
+check('a destructive prompt renders an alarming badge',
+  await evaluate(`var h = blockedBadge({count:1, needs_human:1, phase:'implement', class:'destructive'});
+    return [h.indexOf('needs-human') !== -1, h.indexOf('⚠ blocked') !== -1];`), [true, true]);
+check('a routine prompt renders a quiet one',
+  await evaluate(`var h = blockedBadge({count:1, needs_human:0, phase:'implement', class:'routine'});
+    return [h.indexOf('needs-human') !== -1, h.indexOf('⚠') !== -1];`), [false, false]);
+check('several blocks in one run are counted on the badge',
+  await evaluate(`return blockedBadge({count:3, needs_human:1, phase:'implement', class:'unknown'})
+    .indexOf('+2') !== -1;`), true);
+check('nothing blocked renders nothing',
+  await evaluate(`return blockedBadge(null);`), '');
+check('a blocked review panel nested under a phase is still found',
+  await evaluate(`return treeBlocked([{ name: 'implement-task-1', blocked: null, children: [
+      { name: 'review:task-1:1:security', blocked: { needs_human: true, class: 'unknown' } },
+      { name: 'review:task-1:1:perf', blocked: { needs_human: false, class: 'routine' } }] }])
+    .map(function(n){ return n.name; });`), ['review:task-1:1:security']);
+
+// Leave the page as found: later sections (and the 2s poll) share this tab.
+await evaluate(`
+  notifyBlocked = window.__origNotifyBlocked;
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  return 1;`);
+
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();
 clearTimeout(watchdog);
