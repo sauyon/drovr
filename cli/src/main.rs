@@ -380,6 +380,12 @@ enum AskCmd {
     /// pipe this command — a pipeline's status is its LAST command's, which turns a
     /// timeout into a success (`docs/known-issues.md`, *"Piping a `wait` command
     /// destroys its exit-code contract — a timeout reads as approval"*).
+    ///
+    /// One collision to know about, shared with `review wait` and not introduced
+    /// here: clap exits 2 on a bad flag, so `--bogus` is indistinguishable BY CODE
+    /// from a timeout. Both stay on stderr, and a timeout always names the run and
+    /// says to re-run; a caller that retries a mistyped flag forever should read the
+    /// message, not just the status.
     Wait {
         run: String,
         #[arg(long, default_value_t = 1_800_000)]
@@ -2095,17 +2101,15 @@ fn validate_ask_request(
         });
     }
 
-    // Matches `interview::append_ask`'s rule exactly, checked here so the failure is a
-    // usage error before anything is written rather than an I/O error after. With no
-    // options at all a recommendation is free-text advice and there is nothing to
-    // check it against — the CLI must not be stricter than the module it writes
-    // through, or the two rules drift apart.
-    if let Some(r) = recommend
-        && !options.is_empty()
-        && !options.iter().any(|o| o.value == r)
-    {
+    // `interview`'s own predicate, not a second copy of it, checked here only so the
+    // failure is a usage error before anything is written rather than an I/O error
+    // after. Calling the module's function is what keeps the CLI from being stricter
+    // or laxer than the writer it goes through; `ask_recommend_rule_is_one_
+    // implementation_not_two` holds the two in step.
+    if !interview::recommend_is_offered(recommend, &options) {
         return Err(usage(format!(
-            "--recommend {r:?} names no offered --option"
+            "--recommend {:?} names no offered --option",
+            recommend.unwrap_or_default()
         )));
     }
 
@@ -2218,6 +2222,18 @@ fn cmd_ask_wait(run: &str, timeout_ms: u64) {
         process::exit(1);
     }
     let dir = run_dir(run);
+    // The same guard the post half applies, and for a sharper reason: a run dir that
+    // is not there folds, through `interview::read`, to exactly what a fully answered
+    // interview folds to — an empty log. Without this the wait would print `[]` and
+    // exit 0, i.e. "answered, nothing outstanding", to a caller that typo'd the run
+    // name or whose run was torn down underneath it.
+    if !dir.is_dir() {
+        eprintln!(
+            "drovr: ask wait: no run '{run}' at {} — nothing to wait for",
+            dir.display()
+        );
+        process::exit(1);
+    }
     // An unreadable-but-present log is a real failure (exit 1), never "no questions":
     // reporting a broken interview as an empty one would exit 0 and wave the caller on.
     let read_log = || -> Vec<interview::Ask> {
@@ -4065,6 +4081,58 @@ mod tests {
         // `interview::append_ask` accepts — the CLI must not be stricter than the
         // module it writes through, or the two rules drift.
         assert!(validate_ask_request(Some("r"), Some("q"), &[], Some("z")).is_ok());
+    }
+
+    #[test]
+    fn ask_recommend_rule_is_one_implementation_not_two() {
+        // The CLI refuses early so the human gets a usage error instead of an I/O one,
+        // but the PREDICATE is `interview`'s — the comment above is not what keeps them
+        // in step, this is. Every disagreement between the two here is a case where a
+        // question passes the CLI and dies at the append, or vice versa.
+        let opts = [
+            interview::AskOption {
+                value: "a".into(),
+                label: "Arm A".into(),
+            },
+            interview::AskOption {
+                value: "b".into(),
+                label: "Arm B".into(),
+            },
+        ];
+        for (recommend, options) in [
+            (Some("a"), &opts[..]),
+            (Some("z"), &opts[..]),
+            (None, &opts[..]),
+            (Some("z"), &[][..]),
+            (None, &[][..]),
+        ] {
+            let specs: Vec<String> = options
+                .iter()
+                .map(|o| format!("{}={}", o.value, o.label))
+                .collect();
+            assert_eq!(
+                validate_ask_request(Some("r"), Some("q"), &specs, recommend).is_ok(),
+                interview::recommend_is_offered(recommend, options),
+                "CLI and module disagree on recommend={recommend:?} with {} options",
+                options.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ask_cannot_be_both_the_bare_form_and_the_wait_subcommand() {
+        // `Commands::Ask` is a struct: at the Rust type level `sub` and the bare
+        // form's flags can be populated together, an invalid state. Only clap's
+        // `args_conflicts_with_subcommands` keeps it unreachable — so pin it, or a
+        // clap upgrade or an attribute tidy-up reintroduces it silently.
+        assert!(
+            parse(&["drovr", "ask", "wait", "myrun", "--question", "q"]).is_err(),
+            "the two forms must not be mixable"
+        );
+        assert!(
+            parse(&["drovr", "ask", "wait", "myrun", "--option", "a=A"]).is_err(),
+            "the two forms must not be mixable"
+        );
     }
 
     #[test]

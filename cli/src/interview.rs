@@ -128,6 +128,34 @@ pub fn log_path(run_dir: &Path) -> PathBuf {
     run_dir.join(LOG_FILE)
 }
 
+/// Whether every offered option has a distinct `value`.
+///
+/// The `value` is what an answer records, so a repeat makes the answer ambiguous —
+/// nothing downstream can say which entry the human picked, and a `recommend` naming
+/// it pre-selects one of two indistinguishable choices. The log is append-only, so a
+/// question written ambiguously is ambiguous for good.
+///
+/// One implementation, three callers ([`append_ask`], `parse_record`, and the CLI's
+/// `validate_ask_request`), because a rule copied per call site is a rule that drifts.
+pub fn option_values_are_unique(options: &[AskOption]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(options.len());
+    options.iter().all(|o| seen.insert(o.value.as_str()))
+}
+
+/// Whether `recommend` is a legal recommendation for `options`.
+///
+/// A recommendation that names no offered option pre-selects nothing, and the human
+/// sees a question whose "recommended" choice is invisible. With no options at all it
+/// is a free-text suggestion, and there is nothing to check it against — so that case
+/// is legal, and every caller must agree it is. See [`option_values_are_unique`] on why
+/// this is a shared predicate rather than three copies.
+pub fn recommend_is_offered(recommend: Option<&str>, options: &[AskOption]) -> bool {
+    match recommend {
+        Some(r) if !options.is_empty() => options.iter().any(|o| o.value == r),
+        _ => true,
+    }
+}
+
 /// Fold the log into one [`Ask`] per id, in `seq` order.
 ///
 /// A malformed line is SKIPPED, not fatal. Missing file => `Ok(vec![])`; any other IO
@@ -244,13 +272,13 @@ fn parse_record(line: &str) -> Option<Record> {
                     .collect::<Option<Vec<_>>>()?,
             };
             let recommend = opt_str(obj.get("recommend"))?;
-            // Same rule [`append_ask`] refuses to write, applied to what is read: a
-            // recommendation naming no offered option can only come from a hand-edited
-            // line, and admitting one would leave `Ask`'s documented invariant true of the
-            // records this module mints and false of the ones it hands out.
-            if let Some(r) = &recommend
-                && !options.is_empty()
-                && !options.iter().any(|o| &o.value == r)
+            // The same rules [`append_ask`] refuses to write, applied to what is read:
+            // such a line can only come from a hand-edit, and admitting one would leave
+            // [`Ask`]'s documented invariants true of the records this module mints and
+            // false of the ones it hands out. Both are the shared predicates, not a
+            // second copy of them — a copy is how a read rule and a write rule drift.
+            if !option_values_are_unique(&options)
+                || !recommend_is_offered(recommend.as_deref(), &options)
             {
                 return None;
             }
@@ -427,13 +455,14 @@ pub fn append_ask(
         check_field("option value", &o.value)?;
         check_field("option label", &o.label)?;
     }
-    // A recommendation that names no offered option pre-selects nothing, and the human
-    // sees a question whose "recommended" choice is invisible. With no options at all it
-    // is a free-text suggestion and there is nothing to check it against.
-    if let Some(r) = recommend
-        && !options.is_empty()
-        && !options.iter().any(|o| o.value == r)
-    {
+    if !option_values_are_unique(options) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "drovr ask: two --options share a value; the value is what an answer records, \
+             so a repeat makes the answer ambiguous",
+        ));
+    }
+    if !recommend_is_offered(recommend, options) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "drovr ask: --recommend names a value that is not one of --option's",
@@ -810,6 +839,57 @@ mod tests {
             !log_path(d.path()).exists(),
             "a rejected ask creates no log"
         );
+    }
+
+    #[test]
+    fn append_ask_rejects_two_options_sharing_a_value() {
+        let d = tempfile::tempdir().unwrap();
+        let dup = [
+            AskOption {
+                value: "a".into(),
+                label: "Arm A".into(),
+            },
+            AskOption {
+                value: "a".into(),
+                label: "Arm B".into(),
+            },
+        ];
+        // `value` is the key an answer is recorded as, so two options sharing one make
+        // the answer ambiguous: nothing downstream can say which the human picked, and
+        // `recommend` pre-selects an entry nobody can name. The log is append-only, so
+        // an ambiguous question written once is ambiguous forever.
+        let err = append_ask(d.path(), "which arm?", None, &dup, Some("a")).expect_err("dup");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            !log_path(d.path()).exists(),
+            "a rejected ask creates no log"
+        );
+        // Duplicate LABELS are fine — only the value is a key.
+        let same_label = [
+            AskOption {
+                value: "a".into(),
+                label: "Arm".into(),
+            },
+            AskOption {
+                value: "b".into(),
+                label: "Arm".into(),
+            },
+        ];
+        append_ask(d.path(), "which arm?", None, &same_label, None).expect("distinct values");
+    }
+
+    #[test]
+    fn a_line_offering_two_options_with_one_value_is_skipped() {
+        // The write-side rule, applied on read: such a line can only be a hand-edit,
+        // and admitting it would make the ambiguity real for every later reader.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            log_path(d.path()),
+            br#"{"id":"ask-0","seq":0,"question":"q","options":[{"value":"a","label":"A"},{"value":"a","label":"B"}]}
+"#,
+        )
+        .unwrap();
+        assert_eq!(read(d.path()).unwrap(), Vec::new());
     }
 
     #[test]

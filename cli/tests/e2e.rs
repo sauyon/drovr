@@ -923,8 +923,31 @@ fn e2e_ask_usage_errors_exit_1() {
             ],
         ),
         (
+            "two --options sharing a value",
+            vec![
+                "ask",
+                run,
+                "--question",
+                "q?",
+                "--option",
+                "a=Arm A",
+                "--option",
+                "a=Arm B",
+            ],
+        ),
+        (
             "unknown run",
             vec!["ask", "no-such-run", "--question", "q?"],
+        ),
+        // The half `ask wait` must not get wrong: a run that does not exist reads,
+        // through `interview::read`, exactly like a run whose questions are all
+        // answered — both fold to an empty log. Without its own check the wait would
+        // print `[]` and exit 0, which is "answered, nothing outstanding". A driver
+        // that typo'd the run name, or whose run was torn down under it, would be
+        // waved on. Same guard, same code, as the post half one function up.
+        (
+            "ask wait on an unknown run",
+            vec!["ask", "wait", "no-such-run", "--timeout-ms", "500"],
         ),
     ] {
         let out = ask_cmd(&xdg).args(&args).output().expect("drovr ask");
@@ -934,6 +957,10 @@ fn e2e_ask_usage_errors_exit_1() {
             "{label}: must exit 1; stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "{label}: an error must put nothing on stdout — stdout is the answer channel"
         );
     }
     assert!(
