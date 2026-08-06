@@ -162,11 +162,18 @@ enum Commands {
     /// your turn, and re-run it if it times out. A timeout costs nothing — the
     /// question is still on disk and still on screen.
     ///
-    /// The bare form and the `wait` subcommand share one positional slot, so both
-    /// switches are load-bearing: `subcommand_negates_reqs` is why `run` and
-    /// `question` are `Option` (see [`validate_ask_request`], which enforces them by
-    /// hand), and `args_conflicts_with_subcommands` stops `ask wait <run> --question`
-    /// from parsing as something half-way between the two forms.
+    /// The bare form and the `wait` subcommand share one positional slot, and
+    /// **`args_conflicts_with_subcommands` is the switch that makes that safe**: it
+    /// is what stops `ask wait <run> --question …` from parsing as something halfway
+    /// between the two forms, and `ask_cannot_be_both_the_bare_form_and_the_wait_
+    /// subcommand` is what keeps it. Do not drop it as redundant.
+    ///
+    /// `subcommand_negates_reqs` is inert as the fields stand — clap-derive already
+    /// treats `Option`/`Vec` as not required, so it relaxes nothing. It is kept
+    /// because it is what would let `run` become a required `String` here; until then
+    /// `run` and `question` are `Option` and [`validate_ask_request`] enforces them by
+    /// hand. Neither the emptiness of one switch nor the necessity of the other is
+    /// guessable from the attribute, which is why it is written down.
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Ask {
         #[command(subcommand)]
@@ -2081,10 +2088,10 @@ struct AskRequest {
 
 /// Validate the bare form's arguments, which clap cannot.
 ///
-/// `run` and `question` are `Option` at the clap layer ONLY because
-/// `subcommand_negates_reqs` requires it — a required positional cannot coexist with
-/// a subcommand in the same slot. So `drovr ask myrun` parses fine and this is the
-/// only thing that refuses it. Do not relax either check into a default.
+/// `run` and `question` are `Option` at the clap layer because the bare form shares
+/// its positional slot with the `wait` subcommand (see [`Commands::Ask`]). So `drovr
+/// ask myrun` parses fine, and this is the only thing that refuses it. Do not relax
+/// either check into a default.
 ///
 /// Every error is `InvalidInput` and names the part that was wrong; the caller prints
 /// [`ASK_USAGE`] beneath it.
@@ -4091,8 +4098,9 @@ mod tests {
 
     #[test]
     fn ask_bare_form_requires_a_question() {
-        // `run`/`question` are Options only to satisfy `subcommand_negates_reqs`, so
-        // clap accepts `drovr ask myrun`; the hand-check is what refuses it.
+        // `run`/`question` are `Option` because the bare form shares its positional
+        // slot with the `wait` subcommand, so clap accepts `drovr ask myrun` and this
+        // hand-check is what refuses it.
         let e = validate_ask_request(Some("myrun"), None, &[], None).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(e.to_string().contains("--question"), "{e}");
@@ -4218,14 +4226,31 @@ mod tests {
         // form's flags can be populated together, an invalid state. Only clap's
         // `args_conflicts_with_subcommands` keeps it unreachable — so pin it, or a
         // clap upgrade or an attribute tidy-up reintroduces it silently.
+        //
+        // ORDER MATTERS, and the obvious ordering does not test this. With the flag
+        // AFTER the subcommand, `--question` is simply not an argument of `wait` and
+        // clap rejects it on that ground alone — the assertion passes with the switch
+        // removed. Only a flag BEFORE the subcommand reaches the conflict: without the
+        // switch, `drovr ask --question q wait myrun` parses as BOTH forms at once,
+        // dispatches to `cmd_ask_wait`, and silently discards the question — a
+        // question the caller believes it posted, dropped without a word, which is the
+        // exact failure this whole command exists to prevent.
+        assert!(
+            parse(&["drovr", "ask", "--question", "q", "wait", "myrun"]).is_err(),
+            "a bare-form flag before the subcommand must be refused, not silently dropped"
+        );
+        assert!(
+            parse(&["drovr", "ask", "--option", "a=A", "wait", "myrun"]).is_err(),
+            "a bare-form flag before the subcommand must be refused, not silently dropped"
+        );
+        // The trailing ordering too, which clap refuses for its own reason.
         assert!(
             parse(&["drovr", "ask", "wait", "myrun", "--question", "q"]).is_err(),
             "the two forms must not be mixable"
         );
-        assert!(
-            parse(&["drovr", "ask", "wait", "myrun", "--option", "a=A"]).is_err(),
-            "the two forms must not be mixable"
-        );
+        // And neither form is broken by the switch.
+        assert!(parse(&["drovr", "ask", "wait", "myrun"]).is_ok());
+        assert!(parse(&["drovr", "ask", "myrun", "--question", "q"]).is_ok());
     }
 
     #[test]
