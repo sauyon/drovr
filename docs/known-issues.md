@@ -3434,6 +3434,175 @@ If a state poll is ever genuinely needed, the doc must say to match the terminal
 not be hand-rolling a poll for a state machine the CLI already exposes a blocking call for — that is
 the class of mistake this entry is about, and it should not be reachable from following the skill.
 
+## Every cold `opencode` reviewer pane swallows its seed, so the panel cannot converge (2026-08-06)
+
+**Severity:** high (blocks `code-review run` entirely under `review_agent = "opencode"`; retries
+cannot help, because each one mints another cold pane that fails identically).
+**Found:** 2026-08-06, run `hakobiya-accounts` task-2, against opencode 1.18.3.
+**Caveat — verify before acting on this:** observed on a **nix build of 0.2.0** that predates
+`da99190` and the `drovr/opencode-agent` merges. The newer opencode work may already address it.
+
+This is the sequel to *"`drovr code-review run` panel never completes (reviewer panes don't
+attach)"* above. That entry's readiness gate fix (`c12adb0`, `wait_agent_ready` inside
+`phase::phase_send`, which `code_review.rs` calls after `spawn_reviewer`) is what made the
+"agent target not found" symptom go away. **For opencode the gate passes and the seed still
+does not land** — so `agent_status` is not sufficient evidence that this TUI will accept input.
+
+### Symptom
+
+`drovr code-review run <run> <task>` exits 1 with the standard undelivered-seed diagnostic
+("herdr saw no state change after the prompt, and the payload is nowhere in the agent's
+composer"). Observed on iterations 2 and 3 back-to-back; each attempt left a **new** pane
+behind (`wJ:p2`, `wJ:p3`) and each new pane failed the same way. No `task-2-review-*-*.json`
+was ever written.
+
+### Not the cursor trust-dialog case, and not the paste-not-submitted case
+
+The error text is shared with both, but the pane state distinguishes them:
+
+- **cursor:** a `Do you trust the contents of this directory?` dialog sits on the pane.
+  Answering once persists, so the *next* spawn succeeds — retrying converges.
+- **paste-not-submitted:** the seed is visible in the composer as `→ [Pasted text #1 +N lines]`.
+- **opencode (this entry):** the composer is **clean** — no dialog, no pasted payload. The pane
+  is otherwise correctly wired: `Plan` agent selected (read-only wiring good) and `⊙ 1 MCP`
+  connected (findings channel good). Nothing persists between spawns, so retrying never
+  converges.
+
+Purely a delivery-timing failure; the rest of the opencode integration works.
+
+### Working around it
+
+The failure leaves a live, MCP-connected pane, and the per-angle seed files are already on
+disk. Deliver one by hand:
+
+```
+herdr agent prompt <pane> "$(cat "$(drovr path <run>)/task-<N>-review-<angle>-seed.md)"
+```
+
+The reviewer then runs and calls `submit_findings` through its own MCP connection exactly as
+designed. `code-review run` is no longer supervising, so the driver must poll for
+`task-<N>-review-<iter>-<angle>.json` and merge angles by hand. One warm pane serves one angle;
+minting more means letting `code-review run` fail again for each.
+
+### Fix ideas
+
+1. Gate on something opencode-specific that proves the composer is live rather than on herdr's
+   generic `agent_status` — the TUI prints its footer (`~/path:branch  ⊙ N MCP`) once
+   interactive.
+2. Re-send once after a short delay when the payload is absent from the composer *and* no
+   dialog is detected. drovr deliberately refuses to key into that state, but
+   absent-payload-plus-no-dialog is the signature of a cold TUI, not of a prompt awaiting an
+   answer.
+
+## `/send` and `/keys` are the only write buttons that ignore the response — a 409 eats the text (2026-08-06)
+
+**Severity:** medium (the human types to the agent from the browser, the pane is gone, and the
+message vanishes with no error and no way to recover the text they typed).
+**Found:** 2026-08-06, run `land-interactive`, while auditing main's human↔agent surfaces against
+the orphaned `feat/interactive-session` branch. Found by reading, not by hitting it.
+
+### Symptom
+
+In the **Live session** panel, the human types into the "Type to the agent…" box and clicks Send
+(or presses one of the Enter/Esc/↑/↓/1–5 key buttons). If the run has no live writable pane the
+server answers **409** and nothing is delivered — but the page shows no error. The textarea has
+already been cleared, so the text is gone from the browser too: there is nothing to re-send and
+nothing to copy. The only hint is the session view's "No live pane (this agent may not be running)"
+placeholder, which was already there before the click and does not change in response to it.
+
+### Root cause
+
+`sendPane()` (`cli/web/index.html:2873`) clears the textarea (`el.value = ''`) *before* the fetch,
+then does:
+
+```js
+try {
+  await fetch(api('send') + paneQuery(), { method: 'POST', ... , body: text });
+} catch (e) { /* ignore; next poll reflects state */ }
+```
+
+`fetch` rejects only on a network-level failure; a 409 (or 403, or 500) resolves normally, so the
+`catch` never runs and the status is never read. `sendKeys()` (`cli/web/index.html:2892`) has the
+identical shape at `:2902`. The comment — "next poll reflects state" — is the bug's premise: for
+`/keys` a successful keypress does change the pane, but a *rejected* one changes nothing, so
+"reflects state" is indistinguishable from "nothing happened".
+
+Server side is behaving correctly and specifically: `handle_post_send`
+(`cli/src/review.rs:934`) answers `409 "no live pane for this run"` when
+`resolve_pane(&run, url, Access::Write)` finds no writable target — which includes the deliberate
+exclusion of the workspace root `sh` pane from the writable set (`run_writable_panes`,
+`cli/src/review.rs:751`). So the most likely 409 in practice is the *safety* case, and that is
+exactly the one the human is told nothing about.
+
+These two are the outliers. Every other write in the page reads the response and surfaces the
+failure: submit (`index.html:2261`), create session (`:2326`), archive (`:2442`, logs
+`r.status`), rehydrate (`:2817`, renders `Rehydrate failed (<status>)` into the agents note).
+
+### Impact
+
+Bounded but genuinely annoying: the human's typed instruction is destroyed, silently, at the moment
+they are trying to unblock an agent — which is when they are least likely to be watching for a
+missing acknowledgement. It also makes the pane-writability rule undiscoverable: a human who sends
+to a run whose only pane is the root shell will conclude the feature is broken rather than that it
+is refusing on purpose.
+
+### Fix idea
+
+Read the status in both handlers and surface it, matching what archive/rehydrate already do:
+
+- On a non-`ok` response, **put the text back** in the textarea before showing the error — the
+  clear-before-send is what makes this unrecoverable rather than merely confusing.
+- Render the failure where the human is looking (an inline note under the session panel), with the
+  409 body's own wording, and distinguish "no live pane" from a 403 untrusted-write refusal.
+- For `sendKeys`, the row is already disabled during the await; re-enable and flag the row rather
+  than silently returning it to normal.
+
+## `feedback.json` is overwritten every turn, so earlier turns' annotations are unrecoverable (2026-08-06)
+
+**Severity:** low-medium (no live failure; a reviewer's earlier-round comments cannot be re-read
+once they submit a later round, and `turn` is the only evidence they ever existed).
+**Found:** 2026-08-06, run `land-interactive`, same audit as the entry above.
+
+### Symptom
+
+The reviewer requests changes on turn 1 with a set of annotations, the agent revises, and the
+reviewer submits again on turn 2. Turn 1's `feedback`, `answers` and `annotations` are gone from
+disk. An agent that wants to check whether it actually addressed every turn-1 annotation has no
+source for them; a human who wants to see what they asked for two rounds ago has none either.
+
+### Root cause
+
+Both submit branches do a whole-file `fs::write` to the same path:
+
+- approve: `cli/src/review.rs:1438`
+- request-changes: `cli/src/review.rs:1487`
+
+each writing `{turn, decision, feedback, answers, annotations}` over whatever was there.
+`RunPaths::feedback()` is a single fixed path per run. `rs.turn` increments on every submit
+(`:1478`) and is embedded in the payload — so a reader can always tell *which* turn the surviving
+file describes, which is what the `approve`-discards-answers fix (see that entry) was careful to
+preserve — but no per-turn copy is kept anywhere. The browser's own annotation drafts are held in
+`localStorage` keyed by turn (`cli/web/index.html:1530-1556`) and are cleared on submit, so there
+is no client-side archive either.
+
+Nothing reads history today, which is why this has never bitten: `drovr review wait` branches on
+`/state` alone, and the phase prompts tell the agent to read the *current* `feedback.json`. This is
+a latent gap, not a live defect.
+
+### Impact
+
+Real for multi-round spec reviews, which are the normal case for a contested design. The reviewer's
+own record of what they asked for is destroyed by the act of asking for the next thing. It also
+means a "did you address every annotation" check — the obvious thing to want from a review loop —
+cannot be written against the run dir as it stands.
+
+### Fix idea
+
+Write `feedback-<turn>.json` alongside `feedback.json` (keep the stable path as the "current turn"
+pointer so every existing reader and the documented run-dir contract in `README.md` are unaffected).
+The run dir already carries per-task artifacts with this shape (`<task>-review-<n>.head`), so it
+matches the existing convention and costs one extra `fs::write` per submit.
+
 ## A routine permission prompt notifies nobody when no `phase wait` is running (2026-08-06)
 
 **Severity:** medium — the run stalls indefinitely and every alarm surface stays deliberately quiet.
