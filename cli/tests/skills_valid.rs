@@ -1744,7 +1744,17 @@ fn spec_length_arms() -> SpecLengthArms {
                 path.file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|stem| stem.strip_prefix('S'))
-                    .and_then(|digits| digits.parse::<u32>().ok())
+                    .and_then(|digits| {
+                        let n: u32 = digits.parse().ok()?;
+                        // The name must be the CANONICAL spelling of its number.
+                        // `S00.md` and `S01.md` parse fine but are not `S0.md`
+                        // and `S1.md`; treating them as recognised would let a
+                        // mistyped candidate arm sit in the directory being
+                        // read as the control (n == 0) or as a duplicate of a
+                        // real arm — invisible to the ordering loop either way,
+                        // which is the blind spot the stray bucket exists for.
+                        (digits == n.to_string()).then_some(n)
+                    })
             } else {
                 None
             };
@@ -1929,15 +1939,25 @@ fn freeze_precedes_every_candidate_arm() {
 
 /// One data row of `spec-length/FREEZE.md`'s hash table.
 ///
-/// The `frozen at commit` cell is carried but deliberately **not** checked
-/// against history — see [`freeze_rows_still_hash_to_their_files`]. It is parsed
-/// only so a malformed SHA is a parse error rather than a cell nobody reads.
+/// **`frozen_at_head` is NOT [`ManifestRow`]'s `commit`, and the name is
+/// different so the two cannot be confused.** They are both a 40-hex commit id
+/// in a four-or-six column evidence table, which is exactly why the distinction
+/// needs to survive a careless reader: `ManifestRow::commit` is a *containment*
+/// claim — [`resolve_provenance`] requires that commit to hold the recorded blob
+/// at the recorded path, and `manifest_commits_contain_their_snapshots` enforces
+/// it. This field records what `HEAD` was when the freeze was *taken*, which for
+/// the fixtures and ledgers is a commit at which those paths did not yet exist.
+/// Running manifest provenance logic over it would answer a question this column
+/// never asked, and fail by design.
+///
+/// It is carried, not checked — parsed only so a malformed SHA is a parse error
+/// rather than a cell nobody reads. Same for `date`.
 #[derive(Debug)]
 struct FreezeRow {
     path: String,
     hash: GitObjectId,
     #[allow(dead_code)]
-    commit: GitObjectId,
+    frozen_at_head: GitObjectId,
     #[allow(dead_code)]
     date: String,
 }
@@ -1983,12 +2003,36 @@ fn parse_freeze(contents: &str) -> Result<Vec<FreezeRow>, String> {
         let normalized: Vec<String> = cells.iter().map(|c| normalize_header(c)).collect();
 
         let Some(header) = header.as_ref() else {
-            if FREEZE_REQUIRED_COLUMNS
+            // A row is the header only if it carries the COMPLETE schema. The
+            // preamble is prose about a table and grows illustrations of one, so
+            // locking onto the first `| path | … |`-ish line would let an example
+            // hard-fail a perfectly good freeze record.
+            if !FREEZE_REQUIRED_COLUMNS
                 .iter()
                 .all(|want| normalized.iter().any(|got| got == want))
             {
-                header = Some(normalized);
+                continue;
             }
+            for (i, name) in normalized.iter().enumerate() {
+                if normalized[..i].contains(name) {
+                    return Err(format!("duplicate column `{name}` in the header row"));
+                }
+            }
+            // The schema is CLOSED, exactly as `MANIFEST.md`'s is. `FreezeRow`
+            // models these four and nothing else, so a fifth column would carry
+            // evidence no reader ever sees — and this file's whole point is that
+            // a frozen artifact's record is checkable rather than decorative.
+            // Adding a column is a deliberate edit here, not something a
+            // `FREEZE.md` edit can do on its own.
+            for name in &normalized {
+                if !FREEZE_REQUIRED_COLUMNS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "unknown column `{name}` — the freeze schema is exactly: {}",
+                        FREEZE_REQUIRED_COLUMNS.join(", ")
+                    ));
+                }
+            }
+            header = Some(normalized);
             continue;
         };
 
@@ -2016,8 +2060,8 @@ fn parse_freeze(contents: &str) -> Result<Vec<FreezeRow>, String> {
         rows.push(FreezeRow {
             hash: GitObjectId::parse(&cell(FREEZE_COL_HASH))
                 .map_err(|e| format!("`{path}`: hash cell {e}"))?,
-            commit: GitObjectId::parse(&cell(FREEZE_COL_COMMIT))
-                .map_err(|e| format!("`{path}`: commit cell {e}"))?,
+            frozen_at_head: GitObjectId::parse(&cell(FREEZE_COL_COMMIT))
+                .map_err(|e| format!("`{path}`: `frozen at commit` cell {e}"))?,
             date: cell(FREEZE_COL_DATE),
             path,
         });
@@ -2432,7 +2476,10 @@ fn descends_from_separates_an_ordered_arm_from_a_pre_freeze_one() {
     // Reflexive on purpose: an arm introduced by the very commit that introduced
     // the freeze did not exist before it either.
     assert!(
-        matches!(descends_from_in(repo.path(), &freeze, &freeze), Descent::Yes),
+        matches!(
+            descends_from_in(repo.path(), &freeze, &freeze),
+            Descent::Yes
+        ),
         "a commit is its own ancestor"
     );
 

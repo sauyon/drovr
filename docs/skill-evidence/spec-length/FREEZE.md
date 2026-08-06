@@ -35,11 +35,19 @@ provenance for the derivation, not a containment claim — most plainly for `S0.
 defined as `brainstorm.md`'s spec-authoring instruction *at that commit* and is recoverable with
 `git show <that commit>:skills/pipeline/phase-prompts/brainstorm.md`.
 
-It is deliberately **not** the commit that introduced each frozen file. Git already answers that
-(`git log --diff-filter=A --format=%H -1 -- <path>`), and it is exactly what
-`cli/tests/skills_valid.rs::freeze_precedes_every_candidate_arm` reads to order the arms. Recording
-it here by hand would be a second copy of a fact that can drift from the first, with no check able
-to say which copy was right. One authoritative answer, held by git.
+It is deliberately **not** the commit that introduced each frozen file. Git already answers that,
+and it is exactly what `cli/tests/skills_valid.rs::freeze_precedes_every_candidate_arm` reads to
+order the arms. Recording it here by hand would be a second copy of a fact that can drift from the
+first, with no check able to say which copy was right. One authoritative answer, held by git.
+
+**The command for that is `git log --diff-filter=A --format=%H --reverse -- <path>`, and you want
+its FIRST line.** Not `-1`. `git log` prints newest-first, so `--diff-filter=A -1` returns the most
+recent time a path was added rather than the first — and a path can be added twice, because a
+`git rm` followed by a fresh commit of the same bytes is a second add. An arm authored before the
+freeze could then be laundered into looking compliant by deleting it and re-committing it
+afterwards. `--reverse` with `-1` does not help either: git applies the limit before reversing. The
+test takes the earliest add for exactly this reason, and
+`introducing_commit_reports_the_first_add_not_a_later_re_add` fails if anyone puts `-1` back.
 
 ## The frozen sentinels
 
