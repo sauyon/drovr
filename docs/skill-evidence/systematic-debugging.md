@@ -840,10 +840,16 @@ anywhere before `discrimination-test`, and its *Limitations* item 1 is the recor
 
 **No mechanism is offered for the +2 margin, and a draft of this paragraph offered a false one.**
 It said arm B is *"the only arm whose text makes the bisect-is-not-a-cause move explicit"*. **That
-is false, and `grep` says so**: all three arms mention `bisect` exactly once, in the same sentence,
-as one isolation technique among three (*"Bisect, add logging, or send a read-only explorer…"*), and
-**no arm anywhere says that a bisect names a commit rather than a cause.** The trap `sd-3` builds is
-answered by none of the three texts directly.
+is false, and `grep` says so**: all three arms mention `bisect` **exactly once**, in the same
+position — the isolate step — as one technique among three, and **no arm anywhere says that a bisect
+names a commit rather than a cause.** The trap `sd-3` builds is answered by none of the three texts
+directly.
+
+**Not "the same sentence", though — a draft said that too, and the review panel caught it.** A and
+A′ read *"Bisect, add logging, or **send** a read-only explorer to map the suspect area"*; arm B
+reads *"Bisect, add logging, or **dispatch** a `read-only explorer` to map…"*. Same three techniques,
+same position, different wording. The claim that survives is the one about `bisect`'s frequency and
+about what no arm says — not sameness of wording.
 
 **What the arms *do* carry, checked rather than remembered, and it does not rescue the story
 either.** All three carry the same root-cause step — *"Explain why it happens, mechanistically.
@@ -863,10 +869,15 @@ than filled with a plausible story** — inventing a mechanism is the exact erro
 counter-text section already caught itself making about a UTC-vs-local cause.
 
 **`cites_section` did not separate the arms, and again it separated them the *other* way than for
-`tdd`**: A 4/4, A′ 3/4, B 3/4, unaided 0/4. Arm B cited **least** of the three armored arms while
-scoring highest on `compliant`. Recorded as an observation; it is not a bar and it did not need to
-be one. Task 17's caution stands unchanged — **`cites_section` is the scorer's judgement, not a
-countable token; do not re-derive it with a regex.**
+`tdd`**: A 4/4, A′ 3/4, B 3/4, unaided 0/4. **Arm A cited most, and A′ and B are TIED at 3/4** —
+a draft of this sentence said arm B cited "least of the three armored arms", which is false against
+this stage's own summary table one screen above: B is tied for fewest, not uniquely lowest. **The
+review panel caught it, and it is the third prose-versus-artifact error this section had to
+correct.** What the column actually shows is that the arm scoring **highest** on `compliant` did
+**not** score highest on `cites_section` — the opposite of `tdd`'s ordering, where B led both.
+Recorded as an observation; it is not a bar and it did not need to be one. Task 17's caution stands
+unchanged — **`cites_section` is the scorer's judgement, not a countable token; do not re-derive it
+with a regex.**
 
 ### `meta_test_clear` is 0 / 12 again — uniform across all three arms
 
