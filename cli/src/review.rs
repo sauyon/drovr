@@ -235,6 +235,21 @@ struct Ctx {
 /// open, and the worst case is that a badge appears 5s after the agent stopped.
 const BLOCKED_TTL: Duration = Duration::from_secs(5);
 
+/// How long an INCONCLUSIVE sweep stands in — shorter, because it is not an
+/// answer, but not zero.
+///
+/// Not caching it at all was the first fix, and it has a failure mode of its
+/// own: while herdr is down or hung, every poll from every tab re-sweeps every
+/// live run, each sweep waiting out its own socket, and the requests stack on
+/// the server. A short floor bounds that to one attempt per run per second while
+/// still noticing herdr's return promptly.
+///
+/// It costs nothing in honesty, and that is why it is safe: an inconclusive
+/// sweep is now REPORTED as inconclusive (`blocked.inconclusive` on the wire),
+/// so what is being cached for a second is "we do not know", never "you are
+/// fine".
+const BLOCKED_RETRY_TTL: Duration = Duration::from_secs(1);
+
 /// A run's blocked agents AND how much the sweep that found them knew.
 ///
 /// The two travel together because the interesting answer is a pair: an empty
@@ -248,9 +263,9 @@ struct BlockedSnapshot {
     inconclusive: bool,
 }
 
-/// One run's last blocked sweep, and when it was taken. `at: None` means the
-/// stored snapshot has no TTL — an inconclusive sweep is never cached, so the
-/// next poll retries instead of repeating a non-answer for five seconds.
+/// One run's last blocked sweep, and when it was taken. How long it stands in
+/// depends on what it was: [`BLOCKED_TTL`] for an answer, the much shorter
+/// [`BLOCKED_RETRY_TTL`] for a sweep that learned nothing.
 struct BlockedCache {
     at: Option<Instant>,
     snapshot: BlockedSnapshot,
@@ -284,24 +299,24 @@ impl Ctx {
                 .clone()
         };
         let mut cache = cell.lock().unwrap_or_else(|e| e.into_inner());
-        let fresh = cache.at.is_some_and(|at| at.elapsed() < BLOCKED_TTL);
+        // A sweep that reached no pane holds for a second, not for five: it is
+        // not an answer, so the badge must not keep repeating it after herdr
+        // comes back — but the retry floor keeps a hung herdr from being swept
+        // once per request per tab. Both halves matter, and which TTL applies is
+        // decided by the CACHED sweep, not the incoming one.
+        let ttl = if cache.snapshot.inconclusive {
+            BLOCKED_RETRY_TTL
+        } else {
+            BLOCKED_TTL
+        };
+        let fresh = cache.at.is_some_and(|at| at.elapsed() < ttl);
         if !fresh {
             let scan = crate::blocked::scan_run(h, state);
-            // A sweep that reached no pane is not an answer, and caching it as
-            // one would keep saying "nothing is blocked" for a further TTL after
-            // herdr came back. Keep the result (it is the best we have) and
-            // carry its uncertainty forward, but do NOT start the clock — the
-            // next poll retries.
-            let inconclusive = scan.inconclusive();
             cache.snapshot = BlockedSnapshot {
+                inconclusive: scan.inconclusive(),
                 agents: scan.blocked,
-                inconclusive,
             };
-            cache.at = if inconclusive {
-                None
-            } else {
-                Some(Instant::now())
-            };
+            cache.at = Some(Instant::now());
         }
         cache.snapshot.clone()
     }
@@ -1300,7 +1315,7 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
 /// One blocked agent as the browser sees it: what it is blocked on, the pane
 /// tail so the reviewer can read the prompt without attaching, and whether it
 /// needs a human (a routine prompt does not — see
-/// [`crate::blocked::BlockedAgent::needs_human`]).
+/// [`crate::phase::BlockedClass::needs_human`]).
 fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
     serde_json::json!({
         "class": a.class.as_str(),
@@ -1348,7 +1363,7 @@ fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
                 "phase": serde_json::Value::Null,
                 "class": serde_json::Value::Null,
                 "human_phases": [],
-                "unknown": true,
+                "inconclusive": true,
             })
         } else {
             serde_json::Value::Null
@@ -1362,7 +1377,7 @@ fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
         // Blocks WERE found, so the row has something true to say; `unknown`
         // still travels because some other pane of the run went unread and a
         // further block may be hiding behind it.
-        "unknown": snapshot.inconclusive,
+        "inconclusive": snapshot.inconclusive,
     })
 }
 
@@ -1387,15 +1402,27 @@ fn handle_get_agents(req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths) {
             )),
         ),
     };
+    // `inconclusive` travels with the tree for the same reason it travels with a
+    // session-list row, and it matters MORE here: on a run's page this endpoint
+    // is the browser's only feed of blocked state (the list poll has stopped),
+    // so without it a herdr blip would render every node `blocked: null` and the
+    // page would clear an alarm it had already raised — reporting "all clear"
+    // from a sweep that reached nothing.
+    //
+    // An unreadable `state.json` is the same class of non-answer: it is not a
+    // run with no agents, it is a run we could not read.
     let tree = match load_run_state(&p.dir) {
         Some(state) => {
             let blocked = ctx.blocked_of(&crate::herdr::SystemHerdr::new(), run, &state);
-            build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked.agents)
+            let mut tree = build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked.agents);
+            tree["inconclusive"] = serde_json::Value::Bool(blocked.inconclusive);
+            tree
         }
         None => serde_json::json!({
             "workspace": serde_json::Value::Null,
             "nodes": [],
             "config_error": config_error,
+            "inconclusive": true,
         }),
     };
     respond_str(req, 200, "application/json", tree.to_string());
@@ -1826,6 +1853,17 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
             Some(st) if live != Some(false) => {
                 blocked_summary_json(&ctx.blocked_of(h, &name, st))
             }
+            // The run's own `state.json` would not parse, so we never learned
+            // which panes it has. That is not "nothing is blocked" — and `null`
+            // is read as exactly that, including as permission to clear an alarm
+            // already raised. `list_runs_in` only checks the file EXISTS, so
+            // such rows really are listed.
+            None => blocked_summary_json(&BlockedSnapshot {
+                agents: Vec::new(),
+                inconclusive: true,
+            }),
+            // Workspace confirmed gone: its panes went with it, and there is
+            // genuinely nothing that can be blocked.
             _ => serde_json::Value::Null,
         };
         // Sort key: most-recently-touched review artifact (fall back to 0).
@@ -4909,11 +4947,13 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// A sweep that could not read a single pane learned nothing, and caching
-    /// "nothing blocked" from it would keep answering that for a further TTL
-    /// after herdr came back.
+    /// A sweep that could not read a single pane learned nothing. It is held for
+    /// [`BLOCKED_RETRY_TTL`] rather than the full [`BLOCKED_TTL`] — long enough
+    /// that a hung herdr is not swept once per request per tab, short enough
+    /// that the badge is right again shortly after herdr returns. What it must
+    /// never do is claim the run is fine.
     #[test]
-    fn a_sweep_that_learned_nothing_is_not_cached() {
+    fn a_sweep_that_learned_nothing_answers_unknown_and_retries_soon() {
         let tmp = std::env::temp_dir().join(format!("drovr-blk-7-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         make_running_run(&tmp, "flaky", "w:p0");
@@ -4923,15 +4963,27 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let row = &blocked_rows(&ctx, &h)[0].clone();
         assert_eq!(
-            row["blocked"]["unknown"], true,
+            row["blocked"]["inconclusive"], true,
             "a sweep that reached nothing must not answer `null`, which the \
              browser reads as `this run is fine` — and as permission to clear \
              an alarm it already raised"
         );
         assert_eq!(row["blocked"]["count"], 0);
 
-        // herdr recovers, and the very next poll must see it — not five seconds
-        // later.
+        // Inside the retry window a second poll is served from the cache rather
+        // than sweeping again. This is what keeps a hung herdr from being swept
+        // once per request per open tab.
+        let polls = h.calls().iter().filter(|c| c.contains("agent_status")).count();
+        let _ = blocked_rows(&ctx, &h);
+        assert_eq!(
+            h.calls().iter().filter(|c| c.contains("agent_status")).count(),
+            polls,
+            "an immediate re-poll must not re-sweep"
+        );
+
+        // Past the retry window, herdr's recovery is picked up — without waiting
+        // out the full BLOCKED_TTL a conclusive answer would have earned.
+        std::thread::sleep(BLOCKED_RETRY_TTL + Duration::from_millis(100));
         let back = crate::herdr::FakeHerdr::new();
         back.push_status_for("w:p0", Some("blocked"));
         back.push_read_for("w:p0", "Dangerous rm operation\n1. Yes");
@@ -4971,6 +5023,44 @@ mod tests {
             first["blocked"], second["blocked"],
             "and it must answer the same thing"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// On a run's page the session-list poll has stopped, so `/agents` is the
+    /// browser's only feed of blocked state. If it could not say that a sweep
+    /// reached nothing, opening a run during a herdr blip would render every
+    /// node clean and clear an alarm already raised.
+    #[test]
+    fn the_agent_tree_says_when_its_sweep_reached_nothing() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-10-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "blip", "w:p0");
+        let addr = start_server(tmp.clone());
+
+        // No herdr in the test environment, so the real `SystemHerdr` this
+        // handler uses reaches nothing — which is precisely the state under
+        // test: a sweep that answered for no pane.
+        let (status, body) = http_get(&addr, "/api/runs/blip/agents");
+        assert_eq!(status, 200);
+        let tree: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(tree["inconclusive"], true, "{body}");
+
+        // A run whose own state.json will not parse is the same class of
+        // non-answer: not "no agents", but "we could not read it".
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+        let (status, body) = http_get(&addr, "/api/runs/broken/agents");
+        assert_eq!(status, 200);
+        let tree: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(tree["inconclusive"], true, "{body}");
+        assert_eq!(tree["nodes"], serde_json::json!([]));
+
+        // And the session list says it too, for the same run.
+        let (_, body) = http_get(&addr, "/api/runs");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(row_for(&rows, "broken")["blocked"]["inconclusive"], true);
 
         let _ = fs::remove_dir_all(&tmp);
     }

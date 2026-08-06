@@ -196,10 +196,13 @@ open is one whose close failed, i.e. an agent running in panes drovr believes it
 shut.
 
 A sweep that reached **none** of a run's panes reports itself as unknown rather
-than as clean: `? unreadable` in `drovr list`, `? unknown` on the session-list
-badge, and `blocked.unknown` on the wire — which also stops the browser from
-clearing an alarm it already raised. (A *partial* failure — some panes answer,
-one does not — still reads as conclusive; `docs/known-issues.md` says why.)
+than as clean: `? unreadable` in `drovr list`, a note under `drovr status`'s
+phase table, `? unknown` on the session-list badge, and `blocked.inconclusive`
+(plus `inconclusive` on the agent tree) on the wire — which also stops the
+browser from clearing an alarm it already raised. A run whose own `state.json`
+will not parse answers the same way, for the same reason. (A *partial* failure —
+some panes answer, one does not — still reads as conclusive; `docs/known-issues.md`
+says why.)
 
 ### Resuming an agent's session
 
@@ -264,7 +267,7 @@ escalation    = true   # the phases / handoff escalation contract
 | `drovr list` | List all runs with phase progress and current phase. |
 | `drovr status <name>` | Print each phase, its status, and the resume point. |
 | `drovr attach <name>` | Attach to the current phase's agent pane. |
-| `drovr watch [<name>]` | Block until one of the run's agents stops on a prompt only a human can answer, then exit reporting it. Omit the name to watch every unarchived run. Run it in the background — its exit is the driver's wake-up, like `drovr review wait`. Exit 4 = an agent needs a human, 0 = nothing left to watch (every agent has exited), 2 = timeout, 1 = error. |
+| `drovr watch [<name>]` | Block until one of the run's agents stops on a prompt only a human can answer, then exit reporting it. Omit the name to watch every unarchived run. Run it in the background — its exit is the driver's wake-up, like `drovr review wait`. Exit 4 = an agent needs a human, 0 = nothing left to watch (every agent has exited), 2 = timeout (no agent needed a human in that window — routine prompts and unreadable panes do not end the watch), 1 = error, including "every run I was asked to watch is unreadable". |
 | `drovr resurrect <name>` | Reload a stopped run and print the resume point. |
 | `drovr serve [--host H] [--port P]` | Start the always-on review server (default `127.0.0.1:8791`); serves **every** run plus a session-list landing page. Blocks until killed, and is auto-started on demand by `drovr review …`, so you rarely run it by hand. Exactly one server may serve a data dir: while one holds the `server.pid` lock, this exits 1 and points at it (rather than starting a second server and stealing `server.addr` from it). The server has no authentication; only bind a Tailscale host on a trusted tailnet. |
 | `drovr cleanup <name> [--purge]` | Close the panes drovr opened for the run (phase panes, reviewer panes, retired panes, the workspace root pane) and prune its worktree. Panes you opened yourself in the run's workspace are left alone, and the workspace only closes when nothing but drovr's panes were in it. With `--purge`, also remove the run directory and delete the branch. |

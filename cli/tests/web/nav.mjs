@@ -2174,13 +2174,53 @@ check('several blocks in one run are counted on the badge',
 check('nothing blocked renders nothing',
   await evaluate(`return blockedBadge(null);`), '');
 check('a sweep that reached nothing renders as unknown, not as clean',
-  await evaluate(`var h = blockedBadge({count:0, phase:null, class:null, human_phases:[], unknown:true});
+  await evaluate(`var h = blockedBadge({count:0, phase:null, class:null, human_phases:[], inconclusive:true});
     return [h.indexOf('? unknown') !== -1, h.indexOf('needs-human') !== -1];`), [true, false]);
 check('a blocked review panel nested under a phase is still found',
   await evaluate(`return treeBlocked([{ name: 'implement-task-1', blocked: null, children: [
       { name: 'review:task-1:1:security', blocked: { needs_human: true, class: 'unknown' } },
       { name: 'review:task-1:1:perf', blocked: { needs_human: false, class: 'routine' } }] }])
     .map(function(n){ return n.name; });`), ['review:task-1:1:security']);
+
+// The run-detail page is fed ONLY by /agents — the session-list poll has
+// stopped there. So the wiring, not just the bookkeeping, has to honour the
+// tree's `inconclusive`: this is the path where a herdr blip could dismiss the
+// notification for an agent that is still stuck.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`return currentRun;`), ok: r => r === 'alpha-deploy', label: 'alpha detail',
+});
+// The page's own 2s agent poll is stopped first, and each phase seeds its
+// alarm inside the SAME evaluate that polls and reads the title. Both matter:
+// a real poll already in flight resolves with a tree that reports a conclusive
+// empty sweep, and it would clear the seeded alarm between two round-trips.
+await evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  routeGen++;                       // orphan any poll still in flight
+  window.__origFetch3 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('/agents') !== -1) {
+      return Promise.resolve({ ok: true, json: function() {
+        return Promise.resolve({ nodes: [], workspace: 'w',
+                                 inconclusive: window.__treeInconclusive }); } });
+    }
+    return window.__origFetch3.apply(window, arguments);
+  };
+  return 1;`);
+const pollWithTree = (inconclusive) => evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  window.__treeInconclusive = ${inconclusive};
+  blockedAlarms = { 'alpha-deploy/implement': 'stuck' };
+  blockedNotified = { 'alpha-deploy/implement': true };
+  applyBlockedTitle();
+  return pollAgents(routeGen).then(function(){ return document.title; });`);
+check('a run-detail poll whose sweep reached nothing keeps the alarm',
+  (await pollWithTree(true)).slice(0, 6), '⚠ (1) ');
+check('...and a sweep that DID reach the run clears it',
+  await pollWithTree(false), 'Drovr Review Loop');
+await evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  window.fetch = window.__origFetch3;
+  return 1;`);
 
 // Leave the page as found: later sections (and the 2s poll) share this tab.
 await evaluate(`

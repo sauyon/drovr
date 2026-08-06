@@ -2411,7 +2411,7 @@ var baseTitle = document.title;
 /// its key is in neither the feed nor the scope, so nothing would ever clear it
 /// and the tab title would carry a phantom count for the rest of the session.
 /// `uncertain` names the runs whose sweep could not reach their panes (the
-/// server's `blocked.unknown`). Their alarms are HELD, never cleared: a poll
+/// server's `blocked.inconclusive`, or the agent tree's). Their alarms are HELD, never cleared: a poll
 /// that succeeded while herdr was down carries no evidence that a block went
 /// away, and clearing on it would silently drop the notification for an agent
 /// that is still stuck — the opposite of what a failed fetch does two frames
@@ -2556,7 +2556,7 @@ function blockedBadge(blocked) {
   // The sweep reached none of the run's panes, and nothing was found — which is
   // not the same as nothing being there. Rendering it as a clean row is how a
   // herdr outage comes to look like a healthy run.
-  if (!blocked.count && blocked.unknown) {
+  if (!blocked.count && blocked.inconclusive) {
     return '<span class="run-blocked" title="' + escHtml(
       'drovr could not reach this run’s panes, so whether an agent is blocked is unknown.'
     ) + '">? unknown</span>';
@@ -2767,7 +2767,7 @@ async function renderRunList(gen, resetAnchor) {
     var alarms = [];
     var uncertain = [];
     runs.forEach(function(x) {
-      if (x.blocked && x.blocked.unknown) uncertain.push(x.name);
+      if (x.blocked && x.blocked.inconclusive) uncertain.push(x.name);
       ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
         alarms.push({
           key: x.name + '/' + phase,
@@ -2998,6 +2998,11 @@ async function pollAgents(gen) {
     // The run view's feed into the alarm set. Scoped to this run alone — it is
     // the only one this endpoint knows anything about, and claiming otherwise
     // would clear every other run's alarm the moment someone opened a session.
+    //
+    // On this page the list poll has stopped, so this is the ONLY feed: if it
+    // cleared alarms on a sweep that reached no pane, opening a run during a
+    // herdr blip would silently dismiss the notification for an agent that is
+    // still stuck. `tree.inconclusive` is what says the sweep learned nothing.
     syncBlockedAlarms(
       treeBlocked(nodes).map(function(n) {
         return {
@@ -3006,7 +3011,8 @@ async function pollAgents(gen) {
                  n.blocked.class + ' prompt',
         };
       }),
-      [currentRun]
+      [currentRun],
+      (tree && tree.inconclusive) ? [currentRun] : []
     );
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
