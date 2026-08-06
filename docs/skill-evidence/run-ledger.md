@@ -493,8 +493,9 @@ recorded at their request rather than left to read as budget creep:
 2026-08-05 raise of the *Arm B on held-out* row from 20 to 21. Both are recorded as deviations
 rather than folded in silently.
 
-**All three §7.3 arm rows are now closed.** Tasks 19 and 20 have **4 skills' worth of work and 0
-runs** on every one of them. That is not a new overrun — it is the same one
+**All three §7.3 arm rows are now closed.** Tasks 19 (`ab-code-review`) and 20 (`ab-using-drovr`)
+have **two skills' worth of work and 0 runs** on every one of those rows. That is not a new
+overrun — it is the same one
 `discrimination-test` and `remeasure-tdd` escalated, now expressed per row instead of globally, and
 **this stage does not resolve it**. Global: **99 of 122, 23 remain**; remaining planned work is
 Task 19 (12) + Task 20 (20) + Task 21 `ab-voice` (24) = **56**, landing at **155 of 122**.
