@@ -3,11 +3,40 @@
 Every probe subagent this run spawns is counted here. **Append-only**: each probe-spawning
 task adds its rows as its *last* evidence write, and rewrites nothing above.
 
-`spec.md` §7.3 sets a **122-run hard ceiling** across the whole run, split into per-stage
+`spec.md` §7.3 set a **122-run hard ceiling** across the whole run, split into per-stage
 ceilings. This table is the only mechanism tracking it. Tasks 16–21 read the cumulative
 total *before* starting and **halt with a null** rather than cross a ceiling — a stage that
 hits its ceiling records the null in `docs/skill-evidence/<skill>.md` and stops; it does not
 silently extend.
+
+## The ceiling was RAISED on 2026-08-06, and there are now TWO of them
+
+**Authorised by the human** (the run's owner), on 2026-08-06, when they commissioned the
+`cross-model-arm` phase and stated that substantially more budget was available for it — with
+`qwen` declared **unlimited** and `opus` still metered. **The old 122 was derived for a
+sonnet-only design**: every stage in §7.3's budget table is a sonnet run, and probe model is a
+factor that design never carried. Recorded here rather than folded into the numbers silently,
+per the same rule the 2026-08-05 arm-B raise and the 2026-08-06 A′ raise were recorded under.
+
+- **Global ceiling: 122 → 191.** Derived, not chosen: **99** already spent + **20** metered
+  + **72** unmetered. It bounds `cumulative`, which counts every run in the table.
+- **Metered ceiling: 119.** Derived: **99** spent + **20** for `cross-model-arm`'s `opus` cells
+  (16 planned = 1 skill × 4 conditions × 2 scenarios × 2 samples, plus a **4-run retry
+  allowance**, one per condition, because a failed probe in a 4-run cell voids the cell rather
+  than shrinking it). It bounds the subtotal over rows that are **not** marked `UNMETERED`.
+- **The 72 unmetered runs** are `cross-model-arm`'s `qwen` grid: 64 planned = 2 skills ×
+  4 conditions × 2 scenarios × 4 samples, plus an **8-run retry allowance** (12.5%, because
+  this is the run's first use of a non-Claude backend headless and the ~1% retry rate of the
+  six sonnet stages does not transfer to it).
+
+**How a row declares itself unmetered: the literal string `UNMETERED` in its `stage` cell.**
+**Absence means metered.** A row that forgets the marker is charged against the metered
+ceiling — which can only trip it early. The opposite default, inferring "unmetered" from a
+model name in the cell, would let a typo buy budget silently.
+
+**What is NOT authorised**, stated in the same shape the A′ raise used: raising either ceiling
+for a phase after `cross-model-arm`, or treating any model other than `qwen` as unmetered. Each
+future phase escalates its own.
 
 **A retried run counts.** If a probe is re-dispatched because its first attempt failed,
 returned nothing, or wrote a bad transcript, that is two runs against the ceiling, not one.
@@ -15,7 +44,10 @@ The `runs this stage` cell records what was actually spent, not what was planned
 
 **The table's arithmetic is checked**, by
 `cli/tests/skills_valid.rs::run_ledger_cumulative_is_a_running_total`: `cumulative` must be the
-running total of `runs this stage`, and the last one must be at or under 122. Two rules follow
+running total of `runs this stage`, the last one must be at or under `RUN_CEILING`, and the
+subtotal over rows without the `UNMETERED` marker must be at or under `METERED_RUN_CEILING`.
+**Both constants live beside that check and both moved in the commit that raised them** — the
+numbers above and the numbers in the test are one fact. Two rules follow
 from how it reads this file, and they are stated here because breaking either is silent
 otherwise. **The four load-bearing columns are resolved by their header text, never by position**
 — `task`, `stage (§7.3 row)`, `runs this stage`, `cumulative` — so they may be reordered but not

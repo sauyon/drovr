@@ -8761,8 +8761,36 @@ fn blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts() {
 // The run ledger's arithmetic
 // ---------------------------------------------------------------------------
 
-/// spec §7.3's hard ceiling on probe runs across the whole run.
-const RUN_CEILING: u32 = 122;
+/// The hard ceiling on **all** probe runs across the whole run, metered or not.
+///
+/// spec §7.3 froze this at 122 for a **sonnet-only** design. The `cross-model-arm`
+/// phase adds a factor §7.3 never budgeted — probe model — and the human raised the
+/// ceiling on 2026-08-06 to pay for it. The new value is derived, not chosen:
+/// 99 already spent + 20 metered (`opus`) + 72 unmetered (`qwen`) = 191. The full
+/// derivation, and who authorised it, is in `run-ledger.md`'s prose header; this
+/// constant and that prose move together or the raise is silent in one of them.
+const RUN_CEILING: u32 = 191;
+
+/// The hard ceiling on the runs that **cost metered budget** — every row except the
+/// ones the ledger marks [`UNMETERED_MARKER`].
+///
+/// **Why a second constant rather than only lifting [`RUN_CEILING`].** The
+/// cross-model phase's `qwen` arm is on a model the human declared unlimited, so its
+/// 72 runs belong in the ledger (it records what happened, not only what cost money)
+/// but must not buy metered headroom. Raising `RUN_CEILING` alone from 122 to 191
+/// would have handed the run 69 unaudited metered runs — a set extended without its
+/// guard extended, which is this run's own recurring defect. Derived the same way:
+/// 99 spent + 20 (`opus`: 16 planned + a 4-run retry allowance, one per condition,
+/// because a failed probe in a 4-run cell voids the cell rather than shrinking it).
+const METERED_RUN_CEILING: u32 = 119;
+
+/// The substring a ledger row's `stage` cell carries when its runs are unmetered.
+///
+/// **Absence means metered.** A row that forgets the marker is counted against
+/// [`METERED_RUN_CEILING`], which can only trip the ceiling *early*. The opposite
+/// default — infer "unmetered" from the model named in the cell — would let a typo
+/// buy budget silently, which is the direction that cannot be recovered from.
+const UNMETERED_MARKER: &str = "UNMETERED";
 
 /// One data row of `run-ledger.md`'s budget table.
 ///
@@ -8945,8 +8973,19 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
 }
 
 /// The invariant the ledger states about itself and nothing checked:
-/// `cumulative` is the running total of `runs this stage`, and no row crosses
-/// spec §7.3's global ceiling.
+/// `cumulative` is the running total of `runs this stage`, and neither the global
+/// ceiling nor the **metered** ceiling is crossed.
+///
+/// **Two ceilings, because the run now spends two currencies.** Every row through
+/// `remeasure-systematic-debugging` was a metered Claude run and one number could
+/// guard them all. The `cross-model-arm` phase adds `qwen` runs on a model the human
+/// declared unlimited: they are real runs and belong in `cumulative`, but charging
+/// them against the metered budget would be a lie in one direction and leaving them
+/// out of the table would be a lie in the other. So `cumulative` keeps counting
+/// everything against [`RUN_CEILING`], and a second subtotal — every row whose stage
+/// cell does **not** carry [`UNMETERED_MARKER`] — is held to
+/// [`METERED_RUN_CEILING`]. Raising the first without the second is exactly the
+/// vacuous-guard move this file exists to prevent.
 ///
 /// Returns complaints rather than asserting, following [`check_blind_map`]: a
 /// check that panics can only ever be observed to *pass* on a legal corpus, and
@@ -8973,8 +9012,12 @@ fn check_ledger(text: &str) -> Vec<String> {
         return wrong;
     }
     let mut running = 0u32;
+    let mut metered = 0u32;
     for row in &rows {
         running += row.runs;
+        if !row.stage.contains(UNMETERED_MARKER) {
+            metered += row.runs;
+        }
         if row.cumulative != running {
             wrong.push(format!(
                 "task {} / {:?}: cumulative is {} but the running total of `runs this stage` \
@@ -8986,8 +9029,16 @@ fn check_ledger(text: &str) -> Vec<String> {
     let last = rows[rows.len() - 1].cumulative;
     if last > RUN_CEILING {
         wrong.push(format!(
-            "the ledger's final cumulative is {last}, over spec §7.3's {RUN_CEILING}-run \
-             ceiling — §7.3's rule is to halt and record a null, not to extend"
+            "the ledger's final cumulative is {last}, over the run's {RUN_CEILING}-run \
+             ceiling — the standing rule is to halt and record a null, not to extend"
+        ));
+    }
+    if metered > METERED_RUN_CEILING {
+        wrong.push(format!(
+            "the ledger's metered runs total {metered}, over the {METERED_RUN_CEILING}-run \
+             metered ceiling. A row is metered unless its stage cell says \
+             {UNMETERED_MARKER:?}, so this counts rows that forgot the marker — check those \
+             before raising anything"
         ));
     }
     wrong
@@ -9028,12 +9079,82 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
         check_ledger(&drifted)
     );
 
-    // The ceiling is crossed.
-    let over = format!("{header}| 6 | RED | 200 | 200 | 10 | no |\n");
+    // The global ceiling is crossed. The expected value is read from the constant,
+    // never spelled out: a literal here would have to be hand-edited in lockstep
+    // with every ceiling raise, and the one that got forgotten would leave this
+    // asserting against a ceiling nothing enforces.
+    let over = format!(
+        "{header}| 6 | RED | {} | {} | 10 | {UNMETERED_MARKER} |\n",
+        RUN_CEILING + 1,
+        RUN_CEILING + 1
+    );
+    let ceiling = RUN_CEILING.to_string();
     assert!(
-        check_ledger(&over).iter().any(|c| c.contains("122")),
+        check_ledger(&over)
+            .iter()
+            .any(|c| c.contains("final cumulative") && c.contains(&ceiling)),
         "{:?}",
         check_ledger(&over)
+    );
+
+    // **The metered ceiling is crossed while the global one is not.** This is the
+    // case the single-ceiling check could not see, and the reason the second
+    // constant exists: unmetered rows may run the cumulative up to `RUN_CEILING`,
+    // so a metered overrun below that number is invisible without its own subtotal.
+    let metered_over = format!(
+        "{header}| x | qwen {UNMETERED_MARKER} | 60 | 60 | n/a | n/a |\n\
+         | y | opus | {} | {} | n/a | no |\n",
+        METERED_RUN_CEILING + 1,
+        METERED_RUN_CEILING + 61
+    );
+    assert!(
+        METERED_RUN_CEILING + 61 <= RUN_CEILING,
+        "this case must stay UNDER the global ceiling or it proves nothing about the \
+         metered one: {METERED_RUN_CEILING} + 61 vs {RUN_CEILING}"
+    );
+    let metered_ceiling = METERED_RUN_CEILING.to_string();
+    let wrong = check_ledger(&metered_over);
+    assert!(
+        wrong
+            .iter()
+            .any(|c| c.contains("metered runs total") && c.contains(&metered_ceiling)),
+        "{wrong:?}"
+    );
+    assert!(
+        !wrong.iter().any(|c| c.contains("final cumulative")),
+        "the global ceiling must not be what fired here: {wrong:?}"
+    );
+
+    // …and the control for it: the SAME run counts, with the metered spend moved
+    // onto the unmetered row, are legal. Without this the case above would pass on
+    // a check that simply refused every large table.
+    let metered_ok = format!(
+        "{header}| x | qwen {UNMETERED_MARKER} | {} | {} | n/a | n/a |\n\
+         | y | opus | 60 | {} | n/a | no |\n",
+        METERED_RUN_CEILING + 1,
+        METERED_RUN_CEILING + 1,
+        METERED_RUN_CEILING + 61
+    );
+    assert!(
+        check_ledger(&metered_ok).is_empty(),
+        "an unmetered row must not consume metered budget: {:?}",
+        check_ledger(&metered_ok)
+    );
+
+    // A row that forgets the marker is METERED, not unmetered. The fail-safe
+    // direction, asserted rather than assumed — the opposite default would let a
+    // typo buy budget silently.
+    let unmarked = format!(
+        "{header}| x | qwen (unlimited, no marker) | {} | {} | n/a | n/a |\n",
+        METERED_RUN_CEILING + 1,
+        METERED_RUN_CEILING + 1
+    );
+    assert!(
+        check_ledger(&unmarked)
+            .iter()
+            .any(|c| c.contains("metered runs total")),
+        "{:?}",
+        check_ledger(&unmarked)
     );
 
     // A header with no data rows tracks nothing.
@@ -9077,14 +9198,19 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
     );
 
     // A blank line between rows must NOT end the table. This is the one case
-    // that could make the check pass on a strict prefix: without it, the 200-run
-    // row below the gap is never read and the arithmetic closes on the two rows
-    // above it.
+    // that could make the check pass on a strict prefix: without it, the row
+    // below the gap is never read and the arithmetic closes on the two rows
+    // above it. Its run count is sized off the constant so a later raise cannot
+    // quietly drop it under the ceiling and make this assert on nothing.
     let gapped = format!(
-        "{header}| 6 | RED | 10 | 10 | 10 | no |\n\n| 16 | Arm A | 200 | 210 | 20 | no |\n"
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n\n| 16 | Arm A | {} | {} | 20 | no |\n",
+        RUN_CEILING,
+        RUN_CEILING + 10
     );
     assert!(
-        check_ledger(&gapped).iter().any(|c| c.contains("122")),
+        check_ledger(&gapped)
+            .iter()
+            .any(|c| c.contains("final cumulative") && c.contains(&ceiling)),
         "a blank line inside the table truncated it: {:?}",
         check_ledger(&gapped)
     );
