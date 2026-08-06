@@ -85,6 +85,8 @@ blank line between two rows cannot quietly end the table and leave the check val
 | remeasure-systematic-debugging | Arm A′ on held-out RE-MEASURED (`systematic-debugging`) | 4 | 95 | 20 | **YES — exactly at 20 of 20, on a ceiling RAISED from 16 by the user** |
 | remeasure-systematic-debugging | Arm B on held-out RE-MEASURED (`systematic-debugging`) | 4 | 99 | 21 | **YES — exactly at 21 of 21** |
 | remeasure-systematic-debugging | REFACTOR re-tests (`systematic-debugging`) | 0 | 99 | 20 | no |
+| cross-model-arm | **cross-model (qwen) — UNMETERED, not a §7.3 row** | 72 | 171 | 72 (this stage only) | **YES — exactly at 72 of 72; 2 runs recorded as nulls** |
+| cross-model-arm | **cross-model (opus) — not a §7.3 row** | 16 | 187 | 20 (this stage only) | no |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -624,3 +626,52 @@ running (`plan-HANDOFF.md` dead-end 4). Recorded rather than papered over. The m
 unaffected — the 12 cells are mutually independent, each probe wrote only its own file, and every
 one was confirmed complete before any transcript was assembled or scored — but the single-writer
 property C5 protects was again held by the sandbox, not by the scheduling.
+
+## 2026-08-06 — `cross-model-arm`: 88 runs across two new models, 16 of them metered
+
+**88 attempts spent, cumulative 187 of 191; metered cumulative 115 of 119.** This is the first
+stage in the run to spend on any model but `sonnet`, and the first to spend anything the metered
+ceiling does not count. **No `spec.md` §7.3 row was touched** — probe model is a factor §7.3's
+design never carried, so these are their own rows, and they enter **no pre-registered bar**.
+The stage is **exploratory**: it cannot move a ship/revert decision reached under the §7.3 bars,
+and `docs/skill-evidence/cross-model.md` says so at the top and again at the bottom.
+
+**The two ceilings this stage runs under were raised before it started**, by the human, and the
+derivation is in this file's prose header rather than left to read as budget creep. The guard
+moved in the same commit: `RUN_CEILING` 122 → 191, and a new `METERED_RUN_CEILING` of 119 so
+that 72 unmetered runs could not silently buy metered headroom.
+
+**`opus`: 16 of 16, zero retries.** 1 skill (`systematic-debugging`) × 4 conditions × 2 held-out
+scenarios × 2 samples. Fresh `general-purpose` subagents with the model override, per `plan.md`
+C5. Metered, and charged as such: 99 + 16 = **115 of 119**.
+
+**`qwen`: 72 attempts for 62 measurements, and the stage stopped at its cap.** 2 skills ×
+4 conditions × 2 scenarios × 4 samples = 64 planned, on `ko-ag/qwen3.6-35b-abliterated` through
+`opencode run`. The 8-run retry allowance was derived at 12.5%; the observed retry rate was
+**14%** (9 of 64 runs needed a second attempt), so the 72nd attempt was reached with two cells
+unmeasured. **Recorded as nulls rather than paid for with a raised cap** — the standing rule is
+halt-and-record, and a phase lifting its own ceiling at the last run is what this file has
+escalated three times:
+
+- `506659` — `systematic-debugging`, arm B, `sd-2`, sample 2 — **0 attempts, never dispatched**
+- `d6dc83` — `tdd`, unaided, `tdd-2`, sample 4 — **1 attempt, failed, no retry available**
+
+Two cells therefore carry **n=7** rather than n=8, which is still above the n=4 every other
+result in this run rests on. **A retried run counts**, so the `qwen` row charges 72 and not 62.
+
+**How the `UNMETERED` marker works, since this is the first stage to use it.** A row is metered
+unless its `stage` cell carries the literal string `UNMETERED`; absence means metered, which can
+only trip the ceiling early. `run_ledger_cumulative_is_a_running_total` computes both totals, and
+`cross_model_grid_matches_its_own_verdicts` additionally asserts that each model's rows sit on
+the correct side of that line and charge at least as many runs as there are transcripts.
+
+**Scorers are not charged, and 78 of them ran.** This table counts **probe** dispatches — the
+runs that produce measurements. One blind `sonnet` scorer per transcript, plus a second
+independent pass over 16 of the 78 that agreed 16 of 16 on `compliant`. A scorer re-reading an
+existing transcript produces no new measurement and selects nothing, which is the distinction
+this file has drawn since Task 17.
+
+**Headroom after this stage: 4 runs of 191 global, 4 of 119 metered.** Both are effectively
+closed. The three §7.3 arm rows remain at their ceilings, unchanged by this stage — it did not
+touch them. **Nothing further is authorised**: the header's own rule is that raising either
+ceiling for a phase after `cross-model-arm` requires its own escalation.

@@ -9249,3 +9249,530 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
         check_ledger(&fuzzy)
     );
 }
+
+// ---------------------------------------------------------------------------
+// The cross-model arm
+// ---------------------------------------------------------------------------
+
+/// The models `cross-model.md` probes. A **closed** set, for the reason every
+/// closed set in this file is one: a typo must be a parse error, not a silent
+/// fifth model whose runs are counted under a name nothing else recognises.
+///
+/// `sonnet` is deliberately absent. Its cells are **reused** from the
+/// `remeasure-*` stages rather than re-run, so it owns no transcript in this
+/// directory and a row claiming otherwise is wrong.
+#[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+enum ProbeModel {
+    #[serde(rename = "qwen")]
+    Qwen,
+    #[serde(rename = "opus")]
+    Opus,
+}
+
+impl ProbeModel {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProbeModel::Qwen => "qwen",
+            ProbeModel::Opus => "opus",
+        }
+    }
+
+    /// Whether this model's runs are charged against the metered ceiling.
+    ///
+    /// The ledger's own marker is the authority at the row level; this is the
+    /// per-model fact the row's marker must agree with, so a `qwen` row that
+    /// forgot `UNMETERED` is caught here as well as by [`check_ledger`].
+    fn is_metered(self) -> bool {
+        match self {
+            ProbeModel::Qwen => false,
+            ProbeModel::Opus => true,
+        }
+    }
+}
+
+/// One entry of `transcripts/cross-model/cross-model-blind-map.json`.
+///
+/// A separate type from [`BlindMapEntry`] because it carries two fields that map
+/// has no place for — the probe model and the skill — and `deny_unknown_fields`
+/// means neither type can quietly accept the other's file. The transcripts live
+/// outside `transcripts/<skill>/` for the same reason: this stage's bundle is not
+/// one of [`VerdictBundle`]'s, and dropping its files into a skill directory
+/// would put an unrecognised verdict set where the per-skill checks would walk
+/// straight past it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossModelEntry {
+    arm: BlindArm,
+    #[allow(dead_code)]
+    scenario: String,
+    #[allow(dead_code)]
+    sample: u32,
+    model: ProbeModel,
+    skill: String,
+}
+
+/// One row of `cross-model.md`'s measured grid.
+#[derive(Debug, PartialEq, Eq)]
+struct GridRow {
+    model: String,
+    skill: String,
+    condition: String,
+    compliant: u32,
+    runs: u32,
+}
+
+/// The condition name a grid row uses for a [`BlindArm`].
+fn condition_name(arm: &BlindArm) -> &'static str {
+    match arm {
+        BlindArm::None => "unaided",
+        BlindArm::A => "A",
+        BlindArm::APrime => "A-prime",
+        BlindArm::B => "B",
+        BlindArm::BR1 => "B-r1",
+        BlindArm::BR2 => "B-r2",
+    }
+}
+
+/// Parse `cross-model.md`'s measured grid: the one table whose header is exactly
+/// `model | skill | condition | compliant | runs`.
+///
+/// Resolved by header text like every other table this file reads, and the header
+/// is matched **completely** — the document is full of other tables (the reused
+/// `sonnet` reference, the design grid), and a parser that latched onto the first
+/// five-column table would read the design's *planned* run counts as measurements.
+fn parse_grid(text: &str) -> Result<Vec<GridRow>, String> {
+    const COLS: [&str; 5] = ["model", "skill", "condition", "compliant", "runs"];
+    let mut rows = Vec::new();
+    let mut at: Option<[usize; 5]> = None;
+    for line in text.lines() {
+        if !line.trim_start().starts_with('|') {
+            // Unlike the ledger and the manifest, this table MAY be followed by
+            // prose and by other tables, so a non-row line ends it rather than
+            // being an error. The complete-header match above is what keeps that
+            // from silently reading a later table's rows.
+            if at.is_some() && !line.trim().is_empty() {
+                at = None;
+            }
+            continue;
+        }
+        let cells: Vec<&str> = ledger_cells(line);
+        if cells.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')) {
+            continue;
+        }
+        if at.is_none() {
+            let normalized: Vec<String> = cells.iter().map(|c| normalize_header(c)).collect();
+            let found: Vec<Option<usize>> = COLS
+                .iter()
+                .map(|want| normalized.iter().position(|c| c == &normalize_header(want)))
+                .collect();
+            if found.iter().all(Option::is_some) {
+                let mut idx = [0usize; 5];
+                for (i, f) in found.iter().enumerate() {
+                    idx[i] = f.unwrap();
+                }
+                at = Some(idx);
+            }
+            continue;
+        }
+        let idx = at.unwrap();
+        let get = |i: usize| -> &str { cells.get(idx[i]).copied().unwrap_or("") };
+        let num = |i: usize| -> Result<u32, String> {
+            get(i)
+                .trim()
+                .trim_matches('*')
+                .parse()
+                .map_err(|_| format!("grid row {line:?}: {:?} is not a count", get(i)))
+        };
+        rows.push(GridRow {
+            model: get(0).trim().trim_matches('`').to_string(),
+            skill: get(1).trim().trim_matches('`').to_string(),
+            condition: get(2).trim().trim_matches('`').to_string(),
+            compliant: num(3)?,
+            runs: num(4)?,
+        });
+    }
+    if rows.is_empty() {
+        return Err(
+            "no measured grid found — wanted a table with columns \
+             model / skill / condition / compliant / runs"
+                .to_string(),
+        );
+    }
+    Ok(rows)
+}
+
+/// Recompute the grid from the verdicts and the blind map, and complain about
+/// every way the two can disagree.
+///
+/// Returns complaints rather than asserting, following [`check_ledger`] and
+/// [`check_blind_map`]: a check that panics inline can only ever be observed to
+/// *pass* on a legal corpus. `cross_model_grid_check_refuses_a_grid_that_lies`
+/// is the companion that proves it fires.
+fn check_cross_model_grid(
+    declared: &[GridRow],
+    verdicts: &[(String, bool)],
+    map: &HashMap<String, CrossModelEntry>,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+
+    // The join has to be total in both directions or an arm-level count is drawn
+    // from the wrong set of runs.
+    for (id, _) in verdicts {
+        if !map.contains_key(id) {
+            wrong.push(format!(
+                "cross-model-scores.json scores {id}, which the blind map does not assign"
+            ));
+        }
+    }
+    let scored: HashSet<&str> = verdicts.iter().map(|(i, _)| i.as_str()).collect();
+    for id in map.keys() {
+        if !scored.contains(id.as_str()) {
+            wrong.push(format!(
+                "the blind map assigns {id}, which cross-model-scores.json does not score"
+            ));
+        }
+    }
+
+    // Recompute every cell from the data.
+    let mut counted: HashMap<(String, String, String), (u32, u32)> = HashMap::new();
+    for (id, compliant) in verdicts {
+        let Some(e) = map.get(id) else { continue };
+        let key = (
+            e.model.as_str().to_string(),
+            e.skill.clone(),
+            condition_name(&e.arm).to_string(),
+        );
+        let cell = counted.entry(key).or_insert((0, 0));
+        cell.1 += 1;
+        if *compliant {
+            cell.0 += 1;
+        }
+    }
+
+    for row in declared {
+        let key = (row.model.clone(), row.skill.clone(), row.condition.clone());
+        match counted.get(&key) {
+            None => wrong.push(format!(
+                "the grid declares {key:?}, which no transcript in this stage measured — \
+                 `sonnet` rows belong in the reused-reference table, not the measured grid"
+            )),
+            Some((c, n)) => {
+                if (*c, *n) != (row.compliant, row.runs) {
+                    wrong.push(format!(
+                        "the grid says {key:?} is {} of {}, the verdicts say {c} of {n}",
+                        row.compliant, row.runs
+                    ));
+                }
+            }
+        }
+    }
+    // …and no measured cell may be left out of the grid. Without this, dropping a
+    // row that came out flat would leave every remaining row still checking out.
+    for key in counted.keys() {
+        if !declared
+            .iter()
+            .any(|r| (r.model.clone(), r.skill.clone(), r.condition.clone()) == *key)
+        {
+            wrong.push(format!(
+                "{key:?} was measured but the grid does not report it — null and negative \
+                 results are recorded beside positive ones (spec §7.3)"
+            ));
+        }
+    }
+    wrong
+}
+
+/// `cross-model.md`'s grid is what its own transcripts and verdicts say, and the
+/// ledger charged for exactly those runs on the right side of the metered line.
+///
+/// **What this closes.** The cross-model transcripts sit outside
+/// `transcripts/<skill>/`, so none of [`VerdictBundle`]'s per-skill checks visit
+/// them: `scores_json_verdicts_obey_the_rubric` iterates `SkillName::ALL` and
+/// walks straight past this directory. A verdict set with no schema and a prose
+/// grid with nothing recomputing it is precisely the drift this corpus keeps
+/// finding, so the new artifacts arrive with their own guard rather than
+/// inheriting one that does not reach them.
+#[test]
+fn cross_model_grid_matches_its_own_verdicts() {
+    let evidence = evidence_dir();
+    let doc = evidence.join("cross-model.md");
+    let dir = evidence.join("transcripts/cross-model");
+
+    let text = fs::read_to_string(&doc)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", doc.display()));
+
+    // Until the probes land there is no grid, and a check that quietly passed on
+    // its absence would be the vacuous guard this file exists to prevent. So the
+    // pre-registration is allowed to stand alone — and ONLY while the transcript
+    // directory does not exist. The moment it does, everything below is required.
+    if !dir.exists() {
+        assert!(
+            parse_grid(&text).is_err(),
+            "{} declares a measured grid but {} does not exist — a grid with no \
+             transcripts behind it",
+            doc.display(),
+            dir.display(),
+        );
+        return;
+    }
+
+    let map_path = dir.join("cross-model-blind-map.json");
+    let scores_path = dir.join("cross-model-scores.json");
+    for p in [&map_path, &scores_path] {
+        assert!(
+            p.is_file(),
+            "{} exists, so {} must too — a scored stage's arm assignment is what makes \
+             its verdicts attributable (scoring-rubric.md Part B)",
+            dir.display(),
+            p.display(),
+        );
+    }
+
+    let map: HashMap<String, CrossModelEntry> =
+        serde_json::from_str(&fs::read_to_string(&map_path).expect("map unreadable"))
+            .unwrap_or_else(|e| panic!("{} does not match the cross-model blind-map schema: {e}", map_path.display()));
+
+    // The same closed verdict object every other stage records, held to the same
+    // rubric rules against the same transcript.
+    let verdicts = read_verdicts(&scores_path);
+    let mut pairs = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for v in &verdicts {
+        let id = v.0.transcript_id.as_str();
+        assert!(
+            seen.insert(id),
+            "{}: two verdicts for transcript {id}",
+            scores_path.display()
+        );
+        let transcript = resolve_transcript(&dir, id, &scores_path);
+        let body = fs::read_to_string(&transcript)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", transcript.display()));
+        v.check_rubric_rules(&response_block(&body), &scores_path);
+        pairs.push((id.to_string(), v.0.compliant));
+    }
+
+    // Every transcript file in the directory is scored. Key-set equality against
+    // the map is checked below; this catches a transcript that is in neither.
+    for entry in fs::read_dir(&dir).expect("cannot read cross-model dir") {
+        let path = entry.expect("dir entry").path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if path.extension().and_then(|e| e.to_str()) != Some("md") || !is_transcript_id(stem) {
+            continue;
+        }
+        assert!(
+            seen.contains(stem),
+            "{} exists but {} does not score it — an unscored transcript is a run that \
+             happened and was not counted",
+            path.display(),
+            scores_path.display(),
+        );
+    }
+
+    let declared = parse_grid(&text).unwrap_or_else(|e| panic!("{}: {e}", doc.display()));
+    let wrong = check_cross_model_grid(&declared, &pairs, &map);
+    assert!(wrong.is_empty(), "{}: {}", doc.display(), wrong.join("\n"));
+
+    // The ledger charged for these runs, on the right side of the metered line.
+    // `check_ledger` proves the column adds up; this proves it adds up to the
+    // number of transcripts that actually exist.
+    let ledger_path = evidence.join(EVIDENCE_LEDGER);
+    let ledger_text = fs::read_to_string(&ledger_path).expect("ledger unreadable");
+    let ledger = parse_ledger(&ledger_text).expect("ledger does not parse");
+    for model in [ProbeModel::Qwen, ProbeModel::Opus] {
+        let measured = map.values().filter(|e| e.model == model).count() as u32;
+        let cell = format!("cross-model ({})", model.as_str());
+        let rows: Vec<&LedgerRow> = ledger.iter().filter(|r| r.stage.contains(&cell)).collect();
+        assert!(
+            !rows.is_empty(),
+            "{} charges no row matching {cell:?}, but {measured} of its transcripts exist",
+            ledger_path.display(),
+        );
+        let charged: u32 = rows.iter().map(|r| r.runs).sum();
+        assert!(
+            charged >= measured,
+            "{} charges {charged} run(s) for {cell:?} against {measured} transcript(s). A \
+             retried run counts, so the charge is at or above the number of transcripts, \
+             never below it",
+            ledger_path.display(),
+        );
+        for r in &rows {
+            assert_eq!(
+                !r.stage.contains(UNMETERED_MARKER),
+                model.is_metered(),
+                "{}: row {:?} puts {} on the wrong side of the metered line",
+                ledger_path.display(),
+                r.stage,
+                model.as_str(),
+            );
+        }
+    }
+}
+
+/// [`check_cross_model_grid`] fires on each way the prose and the data can part.
+///
+/// The real grid is legal, so on it the check above can only be observed to pass
+/// — the shape of every vacuous guard this run has found.
+#[test]
+fn cross_model_grid_check_refuses_a_grid_that_lies() {
+    let entry = |model: &str, skill: &str, arm: &str| {
+        serde_json::from_value::<CrossModelEntry>(serde_json::json!({
+            "arm": arm, "scenario": "tdd-2", "sample": 1, "model": model, "skill": skill
+        }))
+        .expect("fixture entry")
+    };
+    let map = || -> HashMap<String, CrossModelEntry> {
+        HashMap::from([
+            ("aaaaaa".to_string(), entry("qwen", "tdd", "B")),
+            ("bbbbbb".to_string(), entry("qwen", "tdd", "B")),
+            ("cccccc".to_string(), entry("opus", "systematic-debugging", "none")),
+        ])
+    };
+    let verdicts = || {
+        vec![
+            ("aaaaaa".to_string(), true),
+            ("bbbbbb".to_string(), false),
+            ("cccccc".to_string(), false),
+        ]
+    };
+    let row = |m: &str, s: &str, c: &str, k: u32, n: u32| GridRow {
+        model: m.to_string(), skill: s.to_string(), condition: c.to_string(),
+        compliant: k, runs: n,
+    };
+
+    // Control. If this fails, every negative case below is meaningless.
+    let ok = vec![
+        row("qwen", "tdd", "B", 1, 2),
+        row("opus", "systematic-debugging", "unaided", 0, 1),
+    ];
+    assert!(
+        check_cross_model_grid(&ok, &verdicts(), &map()).is_empty(),
+        "{:?}",
+        check_cross_model_grid(&ok, &verdicts(), &map())
+    );
+
+    // 1. An inflated compliant count — the failure that would matter most.
+    let lied = vec![
+        row("qwen", "tdd", "B", 2, 2),
+        row("opus", "systematic-debugging", "unaided", 0, 1),
+    ];
+    assert!(
+        check_cross_model_grid(&lied, &verdicts(), &map())
+            .iter()
+            .any(|c| c.contains("the grid says") && c.contains("2 of 2") && c.contains("1 of 2")),
+        "{:?}",
+        check_cross_model_grid(&lied, &verdicts(), &map())
+    );
+
+    // 2. A measured cell dropped from the grid — the quiet way a flat result
+    //    disappears while every surviving row still checks out.
+    let dropped = vec![row("qwen", "tdd", "B", 1, 2)];
+    assert!(
+        check_cross_model_grid(&dropped, &verdicts(), &map())
+            .iter()
+            .any(|c| c.contains("was measured but the grid does not report it")),
+        "{:?}",
+        check_cross_model_grid(&dropped, &verdicts(), &map())
+    );
+
+    // 3. A declared cell nothing measured — e.g. a reused `sonnet` row smuggled
+    //    into the measured grid, where it would read as this phase's own data.
+    let invented = vec![
+        row("qwen", "tdd", "B", 1, 2),
+        row("opus", "systematic-debugging", "unaided", 0, 1),
+        row("sonnet", "tdd", "A", 4, 4),
+    ];
+    assert!(
+        check_cross_model_grid(&invented, &verdicts(), &map())
+            .iter()
+            .any(|c| c.contains("which no transcript in this stage measured")),
+        "{:?}",
+        check_cross_model_grid(&invented, &verdicts(), &map())
+    );
+
+    // 4. A scored transcript the map does not assign — unattributable.
+    let mut short = map();
+    short.remove("bbbbbb");
+    assert!(
+        check_cross_model_grid(&ok, &verdicts(), &short)
+            .iter()
+            .any(|c| c.contains("bbbbbb") && c.contains("does not assign")),
+        "{:?}",
+        check_cross_model_grid(&ok, &verdicts(), &short)
+    );
+
+    // 5. …and the mirror: a mapped transcript nobody scored, a claimed run that
+    //    never produced a verdict.
+    let mut fewer = verdicts();
+    fewer.retain(|(i, _)| i != "cccccc");
+    assert!(
+        check_cross_model_grid(&ok, &fewer, &map())
+            .iter()
+            .any(|c| c.contains("cccccc") && c.contains("does not score")),
+        "{:?}",
+        check_cross_model_grid(&ok, &fewer, &map())
+    );
+
+    // 6. `sonnet` is not a `ProbeModel`, so a map entry naming it is a parse
+    //    error rather than a fifth silent model. This is what keeps the reused
+    //    reference column out of the measured data.
+    assert!(
+        serde_json::from_value::<CrossModelEntry>(serde_json::json!({
+            "arm": "B", "scenario": "tdd-2", "sample": 1, "model": "sonnet", "skill": "tdd"
+        }))
+        .is_err(),
+        "`sonnet` must not deserialize as a probed model — its cells are reused, not run"
+    );
+
+    // 7. An extra key fails the same way: `deny_unknown_fields` is load-bearing
+    //    on a map that grew two fields relative to `BlindMapEntry`.
+    assert!(
+        serde_json::from_value::<CrossModelEntry>(serde_json::json!({
+            "arm": "B", "scenario": "tdd-2", "sample": 1, "model": "qwen",
+            "skill": "tdd", "note": "x"
+        }))
+        .is_err(),
+        "an unknown key must not be silently accepted"
+    );
+}
+
+/// [`parse_grid`] finds the measured grid and nothing else in the document.
+#[test]
+fn cross_model_grid_parser_ignores_the_other_tables() {
+    // The design table and the reused-`sonnet` table both sit above the grid in
+    // `cross-model.md`, and the design table's `runs` column holds PLANNED counts.
+    // A parser that latched onto the first table with a `runs` column would read
+    // 64 planned qwen runs as a measurement.
+    let doc = "\
+| skill | unaided | arm A | arm A' | arm B | source |\n\
+|---|---|---|---|---|---|\n\
+| tdd | 0 of 4 | 4 of 4 | 2 of 4 | 4 of 4 | reused |\n\
+\n\
+| model | skills | conditions | scenarios | samples | runs | metered? |\n\
+|---|---|---|---|---|---|---|\n\
+| qwen | tdd | unaided, A | 2 each | 4 | 64 | no |\n\
+\n\
+| model | skill | condition | compliant | runs |\n\
+|---|---|---|---|---|\n\
+| qwen | tdd | unaided | 3 | 8 |\n\
+| opus | systematic-debugging | B | 4 | 4 |\n\
+\n\
+Prose after the table, which ends it.\n\
+\n\
+| model | skill | condition | compliant | runs |\n\
+|---|---|---|---|---|\n\
+| qwen | systematic-debugging | A | 2 | 8 |\n";
+    let rows = parse_grid(doc).expect("the grid must parse");
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected the three grid rows and neither of the other tables' rows: {rows:?}"
+    );
+    assert_eq!(rows[0], GridRow {
+        model: "qwen".into(), skill: "tdd".into(), condition: "unaided".into(),
+        compliant: 3, runs: 8,
+    });
+
+    // A document with no grid is an error, not an empty result — an empty vec
+    // would make every downstream check pass on a document that reports nothing.
+    assert!(parse_grid("# nothing here\n").is_err());
+}
