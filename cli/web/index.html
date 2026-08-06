@@ -21,6 +21,7 @@
     --success: #16a34a;
     --warn-bg: #fef9c3;
     --warn-border: #ca8a04;
+    --warn-text: #854d0e;
     --ins-bg: #d1fae5;
     --del-bg: #fee2e2;
     --del-text: #991b1b;
@@ -43,6 +44,7 @@
       --success: #4ade80;
       --warn-bg: #422006;
       --warn-border: #d97706;
+      --warn-text: #fbbf24;
       --ins-bg: #064e3b;
       --del-bg: #450a0a;
       --del-text: #fca5a5;
@@ -62,6 +64,7 @@
     --success: #4ade80;
     --warn-bg: #422006;
     --warn-border: #d97706;
+    --warn-text: #fbbf24;
     --ins-bg: #064e3b;
     --del-bg: #450a0a;
     --del-text: #fca5a5;
@@ -80,6 +83,7 @@
     --success: #16a34a;
     --warn-bg: #fef9c3;
     --warn-border: #ca8a04;
+    --warn-text: #854d0e;
     --ins-bg: #d1fae5;
     --del-bg: #fee2e2;
     --del-text: #991b1b;
@@ -363,7 +367,11 @@
     font-weight: 700;
     border: none;
   }
-  .annotatable:hover .annot-trigger { opacity: 1; }
+  /* Hover alone would hide this from keyboard and touch reviewers — and since a
+     saved inline comment now stands in for the feedback box, the submit gate
+     points them here. Focus has to reveal it too. */
+  .annotatable:hover .annot-trigger,
+  .annot-trigger:focus-visible { opacity: 1; }
   .annotation-box {
     background: var(--warn-bg);
     border: 1px solid var(--warn-border);
@@ -405,6 +413,51 @@
     font-size: 0.82rem;
   }
   .saved-annot-chip .annot-comment { flex: 1; color: var(--text); }
+  /* Dropped from the payload because the line it quotes changed — dimmed and
+     tagged so it can't be mistaken for a comment that will be sent. Colour is
+     not the only signal: .annot-stranded-tag carries the reason in words. */
+  .saved-annot-chip.stranded { border-color: var(--warn-border); opacity: 0.75; }
+  .saved-annot-chip.stranded .annot-comment { text-decoration: line-through; }
+  /* --warn-text, not --warn-border: that token is tuned as a border accent and
+     only reaches 2.8:1 as text on the light background, under the 4.5:1 AA needs.
+     A tag that exists for low-vision reviewers has to be legible to them. */
+  .annot-stranded-tag {
+    color: var(--warn-text);
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .unanchored-panel {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin-bottom: 12px;
+  }
+  .unanchored-title {
+    color: var(--warn-text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .unanchored-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 0.82rem;
+    padding: 3px 0;
+  }
+  .unanchored-quote {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .unanchored-comment { flex: 1; color: var(--text); }
+  .unanchored-note { color: var(--muted); font-size: 0.78rem; margin-bottom: 6px; }
   .saved-annot-chip .annot-remove {
     cursor: pointer;
     color: var(--danger);
@@ -583,12 +636,17 @@
     grid-template-columns: 14px minmax(120px, 1fr) 160px 2fr;
     align-items: center;
     gap: 12px;
-    padding: 12px 14px;
+    /* Right padding reserves the lane the absolutely-positioned archive button
+       occupies, so the task text ellipsises before it reaches the control
+       instead of sliding underneath it. */
+    padding: 12px 82px 12px 14px;
     border-bottom: 1px solid var(--border, #2a2a2a);
     text-decoration: none;
     color: inherit;
   }
-  .run-row:last-child { border-bottom: none; }
+  /* The row is wrapped now, so `.run-row:last-child` would never match — the
+     anchor is always the FIRST child of .run-row-wrap, the button the last. */
+  .run-row-wrap:last-child > .run-row { border-bottom: none; }
   .run-row:hover { background: var(--hover, rgba(127,127,127,0.08)); }
   .run-name { font-weight: 600; }
   .run-state { font-size: 12px; opacity: 0.8; }
@@ -597,11 +655,77 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .run-dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
+  /* These five are GATE states, not lifecycle states. `approved` in particular is
+     set when the human approves spec.md at the brainstorm gate — near the START of
+     a run — so it must never be styled as "finished". Completion is the separate
+     .is-complete axis below, driven by `complete` from /api/runs. */
   .run-dot.state-ready { background: #f5a623; }      /* awaiting reviewer */
   .run-dot.state-waiting { background: #4098ff; }    /* awaiting agent */
-  .run-dot.state-approved { background: #3ec46d; }   /* done */
+  .run-dot.state-approved { background: #3ec46d; }   /* spec approved, run proceeding */
   .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
+
+  /* ---- Completion ---- */
+  .run-row.is-complete { opacity: 0.55; }
+  .run-row.is-complete:hover { opacity: 1; }
+  .run-row.is-complete .run-dot { background: #6b6b6b; }
+  .run-row.is-complete .run-dot.state-cancelled { background: #7d4340; }
+  .run-check { color: #3ec46d; font-weight: 700; }
+
+  /* .run-group deliberately has no border-top: the last active row above still
+     carries its own border-bottom (it is not `:last-child` of #run-list-items —
+     this <details> is), and stacking both drew a doubled line. */
+  .run-group > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 10px 14px;
+    font-size: 12px;
+    opacity: 0.7;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .run-group > summary::-webkit-details-marker { display: none; }
+  .run-group > summary:hover { background: var(--hover, rgba(127,127,127,0.08)); opacity: 1; }
+  .run-group > summary::before {
+    content: '▸';
+    display: inline-block;
+    transition: transform 0.12s ease;
+  }
+  .run-group[open] > summary::before { transform: rotate(90deg); }
+
+  /* ---- Archive control ----
+     The row itself is an <a>, and interactive content may not nest inside one,
+     so the button is a SIBLING in a positioned wrapper, not a child of the link.
+     Keeping the anchor intact preserves middle-click, Cmd-click and the
+     browser's own link keyboard handling. */
+  .live-unknown {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: #f5a623;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  .run-row-wrap { position: relative; }
+  .run-archive {
+    position: absolute;
+    right: 10px; top: 50%; transform: translateY(-50%);
+    font: inherit; font-size: 11px;
+    padding: 3px 9px;
+    border: 1px solid var(--border, #2a2a2a);
+    border-radius: 5px;
+    background: var(--bg, #161616);
+    color: var(--muted, #9a9a9a);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.1s ease;
+  }
+  /* Revealed on hover, and ALWAYS on focus — an opacity-0 control that never
+     appears for keyboard users is unreachable in practice. */
+  .run-row-wrap:hover .run-archive,
+  .run-archive:focus { opacity: 1; }
+  .run-archive:hover { color: var(--fg, #e8e8e8); border-color: var(--muted, #9a9a9a); }
+  .run-archive.is-live { border-color: #f5a623; color: #f5a623; }
 
   /* ---- Live session mirror ---- */
   .session-view {
@@ -651,6 +775,17 @@
   .agent-node:hover { background: var(--hover, rgba(127,127,127,0.08)); }
   .agent-node.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .agent-node.no-pane { cursor: default; opacity: 0.7; }
+  /* Reaped: drovr closed this pane. Dimmer than merely pane-less, because it
+     is a phase that RAN and is now recoverable rather than one still to come. */
+  .agent-node.reaped { opacity: 0.5; }
+  .agent-node.reaped:hover { opacity: 0.85; }
+  .agent-rehydrate {
+    margin-left: auto; background: none; border: 1px solid var(--border);
+    color: var(--muted); border-radius: 4px; cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 2px 6px;
+  }
+  .agent-rehydrate:hover { color: var(--fg); border-color: var(--accent); }
+  .agent-rehydrate:disabled { cursor: progress; opacity: 0.5; }
   .agent-dot { width: 9px; height: 9px; border-radius: 50%; background: #888; flex: 0 0 auto; }
   .agent-dot.st-Running { background: #f5a623; }
   .agent-dot.st-Done { background: #3ec46d; }
@@ -659,6 +794,8 @@
   .agent-name { font-family: var(--mono); }
   .agent-angle { color: var(--muted); font-size: 0.85em; }
   .agent-children { margin-left: 18px; border-left: 1px solid var(--border); padding-left: 6px; }
+  .agents-note { margin-top: 8px; font-size: 0.88rem; color: var(--muted); }
+  .agents-note.bad { color: var(--danger); }
 
   /* ---- New session form ---- */
   .new-session-form {
@@ -798,6 +935,7 @@
         <tr><td>Enter &nbsp;o &nbsp;l &nbsp;&rarr;</td><td>open the session under the cursor</td></tr>
         <tr><td>1&ndash;9</td><td>pick that option on the question under the cursor</td></tr>
         <tr><td>i</td><td>type a custom answer on that question</td></tr>
+        <tr><td>a</td><td>archive / restore the session under the cursor</td></tr>
         <tr><td>/ &nbsp;C-s</td><td>filter sessions</td></tr>
       </table>
       <h2>Leave</h2>
@@ -827,7 +965,19 @@
        node to inspect its live session in the panel below. -->
   <div id="agents-panel" style="display:none" class="panel">
     <div class="panel-title">Agents</div>
+    <!-- Why the ⟳ buttons below may not reflect YOUR config. Owned by the
+         poller, unlike #agents-note (which reports what a click did and must
+         survive the 2s re-render), so the two never overwrite each other. -->
+    <div id="agents-config-error" class="agents-note bad" style="display:none"></div>
     <div id="agents-tree" class="agents-tree"></div>
+    <!-- What a ⟳ actually did. A rehydrate has three outcomes the human must
+         not have to guess between — the session came back, a fresh agent was
+         seeded from the handoff, or the agent was NOT CONFIRMED to have this
+         phase's context — and the last one is a 200, not an error. That last
+         one is five states rather than one (the seed is only two of them), so
+         the CLI's own note is rendered verbatim rather than summarised here.
+         Without this the tree just quietly stops showing the ⟳. -->
+    <div id="agents-note" class="agents-note" style="display:none"></div>
   </div>
 
   <div id="session-panel" style="display:none" class="panel">
@@ -871,7 +1021,13 @@
     <div id="diff-content" class="diff-content md-content"></div>
   </div>
 
-  <div id="doc-panel" class="panel">
+  <!-- Outside #doc-panel on purpose: that panel is hidden whenever there is no
+       spec text, which is precisely when comments can no longer be matched and
+       this list is the only place they are still visible. Nested inside, it would
+       disappear in the one case it exists for. -->
+  <div id="unanchored-annots" style="display:none"></div>
+
+  <div id="doc-panel" style="display:none" class="panel">
     <div class="panel-title">Current spec</div>
     <div id="doc-content" class="md-content"></div>
   </div>
@@ -912,7 +1068,7 @@
       </label>
     </div>
 
-    <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes)…"></textarea>
+    <textarea id="feedback" placeholder="Feedback for the agent (required for request-changes, unless you left inline comments)…"></textarea>
     <div class="btn-row">
       <button class="primary" id="submit-btn" onclick="submitDecision()">Submit</button>
       <button class="danger" id="cancel-btn" onclick="cancelRun()"
@@ -997,7 +1153,35 @@ var routeGen = 0;
 // Token.map = [startLine, endLine], both 0-indexed; we emit startLine+1 (1-based).
 var md = (function() {
   if (!window.markdownit) return null;
-  var instance = window.markdownit();
+  // linkify: specs cite sources as bare URLs far more often than as [txt](url),
+  // and markdown-it leaves bare URLs as plain text by default.
+  var instance = window.markdownit({ linkify: true });
+  // fuzzyLink off — it matches scheme-less text whose last segment is a live TLD,
+  // which in a Rust repo turns every bare `phase.rs` into http://phase.rs. Specs
+  // name source files constantly, so require an explicit scheme.
+  instance.linkify.set({ fuzzyLink: false });
+
+  // Citations open in a new tab: unsubmitted answers are read straight off the
+  // live radio buttons (collectAnswers) and an annotation draft isn't in
+  // localStorage until Save, so navigating this page away mid-review loses both.
+  // In-document fragments are left alone — they scroll, they don't navigate.
+  var origLinkOpen = instance.renderer.rules.link_open;
+  instance.renderer.rules.link_open = function(tokens, idx, options, env, self) {
+    var href = tokens[idx].attrGet('href') || '';
+    // Only links that actually leave the page get a new tab. `[t]()` renders
+    // href="" — a new tab of this same page. A `#fragment` must not get one
+    // either, but it cannot be left alone: this whole app routes off
+    // location.hash, so letting the browser follow it navigates the reviewer out
+    // of the run (parseHash finds no /runs/<name> and route() shows the session
+    // list, tearing down the form). scrollSpecFragment intercepts those instead.
+    if (href && href.charAt(0) !== '#') {
+      tokens[idx].attrSet('target', '_blank');
+      tokens[idx].attrSet('rel', 'noopener noreferrer');
+    }
+    return origLinkOpen
+      ? origLinkOpen(tokens, idx, options, env, self)
+      : self.renderToken(tokens, idx, options);
+  };
 
   // Patch renderToken to inject data-source-line on opening block tokens that have .map
   var origRenderToken = instance.renderer.renderToken.bind(instance.renderer);
@@ -1284,6 +1468,12 @@ function legacyRenderReviewDiff(diffText, locMap) {
 // Additive and defensive: absent endpoints render an empty panel; any error
 // leaves the panel hidden so the spec-review loop is unaffected.
 async function refreshReview() {
+  // Every other async flow in this file captures routeGen and bails if it moved;
+  // this one did not, and it is called fire-and-forget from refresh(). Its own two
+  // awaits below outlive a navigation, so without this the late resolution painted
+  // the previous task's findings and diff and then unconditionally re-showed the
+  // panel — over the session list, which only hid it once on the way out.
+  var gen = routeGen;
   var task = reviewTask();
   if (!task) { hideEl('review-panel'); return; }
   var q = '?task=' + encodeURIComponent(task);
@@ -1293,6 +1483,7 @@ async function refreshReview() {
     var fr = await fetch(api('review/findings') + q);
     if (fr.ok) review = await fr.json();
   } catch (e) { review = {}; }
+  if (gen !== routeGen) return;
   var findings = (review && review.findings) || [];
 
   document.getElementById('review-task').textContent = task;
@@ -1305,9 +1496,14 @@ async function refreshReview() {
   document.getElementById('review-findings').innerHTML = renderFindings(findings);
 
   var diffText = await fetchText(api('review/diff') + q);
+  if (gen !== routeGen) return;
   var diffEl = document.getElementById('review-diff');
   if (diffText && diffText.trim().length > 0) {
-    diffEl.innerHTML = await renderReviewDiff(diffText, findings);
+    // renderReviewDiff() awaits internally (it preloads the patch renderer), so
+    // this is a third suspension point and needs the same guard as the two above.
+    var rendered = await renderReviewDiff(diffText, findings);
+    if (gen !== routeGen) return;
+    diffEl.innerHTML = rendered;
     fillFindingAnnotations(diffEl, diffText, findings);
   } else {
     diffEl.innerHTML = '<div class="review-empty">No reviewed diff yet.</div>';
@@ -1321,6 +1517,10 @@ async function refreshReview() {
 var annotations = {};
 var _annotIdSeq = 0;
 var currentTurn = 0;
+// The spec source this page is currently showing, so a saved annotation can be
+// checked against the text it was written against. Reassigned on every refresh(),
+// including to [] when the doc did not load — never left pointing at a stale run.
+var specSourceLines = [];
 
 // Persist annotations across page refreshes (incl. the loop's own reload after
 // each turn). Keyed by turn: a manual refresh mid-turn restores in-progress
@@ -1335,18 +1535,97 @@ function saveAnnotations() {
   } catch (e) {}
 }
 function loadAnnotations(turn) {
+  // Reset FIRST, unconditionally: every mutation calls saveAnnotations(), so
+  // localStorage is authoritative and nothing in-progress is lost. Falling
+  // through any branch below with the previous run's map still in place let its
+  // line comments ride along in this run's submit (collectAnnotations feeds the
+  // payload) with nothing on screen to reveal them — the same cross-run
+  // misattribution as the stale doc panel, but data-losing rather than cosmetic.
+  annotations = {};
   try {
     var raw = localStorage.getItem(annotKey());
-    if (!raw) { annotations = {}; return; }
+    if (!raw) return;
     var stored = JSON.parse(raw);
     if (stored && stored.turn === turn && stored.annotations) {
       annotations = stored.annotations;
       _annotIdSeq = stored.seq || _annotIdSeq;
+      migrateCommentQuotes();
     } else if (stored && stored.turn !== turn) {
-      localStorage.removeItem(annotKey()); // stale (new turn) — clear
-      annotations = {};
+      localStorage.removeItem(annotKey()); // stale (new turn) — already cleared above
     }
   } catch (e) {}
+}
+
+// Comments saved before the quote moved onto the comment carry only the entry's
+// shared quote. Stamp it onto each of them at LOAD, while it still describes the
+// text they were written against — reading it lazily instead would hand them
+// whatever a later save on that line overwrote it with, silently re-anchoring a
+// stale comment to text it was never about. After this, no comment lacks a quote,
+// so nothing downstream has to fall back to a value that keeps changing.
+function migrateCommentQuotes() {
+  Object.keys(annotations).forEach(function(lineStr) {
+    var entry = annotations[lineStr];
+    if (!entry || !entry.comments) return;
+    entry.comments.forEach(function(c) {
+      if (typeof c.quote !== 'string') c.quote = entry.quote;
+    });
+  });
+}
+
+// Give every heading an id so a spec's own `[text](#a-heading)` link has something
+// to reach. markdown-it does not emit ids, so before this there was nothing to
+// scroll to even if the browser were allowed to follow the link.
+// Namespace for generated heading ids. The spec is agent-written text: a heading
+// as ordinary as `# Feedback` would otherwise put id="feedback" on an <h1>, and
+// getElementById('feedback') — which submitDecision calls to read the textarea —
+// answers with whichever comes first in the document. #doc-content precedes the
+// form, so the heading wins, `.value` is undefined, and Submit dies on
+// undefined.trim() with nothing shown to the reviewer. A prefix no static element
+// uses keeps the spec's own words from ever colliding with the page's chrome.
+var SPEC_HEADING_ID = 'spec-h-';
+// Punctuation is stripped by blacklist rather than by whitelisting \w: \w is ASCII,
+// so a CJK or accented heading would slug to nothing and collapse into `section`,
+// leaving every heading in a non-English spec unreachable by its own links.
+function slugifyHeading(text) {
+  return String(text).toLowerCase()
+    .replace(/["'`#.,:;!?()\[\]{}<>\/\\|*_~^$%&+=@]+/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+function idHeadings(container) {
+  // Every id handed out so far, not a per-base counter: "Foo","Foo","Foo 1" all
+  // want `foo-1`, and a counter hands it out twice — getElementById then answers
+  // with the first, scrolling to the wrong heading. Step the suffix until free.
+  var taken = {};
+  var hs = container.querySelectorAll('h1, h2, h3, h4, h5, h6');
+  Array.prototype.forEach.call(hs, function(h) {
+    var base = slugifyHeading(h.textContent) || 'section';
+    var id = base, n = 0;
+    while (taken[id]) { n++; id = base + '-' + n; }
+    taken[id] = true;
+    h.id = SPEC_HEADING_ID + id;
+  });
+}
+
+// Scroll to a spec heading instead of letting the browser put the fragment in
+// location.hash, which the router reads as "leave this run".
+function scrollSpecFragment(href) {
+  var raw = href.replace(/^#/, '');
+  // markdown-it percent-encodes non-ASCII in hrefs, so `[x](#設計方針)` arrives as
+  // `#%E8%A8%AD...` while the heading's id holds the characters themselves — the
+  // decoded form has to be tried or every link in a non-English spec silently
+  // scrolls nowhere. Both forms are looked up: a spec may write either. decodeURI
+  // throws on a malformed escape, which is a link to nothing, not a page error.
+  var decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch (e) {}
+  // Looked up prefixed, and confirmed to live inside the spec: a bare
+  // getElementById on reviewer-supplied text could otherwise scroll the page to a
+  // piece of app chrome that happens to share the name.
+  var doc = document.getElementById('doc-content');
+  var target = document.getElementById(SPEC_HEADING_ID + decoded) ||
+               document.getElementById(SPEC_HEADING_ID + raw);
+  if (!target || !doc || !doc.contains(target)) return;
+  if (target.scrollIntoView) target.scrollIntoView({ block: 'start' });
 }
 
 // After rendering doc content, wire up annotation triggers on each block with data-source-line
@@ -1388,7 +1667,7 @@ function wireAnnotations(container, sourceLines) {
     block.appendChild(savedEl);
 
     // Render any existing saved annotations (carried over from previous render)
-    renderSavedAnnotations(lineNum, savedEl, quote);
+    renderSavedAnnotations(lineNum, savedEl);
 
     trigger.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -1397,13 +1676,23 @@ function wireAnnotations(container, sourceLines) {
   });
 }
 
-function renderSavedAnnotations(lineNum, container, quote) {
+function renderSavedAnnotations(lineNum, container) {
   container.innerHTML = '';
   var entry = annotations[lineNum];
   if (!entry || !entry.comments.length) return;
+  // collectAnnotations drops a comment whose line no longer reads the way it did
+  // when it was saved. Left unmarked, it would sit on screen looking submitted and
+  // be silently absent from the turn — worst on approve, or with feedback typed,
+  // where the submit gate never runs and says nothing. Judged per comment: one
+  // line can hold both a stale comment and a fresh one written after a revision.
   entry.comments.forEach(function(c) {
+    var stranded = !commentIsAnchored(lineNum, entry, c);
     var chip = document.createElement('div');
-    chip.className = 'saved-annot-chip';
+    chip.className = stranded ? 'saved-annot-chip stranded' : 'saved-annot-chip';
+    if (stranded) {
+      chip.title = 'The spec line this comment was written on has changed, so it ' +
+                   'will not be sent. Remove it and comment on the new text.';
+    }
     var commentEl = document.createElement('span');
     commentEl.className = 'annot-comment';
     commentEl.textContent = c.text;
@@ -1413,9 +1702,17 @@ function renderSavedAnnotations(lineNum, container, quote) {
     removeBtn.textContent = '×';
     removeBtn.addEventListener('click', function() {
       removeAnnotation(lineNum, c.id);
-      renderSavedAnnotations(lineNum, container, quote);
+      renderSavedAnnotations(lineNum, container);
     });
     chip.appendChild(commentEl);
+    // A visible tag, not just the tooltip: a title attribute is invisible to
+    // keyboard and touch reviewers, who would never learn the comment is dropped.
+    if (stranded) {
+      var tag = document.createElement('span');
+      tag.className = 'annot-stranded-tag';
+      tag.textContent = 'line changed — not sent';
+      chip.appendChild(tag);
+    }
     chip.appendChild(removeBtn);
     container.appendChild(chip);
   });
@@ -1446,10 +1743,15 @@ function openAnnotationBox(block, lineNum, quote, savedEl) {
     if (!text) return;
     _annotIdSeq++;
     if (!annotations[lineNum]) annotations[lineNum] = { quote: quote, comments: [] };
-    annotations[lineNum].quote = quote;
-    annotations[lineNum].comments.push({ id: _annotIdSeq, text: text });
+    // The quote rides on the COMMENT, not the line. Two comments can sit on one
+    // line with the spec revised in between, so a per-line quote would be whatever
+    // was saved last — overwriting it here re-anchored older comments written
+    // against text that is gone, and shipped them as if they still applied. The
+    // entry's own quote is therefore left exactly as first written and never read
+    // for anchoring; migrateCommentQuotes drains it into pre-existing comments.
+    annotations[lineNum].comments.push({ id: _annotIdSeq, text: text, quote: quote });
     saveAnnotations();
-    renderSavedAnnotations(lineNum, savedEl, quote);
+    renderSavedAnnotations(lineNum, savedEl);
     box.remove();
   });
 
@@ -1475,16 +1777,142 @@ function removeAnnotation(lineNum, id) {
   saveAnnotations();
 }
 
+// A saved annotation keeps the line number and quote it was written against, but
+// the spec underneath it can move: `review summary` re-renders the doc panel, and
+// on a re-summarised SAME turn loadAnnotations restores by turn number alone, so
+// the old anchors come back over new text. Sending the agent a change request
+// pinned to a line that no longer reads that way points it at the wrong place —
+// and since an inline comment can now be a turn's entire payload (see
+// needsWrittenFeedback), a stale one could be everything the agent receives.
+// So an annotation counts only while the line it quotes still reads the same.
+// No spec text means the anchor cannot be checked, not that it is fine: an
+// unverifiable quote is exactly what must not reach the agent as a whole turn.
+//
+// Judged per COMMENT: comments saved on one line at different times can quote
+// different text, and an entry-level check would let the newest save vouch for
+// older comments written against text that has since gone.
+// Deliberately no fallback to entry.quote: that value is shared by the line and
+// gets rewritten by later saves, so borrowing it would vouch for a comment using
+// text it was never written against. Old-shape comments get a real quote stamped
+// on at load (migrateCommentQuotes); anything still missing one is unverifiable,
+// and unverifiable must read as stranded rather than as fine.
+function commentQuote(c) {
+  return typeof c.quote === 'string' ? c.quote : null;
+}
+function commentIsAnchored(lineNum, entry, c) {
+  if (!specSourceLines.length) return false;
+  var q = commentQuote(c);
+  return q !== null && specSourceLines[lineNum - 1] === q;
+}
+function haveSpecText() { return specSourceLines.length > 0; }
+
 function collectAnnotations() {
   var result = [];
   Object.keys(annotations).forEach(function(lineStr) {
     var lineNum = parseInt(lineStr, 10);
     var entry = annotations[lineNum];
     entry.comments.forEach(function(c) {
-      result.push({ line: lineNum, quote: entry.quote, comment: c.text });
+      if (!commentIsAnchored(lineNum, entry, c)) return;
+      result.push({ line: lineNum, quote: commentQuote(c), comment: c.text });
     });
   });
   return result;
+}
+
+// Comments dropped from the payload that have no block left to be marked on. The
+// inline `.stranded` chip only reaches comments whose line still renders as a
+// block; when a revision DELETES the commented line (the most natural response to
+// "cut this"), wireAnnotations never visits that line and the chip is never drawn.
+// Without this panel the comment would disappear from the page and from the turn
+// with nothing said, which is the failure the inline marker exists to prevent.
+function renderUnanchoredPanel() {
+  var panel = document.getElementById('unanchored-annots');
+  if (!panel) return;
+  var orphans = [];
+  Object.keys(annotations).forEach(function(lineStr) {
+    var lineNum = parseInt(lineStr, 10);
+    var entry = annotations[lineNum];
+    if (!entry.comments.length) return;
+    // Rendered inline already? Then the chip carries the marker; don't say it twice.
+    if (document.getElementById('saved-annots-' + lineNum)) return;
+    entry.comments.forEach(function(c) {
+      if (commentIsAnchored(lineNum, entry, c)) return;
+      orphans.push({ line: lineNum, quote: commentQuote(c), comment: c.text, id: c.id });
+    });
+  });
+  panel.innerHTML = '';
+  if (!orphans.length) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  panel.className = 'unanchored-panel';
+  // "The line is gone" is only true when there IS a spec to be gone from. With no
+  // spec text — an absent spec.md or a failed fetch, which the server answers the
+  // same way — these comments are merely unverifiable, and saying they were deleted
+  // would talk the reviewer into discarding good work over a transient hiccup. In
+  // that state the discard buttons are withheld too: an irreversible one-click
+  // delete has no business sitting under a claim the page cannot substantiate.
+  var specKnown = haveSpecText();
+  var title = document.createElement('div');
+  title.className = 'unanchored-title';
+  title.textContent = !specKnown
+    ? (orphans.length === 1 ? '1 comment cannot be matched — the spec text is not loaded'
+                            : orphans.length + ' comments cannot be matched — the spec text is not loaded')
+    : (orphans.length === 1 ? '1 comment will not be sent — the spec line it was written on is gone'
+                            : orphans.length + ' comments will not be sent — the spec lines they were written on are gone');
+  panel.appendChild(title);
+  if (!specKnown) {
+    var note = document.createElement('div');
+    note.className = 'unanchored-note';
+    note.textContent = 'Nothing has been discarded. Reload to match them against the spec again.';
+    panel.appendChild(note);
+  }
+  orphans.forEach(function(o) {
+    var row = document.createElement('div');
+    row.className = 'unanchored-row';
+    var was = document.createElement('div');
+    was.className = 'unanchored-quote';
+    was.textContent = 'was on line ' + o.line + ': ' + o.quote;
+    var said = document.createElement('div');
+    said.className = 'unanchored-comment';
+    said.textContent = o.comment;
+    row.appendChild(was);
+    row.appendChild(said);
+    if (specKnown) {
+      var drop = document.createElement('button');
+      drop.className = 'annot-remove';
+      drop.setAttribute('type', 'button');
+      drop.textContent = '×';
+      drop.title = 'Discard this comment';
+      drop.addEventListener('click', function() {
+        removeAnnotation(o.line, o.id);
+        renderUnanchoredPanel();
+      });
+      row.appendChild(drop);
+    }
+    panel.appendChild(row);
+  });
+}
+
+// Comments the reviewer can still SEE but that collectAnnotations drops, so the
+// submit gate can say why it is refusing instead of claiming they said nothing.
+function strandedAnnotations() {
+  var n = 0;
+  Object.keys(annotations).forEach(function(lineStr) {
+    var lineNum = parseInt(lineStr, 10);
+    var entry = annotations[lineNum];
+    entry.comments.forEach(function(c) {
+      if (!commentIsAnchored(lineNum, entry, c)) n++;
+    });
+  });
+  return n;
+}
+
+// Request-changes has to tell the agent *something*, but an inline comment is
+// already that something — a reviewer who commented on the exact lines they want
+// changed shouldn't have to restate it in the box. Only saved comments count:
+// collectAnnotations is what actually reaches feedback.json, so an unsaved draft
+// sitting in a line's textarea would be feedback the agent never sees.
+function needsWrittenFeedback(feedbackVal) {
+  return !feedbackVal && !collectAnnotations().length;
 }
 
 // ---- Open questions (multiple choice) ----
@@ -1604,6 +2032,11 @@ function blankCustomAnswer() {
 // ---- State ----
 var pollTimer = null;
 var currentDocText = '';
+// Bumped once per refresh() whose fetches landed for the run still on screen.
+// Monotonic on purpose: it is the only signal that distinguishes "this run has
+// been rendered" from "nothing has rendered yet", both of which look like an
+// empty currentDocText. cli/tests/web/nav.mjs waits on it.
+var refreshSeq = 0;
 
 function showEl(id) { document.getElementById(id).style.display = ''; }
 function hideEl(id) { document.getElementById(id).style.display = 'none'; }
@@ -1629,6 +2062,7 @@ async function refresh() {
 
   // Navigated away while these fetches were in flight → drop this stale render.
   if (gen !== routeGen) return;
+  refreshSeq++;
 
   currentDocText = docText;
   var state = stateRes.state;
@@ -1651,13 +2085,31 @@ async function refresh() {
     hideEl('summary-banner');
   }
 
-  // doc panel — render with source-line attributes then wire annotations
+  // doc panel — render with source-line attributes then wire annotations.
+  // The empty case MUST clear and hide, not just skip the write: a run has no
+  // spec.md until its gate is first opened, so /doc answers 200-with-no-body, and
+  // leaving the last render in place showed the PREVIOUS run's spec under this
+  // run's name. route() deliberately does not show this panel — visibility is
+  // owned here, so the stale doc is never briefly visible on the way in either.
+  // specSourceLines is assigned OUTSIDE the `if` for the same reason one step on:
+  // fetchText collapses a 204, a non-2xx and a network failure all to '', and
+  // leaving the previous value in place would check this run's annotations against
+  // whatever ran before it — possibly a different run's spec.
+  specSourceLines = docText ? docText.split('\n') : [];
+  var docContentEl = document.getElementById('doc-content');
   if (docText) {
-    var docContentEl = document.getElementById('doc-content');
     docContentEl.innerHTML = renderMd(docText);
-    var sourceLines = docText.split('\n');
-    wireAnnotations(docContentEl, sourceLines);
+    idHeadings(docContentEl);
+    wireAnnotations(docContentEl, specSourceLines);
+    showEl('doc-panel');
+  } else {
+    docContentEl.innerHTML = '';
+    hideEl('doc-panel');
   }
+  // Comments whose line is gone from the spec entirely have no block left to hang
+  // a marker on, so they get listed on their own — otherwise dropping them from
+  // the payload is invisible.
+  renderUnanchoredPanel();
 
   // diff panel — before→after diff of the raw markdown SOURCE (not rendered
   // HTML): unchanged lines neutral, removals red, additions green.
@@ -1755,8 +2207,21 @@ async function submitDecision(forced) {
   }
   var feedbackVal = document.getElementById('feedback').value.trim();
 
-  if (decisionVal === 'request-changes' && !feedbackVal) {
-    showError('Feedback is required when requesting changes.');
+  if (decisionVal === 'request-changes' && needsWrittenFeedback(feedbackVal)) {
+    // Distinguish the ways of having nothing to send. With comments on screen that
+    // were not counted, "you said nothing" reads as the button being broken.
+    var stranded = strandedAnnotations();
+    showError(!stranded
+      ? 'Say what to change: add feedback, or an inline comment on the spec.'
+      : haveSpecText()
+        ? 'The spec changed under your inline comments, so they no longer match the ' +
+          'lines they quote. Re-add them on the new text, or type feedback here.'
+        // Not "the spec failed to load": fetchText collapses a failed request and a
+        // genuinely empty spec.md into the same '', so naming a cause would be a
+        // guess. Say what is observable — there is no text to match against.
+        : 'There is no spec text to match your inline comments against. ' +
+          'Reload the page, or type feedback here.');
+    document.getElementById('feedback').focus();  // as blankCustomAnswer does below
     return;
   }
 
@@ -1876,14 +2341,256 @@ async function createSession() {
 // `gen` is the routeGen at call time, matching the other pollers: a list fetch in
 // flight when the reviewer navigates into a run must not paint its result over
 // the detail view (or drag the cursor with it).
-async function renderRunList(gen) {
+// Whether the "Completed (N)" group is expanded. Completed sessions are collapsed
+// by default — they are the majority over a project's life and none of them need
+// the reviewer. Persisted so the choice survives the 2s re-render and reloads.
+var completedOpen = (function() {
+  try { return localStorage.getItem('drovr.completedOpen') === '1'; } catch (e) { return false; }
+})();
+
+// One list row. `complete` runs are dimmed and led by a check instead of the gate
+// dot, and their meta reports phase progress rather than the gate state — for a
+// finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
+function runRow(run) {
+  // Archived AND the workspace still open. Two ways to get here, and the row means
+  // the same in both: filed away with something still live in it.
+  //   * the close FAILED — the run's agent keeps running, unnoticed;
+  //   * the close was WITHHELD because panes drovr did not create are in there —
+  //     drovr's own panes went, the human's shell or editor holds the workspace.
+  // Either way it must not render identically to a cleanly-closed run. Declared
+  // here, before first use: `var` hoists the declaration but not the value.
+  var zombie = run.archived && run.live === true;
+  var meta;
+  if (zombie) {
+    // Checked before the complete/active split: archiving is allowed at any
+    // phase, so an archived-but-still-live run is just as likely to be
+    // incomplete — and that is the more alarming case, since an agent is
+    // actively running inside panes we believe we closed.
+    meta = 'archived · panes still live';
+  } else if (run.complete) {
+    if (run.state === 'cancelled') meta = 'cancelled';
+    else if (run.archived) meta = 'archived · ' + run.done + '/' + run.total;
+    else meta = 'complete · ' + run.done + '/' + run.total;
+  } else {
+    meta = (run.state || '') + (run.turn ? ' · turn ' + run.turn : '');
+    if (run.total) meta += ' · ' + run.done + '/' + run.total;
+  }
+  var dot = zombie
+    ? '<span class="run-dot state-ready" title="archived, but its workspace is still open"></span>'
+    : run.complete && run.state !== 'cancelled'
+    ? '<span class="run-check">✓</span>'
+    : '<span class="run-dot state-' + escHtml(run.state) + '"></span>';
+  // `live` is true / false / null, and null means "herdr could not be asked".
+  // Unknown is treated exactly like live: archiving closes panes, so the warning
+  // must not be skipped just because we failed to look.
+  var maybeLive = run.live !== false;
+  var label = run.archived ? 'Restore' : 'Archive';
+  var title = run.archived
+    ? 'Move it back to the active list. Does NOT bring the agent back: the workspace is closed and drovr phase start cannot recreate it.'
+    : (maybeLive
+        ? (run.live === null
+            ? 'Archive — live panes could not be checked; will confirm first'
+            : 'Archive — this run still has live panes; will confirm first')
+        : 'Archive — files the run away; no live panes to close');
+  var btn = '<button class="run-archive' + (!run.archived && maybeLive ? ' is-live' : '') +
+    '" data-run="' + escHtml(run.name) + '" data-archived="' + (run.archived ? '1' : '0') +
+    '" data-live="' + (run.live === null ? 'unknown' : (run.live ? '1' : '0')) +
+    '" title="' + escHtml(title) + '" aria-label="' + escHtml(label + ' session ' + run.name) +
+    '">' + label + '</button>';
+  return '<div class="run-row-wrap">' +
+    '<a class="run-row' + (run.complete ? ' is-complete' : '') +
+      '" href="#/runs/' + encodeURIComponent(run.name) + '">' +
+      dot +
+      '<span class="run-name">' + escHtml(run.name) + '</span>' +
+      '<span class="run-state">' + escHtml(meta) + '</span>' +
+      '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
+    '</a>' + btn +
+  '</div>';
+}
+
+/// Archive or restore `name`. Confirms first whenever archiving could close live
+/// panes — including the unknown case — because the agent's conversation context
+/// dies with the pane and is not recoverable by resuming the run.
+async function toggleArchive(name, archived, live) {
+  // Captured BEFORE the awaits below, like every other async flow here. The POST
+  // blocks on a herdr round-trip, and the reviewer can open a run meanwhile —
+  // re-rendering the list then would run applyNavCursor against the detail
+  // view's question rows (they share `navCursor`) and yank the cursor on a page
+  // that has nothing to do with this action.
+  var gen = routeGen;
+  if (!archived && live !== '0') {
+    var why = live === 'unknown'
+      ? 'Could not check whether "' + name + '" has live panes &mdash; herdr may be ' +
+        'unreachable, or this session\'s own state may be unreadable.'
+      : 'Session "' + name + '" still has live panes.';
+    if (!window.confirm(why + '\n\nArchiving closes its herdr workspace. The run itself ' +
+        'resumes with `drovr phase start`, but the running agent\'s context is lost — ' +
+        'anything it has not written to a HANDOFF doc goes with it.\n\nArchive anyway?')) {
+      return;
+    }
+  }
+  // Where the cursor should land IF this archive removes the row. Captured now,
+  // while the row is still on screen; whether it actually leaves is not knowable
+  // until the next /api/runs, so the decision itself happens after the render.
+  var neighbour = neighbourKey(name);
+  try {
+    var r = await fetch('/api/runs/' + encodeURIComponent(name) + '/archive', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({archived: !archived}),
+    });
+    if (!r.ok) { console.error('[drovr] archive failed', r.status); return; }
+    // The server archives even when the workspace could not be closed — refusing
+    // would leave a row nobody can clear. But if we thought panes were alive and
+    // the close did NOT happen, the run is now filed away while its agent keeps
+    // running. That must not pass silently: the only other record is the
+    // server's stderr, which nobody looking at this page can see.
+    var res = await r.json().catch(function() { return {}; });
+    // `!== true` rather than `=== false`: an unparseable body leaves this
+    // undefined, and "we could not tell whether the panes were closed" belongs on
+    // the warning side, not the silent side.
+    if (!archived && live !== '0' && res.workspace_closed !== true) {
+      window.alert('Archived "' + name + '", but its herdr workspace is still open.\n\n' +
+        'Either the close failed, or it was kept deliberately because panes drovr did ' +
+        'not create are still in it — your own shell or editor. Its panes may still be ' +
+        'running. Check with `herdr workspace list`; `drovr cleanup ' + name + '` closes ' +
+        "drovr's own panes and spares yours.");
+    }
+  } catch (e) {
+    console.error('[drovr] archive failed', e);
+    return;
+  }
+  if (gen !== routeGen) return;
+  // Archiving hides the row by the reviewer's OWN action, so the cursor should
+  // move on to a neighbour. That is the opposite of a row hidden out from under
+  // them (collapsed group, liveness flap), where `applyNavCursor` parks the
+  // cursor off screen and restores it when the row returns. Re-anchor here,
+  // deliberately, rather than letting a stale numeric index drift onto whatever
+  // slides into the slot — that drift was the bug, and it merely happened to
+  // look right in this one case.
+  // Hand the decision to the next render that can actually answer it, rather
+  // than deciding here. Deciding after `await renderRunList(gen)` looked right
+  // but was a race: that render bails without painting when a newer one has been
+  // dispatched (the 2s poll), yet its promise still resolves — so the check ran
+  // against pre-archive DOM, saw the row still there, and skipped the handoff.
+  // The later render then parked the cursor, and nothing re-fired the one-shot
+  // decision, stranding it with no row highlighted.
+  //
+  // `afterSeq` is what makes this correct rather than merely repeated: only a
+  // render dispatched after the POST resolved can have fetched a list reflecting
+  // the archive, so earlier ones must not be allowed to answer.
+  if (!archived) {
+    pendingAdvances.push({ name: name, neighbour: neighbour, gen: gen, afterSeq: listFetchSeq });
+  }
+  renderRunList(gen);
+}
+
+// Answer any archive hand-offs this render is fresh enough to settle.
+//
+// `stillActive` is the names of runs the server still considers active, taken
+// BEFORE the filter is applied — that, not row visibility, is what says whether
+// an archived run really left. Must still be called after the rows are in the
+// DOM, because choosing the replacement row does ask what is on screen.
+//
+// Not called from the catch path on purpose — a failed fetch leaves the previous
+// list painted, which cannot say whether the row left, so entries wait for a
+// render that can answer.
+function resolvePendingAdvances(seq, stillActive) {
+  if (!pendingAdvances.length) return;
+  pendingAdvances = pendingAdvances.filter(function(p) {
+    // This render's list was fetched before that archive committed, so it cannot
+    // say whether the row left. Keep waiting.
+    if (seq <= p.afterSeq) return true;
+    // "Did it leave" is answered from the DATA, not from whether a row is on
+    // screen. A filter hides rows without their going anywhere, so asking the DOM
+    // handed the cursor away from a run that still exists and would come back
+    // when the filter cleared — and `stillActive` is taken before filtering, so
+    // it cannot be fooled that way. A zombie is still active and keeps the cursor.
+    //
+    // Note this is NOT gated on `p.gen === routeGen`: `route()` bumps routeGen on
+    // every 2s poll, so any archive whose herdr round-trip outlasted one tick
+    // looked like a view change and was dropped un-applied, stranding the cursor.
+    if (navCursorKey === p.name && stillActive.indexOf(p.name) === -1) {
+      // The neighbour was captured before the POST and may itself be gone by now
+      // — archiving the last two rows makes them each other's neighbour, so
+      // following it blindly put the cursor on the other archived row. Re-check
+      // against what is actually on screen, and fall back to the top of the list.
+      navCursorKey = isRowVisible(p.neighbour) ? p.neighbour : firstVisibleKey();
+    }
+    // Survived as a zombie, or the reviewer moved on: either way, answered.
+    return false;
+  });
+}
+
+// The key of the first selectable row, or '' when the list is empty.
+function firstVisibleKey() {
+  var rows = navRows();
+  return rows.length ? rowKey(rows[0]) : '';
+}
+
+// The row adjacent to `run` in the visible list, or '' if there is none. Called
+// BEFORE an action that may remove `run`, since afterwards its neighbours can no
+// longer be identified from it.
+function neighbourKey(run) {
+  var rows = navRows(), i = -1;
+  rows.forEach(function(el, n) { if (i < 0 && rowKey(el) === run) i = n; });
+  if (i < 0) return '';
+  var next = rows[i + 1] || rows[i - 1];
+  return next ? rowKey(next) : '';
+}
+
+// Whether `run` currently has a selectable row. A run folded into the collapsed
+// Completed group is NOT visible by this measure, which is the point: the cursor
+// cannot sit on something the reviewer cannot see.
+function isRowVisible(run) {
+  return navRows().some(function(el) { return rowKey(el) === run; });
+}
+
+// `gen` is REQUIRED, and `route()` must keep bumping `routeGen` before it
+// reassigns `currentRun`. Together those make it impossible for
+// `resolvePendingAdvances` to run while the reviewer is inside a run — which is
+// why it needs no `!currentRun` guard of its own. A call site that omits `gen`,
+// or a reordering of those two lines in `route()`, silently breaks that and lets
+// an archive hand-off move the list cursor under someone reading a run. No test
+// catches it structurally, so it is asserted here.
+async function renderRunList(gen, resetAnchor) {
+  console.assert(gen !== undefined, 'renderRunList needs a gen; see the note above');
   var listEl = document.getElementById('run-list-items');
+  // Claimed before the try so the catch can check it too — a superseded call
+  // must not report failure over a newer call's successful render.
+  var seq = ++listFetchSeq;
   try {
     var r = await fetch('/api/runs');
     var runs = await r.json();
     if (gen !== undefined && gen !== routeGen) return;
+    // `routeGen` only changes when the VIEW does, so it cannot order two list
+    // fetches issued from the same view — and there are several: the 2s poll,
+    // toggleArchive's un-awaited re-render, and closeFilter's. If an older
+    // response lands after a newer one it would otherwise win, rebuilding the
+    // list from a stale snapshot and restoring names to `knownRunNames` that
+    // have since disappeared — which is enough to make a deleted run look merely
+    // hidden and bring the cursor drift back.
+    if (seq !== listFetchSeq) return;
+    // A new filter re-scopes the list, so the old anchor is meaningless — start
+    // at the top of whatever now matches. This is done HERE, past the staleness
+    // guard, so it is atomic with the render that carries the new filter text.
+    //
+    // Resetting in the input handler instead left the two unordered: the reset
+    // was synchronous, the render was not, and an in-flight poll's continuation
+    // could re-anchor to the top of the *unfiltered* list in between. The cursor
+    // then pointed at a run the filter excludes, which — once a filtered-out row
+    // stopped being treated as the reviewer's own doing — parked the cursor and
+    // made Enter open nothing.
+    if (resetAnchor) { navCursor = 0; navCursorKey = ''; }
+    // Recorded BEFORE filtering, so the list stays "which runs exist" rather
+    // than "which runs match the current filter".
+    knownRunNames = runs.map(function(x) { return x.name; });
+    // Pre-filter, for the same reason `knownRunNames` is.
+    var stillActive = runs.filter(function(x) { return !x.complete; })
+                          .map(function(x) { return x.name; });
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
+      resolvePendingAdvances(seq, stillActive);
       applyNavCursor(false);
       return;
     }
@@ -1895,23 +2602,97 @@ async function renderRunList(gen) {
       });
       if (!runs.length) {
         listEl.innerHTML = '<div class="review-empty">No sessions match that filter.</div>';
+        resolvePendingAdvances(seq, stillActive);
         applyNavCursor(false);
         return;
       }
     }
-    listEl.innerHTML = runs.map(function(run) {
-      var meta = escHtml(run.state) + (run.turn ? ' · turn ' + run.turn : '');
-      return '<a class="run-row" href="#/runs/' + encodeURIComponent(run.name) + '">' +
-        '<span class="run-dot state-' + escHtml(run.state) + '"></span>' +
-        '<span class="run-name">' + escHtml(run.name) + '</span>' +
-        '<span class="run-state">' + meta + '</span>' +
-        '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
-      '</a>';
-    }).join('');
+    var active = runs.filter(function(r) { return !r.complete; });
+    var complete = runs.filter(function(r) { return r.complete; });
+
+    // Liveness is unknown (herdr unreachable) for at least one run. Say so: the
+    // grouping silently assumes not-live in that case, so without this the
+    // reviewer would read "Completed" as verified when nothing verified it — and
+    // an archived run whose workspace never actually closed folds away unseen.
+    var unknownLive = runs.some(function(r) { return r.live === null; });
+    // Deliberately does not name a cause. `live: null` means two different things
+    // — herdr could not be reached, or that run's own state.json did not parse so
+    // its workspace id was never read — and the page cannot tell which. Naming
+    // herdr was simply wrong in the second case.
+    var banner = unknownLive
+      ? '<div class="live-unknown">Whether some sessions still have live panes is ' +
+        'unknown &mdash; herdr may be unreachable, or a session\'s own state may be ' +
+        'unreadable. Grouping below assumes not live.</div>'
+      : '';
+
+    var html = banner + active.map(runRow).join('');
+    if (complete.length) {
+      // A filter is an explicit search — honour it over the collapsed default,
+      // or matches would hide inside a closed group with no hint they exist.
+      var rendered = !!(completedOpen || listFilter);
+      html += '<details class="run-group"' + (rendered ? ' open' : '') + '>' +
+        '<summary>Completed (' + complete.length + ')</summary>' +
+        complete.map(runRow).join('') +
+      '</details>';
+    }
+    listEl.innerHTML = html;
+
+    // Delegated once on the container, which survives every innerHTML rebuild —
+    // per-button listeners would be re-attached on each 2s poll.
+    if (!listEl.dataset.archiveBound) {
+      listEl.dataset.archiveBound = '1';
+      listEl.addEventListener('click', function(e) {
+        var btn = e.target.closest ? e.target.closest('.run-archive') : null;
+        if (!btn) return;
+        // The button sits inside the row wrapper, beside the <a>. Stop the event
+        // before it can bubble into a navigation.
+        e.preventDefault();
+        e.stopPropagation();
+        toggleArchive(btn.dataset.run, btn.dataset.archived === '1', btn.dataset.live);
+      });
+    }
+
+    var group = listEl.querySelector('.run-group');
+    if (group) {
+      // The list re-renders every 2s; without this the group would snap shut
+      // under the reviewer mid-read.
+      //
+      // Parsing `<details open>` fires `toggle` on its own, so this listener
+      // hears two very different things through one event. Comparing against the
+      // state we just rendered separates them: equal means the browser is only
+      // echoing our own markup back (every poll tick while expanded, and — worse
+      // — the force-open that `listFilter` applies, which would otherwise write
+      // "keep completed expanded" to localStorage merely because the reviewer
+      // searched for something that matched a finished run). Only a real
+      // divergence is the human's doing, and only that is worth persisting.
+      group.addEventListener('toggle', function() {
+        if (group.open === rendered) return;
+        rendered = group.open;
+        completedOpen = group.open;
+        try { localStorage.setItem('drovr.completedOpen', group.open ? '1' : '0'); } catch (e) {}
+        applyNavCursor(false);
+      });
+    }
+    // Resolve a pending archive hand-off, now that rows reflect a list fetched
+    // after the archive committed. Whichever render gets here first answers it —
+    // this one, the 2s poll, or a filter change — so no ordering can lose it.
+    resolvePendingAdvances(seq, stillActive);
     // Rows were just rebuilt — repaint the cursor onto the new elements. Not
     // scrolled: this also runs on the 2s refresh, which must not yank the page.
     applyNavCursor(false);
   } catch (e) {
+    // Same sequencing rule as the success path, and it matters just as much: a
+    // stale call whose fetch rejects AFTER a newer one already rendered would
+    // otherwise wipe a correct list to "Failed to load sessions". The reviewer
+    // sees a phantom failure — and if an archive was in flight, reads it as that
+    // action having failed.
+    if (seq !== listFetchSeq) return;
+    // The reset lives past the `await` above, so a rejected fetch skips it and
+    // the anchor keeps naming a run the new filter excludes — the cursor then
+    // parks and stays invisible even after a later poll succeeds. Apply it here
+    // too: the reviewer asked for a new scope, and whether the fetch happened to
+    // fail is not their concern.
+    if (resetAnchor) { navCursor = 0; navCursorKey = ''; }
     listEl.innerHTML = '<div class="review-empty">Failed to load sessions.</div>';
     applyNavCursor(false);
   }
@@ -1942,14 +2723,49 @@ function selectPane(pane, name) {
 
 function agentNodeHtml(node) {
   var pane = node.pane_id || '';
-  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (pane && pane === selectedPane ? ' selected' : '');
+  var cls = 'agent-node' + (pane ? '' : ' no-pane') + (node.reaped ? ' reaped' : '')
+    + (pane && pane === selectedPane ? ' selected' : '');
   var angle = node.angle ? ' <span class="agent-angle">· ' + escHtml(node.angle) + '</span>' : '';
+  // The button appears exactly when a click will WORK — `rehydratable` is the
+  // same predicate the CLI and the HTTP handler gate on, so it can never be
+  // offered on a phase that then refuses. `resumable` is a different question
+  // (will the conversation come back, or is this a fresh agent reading the
+  // notes?) and it decides what the button PROMISES, not whether it is there.
+  var rehydrate = node.rehydratable
+    ? '<button class="agent-rehydrate" data-phase="' + escHtml(node.name)
+      + '" title="' + (node.resumable
+          ? 'Rehydrate: resume this phase&#39;s session in a new pane'
+          : 'Rehydrate: no session to resume — launches a fresh agent and re-sends the seed')
+      + '">⟳</button>'
+    : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
   return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
     + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
-    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + rehydrate
     + '</div>' + kids;
+}
+
+// Report what a ⟳ did (or failed to do) under the tree. Cleared on navigation
+// by route(), never by a poll — a note about the rehydrate you just triggered
+// must outlive the 2s re-render that follows it.
+function agentsNote(text, bad) {
+  var el = document.getElementById('agents-note');
+  el.textContent = text || '';
+  el.classList.toggle('bad', !!bad);
+  el.style.display = text ? '' : 'none';
+}
+
+// Every pane id currently in the tree, at any depth.
+function treePanes(nodes) {
+  var out = {};
+  (function walk(list) {
+    (list || []).forEach(function(n) {
+      if (n.pane_id) out[n.pane_id] = true;
+      walk(n.children);
+    });
+  })(nodes);
+  return out;
 }
 
 async function pollAgents(gen) {
@@ -1960,6 +2776,13 @@ async function pollAgents(gen) {
     if (gen !== routeGen) return;
     var el = document.getElementById('agents-tree');
     var nodes = (tree && tree.nodes) || [];
+    // A config drovr could not read means `resumable` was decided by the
+    // built-in backends, not the user's. Say so rather than letting the ⟳
+    // appear or vanish for a reason nothing on screen explains. textContent:
+    // the text carries a parse error verbatim.
+    var cfgErr = document.getElementById('agents-config-error');
+    cfgErr.textContent = (tree && tree.config_error) || '';
+    cfgErr.style.display = cfgErr.textContent ? '' : 'none';
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
       : '<div class="review-empty">No agents spawned yet.</div>';
@@ -1968,6 +2791,58 @@ async function pollAgents(gen) {
       var pane = n.getAttribute('data-pane');
       if (pane) n.onclick = function() { selectPane(pane, n.querySelector('.agent-name').textContent); };
     });
+    el.querySelectorAll('.agent-rehydrate').forEach(function(b) {
+      b.onclick = function(ev) {
+        // The row's own click selects a pane; this row has none, but a future
+        // one might — never let the button double as a row click.
+        ev.stopPropagation();
+        b.disabled = true;
+        var phase = b.getAttribute('data-phase');
+        // A rehydrate that has to re-seed waits for the fresh agent to attach,
+        // which can take tens of seconds. Say so, or a disabled button is
+        // indistinguishable from a wedged one.
+        agentsNote('Rehydrating ' + phase + '…', false);
+        fetch(api('rehydrate') + '?phase=' + encodeURIComponent(phase), { method: 'POST' })
+          .then(function(r) {
+            return r.json().catch(function() { return {}; })
+              .then(function(d) { return { ok: r.ok, status: r.status, body: d }; });
+          })
+          .then(function(res) {
+            // A reseed waits for the fresh agent to attach, which can take ~30s
+            // — long enough for the user to navigate to another run first. The
+            // note element is page-global, so writing to it now would file this
+            // run's outcome under whatever run is on screen. Same `routeGen`
+            // guard every poller in this file uses.
+            if (gen !== routeGen) return;
+            if (!res.ok) {
+              b.disabled = false;
+              agentsNote(res.body.error || ('Rehydrate failed (' + res.status + ')'), true);
+              return;
+            }
+            // `detail` is the CLI's own line, and it is the whole point: it
+            // distinguishes "resumed with its session" from "relaunched, and
+            // the seed was NOT re-sent" — both of which are HTTP 200. The
+            // second is flagged, because a pane that is back but was never told
+            // what it is doing is not a success the user should scroll past.
+            agentsNote(res.body.detail || ('Rehydrated ' + phase),
+                       res.body.complete === false);
+            // Refresh now rather than waiting out the 2s tick, and cancel the
+            // pending one so the two chains don't both keep polling.
+            if (agentsTimer) clearTimeout(agentsTimer);
+            pollAgents(gen);
+          })
+          .catch(function() {
+            if (gen !== routeGen) return;
+            b.disabled = false;
+            agentsNote('Rehydrate request failed — is `drovr serve` still up?', true);
+          });
+      };
+    });
+    // A pane that has left the tree must not stay selected. `?pane=<gone>`
+    // answers 204 on the mirror and 409 on send, which reads as a wedged UI
+    // rather than as a stale selection — and a reaped node is exactly how a
+    // selected pane leaves.
+    if (selectedPane && !treePanes(nodes)[selectedPane]) selectPane(null, '');
   } catch (e) { /* transient; keep polling */ }
   if (gen === routeGen) agentsTimer = setTimeout(function(){ pollAgents(gen); }, 2000);
 }
@@ -2035,8 +2910,8 @@ async function sendKeys(keys) {
 
 // ---- Router ----
 var DETAIL_PANELS = ['summary-banner', 'agents-panel', 'session-panel', 'review-panel',
-  'diff-panel', 'doc-panel', 'waiting-overlay', 'approved-overlay', 'cancelled-overlay',
-  'form-section'];
+  'diff-panel', 'doc-panel', 'unanchored-annots', 'waiting-overlay', 'approved-overlay',
+  'cancelled-overlay', 'form-section'];
 
 async function route() {
   clearTimeout(pollTimer);
@@ -2080,7 +2955,49 @@ async function route() {
   // and its answers could be submitted against THIS run.
   clearQuestions();
   showEl('back-link');
-  showEl('doc-panel');
+  // Everything below is a CROSS-RUN reset, so it is gated on the run actually
+  // changing. `#/runs/<run>?task=<t>` is a supported URL (see reviewTask() and the
+  // router comment above), so back/forward — or opening a task link while already
+  // on that run — re-enters route() with the same run; wiping the form there would
+  // destroy the reviewer's half-typed feedback, which is persisted nowhere.
+  if (h.run !== prevRun) {
+    // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
+    // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
+    // run with no spec never flashes the previously-viewed run's doc — and if
+    // refresh() throws mid-flight the stale spec is already gone rather than left
+    // on screen under this run's name.
+    hideEl('doc-panel');
+    document.getElementById('doc-content').innerHTML = '';
+    currentDocText = '';   // keep it in step with the DOM it describes
+    // The review panel is fetched by refreshReview() behind two awaits, so on a
+    // direct run-to-run jump it would otherwise keep painting the OLD task's
+    // findings and diff under the new run's name until those resolve.
+    hideEl('review-panel');
+    // Annotations must be dropped HERE, synchronously, not just in
+    // loadAnnotations(): that runs after refresh()'s awaits, so between this point
+    // and those fetches resolving, collectAnnotations() still returns the previous
+    // run's line comments while api('submit') already addresses THIS run — and if
+    // refresh() rejects, loadAnnotations() never runs at all and they stay
+    // submittable indefinitely. loadAnnotations() then restores this run's own
+    // in-progress comments from localStorage.
+    annotations = {};
+    // ...and repaint the unanchored list from that now-empty map, in the same
+    // synchronous block. It renders only from refresh(), so on its own it would
+    // keep showing the PREVIOUS run's comment text — verbatim, under this run's
+    // name — until those fetches resolved, and forever if they rejected. Rendering
+    // rather than just hiding keeps one authority over what that panel says.
+    renderUnanchoredPanel();
+    // Same class again, and the worst instance of it: the decision radio and the
+    // feedback box are plain form fields that nothing ever reset, so prose typed
+    // for one run stayed in the box — and the radio stayed on whatever was picked
+    // — after navigating to another. Submitting there wrote one run's decision and
+    // feedback into the OTHER run's feedback.json, which an agent then acts on.
+    // Back to the markup default: request-changes selected, box empty.
+    var rcRadio = document.querySelector('input[name="decision"][value="request-changes"]');
+    if (rcRadio) rcRadio.checked = true;
+    document.getElementById('feedback').value = '';
+    hideEl('form-error');
+  }
   // Agent tree + live session mirror: primary surfaces, polled independently of
   // the gate. Reset the inspected pane to the run's default on each navigation.
   selectedPane = null;
@@ -2088,6 +3005,7 @@ async function route() {
   document.getElementById('session-target').textContent = 'active';
   showEl('agents-panel');
   showEl('session-panel');
+  agentsNote('', false);   // a note belongs to the run it was raised in
   pollAgents(routeGen);
   pollPane(routeGen);
   await refresh();
@@ -2107,6 +3025,19 @@ var listFilter = '';
 // and Enter would open a session the reviewer never pointed at. Empty on the
 // detail view, where questions have a fixed order.
 var navCursorKey = '';
+// Every run name the last list fetch returned, before filtering. This is what
+// separates "the anchored row is hidden" from "the anchored run is gone" — see
+// applyNavCursor, which needs the reason, not the duration.
+// Rows the reviewer archived, each waiting on a render fresh enough to say
+// whether it actually left the list. `{name, neighbour, gen, afterSeq}` — see
+// toggleArchive. A LIST, not one slot: archiving a second row before the first
+// repaints is two ordinary clicks, and a single slot silently discarded the
+// first row's hand-off, stranding the cursor on it exactly as the one-shot
+// version did.
+var pendingAdvances = [];
+var knownRunNames = [];
+// Monotonic id for list fetches, so a slow response cannot overwrite a newer one.
+var listFetchSeq = 0;
 
 // Rows the cursor moves over, chosen by view. Detail view has no run rows, and
 // the list view has no questions, so one of these is always empty. On the detail
@@ -2114,8 +3045,14 @@ var navCursorKey = '';
 // QUESTION_ITEM_SEL so the two can never disagree about what a question is.
 var QUESTION_ITEM_SEL = '#questions-area .question-item';
 
+// Rows inside a COLLAPSED "Completed" group are deliberately excluded: they are
+// not on screen, and j/k must never park the cursor somewhere invisible. The two
+// selectors are in document order, so active rows still precede completed ones.
+var RUN_ROW_SEL = '#run-list-items > .run-row-wrap > .run-row, ' +
+                  '#run-list-items details[open] .run-row-wrap > .run-row';
+
 function navRows() {
-  var sel = currentRun ? QUESTION_ITEM_SEL : '#run-list-items .run-row';
+  var sel = currentRun ? QUESTION_ITEM_SEL : RUN_ROW_SEL;
   return Array.prototype.slice.call(document.querySelectorAll(sel));
 }
 
@@ -2134,15 +3071,77 @@ function rowKey(el) {
 // and is clamped because a shrinking list can leave it past the end.
 function applyNavCursor(scroll) {
   var rows = navRows();
-  if (!rows.length) { navCursor = 0; navCursorKey = ''; renderKeyhint(); announceCursor(null); return; }
+  // Zero rows does NOT by itself mean the anchored run is gone. The commonest way
+  // to land here is a failed `/api/runs` fetch, which replaces the list with
+  // "Failed to load sessions" — a server hiccup, not a deletion. Clearing the key
+  // unconditionally discarded the selection before any hidden-vs-gone reasoning
+  // could run, so the cursor never returned after a recovery poll.
+  //
+  // The same `knownRunNames` question applies here as below, so ask it rather
+  // than assume: the failure path leaves that list untouched (so the anchor is
+  // held), while a successful fetch returning no runs at all empties it (so the
+  // anchor is released). Both branches then agree on what "gone" means.
+  if (!rows.length) {
+    navCursor = 0;
+    if (!currentRun && navCursorKey && knownRunNames.indexOf(navCursorKey) === -1) {
+      navCursorKey = '';
+    }
+    renderKeyhint();
+    announceCursor(null);
+    return;
+  }
+  var anchorMissing = false;
   if (!currentRun && navCursorKey) {
     var found = -1;
     rows.forEach(function(el, i) { if (found < 0 && rowKey(el) === navCursorKey) found = i; });
     if (found >= 0) navCursor = found;
+    else anchorMissing = true;
   }
   if (navCursor >= rows.length) navCursor = rows.length - 1;
   if (navCursor < 0) navCursor = 0;
-  if (!currentRun) navCursorKey = rowKey(rows[navCursor]);
+  // When the anchored row is not on screen, what matters is WHY — not how long
+  // it has been away. Both of the obvious rules are wrong, in opposite ways:
+  //
+  // * Re-anchor immediately, and a row that is merely hidden (collapsed into the
+  //   Completed group, folded away by a liveness flap) hands the cursor to
+  //   whatever slid into its index, permanently — a later `a`/Enter acts on a
+  //   session nobody selected.
+  // * Never re-anchor, and a run that is genuinely gone leaves the key naming
+  //   nothing while the numeric index repaints the cursor onto whichever row now
+  //   occupies that slot, so the highlight wanders on its own after every
+  //   re-sort.
+  //
+  // A timeout split the difference and got both halves wrong: it is not a
+  // duration question. `knownRunNames` answers it directly — still in the
+  // server's list means hidden, so hold the anchor and restore the selection
+  // when the row returns; absent from it means gone, so re-anchor at once and
+  // never drift. It also cannot be skewed by how many times this runs per poll,
+  // which the previous counter very much was.
+  var gone = anchorMissing && knownRunNames.indexOf(navCursorKey) === -1;
+  // "Hidden" splits by whether the reviewer did the hiding — but that question is
+  // answered where the hiding happens, not here. Typing in the filter box resets
+  // the anchor on every keystroke, and archiving a row calls `advanceCursorPast`;
+  // both have already moved the cursor by the time this runs.
+  //
+  // So do NOT ask "is a filter active" here. The filtered set is recomputed on
+  // every 2s poll, and a run's `state` changes server-side constantly — when the
+  // selected run's new state stops matching the filter text, its row leaves with
+  // no user action at all. Treating that as the reviewer's doing handed the cursor
+  // to whatever slid into the slot: the same wrong-run archive, different trigger.
+  // Anything still in `knownRunNames` is merely hidden, so park it.
+  var parked = anchorMissing && !gone;
+  if (!currentRun && !parked) navCursorKey = rowKey(rows[navCursor]);
+  // Holding the KEY is only half of parking. The numeric index still points at
+  // whatever row now occupies that slot, and it — not the key — is what paints
+  // `.nav-cursor` and what `a`/Enter resolve through. Leaving it set showed a
+  // selection on a row the reviewer never chose, and `a` archived that row: a
+  // destructive action on the wrong session.
+  //
+  // A parked cursor simply has no position. -1 matches no index, so nothing
+  // paints and `navRows()[navCursor]` is undefined, which every action handler
+  // already treats as "no row". `moveCursor` brings it back (both j and k clamp
+  // -1 to row 0) and re-anchors the key there.
+  if (!currentRun && parked) navCursor = -1;
   rows.forEach(function(el, i) {
     var on = i === navCursor;
     el.classList.toggle('nav-cursor', on);
@@ -2150,9 +3149,9 @@ function applyNavCursor(scroll) {
     // class is purely visual, and we deliberately do not move DOM focus here.
     if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
   });
-  if (scroll) rows[navCursor].scrollIntoView({ block: 'nearest' });
+  if (scroll && rows[navCursor]) rows[navCursor].scrollIntoView({ block: 'nearest' });
   renderKeyhint();
-  announceCursor(rows[navCursor]);
+  announceCursor(rows[navCursor] || null);
 }
 
 // Mirrors the cursor into a polite live region. Without this the cursor is
@@ -2318,14 +3317,11 @@ function initKeyNav() {
   var fin = document.getElementById('nav-filter-input');
   fin.addEventListener('input', function() {
     listFilter = fin.value.trim().toLowerCase();
-    // A new filter re-scopes the list, so the old anchor is meaningless — start
-    // at the top of whatever now matches.
-    navCursor = 0;
-    navCursorKey = '';
-    // Same generation re-check as closeFilter: a keystroke's fetch can still be
-    // in flight when the reviewer presses Enter to open the highlighted run.
+    // The anchor reset lives inside renderRunList (past its staleness guard) so
+    // it is ordered with the render carrying this filter text — see the comment
+    // there. Doing it here left the two unordered and lost the reset.
     var gen = routeGen;
-    renderRunList(gen).then(function(){ if (gen === routeGen) applyNavCursor(false); });
+    renderRunList(gen, true).then(function(){ if (gen === routeGen) applyNavCursor(false); });
   });
   // Every branch here calls stopPropagation: they all blur the input, so without
   // it the event still reaches the document listener, `inTextEntry` now reads
@@ -2350,6 +3346,24 @@ function initKeyNav() {
   // Clicking a row or a question adopts it as the cursor.
   document.addEventListener('click', syncCursorToClick, true);
 
+  // A spec's own `[text](#heading)` link must scroll, not route. Delegated so it
+  // covers every re-render of the doc panel, and capture-phase + preventDefault so
+  // the fragment never reaches location.hash — the router would read it as a run
+  // change and tear the form down, losing typed feedback and unsaved comments.
+  document.addEventListener('click', function(e) {
+    var a = e.target && e.target.closest ? e.target.closest('#doc-content a') : null;
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    if (href && href.charAt(0) !== '#') return; // external links keep their new tab
+    // Everything else stays in this tab. `[t]()` renders href="", which resolves to
+    // the current document and navigates for real — same state loss as a fragment,
+    // just a stranger-looking link. Modifier and middle clicks are intercepted too:
+    // a new tab would open the SPA at a bare fragment, which routes to the session
+    // list rather than the spec, so honouring them would hand over a broken view.
+    e.preventDefault();
+    if (href) scrollSpecFragment(href);
+  }, true);
+
   document.addEventListener('keydown', function(e) {
     // Never steal a browser/OS shortcut. Ctrl and Meta chords we claim are
     // matched explicitly below; anything else with Meta is left alone.
@@ -2366,6 +3380,17 @@ function initKeyNav() {
     }
 
     if (inTextEntry(document.activeElement)) return;
+
+    // A focused <summary> owns its own activation keys. Without this, Enter on
+    // the "Completed" disclosure would be preventDefault()ed out of toggling the
+    // group and would instead open whatever run the (invisible, elsewhere) nav
+    // cursor sat on — a keyboard user activating one control and landing in an
+    // unrelated session. Space is listed for the same reason: it is the other
+    // native activation key for a disclosure.
+    if (document.activeElement && document.activeElement.tagName === 'SUMMARY'
+        && (e.key === 'Enter' || e.key === ' ')) {
+      return;
+    }
 
     // Emacs paging: C-v / M-v. Kept above the plain-key switch because they
     // apply in both views and while the help overlay is up.
@@ -2402,6 +3427,16 @@ function initKeyNav() {
         // Back out of a run to the session list. On the list itself there is
         // nowhere further back, so this is a no-op rather than a history pop.
         if (currentRun) { e.preventDefault(); location.hash = '#/'; }
+        break;
+      case 'a':
+        // List view only — on a run's detail view 'a' has no row to act on.
+        if (!currentRun) {
+          e.preventDefault();
+          var row = navRows()[navCursor];
+          var ab = row && row.parentElement
+            ? row.parentElement.querySelector('.run-archive') : null;
+          if (ab) toggleArchive(ab.dataset.run, ab.dataset.archived === '1', ab.dataset.live);
+        }
         break;
       case 'i':                    e.preventDefault(); focusCustomAnswer(); break;
       case '/':                    e.preventDefault(); openFilter(); break;

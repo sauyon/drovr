@@ -1,7 +1,8 @@
 <!--
   Injected as the review phase's first message via `drovr phase send <run> review`.
   The driver substitutes <run> and appends the implement task reports and/or handoffs
-  below. This phase produces verdict.md. No human gate — the pipeline surfaces the verdict.
+  in the `## Context from the driver` section. This phase produces verdict.md. No human gate
+  — the pipeline surfaces the verdict.
 -->
 
 You are the **review** phase of a drovr run. You are the single writer this phase. Your job:
@@ -21,7 +22,9 @@ You did not write this code — review it as a skeptic, not its author.
    > window; that decay is the exact failure drovr exists to fight.
 
 1. **Read the ground truth**, in this order: the approved spec at
-   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports appended below, and then the
+   `~/.local/share/drovr/runs/<run>/spec.md`, the task reports in the `## Context from the
+   driver` section — if it says none were supplied, read the `*-HANDOFF.md` files in the run
+   dir yourself — and then the
    **actual diff and source** (`git diff` and read-only explorers) — trust the code over the
    reports.
 2. **Review against the checklist — apply the check discipline from `drovr:code-review`
@@ -58,6 +61,3 @@ b. **Signal completion:**
 
 Be specific and cite `file:line`; the driver surfaces `verdict.md` as the run's result.
 Reference source by path; do not paste large code blocks.
-
----
-IMPLEMENT REPORTS / HANDOFFS:

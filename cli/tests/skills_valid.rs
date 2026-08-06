@@ -1825,6 +1825,13 @@ enum Tag {
 /// fifth spelling of the measured set, and collapsing the previous four is what
 /// took a macro. Here a new measured skill cannot be added without a cap, and a
 /// cap cannot be written for a skill that does not exist.
+///
+/// **These caps supersede the single `const BODY_BUDGET` main carried**, which was
+/// re-baselined 2200 → 2600 → 3200 as `code-review` grew and each time came within a
+/// dozen bytes of deciding the content rather than bounding it. That is the failure the
+/// per-skill table removes: one number over a derived subset had to move every time any
+/// one skill did. The re-baselines are subsumed, not dropped — 3200 is well under the
+/// 12_000 the four discipline skills carry here, so nothing main capped is now uncapped.
 macro_rules! skill_names {
     ($($variant:ident => $wire:literal @ $budget:literal,)+) => {
         /// `Deserialize` is derived from the same table as the variants, so a

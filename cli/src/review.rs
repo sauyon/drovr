@@ -16,7 +16,14 @@
 //! The server binds a fixed port (default 8791) and writes two global files in
 //! the drovr data dir:
 //!   * `server.addr` — the bound `host:port`
-//!   * `server.pid`  — the daemon pid
+//!   * `server.pid`  — the daemon pid, and the file the single-server lock is on
+//!
+//! Exactly one server may serve a data dir: [`serve`] takes an exclusive lock on
+//! `server.pid` for its lifetime ([`acquire_pid_lock`]) and a second invocation
+//! refuses instead of starting, since two servers would fight over these two files
+//! and each hold half the drivers. The lock is the whole test: a server that holds
+//! no lock — one from a build predating it, or one whose lock file was deleted
+//! underneath it — is not detected.
 //!
 //! [`ensure_server`] reads `server.addr`; if it is missing or nothing is
 //! listening, it spawns `drovr serve` as a detached background daemon and waits
@@ -31,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -201,14 +209,31 @@ impl RunPaths {
 struct Ctx {
     runs_root: PathBuf,
     cells: Mutex<HashMap<String, Arc<Mutex<ReviewState>>>>,
+    /// `host:port` values this server will answer state-changing requests for.
+    /// Empty means "reject every write" — fail closed, so a construction path
+    /// that forgets to populate it cannot silently disable the guard.
+    allowed_hosts: Vec<String>,
+    /// Set when bound to a wildcard address (`0.0.0.0`/`::`), where the reachable
+    /// addresses cannot be enumerated ahead of time. Then any `Host` that is an
+    /// IP *literal* on this port is accepted. That keeps a LAN/Tailscale reviewer
+    /// working while still defeating rebinding, which fundamentally needs a DNS
+    /// *name* — `evil.example:8791` is not an IP literal and stays refused.
+    wildcard_port: Option<u16>,
 }
 
 impl Ctx {
-    fn new(runs_root: PathBuf) -> Self {
+    fn new(runs_root: PathBuf, allowed_hosts: Vec<String>) -> Self {
         Ctx {
             runs_root,
             cells: Mutex::new(HashMap::new()),
+            allowed_hosts,
+            wildcard_port: None,
         }
+    }
+
+    fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
+        self.wildcard_port = port;
+        self
     }
 
     fn paths(&self, run: &str) -> RunPaths {
@@ -339,7 +364,11 @@ fn safe_component(s: &str) -> bool {
 /// A recorded base is a bare git object id (hex, ≤64 chars for SHA-256). Reject
 /// anything else so it can never be interpreted as a git rev-arg or flag when
 /// interpolated into `git diff <base>..HEAD`.
-fn safe_sha(sha: &str) -> bool {
+///
+/// `pub(crate)` because the review panel interpolates the SAME recorded file into the
+/// same shape of git command (`code_review::base_sha`) and must not grow a second,
+/// drifting opinion about what a base may contain. One validator, both call sites.
+pub(crate) fn safe_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -369,10 +398,143 @@ fn parse_run_path(path: &str) -> Option<(&str, &str)> {
     })
 }
 
+/// Read a request header case-insensitively.
+fn header_of(req: &Request, name: &'static str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// Whether a state-changing request may proceed.
+///
+/// Two checks, and the FIRST is the load-bearing one:
+///
+/// 1. **`Host` must be an address this server actually serves.** Comparing
+///    `Origin` against `Host` alone is not enough, because a browser derives both
+///    from the same URL the page was loaded from — so they agree by construction
+///    even when that URL is the attacker's. That is DNS rebinding: a page served
+///    from `evil.example:8791` whose DNS is then re-pointed at `127.0.0.1` sends
+///    `Origin: http://evil.example:8791` and `Host: evil.example:8791`, matching
+///    each other perfectly while the connection lands here. Checking `Host`
+///    against the addresses we bound breaks that: the forged name is not one of
+///    them. This matters most for `/send` and `/keys`, which type into a live
+///    agent's pane — remote command injection, not a flag flip.
+/// 2. **A present `Origin` must be same-origin.** Catches the ordinary
+///    cross-origin POST. The opaque `null` (sandboxed iframe, `file://` page)
+///    fails this: it can never legitimately be this server.
+///
+/// A missing `Origin` is not a browser cross-origin write at all — curl and
+/// drovr's own CLI send none — so check 1 alone governs those.
+fn write_allowed(req: &Request, allowed_hosts: &[String], wildcard_port: Option<u16>) -> bool {
+    let Some(host) = header_of(req, "Host") else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    if !allowed_hosts.iter().any(|h| h == &host) && !wildcard_ip_host(&host, wildcard_port) {
+        return false;
+    }
+    match header_of(req, "Origin") {
+        None => true,
+        // Lowercased on both sides: `host` was normalised above, so comparing a
+        // raw origin against it would reject on nothing but casing. Bound to a
+        // local rather than chained, so nothing borrows from a temporary.
+        Some(origin) => {
+            let origin = origin.to_ascii_lowercase();
+            origin.split("://").nth(1) == Some(host.as_str())
+        }
+    }
+}
+
+/// Whether `host` is an IP literal on the wildcard bind's port.
+///
+/// Only reachable when the server bound `0.0.0.0`/`::`, where the set of
+/// addresses a reviewer might legitimately use is not knowable up front. An IP
+/// literal is safe to accept because DNS rebinding needs a *name*: the attacker
+/// controls `evil.example`'s resolution, not the literal `192.168.1.5`, and a
+/// page served from a bare IP has no rebinding lever at all.
+fn wildcard_ip_host(host: &str, wildcard_port: Option<u16>) -> bool {
+    let Some(port) = wildcard_port else {
+        return false;
+    };
+    let Some((h, p)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if p.parse::<u16>() != Ok(port) {
+        return false;
+    }
+    h.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Whether `host` names a wildcard bind ("listen on every interface").
+///
+/// Parsed rather than string-matched: `serve_host` is a free-form String with
+/// only a non-empty check (`cli/src/config.rs`), so a user can legitimately write
+/// `::0`, `[::0]` or `0:0:0:0:0:0:0:0`. A spelling this misses is not a security
+/// hole — it fails closed — but it is a silent lockout: the page loads and every
+/// button 403s, which is a miserable thing to debug.
+fn is_wildcard_host(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// The `host:port` values a server bound to `host:port` legitimately answers to.
+/// Loopback aliases are included because the reviewer may reach the UI by any of
+/// them; a forged name is excluded precisely because it is not in this list.
+fn allowed_hosts_for(host: &str, port: u16) -> Vec<String> {
+    // Bracket a bare IPv6 literal: browsers send `Host: [::1]:8791`, never `::1:8791`.
+    let display = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut out = vec![format!("{display}:{port}").to_ascii_lowercase()];
+    // Parsed, not string-matched, for the same reason as `is_wildcard_host`:
+    // `serve_host` is free-form, so `::1`, `[::1]` and `0:0:0:0:0:0:0:1` are all
+    // spellings of loopback a user could reasonably write.
+    let parsed = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>();
+    let loopback_ish = host.eq_ignore_ascii_case("localhost")
+        || parsed.is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if loopback_ish {
+        for alias in ["127.0.0.1", "localhost", "[::1]"] {
+            let candidate = format!("{alias}:{port}").to_ascii_lowercase();
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
 fn handle(req: Request, ctx: &Arc<Ctx>) {
     let method = req.method().clone();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+
+    // Cross-origin writes are refused. This server has no authentication, so
+    // without it any page the user happens to visit while it is running can POST
+    // here from their browser: `fetch(url, {mode:'no-cors', ...})` sends a simple
+    // request with no preflight, and CORS only stops the attacker READING the
+    // reply — the side effect has already happened. That now includes closing a
+    // herdr workspace and killing a live agent's panes (`/archive`), typing into
+    // a live pane (`/send`), and approving a spec (`/submit`).
+    //
+    // Checking `Origin` is enough and costs nothing: browsers always attach it to
+    // a cross-origin request and cannot be talked out of it from script, while
+    // curl and drovr's own CLI send no `Origin` at all and are unaffected.
+    if method == Method::Post && !write_allowed(&req, &ctx.allowed_hosts, ctx.wildcard_port) {
+        eprintln!("drovr: refused an untrusted POST to {path}");
+        respond_str(req, 403, "text/plain", "untrusted write refused".into());
+        return;
+    }
 
     // GET / — serve embedded index.html (the SPA: list view + run detail)
     if method == Method::Get && path == "/" {
@@ -423,7 +585,9 @@ fn handle(req: Request, ctx: &Arc<Ctx>) {
 
     // GET /api/runs — the session list view.
     if method == Method::Get && path == "/api/runs" {
-        respond_str(req, 200, "application/json", list_runs_json(ctx));
+        // One herdr call answers liveness for every row (see `workspace_list`).
+        let live = crate::herdr::SystemHerdr::new().workspace_list();
+        respond_str(req, 200, "application/json", list_runs_json(ctx, live.as_deref()));
         return;
     }
 
@@ -477,6 +641,14 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
             _ => respond_empty(req, 204),
         },
 
+        // POST archive — file a run away (or restore it). Body: {"archived":bool}.
+        //
+        // Archiving is the browser's equivalent of `drovr cleanup`: it closes the
+        // run's herdr workspace and sets the flag. Restoring only clears the flag
+        // — closed panes cannot be reopened, and the run resumes via
+        // `drovr phase start` with a fresh agent seeded from its handoff.
+        (Method::Post, "archive") => handle_archive(req, ctx, run),
+
         // GET summary — raw summary.txt (or empty string)
         (Method::Get, "summary") => {
             let text = fs::read_to_string(p.summary()).unwrap_or_default();
@@ -523,6 +695,9 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         // browser can answer numbered/arrow menus that `send` cannot drive.
         (Method::Post, "keys") => handle_post_keys(req, &p, url),
 
+        // POST rehydrate?phase=<name> — bring back a phase whose pane is gone.
+        (Method::Post, "rehydrate") => handle_post_rehydrate(req, &p, run, url),
+
         _ => respond_404(req),
     }
 }
@@ -531,42 +706,72 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 // Live session mirror (herdr read / prompt)
 // ---------------------------------------------------------------------------
 
-/// The pane that is this run's live agent session: the first phase still
-/// `Running` (with a pane), else the workspace root pane. `None` when the run
-/// has no live pane to mirror.
+/// The pane this run's live mirror follows — [`RunState::live_agent_pane`], the
+/// same answer `drovr attach` gets. `None` when the run has no live agent pane,
+/// which the endpoints render as 204 / "no live pane".
+///
+/// **Neither the workspace root pane nor an earlier phase's pane is a
+/// fallback.** The root pane once was, but only reachably so before the first
+/// `phase start`, because that phase then claimed it; phases now leave the idle
+/// shell alone for the whole run, so falling back would point the mirror at an
+/// `sh` prompt and present it as the run's agent. The earlier-phase fallback is
+/// refused for the reason spelled out on `live_agent_pane`. An empty mirror is
+/// honest; a stale one is not.
 fn active_pane(run: &RunState) -> Option<String> {
-    run.phases
-        .iter()
-        .find(|ph| ph.status == crate::run::PhaseStatus::Running && ph.pane_id.is_some())
-        .and_then(|ph| ph.pane_id.clone())
-        .or_else(|| run.root_pane.clone())
+    run.live_agent_pane().map(|(_, pane)| pane.to_owned())
 }
 
-/// Every pane id that belongs to `run` (phases, review panels, root pane). The
-/// allow-list that gates `?pane=<id>` so a run-scoped endpoint can never be used
-/// to read or write an arbitrary herdr pane outside the run.
-fn run_pane_ids(run: &RunState) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    for ph in run.phases.iter().chain(run.review_phases.iter()) {
-        if let Some(pane) = &ph.pane_id {
-            set.insert(pane.clone());
-        }
-    }
+/// What a request wants to do with the pane it names, which decides which
+/// allow-list gates it — see [`run_writable_panes`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Every pane a run-scoped endpoint may READ: each phase pane, each reviewer
+/// pane, and the workspace's idle root shell. The allow-list that stops
+/// `?pane=<id>` from being used to reach an arbitrary herdr pane outside the run.
+fn run_readable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = run_writable_panes(run);
     if let Some(root) = &run.root_pane {
         set.insert(root.clone());
     }
     set
 }
 
-/// Resolve which pane a `/pane` or `/send` request targets. An explicit
-/// `?pane=<id>` is honored only when it belongs to `run` (else `None`); with no
-/// param, falls back to the run's [`active_pane`].
-fn resolve_pane(run: &RunState, url: &str) -> Option<String> {
+/// Every pane a run-scoped endpoint may WRITE (`/send`, `/keys`): the agent
+/// panes only — the root shell is excluded.
+///
+/// **This is not a privilege boundary.** Typing into a live claude pane is
+/// arbitrary code execution by design, so the unauthenticated server's reach is
+/// exactly what it was. It is a footgun guard: the root shell is a bare `sh`
+/// that now stays alive for the whole run, so a `/send` resolving there would
+/// execute the user's *prose* as a shell command instead of prompting an agent.
+fn run_writable_panes(run: &RunState) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for ph in run.phases.iter().chain(run.review_phases.iter()) {
+        if let Some(pane) = ph.pane_id() {
+            set.insert(pane.to_owned());
+        }
+    }
+    set
+}
+
+/// Resolve which pane a `/pane`, `/send` or `/keys` request targets. An explicit
+/// `?pane=<id>` is honored only when it belongs to `run` under `access` (else
+/// `None`); with no param, falls back to the run's [`active_pane`], which never
+/// yields the root shell and so needs no further gating.
+fn resolve_pane(run: &RunState, url: &str, access: Access) -> Option<String> {
     match query_param(url, "pane") {
         // Pane ids contain a `:` (`w16:p3`), which the browser's
         // `encodeURIComponent` sends as `%3A` — decode before matching, or the
         // allow-list never hits and every explicitly-selected pane 409s.
-        Some(requested) => run_pane_ids(run).take(&percent_decode(&requested)),
+        Some(requested) => match access {
+            Access::Read => run_readable_panes(run),
+            Access::Write => run_writable_panes(run),
+        }
+        .take(&percent_decode(&requested)),
         None => active_pane(run),
     }
 }
@@ -605,7 +810,8 @@ fn percent_decode(s: &str) -> String {
 /// `GET /api/runs/<run>/pane[?pane=<id>]` — the recent transcript of a run
 /// agent's session, as plain text (204 when there is no such live pane).
 fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Read))
+    else {
         respond_empty(req, 204);
         return;
     };
@@ -621,9 +827,114 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 
 /// `POST /api/runs/<run>/send[?pane=<id>]` — type the request body into a run
 /// agent's pane (herdr submits it). 409 when there is no such live pane.
+/// `POST /api/runs/<run>/archive` — body `{"archived":true|false}`.
+///
+/// The browser-side twin of `drovr cleanup`, minus the worktree pruning: that
+/// path can squash-commit and delete branches, which is not something a button
+/// should do without a git-aware conversation. Panes and the flag are enough to
+/// get a dead run out of the way; `drovr cleanup --purge` remains the way to
+/// reclaim the worktree.
+///
+/// Restore clears the flag, puts the row back in the active list, and the run is
+/// runnable again: archiving destroys the workspace, but `phase::ensure_workspace`
+/// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
+/// records the new ids. What it cannot restore is the *agents* — every pane died
+/// with the workspace, so a phase that was `Running` when it was archived comes
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
+/// archived run does not make it runnable again — FIXED 2026-08-02".
+/// Close `state`'s herdr workspace when archiving; report whether it closed.
+///
+/// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
+/// half — the part that kills panes — can be driven by `FakeHerdr` in a test.
+/// The handler itself is bound to `Request`/`SystemHerdr` and cannot be.
+///
+/// Restoring never touches herdr: closed panes cannot be reopened, so a restore
+/// is purely a flag change.
+fn close_for_archive<H: Herdr>(h: &H, state: &RunState, archived: bool) -> bool {
+    if !archived {
+        return false;
+    }
+    let Some(ws) = state.workspace.as_deref() else {
+        return false;
+    };
+    // The SAME teardown `drovr cleanup` performs — deliberately, not incidentally.
+    // This used to call `workspace_close` outright, which killed every pane in the
+    // workspace including the shell or editor the reviewer had open in it. Cleanup
+    // was hardened against exactly that; the button is one click and must not be
+    // the careless path to the same destruction.
+    //
+    // A `false` return now means "the workspace is still standing", which covers
+    // both a failed close and one deliberately withheld because the human's panes
+    // are in there. Both deserve the page's warning: in each case the run may
+    // still have something live attached to it.
+    crate::close_run_panes(state, ws, h)
+}
+
+fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
+    let body = read_body(&mut req);
+    let want = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("archived").and_then(|a| a.as_bool()));
+    let Some(archived) = want else {
+        respond_str(req, 400, "text/plain", "body must be {\"archived\":bool}".into());
+        return;
+    };
+
+    let dir = ctx.runs_root.join(run);
+    let Some(state) = load_run_state(&dir) else {
+        // "Not there" and "there but unreadable" are different answers, and the
+        // reviewer can tell them apart: `list_runs_in` lists any run whose
+        // state.json merely EXISTS, so an unparseable one is visible on the page
+        // with a working-looking Archive button. Answering 404 to a click on a row
+        // they can plainly see reads as a bug in the page.
+        let (code, msg): (u16, &str) = if dir.join("state.json").is_file() {
+            (409, "run state is unreadable; fix or remove its state.json")
+        } else {
+            (404, "no such run")
+        };
+        respond_str(req, code, "text/plain", msg.into());
+        return;
+    };
+
+    // Close the workspace BEFORE flipping the flag, and only when archiving. If
+    // the close fails for a reason other than "already gone" we still archive:
+    // the flag is about how the run is filed, and refusing to file it would
+    // leave the reviewer with a row they cannot clear from the browser.
+    let workspace_closed = close_for_archive(&crate::herdr::SystemHerdr::new(), &state, archived);
+
+    // Re-read before writing. `save_in` rewrites the WHOLE file, and the close
+    // above is a blocking round-trip to the herdr daemon — a phase agent can
+    // land its own `state.json` write during it (recording a phase as Done, say),
+    // which writing back the copy loaded above would silently revert. This server
+    // is multi-threaded and this endpoint is a button a human can hit mid-phase,
+    // so the window is far more reachable than the equivalent one in
+    // `cmd_cleanup`. Re-reading narrows it to this function's own last two
+    // statements; closing it completely needs locking in `RunState::save`
+    // (docs/known-issues.md).
+    let mut state = load_run_state(&dir).unwrap_or(state);
+    state.archived = archived;
+    if let Err(e) = state.save_in(&dir) {
+        eprintln!("drovr archive: could not save run '{run}': {e}");
+        respond_str(req, 500, "text/plain", "could not save run state".into());
+        return;
+    }
+    respond_str(
+        req,
+        200,
+        "application/json",
+        serde_json::json!({
+            "ok": true,
+            "archived": archived,
+            "workspace_closed": workspace_closed,
+        })
+        .to_string(),
+    );
+}
+
 fn handle_post_send(mut req: Request, p: &RunPaths, url: &str) {
     let text = read_body(&mut req);
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -686,7 +997,8 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
             return;
         }
     };
-    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url)) else {
+    let Some(pane) = load_run_state(&p.dir).and_then(|run| resolve_pane(&run, url, Access::Write))
+    else {
         respond_str(req, 409, "text/plain", "no live pane for this run".into());
         return;
     };
@@ -700,13 +1012,238 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
     }
 }
 
+/// `POST /api/runs/<run>/rehydrate?phase=<name>` — bring back a phase whose
+/// pane is gone, resuming its recorded session where the backend supports it.
+///
+/// **Shells out to `current_exe()`**, exactly as [`handle_post_new_run`] does,
+/// so the CLI stays the sole writer of `state.json`. The server is a long-lived
+/// daemon holding no run state; a second writer here would race the driver's own
+/// `phase start` / `phase wait` for a whole-file save.
+///
+/// Three refusals, all BEFORE the shell-out:
+///
+/// * **400** — no `?phase=`, or a name that is not a safe filename component.
+/// * **404** — a phase this run does not have. [`safe_component`] permits `:`
+///   (reviewer names need it) and is a path check, **not an authorization
+///   one** — and `phase_start` appends any name it is handed. Without the
+///   membership test an unauthenticated caller could invent phases.
+/// * **409** — the phase is not in a state to be brought back: it still holds a
+///   pane, it has never run (`drovr new` pre-seeds `Pending` placeholders, and
+///   starting one is `phase start`'s job), it never got an agent, or it is a
+///   reviewer. Every one of them is [`RunState::rehydratable`], read from the
+///   same `state.json` the CLI reads, so the status code and the CLI's refusal
+///   cannot disagree.
+///
+/// And one non-refusal worth its own line:
+///
+/// * **200 with `complete: false`** — child exit 2. The pane IS back, but the
+///   agent in it was not confirmed to have the phase's context. Neither a 500
+///   (which would claim nothing happened) nor a plain `ok: true` (which would
+///   let a caller checking only the status treat it as fully recovered).
+///
+/// # ⚠️ This endpoint is unauthenticated and it starts agent processes
+///
+/// Recorded here because it is a real question with a considered answer, not
+/// an oversight — and because the next person to read this handler will ask it.
+///
+/// **It is not a new capability class.** This server is unauthenticated by
+/// design and already offers arbitrary code execution: `POST /send` types into
+/// a live claude pane, and a claude pane runs bash. Nothing here widens what a
+/// caller who can reach the port may do.
+///
+/// **What it does add is process creation** — talking to an existing agent
+/// versus starting a new one — so the question is resource consumption, and
+/// the answer is that it is bounded by the run's own shape rather than by the
+/// caller's persistence:
+///
+/// 1. A caller cannot invent a target. Rehydrate NEVER appends a phase (unlike
+///    `phase_start`), so the 404 above confines it to phases already in
+///    `state.json`, and the `NeverStarted` / `NoAgentEverRan` refusals confine
+///    it further to phases that have actually run.
+/// 2. A caller cannot multiply agents on one phase. `HoldsPane` refuses a phase
+///    that already has a pane, and a successful rehydrate records one — so the
+///    ceiling is one live agent per already-run phase, which is exactly the
+///    steady state the run has when nothing is reaped.
+/// 3. A flood cannot beat the check. `phase_rehydrate` takes an exclusive
+///    per-run lock and re-reads `state.json` under it, so concurrent requests
+///    serialize and every one after the first sees the pane the first recorded.
+///
+/// **The residual cost, accepted:** each request can occupy one server worker
+/// for up to `SEND_READY_TIMEOUT` (30s) while the agent comes up, and a caller
+/// may restart a reaped phase's agent once. The first is the same slow-handler
+/// exposure `GET /pane` has against a slow herdr; the second is one process for
+/// a phase that is supposed to have one. Neither justifies inventing an auth
+/// scheme for a server whose front door is already open by design — and a
+/// half-measure here would read as protection this endpoint does not have.
+/// `serve_host` defaults to `127.0.0.1`, which is the actual boundary.
+fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
+    let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
+        respond_str(req, 400, "text/plain", "missing phase".into());
+        return;
+    };
+    let phase = percent_decode(&phase);
+    if !safe_component(&phase) {
+        respond_str(req, 400, "text/plain", "invalid phase".into());
+        return;
+    }
+    let Some(state) = load_run_state(&p.dir) else {
+        respond_str(req, 404, "text/plain", "no such run".into());
+        return;
+    };
+    // The SAME predicate `phase_rehydrate` gates on, off the same `state.json`
+    // — not a re-derivation. Written separately, this path checked two of the
+    // CLI's three refusals, so the button a human clicks was more permissive
+    // than the command it shells out to.
+    //
+    // `NoSuchPhase` is the one arm that is a 404 (the name does not exist here
+    // — and `safe_component` permits `:` and is a path check, NOT an
+    // authorization one). Every other arm names a real phase drovr is refusing
+    // to act on, which is a 409.
+    if let Err(why) = state.rehydratable(&phase) {
+        use crate::run::NotRehydratable as Why;
+        let msg = match &why {
+            Why::NoSuchPhase => "no such phase".to_string(),
+            Why::Reviewer => format!(
+                "phase '{phase}' is a review-panel agent — its findings channel cannot be \
+                 re-attached to a resumed session; run the panel again instead"
+            ),
+            Why::HoldsPane(pane) => format!("phase '{phase}' still holds pane {pane}"),
+            Why::NeverStarted => {
+                format!("phase '{phase}' has never run — start it, don't rehydrate it")
+            }
+            Why::NoAgentEverRan => {
+                format!("phase '{phase}' has no agent on record — start it again, with its seed")
+            }
+            Why::NoProjectDir => {
+                format!("run '{run_name}' records no project_dir, so there is nowhere to launch")
+            }
+            Why::NoWorkspace => {
+                format!("run '{run_name}' has no herdr workspace to open a tab in")
+            }
+        };
+        let code = if why == Why::NoSuchPhase { 404 } else { 409 };
+        respond_str(req, code, "text/plain", msg);
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            // JSON, like the other two 500s below: a client that parses the
+            // body on failure must not hit one branch that throws instead.
+            let msg = format!("cannot resolve drovr binary: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            );
+            return;
+        }
+    };
+    // ⚠️ `--` before the positionals is LOAD-BEARING, not tidiness. The exit-2
+    // arm below reads exit 2 as the CLI's "incomplete" outcome — but clap uses
+    // exit 2 for its own usage errors, and neither `safe_component` here nor
+    // `require_phase_name` in the CLI rejects a phase name starting with `-`.
+    // Without the `--`, `?phase=-weird` would make clap fail to parse, exit 2,
+    // and be reported as "the pane is back but incomplete" when in fact nothing
+    // was ever created. `--` makes every positional a value, so exit 2 from the
+    // child can only come from `phase_rehydrate`.
+    match Command::new(&exe)
+        .args(["phase", "rehydrate", "--", run_name, &phase])
+        .output()
+    {
+        Ok(o) if o.status.success() => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({
+                "ok": true,
+                "complete": true,
+                "phase": phase,
+                // The CLI's own line, which distinguishes "resumed with its
+                // session" from "relaunched and reseeded" — the difference the
+                // human actually cares about.
+                "detail": String::from_utf8_lossy(&o.stdout).trim(),
+            })
+            .to_string(),
+        ),
+        // ⚠️ Exit 2 is the CLI's "the pane is back, but the agent was NOT
+        // CONFIRMED to have this phase's context". It must NOT flatten into
+        // either bucket: a 500 would claim nothing happened (a pane really was
+        // created and recorded), and a plain `ok: true` would let a caller
+        // checking only the status treat an unconfirmed agent as fully
+        // recovered. 200 with `complete: false`, and `detail` carries the CLI's
+        // stderr note — which is what says WHICH of the five states it was, a
+        // distinction this status code cannot make and must not appear to.
+        Ok(o) if o.status.code() == Some(2) => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({
+                "ok": true,
+                "complete": false,
+                "phase": phase,
+                "detail": String::from_utf8_lossy(&o.stderr).trim(),
+            })
+            .to_string(),
+        ),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // Log it too. Every sibling handler does (`handle_post_send`,
+            // `handle_post_keys`, `handle_get_pane`), and the browser tells the
+            // user to "see the drovr server log" — which has to actually
+            // contain something for that to be advice rather than a dead end.
+            eprintln!("drovr rehydrate: {run_name}/{phase} failed: {err}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": err }).to_string(),
+            )
+        }
+        Err(e) => {
+            let msg = format!("failed to run drovr phase rehydrate: {e}");
+            eprintln!("drovr rehydrate: {msg}");
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({ "ok": false, "error": msg }).to_string(),
+            )
+        }
+    }
+}
+
 /// `GET /api/runs/<run>/agents` — the tree of spawned agents: each phase pane
 /// with its per-task review panels nested beneath it. Only agents that actually
 /// have a pane appear (unstarted placeholder phases are omitted).
 fn handle_get_agents(req: Request, p: &RunPaths) {
+    // A config that fails to load must not blank the tree — but it must not be
+    // SILENT either. `resumable` is computed from the agent map, so a config
+    // drovr could not read means every ⟳ on this page is decided by the
+    // built-in backends rather than the user's, and the button then appears (or
+    // vanishes) for a reason nothing on screen explains. Serve the tree, carry
+    // the reason with it, and let the page say so.
+    let (cfg, config_error) = match crate::config::load_config() {
+        Ok(cfg) => (cfg, None),
+        Err(e) => (
+            crate::config::Config::default(),
+            Some(format!(
+                "drovr could not read your config ({e}), so the ⟳ buttons below are decided \
+                 by the built-in agent map — a resume surface you configured yourself is not \
+                 reflected here."
+            )),
+        ),
+    };
     let tree = match load_run_state(&p.dir) {
-        Some(run) => build_agent_tree(&run),
-        None => serde_json::json!({ "workspace": serde_json::Value::Null, "nodes": [] }),
+        Some(run) => build_agent_tree(&run, &cfg, config_error.as_deref()),
+        None => serde_json::json!({
+            "workspace": serde_json::Value::Null,
+            "nodes": [],
+            "config_error": config_error,
+        }),
     };
     respond_str(req, 200, "application/json", tree.to_string());
 }
@@ -719,31 +1256,75 @@ fn status_str(status: &crate::run::PhaseStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Build the agent tree for `run`: phases (that have a pane) as top-level nodes,
+/// Whether a rehydrate would bring the CONVERSATION back, as opposed to
+/// launching a fresh agent that re-reads the notes.
+///
+/// **This is not what gates the ⟳ button** — `rehydratable` is (a phase with no
+/// session is still worth bringing back; it reseeds). This decides what the
+/// button PROMISES, so the two are reported separately and each named for what
+/// it means. Reporting only this under a name the button reads would put a ⟳ on
+/// phases the CLI then refuses, and hide it from phases it would have recovered.
+///
+/// Both halves matter, and the second is easy to miss: codex ships with no
+/// resume surface at all, so a codex phase can carry a perfectly good session id
+/// and still only be relaunchable.
+fn has_resumable_session(phase: &crate::run::Phase, cfg: &crate::config::Config) -> bool {
+    phase
+        .resume_target()
+        .is_some_and(|target| cfg.resume_surface(target.backend()).is_some())
+}
+
+/// Build the agent tree for `run`: phases (started, or reaped) as top-level nodes,
 /// with review panels (`review:<task>:<iter>:<angle>`) nested under the matching
 /// `implement-<task>` phase. Reviews with no matching phase land in a trailing
 /// group node so nothing is dropped.
-fn build_agent_tree(run: &RunState) -> serde_json::Value {
+///
+/// `config_error` is why `cfg` is NOT the user's own config, when it is not. It
+/// travels with the tree rather than being logged, because the poll that builds
+/// this runs every two seconds — a log line would be either spam or invisible,
+/// and the person it concerns is looking at the page, not the server's stderr.
+fn build_agent_tree(
+    run: &RunState,
+    cfg: &crate::config::Config,
+    config_error: Option<&str>,
+) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut reviews_by_task: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for rp in &run.review_phases {
-        let Some(pane) = &rp.pane_id else { continue };
+        // A placeholder is not an agent — see `Phase::has_run`, the same
+        // predicate `phase_rehydrate` refuses on, so the tree never offers a ⟳
+        // the CLI would then reject. A REAPED phase does show, dimmed: hiding
+        // it would make a pane drovr closed look like one that never ran, which
+        // is the opposite of what someone hunting for it needs.
+        if !rp.has_run() {
+            continue;
+        }
         let parts: Vec<&str> = rp.name.split(':').collect();
         let task = parts.get(1).copied().unwrap_or("").to_string();
         let angle = parts.get(3).copied().unwrap_or("").to_string();
-        reviews_by_task.entry(task).or_default().push(serde_json::json!({
-            "name": rp.name, "kind": "review", "angle": angle,
-            "status": status_str(&rp.status), "pane_id": pane,
-        }));
+        reviews_by_task
+            .entry(task)
+            .or_default()
+            .push(serde_json::json!({
+                "name": rp.name, "kind": "review", "angle": angle,
+                "status": status_str(&rp.status), "pane_id": rp.pane_id(),
+                "reaped": rp.is_reaped(), "rehydratable": run.rehydratable(&rp.name).is_ok(),
+                "resumable": has_resumable_session(rp, cfg),
+            }));
     }
     let mut nodes = Vec::new();
     for ph in &run.phases {
-        let Some(pane) = &ph.pane_id else { continue };
+        if !ph.has_run() {
+            continue;
+        }
         let task_key = ph.name.strip_prefix("implement-").unwrap_or("");
         let children = reviews_by_task.remove(task_key).unwrap_or_default();
         nodes.push(serde_json::json!({
             "name": ph.name, "kind": "phase",
-            "status": status_str(&ph.status), "pane_id": pane, "children": children,
+            "status": status_str(&ph.status), "pane_id": ph.pane_id(),
+            "reaped": ph.is_reaped(), "rehydratable": run.rehydratable(&ph.name).is_ok(),
+            "resumable": has_resumable_session(ph, cfg),
+            "children": children,
         }));
     }
     for (task, revs) in reviews_by_task {
@@ -752,7 +1333,11 @@ fn build_agent_tree(run: &RunState) -> serde_json::Value {
             "status": "", "pane_id": serde_json::Value::Null, "children": revs,
         }));
     }
-    serde_json::json!({ "workspace": run.workspace, "nodes": nodes })
+    serde_json::json!({
+        "workspace": run.workspace,
+        "nodes": nodes,
+        "config_error": config_error,
+    })
 }
 
 /// `GET /api/runs/<run>/review/diff?task=<task>`: unified `git diff
@@ -968,7 +1553,12 @@ fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths
 }
 
 /// Build the `GET /api/runs` JSON payload: one object per run, newest first.
-fn list_runs_json(ctx: &Arc<Ctx>) -> String {
+///
+/// `live_workspaces` is the set of workspace ids herdr currently has open, or
+/// `None` when herdr could not be reached. Each row reports `live` as
+/// `true`/`false`/`null` accordingly — `null` is "unknown", and the UI must treat
+/// it with the same caution as `true` (it gates a workspace-closing archive).
+fn list_runs_json(ctx: &Arc<Ctx>, live_workspaces: Option<&[String]>) -> String {
     let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
     for name in list_runs_in(&ctx.runs_root) {
         let dir = ctx.runs_root.join(&name);
@@ -978,6 +1568,71 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
             .as_ref()
             .map(|s| (s.task.clone(), s.gate.clone()))
             .unwrap_or_default();
+        // Pipeline progress, the axis the browser never had: `state` below is the
+        // *gate* state, which says nothing about how far the run got. Note the
+        // asymmetry — `approved` is set at the brainstorm gate, i.e. near the
+        // START of a run, so it must never be read as "finished".
+        let (done, total) = run_state.as_ref().map(|s| s.progress()).unwrap_or((0, 0));
+        // A run is finished when its phases are all Done, when `drovr cleanup`
+        // archived it, or when the human cancelled at the gate — the one terminal
+        // verdict that ends a run without completing it. An unreadable state.json
+        // is `None` here and stays visible rather than being hidden as complete.
+        let live = match (live_workspaces, run_state.as_ref()) {
+            // herdr could not be reached: unknown for every run.
+            (None, _) => None,
+            // The run's own state.json did not parse, so we never learned its
+            // workspace id. That is UNKNOWN, not "no panes" — the ambiguity is
+            // this run's file rather than herdr, but the answer is the same, and
+            // claiming `false` asserts a fact we have no basis for. `list_runs_in`
+            // only checks state.json EXISTS, so such runs really are listed.
+            (Some(_), None) => None,
+            (Some(ids), Some(st)) => match st.workspace.as_deref() {
+                // Parsed, and genuinely has no workspace recorded.
+                None => Some(false),
+                Some(ws) => Some(ids.iter().any(|i| i == ws)),
+            },
+        };
+        // Liveness gates the ARCHIVED case only, and nothing else.
+        //
+        // Archiving sets the flag even when closing the workspace failed, so an
+        // archived run with an open workspace is a zombie: filed away while an
+        // agent still runs in panes we believe we shut. That one stays in the
+        // active list, because a fold is exactly where it must not go.
+        //
+        // Finishing every phase is different. Nothing closes a workspace on
+        // completion — only `cleanup` and this endpoint ever call
+        // `workspace_close` — so a normally-finished run keeps its workspace open
+        // indefinitely. Gating on liveness there stranded EVERY finished run in
+        // the active list, which is the clutter this feature exists to remove.
+        let archived = run_state.as_ref().is_some_and(|s| s.archived);
+        // A zombie is specifically an ARCHIVED run whose workspace is still open:
+        // the human asked to close it, the close failed, and nothing else reports
+        // that. Surfaced regardless of phase progress — the anomaly is that an
+        // explicit request did not take effect, which is worth seeing whether or
+        // not the pipeline happened to finish.
+        //
+        // Going through `is_complete()` rather than recomputing keeps its
+        // empty-phases guard: a run whose state.json will not parse stays visible
+        // instead of being hidden as finished.
+        //
+        // `Some(true)` deliberately, NOT `!= Some(false)`. The asymmetry with the
+        // archive confirm — which DOES treat unknown as live — is the point:
+        //
+        // * The confirm gates a destructive act. Unknown must warn, because being
+        //   wrong there means killing a live agent.
+        // * This decides whether to assert "panes still live" on a row. Unknown
+        //   asserting it would stamp that warning on EVERY archived run whenever
+        //   `herdr workspace list` blips — false alarms on a claim we cannot
+        //   support, which is exactly how a warning stops being read.
+        //
+        // The cost is that a genuine zombie collapses while herdr is unreachable.
+        // That is transient and self-healing — the next successful poll surfaces
+        // it again — and `live: null` on the row lets the UI tell the reviewer
+        // liveness is unknown rather than let them read the grouping as fact.
+        let zombie = archived && live == Some(true);
+        let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
+            || rs.state == LoopState::Cancelled)
+            && !zombie;
         // Sort key: most-recently-touched review artifact (fall back to 0).
         let updated = fs::metadata(dir.join("review.state.json"))
             .or_else(|_| fs::metadata(dir.join("state.json")))
@@ -995,6 +1650,20 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
                 "state": rs.state.as_str(),
                 "turn": rs.turn,
                 "updated": updated,
+                "complete": complete,
+                "done": done,
+                "total": total,
+                // Lets the list say *why* a run is complete: "archived" (cleaned
+                // up with phases outstanding) reads very differently from a run
+                // that actually finished its pipeline.
+                "archived": archived,
+                // Whether the run's herdr workspace is still open. `null` when
+                // herdr could not be asked — never coerced to `false`, because
+                // archiving closes panes and "unknown" must not read as "safe".
+                "live": match live {
+                    None => serde_json::Value::Null,
+                    Some(b) => serde_json::Value::Bool(b),
+                },
             }),
         ));
     }
@@ -1008,8 +1677,15 @@ fn list_runs_json(ctx: &Arc<Ctx>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Start the always-on review server, serving every run under the drovr data
-/// dir. Writes `server.addr` and `server.pid` immediately after the socket
-/// opens, then blocks serving requests until the process exits.
+/// dir. Takes the `server.pid` lock, writes `server.addr` once the socket opens,
+/// then blocks serving requests until the process exits.
+///
+/// Refuses to start a *second* server for the same data dir: one server owns
+/// `server.addr` / `server.pid`, which is how every driver finds it, so a
+/// duplicate would silently steal discovery from the live one and leave two
+/// servers holding split in-memory run state. The lock (see [`acquire_pid_lock`])
+/// is the whole test — it is held by the kernel, so it needs nothing to be judged
+/// stale, and it catches a duplicate on *any* port, which the OS bind would not.
 pub fn serve(host: &str, port: u16) -> io::Result<()> {
     let root = runs_dir();
     fs::create_dir_all(&root)?;
@@ -1023,8 +1699,17 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         let _ = fs::set_permissions(data_dir(), fs::Permissions::from_mode(0o700));
     }
 
+    // Single-writer for the discovery files: take the lock before touching the
+    // socket or rewriting `server.addr`, so a live server keeps serving untouched.
+    // Held until this function returns, which for a serving process means until it
+    // exits; the kernel drops it either way.
+    let _lock = acquire_pid_lock()?;
+
     let addr = format!("{host}:{port}");
-    let server = Server::http(&addr).map_err(|e| io::Error::other(e.to_string()))?;
+    // Losing the bind means something foreign holds the port (a duplicate drovr
+    // server was already turned away above); the error names which.
+    let server =
+        Server::http(&addr).map_err(|e| io::Error::other(format!("cannot bind {addr}: {e}")))?;
 
     let bound_addr = server
         .server_addr()
@@ -1032,12 +1717,26 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
         .map(|a| a.to_string())
         .unwrap_or_else(|| addr.clone());
     fs::write(server_addr_file(), bound_addr.as_bytes())?;
-    fs::write(server_pid_file(), std::process::id().to_string().as_bytes())?;
 
     eprintln!("drovr review server listening on http://{bound_addr}");
     eprintln!("  runs: {root:?}");
 
-    let ctx = Arc::new(Ctx::new(root));
+    // Built from the BOUND port, never the requested one: `--port 0` asks the OS
+    // to pick, so `port` is still 0 here while every real request carries the
+    // assigned port. Using the requested value would put `host:0` in the
+    // allowlist and reject every write — locking the user out of their own UI.
+    let bound_port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(port);
+    // A wildcard bind cannot know which address a reviewer will actually use, so
+    // it falls back to "any IP literal on this port" (see `wildcard_ip_host`).
+    // Without this, binding 0.0.0.0 — the whole point of which is reaching the UI
+    // from another machine — serves a readable page whose every button 403s.
+    let wildcard = is_wildcard_host(host).then_some(bound_port);
+    let ctx =
+        Arc::new(Ctx::new(root, allowed_hosts_for(host, bound_port)).with_wildcard_port(wildcard));
     let server = Arc::new(server);
 
     let mut handles = Vec::with_capacity(WORKERS);
@@ -1060,6 +1759,8 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     for h in handles {
         let _ = h.join();
     }
+    // `_lock` drops here (and on every error path above), so the next
+    // `drovr serve` can take it the moment this one stops serving.
     Ok(())
 }
 
@@ -1091,6 +1792,97 @@ pub fn ensure_server() -> io::Result<String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Take the single-server lock, held for as long as the returned file lives.
+///
+/// The lock is an advisory exclusive lock on `server.pid`, not the pid inside it:
+/// the kernel holds it for this process and drops it however the process dies, so
+/// a crashed server never leaves a claim anyone has to judge stale, and nothing
+/// has to guess whether some pid is still a server. It is also the only check that
+/// catches a duplicate on an *arbitrary* port, where the OS bind would not
+/// serialize two starts at all.
+///
+/// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
+/// refusal message — never for the decision.
+fn acquire_pid_lock() -> io::Result<File> {
+    match try_take_lock(&server_pid_file())? {
+        Some(lock) => Ok(lock),
+        // Someone holds it: they are serving (or about to), so stand down.
+        None => Err(duplicate_server_error(recorded_addr(), lock_holder())),
+    }
+}
+
+/// Lock `path` and stamp this process's pid into it, or `Ok(None)` if another
+/// process holds it. Takes the path so it is testable without the data dir (and
+/// so without the process-global `XDG_DATA_HOME` other tests mutate).
+///
+/// The pid is written *after* the lock is taken, so for the moment between the two
+/// the file still names the previous holder — which is why the pid only ever
+/// informs the message, never a decision.
+fn try_take_lock(path: &Path) -> io::Result<Option<File>> {
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(e)) => return Err(e),
+    }
+
+    lock.set_len(0)?;
+    lock.write_all(std::process::id().to_string().as_bytes())?;
+    lock.flush()?;
+    Ok(Some(lock))
+}
+
+/// The pid recorded in `server.pid`, if it holds a readable one.
+fn lock_holder() -> Option<u32> {
+    fs::read_to_string(server_pid_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// The refusal a second `drovr serve` exits with, naming the live server as
+/// precisely as it can be named.
+///
+/// Both parts are conditional on what is known: a start that lost the lock race by
+/// microseconds sees a holder that has neither written its pid nor bound yet.
+fn duplicate_server_error(addr: Option<String>, pid: Option<u32>) -> io::Error {
+    let where_ = match addr {
+        Some(addr) => format!(" on http://{}", display_addr(&addr)),
+        None => String::new(),
+    };
+    let (who, how) = match pid {
+        Some(pid) => (
+            format!(" (pid {pid})"),
+            format!(", or stop it with: kill {pid}"),
+        ),
+        None => (String::new(), String::new()),
+    };
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "a drovr review server is already running{where_}{who} — the server is global \
+             and serves every run, so use that one{how}"
+        ),
+    )
+}
+
+/// The address in `server.addr`, unverified.
+///
+/// Only ever used to put a URL in the refusal above, never to decide anything —
+/// which is why "unverified" is good enough. A holder that has taken the lock but
+/// not yet bound leaves the *previous* server's address here, so the URL can be
+/// stale for as long as a start takes; the refusal itself never depends on it.
+fn recorded_addr() -> Option<String> {
+    let addr = fs::read_to_string(server_addr_file()).ok()?;
+    let addr = addr.trim().to_string();
+    (!addr.is_empty()).then_some(addr)
 }
 
 /// The bound address if `server.addr` names a reachable server, else `None`.
@@ -1351,7 +2143,8 @@ mod tests {
     fn start_server(runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
-        let ctx = Arc::new(Ctx::new(runs_root));
+        let bound_port = server.server_addr().to_ip().expect("ip addr").port();
+        let ctx = Arc::new(Ctx::new(runs_root, allowed_hosts_for("127.0.0.1", bound_port)));
         let server = Arc::new(server);
         for _ in 0..2 {
             let server = Arc::clone(&server);
@@ -1382,6 +2175,618 @@ mod tests {
         dir
     }
 
+    /// Create a run dir whose `state.json` carries real phases, so completion is
+    /// computable. `statuses` is one `PhaseStatus` per pipeline phase.
+    fn make_run_with_phases(
+        root: &Path,
+        run: &str,
+        statuses: &[crate::run::PhaseStatus],
+        archived: bool,
+    ) -> PathBuf {
+        let dir = root.join(run);
+        fs::create_dir_all(&dir).unwrap();
+        let phases: Vec<crate::run::Phase> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut p = crate::run::Phase::new(&format!("phase{i}"));
+                p.status = s.clone();
+                p
+            })
+            .collect();
+        let state = RunState {
+            name: run.into(),
+            task: "t".into(),
+            agent: None,
+            phases,
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: None,
+            root_pane: None,
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived,
+            retired_panes: vec![],
+        };
+        fs::write(
+            dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn row_for<'a>(rows: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+        rows.iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("run '{name}' missing from /api/runs"))
+    }
+
+    #[test]
+    fn list_runs_json_reports_completion_and_progress() {
+        use crate::run::PhaseStatus::{Done, Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-complete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        make_run_with_phases(&tmp, "finished", &[Done, Done, Done, Done], false);
+        make_run_with_phases(&tmp, "midflight", &[Done, Running, Pending, Pending], false);
+        // The `mcp-endpoint` shape: cleaned up mid-brainstorm, phases frozen.
+        make_run_with_phases(&tmp, "archived-early", &[Running, Pending], true);
+        // Unreadable state.json → must NOT be reported complete (see is_complete).
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+
+        // An unreadable state.json means the run's workspace id was never read, so
+        // liveness is UNKNOWN. Reporting `false` asserts "no live panes", which is
+        // a claim we have no basis for — and the row IS listed (`list_runs_in`
+        // only checks the file exists), so the reviewer sees and acts on it.
+        assert!(
+            row_for(&rows, "broken")["live"].is_null(),
+            "an unparseable state.json makes liveness unknown, not false"
+        );
+        // ...while a run that parsed and genuinely records no workspace is not live.
+        assert_eq!(
+            row_for(&rows, "midflight")["live"],
+            false,
+            "a parsed run with no workspace really is not live"
+        );
+
+        assert_eq!(row_for(&rows, "finished")["complete"], true);
+        assert_eq!(row_for(&rows, "finished")["done"], 4);
+        assert_eq!(row_for(&rows, "finished")["total"], 4);
+
+        assert_eq!(row_for(&rows, "midflight")["complete"], false);
+        assert_eq!(row_for(&rows, "midflight")["done"], 1);
+        assert_eq!(row_for(&rows, "midflight")["total"], 4);
+
+        assert_eq!(
+            row_for(&rows, "archived-early")["complete"],
+            true,
+            "a cleaned-up run is complete even with phases left Pending"
+        );
+        assert_eq!(row_for(&rows, "archived-early")["archived"], true);
+        assert_eq!(
+            row_for(&rows, "finished")["archived"],
+            false,
+            "a run that finished its phases was never archived"
+        );
+
+        assert_eq!(
+            row_for(&rows, "broken")["complete"],
+            false,
+            "a run whose state.json will not parse must stay visible, not be hidden as complete"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cross_origin_writes_are_refused_but_same_origin_and_cli_are_not() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-csrf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        make_run_with_phases(&tmp, "guarded", &[Running, Pending], false);
+        let addr = start_server(tmp.clone());
+
+        let archived = || -> bool {
+            let s: RunState = serde_json::from_str(
+                &fs::read_to_string(tmp.join("guarded").join("state.json")).unwrap(),
+            )
+            .unwrap();
+            s.archived
+        };
+
+        // A page on another origin: the drive-by case. Refused, and — the part
+        // that actually matters — the side effect must not have happened.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("http://evil.example"),
+        );
+        assert_eq!(code, 403, "a cross-origin POST must be refused");
+        assert!(!archived(), "a refused request must not archive the run");
+
+        // An opaque origin (sandboxed iframe, file://) is not 'absent' — refuse.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("null"),
+        );
+        assert_eq!(code, 403, "the opaque `null` origin must be refused");
+        assert!(!archived());
+
+        // DNS REBINDING: the attacker's page is served from evil.example, whose
+        // DNS is then re-pointed at this server. The browser derives BOTH headers
+        // from that one URL, so Origin == Host and an Origin-vs-Host check waves
+        // it through. Only the Host allowlist stops this.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some("http://evil.example"),
+            Some("evil.example"),
+        );
+        assert_eq!(
+            code, 403,
+            "a rebound Host must be refused even though Origin matches it"
+        );
+        assert!(!archived(), "a rebinding attempt must not archive the run");
+
+        // Same, with no Origin — the shape a plain cross-site <form> POST takes.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            None,
+            Some("evil.example"),
+        );
+        assert_eq!(code, 403, "an unknown Host is refused with or without Origin");
+        assert!(!archived());
+
+        // Casing must not decide the outcome: `Host` is normalised, so `Origin`
+        // has to be too, or an uppercase spelling would 403 for no good reason.
+        let (code, _) = http_post_full(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some(&format!("HTTP://{}", addr.to_uppercase())),
+            Some(&addr.to_uppercase()),
+        );
+        assert_eq!(code, 200, "an upper-cased Host/Origin pair is still same-origin");
+        assert!(archived());
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":false}"#,
+            Some(&format!("http://{addr}")),
+        );
+        assert_eq!(code, 200);
+        assert!(!archived());
+
+        // drovr's own UI: Origin matches Host.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":true}"#,
+            Some(&format!("http://{addr}")),
+        );
+        assert_eq!(code, 200, "the review UI's own origin must be allowed");
+        assert!(archived());
+
+        // curl / the drovr CLI send no Origin at all and must keep working.
+        let (code, _) = http_post_origin(
+            &addr,
+            "/api/runs/guarded/archive",
+            r#"{"archived":false}"#,
+            None,
+        );
+        assert_eq!(code, 200, "a request with no Origin is not a browser write");
+        assert!(!archived());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn allowed_hosts_cover_the_ways_a_reviewer_actually_reaches_the_ui() {
+        // Loopback: all three spellings work, because the reviewer may use any.
+        let lo = allowed_hosts_for("127.0.0.1", 8791);
+        for expected in ["127.0.0.1:8791", "localhost:8791", "[::1]:8791"] {
+            assert!(lo.contains(&expected.to_string()), "missing {expected} in {lo:?}");
+        }
+        // A bare IPv6 literal must be bracketed — browsers send `Host: [::1]:80`.
+        assert!(allowed_hosts_for("::1", 8791).contains(&"[::1]:8791".to_string()));
+        // A specific non-loopback bind allows exactly itself.
+        let tail = allowed_hosts_for("100.71.4.9", 8791);
+        assert_eq!(tail, vec!["100.71.4.9:8791".to_string()]);
+    }
+
+    #[test]
+    fn every_spelling_of_a_wildcard_bind_is_recognised() {
+        // `serve_host` is a free-form String, so all of these are things a user can
+        // actually write. A spelling missed here is not a hole — it fails closed —
+        // but it is a silent lockout: page loads, every button 403s.
+        for h in ["0.0.0.0", "::", "[::]", "::0", "[::0]", "0:0:0:0:0:0:0:0"] {
+            assert!(is_wildcard_host(h), "{h} is a wildcard bind");
+        }
+        for h in ["127.0.0.1", "::1", "localhost", "192.168.1.5", "evil.example", ""] {
+            assert!(!is_wildcard_host(h), "{h} is NOT a wildcard bind");
+        }
+        // A wildcard bind still offers the loopback aliases, since the machine
+        // running the server reaches it that way.
+        let ws = allowed_hosts_for("::0", 8791);
+        assert!(ws.contains(&"localhost:8791".to_string()), "{ws:?}");
+    }
+
+    /// Give an existing fixture run a workspace id, so liveness is computable.
+    /// The default fixture leaves `workspace: None`, which pins `live` to
+    /// `Some(false)` and makes the live combinations untestable — the gap that
+    /// let a regression stranding every finished run reach a green suite.
+    fn set_workspace(dir: &Path, ws: &str) {
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some(ws.to_string());
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_is_complete_even_though_its_workspace_is_still_open() {
+        use crate::run::PhaseStatus::Done;
+        let tmp = std::env::temp_dir().join(format!("drovr-fin-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // The ordinary end of a pipeline: all four phases Done, nobody has run
+        // `cleanup` yet — so the herdr workspace is still open. Nothing closes it
+        // on completion, so this is the COMMON state of a finished run, not an
+        // edge case, and it must still collapse into "Completed".
+        let dir = make_run_with_phases(&tmp, "finished", &[Done, Done, Done, Done], false);
+        set_workspace(&dir, "wAG");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        let row = row_for(&rows, "finished");
+        assert_eq!(row["live"], true, "precondition: the workspace really is open");
+        assert_eq!(row["archived"], false);
+        assert_eq!(
+            row["complete"], true,
+            "a run that finished every phase belongs in Completed even with its \
+             workspace open — gating this on liveness strands every finished run \
+             in the active list, which is the clutter the group exists to remove"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_run_whose_panes_are_still_live_is_never_filed_as_complete() {
+        use crate::run::PhaseStatus::{Done, Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-zombie-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Archived, but its workspace close failed — the agent is still running.
+        let dir = make_run_with_phases(&tmp, "zombie", &[Running, Pending], true);
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some("wAG".into());
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        let row = row_for(&rows, "zombie");
+        assert_eq!(row["archived"], true);
+        assert_eq!(row["live"], true);
+        assert_eq!(
+            row["complete"], false,
+            "an archived run with a LIVE workspace must stay in the active list — \
+             filing it under Completed hides the one row that needs attention"
+        );
+
+        // Once the workspace really is gone, it files away normally.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+        assert_eq!(row_for(&rows, "zombie")["complete"], true);
+
+        // Herdr unreachable: liveness is unknown, and the row does NOT claim
+        // "panes still live". A deliberate asymmetry with the archive confirm,
+        // which treats unknown as live because it gates a destructive act —
+        // asserting it here would stamp the warning on every archived run on any
+        // herdr blip. `live: null` is what tells the UI to say liveness is
+        // unknown instead of presenting the grouping as verified.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+        let row = row_for(&rows, "zombie");
+        assert!(row["live"].is_null(), "herdr unreachable is unknown, not false");
+        assert_eq!(
+            row["complete"], true,
+            "with liveness unknown the row collapses rather than asserting a \
+             claim we cannot support; transient and self-healing on the next poll"
+        );
+
+        // Finishing every phase does NOT excuse a failed close. The anomaly is
+        // that an explicit archive request didn't take effect, which is worth
+        // surfacing whether or not the pipeline happened to finish.
+        let dir = make_run_with_phases(&tmp, "done-zombie", &[Done, Done], true);
+        set_workspace(&dir, "wAG");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        assert_eq!(
+            row_for(&rows, "done-zombie")["complete"],
+            false,
+            "an archived run with an open workspace stays visible even with all phases Done"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wildcard_bind_accepts_ip_literals_but_never_a_rebound_name() {
+        // Binding 0.0.0.0 exists to be reached from another machine, so the LAN or
+        // Tailscale address a reviewer types must work...
+        assert!(wildcard_ip_host("192.168.1.5:8791", Some(8791)));
+        assert!(wildcard_ip_host("100.71.4.9:8791", Some(8791)));
+        assert!(wildcard_ip_host("[fd7a::1]:8791", Some(8791)));
+        // ...while a DNS name never does. Rebinding needs a name it controls; an
+        // IP literal gives the attacker no lever, which is what makes this safe.
+        assert!(!wildcard_ip_host("evil.example:8791", Some(8791)));
+        assert!(!wildcard_ip_host("localhost:8791", Some(8791)));
+        // Wrong port, and the non-wildcard case, stay closed.
+        assert!(!wildcard_ip_host("192.168.1.5:9999", Some(8791)));
+        assert!(!wildcard_ip_host("192.168.1.5:8791", None));
+        assert!(!wildcard_ip_host("192.168.1.5", Some(8791)));
+    }
+
+    #[test]
+    fn archiving_never_closes_a_workspace_holding_the_humans_own_panes() {
+        use crate::herdr::FakeHerdr;
+        let mut state = tree_run(vec![], vec![]);
+        state.workspace = Some("wAG".into());
+        state.root_pane = Some("wAG:p1".into());
+
+        let h = FakeHerdr::new();
+        // The reviewer's own shell/editor sits in the run's workspace alongside
+        // drovr's pane. `drovr cleanup` is explicitly hardened to spare it
+        // (`cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create`); the
+        // Archive button is one click and must not be the careless path.
+        h.push_workspace_panes("wAG", ["wAG:p1", "wAG:p9"]);
+
+        let closed = close_for_archive(&h, &state, true);
+
+        let calls = h.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("workspace_close")),
+            "archiving must not destroy a workspace holding panes drovr did not \
+             create — that is the human's work: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "pane_close pane=wAG:p1"),
+            "drovr's own pane is still closed: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "pane_close pane=wAG:p9"),
+            "the human's pane must be left alone: {calls:?}"
+        );
+        assert!(
+            !closed,
+            "the workspace is still standing, so the page must not be told it closed"
+        );
+    }
+
+    #[test]
+    fn archiving_closes_the_workspace_and_restoring_never_does() {
+        use crate::herdr::FakeHerdr;
+        let mut state = tree_run(vec![], vec![]);
+        state.workspace = Some("wAG".into());
+
+        let h = FakeHerdr::new();
+        assert!(
+            close_for_archive(&h, &state, true),
+            "archiving closes the run's workspace"
+        );
+        assert!(h.calls().iter().any(|c| c == "workspace_close id=wAG"));
+
+        // Restoring must not touch herdr at all — there is nothing to reopen, and
+        // a stray close here would kill panes on what is meant to be an undo.
+        let h = FakeHerdr::new();
+        assert!(!close_for_archive(&h, &state, false));
+        assert!(
+            h.calls().is_empty(),
+            "restore must issue no herdr calls: {:?}",
+            h.calls()
+        );
+
+        // An already-gone workspace is the common case for a stale run: report
+        // "not closed" but never fail, or the row could never be filed away.
+        let h = FakeHerdr::new();
+        h.set_fail_workspace_close(true);
+        assert!(!close_for_archive(&h, &state, true));
+
+        // A run that never recorded a workspace has nothing to close.
+        let mut no_ws = tree_run(vec![], vec![]);
+        no_ws.workspace = None;
+        let h = FakeHerdr::new();
+        assert!(!close_for_archive(&h, &no_ws, true));
+        assert!(h.calls().is_empty());
+    }
+
+    #[test]
+    fn fake_reports_configured_live_workspaces() {
+        use crate::herdr::FakeHerdr;
+        let h = FakeHerdr::new();
+        h.set_live_workspaces(Some(vec!["w1".into()]));
+        assert_eq!(h.workspace_list(), Some(vec!["w1".to_string()]));
+        h.set_live_workspaces(None);
+        assert_eq!(h.workspace_list(), None, "unreachable herdr stays unknown");
+    }
+
+    #[test]
+    fn list_runs_json_reports_workspace_liveness() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mk = |name: &str, ws: Option<&str>| {
+            let dir = make_run_with_phases(&tmp, name, &[Running, Pending], false);
+            let mut s: RunState =
+                serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+            s.workspace = ws.map(|w| w.to_string());
+            fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+        };
+        mk("alive", Some("wAG"));
+        mk("dead", Some("wZZ"));
+        mk("no-workspace", None);
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let live = vec!["w1".to_string(), "wAG".to_string()];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, Some(&live))).unwrap();
+        assert_eq!(row_for(&rows, "alive")["live"], true);
+        assert_eq!(row_for(&rows, "dead")["live"], false);
+        assert_eq!(
+            row_for(&rows, "no-workspace")["live"],
+            false,
+            "a run that never recorded a workspace has nothing live to close"
+        );
+
+        // herdr unreachable: liveness is UNKNOWN, never silently "false" — the UI
+        // gates a pane-closing archive on this.
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&list_runs_json(&ctx, None)).unwrap();
+        assert!(
+            row_for(&rows, "alive")["live"].is_null(),
+            "unknown liveness must not be reported as not-live"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_endpoint_separates_missing_from_unreadable() {
+        let tmp = std::env::temp_dir().join(format!("drovr-arch404-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Present on the page (listing only requires state.json to EXIST), but its
+        // contents do not parse.
+        let broken = tmp.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("state.json"), b"{ not json").unwrap();
+
+        let addr = start_server(tmp.clone());
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/broken/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(
+            code, 409,
+            "a run that is listed but unreadable must not answer 'no such run' — \
+             the reviewer can see the row, so 404 reads as a bug in the page"
+        );
+
+        let (code, _) = http_post(
+            &addr,
+            "/api/runs/ghost/archive",
+            "application/json",
+            r#"{"archived":true}"#,
+        );
+        assert_eq!(code, 404, "a genuinely absent run is still 404");
+    }
+
+    #[test]
+    fn archive_endpoint_sets_and_clears_the_flag() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-archep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        make_run_with_phases(&tmp, "filed", &[Running, Pending], false);
+
+        let addr = start_server(tmp.clone());
+        let archived_on_disk = || -> bool {
+            let s: RunState = serde_json::from_str(
+                &fs::read_to_string(tmp.join("filed").join("state.json")).unwrap(),
+            )
+            .unwrap();
+            s.archived
+        };
+
+        assert!(!archived_on_disk(), "precondition");
+        let (code, body) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"archived":true}"#);
+        assert_eq!(code, 200, "body: {body}");
+        assert!(archived_on_disk(), "archive must persist to state.json");
+
+        // Archiving sets ONE field. Everything else must survive byte-for-byte:
+        // the handler rewrites the whole file, so a stale or partially-populated
+        // struct here would quietly erase a concurrent phase-status write.
+        let after: RunState = serde_json::from_str(
+            &fs::read_to_string(tmp.join("filed").join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after.task, "t");
+        assert_eq!(after.phases.len(), 2, "phases must not be dropped");
+        assert_eq!(after.phases[0].status, crate::run::PhaseStatus::Running);
+        assert_eq!(after.gate, "spec");
+
+        // The write must land in the server's runs_root, not the ambient data dir.
+        assert!(
+            tmp.join("filed").join("state.json").is_file(),
+            "state.json must be written under the server's runs_root"
+        );
+
+        let (code, _) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"archived":false}"#);
+        assert_eq!(code, 200);
+        assert!(!archived_on_disk(), "restore must clear the flag");
+
+        // Malformed and unknown-run requests are rejected, not silently ignored.
+        let (code, _) = http_post(&addr, "/api/runs/filed/archive", "application/json", r#"{"nope":1}"#);
+        assert_eq!(code, 400);
+        let (code, _) = http_post(&addr, "/api/runs/ghost/archive", "application/json", r#"{"archived":true}"#);
+        assert_eq!(code, 404);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn list_runs_json_treats_a_cancelled_gate_as_complete() {
+        use crate::run::PhaseStatus::{Pending, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-cancelled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let dir = make_run_with_phases(&tmp, "abandoned", &[Running, Pending], false);
+        fs::write(
+            dir.join("review.state.json"),
+            br#"{"state":"cancelled","turn":2}"#,
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&list_runs_json(&ctx, Some(&[]))).unwrap();
+        assert_eq!(
+            row_for(&rows, "abandoned")["complete"],
+            true,
+            "cancelled is a terminal human verdict — the run is over"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     fn http_get(addr: &str, path: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         write!(stream, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
@@ -1395,6 +2800,48 @@ mod tests {
             .unwrap_or(0);
         let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
         (status, body)
+    }
+
+    /// POST with an optional `Origin` header, for exercising the cross-origin
+    /// write guard. `None` models curl / the drovr CLI, which send none.
+    fn http_post_origin(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> (u16, String) {
+        http_post_full(addr, path, body, origin, None)
+    }
+
+    /// POST with an overridable `Host` as well as `Origin`. Forging `Host` is how
+    /// a DNS-rebinding request actually looks on the wire, so the guard cannot be
+    /// tested honestly without it. `host: None` sends the real address.
+    fn http_post_full(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+        host: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let host_hdr = host.unwrap_or(addr);
+        let origin_line = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        write!(
+            stream,
+            "POST {path} HTTP/1.0\r\nHost: {host_hdr}\r\n{origin_line}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let status: u16 = resp
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
+        (status, rb)
     }
 
     fn http_post(addr: &str, path: &str, content_type: &str, body: &str) -> (u16, String) {
@@ -1413,7 +2860,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let rb = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+        let rb = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
         (status, rb)
     }
 
@@ -1457,14 +2904,26 @@ mod tests {
         assert_eq!(v[0]["state"], "idle");
     }
 
+    /// The mirror's default target: the running phase, else the last phase that
+    /// still holds a pane, else nothing.
+    ///
+    /// It used to fall back to `run.root_pane`, which was dead code while the
+    /// first phase consumed that pane. Now that the root shell stays idle for
+    /// the whole run, that fallback would silently point the UI at an empty
+    /// shell — so the honest answer when no phase has a pane is `None` (204 /
+    /// "no live pane"), not a shell prompt dressed up as an agent.
     #[test]
-    fn active_pane_prefers_running_phase_then_root() {
-        let mkphase = |name: &str, status, pane: Option<&str>| crate::run::Phase {
-            name: name.into(),
-            status,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: pane.map(|s| s.to_string()),
+    fn active_pane_is_the_current_phase_or_nothing() {
+        let mkphase = |name: &str, status, pane: Option<&str>| {
+            let mut p = {
+                let mut p = crate::run::Phase::new(name);
+                p.status = status;
+                p
+            };
+            if let Some(pane) = pane {
+                p.set_pane(pane);
+            }
+            p
         };
         let mut run = RunState {
             name: "r".into(),
@@ -1482,15 +2941,55 @@ mod tests {
             project_dir: "/tmp/p".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
         };
-        // Running phase wins.
+        // The phase the run is on.
         assert_eq!(active_pane(&run).as_deref(), Some("w:p2"));
-        // No running phase → falls back to the workspace root pane.
+        // Every phase Done → nothing to mirror. It must NOT fall back to that
+        // phase's own pane once the run has moved past it, nor to an earlier
+        // phase's: under reaping those are exactly the panes that get closed,
+        // so a fallback would mirror a dead or recycled pane as if it were live.
         run.phases[1].status = crate::run::PhaseStatus::Done;
-        assert_eq!(active_pane(&run).as_deref(), Some("w:root"));
-        // Neither → None.
-        run.root_pane = None;
         assert_eq!(active_pane(&run), None);
+        // Still nothing once the panes are actually gone — and still not the
+        // idle root shell, which outlives every phase.
+        run.phases[1].mark_reaped();
+        run.phases[0].mark_reaped();
+        assert!(
+            run.root_pane.is_some(),
+            "the root shell outlives the phases"
+        );
+        assert_eq!(active_pane(&run), None);
+    }
+
+    /// `POST /send` must never resolve to the workspace's idle root shell.
+    ///
+    /// Not a privilege boundary — sending into a live claude pane is arbitrary
+    /// code execution by design, and that surface is unchanged. It is a
+    /// footgun: the root shell is a bare `sh` alive for the whole run, so a
+    /// `/send` landing there runs the user's PROSE as a shell command. Reading
+    /// it is harmless and stays allowed.
+    #[test]
+    fn the_root_shell_is_readable_but_never_writable() {
+        use crate::run::PhaseStatus::Running;
+        let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
+
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root"),
+            "mirroring the idle shell is fine"
+        );
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Write),
+            None,
+            "typing into the idle shell is not"
+        );
+        // A phase pane is writable, so the gate is about the root shell alone.
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
     }
 
     // A RunState with the given phases / review phases; other fields are inert.
@@ -1508,17 +3007,18 @@ mod tests {
             project_dir: "/tmp/p".into(),
             worktree_path: None,
             worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
         }
     }
 
     fn ph(name: &str, status: crate::run::PhaseStatus, pane: Option<&str>) -> crate::run::Phase {
-        crate::run::Phase {
-            name: name.into(),
-            status,
-            handoff_doc: None,
-            herdr_session: None,
-            pane_id: pane.map(|s| s.to_string()),
+        let mut p = crate::run::Phase::new(name);
+        p.status = status;
+        if let Some(pane) = pane {
+            p.set_pane(pane);
         }
+        p
     }
 
     #[test]
@@ -1535,7 +3035,7 @@ mod tests {
                 ph("review:task-1:1:security", Done, Some("w:p5")),
             ],
         );
-        let tree = build_agent_tree(&run);
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
         assert_eq!(tree["workspace"], "w");
         let nodes = tree["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "placeholder omitted: {tree}");
@@ -1559,13 +3059,24 @@ mod tests {
             vec![],
         );
         // Explicit pane belonging to the run is honored.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:p3").as_deref(), Some("w:p3"));
-        // The root pane is in the allow-list.
-        assert_eq!(resolve_pane(&run, "/x?pane=w:root").as_deref(), Some("w:root"));
-        // A pane outside the run is rejected (no silent fallback).
-        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99"), None);
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:p3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
+        // The root pane is in the READABLE allow-list (see
+        // `the_root_shell_is_readable_but_never_writable`).
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w:root", Access::Read).as_deref(),
+            Some("w:root")
+        );
+        // A pane outside the run is rejected (no silent fallback), read or write.
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Read), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9:p99", Access::Write), None);
         // No param → active_pane (first Running phase).
-        assert_eq!(resolve_pane(&run, "/x").as_deref(), Some("w:p1"));
+        assert_eq!(
+            resolve_pane(&run, "/x", Access::Write).as_deref(),
+            Some("w:p1")
+        );
     }
 
     #[test]
@@ -1574,11 +3085,14 @@ mod tests {
         let run = tree_run(vec![ph("implement", Running, Some("w:p3"))], vec![]);
         // The browser sends encodeURIComponent("w:p3") = "w%3Ap3"; without
         // decoding it misses the allow-list and every selected pane 409s.
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3Ap3").as_deref(), Some("w:p3"));
+        assert_eq!(
+            resolve_pane(&run, "/x?pane=w%3Ap3", Access::Write).as_deref(),
+            Some("w:p3")
+        );
         // Decoding must not open a hole: a foreign pane is still rejected.
-        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w9%3Ap99", Access::Write), None);
         // Malformed escapes are passed through verbatim (and so simply miss).
-        assert_eq!(resolve_pane(&run, "/x?pane=w%3"), None);
+        assert_eq!(resolve_pane(&run, "/x?pane=w%3", Access::Write), None);
     }
 
     #[test]
@@ -1660,6 +3174,130 @@ mod tests {
         }
     }
 
+    /// End-to-end proof that `/send` and `/keys` really use the WRITABLE
+    /// allow-list, not just that the pure resolver can tell the two apart.
+    ///
+    /// A wrong `Access` at either call site is invisible to the unit tests: the
+    /// handler would resolve the root pane, hand it to `SystemHerdr`, and fail
+    /// there instead — so this asserts 409 (gated before herdr) rather than the
+    /// 500 an ungated request would produce with no herdr running.
+    ///
+    /// The read side cannot be asserted the same way: `GET /pane` answers 204
+    /// both when the pane is gated and when herdr cannot be reached, so the
+    /// readable set is pinned by `the_root_shell_is_readable_but_never_writable`.
+    #[test]
+    fn the_root_shell_is_refused_by_the_write_endpoints_over_http() {
+        let tmp = make_root("root-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        // An idle root shell plus one phase pane. Both are needed: the phase
+        // pane is the POSITIVE CONTROL that keeps this test from passing
+        // vacuously. If the `state.json` below failed to parse, or `root_pane`
+        // were dropped, every request would 409 for the wrong reason — the
+        // phase pane's 500 is what proves the state loaded and the gate is
+        // discriminating rather than refusing everything.
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![crate::run::Phase::new("implement")],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        run.phases[0].status = crate::run::PhaseStatus::Running;
+        run.phases[0].set_pane("w:p1");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        for (path, ctype, body) in [
+            ("send?pane=w%3Aroot", "text/plain", "ls -la"),
+            (
+                "keys?pane=w%3Aroot",
+                "application/json",
+                r#"{"keys":["enter"]}"#,
+            ),
+        ] {
+            let (s, _) = http_post(&addr, &format!("/api/runs/r/{path}"), ctype, body);
+            assert_eq!(s, 409, "{path} must refuse the idle root shell");
+        }
+
+        // Positive control: the phase pane IS writable, so it gets past the gate
+        // and fails at herdr instead (no daemon in the test environment).
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(
+            s, 500,
+            "a phase pane must pass the gate and fail at herdr, not be refused"
+        );
+    }
+
+    /// The mirror must not keep typing into a pane drovr has closed.
+    ///
+    /// `mark_reaped` clears `pane_id` in the same statement it sets the flag, so
+    /// a reaped phase leaves the writable allow-list by construction rather than
+    /// by a check written here — which is exactly why that pair is one mutator.
+    /// Asserted end to end anyway: the browser holds a sticky `selectedPane` and
+    /// will go on naming a pane the run has moved past, and 409 (gated, before
+    /// herdr) is a different answer from 500 (gated in, failed at herdr).
+    #[test]
+    fn a_reaped_phases_pane_is_no_longer_writable() {
+        let tmp = make_root("reaped-write-gate");
+        let dir = tmp.path().join("r");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), b"# Spec").unwrap();
+        let mut run = crate::run::RunState {
+            name: "r".into(),
+            task: "t".into(),
+            agent: None,
+            phases: vec![
+                crate::run::Phase::new("brainstorm"),
+                crate::run::Phase::new("implement"),
+            ],
+            review_phases: vec![],
+            gate: "spec".into(),
+            cursor: 0,
+            workspace: Some("w".into()),
+            root_pane: Some("w:root".into()),
+            project_dir: String::new(),
+            worktree_path: None,
+            worktree_branch: None,
+            archived: false,
+            retired_panes: vec![],
+        };
+        // brainstorm ran on w:p1 and drovr reaped it; implement is live on w:p2.
+        run.phases[0].status = crate::run::PhaseStatus::Done;
+        run.phases[0].set_pane("w:p1");
+        run.phases[0].mark_reaped();
+        run.retire_pane("w:p1");
+        run.phases[1].status = crate::run::PhaseStatus::Running;
+        run.phases[1].set_pane("w:p2");
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap1", "text/plain", "hi");
+        assert_eq!(s, 409, "a reaped pane must be refused before herdr");
+        // ⚠️ And retiring it did NOT make it writable again. `retired_panes` is
+        // what `drovr cleanup` reads to prove a pane was drovr's; it is not a
+        // list of places the mirror may type.
+        assert!(
+            run.retired_panes.contains(&"w:p1".to_string()),
+            "precondition: the pane is retired, and still refused"
+        );
+
+        // Positive control: the live phase's pane passes the gate and fails at
+        // herdr instead, so the 409 above is discrimination, not a broken state.
+        let (s, _) = http_post(&addr, "/api/runs/r/send?pane=w%3Ap2", "text/plain", "hi");
+        assert_eq!(s, 500, "the live phase's pane must still be writable");
+    }
+
     #[test]
     fn post_keys_honors_pane_gating() {
         // `?pane=` outside the run must never reach herdr: same allow-list as
@@ -1674,6 +3312,288 @@ mod tests {
             r#"{"keys":["enter"]}"#,
         );
         assert_eq!(s, 409);
+    }
+
+    #[test]
+    fn post_rehydrate_refuses_before_it_can_shell_out() {
+        // Every refusal short-circuits before `current_exe()`, so they are safe
+        // to exercise in-process. The happy path shells out to the CLI — which
+        // is the point: the CLI stays the sole writer of state.json — and is
+        // covered by `phase::rehydrate_tests` plus manual verification.
+        let tmp = make_root("rehydrate-http");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let mut run: RunState = serde_json::from_str(
+            &fs::read_to_string(dir.join("state.json")).unwrap(),
+        )
+        .unwrap();
+        let mut live = crate::run::Phase::new("plan");
+        live.status = crate::run::PhaseStatus::Running;
+        live.set_pane("w:p1");
+        let mut reaped = crate::run::Phase::new("brainstorm");
+        reaped.status = crate::run::PhaseStatus::Done;
+        reaped.set_pane("w:p0");
+        reaped.mark_reaped();
+        // A phase `phase_start` persisted as Running and then failed to launch:
+        // has_run() is true, but no agent was ever recorded.
+        let mut launch_failed = crate::run::Phase::new("launch-failed");
+        launch_failed.status = crate::run::PhaseStatus::Running;
+        let mut reviewer = crate::run::Phase::new("review:task-1:1:security");
+        reviewer.status = crate::run::PhaseStatus::Done;
+        reviewer.set_pane("w:p2");
+        reviewer.record_launch("claude", None);
+        reviewer.mark_reaped();
+        run.review_phases = vec![reviewer];
+        run.phases = vec![
+            reaped,
+            live,
+            crate::run::Phase::new("placeholder"),
+            launch_failed,
+        ];
+        fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
+        let before = fs::read_to_string(dir.join("state.json")).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        // No phase at all → 400, not a rehydrate of "".
+        let (s, _) = http_post(&addr, "/api/runs/r/rehydrate", "text/plain", "");
+        assert_eq!(s, 400);
+
+        // A phase this run does not have → 404. `safe_component` permits `:` and
+        // is a filename check, NOT an authorization one, and `phase_start`
+        // happily appends unknown names — so the membership test is what stops
+        // an unauthenticated caller inventing phases.
+        let (s, _) = http_post(&addr, "/api/runs/r/rehydrate?phase=nope", "text/plain", "");
+        assert_eq!(s, 404);
+        // A traversal-shaped name is refused before anything reads a path.
+        let (s, _) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=..%2Fevil",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 400);
+
+        // A phase that still holds a pane → 409. Duplicating an agent into a
+        // live conversation is exactly what rehydrate must not do.
+        let (s, body) = http_post(&addr, "/api/runs/r/rehydrate?phase=plan", "text/plain", "");
+        assert_eq!(s, 409, "{body}");
+
+        // A phase that has never run → 409 as well, and for a reason worth
+        // keeping separate: `drovr new` pre-seeds placeholders, so without this
+        // an unauthenticated caller could START one out of pipeline order.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=placeholder",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("never run"), "{body}");
+
+        // …and the third refusal, which this path used to omit entirely: a
+        // phase that LOOKS started (`phase_start` persists `Running` before it
+        // launches) but never got an agent. The CLI refuses it; so must the
+        // button, or the endpoint a human clicks is more permissive than the
+        // command it shells out to.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=launch-failed",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("no agent on record"), "{body}");
+
+        // A reviewer → 409. Its findings channel cannot be re-attached to a
+        // resumed session, so bringing it back would produce an agent unable to
+        // do the one thing it exists for.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=review%3Atask-1%3A1%3Asecurity",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("review-panel agent"), "{body}");
+
+        assert_eq!(
+            fs::read_to_string(dir.join("state.json")).unwrap(),
+            before,
+            "a refused rehydrate must not write state.json"
+        );
+    }
+
+    #[test]
+    fn agent_tree_carries_reaped_phases_but_not_placeholders() {
+        use crate::run::PhaseStatus::*;
+        let mut reaped = ph("brainstorm", Done, Some("w:p1"));
+        reaped.record_launch("claude", None);
+        assert!(reaped.record_session(
+            crate::herdr::SessionId::new("sess-b".into()).unwrap()
+        ));
+        reaped.mark_reaped();
+        // Reaped, but nothing was ever captured for it — the UI must not offer
+        // a ⟳ that would land on a reseed the human did not ask for.
+        let mut sessionless = ph("plan", Done, Some("w:p2"));
+        sessionless.record_launch("claude", None);
+        sessionless.mark_reaped();
+
+        let run = tree_run(
+            vec![
+                reaped,
+                sessionless,
+                ph("implement", Pending, None), // unstarted placeholder → STILL omitted
+                ph("implement-task-1", Running, Some("w:p3")),
+            ],
+            vec![],
+        );
+        let tree = build_agent_tree(&run, &crate::config::Config::default(), None);
+        let nodes = tree["nodes"].as_array().unwrap();
+        assert_eq!(
+            nodes.len(),
+            3,
+            "reaped phases appear; the placeholder does not: {tree}"
+        );
+
+        assert_eq!(nodes[0]["name"], "brainstorm");
+        assert_eq!(nodes[0]["reaped"], true);
+        assert_eq!(nodes[0]["resumable"], true);
+        assert_eq!(nodes[0]["rehydratable"], true);
+        assert!(nodes[0]["pane_id"].is_null(), "a reaped phase has no pane");
+
+        assert_eq!(nodes[1]["name"], "plan");
+        assert_eq!(nodes[1]["reaped"], true);
+        // No session to resume — but STILL rehydratable: it reseeds, and the ⟳
+        // is gated on that. The two fields answer different questions.
+        assert_eq!(nodes[1]["resumable"], false);
+        assert_eq!(nodes[1]["rehydratable"], true);
+
+        assert_eq!(nodes[2]["name"], "implement-task-1");
+        assert_eq!(nodes[2]["reaped"], false);
+        assert_eq!(nodes[2]["pane_id"], "w:p3");
+        assert_eq!(
+            nodes[2]["rehydratable"], false,
+            "a phase holding a live pane must not be offered a ⟳ the CLI refuses"
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_resume_surface_is_not_advertised_as_resumable() {
+        // The ⟳ button promises the CONVERSATION back. codex ships with no
+        // resume field, so a captured session id is not enough — clicking it
+        // would silently reseed.
+        use crate::run::PhaseStatus::Done;
+        let mut p = ph("plan", Done, Some("w:p1"));
+        p.record_launch("codex", None);
+        assert!(p.record_session(crate::herdr::SessionId::new("sess-c".into()).unwrap()));
+        p.mark_reaped();
+        let run = tree_run(vec![p], vec![]);
+
+        let cfg = crate::config::Config::default();
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["resumable"], false);
+
+        // …and it flips the moment the user opts codex in.
+        let mut cfg = cfg;
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["resumable"], true);
+    }
+
+    #[test]
+    fn the_tree_offers_no_rehydrate_the_cli_would_refuse() {
+        // The ⟳ is gated on the SAME predicate the CLI and the handler ask, so
+        // the run-level prerequisites have to reach the tree too — a button
+        // rendered on a run with no workspace is a button that errors on click.
+        // A reviewer never gets one at all: its findings channel cannot be
+        // re-attached to a resumed session.
+        use crate::run::PhaseStatus::Done;
+        let reaped = |name: &str| {
+            let mut p = ph(name, Done, Some("w:p1"));
+            p.record_launch("claude", None);
+            p.mark_reaped();
+            p
+        };
+        let run = tree_run(
+            vec![reaped("implement-task-1")],
+            vec![reaped("review:task-1:1:security")],
+        );
+        let cfg = crate::config::Config::default();
+        let tree = build_agent_tree(&run, &cfg, None);
+        assert_eq!(tree["nodes"][0]["rehydratable"], true);
+        assert_eq!(
+            tree["nodes"][0]["children"][0]["rehydratable"],
+            false,
+            "a reviewer must never be offered a ⟳: {tree}"
+        );
+        // …and the reviewer is still SHOWN, dimmed — hiding it would make a
+        // pane drovr closed look like one that never ran.
+        assert_eq!(tree["nodes"][0]["children"][0]["reaped"], true);
+
+        let mut no_ws = tree_run(vec![reaped("implement-task-1")], vec![]);
+        no_ws.workspace = None;
+        let tree = build_agent_tree(&no_ws, &cfg, None);
+        assert_eq!(
+            tree["nodes"][0]["rehydratable"], false,
+            "no workspace means nowhere to open the tab: {tree}"
+        );
+    }
+
+    #[test]
+    fn the_tree_and_the_launcher_read_the_same_resume_surface() {
+        // `has_resumable_session` used to reach into `cfg.agents` and test
+        // `spec.resume` itself — a SECOND classifier of the fact
+        // `Config::resume_launch` classifies when it decides between resuming
+        // and reseeding. This branch has already paid twice for exactly that
+        // shape (`Capture::from_poll` vs `PaneState::from_poll`). Pin that the
+        // two agree for every backend, including the ones the config file adds.
+        use crate::run::PhaseStatus::Done;
+        let mut cfg = crate::config::Config::default();
+        cfg.agents.get_mut("codex").unwrap().resume =
+            Some(crate::config::ResumeSpec::subcommand("resume").unwrap());
+        for backend in ["claude", "cursor", "codex", "not-in-the-config"] {
+            let mut p = ph("plan", Done, Some("w:p1"));
+            p.record_launch(backend, None);
+            assert!(p.record_session(crate::herdr::SessionId::new("s-1".into()).unwrap()));
+            let target = p.resume_target().unwrap();
+            // `Ok(None)` is "no resume surface"; `Err` is "the config does not
+            // know this backend at all", which is also not a resume.
+            let launcher = cfg
+                .resume_launch(&target, "/tmp/p", false)
+                .ok()
+                .flatten()
+                .is_some();
+            assert_eq!(
+                has_resumable_session(&p, &cfg),
+                launcher,
+                "the ⟳'s promise and the launcher disagree about '{backend}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_that_would_not_load_is_reported_rather_than_swallowed() {
+        // The tree falls back to the BUILT-IN agent map when the user's config
+        // cannot be read, so `resumable` is computed against the wrong backends
+        // and the ⟳ appears (or vanishes) for a reason nothing on screen
+        // explains. Serving the tree anyway is right — a config typo must not
+        // blank the panel — but silently is not.
+        use crate::run::PhaseStatus::Done;
+        let run = tree_run(vec![ph("plan", Done, Some("w:p1"))], vec![]);
+        let cfg = crate::config::Config::default();
+
+        let clean = build_agent_tree(&run, &cfg, None);
+        assert_eq!(clean["config_error"], serde_json::Value::Null);
+
+        let broken = build_agent_tree(&run, &cfg, Some("expected a value at line 3"));
+        assert!(
+            broken["config_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("expected a value at line 3")),
+            "the reason has to reach the page: {broken}"
+        );
+        // …and the tree is still served, or a config typo blanks the panel.
+        assert_eq!(broken["nodes"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2034,6 +3954,85 @@ mod tests {
         assert!(
             text.contains(MARKDOWN_IT_SHA256),
             "PROVENANCE.toml does not record the pinned markdown-it digest {MARKDOWN_IT_SHA256}"
+        );
+    }
+
+    // -- the single-server lock ------------------------------------------------
+
+    /// Exclusivity *between processes* is what matters, and it is pinned by
+    /// `tests/serve_single.rs` (a second `drovr serve` is refused, and six racing
+    /// starts leave one server). Taking the same lock twice inside one process is
+    /// explicitly unspecified in std, so this covers the rest of the contract: the
+    /// pid lands in the file for humans, and dropping releases the claim.
+    ///
+    /// Deliberately path-based rather than data-dir based: nothing here touches
+    /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
+    /// that do — see "Test suite flakes under parallel `cargo test`" in
+    /// `docs/known-issues.md`.
+    #[test]
+    fn lock_records_our_pid_and_releases_on_drop() {
+        let tmp = make_root("lock-claim");
+        let path = tmp.path().join("server.pid");
+
+        // Every failure here reports the path and what the file held, because this test
+        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
+        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
+        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
+        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
+        // If it fails again, the message below is the evidence to file.
+        let whats_there = |when: &str| -> String {
+            format!(
+                "{when}: {} contains {:?}; this pid is {}",
+                path.display(),
+                fs::read_to_string(&path).unwrap_or_else(|e| format!("<unreadable: {e}>")),
+                std::process::id()
+            )
+        };
+
+        let held = try_take_lock(&path)
+            .unwrap_or_else(|e| panic!("claim failed: {e}; {}", whats_there("at claim")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a freshly created tempdir path was already locked. {}",
+                    whats_there("at claim")
+                )
+            });
+        assert_eq!(
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "the holder records its pid for humans to kill. {}",
+            whats_there("after claim")
+        );
+
+        // Nothing has to prove the holder died for the lock to be free again.
+        drop(held);
+        let _held = try_take_lock(&path)
+            .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a lock released by dropping its File was still held. {}",
+                    whats_there("after drop")
+                )
+            });
+    }
+
+    /// A server that was killed leaves the file behind with its pid in it. The
+    /// kernel released the lock when it died, so the file must not wedge a start.
+    #[test]
+    fn lock_ignores_a_stale_pid_in_the_file() {
+        let tmp = make_root("lock-stale");
+        let path = tmp.path().join("server.pid");
+        fs::write(&path, b"999999").expect("stale pid file");
+
+        let _held = try_take_lock(&path)
+            .expect("claim")
+            .expect("an unlocked file must be claimable");
+        assert_eq!(
+            fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()),
+            Some(std::process::id()),
+            "claiming replaces the dead server's pid with ours"
         );
     }
 
