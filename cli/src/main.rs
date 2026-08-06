@@ -1,3 +1,4 @@
+mod blocked;
 mod brief;
 mod code_review;
 mod config;
@@ -69,6 +70,35 @@ enum Commands {
 
     /// Attach to the current phase's pane.
     Attach { name: String },
+
+    /// Block until one of a run's agents is stuck on a prompt only a human can
+    /// answer, then exit reporting it.
+    ///
+    /// The push half of `drovr list`'s blocked column: run it in the background
+    /// and the harness wakes the driver when an agent stops. Destructive and
+    /// unrecognised prompts raise the alarm; routine permission dialogs do not
+    /// (a `drovr phase wait` answers those itself).
+    ///
+    /// With no run name it watches every run whose state reads — including ones
+    /// that have not started a phase yet, so it is safe to background BEFORE
+    /// `drovr phase start`.
+    ///
+    /// Exit codes: 4 = an agent needs a human (the same code `phase wait` uses
+    /// for a blocked pane); 0 = nothing left to watch (every agent has exited
+    /// AND every run has finished its phases); 2 = timeout, meaning only that no
+    /// agent needed a human in that window — re-run to keep watching; 1 = error,
+    /// including a run whose state could not be read, since nothing can be
+    /// claimed about a run that was never watched.
+    Watch {
+        /// The run to watch. Omit to watch every run drovr can read.
+        name: Option<String>,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+        /// How often to sweep herdr. The default is deliberately slow: a human
+        /// answering a prompt is not a millisecond-scale event.
+        #[arg(long, default_value_t = 5_000)]
+        interval_ms: u64,
+    },
 
     /// Stop the herdr session; optionally remove the run dir.
     Cleanup {
@@ -410,7 +440,7 @@ fn format_progress(run: &RunState) -> String {
 // Porcelain command handlers
 // ---------------------------------------------------------------------------
 
-fn cmd_list() {
+fn cmd_list<H: Herdr>(h: &H) {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
@@ -440,8 +470,31 @@ fn cmd_list() {
     }
 
     runs.sort_by(|a, b| a.name.cmp(&b.name));
+    // Which runs are worth sweeping for blocked agents: the ones still holding a
+    // live herdr workspace. Computed as a SET first, in one herdr call, because
+    // the alternative — asking about every recorded pane — means a `pane.get`
+    // failure, and a "polling is degraded" diagnostic on stderr, for every pane
+    // of every run that ever finished.
+    //
+    // Liveness is the whole gate. An ARCHIVED run is not excluded: archiving
+    // closes the workspace, so a still-live one means the close failed and
+    // something is running in panes drovr believes it shut — the last run whose
+    // stuck agent should go unreported.
+    let live: std::collections::HashSet<String> =
+        blocked::with_live_workspace(h, runs.to_vec())
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
     for run in &runs {
-        println!("{:20}  {}", run.name, format_progress(run));
+        let column = if live.contains(&run.name) {
+            blocked_column(&blocked::scan_run(h, run))
+        } else {
+            None
+        };
+        match column {
+            Some(col) => println!("{:20}  {}  {col}", run.name, format_progress(run)),
+            None => println!("{:20}  {}", run.name, format_progress(run)),
+        }
     }
 }
 
@@ -597,12 +650,18 @@ fn cmd_new(
     println!("created run '{}' at {}", name, run_dir(name).display());
 }
 
-fn cmd_status(name: &str) {
+fn cmd_status<H: Herdr>(h: &H, name: &str) {
     if let Err(e) = validate_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
     let run = load_run(name);
+    // Swept once, read twice: the phase table marks which lines are stuck, and
+    // the report below them says what they are stuck ON. Review panels are in
+    // the same sweep, and they have no row in the table — the report is the only
+    // place a blocked reviewer can surface.
+    let scan = blocked::scan_run(h, &run);
+    let blocked = &scan.blocked;
     println!("run: {}", run.name);
     println!("task: {}", run.task);
     for (i, p) in run.phases.iter().enumerate() {
@@ -611,18 +670,38 @@ fn cmd_status(name: &str) {
         } else {
             ""
         };
+        let stuck = match blocked.iter().find(|a| a.phase == p.name) {
+            Some(a) if a.class.needs_human() => format!("  BLOCKED ({})", a.class.as_str()),
+            Some(_) => "  blocked (routine)".to_string(),
+            None => String::new(),
+        };
         println!(
-            "  [{:2}] {:15} {}{}",
+            "  [{:2}] {:15} {}{}{}",
             i,
             p.name,
             phase_status_str(&p.status),
-            marker
+            marker,
+            stuck
         );
     }
     if let Some(idx) = run.first_incomplete() {
         println!("resume at phase {idx}: {}", run.phases[idx].name);
     } else {
         println!("all phases complete");
+    }
+    // A sweep that reached none of the run's panes must not print a healthy
+    // table and stop. `drovr list` says `? unreadable` for the same state, and
+    // `status` is where someone goes to find out WHY a run looks stuck — the one
+    // place a silent "we could not look" is most costly.
+    if scan.inconclusive() {
+        println!(
+            "\nherdr did not answer for any of this run's {} pane(s), so whether an agent is \
+             blocked is UNKNOWN — this table shows recorded status, not live state.",
+            scan.unreadable
+        );
+    }
+    for a in blocked {
+        println!("\n{}", blocked_report(&run.name, a));
     }
 }
 
@@ -866,6 +945,241 @@ fn cmd_attach(name: &str) {
         });
     if !status.success() {
         process::exit(status.code().unwrap_or(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked agents on the CLI surfaces
+// ---------------------------------------------------------------------------
+
+/// The blocked column `drovr list` appends to a run's row. `None` when nothing
+/// in the run is parked on a prompt.
+///
+/// Case carries the verdict, so the column is greppable and skimmable at once:
+/// **BLOCKED** is asking the reader to do something, lowercase `blocked` is
+/// telling them why a run looks slow. A routine permission dialog is answered by
+/// whatever `drovr phase wait` is running, so it is news, not an alarm.
+fn blocked_column(scan: &blocked::RunScan) -> Option<String> {
+    let blocked = &scan.blocked;
+    let Some(lead) = blocked
+        .iter()
+        .find(|a| a.class.needs_human())
+        .or_else(|| blocked.first())
+    else {
+        // Nothing blocked — but if the sweep reached none of this run's panes,
+        // "nothing blocked" is not something we learned. Say so rather than
+        // rendering the row identically to a healthy one, which is the same
+        // distinction the session list's `live: null` banner draws.
+        return scan
+            .inconclusive()
+            .then(|| "? unreadable (herdr did not answer)".to_string());
+    };
+    let word = if lead.class.needs_human() {
+        "BLOCKED"
+    } else {
+        "blocked"
+    };
+    let extra = match blocked.len() {
+        1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    Some(format!(
+        "{word} {} ({}){extra}",
+        lead.phase,
+        lead.class.as_str()
+    ))
+}
+
+/// The escalation block for one blocked agent: what it is parked on, the prompt
+/// itself, and the command that answers it.
+///
+/// Shared by `drovr status` and `drovr watch` so the two never describe the same
+/// pane differently — the whole point of a watcher is that what wakes you and
+/// what you then read say the same thing.
+fn blocked_report(run: &str, a: &blocked::BlockedAgent) -> String {
+    let verdict = if a.class.needs_human() {
+        format!(
+            "phase '{}' is BLOCKED on a {} prompt drovr will not answer itself",
+            a.phase,
+            a.class.as_str()
+        )
+    } else {
+        format!(
+            "phase '{}' is blocked on a routine permission prompt — a running \
+             `drovr phase wait` answers this one",
+            a.phase
+        )
+    };
+    format!(
+        "{verdict}\nPane {}:\n{}\nAnswer it: drovr attach {}",
+        a.pane_id,
+        a.excerpt,
+        shell_single_quote(run)
+    )
+}
+
+/// Every run `drovr watch` should consider: the one named, or every run whose
+/// `state.json` reads.
+///
+/// **No liveness filter here, deliberately.** `watch_tick` applies liveness
+/// itself, to decide what to SWEEP — filtering the list first made the no-name
+/// form exit 0 with "none has phases outstanding" on the first poll, having
+/// never read any run's phases, whenever herdr listed no matching workspace.
+///
+/// A run whose `state.json` will not parse is skipped rather than fatal — one
+/// broken run must not stop a watch over all the others — but it is COUNTED, so
+/// the caller can tell "there is nothing to watch" apart from "some of what I
+/// was asked to watch is unreadable". A run named EXPLICITLY is loaded through
+/// `load_run`, which exits 1 and says why.
+///
+/// `warned` carries the run names already reported, across polls: this runs
+/// every `interval_ms` for the life of the watch, and a permanently broken
+/// `state.json` would otherwise repeat its diagnostic every five seconds until
+/// the error it is trying to preserve has scrolled away.
+///
+/// It is stricter than `drovr list`'s own parse on purpose. `RunState::load`
+/// enforces the pane/reaped lifecycle; `cmd_list` takes anything serde accepts.
+/// A display surface should show what it can, while this one decides an exit
+/// code a harness acts on, and a run whose recorded state contradicts itself is
+/// not one to make claims about.
+fn runs_to_watch(name: Option<&str>, warned: &mut std::collections::HashSet<String>) -> WatchScope {
+    let Some(name) = name else {
+        // Only runs whose workspace herdr still has: a run whose panes died
+        // long ago holds their ids forever, and sweeping them would both cost a
+        // failed `pane.get` each and print a "polling is degraded" line per
+        // sweep, every interval, for the life of the watch.
+        let mut unparseable_runs = 0;
+        let runs: Vec<RunState> = run::list_runs_in(&run::runs_dir())
+            .into_iter()
+            .filter_map(|n| match RunState::load(&n) {
+                Ok(s) => Some(s),
+                // Named explicitly, this is exit 1. Swept over, it must not stop
+                // the watch — but it must not be silent either: that run is now
+                // unwatched, and a blocked agent in it can never wake anyone.
+                Err(e) => {
+                    if warned.insert(n.clone()) {
+                        eprintln!(
+                            "drovr: not watching run '{n}' — its state could not be read: {e}"
+                        );
+                    }
+                    unparseable_runs += 1;
+                    None
+                }
+            })
+            .collect();
+        return WatchScope {
+            runs,
+            unparseable_runs,
+        };
+    };
+    if let Err(e) = validate_run_name(name) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    WatchScope {
+        runs: vec![load_run(name)],
+        unparseable_runs: 0,
+    }
+}
+
+/// What a watch found to watch, and what it could not read while looking.
+///
+/// The two are separate because the watch's exit code turns on the difference:
+/// "every agent has exited and every run finished" (exit 0, the normal end) and
+/// "some of what I was asked to watch is unreadable" (exit 1) can otherwise
+/// present identically, and a harness that treats exit 0 as all-clear stops
+/// monitoring on the second.
+///
+/// `unparseable_runs` counts RUNS whose `state.json` would not load — named
+/// apart from [`crate::blocked::RunScan::unreadable`], which counts PANES herdr
+/// would not answer for. They are different units in the same feature, and one
+/// `unreadable` for both is how an exit-code predicate comes to be written
+/// against the wrong one.
+struct WatchScope {
+    runs: Vec<RunState>,
+    unparseable_runs: usize,
+}
+
+/// `drovr watch` — block until an agent needs a human, then exit 4.
+///
+/// The push half of the blocked column. Backgrounded, its exit is the driver's
+/// wake-up, the same shape `drovr review wait` uses for the spec gate: the
+/// harness reports the process ending, so nothing has to hot-poll `drovr list`.
+fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let interval = std::time::Duration::from_millis(interval_ms);
+    // Runs already reported as unreadable. The scope is rebuilt every poll, so
+    // without this a permanently broken `state.json` prints its diagnostic every
+    // `interval_ms` until the context it was meant to preserve has scrolled off.
+    let mut warned = std::collections::HashSet::new();
+    loop {
+        // Re-read every sweep: a phase that starts (or is reaped) while the watch
+        // runs changes what there is to watch, and a watch holding the state it
+        // booted with would keep polling a pane nobody records any more.
+        let scope = runs_to_watch(name, &mut warned);
+        match blocked::watch_tick(h, &scope.runs) {
+            blocked::WatchTick::Alarm(findings) => {
+                for f in &findings {
+                    eprintln!("drovr: run '{}' — {}", f.run, blocked_report(&f.run, &f.agent));
+                }
+                process::exit(4);
+            }
+            blocked::WatchTick::NothingToWatch => {
+                // Exit 0 is a CLAIM — "this is over, stop monitoring" — and a
+                // run we could not read is a run we cannot make it about. It
+                // does not matter that other runs finished cleanly: the
+                // unreadable one could be sitting on a destructive prompt, and
+                // nothing here would ever wake anyone for it.
+                if scope.unparseable_runs > 0 {
+                    eprintln!(
+                        "drovr: every run this watch could READ has finished, but {} could not \
+                         be read (see above) and was never watched — so this is not an all-clear",
+                        scope.unparseable_runs
+                    );
+                    process::exit(1);
+                }
+                // Not a failure and not an alarm: a finished run with every
+                // agent gone is the normal end, and saying so beats sitting out
+                // the timeout while the driver assumes work is still happening.
+                println!(
+                    "drovr: nothing left to watch — no run has an agent attached, and none \
+                     has phases outstanding"
+                );
+                process::exit(0);
+            }
+            blocked::WatchTick::Watching => {
+                if std::time::Instant::now() >= deadline {
+                    // Same rule as the branch above, and it has to be repeated
+                    // here because exit 2 is also a claim: "nothing needed you".
+                    // A run that was never watched cannot be part of that, and a
+                    // harness reads 2 as benign ("re-run to keep watching")
+                    // rather than as something to go and fix.
+                    if scope.unparseable_runs > 0 {
+                        eprintln!(
+                            "drovr: watch timed out after {timeout_ms}ms, and {} run(s) could \
+                             not be read (see above) and were never watched — so this is not \
+                             a quiet window, it is a partial one",
+                            scope.unparseable_runs
+                        );
+                        process::exit(1);
+                    }
+                    // Precise about what did NOT happen. This is "no agent asked
+                    // for a human", which is not the same as "nothing is
+                    // blocked": a routine permission prompt keeps the watch
+                    // running by design, and so does a pane herdr would not
+                    // answer for. A driver that read this as a clean bill of
+                    // health would stop looking at exactly the wrong moment.
+                    eprintln!(
+                        "drovr: watch timed out after {timeout_ms}ms — no agent needed a human \
+                         in that window. Agents were still attached (or herdr could not be \
+                         reached); routine prompts and unreadable panes do not end the watch. \
+                         Re-run to keep watching."
+                    );
+                    process::exit(2);
+                }
+                std::thread::sleep(interval);
+            }
+        }
     }
 }
 
@@ -1980,7 +2294,7 @@ fn main() {
     let herdr = SystemHerdr::new();
 
     match cli.command {
-        Commands::List => cmd_list(),
+        Commands::List => cmd_list(&herdr),
         Commands::New {
             name,
             task,
@@ -1988,8 +2302,13 @@ fn main() {
             worktree,
             no_worktree,
         } => cmd_new(&name, task, dir, worktree, no_worktree, &herdr),
-        Commands::Status { name } => cmd_status(&name),
+        Commands::Status { name } => cmd_status(&herdr, &name),
         Commands::Attach { name } => cmd_attach(&name),
+        Commands::Watch {
+            name,
+            timeout_ms,
+            interval_ms,
+        } => cmd_watch(&herdr, name.as_deref(), timeout_ms, interval_ms),
         Commands::Cleanup { name, purge } => cmd_cleanup(&name, purge, &herdr),
         Commands::Resurrect { name } => cmd_resurrect(&herdr, &name),
         Commands::Serve { host, port } => cmd_serve(host, port),
@@ -2961,6 +3280,126 @@ mod tests {
     fn parse_status() {
         let cli = parse(&["drovr", "status", "myrun"]).unwrap();
         assert!(matches!(cli.command, Commands::Status { name } if name == "myrun"));
+    }
+
+    #[test]
+    fn parse_watch_takes_an_optional_run() {
+        let all = parse(&["drovr", "watch"]).unwrap();
+        assert!(matches!(
+            all.command,
+            Commands::Watch {
+                name: None,
+                timeout_ms: 1_800_000,
+                interval_ms: 5_000,
+            }
+        ));
+        let one = parse(&["drovr", "watch", "myrun", "--timeout-ms", "60000"]).unwrap();
+        assert!(matches!(
+            one.command,
+            Commands::Watch { name: Some(n), timeout_ms: 60_000, .. } if n == "myrun"
+        ));
+    }
+
+    fn blocked_agent(phase: &str, class: crate::phase::BlockedClass) -> blocked::BlockedAgent {
+        blocked::BlockedAgent {
+            phase: phase.into(),
+            pane_id: "w:p2".into(),
+            class,
+            excerpt: "1. Yes\n2. No".into(),
+        }
+    }
+
+    /// A sweep that found `blocked`, with everything else healthy.
+    fn scan_of(blocked_agents: Vec<blocked::BlockedAgent>) -> blocked::RunScan {
+        blocked::RunScan {
+            attached: 1 + blocked_agents.len(),
+            unreadable: 0,
+            blocked: blocked_agents,
+        }
+    }
+
+    /// Case is the signal: uppercase asks the reader to act, lowercase explains
+    /// why a run looks slow. A routine prompt is answered by whatever
+    /// `drovr phase wait` is running, so shouting about it trains people to stop
+    /// reading the column.
+    #[test]
+    fn the_list_column_shouts_only_when_a_human_is_needed() {
+        use crate::phase::BlockedClass::{Destructive, Routine, Unknown};
+        assert_eq!(blocked_column(&scan_of(vec![])), None);
+        assert_eq!(
+            blocked_column(&scan_of(vec![blocked_agent("implement", Destructive)])).unwrap(),
+            "BLOCKED implement (destructive)"
+        );
+        assert_eq!(
+            blocked_column(&scan_of(vec![blocked_agent("plan", Unknown)])).unwrap(),
+            "BLOCKED plan (unknown)"
+        );
+        assert_eq!(
+            blocked_column(&scan_of(vec![blocked_agent("implement", Routine)])).unwrap(),
+            "blocked implement (routine)"
+        );
+    }
+
+    /// A sweep herdr would not answer is NOT a clean row. Rendering it as one
+    /// makes an unreachable herdr look exactly like a healthy run — the failure
+    /// mode the `unreadable` count exists to keep visible.
+    #[test]
+    fn a_sweep_that_learned_nothing_says_so_rather_than_showing_a_clean_row() {
+        let scan = blocked::RunScan {
+            blocked: vec![],
+            attached: 0,
+            unreadable: 3,
+        };
+        assert_eq!(
+            blocked_column(&scan).unwrap(),
+            "? unreadable (herdr did not answer)"
+        );
+        // A pane that answered is enough to trust the row: an agent that has
+        // exited is a normal, knowable state, not an outage.
+        let partial = blocked::RunScan {
+            blocked: vec![],
+            attached: 1,
+            unreadable: 1,
+        };
+        assert_eq!(blocked_column(&partial), None);
+    }
+
+    /// With several blocked panes the column names the one that needs a human —
+    /// not the first one found. A row that led with a routine prompt would hide
+    /// the destructive one behind a "+1 more".
+    #[test]
+    fn the_list_column_leads_with_the_pane_that_needs_a_human() {
+        use crate::phase::BlockedClass::{Destructive, Routine};
+        let col = blocked_column(&scan_of(vec![
+            blocked_agent("plan", Routine),
+            blocked_agent("implement", Destructive),
+        ]))
+        .unwrap();
+        assert_eq!(col, "BLOCKED implement (destructive) (+1 more)");
+    }
+
+    #[test]
+    fn the_report_quotes_the_prompt_and_names_the_way_in() {
+        use crate::phase::BlockedClass::Destructive;
+        let r = blocked_report("my run", &blocked_agent("implement", Destructive));
+        assert!(r.contains("BLOCKED on a destructive prompt"), "{r}");
+        assert!(r.contains("Pane w:p2"), "{r}");
+        assert!(r.contains("1. Yes"), "{r}");
+        assert!(
+            r.contains("drovr attach 'my run'"),
+            "the attach command must be pasteable: {r}"
+        );
+    }
+
+    /// A routine prompt says who WILL answer it, so a human reading `drovr
+    /// status` does not go and answer a prompt drovr was about to handle.
+    #[test]
+    fn the_report_says_when_nobody_needs_to_act() {
+        use crate::phase::BlockedClass::Routine;
+        let r = blocked_report("r", &blocked_agent("implement", Routine));
+        assert!(r.contains("routine permission prompt"), "{r}");
+        assert!(r.contains("drovr phase wait"), "{r}");
+        assert!(!r.contains("BLOCKED"), "no alarm for a routine prompt: {r}");
     }
 
     #[test]

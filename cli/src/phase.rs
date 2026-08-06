@@ -4429,7 +4429,11 @@ fn detect_stuck_prompt(pane: &str) -> Option<&'static str> {
 
 /// The last `n` non-blank lines of `pane`, joined — a compact snippet to quote
 /// in the diagnostic so the human can recognize the prompt without attaching.
-fn tail_snippet(pane: &str, n: usize) -> String {
+///
+/// Shared with [`crate::blocked`], which quotes the same tail into the browser
+/// badge and `drovr watch`, so every surface that shows a human "what is your
+/// agent stuck on" shows them the same lines.
+pub(crate) fn tail_snippet(pane: &str, n: usize) -> String {
     let lines: Vec<&str> = pane
         .lines()
         .map(str::trim_end)
@@ -4502,6 +4506,34 @@ pub enum BlockedClass {
     /// A prompt that is neither recognizably destructive nor on the routine
     /// allow-list. Escalate to a human rather than guessing.
     Unknown,
+}
+
+impl BlockedClass {
+    /// Whether a HUMAN has to answer this prompt, as opposed to a driver's
+    /// `phase wait` answering it.
+    ///
+    /// The escalation rule lives here, on the enum that decides it, so a caller
+    /// holding only a class never has to re-encode `!matches!(Routine)` — a new
+    /// variant then changes the policy in one place rather than in every site
+    /// that spelled the match out.
+    ///
+    /// It is the same line [`triage_blocked_phase`] draws: destructive and
+    /// unknown prompts are never auto-answered, so nothing clears them until a
+    /// person acts.
+    pub fn needs_human(self) -> bool {
+        !matches!(self, BlockedClass::Routine)
+    }
+
+    /// The wire name, as the review server's JSON and the CLI's watcher output
+    /// spell it. One spelling for both so a badge and a log line about the same
+    /// pane never disagree about what it is blocked on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedClass::Destructive => "destructive",
+            BlockedClass::Routine => "routine",
+            BlockedClass::Unknown => "unknown",
+        }
+    }
 }
 
 /// Substrings that mark a blocked pane as a DESTRUCTIVE / dangerous confirmation.

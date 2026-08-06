@@ -3872,3 +3872,121 @@ Write `feedback-<turn>.json` alongside `feedback.json` (keep the stable path as 
 pointer so every existing reader and the documented run-dir contract in `README.md` are unaffected).
 The run dir already carries per-task artifacts with this shape (`<task>-review-<n>.head`), so it
 matches the existing convention and costs one extra `fs::write` per submit.
+
+## A routine permission prompt notifies nobody when no `phase wait` is running (2026-08-06)
+
+**Severity:** medium — the run stalls indefinitely and every alarm surface stays deliberately quiet.
+**Found:** 2026-08-06, designing the blocked-agent watchers.
+
+### Symptom
+
+A phase agent hits an ordinary tool-permission prompt ("Do you want to make this edit to `x.rs`?").
+Nothing raises an alarm: `drovr watch` keeps watching, the session-list badge renders in the quiet
+weight, no notification fires, and `drovr list` shows a lowercase `blocked`. The run makes no
+progress until someone happens to look.
+
+### Root cause
+
+Deliberate, and only half-true in the state that produces this. Alarms are gated on
+`BlockedAgent::needs_human`, which is false for `BlockedClass::Routine` because
+`phase::triage_blocked_phase` AUTO-ANSWERS routine prompts — a badge firing on every file-edit
+dialog would train people to dismiss the one that matters.
+
+But that triage only runs from inside `drovr phase wait`. A phase nobody is waiting on — the driver
+was compacted, the wait timed out and was never re-armed, the phase was driven by hand — has no
+auto-answerer, so the prompt drovr classified as "someone else will handle this" is handled by no
+one. Same shape as "A finished phase reports `running` forever unless the driver happens to run
+`phase wait`": a fact that is true only on the path where a wait exists.
+
+### Impact
+
+Bounded but real. The run is visibly stalled to anyone reading `drovr list` or the session list (the
+quiet badge names the phase), so it is a *notification* gap rather than an invisible one. The
+severity is that the quiet weight is the honest rendering when a wait IS running, and the two states
+are indistinguishable from the scan alone.
+
+### Fix ideas
+
+Make the distinction observable rather than assumed. `drovr phase wait` could stamp the run dir with
+a liveness marker (a `<phase>.waiting` file it removes on exit), letting the scan ask "is anyone
+actually going to answer this?" instead of assuming someone is. A cheaper version: escalate a
+routine prompt that has been sitting for more than N sweeps, which needs the scan to remember when
+it first saw a block. Do not simply alarm on every routine prompt — the noise is what the split
+exists to avoid.
+
+## Viewing a finished run's page logs a herdr diagnostic every blocked sweep (2026-08-06)
+
+**Severity:** low — noise in `drovr serve`'s own log, bounded and self-limiting.
+**Found:** 2026-08-06, live-checking the blocked scan against a run whose workspace was gone.
+
+### Symptom
+
+With a run's page open in the review UI, the server's stderr grows a line per dead pane per sweep:
+
+```
+drovr: herdr's pane.get failed for pane wZZ:p9: pane wZZ:p9 not found …
+Agent status polling is degraded — phase sends and waits will run to their timeouts …
+```
+
+### Root cause
+
+A run keeps its recorded `pane_id`s forever — nothing clears them when a session ends — so
+`blocked::scan_run` asks herdr about panes that no longer exist, and `SystemHerdr::pane_info`
+reports every failed `pane.get` on stderr. `GET /api/runs/<run>/agents` scans unconditionally,
+unlike `/api/runs` and `drovr list`, which skip runs whose workspace herdr no longer lists.
+
+That asymmetry is deliberate: the session list sweeps EVERY run (so the noise is multiplied by the
+whole data dir), while the agent tree sweeps the one run a human deliberately opened and should say
+what it can about it, even if the workspace id reads oddly.
+
+### Impact
+
+Bounded by the 5s scan cache — at most one burst per run per 5s however many tabs are open — and it
+lands in the daemon's log rather than in front of anyone. The diagnostic's own wording is also
+misleading here: nothing is waiting on those panes, so nothing will "run to its timeout".
+
+### Fix idea
+
+Herdr's diagnostic is the thing that is wrong for this caller, not the scan: a poll whose whole
+purpose is to find out whether a pane is still there does not need to be told, loudly, that it is
+not. See also "herdr's 'polling is degraded' diagnostic fires on a reap's EXPECTED path" — the same
+diagnostic, the same mismatch, a different caller. One fix (a quiet form of the poll for callers
+that treat a missing pane as an answer) covers both.
+
+## A partially unreadable sweep is cached as a clean answer (2026-08-06)
+
+**Severity:** low — a five-second window, and only for a run where some panes answer and others do not.
+**Found:** 2026-08-06, review round 2 of the blocked-agent watchers.
+
+### Symptom
+
+A run has three panes. herdr answers for two and not for the third. If the unanswered one is the
+pane that is blocked, `/api/runs` reports `blocked: null` — a clean row — and the answer is cached
+for the full `BLOCKED_TTL`.
+
+### Root cause
+
+`RunScan::inconclusive()` is `attached == 0 && unreadable > 0`: a sweep counts as having learned
+something the moment ANY pane answers. A partial failure is therefore treated as conclusive.
+
+The reason it is drawn there is `pane_info`'s contract. It returns the same `None` for "herdr is
+unreachable" and for "that pane id does not name anything any more", and the second is *permanent* —
+a run that keeps a dangling pane id (a pane the human closed by hand, say) would be flagged
+uncertain on every poll forever. Since an inconclusive sweep is deliberately never cached, that run
+would also re-sweep herdr every 2s for the rest of the server's life, which is the cost the cache
+exists to avoid.
+
+### Impact
+
+Bounded: it takes a run where herdr answers for some panes but not the one that is blocked, and it
+self-heals on the next sweep that reaches the pane. The alarm-holding rule on the browser side only
+fires on `unknown`, so this window is also a window where a *cleared* alarm could be dropped.
+
+### Fix idea
+
+The fix is at the herdr boundary, not here: `pane_info` collapsing "socket down" and "pane gone"
+into one `None` is what forces the heuristic. herdr distinguishes them — the failure carries
+`pane_not_found` — so a poll result that says which would let `inconclusive()` be exact ("any pane
+we could not REACH", ignoring panes herdr positively reported as gone) with no permanent-uncertainty
+problem. That is a change to drovr's core poll primitive and its documented contract, so it wants
+its own change rather than riding along with a feature.

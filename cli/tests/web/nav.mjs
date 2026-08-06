@@ -2096,6 +2096,235 @@ check('the review panel stays hidden on the session list',
 check('...and the session list is still what is on screen', (await rowNames()).length > 0, true);
 await evaluate(`window.fetch = window.__origFetch2; return 1;`);
 
+console.log('\n== blocked-agent alarms ==');
+// The badge is server-fed and needs a herdr with a genuinely stuck agent, which
+// this harness has no way to produce. What IS testable — and is where the bugs
+// live — is the page's own bookkeeping: notify once per block, restore the title
+// when it clears, and never let one view's feed clear another view's alarms.
+//
+// The run names below are deliberately absent from the fixture, so the 2s
+// session-list poll (which syncs with the real, unblocked runs) cannot clear
+// them mid-section.
+await goto('#/', LIST_READY);
+await evaluate(`
+  window.__notes = [];
+  window.__origNotifyBlocked = notifyBlocked;
+  // Returns true, as the real one does when the notification went out —
+  // syncBlockedAlarms records "announced" from that answer.
+  notifyBlocked = function(label) { window.__notes.push(label); return window.__notifyOk; };
+  window.__notifyOk = true;
+  blockedAlarms = {}; blockedNotified = {};
+  applyBlockedTitle();
+  return 1;`);
+const sync = (alarms, scope, uncertain) => evaluate(
+  `syncBlockedAlarms(${JSON.stringify(alarms)}, ${JSON.stringify(scope)}, ` +
+  `${JSON.stringify(uncertain || [])}); return document.title;`);
+const notes = () => evaluate(`return window.__notes.slice();`);
+
+const A = { key: 'zz-one/implement', label: 'zz-one · implement is stopped on a destructive prompt' };
+check('a new block puts a count in the tab title',
+  (await sync([A], ['zz-one'])).slice(0, 6), '⚠ (1) ');
+check('...and fires exactly one notification', await notes(), [A.label]);
+await sync([A], ['zz-one']);
+check('a block that persists across polls does not re-notify', (await notes()).length, 1);
+
+const B = { key: 'zz-two/plan', label: 'zz-two · plan is stopped on an unknown prompt' };
+check('a second stuck run raises the count',
+  (await sync([A, B], ['zz-one', 'zz-two'])).slice(0, 6), '⚠ (2) ');
+check('...and notifies only about the new one', (await notes()).length, 2);
+
+// The scope rule: the run detail view can only speak for the run it is showing.
+check('a feed scoped to one run leaves the others alone',
+  (await sync([A], ['zz-one'])).slice(0, 6), '⚠ (2) ');
+check('a feed that CAN speak for a run clears it',
+  (await sync([A], ['zz-one', 'zz-two'])).slice(0, 6), '⚠ (1) ');
+check('the title goes back to normal when nothing is stuck',
+  await sync([], ['zz-one', 'zz-two']), 'Drovr Review Loop');
+check('a block that recurs after clearing notifies again',
+  (await sync([A], ['zz-one']), (await notes()).length), 3);
+
+
+// A null scope is the session list's: it fetched every run there is, so it can
+// clear a key whose run has since been purged. Scoped to the names it happened
+// to SEE, such a key would be in neither the feed nor the scope, and the count
+// would carry a phantom for the rest of the session.
+check('a run that disappears from the list stops counting',
+  await sync([], null), 'Drovr Review Loop');
+// Two agents of one run — a phase and its review panel — stuck at once.
+const C = { key: 'zz-one/review:task-1:1:security', label: 'zz-one · panel is stopped' };
+check('two blocks in one run are two alarms, not one',
+  (await sync([A, C], null)).slice(0, 6), '⚠ (2) ');
+check('...and both are notified', (await notes()).length, 5);
+
+// A notification the browser refused is not a notification delivered: the next
+// poll must try again rather than record it as sent.
+await evaluate(`window.__notifyOk = false; return 1;`);
+await sync([], ['zz-one']);
+await sync([A], ['zz-one']);
+const afterRefusal = (await notes()).length;
+await sync([A], ['zz-one']);
+check('a refused notification is retried on the next poll',
+  (await notes()).length, afterRefusal + 1);
+// Put back the two zz-one alarms this check cleared — the sections below count
+// on them.
+await evaluate(`window.__notifyOk = true; return 1;`);
+await sync([A, C], null);
+
+// A poll that SUCCEEDED while herdr was down carries no evidence that a block
+// went away. Clearing on it would drop the notification for an agent that is
+// still stuck — the opposite of what a failed fetch does.
+// Both live alarms at this point are zz-one's (the phase and its panel), so
+// holding that run holds both.
+check('a run whose sweep could not reach herdr keeps its alarms',
+  (await sync([], null, ['zz-one'])).slice(0, 6), '⚠ (2) ');
+check('...and only clears once a sweep that reached it says so',
+  await sync([], null, []), 'Drovr Review Loop');
+
+check('a destructive prompt renders an alarming badge',
+  await evaluate(`var h = blockedBadge({count:1, human_phases:['implement'], phase:'implement', class:'destructive'});
+    return [h.indexOf('needs-human') !== -1, h.indexOf('⚠ blocked') !== -1];`), [true, true]);
+check('a routine prompt renders a quiet one',
+  await evaluate(`var h = blockedBadge({count:1, human_phases:[], phase:'implement', class:'routine'});
+    return [h.indexOf('needs-human') !== -1, h.indexOf('⚠') !== -1];`), [false, false]);
+check('several blocks in one run are counted on the badge',
+  await evaluate(`return blockedBadge({count:3, human_phases:['implement'], phase:'implement', class:'unknown'})
+    .indexOf('+2') !== -1;`), true);
+check('nothing blocked renders nothing',
+  await evaluate(`return blockedBadge(null);`), '');
+check('a sweep that reached nothing renders as unknown, not as clean',
+  await evaluate(`var h = blockedBadge({count:0, phase:null, class:null, human_phases:[], inconclusive:true});
+    return [h.indexOf('? unknown') !== -1, h.indexOf('needs-human') !== -1];`), [true, false]);
+check('a blocked review panel nested under a phase is still found',
+  await evaluate(`return treeBlocked([{ name: 'implement-task-1', blocked: null, children: [
+      { name: 'review:task-1:1:security', blocked: { needs_human: true, class: 'unknown' } },
+      { name: 'review:task-1:1:perf', blocked: { needs_human: false, class: 'routine' } }] }])
+    .map(function(n){ return n.name; });`), ['review:task-1:1:security']);
+
+// The run-detail page is fed ONLY by /agents — the session-list poll has
+// stopped there. So the wiring, not just the bookkeeping, has to honour the
+// tree's `inconclusive`: this is the path where a herdr blip could dismiss the
+// notification for an agent that is still stuck.
+await goto('#/runs/alpha-deploy', {
+  probe: () => evaluate(`return currentRun;`), ok: r => r === 'alpha-deploy', label: 'alpha detail',
+});
+// The page's own 2s agent poll is stopped first, and each phase seeds its
+// alarm inside the SAME evaluate that polls and reads the title. Both matter:
+// a real poll already in flight resolves with a tree that reports a conclusive
+// empty sweep, and it would clear the seeded alarm between two round-trips.
+await evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);   // the detail view's own /api/runs feed
+  routeGen++;                       // orphan any poll still in flight
+  window.__origFetch3 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('/agents') !== -1) {
+      return Promise.resolve({ ok: true, json: function() {
+        return Promise.resolve({ nodes: [], workspace: 'w',
+                                 inconclusive: window.__treeInconclusive }); } });
+    }
+    return window.__origFetch3.apply(window, arguments);
+  };
+  return 1;`);
+const pollWithTree = (inconclusive) => evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.__treeInconclusive = ${inconclusive};
+  blockedAlarms = { 'alpha-deploy/implement': 'stuck' };
+  blockedNotified = { 'alpha-deploy/implement': true };
+  applyBlockedTitle();
+  return pollAgents(routeGen).then(function(){ return document.title; });`);
+check('a run-detail poll whose sweep reached nothing keeps the alarm',
+  (await pollWithTree(true)).slice(0, 6), '⚠ (1) ');
+check('...and a sweep that DID reach the run clears it',
+  await pollWithTree(false), 'Drovr Review Loop');
+await evaluate(`
+  if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.fetch = window.__origFetch3;
+  return 1;`);
+
+// Opening a session must not stop watching every OTHER run. The list view is
+// not rendered here, so nothing would fetch /api/runs without `pollAlarms` —
+// and a reviewer parked on one run's page is the normal case, not the edge one.
+check('the run-detail view still raises alarms for other runs', await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  window.__origFetch4 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('/api/runs') !== -1 && String(u).indexOf('/api/runs/') === -1) {
+      return Promise.resolve({ ok: true, json: function() {
+        return Promise.resolve([{ name: 'other-run', blocked:
+          { count: 1, phase: 'implement', class: 'destructive', human_phases: ['implement'],
+            inconclusive: false } }]); } });
+    }
+    return window.__origFetch4.apply(window, arguments);
+  };
+  return pollAlarms(routeGen).then(function(){ return document.title; });`),
+  '⚠ (1) Drovr Review Loop');
+await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.fetch = window.__origFetch4;
+  return 1;`);
+
+// A response that started before a newer one must not apply. It does not merely
+// repaint stale data — `syncBlockedAlarms` DELETES keys, so a late empty payload
+// clears a live alarm and the next poll re-notifies for a block that never went
+// away.
+check('a stale alarm poll cannot clear an alarm a newer one raised', await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  window.__origFetch5 = window.fetch;
+  window.__releaseStale = null;
+  window.__payload = [{ name: 'late-run', blocked:
+    { count: 1, phase: 'implement', class: 'destructive', human_phases: ['implement'],
+      inconclusive: false } }];
+  window.fetch = function(u) {
+    if (String(u).indexOf('/api/runs') !== -1 && String(u).indexOf('/api/runs/') === -1) {
+      var body = window.__payload;
+      if (!window.__parked) {
+        window.__parked = true;
+        return new Promise(function(res) {
+          window.__releaseStale = function() {
+            res({ ok: true, json: function() { return Promise.resolve(body); } });
+          };
+        });
+      }
+      return Promise.resolve({ ok: true, json: function() { return Promise.resolve(body); } });
+    }
+    return window.__origFetch5.apply(window, arguments);
+  };
+  // Chain A parks on an empty payload; chain B then completes with the block.
+  window.__payload = [];
+  var stale = pollAlarms(routeGen);
+  return new Promise(function(done) {
+    setTimeout(function() {
+      window.__payload = [{ name: 'late-run', blocked:
+        { count: 1, phase: 'implement', class: 'destructive',
+          human_phases: ['implement'], inconclusive: false } }];
+      if (alarmsTimer) clearTimeout(alarmsTimer);
+      pollAlarms(routeGen).then(function() {
+        if (alarmsTimer) clearTimeout(alarmsTimer);
+        window.__releaseStale();                 // the OLD response lands last
+        stale.then(function() {
+          if (alarmsTimer) clearTimeout(alarmsTimer);
+          done(document.title);
+        });
+      });
+    }, 0);
+  });`),
+  '⚠ (1) Drovr Review Loop');
+await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.fetch = window.__origFetch5;
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  return 1;`);
+
+// Leave the page as found: later sections (and the 2s poll) share this tab.
+await evaluate(`
+  notifyBlocked = window.__origNotifyBlocked;
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  return 1;`);
+
 console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped\n`);
 ws.close();
 clearTimeout(watchdog);

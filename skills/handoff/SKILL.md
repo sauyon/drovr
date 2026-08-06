@@ -119,6 +119,12 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    The wait is stateless and resumable: it polls an on-disk marker, so nothing is lost by
    re-issuing it and a phase that finished during the gap is detected immediately.
 
+   **`phase wait` only sees the phase you named.** It is the right tool while you are driving one
+   phase and have nothing else in flight. When several agents are running — a panel, or two phases
+   across two runs — background `drovr watch [<run>]` instead (or as well): it exits `4` the moment
+   ANY of them stops on a prompt only a human can answer, and `0` when every agent has exited.
+   Answer the prompt, then re-arm exactly as above.
+
 4. **Collect + hand forward.**
    ```
    drovr collect <run> <phase>
@@ -134,6 +140,7 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 | inspect | `drovr phase brief <run> <phase> [--context …]` | prints exactly what the agent is told, spawning nothing |
 | re-brief | `drovr phase brief … \| drovr phase send <run> <phase> -` | for a phase already running; `phase send "<text>"` is for free-form nudges only |
 | wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `5`=superseded by a newer pass → re-arm, not a stuck agent · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
+| watch | `drovr watch [<run>] --timeout-ms <ms>` | **run backgrounded**; exits when ANY agent (of the run, or of every run drovr can read) stops on a prompt drovr will not answer. `4`=needs a human, the report names the phase and quotes the prompt · `0`=nothing left to watch (every agent gone AND every run's phases finished) · `2`=timeout → re-arm · `1`=error, including any run whose state could not be read. Routine permission dialogs do not wake it — a running `phase wait` answers those. Safe to background BEFORE `phase start`: a run with phases outstanding keeps it watching |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
 | scaffold | `drovr handoff-scaffold <run> <phase>` | writes the empty 7 sections for the AGENT to fill; refuses to overwrite an authored one. Structure only — drovr does not guess which commits are yours. `phase done` refuses while any section is still `TODO` |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |

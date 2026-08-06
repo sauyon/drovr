@@ -665,6 +665,26 @@
   .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
 
+  /* ---- Blocked agents ----
+     Two weights, because the two facts are not equally urgent: `needs-human` is
+     a prompt drovr will NEVER answer itself (destructive, or unrecognised), and
+     nothing moves until a person acts. The plain badge is a routine permission
+     dialog, which a running `drovr phase wait` answers — worth explaining a
+     stalled-looking run, not worth alarming anyone. */
+  .run-blocked, .agent-blocked {
+    font-size: 11px; font-weight: 600; border-radius: 4px;
+    padding: 1px 6px; white-space: nowrap;
+    background: rgba(127,127,127,0.18); color: var(--muted, #999);
+  }
+  .run-blocked.needs-human, .agent-blocked.needs-human {
+    background: rgba(229,83,75,0.18); color: #e5534b;
+  }
+  .agent-blocked { margin-left: 6px; cursor: help; }
+  /* The badge must survive the .is-complete dimming: a run that finished its
+     phases while a review panel sits on a prompt is exactly the case nobody
+     notices. */
+  .run-row.is-complete .run-blocked.needs-human { color: #e5534b; opacity: 1; }
+
   /* ---- Completion ---- */
   .run-row.is-complete { opacity: 0.55; }
   .run-row.is-complete:hover { opacity: 1; }
@@ -887,7 +907,14 @@
       <h1>Drovr Review</h1>
       <span class="turn-badge" id="turn-badge"></span>
     </div>
-    <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <!-- Browsers only grant notification permission from a user gesture, so
+           this cannot be requested on load. Hidden once the answer is in:
+           granted needs no button, and denied cannot be re-asked from script. -->
+      <button id="notify-btn" style="display:none" onclick="enableBlockedNotifications()"
+              title="Get a desktop notification when one of your agents stops on a prompt only you can answer">Notify me</button>
+      <button id="theme-btn" onclick="toggleTheme()">Toggle theme</button>
+    </div>
   </div>
 
   <!-- Session list (landing view): every run under the drovr data dir. -->
@@ -2348,6 +2375,186 @@ var completedOpen = (function() {
   try { return localStorage.getItem('drovr.completedOpen') === '1'; } catch (e) { return false; }
 })();
 
+// ---------------------------------------------------------------------------
+// Blocked-agent alarms: the tab title, and the desktop notification
+// ---------------------------------------------------------------------------
+//
+// The badges above are only seen by someone LOOKING at the page. These two are
+// for the reviewer who left the tab open and went to do something else — which
+// is the whole situation a stuck agent creates.
+//
+// Only `needs_human` blocks get here. A routine permission dialog is answered by
+// whatever `drovr phase wait` is running, and notifying about it would train the
+// reviewer to dismiss the notification that matters.
+
+// key ("<run>/<phase>") -> label, for everything currently stuck.
+var blockedAlarms = {};
+// key -> true, for blocks already announced. Kept separately from the set above
+// so a block that clears and recurs announces itself again, while a block that
+// merely persists across polls does not re-fire every 2s.
+var blockedNotified = {};
+var baseTitle = document.title;
+
+/// Fold one feed's view of the world into the alarm set.
+///
+/// `scope` is the runs this feed can speak for — the agent tree only for the run
+/// being viewed. Keys outside the scope are LEFT ALONE rather than treated as
+/// cleared: the run detail view knows nothing about the other runs, and dropping
+/// them would re-announce every one of them on the way back to the list.
+///
+/// Pass `null` for a feed that speaks for EVERYTHING — which the session list
+/// does, since it fetches every run there is. Scoping it to the run names it
+/// happened to see would strand the alarm of a run that has since been purged:
+/// its key is in neither the feed nor the scope, so nothing would ever clear it
+/// and the tab title would carry a phantom count for the rest of the session.
+///
+/// `uncertain` names the runs whose sweep could not reach their panes (the
+/// server's `blocked.inconclusive`, or the agent tree's own). Their alarms are
+/// HELD, never cleared: a poll that succeeded while herdr was down carries no
+/// evidence that a block went away, and clearing on it would silently drop the
+/// notification for an agent that is still stuck — the opposite of what a failed
+/// fetch does two frames later.
+function syncBlockedAlarms(alarms, scope, uncertain) {
+  var inScope = null;
+  if (scope) {
+    inScope = {};
+    scope.forEach(function(name) { inScope[name] = true; });
+  }
+  var unsure = {};
+  (uncertain || []).forEach(function(name) { unsure[name] = true; });
+  var seen = {};
+  alarms.forEach(function(a) { seen[a.key] = true; });
+  Object.keys(blockedAlarms).forEach(function(key) {
+    var run = keyRun(key);
+    if ((inScope === null || inScope[run]) && !seen[key] && !unsure[run]) {
+      delete blockedAlarms[key];
+      delete blockedNotified[key];
+    }
+  });
+  alarms.forEach(function(a) {
+    blockedAlarms[a.key] = a.label;
+    if (blockedNotified[a.key]) return;
+    // Marked notified only if the notification actually went out. Setting it
+    // first meant a constructor that threw (some browsers refuse one outside a
+    // service worker) lost the desktop alert for the whole episode, with the
+    // next poll believing it had already been sent.
+    blockedNotified[a.key] = notifyBlocked(a.label);
+  });
+  applyBlockedTitle();
+}
+
+/// The run half of a "<run>/<phase>" key. Phase names carry `:` (review panels)
+/// but never `/`, and `validate_run_name` keeps `/` out of run names too, so the
+/// FIRST separator is the boundary.
+function keyRun(key) {
+  var i = key.indexOf('/');
+  return i < 0 ? key : key.slice(0, i);
+}
+
+/// Put the count in the tab title. This is the notification that always works:
+/// it needs no permission, and it is what a reviewer with the tab in a
+/// background window actually sees.
+function applyBlockedTitle() {
+  var n = Object.keys(blockedAlarms).length;
+  document.title = n ? '⚠ (' + n + ') ' + baseTitle : baseTitle;
+}
+
+/// Fire the desktop notification. Returns whether the alarm can be considered
+/// announced — false both when notifications are unavailable (the tab title
+/// still carries it, and there is nothing to retry) and when the constructor
+/// threw, where the next poll SHOULD try again rather than assume it landed.
+function notifyBlocked(label) {
+  if (typeof Notification === 'undefined') return true;  // nothing to retry, ever
+  if (Notification.permission === 'denied') return true; // ditto: the answer is no
+  // 'default' — the reviewer has not answered the permission prompt yet, and
+  // may be about to click "Notify me". Reporting this as delivered would mark
+  // the alarm announced and leave the block permanently silent on the desktop
+  // even after they grant it; the next poll retries instead, at no cost.
+  if (Notification.permission !== 'granted') return false;
+  try {
+    new Notification('drovr — agent blocked', { body: label, tag: label });
+    return true;
+  } catch (e) {
+    // Some browsers refuse a Notification constructed outside a service worker.
+    // The title count already carried the fact, so this must not break the poll
+    // that called us — but it must not be recorded as delivered either.
+    console.warn('[drovr] desktop notification failed', e);
+    return false;
+  }
+}
+
+/// Ask for notification permission. Only reachable from the button, because
+/// browsers ignore (and Chrome permanently holds against you) a request that did
+/// not come from a user gesture.
+function enableBlockedNotifications() {
+  if (typeof Notification === 'undefined') return;
+  Notification.requestPermission().then(syncNotifyButton).catch(function() {});
+}
+
+/// Raise alarms from a `/api/runs` payload.
+///
+/// One alarm per stuck PHASE, from `human_phases` — not one per run. Two agents
+/// of one run can be stuck at once (a phase and a review panel), and a per-run
+/// alarm would announce the first and swallow the second.
+///
+/// Scope `null`: this payload is every run there is, so it is entitled to clear
+/// a key for a run that has since vanished from the list.
+function alarmsFromRunList(runs) {
+  var alarms = [];
+  var uncertain = [];
+  runs.forEach(function(x) {
+    if (x.blocked && x.blocked.inconclusive) uncertain.push(x.name);
+    ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
+      alarms.push({
+        key: x.name + '/' + phase,
+        label: x.name + ' · ' + phase + ' is stopped on a prompt drovr will not answer',
+      });
+    });
+  });
+  syncBlockedAlarms(alarms, null, uncertain);
+}
+
+/// The alarm feed for the RUN DETAIL view, where the session list is not being
+/// rendered and so is not being fetched.
+///
+/// Without it, opening a session silently stops watching every other run: only
+/// `pollAgents` would be feeding alarms, scoped to the run on screen. A reviewer
+/// parked on one run's page — which is where they spend their time — would get
+/// no badge, no title count, and no notification for a different run's agent
+/// walking into a destructive prompt.
+///
+/// It fetches the same `/api/runs` the list view does, so it costs one request
+/// per tick and no extra server work: the sweep behind it is TTL-cached per run.
+/// Nothing is rendered from it — the list DOM is not on screen.
+async function pollAlarms(gen) {
+  if (gen !== routeGen) return;
+  // `routeGen` only changes when the VIEW does, so it cannot order two polls
+  // issued from the same view — and there can be two: `route()` starts this
+  // chain, and a re-entry with the same run leaves the previous chain's request
+  // in flight. An older response applying `syncBlockedAlarms` is not a stale
+  // repaint that the next tick fixes; it DELETES alarm keys, which re-notifies
+  // when the next poll raises them again. Same guard as `renderRunList`, for the
+  // same reason.
+  var seq = ++alarmsFetchSeq;
+  try {
+    var r = await fetch('/api/runs');
+    var runs = await r.json();
+    if (gen !== routeGen || seq !== alarmsFetchSeq) return;
+    alarmsFromRunList(runs);
+  } catch (e) { /* transient; a failed fetch clears nothing, by design */ }
+  if (gen === routeGen) alarmsTimer = setTimeout(function(){ pollAlarms(gen); }, 2000);
+}
+var alarmsTimer = null;
+var alarmsFetchSeq = 0;
+
+/// Show the button only while asking is both possible and useful.
+function syncNotifyButton() {
+  var btn = document.getElementById('notify-btn');
+  if (!btn) return;
+  var askable = typeof Notification !== 'undefined' && Notification.permission === 'default';
+  btn.style.display = askable ? '' : 'none';
+}
+
 // One list row. `complete` runs are dimmed and led by a check instead of the gate
 // dot, and their meta reports phase progress rather than the gate state — for a
 // finished run "approved" is stale trivia, "4/4 phases" is the useful fact.
@@ -2403,9 +2610,39 @@ function runRow(run) {
       dot +
       '<span class="run-name">' + escHtml(run.name) + '</span>' +
       '<span class="run-state">' + escHtml(meta) + '</span>' +
+      blockedBadge(run.blocked) +
       '<span class="run-task">' + escHtml(run.task || '') + '</span>' +
     '</a>' + btn +
   '</div>';
+}
+
+/// The session-list badge for `/api/runs`' `blocked` object (null when nothing
+/// in the run is parked on a prompt).
+///
+/// `human_phases` — not `count` — decides the weight. A run can be "blocked" on a
+/// file-edit permission dialog that a `drovr phase wait` is about to accept; a
+/// badge that shouts about those is a badge people learn to ignore, and then the
+/// destructive one goes unread too.
+function blockedBadge(blocked) {
+  if (!blocked) return '';
+  var urgent = ((blocked.human_phases || []).length) > 0;
+  // The sweep reached none of the run's panes, and nothing was found — which is
+  // not the same as nothing being there. Rendering it as a clean row is how a
+  // herdr outage comes to look like a healthy run.
+  if (!blocked.count && blocked.inconclusive) {
+    return '<span class="run-blocked" title="' + escHtml(
+      'drovr could not reach this run’s panes, so whether an agent is blocked is unknown.'
+    ) + '">? unknown</span>';
+  }
+  var extra = blocked.count > 1 ? ' +' + (blocked.count - 1) : '';
+  var title = urgent
+    ? 'Phase ' + blocked.phase + ' is stopped on a ' + blocked.class +
+      ' prompt — drovr will not answer it. Open the session to see it.'
+    : 'Phase ' + blocked.phase + ' is on a routine permission prompt; a running ' +
+      'drovr phase wait answers those.';
+  return '<span class="run-blocked' + (urgent ? ' needs-human' : '') +
+    '" title="' + escHtml(title) + '">' + (urgent ? '⚠ blocked' : 'blocked') +
+    escHtml(extra) + '</span>';
 }
 
 /// Archive or restore `name`. Confirms first whenever archiving could close live
@@ -2588,6 +2825,13 @@ async function renderRunList(gen, resetAnchor) {
     // Pre-filter, for the same reason `knownRunNames` is.
     var stillActive = runs.filter(function(x) { return !x.complete; })
                           .map(function(x) { return x.name; });
+    // Alarms are raised HERE — above the `/` filter and above the empty-list
+    // early return — because both of those are about what the reviewer chose to
+    // READ, and an agent stuck in a run they filtered out is still stuck.
+    // Running last, after the render, would also mean a filter matching nothing
+    // silently froze the alarm set at whatever it was.
+    //
+    alarmsFromRunList(runs);
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       resolvePendingAdvances(seq, stillActive);
@@ -2740,9 +2984,18 @@ function agentNodeHtml(node) {
     : '';
   var kids = (node.children && node.children.length)
     ? '<div class="agent-children">' + node.children.map(agentNodeHtml).join('') + '</div>' : '';
+  // The node's `status` is the PHASE status (Running / Done) — a phase parked on
+  // a permission prompt is still "Running", which is exactly why a stuck agent
+  // used to be invisible here. `blocked` is the live herdr answer beside it.
+  var blocked = '';
+  if (node.blocked) {
+    blocked = '<span class="agent-blocked' + (node.blocked.needs_human ? ' needs-human' : '')
+      + '" title="' + escHtml(node.blocked.excerpt || '') + '">'
+      + (node.blocked.needs_human ? '⚠ ' : '') + escHtml(node.blocked.class) + '</span>';
+  }
   return '<div class="' + cls + '" data-pane="' + escHtml(pane) + '">'
     + '<span class="agent-dot st-' + escHtml(node.status || '') + '"></span>'
-    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + rehydrate
+    + '<span class="agent-name">' + escHtml(node.name) + '</span>' + angle + blocked + rehydrate
     + '</div>' + kids;
 }
 
@@ -2754,6 +3007,21 @@ function agentsNote(text, bad) {
   el.textContent = text || '';
   el.classList.toggle('bad', !!bad);
   el.style.display = text ? '' : 'none';
+}
+
+// Every node in the tree, at any depth, that is blocked on something a human
+// must answer. Nested review panels count: a reviewer stuck on a prompt strands
+// the panel exactly as a phase agent strands the pipeline, and it has no row of
+// its own anywhere else.
+function treeBlocked(nodes) {
+  var out = [];
+  (function walk(list) {
+    (list || []).forEach(function(n) {
+      if (n.blocked && n.blocked.needs_human) out.push(n);
+      walk(n.children);
+    });
+  })(nodes);
+  return out;
 }
 
 // Every pane id currently in the tree, at any depth.
@@ -2768,12 +3036,20 @@ function treePanes(nodes) {
   return out;
 }
 
+var agentsFetchSeq = 0;
 async function pollAgents(gen) {
   if (gen !== routeGen) return;
+  // Two chains can run under one `routeGen`: the rehydrate handler clears the
+  // timer and calls this directly, which does not cancel a request already in
+  // flight. Ordering them matters more now than it did when this only painted a
+  // tree — it also feeds `syncBlockedAlarms`, where an older response DELETES
+  // alarm keys and the next poll then re-notifies for a block that never went
+  // away. Same guard, same reason, as `renderRunList`'s `listFetchSeq`.
+  var seq = ++agentsFetchSeq;
   try {
     var r = await fetch(api('agents'));
     var tree = await r.json();
-    if (gen !== routeGen) return;
+    if (gen !== routeGen || seq !== agentsFetchSeq) return;
     var el = document.getElementById('agents-tree');
     var nodes = (tree && tree.nodes) || [];
     // A config drovr could not read means `resumable` was decided by the
@@ -2783,6 +3059,25 @@ async function pollAgents(gen) {
     var cfgErr = document.getElementById('agents-config-error');
     cfgErr.textContent = (tree && tree.config_error) || '';
     cfgErr.style.display = cfgErr.textContent ? '' : 'none';
+    // The run view's feed into the alarm set. Scoped to this run alone — it is
+    // the only one this endpoint knows anything about, and claiming otherwise
+    // would clear every other run's alarm the moment someone opened a session.
+    //
+    // On this page the list poll has stopped, so this is the ONLY feed: if it
+    // cleared alarms on a sweep that reached no pane, opening a run during a
+    // herdr blip would silently dismiss the notification for an agent that is
+    // still stuck. `tree.inconclusive` is what says the sweep learned nothing.
+    syncBlockedAlarms(
+      treeBlocked(nodes).map(function(n) {
+        return {
+          key: currentRun + '/' + n.name,
+          label: currentRun + ' · ' + n.name + ' is stopped on a ' +
+                 n.blocked.class + ' prompt',
+        };
+      }),
+      [currentRun],
+      (tree && tree.inconclusive) ? [currentRun] : []
+    );
     el.innerHTML = nodes.length
       ? nodes.map(agentNodeHtml).join('')
       : '<div class="review-empty">No agents spawned yet.</div>';
@@ -2917,6 +3212,7 @@ async function route() {
   clearTimeout(pollTimer);
   clearTimeout(paneTimer);
   clearTimeout(agentsTimer);
+  clearTimeout(alarmsTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   // Only a real navigation resets the cursor. route() also re-runs every 2s to
@@ -3008,6 +3304,7 @@ async function route() {
   agentsNote('', false);   // a note belongs to the run it was raised in
   pollAgents(routeGen);
   pollPane(routeGen);
+  pollAlarms(routeGen);
   await refresh();
 }
 
@@ -3455,6 +3752,8 @@ document.getElementById('session-text').addEventListener('keydown', function(e){
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPane(); }
 });
 window.addEventListener('hashchange', function(){ route().catch(console.error); });
+// Reveal "Notify me" only while the browser would still take the question.
+syncNotifyButton();
 route().catch(console.error);
 initKeyNav();
 
