@@ -4024,14 +4024,27 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
         measured += 1;
     }
 
-    // Seeded against what is true: two re-measurement phases have run, one skill
-    // each — `remeasure-tdd` and `remeasure-systematic-debugging`. Without it the
-    // loop passes on a tree where every skill is `NotYetRun`.
+    // Guards the loop against going vacuous on a tree where every skill is
+    // `NotYetRun`. **Derived from `remeasure_scores()`, not a literal**: the
+    // expected count and the per-skill states are the same fact, and a magic
+    // number here has to be hand-bumped every time a skill is re-measured — which
+    // is a stale-literal bug waiting for the third re-measurement, not a check.
+    let declared = SkillName::ALL
+        .iter()
+        .filter(|s| matches!(s.remeasure_scores(), RemeasureScores::Recorded { .. }))
+        .count();
+    assert!(
+        declared > 0,
+        "no skill is declared `RemeasureScores::Recorded`, so this test reads five \
+         evidence files and asserts nothing about any of them. If the last \
+         re-measurement was retracted, delete this check with it rather than leaving \
+         it green and empty"
+    );
     assert_eq!(
-        measured, 2,
-        "{measured} skill(s) carry re-measurement results — `remeasure-tdd` and \
-         `remeasure-systematic-debugging` re-measured one each, so anything else means \
-         a result went missing rather than a measurement never happening",
+        measured, declared,
+        "{measured} skill(s) carry re-measurement results on disk, but {declared} are \
+         declared `RemeasureScores::Recorded` — a result went missing rather than a \
+         measurement never happening",
     );
 }
 
@@ -8339,6 +8352,23 @@ fn scores_json_verdicts_obey_the_rubric() {
                             "{}: {id} quotes {quote:?}, which is not in its `## Response` block",
                             adj.display(),
                         );
+                        // The `tdd` miscoding, stated as an invariant rather than as a
+                        // paragraph. `new_rationalizations` holds excuses advanced FOR
+                        // the option taken (when it is wrong); this list holds quotes
+                        // advanced for an option NOT taken. The two are disjoint by
+                        // definition, so a quote in both means one of the two readings
+                        // is wrong about what the response argues — which is exactly
+                        // the coding error `remeasure-tdd` reported 0 of and this
+                        // stage is the first to have non-empty lists to test.
+                        assert!(
+                            !v.0.new_rationalizations.contains(quote),
+                            "{}: {id} lists {quote:?} as advanced for an option NOT taken, \
+                             while {} lists the same quote as a `new_rationalization` — an \
+                             excuse for the option that WAS taken. The two are disjoint by \
+                             definition; one of the two verdicts has miscoded it",
+                            adj.display(),
+                            bundle.scores_file(),
+                        );
                     }
                 }
             }
@@ -8364,6 +8394,93 @@ fn scores_json_verdicts_obey_the_rubric() {
         "no bar-facing verdicts found under {} — expected at least the scored `tdd` \
          set. {checked} verdict(s) were checked in total, so if that number is \
          non-zero the tree holds unaided verdicts with no scored stage behind them.",
+        transcripts.display(),
+    );
+}
+
+/// No announcement sentence survives redaction in any committed transcript.
+///
+/// §1.3 has the phase agent replace the skills' announcement sentences with
+/// `[announcement elided]` before writing a transcript, because an announcement
+/// appears in **arm B only** — a surviving one identifies the arm to a scorer who
+/// is supposed to be label-blind, and it does so more reliably than any other tell.
+///
+/// **This existed as an assembly-time check and nothing stood over the artifacts,
+/// which is this run's recurring defect exactly.** `remeasure-systematic-debugging`
+/// added a tripwire to its own assembly script that refuses a surviving
+/// `Using drovr:` string, and both `systematic-debugging.md` and `run-ledger.md`
+/// describe it as a hard failure — but a one-shot script that has already run
+/// guards nothing. A partial redaction in a *future* stage, or an edit to a
+/// committed transcript, would leave the suite green while an arm tell sat in the
+/// evidence tree. The review panel found the gap; this closes it for every stage,
+/// past and future, rather than for the one that noticed.
+///
+/// The check is deliberately **broader than the four declared announcements**: any
+/// `Using drovr:` prefix is refused, so a fifth skill's sentence, a re-worded one,
+/// or the router's `Using drovr:<skill> — <purpose>.` cannot slip through a
+/// fixed-string set that was assembled before it existed.
+///
+/// Scoped to `## Response` and `## Meta-test` — the blocks a probe wrote and the
+/// only ones redaction covers. `## Scenario` and `## Forced choice` are assembled
+/// by the phase agent from checked-in scenario bodies.
+#[test]
+fn no_announcement_survives_redaction_in_any_transcript() {
+    let transcripts = evidence_dir().join("transcripts");
+    let mut checked = 0usize;
+    let mut leaked: Vec<String> = Vec::new();
+
+    let dirs = fs::read_dir(&transcripts)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", transcripts.display()));
+    for dir in dirs {
+        let dir = dir.expect("read_dir entry").path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let files = fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for file in files {
+            let path = file.expect("read_dir entry").path();
+            let is_transcript = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit()));
+            if !is_transcript || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let response = response_block(&body);
+            let meta = body
+                .split_once("\n## Meta-test")
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            for (block, text) in [("## Response", response), ("## Meta-test", meta)] {
+                if let Some(at) = text.find("Using drovr:") {
+                    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+                    leaked.push(format!(
+                        "{}: {block} carries an unredacted announcement: {:?}",
+                        path.display(),
+                        &text[at..end],
+                    ));
+                }
+            }
+            checked += 1;
+        }
+    }
+
+    assert!(
+        leaked.is_empty(),
+        "{} transcript block(s) carry an announcement sentence that redaction should have \
+         replaced with `[announcement elided]`. An announcement appears in arm B only, so \
+         each one identifies the arm to a scorer who is supposed to be label-blind:\n  {}",
+        leaked.len(),
+        leaked.join("\n  "),
+    );
+    // Without this the test passes on an empty or renamed transcripts tree, which
+    // is the failure it exists to prevent one level up.
+    assert!(
+        checked >= 12,
+        "only {checked} transcript(s) found under {} — expected at least one 12-run \
+         stage. A redaction check that reads no transcripts asserts nothing",
         transcripts.display(),
     );
 }

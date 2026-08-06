@@ -753,10 +753,23 @@ line separates B from {A, A′}, so the pair is jointly sufficient.
 
 `remeasure-blind-map.json` was written before any scorer ran and never reached one;
 `remeasure-scores.json` was joined to it only after all 12 verdicts were recorded and checked.
-**There is no `remeasure-scores.raw.json`, because there was nothing to adjudicate away**: no
-verdict paired `compliant: true` with a non-empty `new_rationalizations`, so the scorers' output
-*is* the file the bars read. Task 17's raw/adjudicated split exists because that stage had a
-miscoding to preserve the evidence of; inventing the same two files here would be ceremony.
+**"Adjudication" names two different things in this corpus, and this paragraph is where they get
+confused — so they are separated here before either is claimed.** The review panel flagged the
+overload; the vocabulary is inherited and the ambiguity is not this stage's to rename, but it is
+this stage's to not trade on.
+
+| the word | the artifact | this stage |
+|---|---|---|
+| **the raw/final split** — a scorer verdict was rejected and re-scored, and both files are kept | `scores.raw.json` + `scores.json` | **absent, and correctly so** |
+| **the blind re-read** — a second, independent pass over every transcript | `remeasure-adjudication.json` | **present and REQUIRED**, one record per run |
+
+**There is no `remeasure-scores.raw.json`, and that is a statement about the first row only**: no
+verdict paired `compliant: true` with a non-empty `new_rationalizations`, so nothing had to be
+rejected and re-scored, and the scorers' output *is* the file the bars read. Task 17's raw/final
+split exists because that stage had a miscoding to preserve the evidence of; inventing the same two
+files here would be ceremony. **It is not a statement that no re-reading happened** — the second row
+did, on all 12 runs, and `VerdictBundle::Remeasure`'s contract makes its file mandatory rather than
+validated-when-present.
 
 **The measurement is not saturated.** `compliant` varies across arms (2, 2, 4), across scenarios
 within an arm, and against the unaided floor — the property Task 17's data did not have and could
@@ -874,7 +887,12 @@ a draft of this sentence said arm B cited "least of the three armored arms", whi
 this stage's own summary table one screen above: B is tied for fewest, not uniquely lowest. **The
 review panel caught it, and it is the third prose-versus-artifact error this section had to
 correct.** What the column actually shows is that the arm scoring **highest** on `compliant` did
-**not** score highest on `cites_section` — the opposite of `tdd`'s ordering, where B led both.
+**not** score highest on `cites_section`. **The contrast with `tdd` is real but narrower than a
+draft of this sentence claimed** — it said *"where B led both"*, and `remeasure-tdd`'s own table
+says otherwise: on that pair B **tied** arm A at 4/4 on `compliant` and led only `cites_section`
+(B 4/4, A 3/4, A′ 2/4). So the honest contrast is that **`cites_section` ranked arm B first there
+and joint-last here**, while `compliant` ranked it first or joint-first in both. The column moves
+between stages; `compliant` does not.
 Recorded as an observation; it is not a bar and it did not need to be one. Task 17's caution stands
 unchanged — **`cites_section` is the scorer's judgement, not a countable token; do not re-derive it
 with a regex.**
@@ -1139,3 +1157,22 @@ and belongs to the final review phase.
    pins, hash-verified before each stage, and the four measured criteria never read the diff.
    What needs deciding is whether A′ is still "fix-1-only" as `spec.md` §7.3 defines it, and
    that belongs to whoever owns Task 7 and Task 22, not to a measurement phase.
+8. **`Adjudication` stores `matches_key` although the test always recomputes it** — raised by the
+   round-4 review panel against `cli/tests/skills_valid.rs`. `chosen_option` plus the transcript's
+   own `correct_option` determine `matches_key`, so an inconsistent triple is *representable* in a
+   `*-adjudication.json` and is caught only by a runtime assertion in
+   `scores_json_verdicts_obey_the_rubric`, not by the type.
+
+   **Deliberately not fixed by this phase, and the reason is not "it works":** the schema is
+   `remeasure-tdd`'s and it is already serialized into a **committed** evidence artifact
+   (`transcripts/tdd/remeasure-adjudication.json`). Narrowing the struct means rewriting another
+   phase's shipped evidence file, which is a change to the record rather than to the code that
+   reads it — exactly the kind of edit `arms/MANIFEST.md`'s append-only rule exists to prevent
+   being made casually. The assertion is authoritative and is mutation-checked; the gap is between
+   *representable* and *reachable*, and it is documented here rather than papered over. **A phase
+   that is already rewriting both files should collapse the field.**
+9. **The word "adjudication" covers three different artifact contracts** — the raw/final scorer
+   split, the blind re-read, and `AdjudicationContract`'s three states — also from the round-4
+   panel. The *RE-MEASURED* section now separates the first two explicitly rather than trading on
+   the ambiguity, but the **names** still collide, and the panel's diagnosis is worth carrying:
+   an overloaded vocabulary is what keeps producing prose that mis-describes which files exist.
