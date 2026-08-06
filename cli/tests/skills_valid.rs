@@ -1585,26 +1585,40 @@ enum Introduced {
 /// "no output" is the [`Introduced::NotCommitted`] answer and a non-zero exit is
 /// a real failure to ask.
 ///
-/// **`-1` is deliberately absent, and putting it back reopens a hole.** `git
-/// log` prints newest-first, so `--diff-filter=A -1` returns the most RECENT
-/// time a path was added, not the first. A path may be added more than once — a
-/// `git rm` followed by a fresh commit of the same bytes produces a second `A`
-/// event — so an arm authored *before* the freeze can be laundered into looking
-/// compliant by deleting it and re-committing it afterwards. That is precisely
-/// the gaming [`freeze_precedes_every_candidate_arm`] exists to catch, so this
-/// takes the **first** add and lets a re-add be irrelevant.
+/// **Two flags carry this, and both were added because an arm slipped past
+/// without them.** Each closes a way to make text authored before the freeze
+/// look like it arrived after:
 ///
-/// `--reverse` with `-1` does not fix it either: git applies the limit before
-/// reversing, so the pair still yields the newest. The limit is simply gone, and
-/// the first line of the reversed output is the answer.
+/// - **No `-1`.** `git log` prints newest-first, so `--diff-filter=A -1` returns
+///   the most RECENT add, not the first — and a path can be added twice, because
+///   a `git rm` plus a fresh commit of the same bytes is a second `A` event. An
+///   arm could be laundered by deleting and re-committing it after the freeze.
+///   The **last** line of the default (newest-first) output is the earliest add.
+/// - **`--follow`.** Without it the search is anchored to the final filename, so
+///   drafting an arm as `draft.md` before the freeze and `git mv`-ing it to
+///   `S1.md` afterwards reports the *rename* as the introduction. `--follow`
+///   walks through the rename to the original add.
+///
+/// **`--reverse` must not come back.** It looks like the natural way to ask for
+/// the oldest commit and it is how this was first written, but combined with
+/// `--follow` git prints **nothing at all** — which this function would read as
+/// [`Introduced::NotCommitted`], failing every arm rather than passing them, so
+/// at least it fails loudly. Take the last line instead.
+///
+/// **The honest limit:** `--follow` is rename *detection*, a similarity
+/// heuristic. A file moved to `S<n>.md` and substantially rewritten in the same
+/// commit is not recognised as a rename, and resolves to that commit. That is
+/// defensible — text rewritten wholesale is new text — but it is a heuristic
+/// boundary, not a proof, and this check should not be described as one.
 fn introducing_commit_in(repo: &Path, path: &Path) -> Introduced {
+    let shown = format!("git log --follow --diff-filter=A -- {}", path.display());
     let args = [
         "-C".to_string(),
         repo.display().to_string(),
         "log".to_string(),
+        "--follow".to_string(),
         "--diff-filter=A".to_string(),
         "--format=%H".to_string(),
-        "--reverse".to_string(),
         "--".to_string(),
         path.display().to_string(),
     ];
@@ -1614,24 +1628,18 @@ fn introducing_commit_in(repo: &Path, path: &Path) -> Introduced {
     };
     if !out.status.success() {
         return Introduced::Undetermined {
-            how: format!(
-                "`git log --diff-filter=A --reverse -- {}` failed: {}",
-                path.display(),
-                git_stderr(&out)
-            ),
+            how: format!("`{shown}` failed: {}", git_stderr(&out)),
         };
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let Some(first) = stdout.lines().map(str::trim).find(|l| !l.is_empty()) else {
+    // Last non-empty line: git printed newest-first, so this is the earliest add.
+    let Some(earliest) = stdout.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
         return Introduced::NotCommitted;
     };
-    match GitObjectId::parse(first) {
+    match GitObjectId::parse(earliest) {
         Ok(id) => Introduced::At(id),
         Err(e) => Introduced::Undetermined {
-            how: format!(
-                "`git log --diff-filter=A --reverse -- {}` printed {e}",
-                path.display()
-            ),
+            how: format!("`{shown}` printed {e}"),
         },
     }
 }
@@ -2413,6 +2421,41 @@ fn introducing_commit_reports_the_first_add_not_a_later_re_add() {
             found.as_str(),
         ),
         Introduced::NotCommitted => panic!("the file is committed twice over"),
+        Introduced::Undetermined { how } => panic!("could not resolve the scratch repo: {how}"),
+    }
+}
+
+/// An arm drafted under another name before the freeze and renamed into place
+/// afterwards resolves to the **draft**, not to the rename.
+///
+/// The companion to [`introducing_commit_reports_the_first_add_not_a_later_re_add`],
+/// and the second laundering route review found. `git log` anchored to the final
+/// filename reports the `git mv` as the introduction, which is exactly the shape
+/// an honest workflow produces too — draft as `draft.md`, rename when it is
+/// ready — so this is as much about accident as about gaming. `--follow` is what
+/// walks back through the rename; remove it and this test goes red.
+#[test]
+fn introducing_commit_follows_a_rename_back_to_the_original_add() {
+    assert!(git_available(), "`git` is not resolvable");
+    let repo = ScratchRepo::new();
+    let drafted = repo.commit_file("draft.md", "arm text written early\n");
+    repo.commit_file("FREEZE.md", "the freeze\n");
+    repo.git(&["mv", "draft.md", "S1.md"]);
+    repo.git(&["commit", "--quiet", "-m", "rename the draft into place"]);
+
+    match introducing_commit_in(repo.path(), Path::new("S1.md")) {
+        Introduced::At(found) => assert_eq!(
+            found.as_str(),
+            drafted.as_str(),
+            "expected the draft commit {}, got {} — renaming pre-freeze text into an arm \
+             filename must not re-date it",
+            drafted.as_str(),
+            found.as_str(),
+        ),
+        Introduced::NotCommitted => panic!(
+            "resolved to nothing. `--reverse` combined with `--follow` prints no output at \
+             all — if it has been re-added, that is why"
+        ),
         Introduced::Undetermined { how } => panic!("could not resolve the scratch repo: {how}"),
     }
 }

@@ -40,14 +40,31 @@ and it is exactly what `cli/tests/skills_valid.rs::freeze_precedes_every_candida
 order the arms. Recording it here by hand would be a second copy of a fact that can drift from the
 first, with no check able to say which copy was right. One authoritative answer, held by git.
 
-**The command for that is `git log --diff-filter=A --format=%H --reverse -- <path>`, and you want
-its FIRST line.** Not `-1`. `git log` prints newest-first, so `--diff-filter=A -1` returns the most
-recent time a path was added rather than the first — and a path can be added twice, because a
-`git rm` followed by a fresh commit of the same bytes is a second add. An arm authored before the
-freeze could then be laundered into looking compliant by deleting it and re-committing it
-afterwards. `--reverse` with `-1` does not help either: git applies the limit before reversing. The
-test takes the earliest add for exactly this reason, and
-`introducing_commit_reports_the_first_add_not_a_later_re_add` fails if anyone puts `-1` back.
+**The command for that is `git log --follow --diff-filter=A --format=%H -- <path>`, and you want its
+LAST line.** Both flags and the missing `-1` are load-bearing; each closes a way to make text
+authored before the freeze look like it arrived after.
+
+- **No `-1`.** `git log` prints newest-first, so `--diff-filter=A -1` returns the most recent add
+  rather than the first — and a path can be added twice, because a `git rm` plus a fresh commit of
+  the same bytes is a second add. An arm could be laundered by deleting and re-committing it after
+  the freeze. The last line of the default output is the earliest add.
+- **`--follow`.** Anchored to the final filename, the search reports a *rename* as the introduction:
+  draft an arm as `draft.md` before the freeze, `git mv` it to `S1.md` afterwards, and it looks
+  compliant. That is also just an ordinary workflow, so it is as much an accident to catch as a
+  trick. `--follow` walks back through the rename.
+- **Not `--reverse`.** It is the obvious way to ask for the oldest commit, and it is how this was
+  first written — but combined with `--follow`, git prints nothing at all.
+
+`introducing_commit_reports_the_first_add_not_a_later_re_add` and
+`introducing_commit_follows_a_rename_back_to_the_original_add` fail if any of that is undone.
+
+**What this does not catch, stated so nobody reads it as airtight:** `--follow` is rename
+*detection*, a similarity heuristic. A file moved into an arm's filename **and substantially
+rewritten in the same commit** is not recognised as a rename and resolves to that commit. Text
+rewritten wholesale is arguably new text, so that is a defensible boundary — but it is a heuristic
+boundary, and the ordering gate is a guard against accident and casual laundering, not a proof
+against a determined author. The freeze's real strength is that it is public, hashed, and committed
+before the arms.
 
 ## The frozen sentinels
 
