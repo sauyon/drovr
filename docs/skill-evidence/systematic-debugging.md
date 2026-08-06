@@ -848,10 +848,15 @@ answered by none of the three texts directly.
 **What the arms *do* carry, checked rather than remembered, and it does not rescue the story
 either.** All three carry the same root-cause step — *"Explain why it happens, mechanistically.
 'Adding this line makes it go away' is not a cause."* That is the nearest rule in any arm to
-`sd-3`'s trap, and it is **present in all three, so it cannot be what separates them.** The only
-textual difference in that step is a clause arm B appends: *"— including the parts you were not
-chasing."* Whether four runs turn on eight words is exactly the kind of question n=2 cannot answer,
-and **it is recorded as a candidate, not as a finding.**
+`sd-3`'s trap, and it is **present in all three, so it cannot be what separates them.**
+
+A word-level diff of that step across the arms gives **two** differences, and saying "one" would
+have been the same overstatement this section already had to correct once. **A and A′ are identical
+in this step**; against them arm B has (i) a typographic relabel — `**Root-cause** — explain` becomes
+`**Root-cause.** Explain`, which §6's formatting applies to every step — and (ii) **one appended
+clause**, *"— including the parts you were not chasing."* Only (ii) could plausibly carry meaning.
+Whether four runs turn on eight words is exactly the kind of question n=2 cannot answer, and **it is
+recorded as a candidate, not as a finding.**
 
 **So this stage does not know what separates arm B on `sd-3`. Recorded as an open question rather
 than filled with a plausible story** — inventing a mechanism is the exact error Task 11's
