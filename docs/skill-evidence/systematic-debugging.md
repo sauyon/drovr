@@ -1171,8 +1171,17 @@ and belongs to the final review phase.
    being made casually. The assertion is authoritative and is mutation-checked; the gap is between
    *representable* and *reachable*, and it is documented here rather than papered over. **A phase
    that is already rewriting both files should collapse the field.**
-9. **The word "adjudication" covers three different artifact contracts** — the raw/final scorer
-   split, the blind re-read, and `AdjudicationContract`'s three states — also from the round-4
-   panel. The *RE-MEASURED* section now separates the first two explicitly rather than trading on
-   the ambiguity, but the **names** still collide, and the panel's diagnosis is worth carrying:
-   an overloaded vocabulary is what keeps producing prose that mis-describes which files exist.
+9. **The word "adjudication" names two different on-disk artifacts, and a Rust enum about a third
+   thing** — from the round-4 panel, with the taxonomy corrected by the round-5 panel, which
+   pointed out that a first draft of this item listed all three as "artifact contracts" and so
+   committed the very conflation it documents.
+
+   | | what it is |
+   |---|---|
+   | `scores.raw.json` + `scores.json` | **an artifact pair** — a scorer verdict was rejected and re-scored, and both files are kept |
+   | `*-adjudication.json` | **an artifact** — a second, independent blind re-read of every transcript |
+   | `AdjudicationContract` | **not an artifact at all** — a Rust enum saying whether the file above is required, validated-when-present, or inapplicable for a given `VerdictBundle` |
+
+   The *RE-MEASURED* section now separates the first two explicitly rather than trading on the
+   ambiguity, but the **names** still collide, and the panel's diagnosis is worth carrying: an
+   overloaded vocabulary is what keeps producing prose that mis-describes which files exist.

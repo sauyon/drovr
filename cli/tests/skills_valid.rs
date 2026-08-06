@@ -8006,6 +8006,30 @@ fn response_block(transcript: &str) -> &str {
         .unwrap_or(after)
 }
 
+/// The `## Meta-test` block, or `""` when the transcript has none (RED runs are
+/// two-block and unaided runs have no skill to ask about).
+///
+/// Beside [`response_block`] on purpose: those two headings' boundaries are one
+/// piece of knowledge, and the round-5 review panel caught this half being parsed
+/// ad hoc at a call site while the other half was centralised here. A later block
+/// appended after `## Meta-test` would then be scanned as part of it by one caller
+/// and not by the other.
+fn meta_test_block(transcript: &str) -> &str {
+    transcript
+        .split_once("\n## Meta-test")
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
+}
+
+/// Whether a file stem is a `plan.md` §1.3 opaque transcript id — six lowercase
+/// hex characters.
+///
+/// Shared with [`resolve_transcript`] rather than re-inlined, per the round-5
+/// panel: a format rule spelled out at three call sites drifts at two of them.
+fn is_transcript_id(stem: &str) -> bool {
+    stem.len() == 6 && stem.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 /// The `correct_option` recorded in a transcript's `## Forced choice` block — the
 /// ground truth `compliant` is scored against (plan §1.3).
 fn correct_option(transcript: &str, whence: &Path) -> ChosenOption {
@@ -8046,7 +8070,7 @@ fn correct_option(transcript: &str, whence: &Path) -> ChosenOption {
 /// is ever widened.
 fn resolve_transcript(dir: &Path, id: &str, whence: &Path) -> PathBuf {
     assert!(
-        id.len() == 6 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        is_transcript_id(id),
         "{}: transcript_id {id:?} is not a 6-hex-character opaque token (plan §1.3)",
         whence.display(),
     );
@@ -8426,46 +8450,7 @@ fn scores_json_verdicts_obey_the_rubric() {
 #[test]
 fn no_announcement_survives_redaction_in_any_transcript() {
     let transcripts = evidence_dir().join("transcripts");
-    let mut checked = 0usize;
-    let mut leaked: Vec<String> = Vec::new();
-
-    let dirs = fs::read_dir(&transcripts)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", transcripts.display()));
-    for dir in dirs {
-        let dir = dir.expect("read_dir entry").path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let files = fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
-        for file in files {
-            let path = file.expect("read_dir entry").path();
-            let is_transcript = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit()));
-            if !is_transcript || path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let body = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            let response = response_block(&body);
-            let meta = body
-                .split_once("\n## Meta-test")
-                .map(|(_, rest)| rest)
-                .unwrap_or("");
-            for (block, text) in [("## Response", response), ("## Meta-test", meta)] {
-                if let Some(at) = text.find("Using drovr:") {
-                    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
-                    leaked.push(format!(
-                        "{}: {block} carries an unredacted announcement: {:?}",
-                        path.display(),
-                        &text[at..end],
-                    ));
-                }
-            }
-            checked += 1;
-        }
-    }
+    let (leaked, checked) = check_redaction(&transcripts);
 
     assert!(
         leaked.is_empty(),
@@ -8483,6 +8468,138 @@ fn no_announcement_survives_redaction_in_any_transcript() {
          stage. A redaction check that reads no transcripts asserts nothing",
         transcripts.display(),
     );
+}
+
+/// Every `## Response` / `## Meta-test` block under `transcripts` that still
+/// carries an announcement sentence, and how many transcripts were read.
+///
+/// **Returns complaints rather than asserting, following [`check_blind_map`] and
+/// [`check_armor`]** — a check that panics inline can only ever be shown to
+/// *pass*, and this corpus has shipped guards that passed without being able to
+/// fire. `redaction_check_refuses_a_transcript_that_names_its_arm` is the
+/// companion that proves this one fires, on each block and on each shape of
+/// announcement. The round-5 review panel caught the first version of this guard
+/// inlining the scan with no such demonstration.
+fn check_redaction(transcripts: &Path) -> (Vec<String>, usize) {
+    let mut leaked = Vec::new();
+    let mut checked = 0usize;
+
+    let dirs = fs::read_dir(transcripts)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", transcripts.display()));
+    for dir in dirs {
+        let dir = dir.expect("read_dir entry").path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let files =
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for file in files {
+            let path = file.expect("read_dir entry").path();
+            let named_like_a_transcript = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(is_transcript_id);
+            if !named_like_a_transcript || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            for (block, text) in [
+                ("## Response", response_block(&body)),
+                ("## Meta-test", meta_test_block(&body)),
+            ] {
+                if let Some(at) = text.find("Using drovr:") {
+                    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+                    leaked.push(format!(
+                        "{}: {block} carries an unredacted announcement: {:?}",
+                        path.display(),
+                        &text[at..end],
+                    ));
+                }
+            }
+            checked += 1;
+        }
+    }
+    (leaked, checked)
+}
+
+/// [`check_redaction`] fires on each block, on an announcement no fixed-string
+/// set anticipated, and not on the redaction token itself.
+///
+/// Without this, the only evidence the tripwire works is that it is green on a
+/// corpus where nothing has leaked — which is indistinguishable from a scan that
+/// looks in the wrong place. Every case below is a real arm tell: an announcement
+/// sentence appears in arm B alone.
+#[test]
+fn redaction_check_refuses_a_transcript_that_names_its_arm() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("systematic-debugging");
+    fs::create_dir(&dir).expect("create skill dir");
+
+    let transcript = |response: &str, meta: &str| {
+        format!(
+            "## Forced choice\n\n**correct_option:** B\n\n\
+             ## Scenario\n\nYou are the single writer.\n\n\
+             ## Response\n\n{response}\n\n## Meta-test\n\n{meta}\n"
+        )
+    };
+    let write = |id: &str, body: String| {
+        fs::write(dir.join(format!("{id}.md")), body).expect("write transcript");
+    };
+    let scan = || check_redaction(root.path());
+
+    // Control FIRST. If a properly redacted pair complains, every case below is
+    // meaningless — this is the ordering the phase's own mutation harness had to
+    // learn twice.
+    write("aaaaaa", transcript("[announcement elided] I take B.", "Clearer wording."));
+    write("bbbbbb", transcript("I take B.", "[announcement elided] Clearer."));
+    let (leaked, checked) = scan();
+    assert!(leaked.is_empty(), "control: redacted transcripts complained: {leaked:?}");
+    assert_eq!(checked, 2, "control: expected 2 transcripts read, got {checked}");
+
+    // The announcement survives in `## Response`.
+    write(
+        "aaaaaa",
+        transcript(
+            "Using drovr:systematic-debugging — reproducing before fixing. I take B.",
+            "Clearer wording.",
+        ),
+    );
+    let (leaked, _) = scan();
+    assert_eq!(leaked.len(), 1, "an unredacted `## Response` must complain: {leaked:?}");
+    assert!(leaked[0].contains("## Response"), "must name the block: {leaked:?}");
+    assert!(leaked[0].contains("aaaaaa"), "must name the transcript: {leaked:?}");
+
+    // ...and in `## Meta-test`, which the earlier ad-hoc slice made easy to miss.
+    write("aaaaaa", transcript("[announcement elided] I take B.", "Clearer wording."));
+    write(
+        "bbbbbb",
+        transcript(
+            "I take B.",
+            "It should have said: Using drovr:tdd — writing the failing test first.",
+        ),
+    );
+    let (leaked, _) = scan();
+    assert_eq!(leaked.len(), 1, "an unredacted `## Meta-test` must complain: {leaked:?}");
+    assert!(leaked[0].contains("## Meta-test"), "must name the block: {leaked:?}");
+
+    // A skill this corpus has never announced. The check is a prefix scan, not a
+    // fixed-string set assembled before the next skill existed.
+    write("bbbbbb", transcript("Using drovr:some-future-skill — doing it. I take B.", "Clearer."));
+    let (leaked, _) = scan();
+    assert_eq!(leaked.len(), 1, "an unanticipated announcement must complain: {leaked:?}");
+
+    // A file that is not a transcript is not scanned, however it reads.
+    write("aaaaaa", transcript("[announcement elided] I take B.", "Clearer wording."));
+    write("bbbbbb", transcript("I take B.", "Clearer."));
+    fs::write(
+        dir.join("remeasure-scores.json"),
+        "[{\"note\": \"Using drovr:systematic-debugging — reproducing before fixing.\"}]",
+    )
+    .expect("write non-transcript");
+    let (leaked, checked) = scan();
+    assert!(leaked.is_empty(), "a non-transcript file must not be scanned: {leaked:?}");
+    assert_eq!(checked, 2, "non-transcript files must not be counted: {checked}");
 }
 
 /// [`check_blind_map`] rejects each way a map can fail to attribute the verdicts
