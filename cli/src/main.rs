@@ -150,6 +150,44 @@ enum Commands {
         sub: ReviewCmd,
     },
 
+    /// Ask the human a question mid-phase, without blocking on the answer.
+    ///
+    /// `drovr ask <run> --question …` appends the question to the run's interview
+    /// log, makes sure the panel is up, and **exits immediately**. It never waits.
+    /// That is the whole design: a blocking ask dies on its timeout while the human
+    /// is away, and a dead call takes the question with it. Here the question is on
+    /// disk before the process exits, so nothing can lose it.
+    ///
+    /// `drovr ask wait <run>` is the separate, re-armable half: background it, end
+    /// your turn, and re-run it if it times out. A timeout costs nothing — the
+    /// question is still on disk and still on screen.
+    ///
+    /// The bare form and the `wait` subcommand share one positional slot, so both
+    /// switches are load-bearing: `subcommand_negates_reqs` is why `run` and
+    /// `question` are `Option` (see [`validate_ask_request`], which enforces them by
+    /// hand), and `args_conflicts_with_subcommands` stops `ask wait <run> --question`
+    /// from parsing as something half-way between the two forms.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Ask {
+        #[command(subcommand)]
+        sub: Option<AskCmd>,
+        /// Run to ask (bare form).
+        run: Option<String>,
+        /// The question. `@<path>` reads it from a file; `@@` escapes a leading `@`.
+        #[arg(long)]
+        question: Option<String>,
+        /// File whose contents are shown alongside the question.
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// A selectable answer, as `<value>=<label>`. Repeatable.
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Pre-select this option `value` (must be one of `--option`'s, when any
+        /// are offered).
+        #[arg(long)]
+        recommend: Option<String>,
+    },
+
     /// Automatic review-until-clean panel (see drovr:code-review).
     CodeReview {
         #[command(subcommand)]
@@ -326,6 +364,30 @@ enum ReviewCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum AskCmd {
+    /// Block until every question that was outstanding when this started has an
+    /// answer, then print them as JSON.
+    ///
+    /// A pure file poller — it needs no server. The set of questions is snapshotted
+    /// once, at start: an ask posted after that is not waited on, so the contract is
+    /// exactly "the questions I had outstanding when I backgrounded this".
+    ///
+    /// Exit codes: 0 = every snapshotted question is answered (the JSON array is on
+    /// stdout), 2 = timeout (re-run to resume — nothing is lost), 5 = the run was
+    /// cancelled (terminal — stop work), 1 = error.
+    ///
+    /// Only stdout carries the JSON; the other outcomes report on stderr. Do not
+    /// pipe this command — a pipeline's status is its LAST command's, which turns a
+    /// timeout into a success (`docs/known-issues.md`, *"Piping a `wait` command
+    /// destroys its exit-code contract — a timeout reads as approval"*).
+    Wait {
+        run: String,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CodeReviewCmd {
     /// Record HEAD as the review base for `task` (run by the implement phase at
     /// task start, before any code is written, so HEAD is the pre-task SHA).
@@ -392,10 +454,25 @@ fn validate_label(kind: &str, s: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Reject run names that are empty or contain path-separator characters.
-/// Thin wrapper over the shared [`validate_label`] predicate.
+/// Reject run names that are empty, contain path-separator characters, or are the
+/// literal `wait`.
+///
+/// `wait` is reserved because `drovr ask` takes its run as a bare positional and
+/// `drovr ask wait <run>` as a subcommand — a run actually named `wait` would make
+/// `drovr ask wait` mean two things, and clap resolves that in favour of the
+/// subcommand, silently. The refusal lives here rather than in `ask` alone so it also
+/// blocks `drovr new wait`: a run that could never be asked a question is not one to
+/// let anyone create.
 fn validate_run_name(name: &str) -> io::Result<()> {
-    validate_label("run name", name)
+    validate_label("run name", name)?;
+    if name == "wait" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid run name \"wait\": reserved, because `drovr ask wait <run>` would \
+             become ambiguous",
+        ));
+    }
+    Ok(())
 }
 
 fn load_run(name: &str) -> RunState {
@@ -1934,18 +2011,294 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ask — post a question without blocking, and the separate wait for its answer
+// ---------------------------------------------------------------------------
+
+/// The bare form, spelled out. Printed under every usage error, because the errors
+/// exist to say which of these parts was wrong.
+const ASK_USAGE: &str = "usage: drovr ask <run> --question <text|@file> [--context <file>] \
+                         [--option <value>=<label>]... [--recommend <value>]";
+
+/// Where `--question`'s text comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum QuestionSource {
+    /// The argument is the question.
+    Literal(String),
+    /// The argument was `@<path>`; the question is that file's contents.
+    File(PathBuf),
+}
+
+/// Split `--question`'s argument into "this is the text" or "read this file".
+///
+/// A leading `@` is the ONLY form meaning "file", so a question that legitimately
+/// opens with `@` (`@channel: which arm?`) needs an escape, and `@@` is it. Without
+/// one, that question would be read as a path and the command would fail with a
+/// confusing "cannot read" — or, worse on some other day, succeed against a file that
+/// happens to exist.
+fn question_source(raw: &str) -> QuestionSource {
+    if let Some(rest) = raw.strip_prefix("@@") {
+        QuestionSource::Literal(format!("@{rest}"))
+    } else if let Some(path) = raw.strip_prefix('@').filter(|p| !p.is_empty()) {
+        QuestionSource::File(PathBuf::from(path))
+    } else {
+        // Includes a bare `@`, which names no file and so is just an odd question.
+        QuestionSource::Literal(raw.to_string())
+    }
+}
+
+/// A hand-validated `drovr ask` invocation. `question` is still raw — `@<path>` is
+/// resolved later, in [`cmd_ask`], because that is I/O and this is not.
+#[derive(Debug)]
+struct AskRequest {
+    run: String,
+    question: String,
+    options: Vec<interview::AskOption>,
+    recommend: Option<String>,
+}
+
+/// Validate the bare form's arguments, which clap cannot.
+///
+/// `run` and `question` are `Option` at the clap layer ONLY because
+/// `subcommand_negates_reqs` requires it — a required positional cannot coexist with
+/// a subcommand in the same slot. So `drovr ask myrun` parses fine and this is the
+/// only thing that refuses it. Do not relax either check into a default.
+///
+/// Every error is `InvalidInput` and names the part that was wrong; the caller prints
+/// [`ASK_USAGE`] beneath it.
+fn validate_ask_request(
+    run: Option<&str>,
+    question: Option<&str>,
+    option_specs: &[String],
+    recommend: Option<&str>,
+) -> io::Result<AskRequest> {
+    let usage = |msg: String| -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("ask: {msg}"))
+    };
+
+    let run = run.ok_or_else(|| usage("missing <run>".to_string()))?;
+    validate_run_name(run)?;
+    let question = question.ok_or_else(|| usage("missing --question".to_string()))?;
+
+    let mut options = Vec::with_capacity(option_specs.len());
+    for spec in option_specs {
+        // Split on the FIRST `=` so a label may contain one; both halves must be
+        // non-empty, since the value is what gets recorded as the answer and the
+        // label is the only thing the human sees.
+        let (value, label) = spec
+            .split_once('=')
+            .filter(|(v, l)| !v.is_empty() && !l.is_empty())
+            .ok_or_else(|| usage(format!("--option {spec:?} is not <value>=<label>")))?;
+        options.push(interview::AskOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        });
+    }
+
+    // Matches `interview::append_ask`'s rule exactly, checked here so the failure is a
+    // usage error before anything is written rather than an I/O error after. With no
+    // options at all a recommendation is free-text advice and there is nothing to
+    // check it against — the CLI must not be stricter than the module it writes
+    // through, or the two rules drift apart.
+    if let Some(r) = recommend
+        && !options.is_empty()
+        && !options.iter().any(|o| o.value == r)
+    {
+        return Err(usage(format!(
+            "--recommend {r:?} names no offered --option"
+        )));
+    }
+
+    Ok(AskRequest {
+        run: run.to_string(),
+        question: question.to_string(),
+        options,
+        recommend: recommend.map(str::to_string),
+    })
+}
+
+/// Print the cancellation message both `ask` and `ask wait` use, and exit 5.
+///
+/// Cancellation reads the same way in both directions: there is no point asking a
+/// question of a run nobody intends to finish, and no point waiting for an answer to
+/// one. 5 is the same terminal code `review wait` uses — the driver already routes it
+/// to "stop work and tear the run down".
+fn ask_cancelled(run: &str) -> ! {
+    eprintln!("ask: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down");
+    process::exit(5);
+}
+
+fn cmd_ask(
+    sub: Option<AskCmd>,
+    run: Option<String>,
+    question: Option<String>,
+    context: Option<PathBuf>,
+    options: Vec<String>,
+    recommend: Option<String>,
+) {
+    if let Some(AskCmd::Wait { run, timeout_ms }) = sub {
+        cmd_ask_wait(&run, timeout_ms);
+        return;
+    }
+
+    let req = validate_ask_request(
+        run.as_deref(),
+        question.as_deref(),
+        &options,
+        recommend.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("drovr: {e}");
+        eprintln!("{ASK_USAGE}");
+        process::exit(1);
+    });
+
+    let dir = run_dir(&req.run);
+    if !dir.is_dir() {
+        eprintln!(
+            "drovr: ask: no run '{}' at {} — create it with `drovr new` first",
+            req.run,
+            dir.display()
+        );
+        process::exit(1);
+    }
+    // Before the append, not after: refusing to post is only meaningful if nothing
+    // was posted.
+    if dir.join("cancelled").exists() {
+        ask_cancelled(&req.run);
+    }
+
+    let question = match question_source(&req.question) {
+        QuestionSource::Literal(text) => text,
+        QuestionSource::File(path) => read_bounded_file("--question @<file>", &path),
+    };
+    let context = context.map(|p| read_bounded_file("--context", &p));
+
+    let ask = interview::append_ask(
+        &dir,
+        &question,
+        context.as_deref(),
+        &req.options,
+        req.recommend.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("drovr: ask failed: {e}");
+        process::exit(1);
+    });
+
+    // Deliberately `review summary`'s shape: the agent gets the page to point the
+    // human at and the watch to background, in the same two lines it already knows.
+    println!("ask: posted {} for run '{}'", ask.id, req.run);
+    match review::ensure_server() {
+        Ok(addr) => println!("  page:  http://{}/#/runs/{}", display_addr(&addr), req.run),
+        // The record is ALREADY on disk, so this is not a failure of the ask. A
+        // question that cannot be displayed yet is not a question that was lost, and
+        // exiting non-zero here would tell the agent to re-ask one the human will see
+        // the moment the panel comes up.
+        Err(e) => println!(
+            "  note:  review server not up ({e}); the question is on disk and appears as soon as it is"
+        ),
+    }
+    println!(
+        "  wait:  drovr ask wait {}   # run this BACKGROUNDED, then end your turn",
+        shell_single_quote(&req.run)
+    );
+    // No wait, no poll, no answer: this returns NOW. `ask` blocking on its answer is
+    // the design this replaces — a blocking call dies on its timeout while the human
+    // is away, and takes the unanswered question with it.
+}
+
+/// Block until every question outstanding at start has an answer. Exits 0/2/5/1.
+///
+/// A pure file poller — no server, so it works while the panel is down and the
+/// question is merely waiting to be displayed.
+fn cmd_ask_wait(run: &str, timeout_ms: u64) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    let dir = run_dir(run);
+    // An unreadable-but-present log is a real failure (exit 1), never "no questions":
+    // reporting a broken interview as an empty one would exit 0 and wave the caller on.
+    let read_log = || -> Vec<interview::Ask> {
+        interview::read(&dir).unwrap_or_else(|e| {
+            eprintln!("drovr: ask wait failed: {e}");
+            process::exit(1);
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    // Checked before the snapshot as well as inside the loop: on a cancelled run with
+    // nothing outstanding, the nothing-pending shortcut below would exit 0, which tells
+    // the caller to carry on with a run that is over.
+    if dir.join("cancelled").exists() {
+        ask_cancelled(run);
+    }
+
+    // Snapshotted ONCE. An ask posted after this is not waited on, so the contract is
+    // "the questions I had outstanding when I backgrounded this" — a later ask has its
+    // own wait, armed by whoever posted it.
+    let asks = read_log();
+    let snapshot = interview::pending(&asks);
+    if snapshot.is_empty() {
+        // Nothing to wait for, so return the interview as it stands — NOT a bare `[]`.
+        // The difference is the re-arm race: a wait times out, the human answers in the
+        // seconds before the caller re-arms, and the new wait finds nothing pending. A
+        // `[]` there would pair exit 0 ("answered") with no answer, and the caller would
+        // walk on without it — the timeout costing exactly what it promised not to. An
+        // empty log still prints `[]`, because that is its fold.
+        println!("{}", interview::to_json(&asks));
+        return;
+    }
+
+    loop {
+        if dir.join("cancelled").exists() {
+            ask_cancelled(run);
+        }
+        let asks = read_log();
+        let mut waited: Vec<interview::Ask> = asks
+            .into_iter()
+            .filter(|a| snapshot.contains(&a.id))
+            .collect();
+        waited.sort_by_key(|a| a.seq);
+        // Length too: an id that vanished from the log (only a hand-edit can do that)
+        // can never be answered, and reporting the rest as the answer set would hand
+        // the caller a short array it has no way to notice.
+        if waited.len() == snapshot.len() && waited.iter().all(|a| a.answer.is_some()) {
+            println!("{}", interview::to_json(&waited));
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Costs nothing: the question is still on disk and still on screen, and
+            // re-running re-arms the same wait. This is why `ask` never blocks.
+            eprintln!(
+                "ask wait: no answer for run '{run}' within timeout — the question is still on \
+                 disk and still on screen; re-run to resume"
+            );
+            process::exit(2);
+        }
+        std::thread::sleep(review::POLL_INTERVAL.min(deadline - now));
+    }
+}
+
 /// Resolve `--context` / `--context-file` into the context text. clap enforces that
 /// the two are mutually exclusive, so this only has to read the file. An unreadable
 /// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
 /// context to be in the brief, and silently reviewing without it is the failure this
 /// whole mechanism exists to prevent.
-/// Read `--context-file`: a regular file, not through a symlink, size-bounded.
+/// Read a file named by `flag`: a regular file, not through a symlink, size-bounded.
 ///
 /// The path is often inside the run dir, which agents write to (handoffs live there), so it
 /// gets the same treatment as a recorded context: a symlink there would inject an arbitrary
 /// readable file into the brief, a FIFO would hang the driver on `read_to_string`, and a
 /// metadata-only size check is a TOCTOU the read itself has to enforce.
-fn read_context_file(path: &std::path::Path) -> String {
+///
+/// `flag` is only for the messages — every caller's path arrives the same way and gets the
+/// same treatment. One reader for all of them on purpose: `--question @<file>` and
+/// `--context` reach exactly the same untrusted directory, so a second, laxer reader for
+/// the newer flag is how the guard above gets quietly lost.
+fn read_bounded_file(flag: &str, path: &std::path::Path) -> String {
     use brief::MAX_CONTEXT;
     let bail = |msg: String| -> ! {
         eprintln!("drovr: {msg}");
@@ -1953,26 +2306,20 @@ fn read_context_file(path: &std::path::Path) -> String {
     };
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) => bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        )),
+        Err(e) => bail(format!("cannot read {flag} {}: {e}", path.display())),
     };
     if meta.file_type().is_symlink() {
         bail(format!(
-            "--context-file {} is a symlink; pass the real path",
+            "{flag} {} is a symlink; pass the real path",
             path.display()
         ));
     }
     if !meta.file_type().is_file() {
-        bail(format!(
-            "--context-file {} is not a regular file",
-            path.display()
-        ));
+        bail(format!("{flag} {} is not a regular file", path.display()));
     }
     if meta.len() > MAX_CONTEXT {
         bail(format!(
-            "--context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
+            "{flag} {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
              context; check what you passed",
             path.display(),
             meta.len()
@@ -1980,22 +2327,16 @@ fn read_context_file(path: &std::path::Path) -> String {
     }
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) => bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        )),
+        Err(e) => bail(format!("cannot read {flag} {}: {e}", path.display())),
     };
     let mut text = String::new();
     if let Err(e) = io::Read::read_to_string(&mut io::Read::take(file, MAX_CONTEXT + 1), &mut text)
     {
-        bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        ));
+        bail(format!("cannot read {flag} {}: {e}", path.display()));
     }
     if text.len() as u64 > MAX_CONTEXT {
         bail(format!(
-            "--context-file {} grew past the {MAX_CONTEXT}-byte limit while being read",
+            "{flag} {} grew past the {MAX_CONTEXT}-byte limit while being read",
             path.display()
         ));
     }
@@ -2016,7 +2357,7 @@ fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> O
             process::exit(1);
         }
         (Some(text), _) => Some(text),
-        (None, Some(path)) => Some(read_context_file(&path)),
+        (None, Some(path)) => Some(read_bounded_file("--context-file", &path)),
         (None, None) => None,
     }
 }
@@ -2321,6 +2662,14 @@ fn main() {
             force,
         } => cmd_handoff_scaffold(&run, &phase_name, force),
         Commands::Review { sub } => cmd_review(sub),
+        Commands::Ask {
+            sub,
+            run,
+            question,
+            context,
+            options,
+            recommend,
+        } => cmd_ask(sub, run, question, context, options, recommend),
         Commands::CodeReview { sub } => cmd_code_review(sub),
         Commands::Reflex { skill, gate } => match ReflexMode::from_flags(skill.as_deref(), gate) {
             Some(mode) => cmd_reflex(mode),
@@ -3591,6 +3940,154 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // -- ask --------------------------------------------------------------------
+
+    #[test]
+    fn ask_bare_form_parses_run_and_question() {
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "which arm?",
+            "--option",
+            "a=Arm A",
+            "--recommend",
+            "a",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub,
+                run,
+                question,
+                context,
+                options,
+                recommend,
+            } => {
+                assert!(sub.is_none(), "the bare form must not select a subcommand");
+                assert_eq!(run.as_deref(), Some("myrun"));
+                assert_eq!(question.as_deref(), Some("which arm?"));
+                assert_eq!(context, None);
+                assert_eq!(options, vec!["a=Arm A".to_string()]);
+                assert_eq!(recommend.as_deref(), Some("a"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_subcommand_parses() {
+        // The bare form and the subcommand share a positional slot; `wait` must win.
+        let cli = parse(&["drovr", "ask", "wait", "myrun", "--timeout-ms", "500"]).unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub: Some(AskCmd::Wait { run, timeout_ms }),
+                ..
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(timeout_ms, 500);
+            }
+            _ => panic!("`ask wait <run>` must parse as the subcommand, not as run='wait'"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_default_timeout_matches_review_wait() {
+        // One default across both waits: a driver that backgrounds either gets the
+        // same 30 minutes, so the two are interchangeable in a phase prompt.
+        let cli = parse(&["drovr", "ask", "wait", "myrun"]).unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub: Some(AskCmd::Wait { timeout_ms, .. }),
+                ..
+            } => assert_eq!(timeout_ms, 1_800_000),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ask_rejects_a_run_named_wait() {
+        // `drovr ask wait <run>` is only unambiguous while no run is called `wait`.
+        // The refusal lives in `validate_run_name`, so it also blocks `drovr new wait`
+        // — a run that could never be asked a question is not one to allow creating.
+        assert!(validate_run_name("wait").is_err());
+        assert!(validate_run_name("waiting").is_ok());
+    }
+
+    #[test]
+    fn ask_bare_form_requires_a_question() {
+        // `run`/`question` are Options only to satisfy `subcommand_negates_reqs`, so
+        // clap accepts `drovr ask myrun`; the hand-check is what refuses it.
+        let e = validate_ask_request(Some("myrun"), None, &[], None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--question"), "{e}");
+        let e = validate_ask_request(None, Some("q"), &[], None).unwrap_err();
+        assert!(e.to_string().contains("<run>"), "{e}");
+        assert!(validate_ask_request(Some("myrun"), Some("q"), &[], None).is_ok());
+    }
+
+    #[test]
+    fn ask_option_without_equals_is_a_usage_error() {
+        for bad in ["justavalue", "=Label", "value="] {
+            let e = validate_ask_request(Some("r"), Some("q"), &[bad.to_string()], None)
+                .expect_err(bad);
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                e.to_string().contains("<value>=<label>"),
+                "message must name the form: {e}"
+            );
+        }
+        let ok = validate_ask_request(
+            Some("r"),
+            Some("q"),
+            &["a=Arm A".to_string(), "b=has=equals".to_string()],
+            None,
+        )
+        .unwrap();
+        // Split on the FIRST `=`, so a label may contain one.
+        assert_eq!(ok.options[1].value, "b");
+        assert_eq!(ok.options[1].label, "has=equals");
+    }
+
+    #[test]
+    fn ask_recommend_must_name_an_offered_option() {
+        let e = validate_ask_request(Some("r"), Some("q"), &["a=Arm A".to_string()], Some("z"))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--recommend"), "{e}");
+        assert!(
+            validate_ask_request(Some("r"), Some("q"), &["a=Arm A".to_string()], Some("a")).is_ok()
+        );
+        // With no options at all a recommendation is free-text advice, which
+        // `interview::append_ask` accepts — the CLI must not be stricter than the
+        // module it writes through, or the two rules drift.
+        assert!(validate_ask_request(Some("r"), Some("q"), &[], Some("z")).is_ok());
+    }
+
+    #[test]
+    fn ask_question_at_prefix_reads_a_file_and_at_at_escapes_it() {
+        // A question is usually prose; `@` is the only "read this file" marker, so a
+        // question that legitimately starts with `@` needs an escape.
+        assert_eq!(
+            question_source("@/tmp/q.md"),
+            QuestionSource::File(PathBuf::from("/tmp/q.md"))
+        );
+        assert_eq!(
+            question_source("@@channel: which arm?"),
+            QuestionSource::Literal("@channel: which arm?".to_string())
+        );
+        assert_eq!(
+            question_source("which arm?"),
+            QuestionSource::Literal("which arm?".to_string())
+        );
+        // A bare `@` names no file; it is prose.
+        assert_eq!(
+            question_source("@"),
+            QuestionSource::Literal("@".to_string())
+        );
     }
 
     #[test]

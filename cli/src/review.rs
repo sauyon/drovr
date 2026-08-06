@@ -54,7 +54,11 @@ use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
 
 /// How often [`review_wait`] polls the live server for a reviewer decision.
 /// Mirrors `phase::POLL_INTERVAL` — a filesystem/state poll, not a hot loop.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+///
+/// `pub(crate)` because `drovr ask wait` polls the interview log at the same cadence.
+/// Both are a human-in-the-loop wait; one number keeps them from drifting into two
+/// different ideas of how responsive a wait should feel.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Default port for the always-on server. (The default *host* lives in config
 /// as `serve_host`, resolved by `main::cmd_serve`.)
