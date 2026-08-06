@@ -3119,29 +3119,119 @@ fn scenarios_are_well_formed() {
 // A scored held-out stage names the scenario body it ran on
 // ---------------------------------------------------------------------------
 
-/// The skills whose evidence file carries a scored held-out stage.
+/// Whether a skill's evidence file carries a scored held-out stage yet.
 ///
-/// `code-review` and `using-drovr` are absent because their `## Scored results`
-/// sections read *"Not yet run"* — there is no count yet to attach a body to. A
-/// skill that gains one has to gain its provenance rows in the same phase, and
-/// adding its name here is what makes that fail rather than pass quietly.
-const SKILLS_WITH_HELD_OUT_SCORES: &[&str] = &[
-    "tdd",
-    "systematic-debugging",
-    "verification-before-completion",
-];
-
-/// One held-out provenance row: which blob a recorded measurement read.
-struct ProvenanceRow {
-    stem: String,
-    hash: GitObjectId,
-    verdict: String,
+/// **Two states, not a state and a silence** — the shape [`BodyBudget`] and
+/// `SiteState` already use in this file, and for the same reason: a skill that
+/// is simply absent from a list is indistinguishable from one nobody thought
+/// about. Absence is what the `&[&str]` subsets this run spent two tasks
+/// collapsing into [`skill_names!`] were made of.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum HeldOutScores {
+    /// A stage has scored this skill's held-out pair, so its evidence file owes
+    /// one row per scenario naming the blob those probes read.
+    Recorded,
+    /// No scored held-out stage yet — and the reason, because an unexplained
+    /// exemption is indistinguishable from an oversight. Checked in the other
+    /// direction too: a file in this state may carry no rows at all.
+    NotYetRun { why: &'static str },
 }
 
-/// The two words a provenance row may end in.
-const PROVENANCE_VERDICTS: &[&str] = &["CURRENT", "SUPERSEDED"];
+impl SkillName {
+    /// Total over the measured five: the `match` is exhaustive, so a sixth skill
+    /// cannot be added without saying which of the two states it is in. That is
+    /// the property a hand-maintained allowlist beside `ALL` does not have.
+    fn held_out_scores(self) -> HeldOutScores {
+        match self {
+            SkillName::Tdd
+            | SkillName::SystematicDebugging
+            | SkillName::VerificationBeforeCompletion => HeldOutScores::Recorded,
+            SkillName::CodeReview => HeldOutScores::NotYetRun {
+                why: "`ab-code-review` (plan §7.3, Tasks 16–21) has not run; the evidence \
+                      file's `## Scored results` reads \"Not yet run\"",
+            },
+            SkillName::UsingDrovr => HeldOutScores::NotYetRun {
+                why: "`ab-using-drovr` has not run, for either the primary held-out pair or \
+                      the no-skill-applies veto class",
+            },
+        }
+    }
+}
 
-/// Parse `- `<stem>.md` measured at blob `<sha>` — <VERDICT>` lines.
+/// Whether the body a recorded measurement ran on is still the body on disk.
+///
+/// A closed two-value domain, so it is an enum rather than a `String` checked
+/// against a list and then carried on as though it had not been — the same
+/// correction `SkillName` and `Tag` already are.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ScenarioBodyStatus {
+    Current,
+    Superseded,
+}
+
+impl ScenarioBodyStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScenarioBodyStatus::Current => "CURRENT",
+            ScenarioBodyStatus::Superseded => "SUPERSEDED",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        [
+            ScenarioBodyStatus::Current,
+            ScenarioBodyStatus::Superseded,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == raw)
+    }
+
+    /// The verdict a row **claims** is never the verdict this check uses: it is
+    /// recomputed from the two blob ids, so a row that stops being true fails
+    /// rather than continuing to assert itself.
+    fn recompute(recorded: &GitObjectId, on_disk: &GitObjectId) -> Self {
+        if recorded.as_str() == on_disk.as_str() {
+            ScenarioBodyStatus::Current
+        } else {
+            ScenarioBodyStatus::Superseded
+        }
+    }
+}
+
+/// One held-out scenario's recorded body: the blob a scored stage's probes read.
+///
+/// Named for the held-out lifecycle rather than for provenance in general —
+/// [`Provenance`] already answers a different question in this file (which
+/// manifest commit an arm snapshot resolves against).
+struct HeldOutBody {
+    recorded: GitObjectId,
+    claimed: ScenarioBodyStatus,
+}
+
+/// A skill's held-out **pair**, which is what plan §1.2 defines: `-2` and `-3`,
+/// in that order, always both.
+///
+/// Encoded as two fields rather than returned as a `Vec` the caller re-checks,
+/// so "one row is missing" is a parse error at the one place that knows the
+/// shape instead of an assertion every consumer has to remember to repeat.
+struct HeldOutBodies {
+    skill: SkillName,
+    second: HeldOutBody,
+    third: HeldOutBody,
+}
+
+impl HeldOutBodies {
+    /// The pair as `(scenario stem, row)`, in plan §1.2 order. The stem is
+    /// derived here, once, from the skill the pair was parsed for.
+    fn pair(&self) -> [(String, &HeldOutBody); 2] {
+        [
+            (format!("{}-2", self.skill.as_str()), &self.second),
+            (format!("{}-3", self.skill.as_str()), &self.third),
+        ]
+    }
+}
+
+/// Parse a skill's `- `<stem>.md` measured at blob `<sha>` — <STATUS>` rows.
 ///
 /// Lines that do not carry the `measured at blob` marker are skipped rather than
 /// rejected: every evidence file is full of ordinary backticked bullets, and a
@@ -3149,7 +3239,10 @@ const PROVENANCE_VERDICTS: &[&str] = &["CURRENT", "SUPERSEDED"];
 /// carry the marker, every remaining part of it is required — a half-formed row
 /// is a row nobody checks, which is the shape of defect this whole record exists
 /// to stop.
-fn parse_provenance_rows(contents: &str) -> Result<Vec<ProvenanceRow>, String> {
+///
+/// Returns the rows found, in file order, paired with the stem each names.
+/// Binding them to the §1.2 pair is [`parse_held_out_bodies`]'s job.
+fn held_out_body_rows(contents: &str) -> Result<Vec<(String, HeldOutBody)>, String> {
     let mut out = Vec::new();
     for line in contents.lines() {
         let Some(rest) = line.trim().strip_prefix("- `") else {
@@ -3167,42 +3260,91 @@ fn parse_provenance_rows(contents: &str) -> Result<Vec<ProvenanceRow>, String> {
         let stem = stem_md
             .strip_suffix(".md")
             .ok_or_else(|| format!("`{stem_md}` is not a `<stem>.md`: {line}"))?;
-        let verdict = tail.trim().trim_start_matches('—').trim();
-        if !PROVENANCE_VERDICTS.contains(&verdict) {
-            return Err(format!(
-                "verdict `{verdict}` must be one of {PROVENANCE_VERDICTS:?}: {line}"
-            ));
-        }
-        out.push(ProvenanceRow {
-            stem: stem.to_string(),
-            hash: GitObjectId::parse(raw_hash)?,
-            verdict: verdict.to_string(),
-        });
+        let raw_status = tail.trim().trim_start_matches('—').trim();
+        let claimed = ScenarioBodyStatus::parse(raw_status).ok_or_else(|| {
+            format!(
+                "status `{raw_status}` must be `{}` or `{}`: {line}",
+                ScenarioBodyStatus::Current.as_str(),
+                ScenarioBodyStatus::Superseded.as_str()
+            )
+        })?;
+        out.push((
+            stem.to_string(),
+            HeldOutBody {
+                recorded: GitObjectId::parse(raw_hash)?,
+                claimed,
+            },
+        ));
     }
     Ok(out)
 }
 
+/// The held-out pair `skill`'s evidence file records, or why it is not a pair.
+fn parse_held_out_bodies(contents: &str, skill: SkillName) -> Result<HeldOutBodies, String> {
+    let rows = held_out_body_rows(contents)?;
+    let found: Vec<&str> = rows.iter().map(|(stem, _)| stem.as_str()).collect();
+    let expected = [format!("{}-2", skill.as_str()), format!("{}-3", skill.as_str())];
+    if found != expected {
+        return Err(format!(
+            "held-out rows are {found:?}, and plan §1.2's pair is {expected:?} in that order. \
+             A scored stage whose scenario body is not named is a count that cannot be \
+             compared against any later one"
+        ));
+    }
+    let mut rows = rows.into_iter();
+    let (_, second) = rows.next().expect("length checked above");
+    let (_, third) = rows.next().expect("length checked above");
+    Ok(HeldOutBodies {
+        skill,
+        second,
+        third,
+    })
+}
+
 #[test]
-fn provenance_rows_are_parsed_and_their_verdict_is_closed() {
+fn held_out_bodies_parse_as_a_pair_with_a_closed_status() {
     let good = "prose about `tdd-2.md` that is not a row\n\
                 - `tdd-2.md` measured at blob `b8b4b71709bfc022c58b73b1d256d88938db5993` — SUPERSEDED\n\
                 - some other bullet\n\
                 - `tdd-3.md` measured at blob `7bc482a72cdf9747b57473e0360de98c3d4b567c` — CURRENT\n";
-    let rows = parse_provenance_rows(good).expect("both rows parse, prose is skipped");
-    assert_eq!(rows.len(), 2, "prose and unrelated bullets are not rows");
-    assert_eq!(rows[0].stem, "tdd-2");
-    assert_eq!(rows[1].verdict, "CURRENT");
+    let pair = parse_held_out_bodies(good, SkillName::Tdd).expect("the pair parses, prose is skipped");
+    assert_eq!(pair.second.claimed, ScenarioBodyStatus::Superseded);
+    assert_eq!(pair.third.claimed, ScenarioBodyStatus::Current);
+    let stems: Vec<String> = pair.pair().into_iter().map(|(stem, _)| stem).collect();
+    assert_eq!(stems, ["tdd-2", "tdd-3"], "the stem is derived from the skill");
 
-    let bad_verdict = good.replace("— SUPERSEDED", "— probably fine");
-    assert!(
-        parse_provenance_rows(&bad_verdict).is_err(),
-        "the verdict is a closed set; free text would make the check unfalsifiable"
-    );
+    for (why, mutated) in [
+        (
+            "the status is a closed set; free text would make the check unfalsifiable",
+            good.replace("— SUPERSEDED", "— probably fine"),
+        ),
+        (
+            "an abbreviated blob id cannot be compared against `git hash-object` output",
+            good.replace("b8b4b71709bfc022c58b73b1d256d88938db5993", "b8b4b71"),
+        ),
+        (
+            "half a pair is a count with nothing attached to it",
+            good.lines()
+                .filter(|l| !l.contains("tdd-3.md` measured"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        (
+            "the pair is ordered, and a swapped pair attributes each count to the other scenario",
+            good.replace("tdd-2.md", "tmp").replace("tdd-3.md", "tdd-2.md").replace("tmp", "tdd-3.md"),
+        ),
+    ] {
+        assert!(
+            parse_held_out_bodies(&mutated, SkillName::Tdd).is_err(),
+            "should have been rejected: {why}"
+        );
+    }
 
-    let short_hash = good.replace("b8b4b71709bfc022c58b73b1d256d88938db5993", "b8b4b71");
+    // A pair belongs to the skill it was parsed for, not to whichever stems the
+    // file happens to carry.
     assert!(
-        parse_provenance_rows(&short_hash).is_err(),
-        "an abbreviated blob id cannot be compared against `git hash-object` output"
+        parse_held_out_bodies(good, SkillName::CodeReview).is_err(),
+        "`tdd`'s rows are not `code-review`'s pair"
     );
 }
 
@@ -3214,59 +3356,63 @@ fn provenance_rows_are_parsed_and_their_verdict_is_closed() {
 /// recorded count to the body it came from, so those numbers and any measured
 /// after the rewrite would pool into §9 as if they were one instrument. This
 /// makes the question computable: the row records the blob the probes read, and
-/// the verdict word is **recomputed here** rather than trusted, so a later phase
-/// that re-measures on the current bodies — or one that reverts them — is told
-/// its note is now wrong instead of discovering it in the write-up.
+/// the status is **recomputed here** rather than trusted, so a later phase that
+/// re-measures on the current bodies — or one that reverts them — is told its
+/// note is now wrong instead of discovering it in the write-up.
+///
+/// Walks `SkillName::ALL`, not a subset: [`SkillName::held_out_scores`] says
+/// which of the two states each skill is in, and **both are checked**. A skill
+/// declared `NotYetRun` that carries rows anyway is as much a disagreement as a
+/// `Recorded` one that carries none.
 #[test]
 fn held_out_measurements_name_the_scenario_body_they_ran_on() {
     assert!(
         git_available(),
-        "`git` is not resolvable, and the provenance rows are `git hash-object` blob SHAs. \
+        "`git` is not resolvable, and these rows are `git hash-object` blob SHAs. \
          Skipping would turn this into a check that passes when it cannot run"
     );
     let evidence = evidence_dir();
     let scenarios = scenarios_dir();
 
-    for skill in SKILLS_WITH_HELD_OUT_SCORES {
-        let path = evidence.join(format!("{skill}.md"));
+    for skill in SkillName::ALL.iter().copied() {
+        let path = evidence.join(format!("{}.md", skill.as_str()));
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let rows = parse_provenance_rows(&contents)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 
-        // The held-out pair is `-2` and `-3` for every skill (plan §1.2), so
-        // both rows are required and their order is the pair's order — a file
-        // that records one of the two is a file whose other count is unattached.
-        let found: Vec<&str> = rows.iter().map(|r| r.stem.as_str()).collect();
-        let expected = [format!("{skill}-2"), format!("{skill}-3")];
-        assert_eq!(
-            found, expected,
-            "{} must carry one provenance row per held-out scenario, in order. A scored \
-             held-out stage whose scenario body is not named is a count that cannot be \
-             compared against any later one",
-            path.display()
-        );
+        let pair = match skill.held_out_scores() {
+            HeldOutScores::NotYetRun { why } => {
+                let rows = held_out_body_rows(&contents)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                assert!(
+                    rows.is_empty(),
+                    "{} carries {} held-out provenance row(s), but `{}` is declared as having \
+                     no scored held-out stage ({why}). Whichever is now wrong, the scored \
+                     results and `held_out_scores` have to move together",
+                    path.display(),
+                    rows.len(),
+                    skill.as_str()
+                );
+                continue;
+            }
+            HeldOutScores::Recorded => parse_held_out_bodies(&contents, skill)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+        };
 
-        for row in &rows {
-            let file = scenarios.join(format!("{}.md", row.stem));
-            let current = git_hash_object(&file);
-            let computed = if current.as_str() == row.hash.as_str() {
-                "CURRENT"
-            } else {
-                "SUPERSEDED"
-            };
+        for (stem, row) in pair.pair() {
+            let file = scenarios.join(format!("{stem}.md"));
+            let on_disk = git_hash_object(&file);
+            let computed = ScenarioBodyStatus::recompute(&row.recorded, &on_disk);
             assert_eq!(
-                row.verdict,
+                row.claimed,
                 computed,
-                "{} says `{}.md` is {} at blob {}, but {} now hashes to {}. The verdict is \
+                "{} says `{stem}.md` is {} at blob {}, but {} now hashes to {}. The status is \
                  recomputed, not read: fix the row, and do not pool counts across a change of \
                  body",
                 path.display(),
-                row.stem,
-                row.verdict,
-                row.hash.as_str(),
+                row.claimed.as_str(),
+                row.recorded.as_str(),
                 file.display(),
-                current.as_str()
+                on_disk.as_str()
             );
         }
     }
