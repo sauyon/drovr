@@ -1578,19 +1578,33 @@ enum Introduced {
     Undetermined { how: String },
 }
 
-/// The commit that introduced `path`, as `git log --diff-filter=A` reports it.
+/// The **earliest** commit that added `path`, as `git log --diff-filter=A`
+/// reports it.
 ///
 /// An untracked path is not an error to git: it prints nothing and exits 0, so
 /// "no output" is the [`Introduced::NotCommitted`] answer and a non-zero exit is
 /// a real failure to ask.
-fn introducing_commit(path: &Path) -> Introduced {
+///
+/// **`-1` is deliberately absent, and putting it back reopens a hole.** `git
+/// log` prints newest-first, so `--diff-filter=A -1` returns the most RECENT
+/// time a path was added, not the first. A path may be added more than once — a
+/// `git rm` followed by a fresh commit of the same bytes produces a second `A`
+/// event — so an arm authored *before* the freeze can be laundered into looking
+/// compliant by deleting it and re-committing it afterwards. That is precisely
+/// the gaming [`freeze_precedes_every_candidate_arm`] exists to catch, so this
+/// takes the **first** add and lets a re-add be irrelevant.
+///
+/// `--reverse` with `-1` does not fix it either: git applies the limit before
+/// reversing, so the pair still yields the newest. The limit is simply gone, and
+/// the first line of the reversed output is the answer.
+fn introducing_commit_in(repo: &Path, path: &Path) -> Introduced {
     let args = [
         "-C".to_string(),
-        repo_root().display().to_string(),
+        repo.display().to_string(),
         "log".to_string(),
         "--diff-filter=A".to_string(),
         "--format=%H".to_string(),
-        "-1".to_string(),
+        "--reverse".to_string(),
         "--".to_string(),
         path.display().to_string(),
     ];
@@ -1601,21 +1615,21 @@ fn introducing_commit(path: &Path) -> Introduced {
     if !out.status.success() {
         return Introduced::Undetermined {
             how: format!(
-                "`git log --diff-filter=A -- {}` failed: {}",
+                "`git log --diff-filter=A --reverse -- {}` failed: {}",
                 path.display(),
                 git_stderr(&out)
             ),
         };
     }
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if stdout.is_empty() {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some(first) = stdout.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return Introduced::NotCommitted;
-    }
-    match GitObjectId::parse(&stdout) {
+    };
+    match GitObjectId::parse(first) {
         Ok(id) => Introduced::At(id),
         Err(e) => Introduced::Undetermined {
             how: format!(
-                "`git log --diff-filter=A -- {}` printed {e}",
+                "`git log --diff-filter=A --reverse -- {}` printed {e}",
                 path.display()
             ),
         },
@@ -1638,10 +1652,10 @@ enum Descent {
 /// Reflexive: a commit is its own ancestor, so an arm introduced by the very
 /// commit that introduced the freeze record passes. That is the right answer —
 /// such an arm did not exist before the freeze either.
-fn descends_from(ancestor: &GitObjectId, descendant: &GitObjectId) -> Descent {
+fn descends_from_in(repo: &Path, ancestor: &GitObjectId, descendant: &GitObjectId) -> Descent {
     let args = [
         "-C".to_string(),
-        repo_root().display().to_string(),
+        repo.display().to_string(),
         "merge-base".to_string(),
         "--is-ancestor".to_string(),
         ancestor.as_str().to_string(),
@@ -1666,46 +1680,83 @@ fn descends_from(ancestor: &GitObjectId, descendant: &GitObjectId) -> Descent {
     }
 }
 
-/// Candidate arms of the spec-length A/B: every `S<n>.md` with `n >= 1` under
-/// `docs/skill-evidence/arms/spec-length/`, sorted by `n`.
+/// What `docs/skill-evidence/arms/spec-length/` holds.
 ///
-/// `S0.md` is excluded by the `n >= 1` rule, not by name: it is the **control**,
-/// the text that was already in `brainstorm.md` before the experiment, so it
-/// necessarily predates the freeze and has nothing to be ordered against.
+/// Both fields matter to [`freeze_precedes_every_candidate_arm`], and the second
+/// exists because the first is not enough. A scan that only collected the files
+/// it recognised would let a **misnamed** arm — `s1.md`, `S1.markdown`,
+/// `S1-draft.md`, or one tucked into a subdirectory — fall through every failure
+/// bucket at once: not a violation, not uncommitted, not unreadable, simply
+/// invisible. Silence is the one answer an ordering gate must never give, so
+/// everything the naming rule does not recognise is collected and reported.
+#[derive(Default)]
+struct SpecLengthArms {
+    /// `S<n>.md` with `n >= 1`, sorted by `n`. These are ordered against the
+    /// freeze.
+    ///
+    /// `S0.md` is excluded by the `n >= 1` rule, not by name: it is the
+    /// **control**, the text that was already in `brainstorm.md` before the
+    /// experiment, so it necessarily predates the freeze and has nothing to be
+    /// ordered against.
+    candidates: Vec<(u32, PathBuf)>,
+    /// Everything else in the directory. The naming convention is the one
+    /// `FREEZE.md` and `MANIFEST.md` both record, and this directory holds
+    /// arms and nothing else — so a stray file is a mistake to surface, not a
+    /// README to tolerate.
+    strays: Vec<PathBuf>,
+}
+
+/// Scan `docs/skill-evidence/arms/spec-length/`.
 ///
-/// A missing directory yields an empty list rather than a panic — see
-/// [`freeze_precedes_every_candidate_arm`] on why zero arms is a correct state.
-/// Anything not matching `S<digits>.md` is passed over, so the directory can
-/// hold a README without becoming unparseable; the naming convention is the one
-/// `FREEZE.md` and `MANIFEST.md` both record.
-fn spec_length_candidate_arms() -> Vec<(u32, PathBuf)> {
+/// **A missing directory is the empty answer; any other `read_dir` failure
+/// panics.** Those are different facts, and collapsing them is the fail-open
+/// shape the rest of this file keeps refusing: zero arms is a legitimate state
+/// (it is the state at T1), but a directory that exists and cannot be
+/// enumerated means candidate arms may be sitting there unchecked while the
+/// gate reports `ok`. Same rule as [`discover_corpus_roots`].
+fn spec_length_arms() -> SpecLengthArms {
     let dir = spec_length_arms_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SpecLengthArms::default(),
+        Err(e) => panic!(
+            "cannot read the spec-length arms directory {}: {e}. This is NOT the same as \
+             holding no arms — refusing to report an ordering verdict on a directory this \
+             check could not enumerate.",
+            dir.display()
+        ),
     };
-    let mut out = Vec::new();
+
+    let mut out = SpecLengthArms::default();
     for entry in entries {
-        let path = entry.expect("read_dir entry").path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Some(digits) = stem.strip_prefix('S') else {
-            continue;
-        };
-        let Ok(n) = digits.parse::<u32>() else {
-            continue;
-        };
-        if n >= 1 {
-            out.push((n, path));
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "cannot read an entry of {}: {e}. Refusing to order only the arms that \
+                 happened to be readable.",
+                dir.display()
+            )
+        });
+        let path = entry.path();
+        // A subdirectory is a stray too: an arm placed one level down is exactly
+        // as invisible to the gate as a misspelled one.
+        let recognised =
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|stem| stem.strip_prefix('S'))
+                    .and_then(|digits| digits.parse::<u32>().ok())
+            } else {
+                None
+            };
+        match recognised {
+            Some(n) if n >= 1 => out.candidates.push((n, path)),
+            // `S0.md` — recognised, and deliberately not ordered.
+            Some(_) => {}
+            None => out.strays.push(path),
         }
     }
-    out.sort();
+    out.candidates.sort();
+    out.strays.sort();
     out
 }
 
@@ -1720,14 +1771,25 @@ fn spec_length_candidate_arms() -> Vec<(u32, PathBuf)> {
 /// enforce that. Git history can: an arm's introducing commit must descend from
 /// `FREEZE.md`'s.
 ///
-/// **Three outcomes, not two**, the same distinction [`Provenance`] draws:
+/// **Four outcomes, not two**, extending the distinction [`Provenance`] draws.
+/// Three of them fail, and they fail with *different* messages because they call
+/// for different fixes:
 ///   - *pass* — the arm's commit descends from the freeze commit;
 ///   - *ordering violation* — git answered, and it does not. Both commits are
 ///     named, because the fix depends on which one moved;
-///   - *undetermined* — the arm is on disk with no introducing commit. `git
+///   - *not committed* — the arm is on disk with no introducing commit. `git
 ///     log` prints nothing, and feeding that to `merge-base` would be a usage
 ///     error dressed as a verdict. It fails, so a draft cannot sit indefinitely
-///     in a state this check cannot speak to.
+///     in a state this check cannot speak to;
+///   - *unreadable* — git could not be asked at all. Reported first and on its
+///     own, because it is not a verdict about any arm: if one arm could not be
+///     resolved, this run did not verify the ordering, and listing the others
+///     would imply they were the only problems.
+///
+/// A fifth state is refused before the loop rather than bucketed: a **stray**
+/// file in the arms directory. See [`SpecLengthArms`] — an arm the naming rule
+/// does not recognise reaches none of the four outcomes above, and invisibility
+/// is the one answer this gate must never give.
 ///
 /// **Zero arms on disk is a correct state and must not fail.** That is a
 /// deliberate divergence from [`manifest_commits_contain_their_snapshots`],
@@ -1755,6 +1817,28 @@ fn freeze_precedes_every_candidate_arm() {
         "`git` is not resolvable, so no arm's position relative to the freeze can be verified"
     );
 
+    let repo = repo_root();
+    let arms = spec_length_arms();
+    // Before any ordering verdict: a file this scan does not recognise as an arm
+    // is one the ordering loop below will never see. Refused here so it cannot
+    // be mistaken for "no arms to check".
+    assert!(
+        arms.strays.is_empty(),
+        "{} holds {} file(s) that are not named `S<n>.md`:\n{}\n\n\
+         Every file in this directory is an arm, and only `S<n>.md` is ordered against \
+         the freeze. A misnamed or misplaced one reaches none of this check's outcomes — \
+         not a violation, not uncommitted, not unreadable — so it would evade the ordering \
+         gate silently rather than fail loudly. Rename it, move it out, or teach this \
+         check about it deliberately.",
+        spec_length_arms_dir().display(),
+        arms.strays.len(),
+        arms.strays
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
     let freeze = spec_length_freeze_path();
     assert!(
         freeze.is_file(),
@@ -1762,7 +1846,7 @@ fn freeze_precedes_every_candidate_arm() {
          against; without it this check has nothing to compare to.",
         freeze.display()
     );
-    let freeze_commit = match introducing_commit(&freeze) {
+    let freeze_commit = match introducing_commit_in(&repo, &freeze) {
         Introduced::At(commit) => commit,
         Introduced::NotCommitted => panic!(
             "{} exists on disk but no commit introduces it.\n\n\
@@ -1783,9 +1867,9 @@ fn freeze_precedes_every_candidate_arm() {
     let mut violations = Vec::new();
     let mut uncommitted = Vec::new();
     let mut unreadable = Vec::new();
-    for (n, path) in spec_length_candidate_arms() {
+    for (n, path) in arms.candidates {
         let at = format!("arm `S{n}` (`{}`)", path.display());
-        let arm_commit = match introducing_commit(&path) {
+        let arm_commit = match introducing_commit_in(&repo, &path) {
             Introduced::At(commit) => commit,
             Introduced::NotCommitted => {
                 uncommitted.push(format!("  {at}: not yet committed — not verifiable"));
@@ -1796,7 +1880,7 @@ fn freeze_precedes_every_candidate_arm() {
                 continue;
             }
         };
-        match descends_from(&freeze_commit, &arm_commit) {
+        match descends_from_in(&repo, &freeze_commit, &arm_commit) {
             Descent::Yes => {}
             Descent::No => violations.push(format!(
                 "  {at}: introduced by {}, which does NOT descend from the freeze commit {}",
@@ -1841,6 +1925,534 @@ fn freeze_precedes_every_candidate_arm() {
         spec_length_freeze_path().display(),
         violations.join("\n"),
     );
+}
+
+/// One data row of `spec-length/FREEZE.md`'s hash table.
+///
+/// The `frozen at commit` cell is carried but deliberately **not** checked
+/// against history — see [`freeze_rows_still_hash_to_their_files`]. It is parsed
+/// only so a malformed SHA is a parse error rather than a cell nobody reads.
+#[derive(Debug)]
+struct FreezeRow {
+    path: String,
+    hash: GitObjectId,
+    #[allow(dead_code)]
+    commit: GitObjectId,
+    #[allow(dead_code)]
+    date: String,
+}
+
+const FREEZE_COL_PATH: &str = "path";
+const FREEZE_COL_HASH: &str = "git hash-object --no-filters";
+const FREEZE_COL_COMMIT: &str = "frozen at commit";
+const FREEZE_COL_DATE: &str = "date";
+
+/// `FREEZE.md`'s four columns, keyed by normalized header text — the same
+/// header-anchored scheme [`parse_manifest`] uses, and for the same reason: a
+/// positional parser would silently rebind `hash` to `date` if the columns were
+/// ever reordered, and compare a blob SHA against a date while still passing.
+const FREEZE_REQUIRED_COLUMNS: &[&str] = &[
+    FREEZE_COL_PATH,
+    FREEZE_COL_HASH,
+    FREEZE_COL_COMMIT,
+    FREEZE_COL_DATE,
+];
+
+/// Parse `spec-length/FREEZE.md`'s hash table.
+///
+/// **Unlike [`parse_manifest`], this stops at the first non-table line after the
+/// header.** `MANIFEST.md` forbids any later line from beginning with `|`, so it
+/// can treat everything after the header as data; `FREEZE.md` carries a second,
+/// two-column table (who appends which rows, and when) below the prose, which a
+/// read-to-end parser would try to read as short hash rows. Consuming only the
+/// contiguous block keeps that table documentation instead of making it an
+/// error.
+fn parse_freeze(contents: &str) -> Result<Vec<FreezeRow>, String> {
+    let mut header: Option<Vec<String>> = None;
+    let mut rows = Vec::new();
+
+    for line in contents.lines() {
+        let Some(cells) = split_row(line) else {
+            // A non-table line ends the block. Before the header it is prose; after
+            // it, it is the end of the data.
+            if header.is_some() {
+                break;
+            }
+            continue;
+        };
+        let normalized: Vec<String> = cells.iter().map(|c| normalize_header(c)).collect();
+
+        let Some(header) = header.as_ref() else {
+            if FREEZE_REQUIRED_COLUMNS
+                .iter()
+                .all(|want| normalized.iter().any(|got| got == want))
+            {
+                header = Some(normalized);
+            }
+            continue;
+        };
+
+        if is_separator_row(&cells) {
+            continue;
+        }
+        if cells.len() != header.len() {
+            return Err(format!(
+                "row has {} cells, header has {}: {line}",
+                cells.len(),
+                header.len()
+            ));
+        }
+        let cell = |want: &str| -> String {
+            let idx = header
+                .iter()
+                .position(|h| h == want)
+                .expect("column present");
+            cells[idx].clone()
+        };
+        let path = cell(FREEZE_COL_PATH);
+        if path.is_empty() {
+            return Err(format!("row has an empty `path` cell: {line}"));
+        }
+        rows.push(FreezeRow {
+            hash: GitObjectId::parse(&cell(FREEZE_COL_HASH))
+                .map_err(|e| format!("`{path}`: hash cell {e}"))?,
+            commit: GitObjectId::parse(&cell(FREEZE_COL_COMMIT))
+                .map_err(|e| format!("`{path}`: commit cell {e}"))?,
+            date: cell(FREEZE_COL_DATE),
+            path,
+        });
+    }
+
+    if header.is_none() {
+        return Err(format!(
+            "no header row carrying all of {FREEZE_REQUIRED_COLUMNS:?}"
+        ));
+    }
+    Ok(rows)
+}
+
+/// Every frozen artifact still hashes to what `FREEZE.md` records.
+///
+/// **This is what makes the freeze a freeze.** Without it the whole scheme rests
+/// on prose: `freeze_precedes_every_candidate_arm` checks *ordering* and says
+/// nothing about content, and `manifest_commits_contain_their_snapshots` asks
+/// whether a recorded commit holds a recorded blob — neither notices a fixture
+/// spec or a key-point ledger being edited on disk after the fact. A ledger
+/// quietly revised once a candidate arm's weaknesses were visible is the exact
+/// contamination the spec-length A/B is built to prevent, and it would have
+/// passed the entire suite.
+///
+/// **The `frozen at commit` cell is deliberately not checked here, and that is
+/// not an oversight.** `FREEZE.md`'s commit column records what `HEAD` was when
+/// the freeze was *taken* — for the fixtures and ledgers, a commit at which
+/// those paths did not yet exist. It is not `MANIFEST.md`'s
+/// contains-the-blob column, and asserting containment on it would fail by
+/// design. `FREEZE.md` says so in prose; this comment says so where someone
+/// would otherwise "fix" it.
+///
+/// An empty table fails, unlike the zero-arms case in
+/// [`freeze_precedes_every_candidate_arm`]: a freeze record with no rows has
+/// never been a correct state.
+#[test]
+fn freeze_rows_still_hash_to_their_files() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, and these rows are `git hash-object` blob SHAs. \
+         Skipping would turn this into a check that passes when it cannot run"
+    );
+
+    let path = spec_length_freeze_path();
+    let contents =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let rows = parse_freeze(&contents).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        !rows.is_empty(),
+        "{}: no rows, so this check compared nothing",
+        path.display()
+    );
+
+    let repo = repo_root();
+    let mut wrong = Vec::new();
+    for row in &rows {
+        let file = repo.join(&row.path);
+        if !file.is_file() {
+            wrong.push(format!(
+                "  `{}`: recorded in the freeze but not on disk",
+                row.path
+            ));
+            continue;
+        }
+        let found = git_hash_object(&file);
+        if found != row.hash {
+            wrong.push(format!(
+                "  `{}`: hashes to {}, but the freeze records {}",
+                row.path,
+                found.as_str(),
+                row.hash.as_str(),
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} frozen artifact(s) no longer match {}:\n{}\n\n\
+         These files are the measurement basis of the spec-length A/B: the control specs, \
+         the key-point ledgers derived from them, and the arms graded against those \
+         ledgers. A change here is not a diff to review — it invalidates every measurement \
+         taken against the old bytes. If the change was deliberate, it is a new row for a \
+         new artifact, not an edit to this one.",
+        wrong.len(),
+        path.display(),
+        wrong.join("\n"),
+    );
+}
+
+/// Split a key-point ledger row, honouring `\|` as an escaped pipe.
+///
+/// [`split_row`] cannot be reused: `MANIFEST.md` forbids a literal `|` in any
+/// cell and has no escape handling, so it splits on every one. A ledger row
+/// quotes real text out of a frozen spec, and some of that text is shell
+/// alternations (`startup|clear|compact`, a `grep -E` pattern) — the ledgers
+/// escape those as `\|`, which markdown renders as a literal pipe inside the
+/// cell. Splitting on them anyway would report the row as having extra columns.
+fn split_ledger_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|')?;
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                // `\|` is one literal pipe, not a separator.
+                Some('|') => cur.push('|'),
+                Some(other) => {
+                    cur.push('\\');
+                    cur.push(other);
+                }
+                None => cur.push('\\'),
+            },
+            '|' => cells.push(std::mem::take(&mut cur)),
+            other => cur.push(other),
+        }
+    }
+    cells.push(cur);
+    Some(cells.into_iter().map(|c| c.trim().to_string()).collect())
+}
+
+/// The four values a ledger row's `kind` cell may take.
+const LEDGER_KINDS: &[&str] = &["decision", "interface", "constraint", "scope"];
+
+/// Each key-point ledger is the closed list it claims to be.
+///
+/// The ledgers are the rubric every candidate arm is graded against: a row
+/// dropped from a candidate spec eliminates that arm. So the shape of the rubric
+/// has to be checkable, not merely asserted in a preamble — a row whose `kind`
+/// is a typo, an id sequence with a gap, or a "Closed list: N rows" header that
+/// no longer matches the table beneath it would all corrupt the grading while
+/// looking fine.
+///
+/// **The ledgers are discovered from `FREEZE.md`, not from a list repeated
+/// here.** A second list would be a second place to forget a fixture; the freeze
+/// is already the authority on which files are frozen.
+#[test]
+fn spec_length_ledgers_are_the_closed_lists_they_claim() {
+    let freeze_path = spec_length_freeze_path();
+    let contents = fs::read_to_string(&freeze_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", freeze_path.display()));
+    let rows = parse_freeze(&contents).unwrap_or_else(|e| panic!("{}: {e}", freeze_path.display()));
+
+    let repo = repo_root();
+    let ledgers: Vec<&FreezeRow> = rows
+        .iter()
+        .filter(|r| {
+            r.path
+                .starts_with("docs/skill-evidence/spec-length/ledger/")
+        })
+        .collect();
+    assert!(
+        !ledgers.is_empty(),
+        "{} freezes no ledger, so this check compared nothing",
+        freeze_path.display()
+    );
+
+    for row in ledgers {
+        let path = repo.join(&row.path);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let stem = Path::new(&row.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| panic!("{}: no file stem", row.path));
+
+        let declared: usize = text
+            .lines()
+            .find_map(|l| {
+                l.split("Closed list:")
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no `Closed list: N rows` declaration. The count is what makes the \
+                     list closed rather than open-ended.",
+                    path.display()
+                )
+            });
+
+        let mut seen = 0usize;
+        let mut in_table = false;
+        for line in text.lines() {
+            let Some(cells) = split_ledger_row(line) else {
+                continue;
+            };
+            if !in_table {
+                if cells.len() == 3 && cells[0] == "id" && cells[1] == "kind" && cells[2] == "item"
+                {
+                    in_table = true;
+                }
+                continue;
+            }
+            if is_separator_row(&cells) {
+                continue;
+            }
+            assert_eq!(
+                cells.len(),
+                3,
+                "{}: row has {} cells, expected 3 (`| id | kind | item |`). An unescaped \
+                 `|` in the text is the usual cause — escape it as `\\|`.\n  {line}",
+                path.display(),
+                cells.len(),
+            );
+            seen += 1;
+            assert_eq!(
+                cells[0],
+                format!("{stem}-{seen:02}"),
+                "{}: ids must run `{stem}-01`, `{stem}-02`, … with no gaps, renumbering or \
+                 duplicates — every id is cited by an elimination and must stay stable \
+                 forever",
+                path.display(),
+            );
+            assert!(
+                LEDGER_KINDS.contains(&cells[1].as_str()),
+                "{}: row {} has kind `{}`, which is not one of {LEDGER_KINDS:?}",
+                path.display(),
+                cells[0],
+                cells[1],
+            );
+            assert!(
+                !cells[2].is_empty(),
+                "{}: row {} has an empty item",
+                path.display(),
+                cells[0],
+            );
+        }
+
+        assert!(
+            in_table,
+            "{}: no `| id | kind | item |` header row",
+            path.display()
+        );
+        assert_eq!(
+            seen,
+            declared,
+            "{}: declares {declared} rows but carries {seen}. The declared count is the \
+             closed-list claim; a table that has drifted from it means either the ledger \
+             grew after the freeze or the count is stale, and both invalidate grading.",
+            path.display(),
+        );
+    }
+}
+
+/// Build a throwaway repository so the git helpers above can be exercised
+/// against history this file controls.
+///
+/// [`freeze_precedes_every_candidate_arm`] runs against the real repository,
+/// where the interesting states — an arm that predates the freeze, an arm added
+/// twice — do not exist and must never be made to exist. Without a synthetic
+/// repository the branch that actually catches a violation would ship having
+/// never fired, which is the same "green having verified nothing" this file
+/// refuses everywhere else.
+///
+/// Identity and hooks are pinned inline: `commit` fails on a machine with no
+/// `user.email` configured, and an ambient `commit.gpgsign` or a global hook
+/// would otherwise leak a developer's setup into these assertions.
+#[cfg(test)]
+struct ScratchRepo {
+    dir: tempfile::TempDir,
+}
+
+impl ScratchRepo {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Self { dir };
+        repo.git(&["init", "--quiet", "-b", "main"]);
+        repo.git(&["config", "user.email", "freeze-test@example.invalid"]);
+        repo.git(&["config", "user.name", "freeze test"]);
+        repo.git(&["config", "commit.gpgsign", "false"]);
+        repo.git(&["config", "core.hooksPath", "/dev/null"]);
+        repo
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(self.path())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run `git {}`: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "`git {}` failed in the scratch repo: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Write `name` with `body` and commit it, returning the commit id.
+    fn commit_file(&self, name: &str, body: &str) -> GitObjectId {
+        fs::write(self.path().join(name), body).expect("write scratch file");
+        self.git(&["add", name]);
+        self.git(&["commit", "--quiet", "-m", &format!("add {name}")]);
+        GitObjectId::parse(&self.git(&["rev-parse", "HEAD"])).expect("scratch HEAD")
+    }
+
+    fn remove_file(&self, name: &str) -> GitObjectId {
+        self.git(&["rm", "--quiet", name]);
+        self.git(&["commit", "--quiet", "-m", &format!("remove {name}")]);
+        GitObjectId::parse(&self.git(&["rev-parse", "HEAD"])).expect("scratch HEAD")
+    }
+}
+
+/// A path added, deleted, and added again resolves to the **first** add.
+///
+/// This is the regression test for a hole that shipped in the first draft of
+/// [`introducing_commit_in`], which passed `-1` to `git log`. `git log` prints
+/// newest-first, so `-1` returned the most recent `A` event — and an arm
+/// authored before the freeze could be laundered into compliance with a `git rm`
+/// and a re-commit of the same bytes. The ordering gate would then have called
+/// it clean.
+///
+/// Asserting on the *earliest* commit is what makes the re-add irrelevant, so
+/// this test fails the moment `-1` comes back.
+#[test]
+fn introducing_commit_reports_the_first_add_not_a_later_re_add() {
+    assert!(git_available(), "`git` is not resolvable");
+    let repo = ScratchRepo::new();
+    let first = repo.commit_file("S1.md", "an arm\n");
+    repo.remove_file("S1.md");
+    let re_add = repo.commit_file("S1.md", "an arm\n");
+    assert_ne!(
+        first.as_str(),
+        re_add.as_str(),
+        "the scratch repo must really have two distinct add events, or this test \
+         proves nothing"
+    );
+
+    match introducing_commit_in(repo.path(), Path::new("S1.md")) {
+        Introduced::At(found) => assert_eq!(
+            found.as_str(),
+            first.as_str(),
+            "expected the FIRST add {}, got {} — a `git rm` plus a re-commit must not \
+             re-date an arm past the freeze",
+            first.as_str(),
+            found.as_str(),
+        ),
+        Introduced::NotCommitted => panic!("the file is committed twice over"),
+        Introduced::Undetermined { how } => panic!("could not resolve the scratch repo: {how}"),
+    }
+}
+
+/// A file on disk that no commit adds is [`Introduced::NotCommitted`] — an
+/// absence of evidence, distinct from git failing to answer.
+#[test]
+fn introducing_commit_reports_an_untracked_path_as_not_committed() {
+    assert!(git_available(), "`git` is not resolvable");
+    let repo = ScratchRepo::new();
+    repo.commit_file("S1.md", "an arm\n");
+    fs::write(repo.path().join("S9.md"), "a draft\n").expect("write draft");
+
+    assert!(
+        matches!(
+            introducing_commit_in(repo.path(), Path::new("S9.md")),
+            Introduced::NotCommitted
+        ),
+        "an untracked arm must be NotCommitted, never mistaken for a resolved commit"
+    );
+}
+
+/// The two verdicts [`freeze_precedes_every_candidate_arm`] actually turns on,
+/// exercised over history where both really occur.
+///
+/// The violation branch cannot fire in the real repository — no arm predates the
+/// freeze there, and none ever should — so without this the mechanism the whole
+/// spec-length A/B rests on would be attested by code review alone.
+#[test]
+fn descends_from_separates_an_ordered_arm_from_a_pre_freeze_one() {
+    assert!(git_available(), "`git` is not resolvable");
+    let repo = ScratchRepo::new();
+
+    // A side branch cut before the freeze, carrying an arm — the realistic shape
+    // of a violation, since an arm authored on a stale branch and merged in is
+    // reachable from HEAD without descending from the freeze.
+    let root = repo.commit_file("README.md", "root\n");
+    repo.git(&["switch", "--quiet", "-c", "stale", root.as_str()]);
+    let pre_freeze_arm = repo.commit_file("S2.md", "authored too early\n");
+    repo.git(&["switch", "--quiet", "main"]);
+
+    let freeze = repo.commit_file("FREEZE.md", "the freeze\n");
+    let post_freeze_arm = repo.commit_file("S1.md", "authored in order\n");
+    repo.git(&["merge", "--quiet", "--no-ff", "-m", "merge stale", "stale"]);
+
+    assert!(
+        matches!(
+            descends_from_in(repo.path(), &freeze, &post_freeze_arm),
+            Descent::Yes
+        ),
+        "an arm committed after the freeze descends from it"
+    );
+    assert!(
+        matches!(
+            descends_from_in(repo.path(), &freeze, &pre_freeze_arm),
+            Descent::No
+        ),
+        "an arm committed on a branch cut before the freeze does NOT descend from it, \
+         even once merged — this is the violation the gate exists to catch"
+    );
+    // Reflexive on purpose: an arm introduced by the very commit that introduced
+    // the freeze did not exist before it either.
+    assert!(
+        matches!(descends_from_in(repo.path(), &freeze, &freeze), Descent::Yes),
+        "a commit is its own ancestor"
+    );
+
+    // And the merge does not hide the stale arm: the scan resolves it to the
+    // side-branch commit, not to the merge.
+    match introducing_commit_in(repo.path(), Path::new("S2.md")) {
+        Introduced::At(found) => assert_eq!(
+            found.as_str(),
+            pre_freeze_arm.as_str(),
+            "a merged-in arm must resolve to where it was authored, not to the merge"
+        ),
+        other => panic!(
+            "expected the side-branch commit, got {}",
+            match other {
+                Introduced::NotCommitted => "NotCommitted".to_string(),
+                Introduced::Undetermined { how } => how,
+                Introduced::At(_) => unreachable!(),
+            }
+        ),
+    }
 }
 
 /// A URL is an address, not a sentence.
