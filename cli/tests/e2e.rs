@@ -897,6 +897,53 @@ fn e2e_ask_wait_still_yields_an_answer_that_landed_before_the_re_arm() {
 }
 
 #[test]
+fn e2e_ask_wait_fails_fast_when_the_run_is_deleted_under_it() {
+    // A wait can outlive its run — `drovr cleanup <run> --purge` removes the run dir,
+    // and a 30-minute wait is a long time to be exposed to that. A one-shot entry
+    // check is not enough: `interview::read` reads the now-missing log as an EMPTY
+    // one, so the wait would poll out its whole timeout and then exit 2 saying "the
+    // question is still on disk and still on screen" — advice that is false in both
+    // halves, and whose suggested re-run gives a different answer (exit 1).
+    let run = "e2e-ask-vanished";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+    post_ask(&xdg, run, "which arm ships?");
+
+    let mut wait_child = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "20000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("drovr ask wait");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_child.try_wait().expect("try_wait").is_none(),
+        "ask wait must still be blocking before the run goes away"
+    );
+
+    let started = Instant::now();
+    fs::remove_dir_all(&run_dir).expect("purge the run out from under the wait");
+
+    let out = wait_child.wait_with_output().expect("wait for ask wait");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a vanished run is an error, not a timeout; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it must fail fast, not poll out the full timeout; took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "an error must put nothing on stdout"
+    );
+    println!("e2e ask: a run deleted mid-wait fails fast with 1, not a false timeout");
+}
+
+#[test]
 fn e2e_ask_usage_errors_exit_1() {
     let run = "e2e-ask-usage";
     let (_tmp, xdg, run_dir) = ask_fixture(run);

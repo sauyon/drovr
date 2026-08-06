@@ -460,22 +460,35 @@ fn validate_label(kind: &str, s: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Reject run names that are empty, contain path-separator characters, or are the
-/// literal `wait`.
+/// Reject run names that are empty or contain path-separator characters.
+/// Thin wrapper over the shared [`validate_label`] predicate.
 ///
-/// `wait` is reserved because `drovr ask` takes its run as a bare positional and
-/// `drovr ask wait <run>` as a subcommand — a run actually named `wait` would make
-/// `drovr ask wait` mean two things, and clap resolves that in favour of the
-/// subcommand, silently. The refusal lives here rather than in `ask` alone so it also
-/// blocks `drovr new wait`: a run that could never be asked a question is not one to
-/// let anyone create.
+/// Deliberately does NOT reserve `wait` — see [`validate_askable_run_name`]. This is
+/// the validator every command uses to *operate on* a run, and a run named `wait`
+/// that predates the reservation must stay operable, `cleanup` above all. Reserving a
+/// name for new runs and refusing to touch existing ones are different decisions.
 fn validate_run_name(name: &str) -> io::Result<()> {
-    validate_label("run name", name)?;
+    validate_label("run name", name)
+}
+
+/// [`validate_run_name`], plus the reservation of the literal name `wait`.
+///
+/// `drovr ask` takes its run as a bare positional and `drovr ask wait <run>` as a
+/// subcommand, so a run actually named `wait` makes `drovr ask wait` mean two things —
+/// and clap resolves that in favour of the subcommand, silently. Such a run therefore
+/// cannot be asked a question at all.
+///
+/// Used by the two commands where that matters: `drovr new` (so the name cannot be
+/// taken from here on) and `drovr ask` (which cannot honour it). Everything else keeps
+/// the general validator, so a `wait` run created before this existed is still
+/// listable, attachable and — the one that would really hurt — cleanable.
+fn validate_askable_run_name(name: &str) -> io::Result<()> {
+    validate_run_name(name)?;
     if name == "wait" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid run name \"wait\": reserved, because `drovr ask wait <run>` would \
-             become ambiguous",
+            "run name \"wait\" is reserved: `drovr ask wait <run>` is the wait subcommand, \
+             so a run called \"wait\" could never be asked a question",
         ));
     }
     Ok(())
@@ -641,7 +654,10 @@ fn cmd_new(
     no_worktree_flag: bool,
     herdr: &SystemHerdr,
 ) {
-    if let Err(e) = validate_run_name(name) {
+    // The one place the `wait` reservation belongs: a name refused here can never be
+    // taken, which is cheaper than discovering at ask time that this run's questions
+    // have nowhere to go.
+    if let Err(e) = validate_askable_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
@@ -2083,7 +2099,7 @@ fn validate_ask_request(
     };
 
     let run = run.ok_or_else(|| usage("missing <run>".to_string()))?;
-    validate_run_name(run)?;
+    validate_askable_run_name(run)?;
     let question = question.ok_or_else(|| usage("missing --question".to_string()))?;
 
     let mut options = Vec::with_capacity(option_specs.len());
@@ -2101,11 +2117,21 @@ fn validate_ask_request(
         });
     }
 
-    // `interview`'s own predicate, not a second copy of it, checked here only so the
-    // failure is a usage error before anything is written rather than an I/O error
-    // after. Calling the module's function is what keeps the CLI from being stricter
-    // or laxer than the writer it goes through; `ask_recommend_rule_is_one_
-    // implementation_not_two` holds the two in step.
+    // Both are `interview`'s own predicates, not second copies of them, and both are
+    // checked here only so the failure is a usage error before anything is written
+    // rather than an I/O error after — and, since `cmd_ask` checks the run dir and
+    // reads `--context` first, so the message names the actual mistake rather than
+    // whatever the disk happened to object to first. Calling the module's functions is
+    // what keeps the CLI from being stricter or laxer than the writer it goes through;
+    // `ask_recommend_rule_is_one_implementation_not_two` and
+    // `ask_option_values_must_be_distinct_and_the_cli_says_so_first` hold them in step.
+    if !interview::option_values_are_unique(&options) {
+        return Err(usage(
+            "two --options share a value; the value is what an answer records, so a \
+             repeat leaves no way to say which was chosen"
+                .to_string(),
+        ));
+    }
     if !interview::recommend_is_offered(recommend, &options) {
         return Err(usage(format!(
             "--recommend {:?} names no offered --option",
@@ -2119,6 +2145,16 @@ fn validate_ask_request(
         options,
         recommend: recommend.map(str::to_string),
     })
+}
+
+/// Whether the reviewer has cancelled this run.
+///
+/// The marker `handle_post_submit` writes (`cli/src/review.rs`), read off disk rather
+/// than from the server, so `ask wait` needs nothing running to see it. One predicate
+/// for the three places that ask — `cmd_ask`, and `cmd_ask_wait` before and inside its
+/// loop — because a condition spelled out per call site is one that drifts.
+fn run_is_cancelled(dir: &std::path::Path) -> bool {
+    dir.join("cancelled").exists()
 }
 
 /// Print the cancellation message both `ask` and `ask wait` use, and exit 5.
@@ -2168,7 +2204,7 @@ fn cmd_ask(
     }
     // Before the append, not after: refusing to post is only meaningful if nothing
     // was posted.
-    if dir.join("cancelled").exists() {
+    if run_is_cancelled(&dir) {
         ask_cancelled(&req.run);
     }
 
@@ -2224,16 +2260,24 @@ fn cmd_ask_wait(run: &str, timeout_ms: u64) {
     let dir = run_dir(run);
     // The same guard the post half applies, and for a sharper reason: a run dir that
     // is not there folds, through `interview::read`, to exactly what a fully answered
-    // interview folds to — an empty log. Without this the wait would print `[]` and
-    // exit 0, i.e. "answered, nothing outstanding", to a caller that typo'd the run
-    // name or whose run was torn down underneath it.
-    if !dir.is_dir() {
-        eprintln!(
-            "drovr: ask wait: no run '{run}' at {} — nothing to wait for",
-            dir.display()
-        );
-        process::exit(1);
-    }
+    // interview folds to — an empty log. Ungated, the wait would print `[]` and exit 0,
+    // i.e. "answered, nothing outstanding", to a caller that typo'd the run name.
+    //
+    // Re-checked every poll, not just here: a wait can outlive its run (`drovr cleanup
+    // <run> --purge` removes the dir), and a 30-minute wait is a long exposure. One
+    // entry check would let a purged run poll out its whole timeout and then exit 2
+    // claiming the question is "still on disk and still on screen" — false in both
+    // halves, and the re-run it recommends answers differently (1).
+    let require_run_dir = || {
+        if !dir.is_dir() {
+            eprintln!(
+                "drovr: ask wait: no run '{run}' at {} — nothing to wait for",
+                dir.display()
+            );
+            process::exit(1);
+        }
+    };
+    require_run_dir();
     // An unreadable-but-present log is a real failure (exit 1), never "no questions":
     // reporting a broken interview as an empty one would exit 0 and wave the caller on.
     let read_log = || -> Vec<interview::Ask> {
@@ -2247,7 +2291,7 @@ fn cmd_ask_wait(run: &str, timeout_ms: u64) {
     // Checked before the snapshot as well as inside the loop: on a cancelled run with
     // nothing outstanding, the nothing-pending shortcut below would exit 0, which tells
     // the caller to carry on with a run that is over.
-    if dir.join("cancelled").exists() {
+    if run_is_cancelled(&dir) {
         ask_cancelled(run);
     }
 
@@ -2268,9 +2312,13 @@ fn cmd_ask_wait(run: &str, timeout_ms: u64) {
     }
 
     loop {
-        if dir.join("cancelled").exists() {
+        // Cancellation first — it is terminal, and outranks an answer that arrived on
+        // the same tick. Then the run dir, so a purge is an error and not a slow
+        // timeout. Only then is an unchanged log genuinely "no answer yet".
+        if run_is_cancelled(&dir) {
             ask_cancelled(run);
         }
+        require_run_dir();
         let asks = read_log();
         let mut waited: Vec<interview::Ask> = asks
             .into_iter()
@@ -4026,11 +4074,19 @@ mod tests {
 
     #[test]
     fn ask_rejects_a_run_named_wait() {
-        // `drovr ask wait <run>` is only unambiguous while no run is called `wait`.
-        // The refusal lives in `validate_run_name`, so it also blocks `drovr new wait`
-        // — a run that could never be asked a question is not one to allow creating.
-        assert!(validate_run_name("wait").is_err());
-        assert!(validate_run_name("waiting").is_ok());
+        // `drovr ask wait <run>` is only unambiguous while no run is called `wait`, so
+        // `new` and `ask` both refuse the name...
+        assert!(validate_askable_run_name("wait").is_err());
+        assert!(validate_askable_run_name("waiting").is_ok());
+        assert!(validate_ask_request(Some("wait"), Some("q"), &[], None).is_err());
+
+        // ...but the GENERAL validator must not, or a run named `wait` that predates
+        // the reservation becomes unmanageable: `status`, `attach` and above all
+        // `cleanup` would all refuse it, leaving no CLI way to tear it down. Reserving
+        // a name for new runs and refusing to operate on existing ones are different
+        // decisions, and only the first is ours to make.
+        assert!(validate_run_name("wait").is_ok());
+        assert!(validate_run_name("../x").is_err());
     }
 
     #[test]
@@ -4066,6 +4122,43 @@ mod tests {
         // Split on the FIRST `=`, so a label may contain one.
         assert_eq!(ok.options[1].value, "b");
         assert_eq!(ok.options[1].label, "has=equals");
+    }
+
+    #[test]
+    fn ask_option_values_must_be_distinct_and_the_cli_says_so_first() {
+        // `interview::append_ask` refuses these too — it is the authority. The CLI
+        // calls the SAME predicate purely to get the diagnosis out before `cmd_ask`
+        // touches the disk, exactly as it does for `--recommend`: otherwise a typo'd
+        // run name is reported instead of the actual mistake, because the run-dir
+        // check runs first and the duplicate is only noticed at the append.
+        let dup = ["a=Arm A".to_string(), "a=Arm B".to_string()];
+        let e = validate_ask_request(Some("r"), Some("q"), &dup, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--option"), "{e}");
+
+        // Two options may share a LABEL; only the value is a key.
+        let ok = ["a=Arm".to_string(), "b=Arm".to_string()];
+        assert!(validate_ask_request(Some("r"), Some("q"), &ok, None).is_ok());
+
+        // And, as with recommend, the CLI is neither stricter nor laxer than the
+        // module it writes through.
+        for specs in [&dup, &ok] {
+            let parsed: Vec<interview::AskOption> = specs
+                .iter()
+                .map(|s| {
+                    let (v, l) = s.split_once('=').unwrap();
+                    interview::AskOption {
+                        value: v.into(),
+                        label: l.into(),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                validate_ask_request(Some("r"), Some("q"), specs, None).is_ok(),
+                interview::option_values_are_unique(&parsed),
+                "CLI and module disagree on {specs:?}"
+            );
+        }
     }
 
     #[test]
