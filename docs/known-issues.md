@@ -3990,3 +3990,118 @@ into one `None` is what forces the heuristic. herdr distinguishes them — the f
 we could not REACH", ignoring panes herdr positively reported as gone) with no permanent-uncertainty
 problem. That is a change to drovr's core poll primitive and its documented contract, so it wants
 its own change rather than riding along with a feature.
+
+## The seed-delivery detector reports the OPPOSITE of what happened on a cursor pane, and it kills the whole panel (2026-08-06)
+
+**Severity:** high (exit 1 on a review panel that is one keypress from working, and unlike a
+phase there is no hand-recovery path — the panel dies).
+**Found:** 2026-08-06, run `tiered-review` task-1, reviewer pane `wD4:p6`, a **cursor** agent.
+
+This is the `paste-not-submitted` case the opencode entry above names in its disambiguation
+list. What is new here is not the delivery failure — it is that **drovr's diagnostic asserts the
+opposite of the pane's actual state**, and then declines to act on the strength of that wrong
+conclusion.
+
+### Symptom
+
+`drovr code-review run tiered-review task-1` exits **1**, twice, with:
+
+> the seed was NOT delivered — herdr saw no state change after the prompt, and the payload is
+> nowhere in the agent's composer, so it was swallowed rather than left unsubmitted.
+
+Reading the pane showed the composer holding exactly the seed:
+
+```
+  → [Pasted text #1 +72 lines]
+  Plan (shift+tab to cycle)
+  Composer 2.5
+```
+
+A single `herdr pane send-keys wD4:p6 Enter` submitted it and the reviewer ran normally. The
+payload was never swallowed; it was left unsubmitted, which is the branch the message explicitly
+rules out.
+
+### Root cause
+
+cursor renders a multi-line paste as a **reference** — `[Pasted text #N +M lines]` — not as the
+text. drovr's detector looks for the payload's own characters, does not find them, and concludes
+it vanished. The inversion then propagates into the decision: drovr's stated reason for not
+pressing Enter is *"with nothing visibly in the composer we cannot tell a cleared input from a
+dialog"* — but something **is** visibly in the composer. The refusal is correct policy applied to
+a state that is not the one it is guarding against.
+
+### Impact
+
+Worse than the phase-level variant (*"`drovr phase send` returns success with the prompt left
+unsubmitted"* above) on three counts:
+
+- A phase whose seed is left unsubmitted is recoverable by hand
+  (`drovr phase brief … | drovr phase send … -`). **A reviewer pane is not** — drovr says so
+  itself: *"this phase is not one `phase send` re-opens."* The whole panel dies with it.
+- It returns exit **1**, which must never be read as approval.
+- It is reproducible, not flaky: two `--fresh` retries failed identically. Seed-not-delivered hit
+  **four times** this session — `tiered-review` brainstorm, `tiered-review` plan,
+  `implement-task-1`, and this review pane.
+
+### Fix direction
+
+1. Treat a paste reference as composer content: match `[Pasted text #N +M lines]` for cursor, and
+   the equivalent rendering for each other backend.
+2. When composer content is detected, **submit** rather than bail — the guard exists for an empty
+   composer, which this is not.
+3. When the detector is genuinely unsure, report *unsure* rather than asserting *swallowed*. The
+   message above states a root cause it has not established, and that is what sent two retries at
+   the wrong problem.
+
+Note the tension with the auto-suggested-prompt entry below: a detector that simply asks *"is the
+composer non-empty?"* fixes this one and breaks that one.
+
+## An agent's auto-suggested prompt is indistinguishable from composer content to anything reading a pane (2026-08-06)
+
+**Severity:** medium (nothing breaks, but it makes pane reads unreliable for drovr and for
+humans alike, and it cost this session two wrong diagnoses before the real cause was found).
+**Found:** 2026-08-06, run `skill-stickiness`, across five panes.
+**Not a live blocker:** the human is turning the suggestion feature off locally. Filed for the
+general case — any backend that renders a suggestion into the composer region has this shape.
+
+### Symptom
+
+Claude Code renders an **auto-suggested next prompt** into the composer region of an idle pane.
+`herdr pane read` shows it exactly like typed text, so drovr — and any agent or operator reading
+panes — cannot tell a suggestion from a real undelivered payload.
+
+Observed five times this session, each a plausible next instruction:
+`gates on conditional recall, add neovim, keep the strict bar` ·
+`finish the results doc and run code-review` · `who made those two commits?` ·
+`continue with task 2` · `merge origin/main too`.
+
+### Root cause
+
+The composer region is a rendering surface, not a buffer with a type. A suggestion and a pasted
+payload occupy the same rows and read identically; nothing in the pane text marks which is which.
+
+### Impact
+
+Diagnostic, and it compounds. It was misread first as a monitor writing nudges into composers,
+then as the human typing instructions that were not being submitted — both wrong, both acted on
+before being disproved. The driver then avoided sending to affected panes at all, for fear of
+concatenating onto real input, and routed work to fresh phases instead. The cost is the wrong
+diagnosis and the work rerouted around it, not a broken command.
+
+### Tells that distinguish it
+
+Worth encoding wherever drovr inspects a composer:
+
+- It appears only on **idle/finished** panes, never mid-turn.
+- It is always a plausible *next* instruction rather than a brief or a payload.
+- **Enter does not submit it.**
+- `ctrl+u` / BackSpace appear to "fail to clear" it — there is nothing to clear.
+
+### Fix direction, and the constraint on it
+
+This and the cursor paste-reference entry above **pull in opposite directions, and a fix for one
+must not break the other**: that one is a real payload drovr wrongly treats as absent, this one is
+a non-payload drovr could wrongly treat as present. A detector that asks *"is the composer
+non-empty?"* gets this entry wrong; one that matches only literal payload text gets that one
+wrong. The signals that separate them are the paste-reference pattern and whether the pane is
+mid-turn — not the presence of characters.
