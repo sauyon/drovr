@@ -2113,8 +2113,9 @@ await evaluate(`
   blockedAlarms = {}; blockedNotified = {};
   applyBlockedTitle();
   return 1;`);
-const sync = (alarms, scope) => evaluate(
-  `syncBlockedAlarms(${JSON.stringify(alarms)}, ${JSON.stringify(scope)}); return document.title;`);
+const sync = (alarms, scope, uncertain) => evaluate(
+  `syncBlockedAlarms(${JSON.stringify(alarms)}, ${JSON.stringify(scope)}, ` +
+  `${JSON.stringify(uncertain || [])}); return document.title;`);
 const notes = () => evaluate(`return window.__notes.slice();`);
 
 const A = { key: 'zz-one/implement', label: 'zz-one · implement is stopped on a destructive prompt' };
@@ -2151,6 +2152,16 @@ check('two blocks in one run are two alarms, not one',
   (await sync([A, C], null)).slice(0, 6), '⚠ (2) ');
 check('...and both are notified', (await notes()).length, 5);
 
+// A poll that SUCCEEDED while herdr was down carries no evidence that a block
+// went away. Clearing on it would drop the notification for an agent that is
+// still stuck — the opposite of what a failed fetch does.
+// Both live alarms at this point are zz-one's (the phase and its panel), so
+// holding that run holds both.
+check('a run whose sweep could not reach herdr keeps its alarms',
+  (await sync([], null, ['zz-one'])).slice(0, 6), '⚠ (2) ');
+check('...and only clears once a sweep that reached it says so',
+  await sync([], null, []), 'Drovr Review Loop');
+
 check('a destructive prompt renders an alarming badge',
   await evaluate(`var h = blockedBadge({count:1, human_phases:['implement'], phase:'implement', class:'destructive'});
     return [h.indexOf('needs-human') !== -1, h.indexOf('⚠ blocked') !== -1];`), [true, true]);
@@ -2162,6 +2173,9 @@ check('several blocks in one run are counted on the badge',
     .indexOf('+2') !== -1;`), true);
 check('nothing blocked renders nothing',
   await evaluate(`return blockedBadge(null);`), '');
+check('a sweep that reached nothing renders as unknown, not as clean',
+  await evaluate(`var h = blockedBadge({count:0, phase:null, class:null, human_phases:[], unknown:true});
+    return [h.indexOf('? unknown') !== -1, h.indexOf('needs-human') !== -1];`), [true, false]);
 check('a blocked review panel nested under a phase is still found',
   await evaluate(`return treeBlocked([{ name: 'implement-task-1', blocked: null, children: [
       { name: 'review:task-1:1:security', blocked: { needs_human: true, class: 'unknown' } },

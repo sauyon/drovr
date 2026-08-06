@@ -26,7 +26,7 @@
 //! # What is worth waking someone for
 //!
 //! Every blocked pane is REPORTED; only some are worth a notification.
-//! [`BlockedAgent::needs_human`] draws that line at the classifier's own verdict:
+//! [`BlockedClass::needs_human`] draws that line at the classifier's own verdict:
 //! destructive and unknown prompts need a human (drovr will never answer them
 //! itself), routine ones do not (a waiting driver answers them, and a badge that
 //! fires on every file-edit permission dialog is a badge nobody reads).
@@ -54,20 +54,6 @@ pub struct BlockedAgent {
     pub excerpt: String,
 }
 
-impl BlockedAgent {
-    /// Whether a human has to resolve this, as opposed to a driver's wait doing
-    /// it — [`BlockedClass::needs_human`] for this agent's class. These are the
-    /// ones that earn a badge, a browser notification, and a non-zero exit from
-    /// `drovr watch`.
-    ///
-    /// Routine prompts still appear in the scan (the agent tree shows them, and
-    /// a human staring at a stalled run deserves to know why it is stalled);
-    /// they simply do not raise an alarm.
-    pub fn needs_human(&self) -> bool {
-        self.class.needs_human()
-    }
-}
-
 /// What one sweep of a run's panes found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunScan {
@@ -83,6 +69,30 @@ pub struct RunScan {
     /// that folded it into "no agents left" would announce a run finished
     /// because a socket blipped.
     pub unreadable: usize,
+}
+
+impl RunScan {
+    /// Whether this sweep learned anything at all — i.e. whether an empty
+    /// [`RunScan::blocked`] may be reported as "nothing is blocked".
+    ///
+    /// **The one definition of that question.** It was spelled out at three call
+    /// sites (the server's cache, the list column, the wire) before this method
+    /// existed, and three copies of a predicate about uncertainty is how two of
+    /// them come to disagree about whether a run is fine.
+    ///
+    /// The line is drawn at "did ANY pane answer": a run where one pane answered
+    /// is a run herdr is talking to. A partial failure — some panes answered,
+    /// one did not — is therefore reported as conclusive, and that is a
+    /// deliberate limit, not an oversight. `pane_info` returns the same `None`
+    /// for a herdr that is down and for a pane id that no longer names anything,
+    /// and a stale pane id is *permanent*: treating any unreadable pane as
+    /// uncertainty would leave such a run flagged uncertain forever and defeat
+    /// the cache, since an inconclusive sweep is deliberately never cached. See
+    /// `docs/known-issues.md`, "A partially unreadable sweep is cached as a
+    /// clean answer".
+    pub fn inconclusive(&self) -> bool {
+        self.attached == 0 && self.unreadable > 0
+    }
 }
 
 /// Sweep a run's panes: which are blocked, and whether anything is still live.
@@ -224,7 +234,7 @@ pub fn watch_tick<H: Herdr>(h: &H, runs: &[RunState]) -> WatchTick {
         findings.extend(
             scan.blocked
                 .into_iter()
-                .filter(BlockedAgent::needs_human)
+                .filter(|a| a.class.needs_human())
                 .map(|agent| WatchFinding {
                     run: run.name.clone(),
                     agent,
@@ -289,7 +299,7 @@ mod tests {
         assert_eq!(found[0].phase, "implement");
         assert_eq!(found[0].pane_id, "w:p2");
         assert_eq!(found[0].class, BlockedClass::Destructive);
-        assert!(found[0].needs_human());
+        assert!(found[0].class.needs_human());
         assert!(
             found[0].excerpt.contains("rm -rf build/"),
             "the excerpt quotes the prompt: {}",
@@ -306,7 +316,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].class, BlockedClass::Routine);
         assert!(
-            !found[0].needs_human(),
+            !found[0].class.needs_human(),
             "a driver's wait answers routine prompts; a watcher is not woken for them"
         );
     }
@@ -372,7 +382,7 @@ mod tests {
         let found = scan_run(&h, &run_with_panes()).blocked;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].class, BlockedClass::Unknown);
-        assert!(found[0].needs_human());
+        assert!(found[0].class.needs_human());
         assert!(
             found[0].excerpt.contains("could not be read"),
             "the excerpt says why it is empty: {}",

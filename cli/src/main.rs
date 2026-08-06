@@ -459,19 +459,21 @@ fn cmd_list<H: Herdr>(h: &H) {
     }
 
     runs.sort_by(|a, b| a.name.cmp(&b.name));
-    // Which runs are worth sweeping for blocked agents: not archived (`cleanup`
-    // closed those panes) and still holding a live herdr workspace. Computed as
-    // a SET first, in one herdr call, because the alternative — asking about
-    // every recorded pane — means a `pane.get` failure, and a "polling is
-    // degraded" diagnostic on stderr, for every pane of every run that ever
-    // finished.
-    let live: std::collections::HashSet<String> = blocked::with_live_workspace(
-        h,
-        runs.iter().filter(|r| !r.archived).cloned().collect(),
-    )
-    .into_iter()
-    .map(|r| r.name)
-    .collect();
+    // Which runs are worth sweeping for blocked agents: the ones still holding a
+    // live herdr workspace. Computed as a SET first, in one herdr call, because
+    // the alternative — asking about every recorded pane — means a `pane.get`
+    // failure, and a "polling is degraded" diagnostic on stderr, for every pane
+    // of every run that ever finished.
+    //
+    // Liveness is the whole gate. An ARCHIVED run is not excluded: archiving
+    // closes the workspace, so a still-live one means the close failed and
+    // something is running in panes drovr believes it shut — the last run whose
+    // stuck agent should go unreported.
+    let live: std::collections::HashSet<String> =
+        blocked::with_live_workspace(h, runs.to_vec())
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
     for run in &runs {
         let column = if live.contains(&run.name) {
             blocked_column(&blocked::scan_run(h, run))
@@ -657,7 +659,7 @@ fn cmd_status<H: Herdr>(h: &H, name: &str) {
             ""
         };
         let stuck = match blocked.iter().find(|a| a.phase == p.name) {
-            Some(a) if a.needs_human() => format!("  BLOCKED ({})", a.class.as_str()),
+            Some(a) if a.class.needs_human() => format!("  BLOCKED ({})", a.class.as_str()),
             Some(_) => "  blocked (routine)".to_string(),
             None => String::new(),
         };
@@ -938,17 +940,18 @@ fn blocked_column(scan: &blocked::RunScan) -> Option<String> {
     let blocked = &scan.blocked;
     let Some(lead) = blocked
         .iter()
-        .find(|a| a.needs_human())
+        .find(|a| a.class.needs_human())
         .or_else(|| blocked.first())
     else {
-        // Nothing blocked — but if herdr could not answer for a single one of
-        // this run's panes, "nothing blocked" is not something we learned. Say
-        // so rather than rendering the row identically to a healthy one, which
-        // is the same distinction the session list's `live: null` banner draws.
-        return (scan.unreadable > 0 && scan.attached == 0)
+        // Nothing blocked — but if the sweep reached none of this run's panes,
+        // "nothing blocked" is not something we learned. Say so rather than
+        // rendering the row identically to a healthy one, which is the same
+        // distinction the session list's `live: null` banner draws.
+        return scan
+            .inconclusive()
             .then(|| "? unreadable (herdr did not answer)".to_string());
     };
-    let word = if lead.needs_human() {
+    let word = if lead.class.needs_human() {
         "BLOCKED"
     } else {
         "blocked"
@@ -971,7 +974,7 @@ fn blocked_column(scan: &blocked::RunScan) -> Option<String> {
 /// pane differently — the whole point of a watcher is that what wakes you and
 /// what you then read say the same thing.
 fn blocked_report(run: &str, a: &blocked::BlockedAgent) -> String {
-    let verdict = if a.needs_human() {
+    let verdict = if a.class.needs_human() {
         format!(
             "phase '{}' is BLOCKED on a {} prompt drovr will not answer itself",
             a.phase,
@@ -992,8 +995,13 @@ fn blocked_report(run: &str, a: &blocked::BlockedAgent) -> String {
     )
 }
 
-/// Every run `drovr watch` should sweep: the one named, or every run that has
-/// not been archived (archiving closed its panes, so nothing there can block).
+/// Every run `drovr watch` should sweep: the one named, or every run whose herdr
+/// workspace is still live.
+///
+/// Liveness is the only filter, archiving deliberately not among them: an
+/// archived run whose workspace is still open is one whose close FAILED, so an
+/// agent is running in panes drovr believes it shut — the last place a block
+/// should go unwatched.
 ///
 /// A run whose `state.json` will not parse is skipped rather than fatal — one
 /// broken run must not stop a watch over all the others. A run named
@@ -1016,7 +1024,6 @@ fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> Vec<RunState> {
                     None
                 }
             })
-            .filter(|s| !s.archived)
             .collect();
         return blocked::with_live_workspace(h, all);
     };
@@ -1056,9 +1063,17 @@ fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: 
             }
             blocked::WatchTick::Watching => {
                 if std::time::Instant::now() >= deadline {
+                    // Precise about what did NOT happen. This is "no agent asked
+                    // for a human", which is not the same as "nothing is
+                    // blocked": a routine permission prompt keeps the watch
+                    // running by design, and so does a pane herdr would not
+                    // answer for. A driver that read this as a clean bill of
+                    // health would stop looking at exactly the wrong moment.
                     eprintln!(
-                        "drovr: watch timed out after {timeout_ms}ms with agents still \
-                         running and nothing blocked — re-run to keep watching"
+                        "drovr: watch timed out after {timeout_ms}ms — no agent needed a human \
+                         in that window. Agents were still attached (or herdr could not be \
+                         reached); routine prompts and unreadable panes do not end the watch. \
+                         Re-run to keep watching."
                     );
                     process::exit(2);
                 }

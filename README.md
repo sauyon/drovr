@@ -187,10 +187,19 @@ seconds, so however many tabs are open, herdr sees at most one sweep per run per
 pane is not cached at all, so the badge is right on the first poll after herdr
 comes back rather than 5s later.
 
-What bounds the cost is **liveness, not completion**: a run whose herdr
+What bounds the cost is **liveness, and nothing else**: a run whose herdr
 workspace is gone is skipped entirely (one `herdr workspace list` answers that
-for every run at once), and a run whose phases are all `Done` is still swept,
-because a review panel can be up — and stuck — long after the pipeline finished.
+for every run at once). Neither of the two tempting extra filters is applied,
+because both hide a real block — a run whose phases are all `Done` can still
+have a review panel up and stuck, and an *archived* run whose workspace is still
+open is one whose close failed, i.e. an agent running in panes drovr believes it
+shut.
+
+A sweep that reached **none** of a run's panes reports itself as unknown rather
+than as clean: `? unreadable` in `drovr list`, `? unknown` on the session-list
+badge, and `blocked.unknown` on the wire — which also stops the browser from
+clearing an alarm it already raised. (A *partial* failure — some panes answer,
+one does not — still reads as conclusive; `docs/known-issues.md` says why.)
 
 ### Resuming an agent's session
 

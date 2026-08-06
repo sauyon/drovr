@@ -235,10 +235,25 @@ struct Ctx {
 /// open, and the worst case is that a badge appears 5s after the agent stopped.
 const BLOCKED_TTL: Duration = Duration::from_secs(5);
 
-/// One run's last blocked scan, and when it was taken.
+/// A run's blocked agents AND how much the sweep that found them knew.
+///
+/// The two travel together because the interesting answer is a pair: an empty
+/// `agents` means "nothing is blocked" only when the sweep was conclusive, and
+/// separating them is how a herdr outage came to render as a clean row.
+#[derive(Clone, Default)]
+struct BlockedSnapshot {
+    agents: Vec<crate::blocked::BlockedAgent>,
+    /// The sweep could not reach a single one of the run's panes
+    /// ([`crate::blocked::RunScan::inconclusive`]).
+    inconclusive: bool,
+}
+
+/// One run's last blocked sweep, and when it was taken. `at: None` means the
+/// stored snapshot has no TTL — an inconclusive sweep is never cached, so the
+/// next poll retries instead of repeating a non-answer for five seconds.
 struct BlockedCache {
     at: Option<Instant>,
-    agents: Vec<crate::blocked::BlockedAgent>,
+    snapshot: BlockedSnapshot,
 }
 
 impl Ctx {
@@ -256,19 +271,14 @@ impl Ctx {
     ///
     /// Takes the herdr client rather than making one so a test can drive it with
     /// a `FakeHerdr`; the client is never stored, only the plain-data result is.
-    fn blocked_of<H: Herdr>(
-        &self,
-        h: &H,
-        run: &str,
-        state: &RunState,
-    ) -> Vec<crate::blocked::BlockedAgent> {
+    fn blocked_of<H: Herdr>(&self, h: &H, run: &str, state: &RunState) -> BlockedSnapshot {
         let cell = {
             let mut map = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
             map.entry(run.to_string())
                 .or_insert_with(|| {
                     Arc::new(Mutex::new(BlockedCache {
                         at: None,
-                        agents: Vec::new(),
+                        snapshot: BlockedSnapshot::default(),
                     }))
                 })
                 .clone()
@@ -277,19 +287,23 @@ impl Ctx {
         let fresh = cache.at.is_some_and(|at| at.elapsed() < BLOCKED_TTL);
         if !fresh {
             let scan = crate::blocked::scan_run(h, state);
-            // A sweep that could not read a single pane is not an answer, and
-            // caching it as one would keep saying "nothing is blocked" for a
-            // further TTL after herdr came back. Take the result (it is the best
-            // we have) but do NOT start the clock, so the next poll retries.
-            let learned_nothing = scan.attached == 0 && scan.unreadable > 0;
-            cache.agents = scan.blocked;
-            cache.at = if learned_nothing {
+            // A sweep that reached no pane is not an answer, and caching it as
+            // one would keep saying "nothing is blocked" for a further TTL after
+            // herdr came back. Keep the result (it is the best we have) and
+            // carry its uncertainty forward, but do NOT start the clock — the
+            // next poll retries.
+            let inconclusive = scan.inconclusive();
+            cache.snapshot = BlockedSnapshot {
+                agents: scan.blocked,
+                inconclusive,
+            };
+            cache.at = if inconclusive {
                 None
             } else {
                 Some(Instant::now())
             };
         }
-        cache.agents.clone()
+        cache.snapshot.clone()
     }
 
     fn with_wildcard_port(mut self, port: Option<u16>) -> Self {
@@ -1290,7 +1304,7 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
 fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
     serde_json::json!({
         "class": a.class.as_str(),
-        "needs_human": a.needs_human(),
+        "needs_human": a.class.needs_human(),
         "excerpt": a.excerpt,
         "pane_id": a.pane_id,
     })
@@ -1312,24 +1326,43 @@ fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
 /// [`blocked_json`] already spends that name on a bool, and the same name
 /// holding a bool on one endpoint and a number on a neighbouring one is a shape
 /// no typed client can share.
-fn blocked_summary_json(agents: &[crate::blocked::BlockedAgent]) -> serde_json::Value {
+fn blocked_summary_json(snapshot: &BlockedSnapshot) -> serde_json::Value {
+    let agents = &snapshot.agents;
     let human_phases: Vec<&str> = agents
         .iter()
-        .filter(|a| a.needs_human())
+        .filter(|a| a.class.needs_human())
         .map(|a| a.phase.as_str())
         .collect();
     let Some(lead) = agents
         .iter()
-        .find(|a| a.needs_human())
+        .find(|a| a.class.needs_human())
         .or_else(|| agents.first())
     else {
-        return serde_json::Value::Null;
+        // Nothing blocked — but only say so when the sweep actually reached the
+        // run's panes. `null` is what the browser reads as "this run is fine",
+        // including as permission to CLEAR an alarm it already raised, so a
+        // sweep that reached nothing must answer something else.
+        return if snapshot.inconclusive {
+            serde_json::json!({
+                "count": 0,
+                "phase": serde_json::Value::Null,
+                "class": serde_json::Value::Null,
+                "human_phases": [],
+                "unknown": true,
+            })
+        } else {
+            serde_json::Value::Null
+        };
     };
     serde_json::json!({
         "count": agents.len(),
         "phase": lead.phase,
         "class": lead.class.as_str(),
         "human_phases": human_phases,
+        // Blocks WERE found, so the row has something true to say; `unknown`
+        // still travels because some other pane of the run went unread and a
+        // further block may be hiding behind it.
+        "unknown": snapshot.inconclusive,
     })
 }
 
@@ -1357,7 +1390,7 @@ fn handle_get_agents(req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths) {
     let tree = match load_run_state(&p.dir) {
         Some(state) => {
             let blocked = ctx.blocked_of(&crate::herdr::SystemHerdr::new(), run, &state);
-            build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked)
+            build_agent_tree(&state, &cfg, config_error.as_deref(), &blocked.agents)
         }
         None => serde_json::json!({
             "workspace": serde_json::Value::Null,
@@ -1770,24 +1803,27 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
         let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
             || rs.state == LoopState::Cancelled)
             && !zombie;
-        // Blocked agents, for the row's badge. Scanned only for runs where the
-        // answer can be anything but "no": an archived run's panes were closed by
-        // `cleanup`, and a workspace herdr says is gone holds no panes at all.
-        // The scan is TTL-cached (`Ctx::blocked_of`), so the 2s list poll costs
-        // at most one herdr sweep per run per `BLOCKED_TTL`.
+        // Blocked agents, for the row's badge. The scan is TTL-cached
+        // (`Ctx::blocked_of`), so the 2s list poll costs at most one herdr sweep
+        // per run per `BLOCKED_TTL`.
         //
-        // **`complete` is deliberately NOT a reason to skip.** `is_complete()`
-        // walks `phases` only, so a run whose pipeline finished while a REVIEW
-        // PANEL is still up reads as complete — and a reviewer stuck on a
-        // destructive prompt is exactly the block nobody would otherwise notice.
-        // Liveness is what bounds the cost here, not completion.
+        // **Liveness is the ONLY gate**, and the two things it is deliberately
+        // not are both cases where an agent can be stuck:
         //
-        // `live == None` (herdr unreachable) still scans: the scan's own reads
-        // fail closed to "nothing blocked", which is the same answer skipping
-        // gives, and the moment herdr comes back the badge is right again
-        // without waiting for a liveness poll to agree.
+        // * `complete` — `is_complete()` walks `phases` only, so a run whose
+        //   pipeline finished while a REVIEW PANEL is still up reads as
+        //   complete, and a reviewer on a destructive prompt is exactly the
+        //   block nobody would otherwise notice.
+        // * `archived` — the zombie two lines above IS an archived run whose
+        //   panes are still live, kept in the active list precisely because
+        //   something is running in panes we believe we closed. Skipping it
+        //   would blind the one row the list singles out as needing attention.
+        //
+        // `live == None` (herdr unreachable) still scans, and the sweep reports
+        // its own uncertainty (`unknown` below) rather than fabricating a clean
+        // answer.
         let blocked = match run_state.as_ref() {
-            Some(st) if !archived && live != Some(false) => {
+            Some(st) if live != Some(false) => {
                 blocked_summary_json(&ctx.blocked_of(h, &name, st))
             }
             _ => serde_json::Value::Null,
@@ -1823,10 +1859,12 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
                     None => serde_json::Value::Null,
                     Some(b) => serde_json::Value::Bool(b),
                 },
-                // `null` when no agent of this run is parked on a prompt.
-                // Otherwise `{count, needs_human, phase, class}` — and it is
-                // `needs_human`, not `count`, that earns the alarm: a routine
-                // permission dialog is answered by whatever driver is waiting.
+                // `null` when a sweep confirmed no agent of this run is parked
+                // on a prompt. Otherwise `{count, phase, class, human_phases,
+                // unknown}` — and it is `human_phases`, not `count`, that earns
+                // the alarm: a routine permission dialog is answered by whatever
+                // driver is waiting. `unknown` says the sweep could not reach
+                // the run's panes, which is neither "blocked" nor "fine".
                 "blocked": blocked,
             }),
         ));
@@ -4805,6 +4843,72 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    /// A zombie is an ARCHIVED run whose workspace is still open: the human asked
+    /// to close it, the close failed, and an agent is running in panes drovr
+    /// believes it shut. The session list keeps that row out of the Completed
+    /// fold precisely because it needs attention — so it must be swept too.
+    #[test]
+    fn an_archived_run_whose_panes_are_still_live_is_still_scanned() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-8-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = make_running_run(&tmp, "zombie", "w:p0");
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.archived = true;
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("blocked"));
+        h.push_read_for("w:p0", "Dangerous rm operation\n1. Yes");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(row["archived"], true, "precondition: it was filed away");
+        assert_eq!(row["live"], true, "precondition: but its panes are alive");
+        assert_eq!(
+            row["blocked"]["human_phases"],
+            serde_json::json!(["phase0"]),
+            "archiving is not evidence the panes closed — the failed close is \
+             exactly why this row is still on screen"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Two agents of one run can be stuck at once — a phase and its review
+    /// panel. The browser raises one alarm per PHASE, so the wire has to name
+    /// both or the second is never announced.
+    #[test]
+    fn two_simultaneous_blocks_in_one_run_are_both_named() {
+        use crate::run::PhaseStatus::Running;
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-9-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = make_running_run(&tmp, "double", "w:p0");
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        let mut panel = crate::run::Phase::new("review:task-1:1:security");
+        panel.status = Running;
+        panel.set_pane("w:rev");
+        s.review_phases = vec![panel];
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:p0", Some("blocked"));
+        h.push_read_for("w:p0", "Dangerous rm operation\n1. Yes");
+        h.push_status_for("w:rev", Some("blocked"));
+        h.push_read_for("w:rev", "A prompt drovr has never seen\n1. Yes");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(row["blocked"]["count"], 2);
+        assert_eq!(
+            row["blocked"]["human_phases"],
+            serde_json::json!(["phase0", "review:task-1:1:security"])
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// A sweep that could not read a single pane learned nothing, and caching
     /// "nothing blocked" from it would keep answering that for a further TTL
     /// after herdr came back.
@@ -4817,7 +4921,14 @@ mod tests {
         let h = crate::herdr::FakeHerdr::new();
         h.fail_pane_info();
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
-        assert!(blocked_rows(&ctx, &h)[0]["blocked"].is_null());
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(
+            row["blocked"]["unknown"], true,
+            "a sweep that reached nothing must not answer `null`, which the \
+             browser reads as `this run is fine` — and as permission to clear \
+             an alarm it already raised"
+        );
+        assert_eq!(row["blocked"]["count"], 0);
 
         // herdr recovers, and the very next poll must see it — not five seconds
         // later.

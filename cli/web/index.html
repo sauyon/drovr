@@ -2410,16 +2410,25 @@ var baseTitle = document.title;
 /// happened to see would strand the alarm of a run that has since been purged:
 /// its key is in neither the feed nor the scope, so nothing would ever clear it
 /// and the tab title would carry a phantom count for the rest of the session.
-function syncBlockedAlarms(alarms, scope) {
+/// `uncertain` names the runs whose sweep could not reach their panes (the
+/// server's `blocked.unknown`). Their alarms are HELD, never cleared: a poll
+/// that succeeded while herdr was down carries no evidence that a block went
+/// away, and clearing on it would silently drop the notification for an agent
+/// that is still stuck — the opposite of what a failed fetch does two frames
+/// later.
+function syncBlockedAlarms(alarms, scope, uncertain) {
   var inScope = null;
   if (scope) {
     inScope = {};
     scope.forEach(function(name) { inScope[name] = true; });
   }
+  var unsure = {};
+  (uncertain || []).forEach(function(name) { unsure[name] = true; });
   var seen = {};
   alarms.forEach(function(a) { seen[a.key] = true; });
   Object.keys(blockedAlarms).forEach(function(key) {
-    if ((inScope === null || inScope[keyRun(key)]) && !seen[key]) {
+    var run = keyRun(key);
+    if ((inScope === null || inScope[run]) && !seen[key] && !unsure[run]) {
       delete blockedAlarms[key];
       delete blockedNotified[key];
     }
@@ -2544,6 +2553,14 @@ function runRow(run) {
 function blockedBadge(blocked) {
   if (!blocked) return '';
   var urgent = ((blocked.human_phases || []).length) > 0;
+  // The sweep reached none of the run's panes, and nothing was found — which is
+  // not the same as nothing being there. Rendering it as a clean row is how a
+  // herdr outage comes to look like a healthy run.
+  if (!blocked.count && blocked.unknown) {
+    return '<span class="run-blocked" title="' + escHtml(
+      'drovr could not reach this run’s panes, so whether an agent is blocked is unknown.'
+    ) + '">? unknown</span>';
+  }
   var extra = blocked.count > 1 ? ' +' + (blocked.count - 1) : '';
   var title = urgent
     ? 'Phase ' + blocked.phase + ' is stopped on a ' + blocked.class +
@@ -2748,7 +2765,9 @@ async function renderRunList(gen, resetAnchor) {
     // Scope `null`: this feed is every run there is, so it is entitled to clear
     // a key for a run that has since vanished from the list.
     var alarms = [];
+    var uncertain = [];
     runs.forEach(function(x) {
+      if (x.blocked && x.blocked.unknown) uncertain.push(x.name);
       ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
         alarms.push({
           key: x.name + '/' + phase,
@@ -2756,7 +2775,7 @@ async function renderRunList(gen, resetAnchor) {
         });
       });
     });
-    syncBlockedAlarms(alarms, null);
+    syncBlockedAlarms(alarms, null, uncertain);
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       resolvePendingAdvances(seq, stillActive);

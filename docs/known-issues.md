@@ -3513,3 +3513,41 @@ purpose is to find out whether a pane is still there does not need to be told, l
 not. See also "herdr's 'polling is degraded' diagnostic fires on a reap's EXPECTED path" — the same
 diagnostic, the same mismatch, a different caller. One fix (a quiet form of the poll for callers
 that treat a missing pane as an answer) covers both.
+
+## A partially unreadable sweep is cached as a clean answer (2026-08-06)
+
+**Severity:** low — a five-second window, and only for a run where some panes answer and others do not.
+**Found:** 2026-08-06, review round 2 of the blocked-agent watchers.
+
+### Symptom
+
+A run has three panes. herdr answers for two and not for the third. If the unanswered one is the
+pane that is blocked, `/api/runs` reports `blocked: null` — a clean row — and the answer is cached
+for the full `BLOCKED_TTL`.
+
+### Root cause
+
+`RunScan::inconclusive()` is `attached == 0 && unreadable > 0`: a sweep counts as having learned
+something the moment ANY pane answers. A partial failure is therefore treated as conclusive.
+
+The reason it is drawn there is `pane_info`'s contract. It returns the same `None` for "herdr is
+unreachable" and for "that pane id does not name anything any more", and the second is *permanent* —
+a run that keeps a dangling pane id (a pane the human closed by hand, say) would be flagged
+uncertain on every poll forever. Since an inconclusive sweep is deliberately never cached, that run
+would also re-sweep herdr every 2s for the rest of the server's life, which is the cost the cache
+exists to avoid.
+
+### Impact
+
+Bounded: it takes a run where herdr answers for some panes but not the one that is blocked, and it
+self-heals on the next sweep that reaches the pane. The alarm-holding rule on the browser side only
+fires on `unknown`, so this window is also a window where a *cleared* alarm could be dropped.
+
+### Fix idea
+
+The fix is at the herdr boundary, not here: `pane_info` collapsing "socket down" and "pane gone"
+into one `None` is what forces the heuristic. herdr distinguishes them — the failure carries
+`pane_not_found` — so a poll result that says which would let `inconclusive()` be exact ("any pane
+we could not REACH", ignoring panes herdr positively reported as gone) with no permanent-uncertainty
+problem. That is a change to drovr's core poll primitive and its documented contract, so it wants
+its own change rather than riding along with a feature.
