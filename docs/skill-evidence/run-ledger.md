@@ -424,10 +424,15 @@ no rubric, no arm labels, no blind map — asked only which option the `## Respo
 to and which quotes it advances for an option it does not take. `matches_key` was then recomputed
 against the transcript's own key rather than trusted. **12 of 12 agreed with the scorers on
 `compliant`, 12 of 12 recomputed correctly, and 0 quotes were advanced for an option not taken.**
-Recorded at `transcripts/tdd/remeasure-adjudication.json`, and enforced:
-`skills_valid.rs::scores_json_verdicts_obey_the_rubric` now resolves a re-adjudication per verdict
-bundle, so this file is cross-checked exactly as Task 16's is. Per this table's own distinction —
-it counts **probe** dispatches — a re-read of an existing transcript is not charged.
+Recorded at `transcripts/tdd/remeasure-adjudication.json`, and enforced in two places:
+`skills_valid.rs::scores_json_verdicts_obey_the_rubric` resolves a re-adjudication **per verdict
+bundle**, so this file is cross-checked exactly as Task 16's is; and
+`remeasure_stage_records_the_bodies_it_ran_on` **requires it to exist and to hold one record per
+run**. The second half was missing from the first version of this guard — the file was validated
+when present and silently optional when absent, so deleting it would have deleted this paragraph's
+evidence and left the suite green while this paragraph still claimed the check ran. **The review
+panel found that, not the tree.** Per this table's own distinction — it counts **probe**
+dispatches — a re-read of an existing transcript is not charged.
 
 ### `plan.md` C5's FOREGROUND rule was again not honoured
 

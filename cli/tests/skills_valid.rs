@@ -3896,15 +3896,23 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
                 let rows = held_out_body_rows(&contents, ProvenanceStage::Remeasure)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 let verdicts_exist = scores.is_file();
+                let adj = dir.join(
+                    VerdictBundle::Remeasure
+                        .adjudication_file()
+                        .expect("the remeasure bundle carries a re-adjudication"),
+                );
+                let adj_exists = adj.is_file();
                 assert!(
-                    rows.is_empty() && !verdicts_exist,
+                    rows.is_empty() && !verdicts_exist && !adj_exists,
                     "`{}` is declared as never re-measured ({why}), but {} carries {} \
-                     remeasure row(s) and {} exists={verdicts_exist}. Whichever is now \
-                     wrong, the artifacts and `remeasure_scores` have to move together",
+                     remeasure row(s), {} exists={verdicts_exist} and {} \
+                     exists={adj_exists}. Whichever is now wrong, the artifacts and \
+                     `remeasure_scores` have to move together",
                     skill.as_str(),
                     path.display(),
                     rows.len(),
                     scores.display(),
+                    adj.display(),
                 );
                 continue;
             }
@@ -3948,6 +3956,41 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
         );
         let wrong = check_blind_map(&dir, VerdictBundle::Remeasure, &verdicts);
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // The blind re-read is REQUIRED here, not validated-if-present.
+        // `scores_json_verdicts_obey_the_rubric` checks a re-adjudication only when the
+        // file exists — correct for `VerdictBundle::Bar`, where Task 16 wrote one
+        // because a verdict was challenged and a later stage might legitimately not.
+        // It is wrong for this stage, whose whole claim is that a second independent
+        // reading agreed on all twelve: under that rule, deleting the file would
+        // delete the claim's evidence and leave the suite green, with `run-ledger.md`
+        // still asserting the check runs. That is this run's recurring defect, and it
+        // was found in this guard by review rather than in the tree by luck.
+        let adj = dir.join(
+            VerdictBundle::Remeasure
+                .adjudication_file()
+                .expect("the remeasure bundle carries a re-adjudication"),
+        );
+        assert!(
+            adj.is_file(),
+            "`{}` is declared as re-measured over {runs} runs, but {} does not exist. A \
+             re-measurement supersedes an existing verdict, so the blind re-read that \
+             confirms it is part of the measurement, not an optional extra",
+            skill.as_str(),
+            adj.display(),
+        );
+        let adj_text = fs::read_to_string(&adj)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", adj.display()));
+        let records: Vec<Adjudication> = serde_json::from_str(&adj_text)
+            .unwrap_or_else(|e| panic!("{} does not match the adjudication schema: {e}", adj.display()));
+        assert_eq!(
+            records.len(),
+            runs,
+            "{} re-reads {} transcript(s) against {runs} declared runs. A partial \
+             re-adjudication cannot support \"all {runs} agreed\"",
+            adj.display(),
+            records.len(),
+        );
 
         // The pair is named, and the status is recomputed rather than read. A
         // re-measurement whose rows say SUPERSEDED measured the bodies it was
@@ -7761,6 +7804,23 @@ impl VerdictBundle {
         }
     }
 
+    /// Whether a `spec.md` §7.3 pre-registered bar is computed from this bundle.
+    ///
+    /// **Not the same question as `!is_unaided()`, and the difference is the point.**
+    /// Every aided bundle happens also to be bar-facing today, so the two agree by
+    /// coincidence — but a future arm measured for description alone would be aided
+    /// and read by no bar. The vacuity guard at the bottom of
+    /// [`scores_json_verdicts_obey_the_rubric`] must key off *this*: it exists to
+    /// prove the tree still holds a **measurement a verdict was drawn from**, and
+    /// keying it off `Bar` alone would make it satisfiable by the absence of exactly
+    /// the stage that superseded `Bar`'s counts.
+    fn reads_a_pre_registered_bar(self) -> bool {
+        match self {
+            VerdictBundle::Bar | VerdictBundle::Remeasure => true,
+            VerdictBundle::Control | VerdictBundle::Discrimination => false,
+        }
+    }
+
     /// Whether this bundle is meaningless without a scored `ab-*` stage beside it.
     ///
     /// The distinction the `discrimination-test` stage forced into the type. A
@@ -8078,8 +8138,10 @@ fn scores_json_verdicts_obey_the_rubric() {
             if bundle.requires_a_scored_stage() {
                 assert!(
                     dir.join(VerdictBundle::Bar.scores_file()).is_file(),
-                    "{} exists without {} — a control is supplementary to a scored \
-                     stage, never a stage on its own",
+                    "{} exists without {}. A control is supplementary to a scored stage \
+                     and never a stage on its own; a re-measurement SUPERSEDES a scored \
+                     stage and must not erase the counts it supersedes. Either way the \
+                     earlier bundle stays",
                     path.display(),
                     dir.join(VerdictBundle::Bar.scores_file()).display(),
                 );
@@ -8105,7 +8167,7 @@ fn scores_json_verdicts_obey_the_rubric() {
                     path.display()
                 );
                 v.check_rubric_rules(response, &path);
-                if bundle == VerdictBundle::Bar {
+                if bundle.reads_a_pre_registered_bar() {
                     bar_checked += 1;
                 }
                 checked += 1;
@@ -8120,7 +8182,8 @@ fn scores_json_verdicts_obey_the_rubric() {
             };
             let adj = dir.join(adj_name);
             if adj.is_file() {
-                let text = fs::read_to_string(&adj).expect("adjudication.json unreadable");
+                let text = fs::read_to_string(&adj)
+                    .unwrap_or_else(|e| panic!("{} unreadable: {e}", adj.display()));
                 let records: Vec<Adjudication> = serde_json::from_str(&text).unwrap_or_else(|e| {
                     panic!("{} does not match the adjudication schema: {e}", adj.display())
                 });
@@ -8167,10 +8230,11 @@ fn scores_json_verdicts_obey_the_rubric() {
                     assert_eq!(
                         r.matches_key,
                         v.0.compliant,
-                        "{}: {id} adjudicated matches_key={} against scores.json compliant={}. \
+                        "{}: {id} adjudicated matches_key={} against {} compliant={}. \
                          Recompute the bars in order (a)-(d) before shipping either.",
                         adj.display(),
                         r.matches_key,
+                        bundle.scores_file(),
                         v.0.compliant,
                     );
 
@@ -8196,11 +8260,16 @@ fn scores_json_verdicts_obey_the_rubric() {
     // check whose message promises a scored stage. The guard against a vacuous pass
     // must not itself be satisfiable by the absence of the measurement. `checked`
     // stays, one line down, for the same reason at the other bundle's scale.
+    //
+    // **Keyed off [`VerdictBundle::reads_a_pre_registered_bar`], not off `Bar`.** The
+    // `remeasure-*` bundle is aided and its verdicts feed the same bars; counting only
+    // `Bar` would have let the tree keep a superseded stage and lose the one that
+    // superseded it while this guard still read green — the same shape, one stage on.
     assert!(
         bar_checked > 0,
-        "no scores.json verdicts found under {} — expected at least the scored `tdd` \
+        "no bar-facing verdicts found under {} — expected at least the scored `tdd` \
          set. {checked} verdict(s) were checked in total, so if that number is \
-         non-zero the tree holds control verdicts with no scored stage behind them.",
+         non-zero the tree holds unaided verdicts with no scored stage behind them.",
         transcripts.display(),
     );
 }

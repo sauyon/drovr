@@ -791,10 +791,16 @@ same rubric blob. Five things differ, all **arm-invariant**:
    closes open item 5 below**: the rubric prescribes one scorer per set while also requiring that
    transcripts be scored independently and never compared, and one agent holding twelve cannot
    honour both. Splitting removes the tension instead of restating it in a brief.
-5. **The re-adjudication is now enforced rather than merely written.** `adjudication.json` used to
-   be resolved outside the verdict-bundle loop and bound to the bar bundle by construction, so a
-   second bar-facing stage's re-read would have sat in the tree unchecked — this run's recurring
-   defect exactly. `VerdictBundle::adjudication_file()` now names it per bundle.
+5. **The re-adjudication is now required, not validated-when-present.** `adjudication.json` used
+   to be resolved outside the verdict-bundle loop and bound to the bar bundle by construction, so a
+   second bar-facing stage's re-read would have sat in the tree unchecked.
+   `VerdictBundle::adjudication_file()` now names it per bundle — **and
+   `remeasure_stage_records_the_bodies_it_ran_on` requires this stage's file to exist and to hold
+   one record per run.** The first version of the guard stopped at the rename, which left the file
+   optional: deleting it would have removed the evidence for *"12 of 12 agreed"* while the suite
+   stayed green and this file went on asserting the check. That is this run's recurring defect
+   reproduced inside the guard written to prevent it, and **the review panel caught it, not the
+   tree**. The two deletion paths are mutation-proven red.
 
 ### Result
 
