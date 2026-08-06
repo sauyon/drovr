@@ -106,6 +106,14 @@ candidate arm is `S1`, the mandated rewrite — beating `S0` is not an achieveme
   descends from the commit introducing **this file**. Zero such arms is a correct state (it is the
   state at T1) and does not fail; an arm on disk with no introducing commit does fail, because a
   draft that history cannot place is a draft this check cannot speak to.
-- Re-verifying the hashes is a manual step every task that reads a frozen artifact owes:
-  `git hash-object --no-filters <path>` for each row above. T8's start gate does exactly this
-  before its first probe.
+**Nothing automatically re-hashes the rows above, and you should know that before trusting them.**
+`freeze_precedes_every_candidate_arm` checks *ordering*, not content, and
+`manifest_commits_contain_their_snapshots` checks that a recorded commit holds a recorded blob —
+neither asks whether the file on disk still matches its row. So an edit to a frozen fixture, ledger,
+or arm passes the whole suite today. This is the same gap `MANIFEST.md` documents for an arm being
+filled one row at a time, and it closes the same way: a per-arm drift tripwire arrives with the
+arm's last row (T8), on the `voice_snapshots_match_manifest` precedent.
+
+Until then, re-verifying is a manual step every task that reads a frozen artifact owes:
+`git hash-object --no-filters <path>` for each row above. T8's start gate does exactly this before
+its first probe, which is why that gate is written as a real check and not a formality.
