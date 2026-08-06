@@ -2119,6 +2119,28 @@ Wanted work that is not a defect — nothing here is broken today.
   how much faster anyone reads a graph; that would be a comparative with no measurement behind
   it.
 
+- **Make the orchestrator itself a drovr agent, one per task** (raised 2026-08-06, run
+  `brainstorm-rework`). Every phase runs as a drovr agent in its own pane; the *driver* that
+  starts them does not. It is whatever session the human happened to type in, so it is the one
+  role in the discipline with no pane, no `state.json` entry, no handoff, and no clean-context
+  boundary — while being the role that accumulates the most context, since it outlives every
+  phase it drives. `drovr never moves the driver out of the invoking checkout` (below) is one
+  symptom of the same root: the driver is not a managed thing.
+
+  Wanted shape: `drovr new` provisions an orchestrator agent for the run alongside the
+  workspace, so one task gets one orchestrator, addressable like any other agent — visible in
+  the agent tree, attachable, reapable, and resumable. A human then talks *to* a run rather
+  than *being* its driver.
+
+  Recorded rather than built because it changes what a "run" is at the top, and because the
+  in-flight interactive-brainstorm work (`drovr ask`) has to land first: an orchestrator with
+  no channel to the human is strictly worse than a human driving by hand, which is the exact
+  trap that produced this entry. Two known consequences of the present shape, both observed on
+  this run: a brainstorm conducted in the human's chat session leaves the run with **zero agent
+  panes**, so `/api/runs/<run>/agents` answers `nodes: []` and the review UI reports "no live
+  pane" on a run that is actively at its gate; and the interview itself lands in the driver's
+  context, which is the context-rot drovr exists to prevent.
+
 ## drovr never moves the driver out of the invoking checkout
 
 **Severity:** high (the driver's every git observation is silently about the wrong tree, and on a
