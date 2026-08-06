@@ -2528,19 +2528,24 @@ function alarmsFromRunList(runs) {
 /// Nothing is rendered from it — the list DOM is not on screen.
 async function pollAlarms(gen) {
   if (gen !== routeGen) return;
+  // `routeGen` only changes when the VIEW does, so it cannot order two polls
+  // issued from the same view — and there can be two: `route()` starts this
+  // chain, and a re-entry with the same run leaves the previous chain's request
+  // in flight. An older response applying `syncBlockedAlarms` is not a stale
+  // repaint that the next tick fixes; it DELETES alarm keys, which re-notifies
+  // when the next poll raises them again. Same guard as `renderRunList`, for the
+  // same reason.
+  var seq = ++alarmsFetchSeq;
   try {
     var r = await fetch('/api/runs');
     var runs = await r.json();
-    // A navigation mid-flight makes this payload stale for alarm purposes only
-    // in the sense that a newer feed will supersede it; but the alarm set is
-    // global, so applying it is harmless and dropping it is the safer symmetry
-    // with every other poller here.
-    if (gen !== routeGen) return;
+    if (gen !== routeGen || seq !== alarmsFetchSeq) return;
     alarmsFromRunList(runs);
   } catch (e) { /* transient; a failed fetch clears nothing, by design */ }
   if (gen === routeGen) alarmsTimer = setTimeout(function(){ pollAlarms(gen); }, 2000);
 }
 var alarmsTimer = null;
+var alarmsFetchSeq = 0;
 
 /// Show the button only while asking is both possible and useful.
 function syncNotifyButton() {
@@ -3031,12 +3036,20 @@ function treePanes(nodes) {
   return out;
 }
 
+var agentsFetchSeq = 0;
 async function pollAgents(gen) {
   if (gen !== routeGen) return;
+  // Two chains can run under one `routeGen`: the rehydrate handler clears the
+  // timer and calls this directly, which does not cancel a request already in
+  // flight. Ordering them matters more now than it did when this only painted a
+  // tree — it also feeds `syncBlockedAlarms`, where an older response DELETES
+  // alarm keys and the next poll then re-notifies for a block that never went
+  // away. Same guard, same reason, as `renderRunList`'s `listFetchSeq`.
+  var seq = ++agentsFetchSeq;
   try {
     var r = await fetch(api('agents'));
     var tree = await r.json();
-    if (gen !== routeGen) return;
+    if (gen !== routeGen || seq !== agentsFetchSeq) return;
     var el = document.getElementById('agents-tree');
     var nodes = (tree && tree.nodes) || [];
     // A config drovr could not read means `resumable` was decided by the

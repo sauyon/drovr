@@ -2266,6 +2266,59 @@ await evaluate(`
   window.fetch = window.__origFetch4;
   return 1;`);
 
+// A response that started before a newer one must not apply. It does not merely
+// repaint stale data — `syncBlockedAlarms` DELETES keys, so a late empty payload
+// clears a live alarm and the next poll re-notifies for a block that never went
+// away.
+check('a stale alarm poll cannot clear an alarm a newer one raised', await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  window.__origFetch5 = window.fetch;
+  window.__releaseStale = null;
+  window.__payload = [{ name: 'late-run', blocked:
+    { count: 1, phase: 'implement', class: 'destructive', human_phases: ['implement'],
+      inconclusive: false } }];
+  window.fetch = function(u) {
+    if (String(u).indexOf('/api/runs') !== -1 && String(u).indexOf('/api/runs/') === -1) {
+      var body = window.__payload;
+      if (!window.__parked) {
+        window.__parked = true;
+        return new Promise(function(res) {
+          window.__releaseStale = function() {
+            res({ ok: true, json: function() { return Promise.resolve(body); } });
+          };
+        });
+      }
+      return Promise.resolve({ ok: true, json: function() { return Promise.resolve(body); } });
+    }
+    return window.__origFetch5.apply(window, arguments);
+  };
+  // Chain A parks on an empty payload; chain B then completes with the block.
+  window.__payload = [];
+  var stale = pollAlarms(routeGen);
+  return new Promise(function(done) {
+    setTimeout(function() {
+      window.__payload = [{ name: 'late-run', blocked:
+        { count: 1, phase: 'implement', class: 'destructive',
+          human_phases: ['implement'], inconclusive: false } }];
+      if (alarmsTimer) clearTimeout(alarmsTimer);
+      pollAlarms(routeGen).then(function() {
+        if (alarmsTimer) clearTimeout(alarmsTimer);
+        window.__releaseStale();                 // the OLD response lands last
+        stale.then(function() {
+          if (alarmsTimer) clearTimeout(alarmsTimer);
+          done(document.title);
+        });
+      });
+    }, 0);
+  });`),
+  '⚠ (1) Drovr Review Loop');
+await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.fetch = window.__origFetch5;
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  return 1;`);
+
 // Leave the page as found: later sections (and the 2s poll) share this tab.
 await evaluate(`
   notifyBlocked = window.__origNotifyBlocked;
