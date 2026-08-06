@@ -99,6 +99,18 @@ pub struct AskOption {
 /// where absent — because a client rendering the interview should not have to distinguish
 /// "absent" from "empty". The on-disk shape is built separately, in [`append_ask`] and
 /// [`append_answer`], where field *presence* carries meaning.
+///
+/// Two invariants hold for every `Ask` this module hands out, enforced at both places one
+/// can be built — `parse_record` and [`append_ask`] — rather than in the type:
+///
+/// * `answer.is_some() == answered_at.is_some()`.
+/// * `recommend`, when `options` is non-empty, is one of their `value`s.
+///
+/// The fields stay flat and `pub` because the spec pins this record's field set
+/// (`{id, seq, question, context, options, recommend, answer, answered_at}`) and the UI
+/// reads it; nesting `answer` into its own type would either change the wire shape or need
+/// a second, hand-written serialization of it, which is the one thing this module is
+/// careful not to have.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Ask {
     pub id: String,
@@ -374,7 +386,8 @@ fn check_field(name: &str, text: &str) -> io::Result<()> {
 /// A blank `question` is rejected with `ErrorKind::InvalidInput`: an unanswerable record
 /// is worse than an error, because it occupies a `seq` and renders as an empty prompt. So
 /// is any field over [`MAX_FIELD`] — the log is append-only, so an oversized record is
-/// permanent, and every later `read` pays for it.
+/// permanent, and every later `read` pays for it — and so is a `recommend` that names no
+/// offered option.
 pub fn append_ask(
     run_dir: &Path,
     question: &str,
@@ -398,6 +411,18 @@ pub fn append_ask(
     for o in options {
         check_field("option value", &o.value)?;
         check_field("option label", &o.label)?;
+    }
+    // A recommendation that names no offered option pre-selects nothing, and the human
+    // sees a question whose "recommended" choice is invisible. With no options at all it
+    // is a free-text suggestion and there is nothing to check it against.
+    if let Some(r) = recommend
+        && !options.is_empty()
+        && !options.iter().any(|o| o.value == r)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "drovr ask: --recommend names a value that is not one of --option's",
+        ));
     }
 
     let existing = read(run_dir)?;
@@ -930,6 +955,22 @@ mod tests {
             err.to_string().len() < 200,
             "the id must not be echoed whole: {err}"
         );
+    }
+
+    #[test]
+    fn a_recommendation_must_name_one_of_the_offered_options() {
+        let d = tempfile::tempdir().unwrap();
+        let opts = vec![AskOption {
+            value: "a".into(),
+            label: "Alpha".into(),
+        }];
+        let err = append_ask(d.path(), "which?", None, &opts, Some("z")).expect_err("not offered");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(!log_path(d.path()).exists(), "nothing was appended");
+
+        append_ask(d.path(), "which?", None, &opts, Some("a")).expect("an offered value");
+        // With no options at all, a recommendation is a free-text suggestion, not a choice.
+        append_ask(d.path(), "free?", None, &[], Some("anything")).expect("no options");
     }
 
     #[test]
