@@ -3258,6 +3258,70 @@ impl SkillName {
     }
 }
 
+/// Whether a skill's evidence file carries a `remeasure-<skill>` stage: the three
+/// arms re-run against the bodies `harden-scenarios` wrote.
+///
+/// A third state machine beside [`HeldOutScores`] and [`DiscriminationScores`], for
+/// the reason the second was added beside the first — it answers a question neither
+/// can. `held_out_scores` says an **arm** was measured but not on *which body*, and
+/// `tdd` is `Recorded` there against a pair that no longer exists.
+/// `discrimination_scores` says the pair was probed with **no** skill. Only this one
+/// says the pre-registered bars were re-applied on the current bodies, which is what
+/// a §9 reader deciding which counts to quote actually needs.
+///
+/// `runs` is carried for [`DiscriminationScores`]'s reason: a file holding three
+/// verdicts of twelve satisfies "the file exists" and turns 4-of-4 into a fraction
+/// with no denominator.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RemeasureScores {
+    /// The `remeasure-<skill>` stage re-ran the arms on the current bodies. `runs`
+    /// is what `run-ledger.md` charged across its rows, and the verdict file owes
+    /// exactly that many verdicts.
+    Recorded { runs: usize },
+    /// Not re-measured, and why — checked in both directions like the other two, so
+    /// a skill in this state may carry no remeasure rows and no verdict file.
+    NotYetRun { why: &'static str },
+}
+
+impl SkillName {
+    /// Total over the measured five, so a sixth skill cannot compile without
+    /// declaring which state it is in.
+    ///
+    /// Only `tdd` is `Recorded`: `discrimination-test` found its rewritten pair the
+    /// strongest of the five (0 of 4 unaided), and the human authorised one stage to
+    /// re-apply the bars on an instrument that demonstrably discriminates. The other
+    /// four are untouched, and the two marginal pairs are not a re-measurement anyone
+    /// has decided to spend runs on.
+    fn remeasure_scores(self) -> RemeasureScores {
+        match self {
+            SkillName::Tdd => RemeasureScores::Recorded { runs: 12 },
+            SkillName::SystematicDebugging => RemeasureScores::NotYetRun {
+                why: "`remeasure-tdd` covered `tdd` only; this pair also scores 0 of 4 \
+                      unaided, so a re-measurement would be worth its runs, but none was \
+                      authorised",
+            },
+            SkillName::VerificationBeforeCompletion => RemeasureScores::NotYetRun {
+                why: "its rewritten pair is marginal (2 of 4 unaided) and no re-measurement \
+                      was authorised",
+            },
+            SkillName::CodeReview => RemeasureScores::NotYetRun {
+                why: "`ab-code-review` has not run at all, and its pair came back saturated \
+                      (3 of 4 unaided) — there is no earlier verdict to supersede",
+            },
+            SkillName::UsingDrovr => RemeasureScores::NotYetRun {
+                why: "`ab-using-drovr` has not run at all — there is no earlier verdict to \
+                      supersede",
+            },
+        }
+    }
+
+    /// The `run-ledger.md` stage cell that charges this skill's re-measurement,
+    /// derived from the skill rather than written twice.
+    fn remeasure_ledger_stage(self) -> String {
+        format!("held-out RE-MEASURED (`{}`)", self.as_str())
+    }
+}
+
 /// Which stage's probes a provenance row describes.
 ///
 /// Two stages now measure the same held-out pair for different purposes, and each
@@ -3276,6 +3340,12 @@ enum ProvenanceStage {
     BarHeldOut,
     /// The `discrimination-test` unaided probes: no skill text at all.
     Discrimination,
+    /// The `remeasure-<skill>` stage: the same three arms as [`Self::BarHeldOut`],
+    /// re-run against the bodies `harden-scenarios` wrote. It is a third stage and
+    /// therefore a third variant, which is what the doc comment above asked for —
+    /// reusing `BarHeldOut`'s marker would put four rows where §1.2 defines two and
+    /// fail the pair check on a file that is exactly right.
+    Remeasure,
 }
 
 impl ProvenanceStage {
@@ -3284,6 +3354,7 @@ impl ProvenanceStage {
         match self {
             ProvenanceStage::BarHeldOut => " measured at blob `",
             ProvenanceStage::Discrimination => " unaided-probed at blob `",
+            ProvenanceStage::Remeasure => " re-measured at blob `",
         }
     }
 }
@@ -3754,6 +3825,169 @@ fn discrimination_stage_records_every_skill_it_measured() {
         measured, 5,
         "{measured} skill(s) carry discrimination results — the stage probed all five \
          held-out pairs unaided, so anything less means a result went missing rather \
+         than a measurement never happening",
+    );
+}
+
+/// The `remeasure-<skill>` stage's artifacts exist, are complete, and name the
+/// bodies they were re-measured on — for every skill it claims to have re-measured.
+///
+/// The same guard `discrimination_stage_records_every_skill_it_measured` is, one
+/// stage on, and it exists for the same reason: this run's recurring defect is an
+/// artifact set that grows without its guard growing, and this stage added a verdict
+/// file, a blind map, a re-adjudication and twelve transcripts. Three failures it
+/// forecloses, past the ones the sibling guard already names:
+///
+/// 1. **A superseded verdict is read as current.** `tdd.md` now carries two scored
+///    arm stages measured on two different pairs. Without the `Remeasure` provenance
+///    rows a reader — or §9 — cannot tell which counts came from which instrument,
+///    and pooling them is the exact error `harden-scenarios` was cleaning up after.
+/// 2. **The re-measurement replaces the record instead of superseding it.**
+///    [`VerdictBundle::requires_a_scored_stage`] refuses a `remeasure-scores.json`
+///    with no `scores.json` beside it, so deleting the superseded verdicts to tidy
+///    up fails the build rather than erasing what was superseded.
+/// 3. **The charge and the measurement drift.** `run_ledger_cumulative_is_a_running_total`
+///    checks that table's arithmetic and nothing outside it. These runs are charged
+///    across the three §7.3 arm rows, so the check is on the **total** over the rows
+///    matching this stage's cell, not on one row: a re-measurement spends on every
+///    arm it re-runs.
+#[test]
+fn remeasure_stage_records_the_bodies_it_ran_on() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, and these rows are `git hash-object` blob SHAs. \
+         Skipping would turn this into a check that passes when it cannot run"
+    );
+    let evidence = evidence_dir();
+    let scenarios = scenarios_dir();
+    let transcripts = evidence.join("transcripts");
+    let mut measured = 0usize;
+
+    let ledger_path = evidence.join(EVIDENCE_LEDGER);
+    let ledger_text = fs::read_to_string(&ledger_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+    let ledger =
+        parse_ledger(&ledger_text).unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()));
+
+    for skill in SkillName::ALL.iter().copied() {
+        let path = evidence.join(format!("{}.md", skill.as_str()));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let dir = transcripts.join(skill.as_str());
+        let scores = dir.join(VerdictBundle::Remeasure.scores_file());
+
+        let stage_cell = skill.remeasure_ledger_stage();
+        let charged: Vec<&LedgerRow> = ledger
+            .iter()
+            .filter(|row| row.stage.contains(&stage_cell))
+            .collect();
+
+        let runs = match skill.remeasure_scores() {
+            RemeasureScores::NotYetRun { why } => {
+                assert!(
+                    charged.is_empty(),
+                    "{} charges {} row(s) for {stage_cell}, but `{}` is declared as never \
+                     re-measured ({why}). A charge with no measurement behind it misreads \
+                     the ceiling for whoever spends next",
+                    ledger_path.display(),
+                    charged.len(),
+                    skill.as_str(),
+                );
+                let rows = held_out_body_rows(&contents, ProvenanceStage::Remeasure)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let verdicts_exist = scores.is_file();
+                assert!(
+                    rows.is_empty() && !verdicts_exist,
+                    "`{}` is declared as never re-measured ({why}), but {} carries {} \
+                     remeasure row(s) and {} exists={verdicts_exist}. Whichever is now \
+                     wrong, the artifacts and `remeasure_scores` have to move together",
+                    skill.as_str(),
+                    path.display(),
+                    rows.len(),
+                    scores.display(),
+                );
+                continue;
+            }
+            RemeasureScores::Recorded { runs } => runs,
+        };
+
+        // Summed across the rows, not asserted to be one: a re-measurement of three
+        // arms charges three §7.3 rows, and a per-row check would either reject the
+        // correct ledger or silently accept a stage that only paid for one arm.
+        let charged_runs: u32 = charged.iter().map(|row| row.runs).sum();
+        assert!(
+            !charged.is_empty(),
+            "{} charges nothing for {stage_cell}, but `{}` is declared as re-measured over \
+             {runs} runs",
+            ledger_path.display(),
+            skill.as_str(),
+        );
+        assert_eq!(
+            charged_runs as usize, runs,
+            "{} charges {charged_runs} run(s) across {} row(s) for {stage_cell} against \
+             {runs} declared. The ceiling decision the next phase makes is read from that \
+             column, so the charge and the measurement have to be the same number",
+            ledger_path.display(),
+            charged.len(),
+        );
+
+        assert!(
+            scores.is_file(),
+            "`{}` is declared as re-measured over {runs} runs, but {} does not exist",
+            skill.as_str(),
+            scores.display(),
+        );
+        let verdicts = read_verdicts(&scores);
+        assert_eq!(
+            verdicts.len(),
+            runs,
+            "{} holds {} verdict(s) against {runs} declared runs. A bar reads a count over \
+             a denominator, and a partial file silently changes it",
+            scores.display(),
+            verdicts.len(),
+        );
+        let wrong = check_blind_map(&dir, VerdictBundle::Remeasure, &verdicts);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // The pair is named, and the status is recomputed rather than read. A
+        // re-measurement whose rows say SUPERSEDED measured the bodies it was
+        // created to stop measuring.
+        let pair = parse_held_out_bodies(&contents, skill, ProvenanceStage::Remeasure)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for (stem, row) in pair.pair() {
+            let file = scenarios.join(format!("{stem}.md"));
+            let on_disk = git_hash_object(&file);
+            let computed = ScenarioBodyStatus::recompute(&row.recorded, &on_disk);
+            assert_eq!(
+                row.claimed,
+                computed,
+                "{} says the re-measurement read `{stem}.md` at blob {} and calls that {}, \
+                 but {} now hashes to {}. The status is recomputed, not read: fix the row, \
+                 and do not pool counts across a change of body",
+                path.display(),
+                row.recorded.as_str(),
+                row.claimed.as_str(),
+                file.display(),
+                on_disk.as_str(),
+            );
+            assert_eq!(
+                computed,
+                ScenarioBodyStatus::Current,
+                "{} re-measured `{stem}.md` at a blob that is not the body on disk. The \
+                 point of this stage is a verdict on the CURRENT instrument; a superseded \
+                 row here means the verdict cannot claim to be one",
+                path.display(),
+            );
+        }
+        measured += 1;
+    }
+
+    // Seeded against what is true: `remeasure-tdd` re-measured exactly one skill.
+    // Without it the loop passes on a tree where every skill is `NotYetRun`.
+    assert_eq!(
+        measured, 1,
+        "{measured} skill(s) carry re-measurement results — the `remeasure-tdd` phase \
+         re-measured exactly one, so anything else means a result went missing rather \
          than a measurement never happening",
     );
 }
@@ -7464,13 +7698,22 @@ enum VerdictBundle {
     /// so it is the one bundle that is meaningful with no arm ever measured. Two
     /// of the five skills it covers have no `ab-*` stage at all.
     Discrimination,
+    /// `remeasure-scores.json` — the `remeasure-<skill>` stage. The same three arms
+    /// and the same pre-registered bars as [`Self::Bar`], re-run on the bodies
+    /// `harden-scenarios` wrote. A **separate** bundle rather than a second
+    /// `scores.json`, because pooling the two would merge counts from two
+    /// instruments into one rate, which is the error
+    /// `held_out_measurements_name_the_scenario_body_they_ran_on` exists to make
+    /// impossible.
+    Remeasure,
 }
 
 impl VerdictBundle {
-    const ALL: [VerdictBundle; 3] = [
+    const ALL: [VerdictBundle; 4] = [
         VerdictBundle::Bar,
         VerdictBundle::Control,
         VerdictBundle::Discrimination,
+        VerdictBundle::Remeasure,
     ];
 
     fn scores_file(self) -> &'static str {
@@ -7478,6 +7721,7 @@ impl VerdictBundle {
             VerdictBundle::Bar => "scores.json",
             VerdictBundle::Control => "control-scores.json",
             VerdictBundle::Discrimination => "discrimination-scores.json",
+            VerdictBundle::Remeasure => "remeasure-scores.json",
         }
     }
 
@@ -7486,6 +7730,22 @@ impl VerdictBundle {
             VerdictBundle::Bar => "blind-map.json",
             VerdictBundle::Control => "control-blind-map.json",
             VerdictBundle::Discrimination => "discrimination-blind-map.json",
+            VerdictBundle::Remeasure => "remeasure-blind-map.json",
+        }
+    }
+
+    /// The blind re-read that answers to this bundle, if the stage wrote one.
+    ///
+    /// `adjudication.json` used to be read outside the bundle loop and bound to
+    /// [`Self::Bar`] by construction, so a second bar-facing stage's re-read would
+    /// have sat in the tree unchecked — the shape of every vacuous pass this run
+    /// has found. Naming the file per bundle is what keeps the two from being
+    /// cross-checked against each other's verdicts.
+    fn adjudication_file(self) -> Option<&'static str> {
+        match self {
+            VerdictBundle::Bar => Some("adjudication.json"),
+            VerdictBundle::Remeasure => Some("remeasure-adjudication.json"),
+            VerdictBundle::Control | VerdictBundle::Discrimination => None,
         }
     }
 
@@ -7496,7 +7756,7 @@ impl VerdictBundle {
     /// wrong verdict file, which is the one error blinding cannot survive.
     fn is_unaided(self) -> bool {
         match self {
-            VerdictBundle::Bar => false,
+            VerdictBundle::Bar | VerdictBundle::Remeasure => false,
             VerdictBundle::Control | VerdictBundle::Discrimination => true,
         }
     }
@@ -7513,7 +7773,10 @@ impl VerdictBundle {
     fn requires_a_scored_stage(self) -> bool {
         match self {
             VerdictBundle::Bar | VerdictBundle::Discrimination => false,
-            VerdictBundle::Control => true,
+            // A re-measurement supersedes a scored stage; it does not replace the
+            // record of one. The superseded counts stay in the tree with their
+            // provenance rows, so the earlier bundle must still be there.
+            VerdictBundle::Control | VerdictBundle::Remeasure => true,
         }
     }
 }
@@ -7847,80 +8110,78 @@ fn scores_json_verdicts_obey_the_rubric() {
                 }
                 checked += 1;
             }
-        }
 
-        let path = dir.join(VerdictBundle::Bar.scores_file());
-        if !path.is_file() {
-            continue;
-        }
-        let verdicts = read_verdicts(&path);
-
-        // A re-adjudication, if one was needed, is evidence too. It adjudicates the
-        // bar-facing set specifically — `VerdictBundle::Bar` here is the assertion
-        // that a control set can never be what an `adjudication.json` answers to.
-        let adj = dir.join("adjudication.json");
-        if adj.is_file() {
-            let text = fs::read_to_string(&adj).expect("adjudication.json unreadable");
-            let records: Vec<Adjudication> = serde_json::from_str(&text).unwrap_or_else(|e| {
-                panic!("{} does not match the adjudication schema: {e}", adj.display())
-            });
-            let scored: HashMap<&str, &Verdict> = verdicts
-                .iter()
-                .map(|v| (v.0.transcript_id.as_str(), v))
-                .collect();
-            assert_eq!(
-                records.len(),
-                verdicts.len(),
-                "{}: adjudicates {} transcripts but {} were scored — a partial \
-                 re-adjudication cannot settle a challenged verdict",
-                adj.display(),
-                records.len(),
-                verdicts.len(),
-            );
-            for r in &records {
-                let id = r.transcript_id.as_str();
-                let transcript = resolve_transcript(&dir, id, &adj);
-                let v = scored.get(id).unwrap_or_else(|| {
-                    panic!("{}: adjudicates {id}, which was never scored", adj.display())
+            // A re-adjudication, if one was needed, is evidence too. It adjudicates
+            // one bundle's verdicts specifically — `adjudication_file()` returning
+            // `None` is the assertion that an unaided set can never be what a
+            // re-adjudication answers to.
+            let Some(adj_name) = bundle.adjudication_file() else {
+                continue;
+            };
+            let adj = dir.join(adj_name);
+            if adj.is_file() {
+                let text = fs::read_to_string(&adj).expect("adjudication.json unreadable");
+                let records: Vec<Adjudication> = serde_json::from_str(&text).unwrap_or_else(|e| {
+                    panic!("{} does not match the adjudication schema: {e}", adj.display())
                 });
-                let body = fs::read_to_string(&transcript).expect("transcript unreadable");
-
-                // `matches_key` is a CLAIM about the transcript's own ground truth,
-                // so it is checked against that ground truth rather than taken on
-                // trust. Without this the field could agree with `compliant` while
-                // both disagreed with the key, and the cross-check below would
-                // certify the pair — which is the one thing it exists to prevent.
-                let key = correct_option(&body, &transcript);
+                let scored: HashMap<&str, &Verdict> = verdicts
+                    .iter()
+                    .map(|v| (v.0.transcript_id.as_str(), v))
+                    .collect();
                 assert_eq!(
-                    r.matches_key,
-                    r.chosen_option == key,
-                    "{}: {id} records chosen_option={:?} and matches_key={} against a \
-                     transcript whose correct_option is {key:?}",
+                    records.len(),
+                    verdicts.len(),
+                    "{}: adjudicates {} transcripts but {} were scored — a partial \
+                     re-adjudication cannot settle a challenged verdict",
                     adj.display(),
-                    r.chosen_option,
-                    r.matches_key,
+                    records.len(),
+                    verdicts.len(),
                 );
+                for r in &records {
+                    let id = r.transcript_id.as_str();
+                    let transcript = resolve_transcript(&dir, id, &adj);
+                    let v = scored.get(id).unwrap_or_else(|| {
+                        panic!("{}: adjudicates {id}, which was never scored", adj.display())
+                    });
+                    let body = fs::read_to_string(&transcript).expect("transcript unreadable");
 
-                // The adjudication exists to confirm or overturn `compliant`. If the
-                // two disagree, a human decides which is right — the suite must not
-                // let the run proceed as though the question were settled.
-                assert_eq!(
-                    r.matches_key,
-                    v.0.compliant,
-                    "{}: {id} adjudicated matches_key={} against scores.json compliant={}. \
-                     Recompute the bars in order (a)-(d) before shipping either.",
-                    adj.display(),
-                    r.matches_key,
-                    v.0.compliant,
-                );
-
-                let response = response_block(&body);
-                for quote in &r.excuses_for_an_option_not_taken {
-                    assert!(
-                        response.contains(quote.as_str()),
-                        "{}: {id} quotes {quote:?}, which is not in its `## Response` block",
+                    // `matches_key` is a CLAIM about the transcript's own ground truth,
+                    // so it is checked against that ground truth rather than taken on
+                    // trust. Without this the field could agree with `compliant` while
+                    // both disagreed with the key, and the cross-check below would
+                    // certify the pair — which is the one thing it exists to prevent.
+                    let key = correct_option(&body, &transcript);
+                    assert_eq!(
+                        r.matches_key,
+                        r.chosen_option == key,
+                        "{}: {id} records chosen_option={:?} and matches_key={} against a \
+                         transcript whose correct_option is {key:?}",
                         adj.display(),
+                        r.chosen_option,
+                        r.matches_key,
                     );
+
+                    // The adjudication exists to confirm or overturn `compliant`. If the
+                    // two disagree, a human decides which is right — the suite must not
+                    // let the run proceed as though the question were settled.
+                    assert_eq!(
+                        r.matches_key,
+                        v.0.compliant,
+                        "{}: {id} adjudicated matches_key={} against scores.json compliant={}. \
+                         Recompute the bars in order (a)-(d) before shipping either.",
+                        adj.display(),
+                        r.matches_key,
+                        v.0.compliant,
+                    );
+
+                    let response = response_block(&body);
+                    for quote in &r.excuses_for_an_option_not_taken {
+                        assert!(
+                            response.contains(quote.as_str()),
+                            "{}: {id} quotes {quote:?}, which is not in its `## Response` block",
+                            adj.display(),
+                        );
+                    }
                 }
             }
         }

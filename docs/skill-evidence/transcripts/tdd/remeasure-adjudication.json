@@ -1,0 +1,74 @@
+[
+  {
+    "transcript_id": "0078c0",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "02f5ce",
+    "chosen_option": "B",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "0f8cbf",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "1687ef",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "19a853",
+    "chosen_option": "A",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "423e2b",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "62cfb0",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "6a1a6c",
+    "chosen_option": "A",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "6ffccd",
+    "chosen_option": "B",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "7ce3e0",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "80027d",
+    "chosen_option": "A",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "f29975",
+    "chosen_option": "A",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  }
+]

@@ -45,6 +45,10 @@ blank line between two rows cannot quietly end the table and leave the check val
 | discrimination-test | **Discrimination probe (`verification-before-completion`) — not a §7.3 row** | 4 | 67 | 4 (this stage only) | n/a |
 | discrimination-test | **Discrimination probe (`code-review`) — not a §7.3 row** | 4 | 71 | 4 (this stage only) | n/a |
 | discrimination-test | **Discrimination probe (`using-drovr`) — not a §7.3 row** | 4 | 75 | 4 (this stage only) | n/a |
+| remeasure-tdd | Arm A on held-out RE-MEASURED (`tdd`) | 4 | 79 | 20 | no |
+| remeasure-tdd | Arm A′ on held-out RE-MEASURED (`tdd`) | 4 | 83 | 16 | **YES — exactly at 16 of 16** |
+| remeasure-tdd | Arm B on held-out RE-MEASURED (`tdd`) | 4 | 87 | 21 | no |
+| remeasure-tdd | REFACTOR re-tests (`tdd`) | 0 | 87 | 20 | no |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -308,3 +312,127 @@ pair came back saturated at 3 of 4**, so Task 19's 12 runs would be spent on an 
 shown unable to separate the arms. Deferring Task 19 until `code-review-3` is rewritten lands the
 run at **119 of 122** and needs nothing else cut. **Escalated in `discrimination-test-HANDOFF.md`
 rather than decided here.**
+
+## 2026-08-06 — `remeasure-tdd`: 12 runs, the bars re-applied on an instrument with range
+
+**12 runs spent, zero retries, cumulative 87 of 122.** 3 arms × 2 held-out scenarios × 2
+samples, for `tdd` only, against the bodies `harden-scenarios` wrote. **These are §7.3 rows** —
+the same three *Arm … on held-out* rows Task 16 charged — and they are charged there rather than
+under a new non-§7.3 label, because they are the same kind of spend and hiding them under a fresh
+name would understate the pressure on those ceilings.
+
+**Why the stage exists.** Task 16 reverted `tdd` on branch (a) with arm A at 4 of 4 — measured on
+a pair an unaided agent also passed 3 times in 4. `discrimination-test` then measured the
+rewritten pair at **0 of 4 unaided**, the strongest of the five. The verdict was sound on its own
+terms and made on an instrument with almost no dynamic range; this stage re-applies the same
+pre-registered bars where a passing arm can mean something. **Task 16's verdict is superseded,
+not deleted** — its counts stay in `tdd.md` with their `SUPERSEDED` provenance rows.
+
+### What it cost against the per-stage ceilings, stated before anything else
+
+Written as prose, not as a table: this file's parser reads **every** line after the header that
+begins with `|` as a data row, so a second table here would be counted as spend.
+
+- *Arm A on held-out* — 12 spent before, +4, now **16 of 20**; 4 left.
+- *Arm A′ on held-out* — 12 spent before, +4, now **16 of 16**; **0 left**.
+- *Arm B on held-out* — 13 spent before, +4, now **17 of 21**; 4 left.
+
+**The Arm A′ row is now exactly at its ceiling, and Tasks 19 and 20 need 4 each.** Nothing was
+crossed — 16 of 16 is at the ceiling, not past it — and this stage was authorised at 12 runs with
+the ledger read first, so it spent what it was given. But the row is now closed, and
+`ab-code-review` and `ab-using-drovr` cannot run their A′ arm without a run-level decision.
+**This stage does not make that decision**, for the same reason `discrimination-test` did not make
+the global one: the ledger's standing rule reserves it, and it compounds a global overrun that was
+already escalated. Both are escalated together in `remeasure-tdd-HANDOFF.md`.
+
+**Global: 87 of 122, 35 remain.** Remaining planned work is Task 19 (12) + Task 20 (20) +
+Task 21 `ab-voice` (24) = **56**, landing at **143 of 122** — the 9-run overrun
+`discrimination-test` recorded, plus this stage's 12. That arithmetic is the escalation, not a
+side effect of it: the human authorised these 12 knowing the total, and what changes is the size
+of the cut the run-level call has to make.
+
+### Method
+
+Tasks 16–18's method, with the three strengthenings they asked their successors to copy, plus two
+this stage added. Each run: a fresh `general-purpose` subagent on `sonnet` (`plan.md` C5). Per C5a
+each probe wrote its own response file and returned a one-line confirmation; **no probe's words
+entered the orchestrator's context** at any point, including during assembly and scoring.
+
+1. **Twelve prompt files, assembled mechanically and verified byte-exact** — one per run rather
+   than Task 16's one per cell, so the output path is inside the verified file. Each = the harness
+   preamble, the arm text between `----- BEGIN SKILL -----` / `----- END SKILL -----`, and the
+   scenario body plus its three rendered options between `----- BEGIN SITUATION -----` /
+   `----- END SITUATION -----`. A script extracted each region and compared it by
+   `git hash-object` to the arm snapshot and to the scenario body: **all 12 matched**, all 12
+   carried all three options verbatim, and all 12 were positively asserted to contain no
+   `correct_option`, `forced_choice:`, `tag:` or `pressures:` line. Prompt files are named by the
+   run's opaque id, so a probe cannot read its arm off the path.
+2. **The verifier was mutation-checked before it was trusted.** An unmutated copy was confirmed
+   GREEN first — without that control, a "red" says only that the copy is broken — and then seven
+   mutations each turned it red: a swapped arm, a reworded option, a leaked `correct_option`, a
+   one-word body edit, a deleted file, a corrupted preamble, a wrong output path. This is the
+   direct answer to Task 16's *"if you write a verification script this phase, make its not-found
+   path loud"*, and the control-first ordering is what that lesson was missing.
+3. **The probe wrote only `## Response`; the meta-test was a separate file in a later turn.**
+   `## Forced choice` and `## Scenario` were prepended by the phase agent from the checked-in
+   scenario file, so `correct_option` never reached a probe. Assembly refuses a missing file, a
+   file not beginning with its block header, an empty block, a second assembly, and a probe that
+   wrote a block only the phase agent may write. The 12 response files were SHA-256-verified
+   **byte-identical before and after the meta-test turn**.
+4. **Scoring was sealed and split to one scorer per transcript.** Twelve sealed directories, each
+   holding exactly two files: one transcript and a `git hash-object`-verified copy of
+   `scoring-rubric.md` (`1a2b1c552071192bcbeb5660ead5ef492b43275f`, the value Tasks 17, 18 and
+   `discrimination-test` record). No scorer had a blind map, an arm snapshot or a second
+   transcript within reach; every scorer wrote outside the evidence tree. **This closes `tdd.md`
+   open item 5** — the rubric prescribes one scorer per set while also requiring that transcripts
+   be scored independently and never compared, and one agent holding twelve cannot honour both.
+   One scorer per transcript removes the tension rather than restating it in a brief.
+5. **Joined to the blind map only after every verdict was recorded**, and the map was written
+   before any scorer ran.
+
+### Positive control — two independent mechanisms, agreeing on all 12 cells
+
+Each probe returned three facts derivable only from the text it was given: the verbatim
+`description:` line, the verbatim last non-empty line of the skill region, and that region's line
+count. **The `description:` line separates A from {A′, B} — that difference *is* fix 1 — and the
+last line separates B from {A, A′}, so the pair is jointly sufficient; the line count is not, and
+this stage is why.**
+
+- **11 of 12 confirmed on the first return.** One (`62cfb0`, an A′ cell) reported a line count of
+  29 and a "last line" that occurs at line 28 of all three arms — a fingerprint that identifies no
+  arm. It was re-asked, with the region boundaries restated and no expected value named, and
+  returned the A′ fingerprint exactly: 44 lines, ending `and confirm with evidence, not
+  assertion.` The re-ask is a question about the prompt, not a new measurement: **the response had
+  already been written and was byte-unchanged**, so nothing was selected on. **Not charged as a
+  retry**, and the reason is the distinction the ledger already draws — a retry re-runs a probe
+  and produces a new response to choose between; this produced none.
+- **The line-count leg proved unreliable and is recorded as such**: three probes counted the
+  delimiter lines or unwrapped a hard-wrapped paragraph (44→46, 175→177, and `62cfb0`'s 29). No
+  arm assignment ever rested on it.
+- **The announcement substitution fired exactly 4 times — once in each arm-B cell, and 0 times in
+  every A and A′ cell.** Arm B is the only arm carrying an announcement sentence, so a second
+  mechanism, independent of what any probe reported, agrees on the arm of all 12 runs.
+- **12 of 12 response bodies are distinct texts** — the check against a harness that dispatched
+  one probe and copied it.
+- `git status` after all 12 runs showed **no file changed outside the scratch directory**. The
+  preamble's sandbox constraint has now held for five stages.
+
+### A second blind pass, and it is not a charged run
+
+All 12 transcripts were re-read by a **second** set of twelve blind agents — one per transcript,
+no rubric, no arm labels, no blind map — asked only which option the `## Response` block commits
+to and which quotes it advances for an option it does not take. `matches_key` was then recomputed
+against the transcript's own key rather than trusted. **12 of 12 agreed with the scorers on
+`compliant`, 12 of 12 recomputed correctly, and 0 quotes were advanced for an option not taken.**
+Recorded at `transcripts/tdd/remeasure-adjudication.json`, and enforced:
+`skills_valid.rs::scores_json_verdicts_obey_the_rubric` now resolves a re-adjudication per verdict
+bundle, so this file is cross-checked exactly as Task 16's is. Per this table's own distinction —
+it counts **probe** dispatches — a re-read of an existing transcript is not charged.
+
+### `plan.md` C5's FOREGROUND rule was again not honoured
+
+The harness dispatched every subagent asynchronously without being asked to, for the fifth stage
+running (`plan-HANDOFF.md` dead-end 4). Recorded rather than papered over. The measurement is
+unaffected — the 12 cells are mutually independent, each probe wrote only its own file, and every
+one was confirmed complete before any transcript was assembled or scored — but the single-writer
+property C5 protects was again held by the sandbox, not by the scheduling.

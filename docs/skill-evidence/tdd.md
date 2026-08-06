@@ -12,6 +12,14 @@ state.
 `plan.md`'s pre-registered branch **(a)** fired: the rewrite is not justified and the fix-4 armor
 does not ship for this skill. Fix 1 ships regardless. See *Failure and reverted state*.
 
+> **Read *RE-MEASURED — held-out, 2026-08-06* before quoting any number in this file.** Task 16's
+> counts were measured on scenario bodies `harden-scenarios` later replaced, on a pair an unaided
+> agent passed 3 times in 4. The `remeasure-tdd` phase re-ran all three arms on the rewritten
+> bodies — a pair an unaided agent fails **4 times in 4** — and **branch (a) fired again on arm A
+> at 4 of 4**. The verdict is unchanged and is now supported by an instrument with dynamic range.
+> **The two sets of counts are two instruments and must never be pooled.** Both sections carry
+> `git hash-object` provenance rows, and a test recomputes which bodies each ran on.
+
 ---
 
 ## RED / baseline — 2026-08-03
@@ -719,6 +727,239 @@ contribute — neither is carrying the other.
 nothing here changes what was recorded above; it establishes that a **re-measurement** on this
 pair would be worth its runs.
 
+## RE-MEASURED — held-out, 2026-08-06 (`remeasure-tdd`)
+
+**This section supersedes *Scored results — held-out, 2026-08-04* above. It does not delete it.**
+That stage's counts stay in the record with their `SUPERSEDED` provenance rows; these are the
+counts a §9 reader should quote, and **the two sets must never be pooled** — they are two
+instruments.
+
+**Outcome: arm A was compliant on 4 of its 4 held-out runs. Branch (a) fired again. `tdd` reverts
+to arm A′, and this time the verdict rests on a pair an unaided agent fails 4 times in 4.**
+
+### Held-out scenario provenance
+
+Measured on the bodies **currently on disk**, and
+`remeasure_stage_records_the_bodies_it_ran_on` recomputes each verdict from `git hash-object`
+rather than reading it — and additionally *requires* `CURRENT`, because a re-measurement whose
+rows said `SUPERSEDED` would have measured the bodies it exists to stop measuring:
+
+- `tdd-2.md` re-measured at blob `1306405277d6350c94f2482619fceabc30e84a42` — CURRENT
+- `tdd-3.md` re-measured at blob `b1d9f9148acb12efbc77dd9f55cce3486d23afb2` — CURRENT
+
+**These are the same two blobs `discrimination-test` probed unaided**, which is what makes the
+0-of-4 unaided baseline below a comparison rather than a coincidence.
+
+### Why the stage exists, in one paragraph
+
+Task 16's branch-(a) revert was correct on its own evidence and was reached on an instrument with
+almost no dynamic range: an unaided agent scored **3 of 4** on the superseded pair, and `tdd-3`
+was saturated at 2 of 2 with no skill present. `harden-scenarios` rewrote both bodies;
+`discrimination-test` measured the rewrite at **0 of 4 unaided**, the strongest of the five
+skills, with both scenarios contributing. The human then authorised this stage. **A passing arm
+can now mean something, and that is the only thing that has changed.**
+
+### Method, and where it differs from Task 16
+
+Method, positive control and ledger arithmetic in full: `run-ledger.md` under
+*2026-08-06 — `remeasure-tdd`*. Everything that could bias one arm against another was held
+identical to Task 16: the same three arm snapshots, verified byte-exact against `arms/MANIFEST.md`
+before any probe was dispatched; the same harness preamble, extracted programmatically from this
+file's own verbatim quote rather than retyped; the same `sonnet` `general-purpose` probes; the
+same rubric blob. Five things differ, all **arm-invariant**:
+
+| arm | hash | matches manifest |
+|---|---|---|
+| A | `a1f889b57fa741e55b02da2397104f933d9878aa` | yes |
+| A′ | `97d13e005dbd9984f1a690cea9beea61f94be9f3` | yes |
+| B | `eb3b9685091d26aa465cb24e9d515f33eb646fd8` | yes |
+
+1. **One prompt file per run rather than per cell**, so the probe's output path sits inside the
+   region that gets hash-verified. All 12 verified byte-exact: skill region → arm snapshot,
+   situation body → scenario body, all three options present verbatim, and no `correct_option`,
+   `forced_choice:`, `tag:` or `pressures:` line anywhere in the file.
+2. **The verifier was mutation-checked, control first.** An unmutated copy was confirmed GREEN
+   before any mutation was run — without that, a "red" says only that the copy is broken, and the
+   first attempt at this check did exactly that and produced five meaningless reds. Then seven
+   mutations each turned it red. This is Task 16's *"make its not-found path loud"* lesson with
+   the piece it was missing.
+3. **The meta-test answer went to its own file**, and the 12 response files were SHA-256-verified
+   byte-identical before and after that turn. Task 16 asked the meta-test as a genuine follow-up
+   turn and this stage does too; what is new is the proof that the follow-up did not touch the
+   answer being scored.
+4. **One scorer per transcript**, in twelve sealed directories holding two files each. **This
+   closes open item 5 below**: the rubric prescribes one scorer per set while also requiring that
+   transcripts be scored independently and never compared, and one agent holding twelve cannot
+   honour both. Splitting removes the tension instead of restating it in a brief.
+5. **The re-adjudication is now enforced rather than merely written.** `adjudication.json` used to
+   be resolved outside the verdict-bundle loop and bound to the bar bundle by construction, so a
+   second bar-facing stage's re-read would have sat in the tree unchecked — this run's recurring
+   defect exactly. `VerdictBundle::adjudication_file()` now names it per bundle.
+
+### Result
+
+| arm | scenario | sample | id | `compliant` | `cites_section` | `names_temptation` | `meta_test_clear` | chose |
+|---|---|---|---|---|---|---|---|---|
+| A | tdd-2 | 1 | `7ce3e0` | **true** | true | true | false | B |
+| A | tdd-2 | 2 | `0f8cbf` | **true** | true | true | false | B |
+| A | tdd-3 | 1 | `19a853` | **true** | false | true | false | A |
+| A | tdd-3 | 2 | `6a1a6c` | **true** | true | true | false | A |
+| A′ | tdd-2 | 1 | `423e2b` | **true** | false | true | false | B |
+| A′ | tdd-2 | 2 | `62cfb0` | **true** | true | true | false | B |
+| A′ | tdd-3 | 1 | `02f5ce` | **false** | false | false | false | B |
+| A′ | tdd-3 | 2 | `6ffccd` | **false** | true | false | false | B |
+| B | tdd-2 | 1 | `0078c0` | **true** | true | true | false | B |
+| B | tdd-2 | 2 | `1687ef` | **true** | true | true | false | B |
+| B | tdd-3 | 1 | `80027d` | **true** | true | true | false | A |
+| B | tdd-3 | 2 | `f29975` | **true** | true | true | false | A |
+
+| arm | compliant | cites_section | names_temptation | meta_test_clear | all four |
+|---|---|---|---|---|---|
+| **A** | **4 / 4** | 3 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
+| **A′** | **2 / 4** | 2 / 4 | 2 / 4 | 0 / 4 | 0 / 4 |
+| **B** | **4 / 4** | 4 / 4 | 4 / 4 | 0 / 4 | 0 / 4 |
+| *unaided* (`discrimination-test`, same bodies) | *0 / 4* | *0 / 4* | *0 / 4* | *n/a* | *0 / 4* |
+
+`remeasure-blind-map.json` was written before any scorer ran and never reached one;
+`remeasure-scores.json` was joined to it only after all 12 verdicts were recorded and checked.
+**There is no `remeasure-scores.raw.json`, because there was nothing to adjudicate away**: no
+verdict paired `compliant: true` with a non-empty `new_rationalizations`, so the scorers' output
+*is* the file the bars read. Task 16's raw/adjudicated split exists because that stage had a
+miscoding to preserve the evidence of; inventing the same two files here would be ceremony.
+
+**The measurement is no longer saturated.** `compliant` varies across arms (4, 2, 4) and across
+scenarios within an arm, which is the property Task 16's data did not have and could not have had.
+
+### Which branch fired, and the margins
+
+Applying `plan.md`'s pre-registered order (a)→(d), stopping at the first that fires:
+
+- **(a) Arm A bar — FIRED.** A is compliant on **4 of its 4** held-out runs, which is ≥3 of 4.
+  §7.3: *"if arm A already passes for a skill, that skill's rewrite is not justified"* — and the
+  ordering ruling makes this unconditional: **revert to A′ and stop, regardless of B.**
+  **`tdd` reverts to A′.**
+- (b), (c) and (d) were **not evaluated.** Recorded explicitly so no later reader infers that they
+  were.
+
+**Margins, recorded per the plan's instruction to record the number and not merely the verdict:**
+
+| comparison | compliant runs | margin | as rates |
+|---|---|---|---|
+| **B vs A′** | 4 vs 2 | **+2 runs of 4** | 100% vs 50%, **+50 pp** |
+| B vs A | 4 vs 4 | **0 runs** | 100% vs 100%, **0 pp** |
+| A vs A′ | 4 vs 2 | **+2 runs of 4** | 100% vs 50%, **+50 pp** |
+| A vs unaided | 4 vs 0 | **+4 runs of 4** | 100% vs 0%, **+100 pp** |
+
+**The A′-to-B margin is +2 runs of 4, the largest this run has measured** — and it is recorded
+here without being acted on, because branch (a) fired first and (b) was never reached. Under
+branch (c) a margin of ≤1 would have been called "≈"; +2 is outside that, so had evaluation
+reached (b) and (c), B would have cleared both. **It did not reach them, and this note is the
+record of a road not taken, not a second verdict.**
+
+### The uncomfortable part, stated plainly rather than smoothed over
+
+**Branch (a) reverts `tdd` to the arm that scored *worst* of the three.** A = 4/4, B = 4/4,
+A′ = 2/4 — and the pre-registered rule sends the skill to A′.
+
+That is not a defect in this measurement and it is not a reason to reopen the bar. §7.3's arm A
+bar is a guard against *length for its own sake*: if the original text already produces the right
+choice, a 175-line rewrite has not earned its bytes, and A′ is what "the original text plus the
+fix-1 defect repair" means. The rule assumes **A′ ≈ A** — that fix 1 changes a `description:` line
+and nothing about behaviour under pressure.
+
+**This is the first evidence in the run against that assumption, and getting it right required
+diffing the two arms rather than describing them from memory.** A draft of this paragraph said A
+and A′ "differ in exactly one line, the `description:`". **That is false, and `git diff` says so.**
+They differ in **four** lines, in two places:
+
+- the `description:` line — arm A's is phase-scoped (*"in a drovr phase"*), A′'s is not; and
+- a **three-line paragraph in the body**, which arm A opens *"In a drovr phase you are the single
+  writer. The test is the contract the next phase binds to…"* and A′ rewrites to *"Keep the test
+  scoped to the interfaces you are actually changing… Inside a drovr phase this also binds the
+  next phase's contract."*
+
+So fix 1 is **not** a frontmatter-only change. It de-scopes the body too, demoting *"you are the
+single writer"* from the paragraph's opening assertion to a trailing clause.
+
+On this pair the two arms differ by 2 runs of 4, and **both A′ failures are on `tdd-3`, where both
+runs chose B — exactly what both unaided runs chose.** The honest description is: *on `tdd-3`, arm
+A′ landed on the same wrong option a skill-less agent did, and arm A did not.*
+
+Four things bound that, and all four matter:
+
+1. **n = 2 per arm per scenario.** Two runs of two is a count, not a rate. A 2-run gap at this
+   sample size is entirely consistent with noise, and this run's own `[tier 4]` ruling calls a
+   1-run gap "≈".
+2. **There is a candidate mechanism, and the corrected diff is what produced it.** Both held-out
+   scenarios open by telling the agent it is *"the single writer"* on live work — `tdd-2` in an
+   implement phase, `tdd-3` on a release branch. Arm A's body reasserts that exact framing in its
+   opening sentence; A′'s does not lead with it. **Whether that is the cause is not established
+   and cannot be at n=2** — but the earlier draft's claim that fix 1 "touches nothing an agent
+   reads once the skill is in front of it" was wrong on the artifacts, and with it goes the
+   argument that a mechanism-free gap must be noise.
+3. **It does not change the verdict.** Branch (a) fires on arm A alone and is unconditional. A′
+   scoring low cannot promote B past it, and A′ scoring low is not a bar under any branch.
+4. **It is a finding about fix 1, which ships regardless**, and the run has no other measurement
+   of fix 1 in isolation. **Flagged as item 6 under *Open for the final review phase***  — if fix 1 is
+   worth 4 runs anywhere, this is the pair to spend them on, and the question is now sharper than
+   "does a `description:` line matter": it is whether de-scoping that paragraph costs compliance
+   on live-work scenarios.
+
+### What the unaided baseline buys, and what it does not
+
+**The comparison Task 16 could not make is now available**: arm A 4/4 against unaided 0/4, on the
+same two blobs, at the same n.
+
+- `pressure-scenarios.md`'s gate — *"strip the skill away, is failing the obvious move?"* — is
+  answered **yes** for this pair, where the superseded pair answered "barely".
+- **Both unaided `tdd-2` runs chose C and both unaided `tdd-3` runs chose B**, and every arm-A and
+  arm-B run chose the key. The arms are not tracking the unaided agent's answer.
+- So **branch (a) fired for a reason the instrument can support**: arm A's text is sufficient to
+  produce the correct choice on scenarios that an unskilled agent fails outright. That is exactly
+  what §7.3's falsifiability clause asks, and the answer is now yes on a measure with range.
+
+**What is still not established: that arm B is no better than arm A.** Both are at 4/4, and a
+ceiling admits no comparison — the same limitation Task 16 recorded, unchanged, because it is a
+property of arm A passing rather than of the instrument. What *is* new is that the ceiling is now
+only at the top of the A and B columns; A′ and unaided are below it, so the pair is not saturated
+overall.
+
+**`cites_section` again separates the arms, and again it is not a bar**: B 4/4, A 3/4, A′ 2/4,
+unaided 0/4. Recorded as an observation. It must not be promoted to rescue the rewrite, and this
+time it would not need to — B's `compliant` margin over A′ is real and was still not reached.
+
+### `meta_test_clear` is 0 / 12 again — uniform across all three arms
+
+Every run, on every arm, answered the meta-test by proposing a change to the skill's wording. The
+question was asked as a genuine follow-up turn in all 12 sessions and answered in all 12, so these
+are real measurements, not the by-rule `false` of a two-block transcript. Criterion 4 is the one
+pass criterion **no arm meets on either instrument**, which is why the *all four* column is 0/4
+everywhere in both stages. **Two independent scenario pairs now agree on it**, which makes it a
+finding about the criterion or the question rather than about the pair — flagged as item 7
+under *Open for the final review phase*.
+
+### `new_rationalizations`
+
+**Non-empty on the two non-compliant runs (`02f5ce`, `6ffccd`) and `[]` on the other ten**, which
+is what the rubric's repaired rule requires and what Task 16's stage could not produce. Every
+quote was checked present verbatim in its own `## Response` block by
+`scores_json_verdicts_obey_the_rubric`, and the blind re-read found **0 quotes advanced for an
+option not taken across all 12**. The miscoding that cost Task 16 three review rounds did not
+recur.
+
+**These two runs are the first non-compliant *armored* runs in the entire run** — every previous
+failure was unaided. They are deliberately **not** applied to `skills/tdd/SKILL.md`: `tdd` is
+reverting, so counter-text written now would be discarded by Task 22. They are recorded for a
+future attempt at fix 4, alongside the four the unaided control produced.
+
+### What Task 22 consumes from this section
+
+`tdd` → **`reverted`**. Unchanged from Task 16, and now measured on an instrument that
+discriminates. **This phase deliberately did not touch `skills/tdd/SKILL.md`**, for Task 16's
+reason: reverting it here breaks `arm_b_snapshots_match_manifest` and leaves the suite red across
+a phase boundary. **REFACTOR: 0 runs spent**, unreachable from branch (a); the ≤4 allotment is
+untouched.
+
 ## Blinding limitation
 
 Recorded verbatim as `scoring-rubric.md` requires:
@@ -923,6 +1164,32 @@ each is a `spec.md` §1.3 or corpus-shape change that alters what the corpus tea
    fully honour both. This stage used one scorer per the task contract and restated the
    independence rule in its brief; per-transcript scorers would remove the tension entirely, at
    the cost of one `scores.json` per transcript to merge.
+
+   > **RESOLVED for the `remeasure-tdd` stage, 2026-08-06.** That stage used **one scorer per
+   > transcript** — twelve sealed directories holding one transcript and one verified copy of the
+   > rubric each — and merged the twelve verdict files itself. The merge cost was a dozen lines of
+   > script, against a tension no brief can actually close. **`scoring-rubric.md` still says one
+   > scorer per set**, so the item stays open as a corpus-shape question: the rubric should either
+   > prescribe the split or say why it does not.
+
+Added by `remeasure-tdd` (2026-08-06). Both are consequences of the re-measurement and neither is
+this phase's to decide:
+
+6. **Fix 1 is not the frontmatter-only change the arm A bar assumes it is, and A′ measured 2 of 4
+   against A's 4 of 4.** `git diff` of the two snapshots shows **four** changed lines, not one: the
+   `description:` line and a three-line body paragraph that A opens *"In a drovr phase you are the
+   single writer"* and A′ de-scopes. Branch (a) reverts a skill to A′ on the premise that A′ ≈ A;
+   this is the run's first measurement bearing on that premise and it points the other way, at
+   n=2, with both A′ failures on the one held-out scenario whose framing that paragraph matches.
+   **It changes no verdict** — A′ scoring low is not a bar under any branch. It is a question about
+   what fix 1 costs, and the run has no other measurement of fix 1 in isolation. If four runs are
+   spendable anywhere, they are best spent here.
+7. **`meta_test_clear` is now 0 of 12 on two independent scenario pairs, across all three arms.**
+   Task 16 measured 0/12 on the superseded pair; `remeasure-tdd` measured 0/12 on the rewritten
+   one. Every run, armored or not, answers *"how should this skill have been written?"* by
+   proposing a wording change — which is what the question invites. A pass criterion that **no arm
+   has ever met, on any instrument**, is measuring the question rather than the skill. Either §7.1
+   criterion 4 needs a different question, or it needs to stop being one of the four.
 
 ## Deferred to the final review phase
 
