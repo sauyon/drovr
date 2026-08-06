@@ -3380,3 +3380,56 @@ The honest fix would be for drovr to distinguish "session id known" from "sessio
 it cannot check the second without reaching into claude's storage layout. Guessing instead — a
 heuristic under the authoritative flag — would make the ⟳ look trustworthy when it is not. The
 current message is truthful about what drovr observed; this entry supplies what it cannot.
+
+## The spec gate tells the driver to poll for `ready`, which loses a fast approval
+
+**Severity:** high (the driver hangs indefinitely after a *successful* gate; the run stalls with
+every artifact already on disk, and only a human noticing "why hasn't it come back" recovers it).
+**Found:** 2026-08-06, run `tui-dc-picker`, brainstorm phase.
+
+### Symptom
+
+The reviewer approved `spec.md`. The brainstorm agent then finished normally, authored its handoff
+and dropped `brainstorm.done`. The driver never woke and never started the plan phase — it sat idle
+for as long as the human left it, with `approved`, `feedback.json` and `brainstorm-HANDOFF.md` all
+present in the run dir the whole time.
+
+### Root cause
+
+`skills/pipeline/SKILL.md:61` forbids starting `drovr review wait` before the first summary and
+instructs the driver to hand-roll a poll instead:
+
+> Background a poll on the run's state for the `ready` transition; don't busy-wait inline.
+
+`ready` is an *intermediate* state. The run passes through it on the way to the terminal `approved`,
+and nothing holds it there — a reviewer who approves between two ticks of the driver's poll moves
+`idle → ready → approved`, and a poll written to match `ready` matches nothing, ever again. It then
+spins to its own timeout while the run is complete. The faster the human reviews, the more likely
+the failure: an attentive reviewer is the worst case.
+
+The advice is also unnecessary. `drovr review wait` **blocks** on a specless run rather than
+erroring — `wait_times_out_while_idle` (`cli/src/review.rs`) asserts exactly that, and a timeout is
+documented as exit 2, "re-run to resume". So the wait started immediately after `phase start` would
+have blocked through `idle`, through `ready`, and exited 0 on the approval. The "churns" warning at
+`SKILL.md:61` and `:311` is describing a cost that a blocking wait does not have.
+
+### Impact
+
+Fires on any run where the reviewer acts faster than the driver's poll interval, which is the normal
+case for a reviewer already watching the page. The failure is silent and indistinguishable from a
+slow phase, so the driver reports "still running" in good faith. Nothing on disk is lost — recovery
+is just noticing — but the run makes no progress until a human intervenes, which defeats the point
+of everything after the gate running unattended.
+
+### Fix idea
+
+Delete the prohibition and make the blocking primitive the only documented path: background
+`drovr review wait <run>` as soon as the brainstorm phase starts, re-arm on exit 2, and branch on
+0/3/5 exactly as the table below it already says. The URL-announcement rule is a separate concern
+and should be decoupled — "wait for `spec.md` before showing the human the page" is good advice and
+does not require the driver to hand-roll a state poll to honour it.
+
+If a state poll is ever genuinely needed, the doc must say to match the terminal states
+(`approved`/`cancelled`/`waiting`), never `ready` alone. But the better fix is that a driver should
+not be hand-rolling a poll for a state machine the CLI already exposes a blocking call for — that is
+the class of mistake this entry is about, and it should not be reachable from following the skill.
