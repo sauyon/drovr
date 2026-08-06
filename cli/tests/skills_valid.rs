@@ -3898,7 +3898,8 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
                 let verdicts_exist = scores.is_file();
                 let adj = dir.join(
                     VerdictBundle::Remeasure
-                        .adjudication_file()
+                        .adjudication()
+                        .file()
                         .expect("the remeasure bundle carries a re-adjudication"),
                 );
                 let adj_exists = adj.is_file();
@@ -3968,7 +3969,8 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
         // was found in this guard by review rather than in the tree by luck.
         let adj = dir.join(
             VerdictBundle::Remeasure
-                .adjudication_file()
+                .adjudication()
+                .file()
                 .expect("the remeasure bundle carries a re-adjudication"),
         );
         assert!(
@@ -7719,6 +7721,76 @@ enum ChosenOption {
     None,
 }
 
+/// On what terms a [`VerdictBundle`]'s blind re-read is held.
+///
+/// Three states rather than an `Option<&str>`, because "there is a file name" and
+/// "the file must be there" are different claims and an `Option` conflates them.
+/// The conflation was not hypothetical: it let `run-ledger.md` and `tdd.md` both
+/// state that a deletion would fail the build when only one of the two tests
+/// would have noticed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum AdjudicationContract {
+    /// No blind re-read answers to this bundle. The unaided stages compare nothing,
+    /// so there is no verdict for a second reading to confirm or overturn.
+    NotApplicable,
+    /// Written only because a verdict was challenged, so its absence is legal and
+    /// its presence is checked. `VerdictBundle::Bar` is this: Task 16 wrote one
+    /// after a review gate, and a later `ab-*` stage may legitimately need none.
+    WhenChallenged(&'static str),
+    /// Part of the measurement, so its absence is a missing artifact. A stage that
+    /// SUPERSEDES an existing verdict rests on a second independent reading having
+    /// agreed; without the file that claim has nothing behind it.
+    Required(&'static str),
+}
+
+impl AdjudicationContract {
+    /// The file name, whichever terms it is held on.
+    fn file(self) -> Option<&'static str> {
+        match self {
+            AdjudicationContract::NotApplicable => None,
+            AdjudicationContract::WhenChallenged(name) | AdjudicationContract::Required(name) => {
+                Some(name)
+            }
+        }
+    }
+}
+
+/// What an earlier [`VerdictBundle`] in the same directory means for this one.
+///
+/// A three-state enum rather than the `bool` it replaced. The bool answered "must
+/// something else be here?" and both `true` variants then shared one failure
+/// message, which described only the control case — so a `Remeasure` bundle whose
+/// superseded stage had been deleted would have been told it was a control.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PriorBundle {
+    /// Meaningful on its own. The bar stage is the first measurement; the
+    /// discrimination stage measures the scenario and needs no arm at all.
+    StandsAlone,
+    /// Supplementary: it re-runs a scored stage's cells with the skill removed, so
+    /// standing alone it describes a comparison against nothing.
+    Supplements,
+    /// Superseding: it replaces which counts should be quoted, not the record of
+    /// what was measured before. Deleting the superseded bundle to tidy up would
+    /// destroy the evidence that there was something to supersede.
+    Supersedes,
+}
+
+impl PriorBundle {
+    /// Why the earlier bundle has to still be there — `None` when it need not be.
+    fn why(self) -> Option<&'static str> {
+        match self {
+            PriorBundle::StandsAlone => None,
+            PriorBundle::Supplements => {
+                Some("a control is supplementary to a scored stage, never a stage on its own")
+            }
+            PriorBundle::Supersedes => Some(
+                "a re-measurement supersedes a scored stage and must not erase the counts it \
+                 supersedes",
+            ),
+        }
+    }
+}
+
 /// Which verdict set a file holds, and the rules that follow from that — a closed
 /// set, so "which file is this?" is answered once instead of at each use site.
 ///
@@ -7777,18 +7849,30 @@ impl VerdictBundle {
         }
     }
 
-    /// The blind re-read that answers to this bundle, if the stage wrote one.
+    /// The blind re-read that answers to this bundle, and **on what terms**.
     ///
     /// `adjudication.json` used to be read outside the bundle loop and bound to
     /// [`Self::Bar`] by construction, so a second bar-facing stage's re-read would
     /// have sat in the tree unchecked — the shape of every vacuous pass this run
-    /// has found. Naming the file per bundle is what keeps the two from being
-    /// cross-checked against each other's verdicts.
-    fn adjudication_file(self) -> Option<&'static str> {
+    /// has found. Naming the file per bundle keeps the two from being cross-checked
+    /// against each other's verdicts.
+    ///
+    /// **The terms are in the type because they differ, and an `Option` hid that.**
+    /// A first version returned `Option<&str>`, and `Some` meant two incompatible
+    /// things: for `Bar`, *validate this if it happens to be there* — correct, since
+    /// Task 16 wrote one only because a verdict was challenged; for `Remeasure`,
+    /// *this is part of the measurement*. One `Option` carrying two contracts is
+    /// what let the evidence files claim an enforcement that ran in only one of the
+    /// two tests, which is the finding that produced this enum.
+    fn adjudication(self) -> AdjudicationContract {
         match self {
-            VerdictBundle::Bar => Some("adjudication.json"),
-            VerdictBundle::Remeasure => Some("remeasure-adjudication.json"),
-            VerdictBundle::Control | VerdictBundle::Discrimination => None,
+            VerdictBundle::Bar => AdjudicationContract::WhenChallenged("adjudication.json"),
+            VerdictBundle::Remeasure => {
+                AdjudicationContract::Required("remeasure-adjudication.json")
+            }
+            VerdictBundle::Control | VerdictBundle::Discrimination => {
+                AdjudicationContract::NotApplicable
+            }
         }
     }
 
@@ -7830,13 +7914,11 @@ impl VerdictBundle {
     /// at all, which is answerable — and worth answering — before any arm is
     /// written. Left as an `is_unaided()` check, the second would have inherited
     /// the first's rule and made the guard reject the correct tree.
-    fn requires_a_scored_stage(self) -> bool {
+    fn requires_a_scored_stage(self) -> PriorBundle {
         match self {
-            VerdictBundle::Bar | VerdictBundle::Discrimination => false,
-            // A re-measurement supersedes a scored stage; it does not replace the
-            // record of one. The superseded counts stay in the tree with their
-            // provenance rows, so the earlier bundle must still be there.
-            VerdictBundle::Control | VerdictBundle::Remeasure => true,
+            VerdictBundle::Bar | VerdictBundle::Discrimination => PriorBundle::StandsAlone,
+            VerdictBundle::Control => PriorBundle::Supplements,
+            VerdictBundle::Remeasure => PriorBundle::Supersedes,
         }
     }
 }
@@ -8135,13 +8217,10 @@ fn scores_json_verdicts_obey_the_rubric() {
             // what the scenarios do unaided. Standing alone it describes a
             // measurement that never happened — and, before this assertion, it
             // also satisfied the vacuity guard at the bottom of this test.
-            if bundle.requires_a_scored_stage() {
+            if let Some(why) = bundle.requires_a_scored_stage().why() {
                 assert!(
                     dir.join(VerdictBundle::Bar.scores_file()).is_file(),
-                    "{} exists without {}. A control is supplementary to a scored stage \
-                     and never a stage on its own; a re-measurement SUPERSEDES a scored \
-                     stage and must not erase the counts it supersedes. Either way the \
-                     earlier bundle stays",
+                    "{} exists without {} — {why}",
                     path.display(),
                     dir.join(VerdictBundle::Bar.scores_file()).display(),
                 );
@@ -8177,10 +8256,27 @@ fn scores_json_verdicts_obey_the_rubric() {
             // one bundle's verdicts specifically — `adjudication_file()` returning
             // `None` is the assertion that an unaided set can never be what a
             // re-adjudication answers to.
-            let Some(adj_name) = bundle.adjudication_file() else {
+            let contract = bundle.adjudication();
+            let Some(adj_name) = contract.file() else {
                 continue;
             };
             let adj = dir.join(adj_name);
+            // `Required` means absence is a missing artifact, not a legal silence.
+            // Asserting it HERE as well as in the stage's own guard is what makes
+            // "enforced in two places" a true sentence rather than a hopeful one:
+            // before this, deleting the file left this test green and only the
+            // stage guard red, and the evidence files claimed both.
+            if contract == AdjudicationContract::Required(adj_name) {
+                assert!(
+                    adj.is_file(),
+                    "{} exists but {} does not. This bundle's re-adjudication is part of \
+                     the measurement — a stage that supersedes an existing verdict rests \
+                     on a second independent reading having agreed, and without the file \
+                     that claim has nothing behind it",
+                    path.display(),
+                    adj.display(),
+                );
+            }
             if adj.is_file() {
                 let text = fs::read_to_string(&adj)
                     .unwrap_or_else(|e| panic!("{} unreadable: {e}", adj.display()));

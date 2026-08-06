@@ -424,15 +424,21 @@ no rubric, no arm labels, no blind map — asked only which option the `## Respo
 to and which quotes it advances for an option it does not take. `matches_key` was then recomputed
 against the transcript's own key rather than trusted. **12 of 12 agreed with the scorers on
 `compliant`, 12 of 12 recomputed correctly, and 0 quotes were advanced for an option not taken.**
-Recorded at `transcripts/tdd/remeasure-adjudication.json`, and enforced in two places:
-`skills_valid.rs::scores_json_verdicts_obey_the_rubric` resolves a re-adjudication **per verdict
-bundle**, so this file is cross-checked exactly as Task 16's is; and
-`remeasure_stage_records_the_bodies_it_ran_on` **requires it to exist and to hold one record per
-run**. The second half was missing from the first version of this guard — the file was validated
-when present and silently optional when absent, so deleting it would have deleted this paragraph's
-evidence and left the suite green while this paragraph still claimed the check ran. **The review
-panel found that, not the tree.** Per this table's own distinction — it counts **probe**
-dispatches — a re-read of an existing transcript is not charged.
+Recorded at `transcripts/tdd/remeasure-adjudication.json`. **Deleting that file turns two tests
+red, and this sentence is written after checking each one separately rather than inferring it from
+a full-suite run**: `skills_valid.rs::scores_json_verdicts_obey_the_rubric` resolves the re-read
+per verdict bundle and asserts its presence where the bundle's contract is `Required`, and
+`remeasure_stage_records_the_bodies_it_ran_on` requires it to exist and to hold one record per run.
+
+**Two rounds of review were needed to make that sentence true.** The first version of the guard
+only renamed the file per bundle, leaving it validated-when-present and silently optional when
+absent — so deleting it would have deleted this paragraph's evidence and left the suite green while
+this paragraph claimed the check ran. The second version fixed the stage guard and the prose then
+claimed "enforced in two places", which was still wrong: only one of the two tests would have
+noticed. **The panel found the gap and then found the overstatement of its repair.** The root cause
+was an `Option<&str>` whose `Some` meant two incompatible contracts; it is now a three-state
+`AdjudicationContract`. Per this table's own distinction — it counts **probe** dispatches — a
+re-read of an existing transcript is not charged.
 
 ### `plan.md` C5's FOREGROUND rule was again not honoured
 

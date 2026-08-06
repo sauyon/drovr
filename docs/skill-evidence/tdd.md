@@ -796,11 +796,17 @@ same rubric blob. Five things differ, all **arm-invariant**:
    second bar-facing stage's re-read would have sat in the tree unchecked.
    `VerdictBundle::adjudication_file()` now names it per bundle — **and
    `remeasure_stage_records_the_bodies_it_ran_on` requires this stage's file to exist and to hold
-   one record per run.** The first version of the guard stopped at the rename, which left the file
-   optional: deleting it would have removed the evidence for *"12 of 12 agreed"* while the suite
-   stayed green and this file went on asserting the check. That is this run's recurring defect
-   reproduced inside the guard written to prevent it, and **the review panel caught it, not the
-   tree**. The two deletion paths are mutation-proven red.
+   one record per run**, and `scores_json_verdicts_obey_the_rubric` asserts its existence too.
+   **Named precisely, because a draft of this sentence was not:** deleting
+   `remeasure-adjudication.json` now turns **both** tests red — checked one test at a time, each
+   run `--exact`, control green before and after — and truncating it to six records turns the stage
+   guard red. The first version of the guard stopped at the rename, which left the file *validated
+   when present and optional when absent*: deleting it would have removed the evidence for *"12 of
+   12 agreed"* while the suite stayed green and this file went on asserting the check. **The review
+   panel caught that, and then caught the sentence that overstated the repair.** The root cause was
+   a type: `adjudication_file()` returned `Option<&str>` where `Some` meant *validate if present*
+   for one bundle and *required* for another. It now returns an `AdjudicationContract` with three
+   states, so the difference is in the type rather than in a comment.
 
 ### Result
 
@@ -941,7 +947,7 @@ question was asked as a genuine follow-up turn in all 12 sessions and answered i
 are real measurements, not the by-rule `false` of a two-block transcript. Criterion 4 is the one
 pass criterion **no arm meets on either instrument**, which is why the *all four* column is 0/4
 everywhere in both stages. **Two independent scenario pairs now agree on it**, which makes it a
-finding about the criterion or the question rather than about the pair — flagged as item 7
+finding about the criterion or the question rather than about the pair — flagged as item 8
 under *Open for the final review phase*.
 
 ### `new_rationalizations`
@@ -1190,7 +1196,18 @@ this phase's to decide:
    **It changes no verdict** — A′ scoring low is not a bar under any branch. It is a question about
    what fix 1 costs, and the run has no other measurement of fix 1 in isolation. If four runs are
    spendable anywhere, they are best spent here.
-7. **`meta_test_clear` is now 0 of 12 on two independent scenario pairs, across all three arms.**
+7. **A stage's identity is spread across four uncoupled types, and nothing makes them move
+   together.** `remeasure-tdd` needs a `RemeasureScores` variant, a `ProvenanceStage` variant, a
+   `VerdictBundle` variant and a `remeasure_ledger_stage()` string, and a new stage that adds three
+   of the four compiles. **Raised by the review panel and deliberately not fixed here.** The reason
+   is scope, stated so it is not mistaken for disagreement: `discrimination-test` has exactly the
+   same four-way spread, and `ab-*` has three of them, so this is the corpus's existing shape
+   rather than something this stage introduced. Unifying it means refactoring three stages' worth
+   of guards in a phase whose job was to measure, and a bad refactor of the guards would be worse
+   than the coupling it removed. **The cost is real and is what a reader should weigh**: the fourth
+   piece is caught only by the assertions each stage's own test makes, which is why those tests are
+   mutation-checked.
+8. **`meta_test_clear` is now 0 of 12 on two independent scenario pairs, across all three arms.**
    Task 16 measured 0/12 on the superseded pair; `remeasure-tdd` measured 0/12 on the rewritten
    one. Every run, armored or not, answers *"how should this skill have been written?"* by
    proposing a wording change — which is what the question invites. A pass criterion that **no arm
