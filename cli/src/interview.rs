@@ -161,11 +161,15 @@ pub fn check_options(options: &[AskOption]) -> Result<(), String> {
                 .to_string());
         }
         if !seen.insert(o.value.as_str()) {
-            return Err(format!(
-                "two --options share the value {:?}, so an answer could not say which \
-                 was chosen",
-                o.value
-            ));
+            // The offending value is NOT echoed, for the reason `check_id` gives: this
+            // runs before any size cap — `validate_ask_request` calls it to fail fast,
+            // and `check_field` only runs later inside `append_ask` — so echoing it is
+            // unbounded. T4 calls this from an HTTP handler, where that would be a
+            // response body mirroring a request's own field back at its sender.
+            return Err(
+                "two --options share a value, so an answer could not say which was chosen"
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -905,6 +909,32 @@ mod tests {
             std::fs::write(log_path(d.path()), format!("{line}\n")).unwrap();
             assert_eq!(read(d.path()).unwrap(), Vec::new(), "line={line}");
         }
+    }
+
+    #[test]
+    fn no_option_rule_echoes_the_value_it_rejected() {
+        // The same discipline as `check_id`, which bounds an id "without echoing it".
+        // `check_options` is reached BEFORE `check_field` on the CLI path — it is what
+        // `validate_ask_request` calls to fail fast, and the size caps only run later,
+        // inside `append_ask` — so an echoing message here is unbounded. T4 will call
+        // this from an HTTP handler, where the echo would be a response body mirroring
+        // a request's own field back at whoever sent it.
+        let huge = "x".repeat(100_000);
+        let opts = [
+            AskOption {
+                value: huge.clone(),
+                label: "A".into(),
+            },
+            AskOption {
+                value: huge.clone(),
+                label: "B".into(),
+            },
+        ];
+        let why = check_options(&opts).expect_err("duplicate");
+        assert!(!why.contains(&huge), "the message echoes the value: {why}");
+        assert!(why.len() < 500, "message is {} bytes", why.len());
+        // It still says which rule was broken.
+        assert!(why.contains("share"), "{why}");
     }
 
     #[test]
