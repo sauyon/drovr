@@ -843,10 +843,19 @@ It said arm B is *"the only arm whose text makes the bisect-is-not-a-cause move 
 is false, and `grep` says so**: all three arms mention `bisect` exactly once, in the same sentence,
 as one isolation technique among three (*"Bisect, add logging, or send a read-only explorer…"*), and
 **no arm anywhere says that a bisect names a commit rather than a cause.** The trap `sd-3` builds is
-answered by none of the three texts directly. So what separates arm B on `sd-3` is not a rule any
-arm states about bisects, and this stage does not know what it is. **Recorded as an open question
-rather than filled with a plausible story** — inventing a mechanism is the exact error
-Task 11's counter-text section already caught itself making about a UTC-vs-local cause.
+answered by none of the three texts directly.
+
+**What the arms *do* carry, checked rather than remembered, and it does not rescue the story
+either.** All three carry the same root-cause step — *"Explain why it happens, mechanistically.
+'Adding this line makes it go away' is not a cause."* That is the nearest rule in any arm to
+`sd-3`'s trap, and it is **present in all three, so it cannot be what separates them.** The only
+textual difference in that step is a clause arm B appends: *"— including the parts you were not
+chasing."* Whether four runs turn on eight words is exactly the kind of question n=2 cannot answer,
+and **it is recorded as a candidate, not as a finding.**
+
+**So this stage does not know what separates arm B on `sd-3`. Recorded as an open question rather
+than filled with a plausible story** — inventing a mechanism is the exact error Task 11's
+counter-text section already caught itself making about a UTC-vs-local cause.
 
 **`cites_section` did not separate the arms, and again it separated them the *other* way than for
 `tdd`**: A 4/4, A′ 3/4, B 3/4, unaided 0/4. Arm B cited **least** of the three armored arms while
