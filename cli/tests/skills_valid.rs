@@ -9893,8 +9893,13 @@ fn parse_second_pass_declaration(text: &str) -> Result<SecondPassDeclaration, St
 ///
 /// `declared` is the whole [`SecondPassDeclaration`] rather than the `usize` peeled
 /// off it. That struct exists precisely because its two counts are confusable, and
-/// a `usize` parameter would let a caller hand over `corpus` — or `pairs.len()` —
-/// with nothing to notice.
+/// a `usize` parameter would let a caller hand over `corpus` with nothing to
+/// notice. **Both halves are checked here**, for the same reason: taking the whole
+/// declaration and then enforcing only `sample` would leave `corpus` a caller
+/// obligation, and a call site that met the coverage rule while the document
+/// declared the wrong denominator — *"16 of 70"* against 78 verdicts — would come
+/// back clean. `primary` IS the corpus, so nothing extra has to be passed to check
+/// it.
 fn check_cross_model_adjudication(
     adjudications: &[CrossModelAdjudication],
     primary: &HashMap<&TranscriptId, bool>,
@@ -9919,6 +9924,16 @@ fn check_cross_model_adjudication(
     // makes a short one more legitimate than a short re-adjudication: the
     // denominator is declared before the pass runs, so a record below it is a
     // transcript that was never re-read. The strict reading wins.
+    if primary.len() != declared.corpus() {
+        wrong.push(format!(
+            "`cross-model.md` declares a second pass over a corpus of {}, but {} \
+             transcript(s) were scored. The sample is drawn from the primary verdicts, so \
+             a denominator that does not match them describes some other set of runs",
+            declared.corpus(),
+            primary.len(),
+        ));
+    }
+
     let sample = declared.sample();
     if adjudications.len() != sample {
         wrong.push(format!(
@@ -10105,6 +10120,21 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
         check_cross_model_adjudication(&extra, &primary, &decl(2)).0
     );
 
+    // 5d. The OTHER half of the declaration: a corpus that is not the set the
+    //     sample was drawn from. Every record here is legal and covers the
+    //     declared sample, so nothing else fires — the document has simply lost
+    //     track of how many transcripts it scored, and "16 of 70" against 78
+    //     verdicts is a sample of something this stage did not measure.
+    let wrong_corpus = SecondPassDeclaration::new(2, 70).expect("fixture declaration");
+    assert!(
+        check_cross_model_adjudication(&ok, &primary, &wrong_corpus)
+            .0
+            .iter()
+            .any(|c| c.contains("corpus of 70, but 3 transcript(s) were scored")),
+        "{:?}",
+        check_cross_model_adjudication(&ok, &primary, &wrong_corpus).0
+    );
+
     // 6. A malformed id fails at DESERIALIZATION, so it never reaches the checks
     //    above — asserted here because that is the only place it is observable.
     assert!(
@@ -10249,21 +10279,11 @@ fn cross_model_grid_matches_its_own_verdicts() {
             .unwrap_or_else(|e| panic!("{} does not match the schema: {e}", adj_path.display()));
 
     // The denominator the record is held to, read out of the document rather than
-    // off the record itself — see [`parse_second_pass_declaration`]. The corpus
-    // half is checked here because only this test knows how many transcripts were
-    // scored, and a document declaring a sample "of the 78" while 70 were scored
-    // has already lost track of what it sampled.
+    // off the record itself — see [`parse_second_pass_declaration`]. Both halves of
+    // it are enforced by the check below, not here: a guard that only this test
+    // runs can only ever be observed to pass.
     let declaration = parse_second_pass_declaration(&text)
         .unwrap_or_else(|e| panic!("{}: {e}", doc.display()));
-    assert_eq!(
-        declaration.corpus(),
-        pairs.len(),
-        "{} declares a second pass over a corpus of {}, but {} holds {} verdict(s)",
-        doc.display(),
-        declaration.corpus(),
-        scores_path.display(),
-        pairs.len(),
-    );
 
     let primary: HashMap<&TranscriptId, bool> = pairs.iter().map(|(i, c)| (i, *c)).collect();
     let (wrong, agreed) = check_cross_model_adjudication(&adjudications, &primary, &declaration);
@@ -10493,10 +10513,11 @@ fn cross_model_grid_check_refuses_a_grid_that_lies() {
 /// Every [`BlindArm`] has a grid condition name, and every condition name parses
 /// back to the arm it came from.
 ///
-/// The pair [`condition_name`] / [`parse_condition`] is a bijection or the typed
-/// `GridRow` is a downgrade: an arm added to the enum and left out of
-/// [`GRID_CONDITIONS`] would make a legal condition cell a parse error, which is
-/// the failure mode a closed set introduces if its list is not guarded.
+/// The pair [`BlindArm::condition_name`] / [`parse_condition`] is a bijection or
+/// the typed `GridRow` is a downgrade: an arm whose condition name no other arm's
+/// spelling collides with is what makes a legal grid cell parse and an illegal one
+/// fail. [`blind_arms!`] makes `BlindArm::ALL` complete by construction, so what
+/// is left to guard is the mapping itself.
 #[test]
 fn grid_conditions_round_trip_every_arm() {
     for arm in BlindArm::ALL {
