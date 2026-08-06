@@ -2464,8 +2464,13 @@ function applyBlockedTitle() {
 /// still carries it, and there is nothing to retry) and when the constructor
 /// threw, where the next poll SHOULD try again rather than assume it landed.
 function notifyBlocked(label) {
-  if (typeof Notification === 'undefined') return true;   // nothing to retry
-  if (Notification.permission !== 'granted') return true; // ditto: not a failure
+  if (typeof Notification === 'undefined') return true;  // nothing to retry, ever
+  if (Notification.permission === 'denied') return true; // ditto: the answer is no
+  // 'default' — the reviewer has not answered the permission prompt yet, and
+  // may be about to click "Notify me". Reporting this as delivered would mark
+  // the alarm announced and leave the block permanently silent on the desktop
+  // even after they grant it; the next poll retries instead, at no cost.
+  if (Notification.permission !== 'granted') return false;
   try {
     new Notification('drovr — agent blocked', { body: label, tag: label });
     return true;
@@ -2485,6 +2490,57 @@ function enableBlockedNotifications() {
   if (typeof Notification === 'undefined') return;
   Notification.requestPermission().then(syncNotifyButton).catch(function() {});
 }
+
+/// Raise alarms from a `/api/runs` payload.
+///
+/// One alarm per stuck PHASE, from `human_phases` — not one per run. Two agents
+/// of one run can be stuck at once (a phase and a review panel), and a per-run
+/// alarm would announce the first and swallow the second.
+///
+/// Scope `null`: this payload is every run there is, so it is entitled to clear
+/// a key for a run that has since vanished from the list.
+function alarmsFromRunList(runs) {
+  var alarms = [];
+  var uncertain = [];
+  runs.forEach(function(x) {
+    if (x.blocked && x.blocked.inconclusive) uncertain.push(x.name);
+    ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
+      alarms.push({
+        key: x.name + '/' + phase,
+        label: x.name + ' · ' + phase + ' is stopped on a prompt drovr will not answer',
+      });
+    });
+  });
+  syncBlockedAlarms(alarms, null, uncertain);
+}
+
+/// The alarm feed for the RUN DETAIL view, where the session list is not being
+/// rendered and so is not being fetched.
+///
+/// Without it, opening a session silently stops watching every other run: only
+/// `pollAgents` would be feeding alarms, scoped to the run on screen. A reviewer
+/// parked on one run's page — which is where they spend their time — would get
+/// no badge, no title count, and no notification for a different run's agent
+/// walking into a destructive prompt.
+///
+/// It fetches the same `/api/runs` the list view does, so it costs one request
+/// per tick and no extra server work: the sweep behind it is TTL-cached per run.
+/// Nothing is rendered from it — the list DOM is not on screen.
+async function pollAlarms(gen) {
+  if (gen !== routeGen) return;
+  try {
+    var r = await fetch('/api/runs');
+    var runs = await r.json();
+    // A navigation mid-flight makes this payload stale for alarm purposes only
+    // in the sense that a newer feed will supersede it; but the alarm set is
+    // global, so applying it is harmless and dropping it is the safer symmetry
+    // with every other poller here.
+    if (gen !== routeGen) return;
+    alarmsFromRunList(runs);
+  } catch (e) { /* transient; a failed fetch clears nothing, by design */ }
+  if (gen === routeGen) alarmsTimer = setTimeout(function(){ pollAlarms(gen); }, 2000);
+}
+var alarmsTimer = null;
 
 /// Show the button only while asking is both possible and useful.
 function syncNotifyButton() {
@@ -2770,24 +2826,7 @@ async function renderRunList(gen, resetAnchor) {
     // Running last, after the render, would also mean a filter matching nothing
     // silently froze the alarm set at whatever it was.
     //
-    // One alarm per stuck PHASE, from `human_phases` — not one per run. Two
-    // agents of one run can be stuck at once (a phase and a review panel), and
-    // a per-run alarm would announce the first and swallow the second.
-    //
-    // Scope `null`: this feed is every run there is, so it is entitled to clear
-    // a key for a run that has since vanished from the list.
-    var alarms = [];
-    var uncertain = [];
-    runs.forEach(function(x) {
-      if (x.blocked && x.blocked.inconclusive) uncertain.push(x.name);
-      ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
-        alarms.push({
-          key: x.name + '/' + phase,
-          label: x.name + ' · ' + phase + ' is stopped on a prompt drovr will not answer',
-        });
-      });
-    });
-    syncBlockedAlarms(alarms, null, uncertain);
+    alarmsFromRunList(runs);
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       resolvePendingAdvances(seq, stillActive);
@@ -3160,6 +3199,7 @@ async function route() {
   clearTimeout(pollTimer);
   clearTimeout(paneTimer);
   clearTimeout(agentsTimer);
+  clearTimeout(alarmsTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   // Only a real navigation resets the cursor. route() also re-runs every 2s to
@@ -3251,6 +3291,7 @@ async function route() {
   agentsNote('', false);   // a note belongs to the run it was raised in
   pollAgents(routeGen);
   pollPane(routeGen);
+  pollAlarms(routeGen);
   await refresh();
 }
 

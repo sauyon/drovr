@@ -163,7 +163,7 @@ surfaces it on every watching surface instead:
 | `drovr watch [<run>]` | blocks until an agent needs a human, then exits 4 — the push form, for a driver |
 | the review UI's session list | a ⚠ badge on the run's row |
 | the review UI's agent tree | a badge on the node, the prompt in its tooltip |
-| the browser tab | `⚠ (n)` in the title, and a desktop notification if you granted permission (**Notify me**, top right) |
+| the browser tab | `⚠ (n)` in the title, and a desktop notification if you granted permission (**Notify me**, top right). Both keep working while you are inside a session, not just on the list |
 
 **Only prompts drovr will not answer itself raise an alarm.** The prompt is
 classified by the same function `drovr phase wait` triages with:

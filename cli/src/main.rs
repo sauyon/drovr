@@ -1143,6 +1143,20 @@ fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: 
             }
             blocked::WatchTick::Watching => {
                 if std::time::Instant::now() >= deadline {
+                    // Same rule as the branch above, and it has to be repeated
+                    // here because exit 2 is also a claim: "nothing needed you".
+                    // A run that was never watched cannot be part of that, and a
+                    // harness reads 2 as benign ("re-run to keep watching")
+                    // rather than as something to go and fix.
+                    if scope.unparseable_runs > 0 {
+                        eprintln!(
+                            "drovr: watch timed out after {timeout_ms}ms, and {} run(s) could \
+                             not be read (see above) and were never watched — so this is not \
+                             a quiet window, it is a partial one",
+                            scope.unparseable_runs
+                        );
+                        process::exit(1);
+                    }
                     // Precise about what did NOT happen. This is "no agent asked
                     // for a human", which is not the same as "nothing is
                     // blocked": a routine permission prompt keeps the watch

@@ -1329,9 +1329,19 @@ fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
 /// [`blocked_json`] already spends that name on a bool, and the same name
 /// holding a bool on one endpoint and a number on a neighbouring one is a shape
 /// no typed client can share.
-fn blocked_summary_json(scan: &crate::blocked::RunScan) -> serde_json::Value {
-    let agents = &scan.blocked;
-    let inconclusive = scan.inconclusive();
+/// `scan` is `None` when no sweep was possible at all — the run's own
+/// `state.json` would not parse, so drovr never learned which panes it has.
+/// That is reported exactly like a sweep that reached nothing, because it is the
+/// same fact: `inconclusive`, with nothing found.
+///
+/// Passing `None` rather than a fabricated `RunScan { unreadable: 1 }` keeps
+/// `RunScan::unreadable` meaning what it says — PANES herdr would not answer for
+/// — which is the same distinction `WatchScope::unparseable_runs` is named apart
+/// for. A run-level failure is not one unreadable pane.
+fn blocked_summary_json(scan: Option<&crate::blocked::RunScan>) -> serde_json::Value {
+    let empty = crate::blocked::RunScan::default();
+    let agents = &scan.unwrap_or(&empty).blocked;
+    let inconclusive = scan.is_none_or(crate::blocked::RunScan::inconclusive);
     let human_phases: Vec<&str> = agents
         .iter()
         .filter(|a| a.class.needs_human())
@@ -1840,20 +1850,15 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
         // answer.
         let blocked = match run_state.as_ref() {
             Some(st) if live != Some(false) => {
-                blocked_summary_json(&ctx.blocked_of(h, &name, st))
+                blocked_summary_json(Some(&ctx.blocked_of(h, &name, st)))
             }
             // The run's own `state.json` would not parse, so we never learned
-            // which panes it has. That is not "nothing is blocked" — and `null`
-            // is read as exactly that, including as permission to clear an alarm
-            // already raised. `list_runs_in` only checks the file EXISTS, so
-            // such rows really are listed.
-            // One unreadable pane's worth of "we do not know", which is what
-            // `RunScan::inconclusive` reads: no pane answered, and one did not.
-            None => blocked_summary_json(&crate::blocked::RunScan {
-                blocked: Vec::new(),
-                attached: 0,
-                unreadable: 1,
-            }),
+            // which panes it has — no sweep was possible at all. That is not
+            // "nothing is blocked", and `null` is read as exactly that,
+            // including as permission to clear an alarm already raised.
+            // `list_runs_in` only checks the file EXISTS, so such rows really
+            // are listed.
+            None => blocked_summary_json(None),
             // Workspace confirmed gone: its panes went with it, and there is
             // genuinely nothing that can be blocked.
             _ => serde_json::Value::Null,

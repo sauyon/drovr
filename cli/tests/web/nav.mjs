@@ -2213,6 +2213,7 @@ await goto('#/runs/alpha-deploy', {
 // empty sweep, and it would clear the seeded alarm between two round-trips.
 await evaluate(`
   if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);   // the detail view's own /api/runs feed
   routeGen++;                       // orphan any poll still in flight
   window.__origFetch3 = window.fetch;
   window.fetch = function(u) {
@@ -2226,6 +2227,7 @@ await evaluate(`
   return 1;`);
 const pollWithTree = (inconclusive) => evaluate(`
   if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);
   window.__treeInconclusive = ${inconclusive};
   blockedAlarms = { 'alpha-deploy/implement': 'stuck' };
   blockedNotified = { 'alpha-deploy/implement': true };
@@ -2237,7 +2239,31 @@ check('...and a sweep that DID reach the run clears it',
   await pollWithTree(false), 'Drovr Review Loop');
 await evaluate(`
   if (agentsTimer) clearTimeout(agentsTimer);
+  if (alarmsTimer) clearTimeout(alarmsTimer);
   window.fetch = window.__origFetch3;
+  return 1;`);
+
+// Opening a session must not stop watching every OTHER run. The list view is
+// not rendered here, so nothing would fetch /api/runs without `pollAlarms` —
+// and a reviewer parked on one run's page is the normal case, not the edge one.
+check('the run-detail view still raises alarms for other runs', await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  blockedAlarms = {}; blockedNotified = {}; applyBlockedTitle();
+  window.__origFetch4 = window.fetch;
+  window.fetch = function(u) {
+    if (String(u).indexOf('/api/runs') !== -1 && String(u).indexOf('/api/runs/') === -1) {
+      return Promise.resolve({ ok: true, json: function() {
+        return Promise.resolve([{ name: 'other-run', blocked:
+          { count: 1, phase: 'implement', class: 'destructive', human_phases: ['implement'],
+            inconclusive: false } }]); } });
+    }
+    return window.__origFetch4.apply(window, arguments);
+  };
+  return pollAlarms(routeGen).then(function(){ return document.title; });`),
+  '⚠ (1) Drovr Review Loop');
+await evaluate(`
+  if (alarmsTimer) clearTimeout(alarmsTimer);
+  window.fetch = window.__origFetch4;
   return 1;`);
 
 // Leave the page as found: later sections (and the 2s poll) share this tab.
