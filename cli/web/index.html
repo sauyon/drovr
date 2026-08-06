@@ -2400,18 +2400,26 @@ var baseTitle = document.title;
 
 /// Fold one feed's view of the world into the alarm set.
 ///
-/// `scope` is the runs this feed can speak for — the session list speaks for
-/// every row it fetched, the agent tree only for the run being viewed. Keys
-/// outside the scope are LEFT ALONE rather than treated as cleared: the run
-/// detail view knows nothing about the other runs, and dropping them would
-/// re-announce every one of them on the way back to the list.
+/// `scope` is the runs this feed can speak for — the agent tree only for the run
+/// being viewed. Keys outside the scope are LEFT ALONE rather than treated as
+/// cleared: the run detail view knows nothing about the other runs, and dropping
+/// them would re-announce every one of them on the way back to the list.
+///
+/// Pass `null` for a feed that speaks for EVERYTHING — which the session list
+/// does, since it fetches every run there is. Scoping it to the run names it
+/// happened to see would strand the alarm of a run that has since been purged:
+/// its key is in neither the feed nor the scope, so nothing would ever clear it
+/// and the tab title would carry a phantom count for the rest of the session.
 function syncBlockedAlarms(alarms, scope) {
-  var inScope = {};
-  (scope || []).forEach(function(name) { inScope[name] = true; });
+  var inScope = null;
+  if (scope) {
+    inScope = {};
+    scope.forEach(function(name) { inScope[name] = true; });
+  }
   var seen = {};
   alarms.forEach(function(a) { seen[a.key] = true; });
   Object.keys(blockedAlarms).forEach(function(key) {
-    if (inScope[keyRun(key)] && !seen[key]) {
+    if ((inScope === null || inScope[keyRun(key)]) && !seen[key]) {
       delete blockedAlarms[key];
       delete blockedNotified[key];
     }
@@ -2529,13 +2537,13 @@ function runRow(run) {
 /// The session-list badge for `/api/runs`' `blocked` object (null when nothing
 /// in the run is parked on a prompt).
 ///
-/// `needs_human` — not `count` — decides the weight. A run can be "blocked" on a
+/// `human_phases` — not `count` — decides the weight. A run can be "blocked" on a
 /// file-edit permission dialog that a `drovr phase wait` is about to accept; a
 /// badge that shouts about those is a badge people learn to ignore, and then the
 /// destructive one goes unread too.
 function blockedBadge(blocked) {
   if (!blocked) return '';
-  var urgent = blocked.needs_human > 0;
+  var urgent = ((blocked.human_phases || []).length) > 0;
   var extra = blocked.count > 1 ? ' +' + (blocked.count - 1) : '';
   var title = urgent
     ? 'Phase ' + blocked.phase + ' is stopped on a ' + blocked.class +
@@ -2732,17 +2740,23 @@ async function renderRunList(gen, resetAnchor) {
     // READ, and an agent stuck in a run they filtered out is still stuck.
     // Running last, after the render, would also mean a filter matching nothing
     // silently froze the alarm set at whatever it was.
-    syncBlockedAlarms(
-      runs.filter(function(x) { return x.blocked && x.blocked.needs_human > 0; })
-          .map(function(x) {
-            return {
-              key: x.name + '/' + x.blocked.phase,
-              label: x.name + ' · ' + x.blocked.phase + ' is stopped on a ' +
-                     x.blocked.class + ' prompt',
-            };
-          }),
-      knownRunNames
-    );
+    //
+    // One alarm per stuck PHASE, from `human_phases` — not one per run. Two
+    // agents of one run can be stuck at once (a phase and a review panel), and
+    // a per-run alarm would announce the first and swallow the second.
+    //
+    // Scope `null`: this feed is every run there is, so it is entitled to clear
+    // a key for a run that has since vanished from the list.
+    var alarms = [];
+    runs.forEach(function(x) {
+      ((x.blocked && x.blocked.human_phases) || []).forEach(function(phase) {
+        alarms.push({
+          key: x.name + '/' + phase,
+          label: x.name + ' · ' + phase + ' is stopped on a prompt drovr will not answer',
+        });
+      });
+    });
+    syncBlockedAlarms(alarms, null);
     if (!runs.length) {
       listEl.innerHTML = '<div class="review-empty">No sessions yet.</div>';
       resolvePendingAdvances(seq, stillActive);

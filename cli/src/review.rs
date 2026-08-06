@@ -274,12 +274,20 @@ impl Ctx {
                 .clone()
         };
         let mut cache = cell.lock().unwrap_or_else(|e| e.into_inner());
-        let fresh = cache
-            .at
-            .is_some_and(|at| at.elapsed() < BLOCKED_TTL);
+        let fresh = cache.at.is_some_and(|at| at.elapsed() < BLOCKED_TTL);
         if !fresh {
-            cache.agents = crate::blocked::scan_run(h, state).blocked;
-            cache.at = Some(Instant::now());
+            let scan = crate::blocked::scan_run(h, state);
+            // A sweep that could not read a single pane is not an answer, and
+            // caching it as one would keep saying "nothing is blocked" for a
+            // further TTL after herdr came back. Take the result (it is the best
+            // we have) but do NOT start the clock, so the next poll retries.
+            let learned_nothing = scan.attached == 0 && scan.unreadable > 0;
+            cache.agents = scan.blocked;
+            cache.at = if learned_nothing {
+                None
+            } else {
+                Some(Instant::now())
+            };
         }
         cache.agents.clone()
     }
@@ -1289,13 +1297,27 @@ fn blocked_json(a: &crate::blocked::BlockedAgent) -> serde_json::Value {
 }
 
 /// The session list's one-line verdict on a run: `null` when nothing is blocked,
-/// otherwise the counts plus the phase to name in the badge.
+/// otherwise `{count, phase, class, human_phases}`.
 ///
 /// The named phase is the first one NEEDING A HUMAN where there is one, because
 /// that is the row the badge is asking someone to act on; it falls back to the
 /// first blocked phase so a run held up only by routine prompts still says which
 /// agent is sitting there.
+///
+/// `human_phases` lists EVERY phase needing a human rather than counting them,
+/// and that is what the browser raises alarms from: an alarm is per phase (it
+/// carries a phase's name and is cleared when that phase's block clears), so a
+/// count would let a run's second simultaneous block go unannounced. It is also
+/// why there is no `needs_human` field here — the per-node
+/// [`blocked_json`] already spends that name on a bool, and the same name
+/// holding a bool on one endpoint and a number on a neighbouring one is a shape
+/// no typed client can share.
 fn blocked_summary_json(agents: &[crate::blocked::BlockedAgent]) -> serde_json::Value {
+    let human_phases: Vec<&str> = agents
+        .iter()
+        .filter(|a| a.needs_human())
+        .map(|a| a.phase.as_str())
+        .collect();
     let Some(lead) = agents
         .iter()
         .find(|a| a.needs_human())
@@ -1305,9 +1327,9 @@ fn blocked_summary_json(agents: &[crate::blocked::BlockedAgent]) -> serde_json::
     };
     serde_json::json!({
         "count": agents.len(),
-        "needs_human": agents.iter().filter(|a| a.needs_human()).count(),
         "phase": lead.phase,
         "class": lead.class.as_str(),
+        "human_phases": human_phases,
     })
 }
 
@@ -1749,17 +1771,23 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
             || rs.state == LoopState::Cancelled)
             && !zombie;
         // Blocked agents, for the row's badge. Scanned only for runs where the
-        // answer can be anything but "no": a finished or archived run holds no
-        // working agent, and a workspace herdr says is gone holds no panes. The
-        // scan is TTL-cached (`Ctx::blocked_of`), so the 2s list poll costs at
-        // most one herdr sweep per run per `BLOCKED_TTL`.
+        // answer can be anything but "no": an archived run's panes were closed by
+        // `cleanup`, and a workspace herdr says is gone holds no panes at all.
+        // The scan is TTL-cached (`Ctx::blocked_of`), so the 2s list poll costs
+        // at most one herdr sweep per run per `BLOCKED_TTL`.
+        //
+        // **`complete` is deliberately NOT a reason to skip.** `is_complete()`
+        // walks `phases` only, so a run whose pipeline finished while a REVIEW
+        // PANEL is still up reads as complete — and a reviewer stuck on a
+        // destructive prompt is exactly the block nobody would otherwise notice.
+        // Liveness is what bounds the cost here, not completion.
         //
         // `live == None` (herdr unreachable) still scans: the scan's own reads
         // fail closed to "nothing blocked", which is the same answer skipping
         // gives, and the moment herdr comes back the badge is right again
         // without waiting for a liveness poll to agree.
         let blocked = match run_state.as_ref() {
-            Some(st) if !complete && !archived && live != Some(false) => {
+            Some(st) if !archived && live != Some(false) => {
                 blocked_summary_json(&ctx.blocked_of(h, &name, st))
             }
             _ => serde_json::Value::Null,
@@ -4663,10 +4691,13 @@ mod tests {
 
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let row = &blocked_rows(&ctx, &h)[0].clone();
-        assert_eq!(row["blocked"]["needs_human"], 1);
         assert_eq!(row["blocked"]["count"], 1);
         assert_eq!(row["blocked"]["phase"], "phase0");
         assert_eq!(row["blocked"]["class"], "destructive");
+        // Every phase needing a human is NAMED, not counted: the browser raises
+        // one alarm per phase, so two simultaneous blocks in one run have to be
+        // two entries or the second is never announced.
+        assert_eq!(row["blocked"]["human_phases"], serde_json::json!(["phase0"]));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -4687,8 +4718,12 @@ mod tests {
         let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
         let row = &blocked_rows(&ctx, &h)[0].clone();
         assert_eq!(row["blocked"]["count"], 1);
-        assert_eq!(row["blocked"]["needs_human"], 0);
         assert_eq!(row["blocked"]["class"], "routine");
+        assert_eq!(
+            row["blocked"]["human_phases"],
+            serde_json::json!([]),
+            "reported, but nobody is asked to act"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -4732,6 +4767,67 @@ mod tests {
             .filter(|c| c.contains("agent_status"))
             .collect();
         assert!(polls.is_empty(), "herdr was polled anyway: {polls:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `is_complete()` walks `phases` only, so a run whose pipeline finished
+    /// while a REVIEW PANEL is still up reads as complete. Skipping those would
+    /// hide a stuck reviewer — the block least likely to be noticed any other
+    /// way, since a completed run is exactly what nobody is watching.
+    #[test]
+    fn a_completed_run_with_a_live_review_panel_is_still_scanned() {
+        use crate::run::PhaseStatus::{Done, Running};
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-6-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = make_run_with_phases(&tmp, "shipped", &[Done, Done], false);
+        let mut s: RunState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        s.workspace = Some("wB".into());
+        let mut panel = crate::run::Phase::new("review:task-1:1:security");
+        panel.status = Running;
+        panel.set_pane("w:rev");
+        s.review_phases = vec![panel];
+        fs::write(dir.join("state.json"), serde_json::to_string(&s).unwrap()).unwrap();
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.push_status_for("w:rev", Some("blocked"));
+        h.push_read_for("w:rev", "Bash: git push --force\n1. Yes\n2. No");
+
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        let row = &blocked_rows(&ctx, &h)[0].clone();
+        assert_eq!(row["complete"], true, "precondition: it reads as finished");
+        assert_eq!(
+            row["blocked"]["human_phases"],
+            serde_json::json!(["review:task-1:1:security"])
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A sweep that could not read a single pane learned nothing, and caching
+    /// "nothing blocked" from it would keep answering that for a further TTL
+    /// after herdr came back.
+    #[test]
+    fn a_sweep_that_learned_nothing_is_not_cached() {
+        let tmp = std::env::temp_dir().join(format!("drovr-blk-7-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        make_running_run(&tmp, "flaky", "w:p0");
+
+        let h = crate::herdr::FakeHerdr::new();
+        h.fail_pane_info();
+        let ctx = Arc::new(Ctx::new(tmp.clone(), vec![]));
+        assert!(blocked_rows(&ctx, &h)[0]["blocked"].is_null());
+
+        // herdr recovers, and the very next poll must see it — not five seconds
+        // later.
+        let back = crate::herdr::FakeHerdr::new();
+        back.push_status_for("w:p0", Some("blocked"));
+        back.push_read_for("w:p0", "Dangerous rm operation\n1. Yes");
+        assert_eq!(
+            blocked_rows(&ctx, &back)[0]["blocked"]["human_phases"],
+            serde_json::json!(["phase0"])
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

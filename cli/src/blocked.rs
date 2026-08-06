@@ -56,15 +56,15 @@ pub struct BlockedAgent {
 
 impl BlockedAgent {
     /// Whether a human has to resolve this, as opposed to a driver's wait doing
-    /// it. Destructive and unknown prompts are never auto-answered by drovr, so
-    /// nothing clears them until a person acts — those are the ones that earn a
-    /// badge, a browser notification, and a non-zero exit from `drovr watch`.
+    /// it — [`BlockedClass::needs_human`] for this agent's class. These are the
+    /// ones that earn a badge, a browser notification, and a non-zero exit from
+    /// `drovr watch`.
     ///
     /// Routine prompts still appear in the scan (the agent tree shows them, and
     /// a human staring at a stalled run deserves to know why it is stalled);
     /// they simply do not raise an alarm.
     pub fn needs_human(&self) -> bool {
-        !matches!(self.class, BlockedClass::Routine)
+        self.class.needs_human()
     }
 }
 
@@ -131,6 +131,15 @@ pub fn scan_run<H: Herdr>(h: &H, run: &RunState) -> RunScan {
 /// answer: herdr says an agent is waiting on something, and we cannot see what.
 /// Silently dropping it would hide exactly the case where the human is most
 /// needed.
+///
+/// That does put an IO failure and an unrecognised prompt in one variant, which
+/// is a real (if small) conflation — a reviewer flagged it. It stays that way
+/// deliberately: `BlockedClass` is what `phase wait`'s triage decides POLICY on,
+/// the policy for both is identical ("do not guess, ask a person"), and a
+/// transport variant added here would have to be handled by every caller of a
+/// prompt classifier that has nothing to do with transport. The excerpt says
+/// which it was, in the one place that difference is actionable — in front of
+/// the human being asked to look.
 fn classify_pane<H: Herdr>(h: &H, phase: &str, pane_id: &str) -> BlockedAgent {
     let (class, excerpt) = match h.agent_read(pane_id) {
         Ok(pane) => (
@@ -176,8 +185,12 @@ pub fn with_live_workspace<H: Herdr>(h: &H, runs: Vec<RunState>) -> Vec<RunState
 
 /// A blocked agent together with the run it belongs to — what a watcher
 /// spanning several runs has to report.
+///
+/// Named apart from [`crate::findings::Finding`], which is a code-review result:
+/// two unrelated things called `Finding` in one crate is an import alias waiting
+/// to be got wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
+pub struct WatchFinding {
     pub run: String,
     pub agent: BlockedAgent,
 }
@@ -186,7 +199,7 @@ pub struct Finding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchTick {
     /// At least one agent needs a human. The watch ends here.
-    Alarm(Vec<Finding>),
+    Alarm(Vec<WatchFinding>),
     /// Agents are still attached (or herdr could not be reached, which is not
     /// the same as "gone"). Keep watching.
     Watching,
@@ -212,7 +225,7 @@ pub fn watch_tick<H: Herdr>(h: &H, runs: &[RunState]) -> WatchTick {
             scan.blocked
                 .into_iter()
                 .filter(BlockedAgent::needs_human)
-                .map(|agent| Finding {
+                .map(|agent| WatchFinding {
                     run: run.name.clone(),
                     agent,
                 }),

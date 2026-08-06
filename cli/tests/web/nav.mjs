@@ -2139,14 +2139,26 @@ check('the title goes back to normal when nothing is stuck',
 check('a block that recurs after clearing notifies again',
   (await sync([A], ['zz-one']), (await notes()).length), 3);
 
+// A null scope is the session list's: it fetched every run there is, so it can
+// clear a key whose run has since been purged. Scoped to the names it happened
+// to SEE, such a key would be in neither the feed nor the scope, and the count
+// would carry a phantom for the rest of the session.
+check('a run that disappears from the list stops counting',
+  await sync([], null), 'Drovr Review Loop');
+// Two agents of one run — a phase and its review panel — stuck at once.
+const C = { key: 'zz-one/review:task-1:1:security', label: 'zz-one · panel is stopped' };
+check('two blocks in one run are two alarms, not one',
+  (await sync([A, C], null)).slice(0, 6), '⚠ (2) ');
+check('...and both are notified', (await notes()).length, 5);
+
 check('a destructive prompt renders an alarming badge',
-  await evaluate(`var h = blockedBadge({count:1, needs_human:1, phase:'implement', class:'destructive'});
+  await evaluate(`var h = blockedBadge({count:1, human_phases:['implement'], phase:'implement', class:'destructive'});
     return [h.indexOf('needs-human') !== -1, h.indexOf('⚠ blocked') !== -1];`), [true, true]);
 check('a routine prompt renders a quiet one',
-  await evaluate(`var h = blockedBadge({count:1, needs_human:0, phase:'implement', class:'routine'});
+  await evaluate(`var h = blockedBadge({count:1, human_phases:[], phase:'implement', class:'routine'});
     return [h.indexOf('needs-human') !== -1, h.indexOf('⚠') !== -1];`), [false, false]);
 check('several blocks in one run are counted on the badge',
-  await evaluate(`return blockedBadge({count:3, needs_human:1, phase:'implement', class:'unknown'})
+  await evaluate(`return blockedBadge({count:3, human_phases:['implement'], phase:'implement', class:'unknown'})
     .indexOf('+2') !== -1;`), true);
 check('nothing blocked renders nothing',
   await evaluate(`return blockedBadge(null);`), '');

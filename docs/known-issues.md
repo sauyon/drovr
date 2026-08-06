@@ -3475,37 +3475,6 @@ routine prompt that has been sitting for more than N sweeps, which needs the sca
 it first saw a block. Do not simply alarm on every routine prompt — the noise is what the split
 exists to avoid.
 
-## An unreachable herdr silently drops the blocked column from `drovr list` (2026-08-06)
-
-**Severity:** low — degrades to "no worse than before the feature", but does it without saying so.
-**Found:** 2026-08-06, same work.
-
-### Symptom
-
-With herdr down (or a pane it will not answer for), `drovr list` prints exactly the rows it printed
-before blocked columns existed. A run whose agent IS stuck on a destructive prompt shows nothing.
-
-### Root cause
-
-`blocked::scan_run` counts panes herdr could not answer for in `RunScan::unreadable`, precisely so
-"we do not know" stays distinguishable from "nothing is blocked" — `drovr watch` reads it and keeps
-watching rather than declaring the run over. `cmd_list` ignores that count and renders only the
-`blocked` vector, so unknown collapses into absent.
-
-### Impact
-
-Fails closed, which is the right direction: nothing is ever claimed to be fine when it is not known
-to be, and a missing column is the same information the command carried a release ago. It is listed
-because the collapse is invisible — the row does not say the sweep failed — and because `drovr
-watch` and the review UI's `live: null` banner both take the opposite, louder approach to the same
-ambiguity.
-
-### Fix idea
-
-Render a distinct marker (`?`) when `unreadable > 0 && blocked.is_empty()`, matching the session
-list's "liveness unknown" banner. Cheap; left out of the first cut to keep one rendering rule per
-column.
-
 ## Viewing a finished run's page logs a herdr diagnostic every blocked sweep (2026-08-06)
 
 **Severity:** low — noise in `drovr serve`'s own log, bounded and self-limiting.

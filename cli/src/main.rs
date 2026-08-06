@@ -474,7 +474,7 @@ fn cmd_list<H: Herdr>(h: &H) {
     .collect();
     for run in &runs {
         let column = if live.contains(&run.name) {
-            blocked_column(&blocked::scan_run(h, run).blocked)
+            blocked_column(&blocked::scan_run(h, run))
         } else {
             None
         };
@@ -934,11 +934,20 @@ fn cmd_attach(name: &str) {
 /// **BLOCKED** is asking the reader to do something, lowercase `blocked` is
 /// telling them why a run looks slow. A routine permission dialog is answered by
 /// whatever `drovr phase wait` is running, so it is news, not an alarm.
-fn blocked_column(blocked: &[blocked::BlockedAgent]) -> Option<String> {
-    let lead = blocked
+fn blocked_column(scan: &blocked::RunScan) -> Option<String> {
+    let blocked = &scan.blocked;
+    let Some(lead) = blocked
         .iter()
         .find(|a| a.needs_human())
-        .or_else(|| blocked.first())?;
+        .or_else(|| blocked.first())
+    else {
+        // Nothing blocked — but if herdr could not answer for a single one of
+        // this run's panes, "nothing blocked" is not something we learned. Say
+        // so rather than rendering the row identically to a healthy one, which
+        // is the same distinction the session list's `live: null` banner draws.
+        return (scan.unreadable > 0 && scan.attached == 0)
+            .then(|| "? unreadable (herdr did not answer)".to_string());
+    };
     let word = if lead.needs_human() {
         "BLOCKED"
     } else {
@@ -997,7 +1006,16 @@ fn runs_to_watch<H: Herdr>(h: &H, name: Option<&str>) -> Vec<RunState> {
         // sweep, every interval, for the life of the watch.
         let all = run::list_runs_in(&run::runs_dir())
             .into_iter()
-            .filter_map(|n| RunState::load(&n).ok())
+            .filter_map(|n| match RunState::load(&n) {
+                Ok(s) => Some(s),
+                // Named explicitly, this is exit 1. Swept over, it must not stop
+                // the watch — but it must not be silent either: that run is now
+                // unwatched, and a blocked agent in it can never wake anyone.
+                Err(e) => {
+                    eprintln!("drovr: not watching run '{n}' — its state could not be read: {e}");
+                    None
+                }
+            })
             .filter(|s| !s.archived)
             .collect();
         return blocked::with_live_workspace(h, all);
@@ -3095,6 +3113,15 @@ mod tests {
         }
     }
 
+    /// A sweep that found `blocked`, with everything else healthy.
+    fn scan_of(blocked_agents: Vec<blocked::BlockedAgent>) -> blocked::RunScan {
+        blocked::RunScan {
+            attached: 1 + blocked_agents.len(),
+            unreadable: 0,
+            blocked: blocked_agents,
+        }
+    }
+
     /// Case is the signal: uppercase asks the reader to act, lowercase explains
     /// why a run looks slow. A routine prompt is answered by whatever
     /// `drovr phase wait` is running, so shouting about it trains people to stop
@@ -3102,19 +3129,43 @@ mod tests {
     #[test]
     fn the_list_column_shouts_only_when_a_human_is_needed() {
         use crate::phase::BlockedClass::{Destructive, Routine, Unknown};
-        assert_eq!(blocked_column(&[]), None);
+        assert_eq!(blocked_column(&scan_of(vec![])), None);
         assert_eq!(
-            blocked_column(&[blocked_agent("implement", Destructive)]).unwrap(),
+            blocked_column(&scan_of(vec![blocked_agent("implement", Destructive)])).unwrap(),
             "BLOCKED implement (destructive)"
         );
         assert_eq!(
-            blocked_column(&[blocked_agent("plan", Unknown)]).unwrap(),
+            blocked_column(&scan_of(vec![blocked_agent("plan", Unknown)])).unwrap(),
             "BLOCKED plan (unknown)"
         );
         assert_eq!(
-            blocked_column(&[blocked_agent("implement", Routine)]).unwrap(),
+            blocked_column(&scan_of(vec![blocked_agent("implement", Routine)])).unwrap(),
             "blocked implement (routine)"
         );
+    }
+
+    /// A sweep herdr would not answer is NOT a clean row. Rendering it as one
+    /// makes an unreachable herdr look exactly like a healthy run — the failure
+    /// mode the `unreadable` count exists to keep visible.
+    #[test]
+    fn a_sweep_that_learned_nothing_says_so_rather_than_showing_a_clean_row() {
+        let scan = blocked::RunScan {
+            blocked: vec![],
+            attached: 0,
+            unreadable: 3,
+        };
+        assert_eq!(
+            blocked_column(&scan).unwrap(),
+            "? unreadable (herdr did not answer)"
+        );
+        // A pane that answered is enough to trust the row: an agent that has
+        // exited is a normal, knowable state, not an outage.
+        let partial = blocked::RunScan {
+            blocked: vec![],
+            attached: 1,
+            unreadable: 1,
+        };
+        assert_eq!(blocked_column(&partial), None);
     }
 
     /// With several blocked panes the column names the one that needs a human —
@@ -3123,10 +3174,10 @@ mod tests {
     #[test]
     fn the_list_column_leads_with_the_pane_that_needs_a_human() {
         use crate::phase::BlockedClass::{Destructive, Routine};
-        let col = blocked_column(&[
+        let col = blocked_column(&scan_of(vec![
             blocked_agent("plan", Routine),
             blocked_agent("implement", Destructive),
-        ])
+        ]))
         .unwrap();
         assert_eq!(col, "BLOCKED implement (destructive) (+1 more)");
     }

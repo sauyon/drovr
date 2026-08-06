@@ -158,7 +158,7 @@ surfaces it on every watching surface instead:
 
 | Surface | What it shows |
 |---|---|
-| `drovr list` | a `BLOCKED <phase> (<class>)` column on the run's row |
+| `drovr list` | a `BLOCKED <phase> (<class>)` column on the run's row (`? unreadable` when herdr would not answer for the run's panes at all) |
 | `drovr status <run>` | the marker on the phase's line, plus the prompt itself and the `drovr attach` that answers it |
 | `drovr watch [<run>]` | blocks until an agent needs a human, then exits 4 — the push form, for a driver |
 | the review UI's session list | a ⚠ badge on the run's row |
@@ -183,7 +183,14 @@ when that pane came back `blocked`. Unlike the triage inside `phase wait`, it
 never sends the accept keystroke — it runs off a browser poll and off `drovr
 list`, from processes that are only looking. The review server caches it for 5
 seconds, so however many tabs are open, herdr sees at most one sweep per run per
-5s and a badge can lag the block by that much.
+5s and a badge can lag the block by that much. A sweep herdr answered for *no*
+pane is not cached at all, so the badge is right on the first poll after herdr
+comes back rather than 5s later.
+
+What bounds the cost is **liveness, not completion**: a run whose herdr
+workspace is gone is skipped entirely (one `herdr workspace list` answers that
+for every run at once), and a run whose phases are all `Done` is still swept,
+because a review panel can be up — and stuck — long after the pipeline finished.
 
 ### Resuming an agent's session
 
