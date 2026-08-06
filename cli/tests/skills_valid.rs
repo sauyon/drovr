@@ -9586,6 +9586,176 @@ fn check_cross_model_grid(
     wrong
 }
 
+/// Every way the second-pass record can disagree with the primary verdicts, plus
+/// the recomputed agreement count.
+///
+/// **Extracted rather than left inline, because inline is how a guard becomes
+/// vacuous.** The first version asserted all of this inside
+/// `cross_model_grid_matches_its_own_verdicts`, where on a legal corpus it could
+/// only ever be observed to *pass* — the exact shape of every dead guard this run
+/// has found. The mutations that proved it fired were run by hand and committed
+/// nowhere, so nothing durable stood behind the claim that it worked. Returning
+/// complaints, the way [`check_ledger`] and [`check_cross_model_grid`] do, is what
+/// lets `cross_model_adjudication_check_refuses_a_record_that_lies` demonstrate it.
+fn check_cross_model_adjudication(
+    adjudications: &[CrossModelAdjudication],
+    primary: &HashMap<&str, bool>,
+) -> (Vec<String>, usize) {
+    let mut wrong = Vec::new();
+    let mut agreed = 0usize;
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    if adjudications.is_empty() {
+        wrong.push(
+            "the second-pass record is empty — a preserved second pass records verdicts"
+                .to_string(),
+        );
+        return (wrong, 0);
+    }
+
+    for a in adjudications {
+        // **One record per transcript.** The prose claim is keyed on the record
+        // count, so fifteen unique transcripts plus one duplicate — both agreeing
+        // — would read as "16 of 16 agree" while one transcript was never
+        // re-scored and another was counted twice.
+        if !seen.insert(a.transcript_id.as_str()) {
+            wrong.push(format!(
+                "two records for transcript {} — the agreement count is keyed on the record \
+                 count, so a duplicate silently stands in for a transcript that was never \
+                 re-read",
+                a.transcript_id
+            ));
+        }
+        match primary.get(a.transcript_id.as_str()) {
+            None => wrong.push(format!(
+                "re-reads {}, which the primary verdicts do not score",
+                a.transcript_id
+            )),
+            Some(got) if *got != a.primary_compliant => wrong.push(format!(
+                "records primary_compliant={} for {}, but the primary verdict says {got}",
+                a.primary_compliant, a.transcript_id,
+            )),
+            Some(_) => {}
+        }
+        // Recomputed, never trusted — the rule the `remeasure-*` stages applied
+        // to `matches_key`.
+        if a.agrees != (a.primary_compliant == a.second_pass_compliant) {
+            wrong.push(format!(
+                "{} records agrees={} against primary={} second={}",
+                a.transcript_id, a.agrees, a.primary_compliant, a.second_pass_compliant,
+            ));
+        }
+        agreed += usize::from(a.agrees);
+    }
+    (wrong, agreed)
+}
+
+/// [`check_cross_model_adjudication`] fires on each way the second pass can lie.
+///
+/// The real record is legal, so in the test above this check can only be observed
+/// to pass. This is the demonstration that it can fail.
+#[test]
+fn cross_model_adjudication_check_refuses_a_record_that_lies() {
+    let rec = |id: &str, second: bool, primary: bool, agrees: bool| {
+        serde_json::from_value::<CrossModelAdjudication>(serde_json::json!({
+            "transcript_id": id, "second_pass_compliant": second,
+            "primary_compliant": primary, "agrees": agrees
+        }))
+        .expect("fixture record")
+    };
+    let primary: HashMap<&str, bool> =
+        HashMap::from([("aaaaaa", true), ("bbbbbb", false), ("cccccc", true)]);
+
+    // Control. If this fails, every negative case below is meaningless.
+    let ok = vec![
+        rec("aaaaaa", true, true, true),
+        rec("bbbbbb", true, false, false),
+    ];
+    let (wrong, agreed) = check_cross_model_adjudication(&ok, &primary);
+    assert!(wrong.is_empty(), "{wrong:?}");
+    assert_eq!(agreed, 1, "the agreement count is recomputed, not carried");
+
+    // 1. A duplicate inflating the count: two unique transcripts' worth of
+    //    records covering one transcript twice, every field self-consistent.
+    let dup = vec![
+        rec("aaaaaa", true, true, true),
+        rec("aaaaaa", true, true, true),
+    ];
+    assert!(
+        check_cross_model_adjudication(&dup, &primary)
+            .0
+            .iter()
+            .any(|c| c.contains("two records for transcript aaaaaa")),
+        "{:?}",
+        check_cross_model_adjudication(&dup, &primary).0
+    );
+
+    // 2. `agrees` that does not follow from the two booleans beside it.
+    let lying = vec![rec("aaaaaa", false, true, true)];
+    assert!(
+        check_cross_model_adjudication(&lying, &primary)
+            .0
+            .iter()
+            .any(|c| c.contains("records agrees=true")),
+        "{:?}",
+        check_cross_model_adjudication(&lying, &primary).0
+    );
+
+    // 3. `primary_compliant` contradicting the primary verdicts while staying
+    //    internally consistent — the mutation a self-consistency check misses.
+    let contradicts = vec![rec("bbbbbb", true, true, true)];
+    assert!(
+        check_cross_model_adjudication(&contradicts, &primary)
+            .0
+            .iter()
+            .any(|c| c.contains("primary verdict says false")),
+        "{:?}",
+        check_cross_model_adjudication(&contradicts, &primary).0
+    );
+
+    // 4. A record for a transcript nobody scored.
+    let orphan = vec![rec("dddddd", true, true, true)];
+    assert!(
+        check_cross_model_adjudication(&orphan, &primary)
+            .0
+            .iter()
+            .any(|c| c.contains("dddddd") && c.contains("do not score")),
+        "{:?}",
+        check_cross_model_adjudication(&orphan, &primary).0
+    );
+
+    // 5. An empty record is a complaint, not a silent zero — a zero-length
+    //    second pass would otherwise satisfy "0 of 0 agree".
+    assert!(
+        check_cross_model_adjudication(&[], &primary)
+            .0
+            .iter()
+            .any(|c| c.contains("empty")),
+    );
+
+    // 6. A malformed id fails at DESERIALIZATION, so it never reaches the checks
+    //    above — asserted here because that is the only place it is observable.
+    assert!(
+        serde_json::from_value::<CrossModelAdjudication>(serde_json::json!({
+            "transcript_id": "ZZZZZZ", "second_pass_compliant": true,
+            "primary_compliant": true, "agrees": true
+        }))
+        .is_err(),
+        "a non-hex transcript id must not deserialize"
+    );
+
+    // 7. …and an unknown key the same way: `deny_unknown_fields` is load-bearing
+    //    on a record whose shape differs from both other adjudication types.
+    assert!(
+        serde_json::from_value::<CrossModelAdjudication>(serde_json::json!({
+            "transcript_id": "aaaaaa", "second_pass_compliant": true,
+            "primary_compliant": true, "agrees": true, "note": "x"
+        }))
+        .is_err(),
+        "an unknown key must not be silently accepted"
+    );
+}
+
 /// `cross-model.md`'s grid is what its own transcripts and verdicts say, and the
 /// ledger charged for exactly those runs on the right side of the metered line.
 ///
@@ -9706,53 +9876,9 @@ fn cross_model_grid_matches_its_own_verdicts() {
         adj_path.display()
     );
     let primary: HashMap<&str, bool> = pairs.iter().map(|(i, c)| (i.as_str(), *c)).collect();
-    let mut agreed = 0usize;
-    // **One record per transcript.** The prose claim is keyed on
-    // `adjudications.len()`, so fifteen unique transcripts plus one duplicate —
-    // both agreeing — would read as "16 of 16 agree" while one transcript was
-    // never re-scored and another was counted twice. The primary verdict loop
-    // above already forbids this for the same reason; the second pass needs it
-    // just as much, and had it only by luck.
-    let mut adj_seen: HashSet<&str> = HashSet::new();
-    for a in &adjudications {
-        assert!(
-            adj_seen.insert(a.transcript_id.as_str()),
-            "{}: two records for transcript {} — the agreement count is keyed on the \
-             record count, so a duplicate silently stands in for a transcript that was \
-             never re-read",
-            adj_path.display(),
-            a.transcript_id,
-        );
-        let got = primary.get(a.transcript_id.as_str()).unwrap_or_else(|| {
-            panic!(
-                "{}: re-reads {}, which {} does not score",
-                adj_path.display(),
-                a.transcript_id,
-                scores_path.display()
-            )
-        });
-        assert_eq!(
-            a.primary_compliant,
-            *got,
-            "{}: records primary_compliant={} for {}, but the primary verdict says {got}",
-            adj_path.display(),
-            a.primary_compliant,
-            a.transcript_id,
-        );
-        // Recomputed, never trusted — the same rule the `remeasure-*` stages
-        // applied to `matches_key`.
-        assert_eq!(
-            a.agrees,
-            a.primary_compliant == a.second_pass_compliant,
-            "{}: {} records agrees={} against {} vs {}",
-            adj_path.display(),
-            a.transcript_id,
-            a.agrees,
-            a.primary_compliant,
-            a.second_pass_compliant,
-        );
-        agreed += usize::from(a.agrees);
-    }
+    let (wrong, agreed) = check_cross_model_adjudication(&adjudications, &primary);
+    assert!(wrong.is_empty(), "{}: {}", adj_path.display(), wrong.join("\n"));
+
     let claim = format!("**{agreed} of {} agree on\n`compliant`.**", adjudications.len());
     let claim_flat = format!("**{agreed} of {} agree on `compliant`.**", adjudications.len());
     assert!(
