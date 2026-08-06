@@ -1827,9 +1827,15 @@ enum Tag {
 /// cap cannot be written for a skill that does not exist.
 macro_rules! skill_names {
     ($($variant:ident => $wire:literal @ $budget:literal,)+) => {
-        #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+        /// `Deserialize` is derived from the same table as the variants, so a
+        /// wire name cannot exist without a variant and a JSON-facing field can
+        /// hold this type directly. The alternative — a bespoke
+        /// `deserialize_with` per field — is a second place the closed set is
+        /// spelled out, and it made `skill` the odd one out beside `arm` and
+        /// `model`, which have always deserialized straight into their enums.
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
         enum SkillName {
-            $($variant,)+
+            $(#[serde(rename = $wire)] $variant,)+
         }
 
         impl SkillName {
@@ -9362,34 +9368,57 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
 // The cross-model arm
 // ---------------------------------------------------------------------------
 
-/// The models `cross-model.md` probes. A **closed** set, for the reason every
-/// closed set in this file is one: a typo must be a parse error, not a silent
-/// fifth model whose runs are counted under a name nothing else recognises.
+/// Declare [`ProbeModel`]'s variants, their wire names and whether each is
+/// metered from **one** table.
 ///
-/// `sonnet` is deliberately absent. Its cells are **reused** from the
-/// `remeasure-*` stages rather than re-run, so it owns no transcript in this
-/// directory and a row claiming otherwise is wrong.
-#[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
-enum ProbeModel {
-    #[serde(rename = "qwen")]
-    Qwen,
-    #[serde(rename = "opus")]
-    Opus,
+/// [`skill_names!`] and [`blind_arms!`]'s reason, applied to the third closed set
+/// in this file. The hand-written version kept four parallel lists — the variants,
+/// their `#[serde(rename)]`s, `ALL`, and the `is_metered` match — and only two of
+/// them were exhaustive: a third model added to the enum but left out of `ALL`
+/// would still deserialize out of a blind map and then fail grid parsing under a
+/// name `ProbeModel::accepted()` never mentions.
+macro_rules! probe_models {
+    ($($variant:ident => $wire:literal, metered: $metered:literal,)+) => {
+        /// The models `cross-model.md` probes. A **closed** set, for the reason every
+        /// closed set in this file is one: a typo must be a parse error, not a silent
+        /// fifth model whose runs are counted under a name nothing else recognises.
+        ///
+        /// `sonnet` is deliberately absent. Its cells are **reused** from the
+        /// `remeasure-*` stages rather than re-run, so it owns no transcript in this
+        /// directory and a row claiming otherwise is wrong.
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+        enum ProbeModel {
+            $(#[serde(rename = $wire)] $variant,)+
+        }
+
+        impl ProbeModel {
+            /// Every probed model. Complete by construction: the parser, the
+            /// accepted-values error text and the ledger cross-charge loop all read
+            /// this, and it comes out of the same table as the variants.
+            const ALL: &'static [ProbeModel] = &[$(ProbeModel::$variant,)+];
+
+            fn as_str(self) -> &'static str {
+                match self { $(ProbeModel::$variant => $wire,)+ }
+            }
+
+            /// Whether this model's runs are charged against the metered ceiling.
+            ///
+            /// The ledger's own marker is the authority at the row level; this is the
+            /// per-model fact the row's marker must agree with, so a `qwen` row that
+            /// forgot `UNMETERED` is caught here as well as by [`check_ledger`].
+            fn is_metered(self) -> bool {
+                match self { $(ProbeModel::$variant => $metered,)+ }
+            }
+        }
+    };
+}
+
+probe_models! {
+    Qwen => "qwen", metered: false,
+    Opus => "opus", metered: true,
 }
 
 impl ProbeModel {
-    /// Every probed model. The one list the parser, the accepted-values error
-    /// text and the ledger cross-charge loop all read, so a third model cannot be
-    /// added to one and missed by the others.
-    const ALL: &'static [ProbeModel] = &[ProbeModel::Qwen, ProbeModel::Opus];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            ProbeModel::Qwen => "qwen",
-            ProbeModel::Opus => "opus",
-        }
-    }
-
     fn parse(raw: &str) -> Option<Self> {
         ProbeModel::ALL.iter().copied().find(|m| m.as_str() == raw)
     }
@@ -9402,18 +9431,6 @@ impl ProbeModel {
             .map(|m| m.as_str())
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    /// Whether this model's runs are charged against the metered ceiling.
-    ///
-    /// The ledger's own marker is the authority at the row level; this is the
-    /// per-model fact the row's marker must agree with, so a `qwen` row that
-    /// forgot `UNMETERED` is caught here as well as by [`check_ledger`].
-    fn is_metered(self) -> bool {
-        match self {
-            ProbeModel::Qwen => false,
-            ProbeModel::Opus => true,
-        }
     }
 }
 
@@ -9437,27 +9454,12 @@ struct CrossModelEntry {
     model: ProbeModel,
     /// **[`SkillName`], not a validated `String`.** The predecessor ran
     /// `SkillName::parse` in a `deserialize_with` and then returned the raw
-    /// string, discarding the parse result it had just computed: the field still
+    /// string, discarding the parse result it had just computed: the field stayed
     /// typed as an opaque wire value, so only the serde boundary knew the set was
-    /// closed and a hand-built entry did not. `arm` and `model` are closed enums;
-    /// this is the third dimension of the same key and it is one now too.
-    #[serde(deserialize_with = "de_skill_name")]
+    /// closed and a hand-built entry did not. `arm` and `model` are closed enums
+    /// that deserialize straight into themselves; this is the third dimension of
+    /// the same key and it is one now too.
     skill: SkillName,
-}
-
-fn de_skill_name<'de, D>(d: D) -> Result<SkillName, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    use serde::Deserialize as _;
-    let raw = String::deserialize(d)?;
-    SkillName::parse(&raw).ok_or_else(|| {
-        D::Error::custom(format!(
-            "{raw:?} is not a measured skill; accepted: {}",
-            SkillName::accepted()
-        ))
-    })
 }
 
 /// One record of `transcripts/cross-model/cross-model-adjudication.json`: the
@@ -9766,21 +9768,63 @@ fn check_cross_model_grid(
 /// the cross-model analogue of the `runs` count the `remeasure-*` guard reads out
 /// of the per-skill evidence doc.
 ///
-/// What `cross-model.md` declares about its second pass: a `sample` drawn from a
-/// `corpus`.
+/// [`SecondPassDeclaration`], in a module so its fields are genuinely **private**.
 ///
-/// **Named fields rather than a `(usize, usize)`.** The two counts have the same
-/// type and a containment relation between them, so a bare tuple makes swapping
-/// them at the destructure a representable mistake that no type would catch — and
-/// swapping them here would hold a 16-record file to a denominator of 78 and the
-/// 78-transcript corpus to 16.
-#[derive(Debug, PartialEq, Eq)]
-struct SecondPassDeclaration {
-    /// How many transcripts the second pass re-read.
-    sample: usize,
-    /// How many the primary pass scored, which the sample is drawn from.
-    corpus: usize,
+/// The only module in this file, and it earns itself: the type's whole job is that
+/// its two counts cannot be confused or contradict each other, and a struct
+/// literal written anywhere else in a 10,000-line file undoes both. Inside these
+/// braces there is one constructor and it checks the invariant.
+mod second_pass {
+    /// What `cross-model.md` declares about its second pass: a `sample` drawn from
+    /// a `corpus`.
+    ///
+    /// **Named fields rather than a `(usize, usize)`.** The two counts have the
+    /// same type and a containment relation between them, so a bare tuple makes
+    /// swapping them at the destructure a representable mistake no type would
+    /// catch — and swapping them would hold a 16-record file to a denominator of
+    /// 78 while checking the 78-transcript corpus against 16.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct SecondPassDeclaration {
+        sample: usize,
+        corpus: usize,
+    }
+
+    impl SecondPassDeclaration {
+        /// The only way to build one, and it refuses `sample > corpus`.
+        ///
+        /// A sample larger than the corpus it is drawn from is not a number that
+        /// needs interpreting downstream — it is a document that has lost track of
+        /// what it sampled, and it is refused where it is read.
+        ///
+        /// `sample == 0` is deliberately **allowed** here. A declared second pass
+        /// over nothing is caught by
+        /// [`check_cross_model_adjudication`](super::check_cross_model_adjudication)'s
+        /// empty-record complaint, which is where "a preserved second pass records
+        /// verdicts" is already stated; refusing it here as well would put one rule
+        /// in two places, and the two would eventually disagree.
+        pub fn new(sample: usize, corpus: usize) -> Result<Self, String> {
+            if sample > corpus {
+                return Err(format!(
+                    "a second pass over {sample} of {corpus} samples more transcripts than \
+                     were scored — the sample is drawn FROM the corpus"
+                ));
+            }
+            Ok(SecondPassDeclaration { sample, corpus })
+        }
+
+        /// How many transcripts the second pass re-read.
+        pub fn sample(&self) -> usize {
+            self.sample
+        }
+
+        /// How many the primary pass scored, which the sample is drawn from.
+        pub fn corpus(&self) -> usize {
+            self.corpus
+        }
+    }
 }
+
+use second_pass::SecondPassDeclaration;
 
 /// Exactly one declaration, for [`parse_grid`]'s reason: two sentences claiming
 /// different sample sizes has no obvious right answer and taking the first
@@ -9824,7 +9868,7 @@ fn parse_second_pass_declaration(text: &str) -> Result<SecondPassDeclaration, St
                     .to_string(),
             );
         }
-        found = Some(SecondPassDeclaration { sample, corpus });
+        found = Some(SecondPassDeclaration::new(sample, corpus).map_err(|e| format!("{line:?}: {e}"))?);
     }
     found.ok_or_else(|| {
         format!("no second-pass declaration found — wanted a line reading \"{LEAD}N of the M\"")
@@ -9846,10 +9890,15 @@ fn parse_second_pass_declaration(text: &str) -> Result<SecondPassDeclaration, St
 /// [`check_cross_model_grid`]'s reason: both sides of this lookup are ids from the
 /// same domain, and typing one of them as a bare string would put the format rule
 /// back on whoever builds the map.
+///
+/// `declared` is the whole [`SecondPassDeclaration`] rather than the `usize` peeled
+/// off it. That struct exists precisely because its two counts are confusable, and
+/// a `usize` parameter would let a caller hand over `corpus` — or `pairs.len()` —
+/// with nothing to notice.
 fn check_cross_model_adjudication(
     adjudications: &[CrossModelAdjudication],
     primary: &HashMap<&TranscriptId, bool>,
-    declared: usize,
+    declared: &SecondPassDeclaration,
 ) -> (Vec<String>, usize) {
     let mut wrong = Vec::new();
     let mut agreed = 0usize;
@@ -9870,11 +9919,12 @@ fn check_cross_model_adjudication(
     // makes a short one more legitimate than a short re-adjudication: the
     // denominator is declared before the pass runs, so a record below it is a
     // transcript that was never re-read. The strict reading wins.
-    if adjudications.len() != declared {
+    let sample = declared.sample();
+    if adjudications.len() != sample {
         wrong.push(format!(
-            "the second-pass record holds {} record(s) against the {declared} \
+            "the second-pass record holds {} record(s) against the {sample} \
              `cross-model.md` declares it re-read. A partial second pass cannot support \
-             \"{declared} of {declared} agree\", and a longer one re-read transcripts the \
+             \"{sample} of {sample} agree\", and a longer one re-read transcripts the \
              document does not account for",
             adjudications.len(),
         ));
@@ -9946,13 +9996,18 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
     let (a, b, c) = (id("aaaaaa"), id("bbbbbb"), id("cccccc"));
     let primary: HashMap<&TranscriptId, bool> =
         HashMap::from([(&a, true), (&b, false), (&c, true)]);
+    // The declared sample the record is held to. The corpus is the three
+    // transcripts `primary` scores.
+    let decl = |sample: usize| {
+        SecondPassDeclaration::new(sample, 3).expect("fixture declaration")
+    };
 
     // Control. If this fails, every negative case below is meaningless.
     let ok = vec![
         rec("aaaaaa", true, true, true),
         rec("bbbbbb", true, false, false),
     ];
-    let (wrong, agreed) = check_cross_model_adjudication(&ok, &primary, 2);
+    let (wrong, agreed) = check_cross_model_adjudication(&ok, &primary, &decl(2));
     assert!(wrong.is_empty(), "{wrong:?}");
     assert_eq!(agreed, 1, "the agreement count is recomputed, not carried");
 
@@ -9963,46 +10018,46 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
         rec("aaaaaa", true, true, true),
     ];
     assert!(
-        check_cross_model_adjudication(&dup, &primary, 2)
+        check_cross_model_adjudication(&dup, &primary, &decl(2))
             .0
             .iter()
             .any(|c| c.contains("two records for transcript aaaaaa")),
         "{:?}",
-        check_cross_model_adjudication(&dup, &primary, 2).0
+        check_cross_model_adjudication(&dup, &primary, &decl(2)).0
     );
 
     // 2. `agrees` that does not follow from the two booleans beside it.
     let lying = vec![rec("aaaaaa", false, true, true)];
     assert!(
-        check_cross_model_adjudication(&lying, &primary, 1)
+        check_cross_model_adjudication(&lying, &primary, &decl(1))
             .0
             .iter()
             .any(|c| c.contains("records agrees=true")),
         "{:?}",
-        check_cross_model_adjudication(&lying, &primary, 1).0
+        check_cross_model_adjudication(&lying, &primary, &decl(1)).0
     );
 
     // 3. `primary_compliant` contradicting the primary verdicts while staying
     //    internally consistent — the mutation a self-consistency check misses.
     let contradicts = vec![rec("bbbbbb", true, true, true)];
     assert!(
-        check_cross_model_adjudication(&contradicts, &primary, 1)
+        check_cross_model_adjudication(&contradicts, &primary, &decl(1))
             .0
             .iter()
             .any(|c| c.contains("primary verdict says false")),
         "{:?}",
-        check_cross_model_adjudication(&contradicts, &primary, 1).0
+        check_cross_model_adjudication(&contradicts, &primary, &decl(1)).0
     );
 
     // 4. A record for a transcript nobody scored.
     let orphan = vec![rec("dddddd", true, true, true)];
     assert!(
-        check_cross_model_adjudication(&orphan, &primary, 1)
+        check_cross_model_adjudication(&orphan, &primary, &decl(1))
             .0
             .iter()
             .any(|c| c.contains("dddddd") && c.contains("do not score")),
         "{:?}",
-        check_cross_model_adjudication(&orphan, &primary, 1).0
+        check_cross_model_adjudication(&orphan, &primary, &decl(1)).0
     );
 
     // 5. An empty record is a complaint, not a silent zero — a zero-length
@@ -10010,7 +10065,7 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
     //    declared size of 0, so it is the emptiness that fires and not the
     //    coverage check standing in for it.
     assert!(
-        check_cross_model_adjudication(&[], &primary, 0)
+        check_cross_model_adjudication(&[], &primary, &decl(0))
             .0
             .iter()
             .any(|c| c.contains("empty")),
@@ -10024,12 +10079,12 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
     //     `records.len() == runs` has guarded since it was found there.
     let shrunk = vec![rec("aaaaaa", true, true, true)];
     assert!(
-        check_cross_model_adjudication(&shrunk, &primary, 2)
+        check_cross_model_adjudication(&shrunk, &primary, &decl(2))
             .0
             .iter()
             .any(|c| c.contains("holds 1 record(s) against the 2")),
         "{:?}",
-        check_cross_model_adjudication(&shrunk, &primary, 2).0
+        check_cross_model_adjudication(&shrunk, &primary, &decl(2)).0
     );
 
     // 5c. …and the mirror: a record LONGER than the declared sample re-read
@@ -10042,12 +10097,12 @@ fn cross_model_adjudication_check_refuses_a_record_that_lies() {
         rec("cccccc", true, true, true),
     ];
     assert!(
-        check_cross_model_adjudication(&extra, &primary, 2)
+        check_cross_model_adjudication(&extra, &primary, &decl(2))
             .0
             .iter()
             .any(|c| c.contains("holds 3 record(s) against the 2")),
         "{:?}",
-        check_cross_model_adjudication(&extra, &primary, 2).0
+        check_cross_model_adjudication(&extra, &primary, &decl(2)).0
     );
 
     // 6. A malformed id fails at DESERIALIZATION, so it never reaches the checks
@@ -10201,18 +10256,17 @@ fn cross_model_grid_matches_its_own_verdicts() {
     let declaration = parse_second_pass_declaration(&text)
         .unwrap_or_else(|e| panic!("{}: {e}", doc.display()));
     assert_eq!(
-        declaration.corpus,
+        declaration.corpus(),
         pairs.len(),
         "{} declares a second pass over a corpus of {}, but {} holds {} verdict(s)",
         doc.display(),
-        declaration.corpus,
+        declaration.corpus(),
         scores_path.display(),
         pairs.len(),
     );
 
     let primary: HashMap<&TranscriptId, bool> = pairs.iter().map(|(i, c)| (i, *c)).collect();
-    let (wrong, agreed) =
-        check_cross_model_adjudication(&adjudications, &primary, declaration.sample);
+    let (wrong, agreed) = check_cross_model_adjudication(&adjudications, &primary, &declaration);
     assert!(wrong.is_empty(), "{}: {}", adj_path.display(), wrong.join("\n"));
 
     let claim = format!("**{agreed} of {} agree on\n`compliant`.**", adjudications.len());
@@ -10510,10 +10564,7 @@ fn second_pass_declaration_is_read_from_the_document() {
     let real = "**A second, independent pass on 16 of the 78, and it is not a charged run.**";
     assert_eq!(
         parse_second_pass_declaration(real),
-        Ok(SecondPassDeclaration {
-            sample: 16,
-            corpus: 78
-        })
+        SecondPassDeclaration::new(16, 78)
     );
 
     // Two declarations is an error, not a first-match win — `parse_grid`'s rule.
@@ -10532,6 +10583,19 @@ fn second_pass_declaration_is_read_from_the_document() {
     assert!(parse_second_pass_declaration("A second, independent pass on some of the 78.").is_err());
     assert!(parse_second_pass_declaration("A second, independent pass on 16 transcripts.").is_err());
     assert!(parse_second_pass_declaration("A second, independent pass on 16 of the corpus.").is_err());
+
+    // A sample larger than the corpus it is drawn from is refused where it is
+    // read, not carried forward to fail as something else downstream.
+    assert!(SecondPassDeclaration::new(100, 16)
+        .unwrap_err()
+        .contains("samples more transcripts than were scored"));
+    assert!(
+        parse_second_pass_declaration("A second, independent pass on 100 of the 16.")
+            .unwrap_err()
+            .contains("samples more transcripts than were scored")
+    );
+    // The boundary is legal: a second pass may cover the whole corpus.
+    assert!(SecondPassDeclaration::new(16, 16).is_ok());
 }
 
 /// [`parse_grid`] finds the measured grid and nothing else in the document.
