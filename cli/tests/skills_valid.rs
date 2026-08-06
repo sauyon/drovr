@@ -9332,6 +9332,22 @@ where
     }
 }
 
+fn de_transcript_id<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde::Deserialize as _;
+    let raw = String::deserialize(d)?;
+    if is_transcript_id(&raw) {
+        Ok(raw)
+    } else {
+        Err(D::Error::custom(format!(
+            "{raw:?} is not a 6-hex transcript id"
+        )))
+    }
+}
+
 /// One record of `transcripts/cross-model/cross-model-adjudication.json`: the
 /// second, independent scoring pass over a transcript the primary pass scored.
 ///
@@ -9344,6 +9360,10 @@ where
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CrossModelAdjudication {
+    /// Validated as a 6-hex transcript id on the way in, for the reason
+    /// `CrossModelEntry::skill` is validated: a malformed id deserializes cleanly
+    /// and only fails later at the join, which pushes the invariant onto callers.
+    #[serde(deserialize_with = "de_transcript_id")]
     transcript_id: String,
     second_pass_compliant: bool,
     primary_compliant: bool,
@@ -9687,7 +9707,22 @@ fn cross_model_grid_matches_its_own_verdicts() {
     );
     let primary: HashMap<&str, bool> = pairs.iter().map(|(i, c)| (i.as_str(), *c)).collect();
     let mut agreed = 0usize;
+    // **One record per transcript.** The prose claim is keyed on
+    // `adjudications.len()`, so fifteen unique transcripts plus one duplicate —
+    // both agreeing — would read as "16 of 16 agree" while one transcript was
+    // never re-scored and another was counted twice. The primary verdict loop
+    // above already forbids this for the same reason; the second pass needs it
+    // just as much, and had it only by luck.
+    let mut adj_seen: HashSet<&str> = HashSet::new();
     for a in &adjudications {
+        assert!(
+            adj_seen.insert(a.transcript_id.as_str()),
+            "{}: two records for transcript {} — the agreement count is keyed on the \
+             record count, so a duplicate silently stands in for a transcript that was \
+             never re-read",
+            adj_path.display(),
+            a.transcript_id,
+        );
         let got = primary.get(a.transcript_id.as_str()).unwrap_or_else(|| {
             panic!(
                 "{}: re-reads {}, which {} does not score",
