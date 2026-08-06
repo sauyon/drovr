@@ -3250,6 +3250,12 @@ impl SkillName {
             | SkillName::UsingDrovr => DiscriminationScores::Recorded { runs: 4 },
         }
     }
+
+    /// The `run-ledger.md` stage cell that charges this skill's discrimination
+    /// probes, derived from the skill rather than written twice.
+    fn discrimination_ledger_stage(self) -> String {
+        format!("Discrimination probe (`{}`)", self.as_str())
+    }
 }
 
 /// Which stage's probes a provenance row describes.
@@ -3608,6 +3614,12 @@ fn held_out_measurements_name_the_scenario_body_they_ran_on() {
 /// 3. **The counts outlive the bodies.** This is `harden-scenarios`'s own defect,
 ///    one generation on: these numbers are only comparable to a later stage's if
 ///    the pair still hashes to what the probes read.
+/// 4. **The ledger and the artifacts drift apart.** `run-ledger.md` is what Tasks
+///    19–21 read *before* spawning probes, to decide whether §7.3's ceiling leaves
+///    room. `run_ledger_cumulative_is_a_running_total` checks that table's internal
+///    arithmetic and nothing outside it, so a hand-edited charge could under- or
+///    over-report this stage's spend with every artifact guard still green. The
+///    charge, the declaration and the verdicts are one fact and are checked as one.
 #[test]
 fn discrimination_stage_records_every_skill_it_measured() {
     assert!(
@@ -3620,6 +3632,12 @@ fn discrimination_stage_records_every_skill_it_measured() {
     let transcripts = evidence.join("transcripts");
     let mut measured = 0usize;
 
+    let ledger_path = evidence.join(EVIDENCE_LEDGER);
+    let ledger_text = fs::read_to_string(&ledger_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+    let ledger =
+        parse_ledger(&ledger_text).unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()));
+
     for skill in SkillName::ALL.iter().copied() {
         let path = evidence.join(format!("{}.md", skill.as_str()));
         let contents = fs::read_to_string(&path)
@@ -3627,8 +3645,24 @@ fn discrimination_stage_records_every_skill_it_measured() {
         let dir = transcripts.join(skill.as_str());
         let scores = dir.join(VerdictBundle::Discrimination.scores_file());
 
+        // (4): what the ledger charged for this skill, resolved by the stage cell.
+        let stage_cell = skill.discrimination_ledger_stage();
+        let charged: Vec<&LedgerRow> = ledger
+            .iter()
+            .filter(|row| row.stage.contains(&stage_cell))
+            .collect();
+
         let runs = match skill.discrimination_scores() {
             DiscriminationScores::NotYetRun { why } => {
+                assert!(
+                    charged.is_empty(),
+                    "{} charges {} row(s) for {stage_cell}, but `{}` is declared as never \
+                     probed unaided ({why}). The ledger is what a later phase reads before \
+                     spending, so a charge with no measurement behind it is worse than none",
+                    ledger_path.display(),
+                    charged.len(),
+                    skill.as_str(),
+                );
                 let rows = held_out_body_rows(&contents, ProvenanceStage::Discrimination)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 let verdicts_exist = scores.is_file();
@@ -3647,6 +3681,27 @@ fn discrimination_stage_records_every_skill_it_measured() {
             DiscriminationScores::Recorded { runs } => runs,
         };
 
+        // A retried run counts, so the charge is per row and there is exactly one
+        // row per skill: two rows would mean a stage that ran twice under one name.
+        assert_eq!(
+            charged.len(),
+            1,
+            "{} carries {} row(s) matching {stage_cell}; this stage charged `{}` on exactly \
+             one row",
+            ledger_path.display(),
+            charged.len(),
+            skill.as_str(),
+        );
+        assert_eq!(
+            charged[0].runs as usize,
+            runs,
+            "{} charges {} run(s) for {stage_cell} against {runs} declared. The ceiling \
+             decision Tasks 19–21 make is read from that column, so the charge and the \
+             measurement have to be the same number",
+            ledger_path.display(),
+            charged[0].runs,
+        );
+
         // (1) and (2): the file exists and holds every cell, not merely some.
         assert!(
             scores.is_file(),
@@ -3658,10 +3713,13 @@ fn discrimination_stage_records_every_skill_it_measured() {
         assert_eq!(
             verdicts.len(),
             runs,
-            "{} holds {} verdict(s) against {runs} declared runs. A per-skill count is a \
-             fraction of its denominator, and a partial file silently changes it",
+            "{} holds {} verdict(s) against {runs} declared runs (and {} charged in {}). A \
+             per-skill count is a fraction of its denominator, and a partial file silently \
+             changes it",
             scores.display(),
             verdicts.len(),
+            charged[0].runs,
+            ledger_path.display(),
         );
         let wrong = check_blind_map(&dir, VerdictBundle::Discrimination, &verdicts);
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
