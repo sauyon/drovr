@@ -58,13 +58,39 @@ authored before the freeze look like it arrived after.
 `introducing_commit_reports_the_first_add_not_a_later_re_add` and
 `introducing_commit_follows_a_rename_back_to_the_original_add` fail if any of that is undone.
 
-**What this does not catch, stated so nobody reads it as airtight:** `--follow` is rename
-*detection*, a similarity heuristic. A file moved into an arm's filename **and substantially
-rewritten in the same commit** is not recognised as a rename and resolves to that commit. Text
-rewritten wholesale is arguably new text, so that is a defensible boundary — but it is a heuristic
-boundary, and the ordering gate is a guard against accident and casual laundering, not a proof
-against a determined author. The freeze's real strength is that it is public, hashed, and committed
-before the arms.
+## What the freeze proves, and what it does not
+
+Worth being exact about, because "the ordering is enforced by a test" invites more confidence than
+any commit-graph check can carry. Three tiers:
+
+**Closed, and this is the one that matters.** The ledger and the fixtures cannot change after the
+freeze without turning the suite red (`freeze_rows_still_hash_to_their_files`), and `FREEZE.md`'s own
+introducing commit is what every arm is ordered against. **The contamination that actually voids
+this experiment is the ledger being shaped by the arms** — grading a candidate against a rubric
+rewritten once its weaknesses were visible — and that is shut: the ledger is hashed, committed, and
+derived from the control specs alone, before any arm text exists. An arm authored early is a much
+weaker problem, because it was still graded against a rubric it could not have influenced.
+
+**Guarded against accident and casual laundering.** An arm whose commit predates the freeze fails,
+including one authored on a branch cut before the freeze and merged in later. So do the two routes
+review found: deleting and re-committing an arm, and drafting it under another name and renaming it
+into place.
+
+**Not detectable, by construction — do not read the gate as covering these:**
+
+- **Cherry-picking a pre-freeze arm commit onto a post-freeze branch.** A cherry-pick creates a new
+  commit with no ancestry link to the original, so the original is not reachable from `HEAD` at all
+  and `merge-base` has nothing to find. Reproduced; it passes.
+- **Renaming a file into an arm's name while substantially rewriting it in the same commit.**
+  `--follow` is rename *detection*, a similarity heuristic, and will not connect them.
+- **Simply retyping text composed earlier.** Indistinguishable, in principle, from authoring it
+  fresh — no check over git history can separate the two.
+
+These are not a to-do list. A reachability check cannot close them, and pairing this gate with a
+patch-id or content heuristic would buy the appearance of coverage while leaving the same hole: the
+last item is unclosable by anything. What actually carries the weight here is procedural — the
+ledger is public, hashed, and committed first, and the arms are authored against it in the open.
+The test enforces the part a machine can enforce, and this section is the rest of the claim.
 
 ## The frozen sentinels
 

@@ -1809,6 +1809,24 @@ fn spec_length_arms() -> SpecLengthArms {
 /// does not recognise reaches none of the four outcomes above, and invisibility
 /// is the one answer this gate must never give.
 ///
+/// **What this cannot see, so nobody mistakes it for a proof.** It is a
+/// reachability check, and three routes are outside what reachability can
+/// answer: a **cherry-picked** pre-freeze arm commit (the cherry-pick has no
+/// ancestry link to the original, so the original is not reachable from `HEAD`
+/// at all — reproduced, and it passes); a rename into an arm's filename combined
+/// with a wholesale rewrite in one commit (`--follow` is a similarity
+/// heuristic); and simply retyping text composed earlier, which is
+/// indistinguishable in principle from authoring it fresh.
+///
+/// Those are documented rather than patched, and deliberately so: no commit-graph
+/// check closes the last one, and bolting a patch-id heuristic beside this gate
+/// would buy the look of coverage without the fact of it. The load-bearing
+/// guarantee is elsewhere and it is airtight — the *ledger* cannot move
+/// ([`freeze_rows_still_hash_to_their_files`]), so a candidate arm is always
+/// graded against a rubric it could not have influenced, whenever its text was
+/// composed. `docs/skill-evidence/spec-length/FREEZE.md` states the full
+/// boundary under "What the freeze proves, and what it does not".
+///
 /// **Zero arms on disk is a correct state and must not fail.** That is a
 /// deliberate divergence from [`manifest_commits_contain_their_snapshots`],
 /// which hard-fails on `rows.is_empty()` because an empty MANIFEST is never
