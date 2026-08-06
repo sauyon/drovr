@@ -82,7 +82,7 @@ enum Commands {
     /// With no run name it watches every run that still has an agent attached.
     ///
     /// Exit codes: 4 = an agent needs a human (same code `phase wait` uses for a
-    /// blocked pane), 0 = nothing left to watch (every agent has exited), 2 =
+    /// blocked pane), 0 = nothing left to watch (every agent has exited AND every run finished its phases), 2 =
     /// timeout (re-run to resume), 1 = error.
     Watch {
         /// The run to watch. Omit to watch every run with a live agent.
@@ -1099,10 +1099,13 @@ fn cmd_watch<H: Herdr>(h: &H, name: Option<&str>, timeout_ms: u64, interval_ms: 
                 process::exit(4);
             }
             blocked::WatchTick::NothingToWatch => {
-                // Not a failure and not an alarm: every agent being gone is the
-                // normal end of a run, and saying so beats sitting out the
-                // timeout while the driver assumes work is still happening.
-                println!("drovr: nothing left to watch — no run has an agent attached");
+                // Not a failure and not an alarm: a finished run with every
+                // agent gone is the normal end, and saying so beats sitting out
+                // the timeout while the driver assumes work is still happening.
+                println!(
+                    "drovr: nothing left to watch — no run has an agent attached, and none \
+                     has phases outstanding"
+                );
                 process::exit(0);
             }
             blocked::WatchTick::Watching => {

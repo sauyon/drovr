@@ -210,13 +210,14 @@ pub struct WatchFinding {
 pub enum WatchTick {
     /// At least one agent needs a human. The watch ends here.
     Alarm(Vec<WatchFinding>),
-    /// Agents are still attached (or herdr could not be reached, which is not
-    /// the same as "gone"). Keep watching.
+    /// Something could still block: an agent is attached, herdr could not be
+    /// reached (which is not the same as "gone"), or a run has phases left to
+    /// run and so can still be handed an agent. Keep watching.
     Watching,
-    /// Every pane herdr could answer for has lost its agent. Nothing that is
-    /// being watched can ever block again, so the watch ends — reporting this
-    /// rather than waiting out its timeout is the difference between "your run
-    /// is over" and "something might still be coming".
+    /// No scoped run can produce a blocked agent any more: every pane herdr
+    /// answered for has lost its agent, AND every run has finished its phases.
+    /// Reporting this rather than waiting out the timeout is the difference
+    /// between "your run is over" and "something might still be coming".
     NothingToWatch,
 }
 
@@ -230,7 +231,21 @@ pub fn watch_tick<H: Herdr>(h: &H, runs: &[RunState]) -> WatchTick {
     let mut anything_live = false;
     for run in runs {
         let scan = scan_run(h, run);
-        anything_live |= scan.attached > 0 || scan.unreadable > 0;
+        // `!is_complete()` is the third term, and it exists because of a race a
+        // driver hits constantly: the documented use is to background this watch
+        // ALONGSIDE `drovr phase start`, and between `drovr new` and the pane
+        // appearing, every phase has `pane_id: None`. Judged on attached panes
+        // alone the first poll would announce "nothing left to watch" and exit 0
+        // while the phase was still launching, so the block it later hits would
+        // wake nobody.
+        //
+        // A run with phases outstanding can always be handed an agent — by the
+        // driver, or by the browser's ⟳ — so it is watchable whether or not one
+        // is attached this instant. The cost is that a genuinely abandoned run
+        // keeps the watch alive to its timeout (exit 2, "re-run to keep
+        // watching") rather than exiting 0, which is the right way round: exit 0
+        // asserts the run is OVER, and a harness acts on that.
+        anything_live |= scan.attached > 0 || scan.unreadable > 0 || !run.is_complete();
         findings.extend(
             scan.blocked
                 .into_iter()
@@ -489,16 +504,59 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_ends_when_every_agent_has_exited() {
+    fn a_watch_ends_when_every_agent_has_exited_and_the_run_is_finished() {
         let h = FakeHerdr::new();
         for pane in ["w:p1", "w:p2", "w:p3"] {
             h.push_status_for(pane, Some("unknown"));
         }
+        let mut run = run_with_panes();
+        for p in run.phases.iter_mut() {
+            p.status = PhaseStatus::Done;
+        }
         assert_eq!(
-            watch_tick(&h, &[run_with_panes()]),
+            watch_tick(&h, &[run]),
             WatchTick::NothingToWatch,
-            "nothing can block in a run with no agents left"
+            "nothing can block in a finished run with no agents left"
         );
+    }
+
+    /// The race the third term of `anything_live` exists for: a driver
+    /// backgrounds the watch alongside `drovr phase start`, and for the moment
+    /// before the pane appears the run holds no pane at all. Exiting 0 there
+    /// tells the driver the run is over while its first phase is still
+    /// launching, and the block it later hits wakes nobody.
+    #[test]
+    fn a_watch_does_not_end_on_a_run_whose_phases_have_not_started() {
+        let h = FakeHerdr::new();
+        let mut run = run_with_panes();
+        run.review_phases.clear();
+        for p in run.phases.iter_mut() {
+            p.status = PhaseStatus::Pending;
+            p.forget_dangling_pane();
+        }
+        assert_eq!(
+            watch_tick(&h, &[run]),
+            WatchTick::Watching,
+            "a run with phases outstanding can still be handed an agent"
+        );
+        assert!(
+            h.calls().iter().all(|c| !c.contains("agent_status")),
+            "and it costs no herdr poll to say so — there are no panes to poll"
+        );
+    }
+
+    /// Same rule between phases, which is where a long run spends most of its
+    /// life: brainstorm done and reaped, plan not started, no pane anywhere.
+    #[test]
+    fn a_watch_does_not_end_between_two_phases() {
+        let h = FakeHerdr::new();
+        let mut run = run_with_panes();
+        run.review_phases.clear();
+        run.phases[0].status = PhaseStatus::Done;
+        run.phases[0].mark_reaped();
+        run.phases[1].status = PhaseStatus::Pending;
+        run.phases[1].forget_dangling_pane();
+        assert_eq!(watch_tick(&h, &[run]), WatchTick::Watching);
     }
 
     /// The failure this distinction exists to prevent: herdr blips, every pane
