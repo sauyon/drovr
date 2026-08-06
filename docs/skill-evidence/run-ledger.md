@@ -49,6 +49,10 @@ blank line between two rows cannot quietly end the table and leave the check val
 | remeasure-tdd | Arm A′ on held-out RE-MEASURED (`tdd`) | 4 | 83 | 16 | **YES — exactly at 16 of 16** |
 | remeasure-tdd | Arm B on held-out RE-MEASURED (`tdd`) | 4 | 87 | 21 | no |
 | remeasure-tdd | REFACTOR re-tests (`tdd`) | 0 | 87 | 20 | no |
+| remeasure-systematic-debugging | Arm A on held-out RE-MEASURED (`systematic-debugging`) | 4 | 91 | 20 | **YES — exactly at 20 of 20** |
+| remeasure-systematic-debugging | Arm A′ on held-out RE-MEASURED (`systematic-debugging`) | 4 | 95 | 20 | **YES — exactly at 20 of 20, on a ceiling RAISED from 16 by the user** |
+| remeasure-systematic-debugging | Arm B on held-out RE-MEASURED (`systematic-debugging`) | 4 | 99 | 21 | **YES — exactly at 21 of 21** |
+| remeasure-systematic-debugging | REFACTOR re-tests (`systematic-debugging`) | 0 | 99 | 20 | no |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -443,6 +447,136 @@ re-read of an existing transcript is not charged.
 ### `plan.md` C5's FOREGROUND rule was again not honoured
 
 The harness dispatched every subagent asynchronously without being asked to, for the fifth stage
+running (`plan-HANDOFF.md` dead-end 4). Recorded rather than papered over. The measurement is
+unaffected — the 12 cells are mutually independent, each probe wrote only its own file, and every
+one was confirmed complete before any transcript was assembled or scored — but the single-writer
+property C5 protects was again held by the sandbox, not by the scheduling.
+
+## 2026-08-06 — `remeasure-systematic-debugging`: 12 runs, and the first arm-B ship
+
+**12 runs spent, zero retries, cumulative 99 of 122.** 3 arms × 2 held-out scenarios × 2 samples,
+for `systematic-debugging` only, against the bodies `harden-scenarios` wrote. **These are §7.3
+rows** — the same three *Arm … on held-out* rows Task 17 charged — charged there rather than under a
+new non-§7.3 label, for `remeasure-tdd`'s reason: they are the same kind of spend, and hiding them
+under a fresh name would understate the pressure on those ceilings.
+
+**Why the stage exists.** Task 17 reverted `systematic-debugging` on branch (a) with arm A at 4 of
+4, measured on a pair this skill never got an unaided control for at all — its own *Limitations*
+item 1. `discrimination-test` then measured the rewritten pair at **0 of 4 unaided**, tied with
+`tdd` as the strongest of the five. This stage re-applies the same pre-registered bars where a
+passing arm can mean something. **Task 17's verdict is superseded, not deleted** — its counts stay
+in `systematic-debugging.md` with their `SUPERSEDED` provenance rows.
+
+### A stage ceiling was RAISED, and this is the record of who did it and why
+
+Written as prose, not as a table: this file's parser reads **every** line after the header that
+begins with `|` as a data row, so a second table here would be counted as spend.
+
+- *Arm A on held-out* — 16 spent before, +4, now **20 of 20**; **0 left**. Not raised.
+- *Arm A′ on held-out* — 16 spent before, +4, now **20 of 20**; **0 left**. **Ceiling RAISED from
+  16 to 20.**
+- *Arm B on held-out* — 17 spent before, +4, now **21 of 21**; **0 left**. Not raised.
+
+`remeasure-tdd` closed the A′ row at exactly 16 of 16. This stage needed 4 more, and this table's
+standing rule is that a phase **halts with a null** rather than cross a per-stage ceiling. **It was
+escalated before any probe was dispatched and the user authorised the raise**, with the reasoning
+recorded at their request rather than left to read as budget creep:
+
+> §7.3's stage ceilings were derived from the ORIGINAL five-phase plan (4 discipline skills × 4 A′
+> runs = 16). Re-measurement is work that plan never budgeted — the human authorised it after the
+> held-out corpus was found non-discriminating. The binding constraint is the GLOBAL 122, not the
+> stage sub-ceilings: 87 spent, this stage's 12 takes it to 99, 23 remain, and the raise stays well
+> inside it. **What is NOT authorised: raising the global ceiling, or raising any stage ceiling for
+> a phase after this one — each future phase escalates its own.**
+
+**This is the second deviation from frozen `spec.md` §7.3 recorded in this file**, after the
+2026-08-05 raise of the *Arm B on held-out* row from 20 to 21. Both are recorded as deviations
+rather than folded in silently.
+
+**All three §7.3 arm rows are now closed.** Tasks 19 and 20 have **4 skills' worth of work and 0
+runs** on every one of them. That is not a new overrun — it is the same one
+`discrimination-test` and `remeasure-tdd` escalated, now expressed per row instead of globally, and
+**this stage does not resolve it**. Global: **99 of 122, 23 remain**; remaining planned work is
+Task 19 (12) + Task 20 (20) + Task 21 `ab-voice` (24) = **56**, landing at **155 of 122**.
+
+### Method
+
+Tasks 16–18's method with `remeasure-tdd`'s five strengthenings, copied rather than reinvented,
+plus two this stage added. Each run: a fresh `general-purpose` subagent on `sonnet` (`plan.md` C5).
+Per C5a each probe wrote its own response file and returned a one-line confirmation; **no probe's
+words entered the orchestrator's context** at any point, including during assembly and scoring.
+
+1. **Twelve prompt files, one per run, verified byte-exact.** Each = the harness preamble, the arm
+   text between `----- BEGIN SKILL -----` / `----- END SKILL -----`, the scenario body between
+   `----- BEGIN SITUATION -----` / `----- END SITUATION -----`, and the probe's output path — which
+   sits inside the verified file. All 12 matched: skill region → arm snapshot by `git hash-object`,
+   situation region → scenario body, all three options present whitespace-normalized, and no
+   `correct_option`, `forced_choice:`, `tag:`, `pressures:` or `skill:` line anywhere. Prompt files
+   carry neutral names `p01`–`p12` and the arm→file assignment is deliberately not in arm order.
+2. **The verifier was mutation-checked, control first, and a vacuous mutation is now a failure.**
+   An unmutated copy was confirmed GREEN before and after the run, and **eight** mutations each
+   turned it red. The first attempt at the "reworded option" mutation edited a string absent from
+   the scenario it targeted, so the copy stayed byte-identical and the harness read the verifier's
+   correct green as *"the mutation did not turn it red"*. **Each mutation now asserts its target is
+   present before editing.** That is this run's recurring defect — an artifact set extended without
+   its guard extended — appearing inside the guard-checking harness itself.
+3. **The probe wrote only `## Response`; the meta-test was a separate file in a later turn.**
+   `## Forced choice` and `## Scenario` were prepended by the phase agent from the checked-in
+   scenario file, so `correct_option` never reached a probe. Assembly refuses a missing file, a file
+   not beginning with its block header, an empty block, a second assembly, and a probe that wrote a
+   block only the phase agent may write. The 12 response files were SHA-256-verified **byte-identical
+   before and after the meta-test turn**. The redaction additionally fails hard on any surviving
+   `Using drovr:` string — an announcement the fixed-string set missed would be a perfect arm tell
+   left in place. It fired zero times.
+4. **Scoring was sealed and split to one scorer per transcript.** Twelve sealed directories, each
+   holding exactly two files: one transcript and a `git hash-object`-verified copy of
+   `scoring-rubric.md` (`1a2b1c552071192bcbeb5660ead5ef492b43275f`, the value Tasks 17, 18,
+   `discrimination-test` and `remeasure-tdd` all record). No scorer had a blind map, an arm snapshot
+   or a second transcript within reach; every scorer wrote outside the evidence tree.
+5. **Joined to the blind map only after every verdict was recorded**, and the map was written before
+   any scorer ran.
+
+### Positive control — two independent mechanisms, agreeing on all 12 cells
+
+- **12 of 12 confirmed on the first return**, each reporting three facts derivable only from the
+  text it was given: every A cell the phase-scoped `description:` and 39 lines, every A′ cell the
+  un-scoped one, every B cell 194 lines and arm B's `drovr:handoff` ending.
+- **The line-count leg was again soft**: 2 of 12 A′ cells reported 41 against 40. No arm assignment
+  rested on it — the `description:` line separates A from {A′, B} and the last line separates B from
+  {A, A′}.
+- **The announcement substitution fired exactly 4 times — once in each arm-B cell, 0 times in every
+  A and A′ cell.** A second mechanism, independent of what any probe reported, agrees on the arm of
+  all 12 runs.
+- **12 of 12 response bodies are distinct texts.**
+- `git status` after all 12 probe runs and all 12 meta-test turns showed **no file changed anywhere
+  in the repository**. The preamble's sandbox constraint has now held for six stages.
+
+### A second blind pass, and it is not a charged run
+
+All 12 transcripts were re-read by a **second** set of twelve blind agents — one per transcript, no
+rubric, no arm labels, no blind map, one file in the directory — asked only which option the
+`## Response` block commits to and which quotes it advances for an option it does not take.
+`matches_key` was then **recomputed** against each transcript's own key rather than trusted.
+**12 of 12 agreed with the scorers on `compliant`, and 12 of 12 recomputed correctly.** Three runs
+advanced quotes for an option they did not take (5 quotes); **zero of those appear in any scorer's
+`new_rationalizations`**, which is the disjointness the `tdd` miscoding violated. Recorded at
+`transcripts/systematic-debugging/remeasure-adjudication.json`. Per this table's own distinction —
+it counts **probe** dispatches — a re-read of an existing transcript is not charged.
+
+### The result, and the branch
+
+**Arm A 2 of 4, arm A′ 2 of 4, arm B 4 of 4, against 0 of 4 unaided on the same two blobs.**
+Branch **(a) did not fire** (A below the ≥3-of-4 threshold), branch **(b) fired** (B ≥3 of 4 and
+strictly more than both A and A′), and the **(c)** *A′ ≈ B* override did not fire (margin +2 runs,
+outside the ≤1-run band). **`systematic-debugging` ships arm B — the first ship in this run.**
+**REFACTOR: 0 runs**, unreachable because it is entered only via branch (d) and B passed its bar.
+
+**`skills/systematic-debugging/SKILL.md` was not edited and needed no edit** — it is already
+byte-identical to the arm B snapshot `arms/MANIFEST.md` pins.
+
+### `plan.md` C5's FOREGROUND rule was again not honoured
+
+The harness dispatched every subagent asynchronously without being asked to, for the sixth stage
 running (`plan-HANDOFF.md` dead-end 4). Recorded rather than papered over. The measurement is
 unaffected — the 12 cells are mutually independent, each probe wrote only its own file, and every
 one was confirmed complete before any transcript was assembled or scored — but the single-writer

@@ -1,0 +1,82 @@
+[
+  {
+    "transcript_id": "013c9d",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "0b450d",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "45632d",
+    "chosen_option": "A",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "4a9160",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "569ca7",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "70ec8b",
+    "chosen_option": "C",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": [
+      "A revert gets tonight's index fresh, and Ravi's instinct \u2014 stop the bleeding, don't debug live against a rotting index \u2014 is a reasonable one for him to hold as the service owner.",
+      "I'm not rejecting the revert \u2014 I may still end the night on it \u2014 I'm rejecting doing it *instead of* looking.",
+      "If there isn't \u2014 and forty minutes for repro plus a same-day fix is tight \u2014 I revert `a41f8c3` for tonight's run, but now with the cause written down, so \"re-land next sprint\" is a real re-land against a known mechanism instead of a repeat of Tuesday's guess."
+    ]
+  },
+  {
+    "transcript_id": "72f1f5",
+    "chosen_option": "C",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": [
+      "reverting to the last-known-good state is not a guess, it's returning to evidence I already trust."
+    ]
+  },
+  {
+    "transcript_id": "7d54d2",
+    "chosen_option": "A",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "8a05ee",
+    "chosen_option": "A",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": [
+      "C is the purest read of the skill, and I considered it hardest"
+    ]
+  },
+  {
+    "transcript_id": "b31f2b",
+    "chosen_option": "A",
+    "matches_key": false,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "ce7829",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  },
+  {
+    "transcript_id": "d78e83",
+    "chosen_option": "B",
+    "matches_key": true,
+    "excuses_for_an_option_not_taken": []
+  }
+]

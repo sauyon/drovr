@@ -3287,19 +3287,16 @@ impl SkillName {
     /// Total over the measured five, so a sixth skill cannot compile without
     /// declaring which state it is in.
     ///
-    /// Only `tdd` is `Recorded`: `discrimination-test` found its rewritten pair the
-    /// strongest of the five (0 of 4 unaided), and the human authorised one stage to
-    /// re-apply the bars on an instrument that demonstrably discriminates. The other
-    /// four are untouched, and the two marginal pairs are not a re-measurement anyone
-    /// has decided to spend runs on.
+    /// `tdd` and `systematic-debugging` are `Recorded`: `discrimination-test` found
+    /// their rewritten pairs the two strongest of the five (0 of 4 unaided each), and
+    /// the human authorised one stage per pair to re-apply the bars on an instrument
+    /// that demonstrably discriminates. The other three are untouched — the two
+    /// marginal pairs and the saturated one are not a re-measurement anyone has
+    /// decided to spend runs on.
     fn remeasure_scores(self) -> RemeasureScores {
         match self {
             SkillName::Tdd => RemeasureScores::Recorded { runs: 12 },
-            SkillName::SystematicDebugging => RemeasureScores::NotYetRun {
-                why: "`remeasure-tdd` covered `tdd` only; this pair also scores 0 of 4 \
-                      unaided, so a re-measurement would be worth its runs, but none was \
-                      authorised",
-            },
+            SkillName::SystematicDebugging => RemeasureScores::Recorded { runs: 12 },
             SkillName::VerificationBeforeCompletion => RemeasureScores::NotYetRun {
                 why: "its rewritten pair is marginal (2 of 4 unaided) and no re-measurement \
                       was authorised",
@@ -4027,13 +4024,14 @@ fn remeasure_stage_records_the_bodies_it_ran_on() {
         measured += 1;
     }
 
-    // Seeded against what is true: `remeasure-tdd` re-measured exactly one skill.
-    // Without it the loop passes on a tree where every skill is `NotYetRun`.
+    // Seeded against what is true: two re-measurement phases have run, one skill
+    // each — `remeasure-tdd` and `remeasure-systematic-debugging`. Without it the
+    // loop passes on a tree where every skill is `NotYetRun`.
     assert_eq!(
-        measured, 1,
-        "{measured} skill(s) carry re-measurement results — the `remeasure-tdd` phase \
-         re-measured exactly one, so anything else means a result went missing rather \
-         than a measurement never happening",
+        measured, 2,
+        "{measured} skill(s) carry re-measurement results — `remeasure-tdd` and \
+         `remeasure-systematic-debugging` re-measured one each, so anything else means \
+         a result went missing rather than a measurement never happening",
     );
 }
 
