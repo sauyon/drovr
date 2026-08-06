@@ -243,13 +243,24 @@ fn parse_record(line: &str) -> Option<Record> {
                     })
                     .collect::<Option<Vec<_>>>()?,
             };
+            let recommend = opt_str(obj.get("recommend"))?;
+            // Same rule [`append_ask`] refuses to write, applied to what is read: a
+            // recommendation naming no offered option can only come from a hand-edited
+            // line, and admitting one would leave `Ask`'s documented invariant true of the
+            // records this module mints and false of the ones it hands out.
+            if let Some(r) = &recommend
+                && !options.is_empty()
+                && !options.iter().any(|o| &o.value == r)
+            {
+                return None;
+            }
             Some(Record::Ask(Ask {
                 id: id.to_string(),
                 seq,
                 question: obj.get("question")?.as_str()?.to_string(),
                 context: opt_str(obj.get("context"))?,
                 options,
-                recommend: opt_str(obj.get("recommend"))?,
+                recommend,
                 answer: None,
                 answered_at: None,
             }))
@@ -388,6 +399,10 @@ fn check_field(name: &str, text: &str) -> io::Result<()> {
 /// is any field over [`MAX_FIELD`] — the log is append-only, so an oversized record is
 /// permanent, and every later `read` pays for it — and so is a `recommend` that names no
 /// offered option.
+///
+/// `ErrorKind::AlreadyExists` if the minted id is already in the log, which is what a
+/// non-contiguous set of ask ids produces. The alternative is a question the caller
+/// believes it asked and the fold drops.
 pub fn append_ask(
     run_dir: &Path,
     question: &str,
@@ -432,9 +447,24 @@ pub fn append_ask(
             "interview.jsonl: more asks than a u32 seq can number",
         )
     })?;
+    let id = format!("ask-{seq}");
+    // `seq` counts folded asks, so a log whose ask ids are not contiguous — a line
+    // hand-deleted, or a second writer breaking the single-writer discipline — can produce
+    // an id that is already taken. The fold keeps the FIRST ask per id, so writing it would
+    // register a question nobody ever sees while this call returned Ok. Refuse instead: a
+    // loud failure is recoverable, a silently dropped question is not.
+    if existing.iter().any(|a| a.id == id) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "interview.jsonl already carries {id}; the log's ids are not contiguous, \
+                 so this ask cannot be registered"
+            ),
+        ));
+    }
 
     let ask = Ask {
-        id: format!("ask-{seq}"),
+        id,
         seq,
         question: question.to_string(),
         context: context.map(str::to_string),
@@ -971,6 +1001,58 @@ mod tests {
         append_ask(d.path(), "which?", None, &opts, Some("a")).expect("an offered value");
         // With no options at all, a recommendation is a free-text suggestion, not a choice.
         append_ask(d.path(), "free?", None, &[], Some("anything")).expect("no options");
+    }
+
+    #[test]
+    fn an_ask_is_refused_rather_than_minted_onto_an_id_already_in_the_log() {
+        // Round 4: `seq` counts folded asks, so a log whose ids are not contiguous (a line
+        // hand-deleted, a second writer) can mint an id that already exists — and the fold
+        // keeps the FIRST ask per id, so the new question would be dropped while
+        // `append_ask` returned Ok. A question the agent believes it asked and the human
+        // never sees is the worst outcome available here; fail instead.
+        let d = tempfile::tempdir().unwrap();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path(d.path()))
+            .unwrap();
+        for line in [
+            r#"{"id":"ask-1","seq":1,"question":"one?"}"#,
+            r#"{"id":"ask-2","seq":2,"question":"two?"}"#,
+        ] {
+            f.write_all(format!("{line}\n").as_bytes()).unwrap();
+        }
+        drop(f);
+
+        let err = append_ask(d.path(), "new?", None, &[], None).expect_err("id collision");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(read_lines(d.path()).len(), 2, "nothing was appended");
+    }
+
+    #[test]
+    fn an_ask_line_recommending_an_unoffered_value_is_skipped() {
+        // The invariant `Ask` documents has to hold for every Ask this module hands out,
+        // not only for the ones it minted — otherwise the doc is a wish.
+        let d = tempfile::tempdir().unwrap();
+        append_ask(d.path(), "real?", None, &[], None).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(log_path(d.path()))
+            .unwrap();
+        f.write_all(
+            br#"{"id":"ask-1","seq":1,"question":"which?","options":[{"value":"a","label":"A"}],"recommend":"z"}"#,
+        )
+        .unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+
+        let folded = read(d.path()).unwrap();
+        assert_eq!(
+            folded.len(),
+            1,
+            "the inconsistent ask is skipped: {folded:?}"
+        );
+        assert_eq!(folded[0].id, "ask-0");
     }
 
     #[test]
