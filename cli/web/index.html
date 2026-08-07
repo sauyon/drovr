@@ -2151,15 +2151,23 @@ var renderedAskId = null;
 var answerInFlight = false;  // true between the POST and its response
 var interviewMuted = false;  // true only while the run is `cancelled`
 var interviewTimer = null;
-// Whether the LAST poll failed, so a recovery can clear the message it left
-// behind without also wiping a submit error the human has not read yet.
-var interviewPollFailed = false;
-// A message that stands in PLACE of a question rather than beside one — today,
-// only the cancellation explanation. It lives here rather than in the DOM because
-// the no-question branch of renderInterview OWNS what this container says, and it
-// repaints every 2s: a notice written straight into the panel is erased two
-// seconds after the human was told, which is worse than never having said it.
-var interviewNotice = '';
+// What #interview-error is saying, and WHO said it — `null`, or
+// `{kind, text}` with kind one of:
+//
+//   'poll'       the last read failed. Lowest priority: it recovers by itself, so
+//                a recovery clears it and it never overwrites the other two.
+//   'submit'     an answer did not land, or the human's own input was refused.
+//                Cleared when they submit again or the question changes — NOT by
+//                a poll, which is how "your answer was not recorded" used to
+//                vanish within 2s and leave the panel looking perfectly normal.
+//   'cancelled'  terminal, and stands in PLACE of a question rather than beside
+//                one.
+//
+// It is state rather than DOM because the panel repaints every 2s: a message
+// written straight into the container is erased two seconds after the human was
+// told, which is worse than never having said it. renderInterview is the one
+// thing that paints this container, so everything it says goes through here.
+var interviewMsg = null;
 
 // `read` returns seq order, so the first unanswered entry is the oldest one. The
 // server always sends `answer: null` when there is none; `undefined` is tolerated
@@ -2182,11 +2190,9 @@ function renderInterview(asks) {
   var ask = interviewMuted ? null : (pending[0] || null);
   currentAsk = ask;
   if (!ask) {
-    area.innerHTML = interviewNotice
-      ? '<div class="interview-panel"><div id="interview-error" class="error-msg">' +
-        escHtml(interviewNotice) + '</div></div>'
-      : '';
+    area.innerHTML = '';
     renderedAskId = null;
+    paintInterviewMsg();          // re-raises a standing message, if there is one
     applyNavCursor(false);
     return;
   }
@@ -2207,15 +2213,27 @@ function renderInterview(asks) {
   if (ask.id === renderedAskId) {
     var countEl = area.querySelector('.interview-count');
     if (countEl) countEl.textContent = countText;
+    paintInterviewMsg();
     applyNavCursor(false);
     return;
   }
+  // A new question. Whatever the human was told about the LAST one is spent —
+  // "type an answer", "that answer was not recorded" — and carrying it over would
+  // read as a complaint about a question they have not answered yet. A cancelled
+  // run has no next question, so that message never reaches here.
+  if (interviewMsg && interviewMsg.kind === 'submit') interviewMsg = null;
 
   var opts = ask.options || [];
   // A `recommend` naming an offered option preselects it. One that names nothing
   // offered (the free-text case) is a suggestion, not a pick: show it, but leave
   // every radio unchecked and never prefill the text box — an untouched question
   // must read as unanswered, the same rule the questions panel's Other follows.
+  //
+  // `interview::check_options` already refuses an ask whose `recommend` names no
+  // offered option WHEN there are options, so in practice the free-text branch is
+  // reached only by an ask with none. It is decided here anyway rather than
+  // assumed: this is the client of a wire format, and a rule it cannot enforce is
+  // not a rule it should crash on.
   var recIsOption = false;
   opts.forEach(function(o) { if (ask.recommend && o.value === ask.recommend) recIsOption = true; });
 
@@ -2255,6 +2273,7 @@ function renderInterview(asks) {
   html += '</div>';
   area.innerHTML = html;
   renderedAskId = ask.id;
+  paintInterviewMsg();
   applyNavCursor(false);
 }
 
@@ -2276,7 +2295,7 @@ function clearInterview() {
   currentAsk = null;
   renderedAskId = null;
   answerInFlight = false;
-  interviewNotice = '';
+  interviewMsg = null;
   document.getElementById('interview-area').innerHTML = '';
   // As clearQuestions does: this drives renderKeyhint() and announceCursor(null),
   // so skipping it leaves stale keyboard hints and a stale screen-reader
@@ -2284,19 +2303,28 @@ function clearInterview() {
   applyNavCursor(false);
 }
 
-// A failure with nowhere to show it is invisible, which is the defect this whole
-// panel exists to retire — so when there is no panel on screen to carry the
-// message, give it a container of its own. That container holds no question, so
-// renderedAskId stays null and the next good poll rebuilds over it.
-function showInterviewError(msg) {
+// Puts `interviewMsg` on screen — the ONLY thing that writes #interview-error, so
+// what the panel says is decided by the state above and not by whichever handler
+// last got there. Idempotent: every repaint re-asserts it.
+function paintInterviewMsg() {
   var el = document.getElementById('interview-error');
   if (!el) {
+    if (!interviewMsg) return;
+    // A failure with nowhere to show it is invisible, which is the defect this
+    // whole panel exists to retire — so when no panel is on screen to carry the
+    // message, give it a container of its own. It holds no question, so
+    // renderedAskId stays null and the next good poll rebuilds over it.
     document.getElementById('interview-area').innerHTML =
       '<div class="interview-panel"><div id="interview-error" class="error-msg"></div></div>';
     el = document.getElementById('interview-error');
   }
-  el.textContent = msg;
-  el.style.display = '';
+  el.textContent = interviewMsg ? interviewMsg.text : '';
+  el.style.display = interviewMsg ? '' : 'none';
+}
+
+function setInterviewMsg(kind, text) {
+  interviewMsg = { kind: kind, text: text };
+  paintInterviewMsg();
 }
 
 async function pollInterview(gen) {
@@ -2319,17 +2347,19 @@ async function pollInterview(gen) {
         var errBody = await r.json();
         if (errBody && errBody.error) msg = errBody.error;
       } catch (e) { /* not JSON; keep the generic message */ }
-      if (gen === routeGen) { interviewPollFailed = true; showInterviewError(msg); }
+      // A read failure is the least urgent thing this panel can say — it recovers
+      // by itself — so it never speaks over an answer that did not land or a run
+      // that was cancelled. Those two do not recover on their own.
+      if (gen === routeGen && (!interviewMsg || interviewMsg.kind === 'poll')) {
+        setInterviewMsg('poll', msg);
+      }
     } else {
       var data = await r.json();
       if (gen === routeGen) {
-        // Only a recovery clears the message: a submit error the human has not
-        // read yet must survive the next tick.
-        if (interviewPollFailed) {
-          interviewPollFailed = false;
-          var errEl = document.getElementById('interview-error');
-          if (errEl) errEl.style.display = 'none';
-        }
+        // A recovery clears ONLY what a read failure put there. Clearing more is
+        // how "your answer was not recorded" used to vanish inside 2s, leaving an
+        // unanswered question on a panel that looked perfectly normal.
+        if (interviewMsg && interviewMsg.kind === 'poll') interviewMsg = null;
         renderInterview(data);
       }
     }
@@ -2350,19 +2380,18 @@ async function submitAnswer() {
   var answerUrl = api('answer');
   var interviewUrl = api('interview');
   var area = document.getElementById('interview-area');
-  var errEl = document.getElementById('interview-error');
-  if (errEl) errEl.style.display = 'none';
-  // Whatever the last poll failure left on screen is stale the moment the human
-  // submits — and clearing the flag here is what stops a recovering poll from
-  // wiping the submit error this call is about to show.
-  interviewPollFailed = false;
+  // Whatever the panel was saying is spent the moment the human submits — and
+  // dropping it here is also what stops a recovering poll from later mistaking
+  // this call's own error for the read failure it cleared up.
+  interviewMsg = null;
+  paintInterviewMsg();
 
   var opts = ask.options || [];
   var checked = area.querySelector('input[type="radio"]:checked');
   // An ask with no options has nothing to pick, so "pick one" is not advice — it
   // names a control that is not on screen. Both refusals below say what this ask
   // actually offers.
-  if (!checked && opts.length) { showInterviewError('Pick an answer, or type one.'); return; }
+  if (!checked && opts.length) { setInterviewMsg('submit', 'Pick an answer, or type one.'); return; }
   var text;
   if (!checked || checked.value === OTHER_SENTINEL) {
     var box = document.getElementById('interview-text');
@@ -2374,7 +2403,7 @@ async function submitAnswer() {
     // browser; the plan specifies this refusal unconditionally, and giving that
     // answer its own affordance is UI nobody has agreed to yet.
     if (!text) {
-      showInterviewError(opts.length
+      setInterviewMsg('submit', opts.length
         ? 'Type an answer, or pick one of the options.'
         : 'Type an answer.');
       if (box) box.focus();
@@ -2429,11 +2458,11 @@ async function submitAnswer() {
     // question rather than beside a control that no longer does anything.
     interviewMuted = true;
     clearInterview();
-    // AFTER clearInterview, which resets it: this notice has to outlive the
+    // AFTER clearInterview, which drops it: this notice has to outlive the
     // question it replaces, and the 2s poll repaints over anything left loose in
-    // the DOM. renderInterview is what paints it, so it survives every tick.
-    interviewNotice = 'This run was cancelled — the agent is no longer waiting for an answer.';
-    renderInterview(currentInterview);
+    // the DOM. renderInterview paints it, so it survives every tick.
+    setInterviewMsg('cancelled',
+      'This run was cancelled — the agent is no longer waiting for an answer.');
     return;
   }
 
@@ -2441,7 +2470,7 @@ async function submitAnswer() {
   // defect this panel retires. The server's `error` is a fixed string that never
   // echoes the request, so showing it verbatim is safe.
   if (btn) btn.disabled = false;
-  showInterviewError((body && body.error)
+  setInterviewMsg('submit', (body && body.error)
     ? body.error
     : 'The answer could not be sent, and was not recorded. It is still unanswered.');
 }
@@ -2554,8 +2583,17 @@ async function refresh() {
   // and `waiting`/`approved` are the load-bearing ones: an agent asking mid-phase
   // is exactly when the gate is not at `ready`. This runs BEFORE the state
   // branches below, each of which returns.
-  interviewMuted = (state === 'cancelled');
-  if (interviewMuted) clearInterview();
+  //
+  // It only ever SETS the mute, never clears it. A run does not un-cancel, and
+  // `state` here was read when this refresh's fetches went out — while a 409 from
+  // POST answer is a strictly fresher reading of the same marker. Assigning the
+  // stale one back would unmute a run the human has just been told is cancelled,
+  // and the panel would resume offering answers that can only 409 again. route()
+  // clears it, on the one transition where a mute becomes wrong: a different run.
+  if (state === 'cancelled') {
+    interviewMuted = true;
+    clearInterview();
+  }
 
   // Any re-render disarms Cancel: a half-armed button must never carry over a
   // state change or a navigation to another run.

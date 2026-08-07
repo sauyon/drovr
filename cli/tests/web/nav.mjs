@@ -1507,6 +1507,11 @@ await evaluate(`
 check('a recovering poll does not wipe an unread submit error', await evaluate(`
   return (async function() {
     var saved = window.fetch;
+    // Start from a quiet panel: the refusal the check above left standing is a
+    // 'submit' message, which a read failure deliberately does NOT speak over —
+    // so leaving it here would arm nothing. (That precedence is what
+    // duringSecondRead below asserts, on purpose rather than by accident.)
+    interviewMsg = null; paintInterviewMsg();
     // 1. a read failure, so the recovery path is armed
     window.fetch = function() {
       return Promise.resolve({ ok: false, status: 500,
@@ -1527,17 +1532,30 @@ check('a recovering poll does not wipe an unread submit error', await evaluate(`
     document.getElementById('iv_other').checked = true;
     await submitAnswer();
     var afterSubmit = document.getElementById('interview-error').textContent;
-    // 3. the read recovers
+    // 3. ANOTHER read failure on top of the submit failure. A read recovers by
+    //    itself; an answer that did not land does not — so the read must not
+    //    speak over it, and must not clear it on the way back out either.
+    window.fetch = function() {
+      return Promise.resolve({ ok: false, status: 500,
+        json: function() { return Promise.resolve({ ok: false, error: 'interview log unreadable' }); } });
+    };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var duringSecondRead = document.getElementById('interview-error').textContent;
+    // 4. the read recovers
     window.fetch = saved;
     await pollInterview(routeGen);
     clearTimeout(interviewTimer);
     var afterRecovery = document.getElementById('interview-error');
-    document.getElementById('interview-text').value = '';
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
     return { afterRead: afterRead, afterSubmit: afterSubmit,
+             duringSecondRead: duringSecondRead,
              stillShown: afterRecovery.style.display !== 'none' && afterRecovery.textContent };
   })();`), {
     afterRead: 'interview log unreadable',
     afterSubmit: 'could not append the answer',
+    duringSecondRead: 'could not append the answer',
     stillShown: 'could not append the answer',
   });
 
@@ -1609,9 +1627,26 @@ check('a cancellation explanation outlives the poll that clears the question', a
     await pollInterview(routeGen);
     clearTimeout(interviewTimer);
     var after = document.getElementById('interview-error');
+    // ...and a refresh() whose /state was read BEFORE the cancellation must not
+    // hand the panel back. A run does not un-cancel, so the 409 is the fresher
+    // reading of the same marker; assigning the stale one over it resumes offering
+    // answers that can now only 409 again.
+    window.fetch = function(url, opts) {
+      if (String(url).indexOf('/state') !== -1) {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ state: 'ready', turn: 0 }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    await refresh();
+    clearTimeout(pollTimer);
+    window.fetch = saved;
+    var afterStaleRefresh = document.getElementById('interview-error');
     var got = { immediately: immediately,
                 afterATick: !!after && after.textContent,
-                askGone: !document.querySelector('#interview-area .interview-question') };
+                askGone: !document.querySelector('#interview-area .interview-question'),
+                stillMuted: interviewMuted,
+                afterStaleRefresh: !!afterStaleRefresh && afterStaleRefresh.textContent };
     // Undo the mute and let the panel come back for the sections below.
     interviewMuted = false;
     clearInterview();
@@ -1621,6 +1656,8 @@ check('a cancellation explanation outlives the poll that clears the question', a
     immediately: 'This run was cancelled — the agent is no longer waiting for an answer.',
     afterATick: 'This run was cancelled — the agent is no longer waiting for an answer.',
     askGone: true,
+    stillMuted: true,
+    afterStaleRefresh: 'This run was cancelled — the agent is no longer waiting for an answer.',
   });
 
 console.log('\n== run detail: the interview is not gated on the review state ==');
