@@ -9,6 +9,60 @@ never the defect — an expensive root cause guarded by nothing, or a rule that 
 being re-filed — moves to **`## Lessons kept from retired issues`**. Before adding a `— FIXED`
 marker, delete instead. If the fix is worth recording, it is worth recording in the code.
 
+## With `review_agent = "opencode"` the seed reaches no composer at all — OPEN
+
+**Severity:** high — `drovr code-review run` cannot complete, so the gate every task is supposed
+to pass through is unreachable. Two consecutive iterations failed identically.
+**Found:** 2026-08-07, `drovr code-review run skill-stickiness task-22`.
+
+### Symptom
+
+```
+drovr: code-review run failed: phase 'review:task-22:1:correctness' … the seed was NOT
+delivered — herdr saw no state change after the prompt, and the payload is nowhere in the
+agent's composer, so it was swallowed rather than left unsubmitted.
+```
+
+Re-running without `--fresh` advances the iteration (`:1:` → `:2:`) and fails the same way.
+
+### This is NOT the `[Pasted text #1]` case, and the standard recovery does not apply
+
+The entry below on the panel's stalls documents **cursor** parking with the brief visible in the
+composer as `→ [Pasted text #1 +46 lines]`, unsubmitted — where drovr's detector cannot see the
+paste, the diagnosis is inverted, and `herdr pane send-keys <pane> Enter` recovers it.
+
+**Check before applying that recovery.** Here the composer is genuinely empty:
+
+```
+$ herdr pane read <pane> --source visible --lines 45
+   ┃  Ask anything... "Fix a TODO in the codebase"
+   ┃  Plan · Qwen3.6 35B A3B (abliterated) ko.ag
+```
+
+Nothing pasted, nothing pending. Pressing Enter into that would send an empty prompt at best, and
+drovr's error text says why it refuses to press a key on your behalf. **A `send-keys Enter` habit
+formed on the cursor bug will silently do the wrong thing here** — read the pane first, every
+time. The pane is also titled `OpenCode` rather than `Correctness Reviewer`, unlike the cursor
+reviewer panes, which is a second cheap way to tell the two situations apart.
+
+### Suspected cause — not confirmed
+
+`review_agent = "opencode"` is set in `~/.config/drovr/config.toml`, which routes the panel to the
+opencode backend. On this host that resolves to a local `Qwen3.6 35B A3B (abliterated)` model.
+Whether the seed is lost in the launch, in the paste, or in opencode's composer handling was not
+established — the failure was hit inside a task whose deliverable was something else, and
+diagnosis stopped at two attempts rather than becoming a third.
+
+### What to try next
+
+1. Confirm the backend is the variable: temporarily point `review_agent` at `cursor` or `claude`
+   and re-run the same task. If the seed lands, this is opencode-specific.
+2. If it is, check whether it is the paste path or the launch: `herdr pane send-text <pane>
+   'hello'` into a live opencode reviewer pane and see whether the text appears.
+3. **Do not silently rewrite `~/.config/drovr/config.toml`** to work around it. It is the user's
+   global config, the setting is plausibly deliberate (the `cross-model-arm` stage ran qwen
+   through opencode), and swapping the reviewer changes what reviewed the work.
+
 ## `claude --plugin-dir <checkout>` loads the skills but NOT the hooks — OPEN
 
 **Severity:** medium, and silent in the same way as the entry below it: the plugin's skills
