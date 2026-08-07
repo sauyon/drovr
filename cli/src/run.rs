@@ -917,6 +917,7 @@ fn refuse_home_data_root(base: &std::path::Path) {
     // Raw std::env on purpose: this guard must see the REAL $HOME, and the cfg(test)
     // shim answers only from the overlay, which never seeds HOME. Dies with this
     // function at T13.
+    // ENV-SHIM-RAW-OK: refuse-home-data-root
     let home = match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
         _ => return,
@@ -1970,6 +1971,15 @@ mod tests {
     ///      developer's shell exports, so this is the case that actually fired.
     /// A scratch root outside `$HOME` must still resolve normally; a guard that
     /// refused everything would just be a broken suite.
+    ///
+    /// These reads go through `crate::env`, but the `HOME` they see must be the
+    /// same one [`refuse_home_data_root`] reads raw, or case (2) aims at the
+    /// wrong directory and asserts nothing. They agree because no overlay is
+    /// ever installed on this test's thread: it keeps `ENV_LOCK` and raw writes
+    /// until it is deleted outright, together with the guard it exercises.
+    /// **Wrapping this test in a `TestEnv` would silently break it** — the
+    /// shimmed `HOME` would come from the overlay and the guard's from the
+    /// process.
     #[test]
     fn data_dir_refuses_to_resolve_inside_the_real_home() {
         let _lock = ENV_LOCK.lock().unwrap();

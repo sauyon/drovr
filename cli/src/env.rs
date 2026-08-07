@@ -59,17 +59,19 @@ pub fn var_os(key: &str) -> Option<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    /// A raw `std::env::var*` read that is allowed to stay raw, and the reason.
+    /// A raw `std::env` access that is allowed to stay raw, and the reason.
     ///
-    /// `file` is a filename under `cli/src/`; `line` is the source line with
-    /// its leading indentation stripped, matched exactly so that editing the
-    /// site re-opens the question. `why` is here to be read by whoever is
-    /// tempted to add the next entry.
+    /// `file` is the path under `cli/src/`, `/`-separated. `tag` is the label
+    /// written in an `ENV-SHIM-RAW-OK: <tag>` comment immediately above the
+    /// site: the exception is keyed on that, not on the source line's text, so
+    /// reformatting the call does not read as a policy violation while moving
+    /// it out from under its comment does. `why` is here to be read by whoever
+    /// is tempted to add the next entry.
     struct RawException {
         file: &'static str,
-        line: &'static str,
+        tag: &'static str,
         why: &'static str,
     }
 
@@ -78,13 +80,16 @@ mod tests {
     /// still races.
     const RAW_EXCEPTIONS: &[RawException] = &[RawException {
         file: "run.rs",
-        line: r#"let home = match std::env::var("HOME") {"#,
+        tag: "refuse-home-data-root",
         why: "refuse_home_data_root must see the REAL $HOME. The cfg(test) shim answers \
               only from the overlay, which never seeds HOME, so a shimmed read would \
               return NotPresent and the guard would pass unconditionally for every \
               migrated test — silently inert for exactly the sweep it backstops. This \
               exception dies with the function it belongs to.",
     }];
+
+    /// The comment that claims an exception, e.g. `// ENV-SHIM-RAW-OK: <tag>`.
+    const MARKER: &str = "ENV-SHIM-RAW-OK:";
 
     /// `env.rs` is the door itself; its own `std::env` calls are the point.
     const THE_DOOR: &str = "env.rs";
@@ -93,13 +98,52 @@ mod tests {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
     }
 
-    /// Source lines that are commented out are prose, not reads.
+    /// Every `.rs` file under `cli/src/`, at any depth.
+    ///
+    /// Recursive on purpose: a guard that stops looking the day someone splits
+    /// a module into a directory is the silent hole this whole module exists to
+    /// close.
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("entry under {}: {e}", dir.display()))
+                .path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Source lines that are commented out are prose, not code.
     ///
     /// This is a line-comment check only — a `std::env::var` buried in a block
     /// comment would be reported. Nothing in the crate does that, and a false
     /// positive here is a visible test failure rather than a silent hole.
     fn is_comment(line: &str) -> bool {
         line.trim_start().starts_with("//")
+    }
+
+    /// What this line does that only [`super::var`]/[`super::var_os`] should.
+    ///
+    /// Two shapes, because catching only the first leaves the second as an
+    /// escape hatch: `use std::env::var;` followed by a bare `var("HOME")` is a
+    /// process-global read that no substring search for `std::env::var` would
+    /// ever see. No file but `env.rs` needs to name `std::env` in a `use` at
+    /// all, so the rule is simply that none may.
+    ///
+    /// `std::env::vars`/`vars_os` are caught by the same substring as `var`.
+    fn violation(line: &str) -> Option<&'static str> {
+        if line.contains("std::env::var") {
+            Some("raw environment read")
+        } else if line.contains("use std::env") {
+            Some("import of std::env, which hides raw reads from this scan")
+        } else {
+            None
+        }
     }
 
     /// Every environment read in `src/` goes through this module.
@@ -109,51 +153,69 @@ mod tests {
     /// the process-global environment happens to say at that instant. Grepping
     /// for that by hand once, at the moment the sweep lands, protects nothing
     /// from the tasks that come after it.
+    ///
+    /// Scope is `cli/src/`. The integration tests under `cli/tests/` drive the
+    /// *built binary*, compiled without `cfg(test)`, so there is no overlay for
+    /// them to bypass; they pin the child's environment themselves.
     #[test]
     fn crate_reads_the_environment_only_through_the_shim() {
         let mut offenders: Vec<String> = Vec::new();
         let mut matched = vec![false; RAW_EXCEPTIONS.len()];
 
-        let mut files: Vec<_> = std::fs::read_dir(src_dir())
-            .expect("cli/src must be readable")
-            .map(|e| e.expect("cli/src entry must be readable").path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        let mut files = Vec::new();
+        rs_files(src_dir(), &mut files);
         files.sort();
         assert!(!files.is_empty(), "found no .rs files in {:?}", src_dir());
 
         for path in &files {
             let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("source file names are UTF-8");
+                .strip_prefix(src_dir())
+                .expect("rs_files only yields paths under src/")
+                .to_str()
+                .expect("source file names are UTF-8")
+                .replace(std::path::MAIN_SEPARATOR, "/");
             if name == THE_DOOR {
                 continue;
             }
             let text = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+            // A marker comment claims the next line of code, so that the reason
+            // travels with the site instead of living only in a table far away.
+            let mut claimed: Option<&str> = None;
             for (i, line) in text.lines().enumerate() {
-                if !line.contains("std::env::var") || is_comment(line) {
+                if line.trim().is_empty() {
                     continue;
                 }
-                let trimmed = line.trim();
-                match RAW_EXCEPTIONS
-                    .iter()
-                    .position(|x| x.file == name && x.line == trimmed)
-                {
+                if is_comment(line) {
+                    if let Some((_, tag)) = line.split_once(MARKER) {
+                        claimed = Some(tag.trim());
+                    }
+                    continue;
+                }
+                let tag = claimed.take();
+                let Some(what) = violation(line) else {
+                    continue;
+                };
+                match tag.and_then(|t| {
+                    RAW_EXCEPTIONS
+                        .iter()
+                        .position(|x| x.file == name && x.tag == t)
+                }) {
                     Some(idx) => matched[idx] = true,
-                    None => offenders.push(format!("{}:{}: {trimmed}", name, i + 1)),
+                    None => offenders.push(format!("{}:{}: {what}: {}", name, i + 1, line.trim())),
                 }
             }
         }
 
         assert!(
             offenders.is_empty(),
-            "{} environment read(s) bypass crate::env. A raw std::env::var* cannot be \
-             redirected by a test's overlay, so it still resolves the process-global \
-             environment and still races. Route each through crate::env::var / \
-             crate::env::var_os, or — if it genuinely must stay raw — add it to \
-             RAW_EXCEPTIONS in cli/src/env.rs with the reason:\n  {}",
+            "{} site(s) reach the process environment around crate::env. A raw read \
+             cannot be redirected by a test's overlay, so it still resolves the \
+             process-global environment and still races. Route each through \
+             crate::env::var / crate::env::var_os, or — if it genuinely must stay raw — \
+             mark it with a `// {MARKER} <tag>` comment on the line above and declare \
+             that tag in RAW_EXCEPTIONS in cli/src/env.rs with the reason:\n  {}",
             offenders.len(),
             offenders.join("\n  "),
         );
@@ -161,10 +223,11 @@ mod tests {
         for (i, ok) in matched.iter().enumerate() {
             assert!(
                 ok,
-                "RAW_EXCEPTIONS[{i}] no longer matches any source line ({}: {}). The site \
-                 moved or went away; delete the exception rather than leaving a standing \
-                 permission nobody is using. It was granted because: {}",
-                RAW_EXCEPTIONS[i].file, RAW_EXCEPTIONS[i].line, RAW_EXCEPTIONS[i].why,
+                "RAW_EXCEPTIONS[{i}] matches no marked site ({}, tag {}). The site moved, \
+                 lost its `{MARKER}` comment, or went away; delete the exception rather \
+                 than leaving a standing permission nobody is using. It was granted \
+                 because: {}",
+                RAW_EXCEPTIONS[i].file, RAW_EXCEPTIONS[i].tag, RAW_EXCEPTIONS[i].why,
             );
         }
     }
