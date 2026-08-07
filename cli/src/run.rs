@@ -861,11 +861,78 @@ fn legacy_agent() -> Option<String> {
 ///
 /// Home of the global always-on-server discovery files (`server.addr`,
 /// `server.pid`) and the `runs/` directory. [`run_dir`] resolves under it.
+///
+/// This is the ONLY place the data root is resolved. `drovr list` used to carry
+/// its own inline copy of the `XDG_DATA_HOME`-or-`$HOME` expression; two copies
+/// of this is how one of them gets a guard and the other keeps deleting things.
+///
+/// # Fail-closed under `cfg(test)`
+///
+/// Under test this refuses to resolve anywhere inside `$HOME` and panics
+/// instead — see [`refuse_home_data_root`]. Behaviour outside `cfg(test)` is
+/// unchanged: the real CLI resolves the real data root, which is the point of
+/// it.
 pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
+    #[cfg(test)]
+    refuse_home_data_root(&base);
     base.join("drovr")
+}
+
+/// Panic if a test just resolved the data root inside the user's home
+/// directory.
+///
+/// `cargo test` destroyed the real `~/.local/share/drovr` twice, taking ~65
+/// runs across four agents with it. The mechanism was not one bad test: tests
+/// redirect `XDG_DATA_HOME` by mutating it PROCESS-GLOBALLY under `ENV_LOCK`,
+/// and the only thing tying a test to that lock was a doc comment. A test that
+/// read the variable outside the lock — or simply ran before any test had set
+/// it, with the developer's own `XDG_DATA_HOME=$HOME/.local/share` still in the
+/// environment — resolved the LIVE root and *silently succeeded*. The silent
+/// success is the bug. This makes that case stop.
+///
+/// The rule is one comparison, deliberately: **the resolved base must not lie
+/// inside `$HOME`**. Not "does this look like a real path" — there is no
+/// guessing here, and there is no second heuristic backstop next to it. A test
+/// data root belongs in a temp dir; anything under the user's home is a test
+/// that got it wrong, whether it arrived via the `$HOME/.local/share` fallback
+/// or an `XDG_DATA_HOME` aimed straight at the live root.
+///
+/// Both sides are canonicalised where they exist, so a symlinked `$HOME` (or a
+/// `..`-laden `XDG_DATA_HOME`) does not walk around the check.
+///
+/// # Where this guard is weaker than it looks
+///
+/// * It is `cfg(test)` only, so it covers the unit tests compiled into the
+///   `drovr` bin. The integration tests under `cli/tests/` drive the *built
+///   binary*, which is compiled WITHOUT `cfg(test)` and therefore unguarded;
+///   they must keep pinning `XDG_DATA_HOME` on the child themselves.
+/// * A path that reaches `$HOME` only through a symlink whose own parent does
+///   not exist yet cannot be canonicalised, so it is compared literally.
+/// * `$HOME` unset leaves nothing to protect and the check passes.
+#[cfg(test)]
+fn refuse_home_data_root(base: &std::path::Path) {
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return,
+    };
+    let real_home = fs::canonicalize(&home).unwrap_or(home);
+    let real_base = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    if real_base.starts_with(&real_home) {
+        panic!(
+            "drovr test guard: data_dir() resolved to {}/drovr, inside the real home \
+             directory {} — this is the LIVE drovr data root, and a test writing there \
+             is how ~/.local/share/drovr got destroyed. XDG_DATA_HOME was {:?}. Set it \
+             to a temp dir (holding ENV_LOCK) before anything that calls \
+             data_dir()/run_dir()/runs_dir(), or pass an explicit root to the *_in() \
+             variant.",
+            real_base.display(),
+            real_home.display(),
+            std::env::var("XDG_DATA_HOME").ok(),
+        );
+    }
 }
 
 pub fn run_dir(name: &str) -> PathBuf {
@@ -1881,6 +1948,73 @@ mod tests {
             PathBuf::from("/tmp/drovr-xdg-test/drovr/runs/demo")
         );
         assert_eq!(data_dir(), PathBuf::from("/tmp/drovr-xdg-test/drovr"));
+    }
+
+    /// `data_dir()` must never resolve inside the real home directory while the
+    /// test suite is running.
+    ///
+    /// It did, twice, and took the run directories of ~65 runs with it. The
+    /// failure mode was SILENT SUCCESS: a test that lost the process-global
+    /// `XDG_DATA_HOME` race resolved the LIVE data root and carried on writing
+    /// — and deleting — there, passing all the while. Nothing about the old
+    /// code could tell the two apart, so the guard has to be the thing that
+    /// stops, not a convention.
+    ///
+    /// Both ways in are covered, because only one of them is the documented
+    /// one:
+    ///   1. `XDG_DATA_HOME` unset → the `$HOME/.local/share` fallback.
+    ///   2. `XDG_DATA_HOME` SET to the live root — which is exactly what a
+    ///      developer's shell exports, so this is the case that actually fired.
+    /// A scratch root outside `$HOME` must still resolve normally; a guard that
+    /// refused everything would just be a broken suite.
+    #[test]
+    fn data_dir_refuses_to_resolve_inside_the_real_home() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+
+        // (1) Unset: the `$HOME/.local/share` fallback.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        let fallback = std::panic::catch_unwind(data_dir);
+
+        // (2) Set, but aimed straight at the live root.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        let live = std::panic::catch_unwind(data_dir);
+
+        // (3) A scratch root outside `$HOME` still resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+        let scratch = std::panic::catch_unwind(data_dir);
+
+        // Restore before asserting: a failed assertion must not leak a
+        // home-pointing `XDG_DATA_HOME` into whatever runs next.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        assert!(
+            fallback.is_err(),
+            "data_dir() silently resolved the LIVE data root through the \
+             $HOME/.local/share fallback: {fallback:?}"
+        );
+        assert!(
+            live.is_err(),
+            "data_dir() silently resolved the LIVE data root from an \
+             XDG_DATA_HOME pointing at it: {live:?}"
+        );
+        assert_eq!(
+            scratch.expect("a scratch root outside $HOME must still resolve"),
+            tmp.path().join("drovr")
+        );
     }
 
     #[test]

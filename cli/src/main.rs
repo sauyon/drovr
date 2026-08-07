@@ -441,10 +441,10 @@ fn format_progress(run: &RunState) -> String {
 // ---------------------------------------------------------------------------
 
 fn cmd_list<H: Herdr>(h: &H) {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
-    let runs_dir = base.join("drovr").join("runs");
+    // Resolved through `run::runs_dir()`, never inline: this used to carry its
+    // own copy of the `XDG_DATA_HOME`-or-`$HOME/.local/share` expression, which
+    // meant the test-time guard on `run::data_dir()` did not cover this path.
+    let runs_dir = run::runs_dir();
 
     let entries = match std::fs::read_dir(&runs_dir) {
         Ok(e) => e,
