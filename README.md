@@ -531,6 +531,13 @@ cargo test              # unit + integration + e2e
 cargo test --test e2e   # e2e smoke only
 ```
 
+**This repo forces `XDG_DATA_HOME`.** `.cargo/config.toml` at the repo root points it at
+`<repo>/target/cargo-xdg-data` for every process cargo launches — test binaries, and the
+`drovr` children `cli/tests/*` exec — so no test run can reach your real
+`~/.local/share/drovr`. The cost: `cargo run -- <anything>` from this repo also sees that
+empty scratch root rather than your live runs. Use an installed `drovr` for real work. Note
+the scratch root sits beside `cli/target`, so `cargo clean` does not sweep it.
+
 The e2e test requires `herdr`, `claude`, and the herdr claude integration hook.
 It creates an isolated run in a temp directory and removes it on completion. If
 prerequisites are absent it prints a skip message and exits cleanly.

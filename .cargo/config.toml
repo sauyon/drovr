@@ -1,0 +1,11 @@
+# Every process cargo launches from this repo — build scripts, test binaries, and the
+# children those spawn — gets a scratch XDG_DATA_HOME under the repo. `cli/tests/*` exec the
+# BUILT binary, compiled without cfg(test), so the in-process capability
+# (cli/src/test_env.rs) provably cannot reach them; this covers that disjoint path.
+# Cost: `cargo run -- <anything>` from this repo sees an empty data root, not your real one.
+#
+# `relative = true` resolves against the parent of this `.cargo` directory, so the value is
+# <repo>/target/cargo-xdg-data while cargo builds into <repo>/cli/target. `cargo clean` (run
+# from cli/) therefore does NOT sweep it; `.gitignore`'s bare `target/` does ignore it.
+[env]
+XDG_DATA_HOME = { value = "target/cargo-xdg-data", relative = true, force = true }
