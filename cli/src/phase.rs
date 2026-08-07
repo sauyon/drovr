@@ -4710,6 +4710,11 @@ mod tests {
     use crate::run::{Phase, PhaseStatus, RunState};
     use crate::test_env::TestEnv;
 
+    /// A distinctive stand-in for a real `ANTHROPIC_API_KEY`, so the "no secret
+    /// on the command line" assertions can look for a VALUE that is actually
+    /// present rather than for a variable name no production path ever emits.
+    const SECRET_SENTINEL: &str = "sk-ant-DO-NOT-INLINE-ME-a7f3c19b";
+
     /// Only the fixtures that WRITE the environment take `&TestEnv`.
     ///
     /// The parameter is not decorative, and it is not merely the old "Caller must
@@ -7962,7 +7967,14 @@ mod tests {
         // The explicit unsets keep that dependency visible rather than implicit.
         // (CLAUDE_CONFIG_DIR, when set, IS inlined — see the dedicated test below.)
         env.unset("CLAUDE_CONFIG_DIR");
-        env.unset("ANTHROPIC_API_KEY");
+        // A real-shaped secret, PRESENT in the environment rather than absent.
+        // Asserting only that the string "ANTHROPIC_API_KEY" is missing from the
+        // command proves nothing: no production path emits that name, so the
+        // assertion passes however `launch_in_pane` behaves. Seeding a value and
+        // looking for the VALUE is what discriminates — and it is safe to seed
+        // only because the overlay is thread-scoped, where writing a secret into
+        // the process environment would have leaked it into every concurrent test.
+        env.set("ANTHROPIC_API_KEY", SECRET_SENTINEL);
         let h = FakeHerdr::new();
         let mut run = make_run(&env, "start-test");
 
@@ -7976,7 +7988,7 @@ mod tests {
         );
         // Auth secrets must never be inlined into the launch command.
         assert!(
-            !run_call.contains("ANTHROPIC_API_KEY"),
+            !run_call.contains(SECRET_SENTINEL) && !run_call.contains("ANTHROPIC_API_KEY"),
             "no secret in command: {run_call}"
         );
         assert!(
@@ -7994,7 +8006,10 @@ mod tests {
     fn phase_start_inlines_claude_config_dir_when_set() {
         let env = TestEnv::new();
         env.set("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
-        env.unset("ANTHROPIC_API_KEY");
+        // Present, not absent — see `phase_start_sets_drovr_phase`. The point of
+        // this pair is that the path IS inlined and the secret beside it is NOT,
+        // which only means something if the secret is there to be leaked.
+        env.set("ANTHROPIC_API_KEY", SECRET_SENTINEL);
         let h = FakeHerdr::new();
         let mut run = make_run(&env, "cfg-dir-test");
 
@@ -8013,9 +8028,10 @@ mod tests {
             ) && run_call.contains(r"DROVR_PHASE='cfg-dir-test/brainstorm'"),
             "CLAUDE_CONFIG_DIR must be inlined single-quoted alongside DROVR_PHASE: {run_call}"
         );
-        // A real secret still never rides the command line.
+        // A real secret still never rides the command line, even beside a value
+        // that legitimately does.
         assert!(
-            !run_call.contains("ANTHROPIC_API_KEY"),
+            !run_call.contains(SECRET_SENTINEL) && !run_call.contains("ANTHROPIC_API_KEY"),
             "no secret in command: {run_call}"
         );
     }

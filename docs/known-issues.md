@@ -1,10 +1,13 @@
 # Known issues
 
-## Two test binaries on one machine fight over the fixed `/tmp/drovr-*-test-*` scratch roots (2026-08-06)
+## `acquire_run_lock` WouldBlock on a fixed `/tmp/drovr-*-test-*` root reds ~30-210 tests, cause NOT fully identified (2026-08-06)
 
 **Severity:** high while several worktrees are live — it reds an arbitrary ~30 to ~210 tests in a
 run that has nothing wrong with it, and the first-reported failure is never the cause.
 **Found:** run `enforce-env-lock`, task 6, while measuring `cargo test` stability.
+**Status:** one contributing cause confirmed and reproducible on demand (below). It is **not the
+whole story** — see *"The part that does not fit"*. Do not close this on the two-binary explanation
+alone.
 
 ### Symptom
 
@@ -18,9 +21,11 @@ called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error:
 ```
 
 Only one test in the binary uses the run name `rh-profile`, and it holds `ENV_LOCK`, so the
-contending `flock` holder cannot be another test in the same process.
+contending `flock` holder cannot be another test in the same process. Instrumenting
+`acquire_run_lock` to walk `/proc/self/fd` at the moment of failure confirms this directly: the
+only fd open on that path is the one `acquire_run_lock` just opened itself.
 
-### Root cause
+### One confirmed contributing cause
 
 The test fixtures that predate `TestEnv` point `XDG_DATA_HOME` at a *fixed, machine-global* path
 derived from the run name — `phase::rehydrate_tests::rehydrate_run` uses
@@ -42,6 +47,28 @@ $B > a.txt 2>&1 & $B > b.txt 2>&1 & wait
 One side comes back with ~200 failures and ~200 `PoisonError`s. Confirmed at `25fab8f` (before any
 task-6 edit) and at task 6's head — it is not caused by either.
 
+### The part that does not fit — READ BEFORE CLOSING THIS
+
+The same failure occurred **once inside `nix build`'s `checkPhase`**, and that sandbox rules the
+above explanation out for that occurrence:
+
+- `nix config show` reports `sandbox = true`, and a probe derivation (`ls /tmp`) confirms the
+  sandbox's `/tmp` is **empty** — it cannot see the host's 1000+ `/tmp/drovr-*` directories, so no
+  other worktree's binary can be the holder.
+- `cargo test` runs the eight test binaries sequentially, and `--bin drovr` — the one that failed —
+  runs first, so no sibling test binary is alive either.
+- The `/proc/self/fd` walk says no other fd in the process holds the file.
+
+So something can make `File::try_lock` return `WouldBlock` with, apparently, no holder. Candidates
+not yet ruled out: a `drovr` child process left alive by an earlier phase; `flock` semantics under
+the sandbox's overlay/tmpfs mount; or a genuine second in-process acquisition on a path this
+instrumentation did not catch. **Unresolved.**
+
+Frequency, measured with forced rebuilds (`nix build --no-link --rebuild`, interleaved to control
+for machine load): **0 failures in 5 rebuilds at task 6's head and 0 in 5 at `25fab8f`.** One
+observed failure outside that sample, on a heavily loaded machine. Rare, and no worse at task 6's
+head than at the base.
+
 ### Consequence for measurement
 
 **Do not conclude a change made the suite flaky by comparing run counts across time.** With eight
@@ -50,7 +77,7 @@ under test. An unpaired batch of runs at `25fab8f` came back 0/9 clean while tas
 6/14 cascaded, purely because the windows differed; the two-binary experiment above shows both
 commits fail identically.
 
-### Fix
+### Fix — for the confirmed cause; verify it is enough
 
 Give every test its own scratch root. `cli/src/test_env.rs`'s `TestEnv` does exactly this (a
 `tempfile::TempDir` per test), so a module is immune once its fixtures take `&TestEnv` —
