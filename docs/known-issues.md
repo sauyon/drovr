@@ -1305,7 +1305,7 @@ Read it carefully, because it constrains any fix:
 124-line briefing:
 
 1. The first `drovr phase send` landed **nothing at all** — composer empty at `$0.00`. That is
-   the readiness race described under "`drovr code-review run` panel never completes" reaching
+   the readiness race described under "The code-review panel's stalls" reaching
    the `phase send` CLI path, not just the reviewer-spawn path: success reported, payload
    dropped.
 2. A second, identical send landed as a collapsed paste: `❯ [Pasted text #1 +124 lines]`,
@@ -3551,8 +3551,8 @@ cannot help, because each one mints another cold pane that fails identically).
 **Caveat — verify before acting on this:** observed on a **nix build of 0.2.0** that predates
 `da99190` and the `drovr/opencode-agent` merges. The newer opencode work may already address it.
 
-This is the sequel to *"`drovr code-review run` panel never completes (reviewer panes don't
-attach)"* above. That entry's readiness gate fix (`c12adb0`, `wait_agent_ready` inside
+This is the sequel to *"The code-review panel's stalls — what is fixed, and the unsubmitted seed
+that is not"* above. That entry's readiness gate fix (`c12adb0`, `wait_agent_ready` inside
 `phase::phase_send`, which `code_review.rs` calls after `spawn_reviewer`) is what made the
 "agent target not found" symptom go away. **For opencode the gate passes and the seed still
 does not land** — so `agent_status` is not sufficient evidence that this TUI will accept input.
