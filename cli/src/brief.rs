@@ -587,16 +587,22 @@ mod tests {
     /// Crude on purpose: the templates are prose, and the only thing this has to
     /// separate is "angle-bracket token" from "not one".
     ///
-    /// **Scanned per line**, which is the whole of its robustness. A token never
-    /// spans a newline, while a stray `<` — a less-than in prose, say — does meet
-    /// a Markdown block-quote `>` two lines down. Scanning the body whole, that
-    /// stray would swallow everything between the two and resume after the `>`,
-    /// silently dropping every real token in between: the guard would keep
-    /// passing over a corpus it had quietly stopped checking. Per line, a stray
-    /// `<` costs at most the rest of its own line.
+    /// Two rules, and both exist because a stray `<` — a less-than in prose, a
+    /// `Vec<T`, a shell redirect — otherwise **swallows real tokens silently**,
+    /// leaving the caller's derived corpus quietly smaller than it looks. A guard
+    /// that checks fewer things without failing is the exact defect this whole
+    /// area keeps producing.
     ///
-    /// Slicing is at `<` and `>`, both ASCII, so the byte offsets `find` returns
-    /// are always char boundaries however much non-ASCII prose surrounds them.
+    /// 1. **Per line.** A token never spans a newline, while a stray `<` does
+    ///    meet a Markdown block-quote `>` two lines down.
+    /// 2. **Innermost pairing.** A `<` inside the candidate means the outer one
+    ///    was the stray, so re-anchor on the last one and check the real token
+    ///    instead of a garbled span containing it. Without this,
+    ///    `<a> x < y <b>` yields `<a>` and `< y <b>` — and `<b>` is never checked.
+    ///
+    /// Slicing is at `<` and `>`, both ASCII, so the byte offsets `find`/`rfind`
+    /// return are always char boundaries however much non-ASCII prose surrounds
+    /// them. Every branch advances `rest` by at least one byte, so it terminates.
     fn angle_tokens(body: &str) -> Vec<&str> {
         let mut out = Vec::new();
         for line in body.lines() {
@@ -604,11 +610,45 @@ mod tests {
             while let Some(open) = rest.find('<') {
                 let Some(len) = rest[open..].find('>') else { break };
                 let end = open + len + 1;
-                out.push(&rest[open..end]);
-                rest = &rest[end..];
+                let token = &rest[open..end];
+                match token[1..].rfind('<') {
+                    Some(inner) => rest = &rest[open + 1 + inner..],
+                    None => {
+                        out.push(token);
+                        rest = &rest[end..];
+                    }
+                }
             }
         }
         out
+    }
+
+    /// [`angle_tokens`] against the two shapes that make it lie rather than fail:
+    /// a stray `<` before a real token, and one that never closes.
+    ///
+    /// Direct, because the guard that uses it cannot see this. A swallowed token
+    /// leaves the derived corpus non-empty and every surviving token still
+    /// present, so `composition_leaves_non_placeholder_angle_brackets_alone`
+    /// stays green while checking less than it claims.
+    #[test]
+    fn angle_tokens_are_not_swallowed_by_a_stray_bracket() {
+        assert_eq!(
+            angle_tokens("<first> ok. Then a stray x < y with no close. <second> lost?"),
+            vec!["<first>", "<second>"],
+            "a stray `<` paired with a later token's `>` and ate the token between them"
+        );
+        assert_eq!(
+            angle_tokens("count < limit, and <kept> after it"),
+            vec!["<kept>"]
+        );
+        // Unclosed on its own line stops THAT line, not the scan.
+        assert_eq!(
+            angle_tokens("a < b\n<still-seen>\n"),
+            vec!["<still-seen>"],
+            "an unmatched `<` must not abandon the rest of the document"
+        );
+        // A quote marker two lines down is not a closer.
+        assert_eq!(angle_tokens("x < y\n> quoted\n"), Vec::<&str>::new());
     }
 
     /// Substitution is an allowlist, never "replace anything in angle brackets".

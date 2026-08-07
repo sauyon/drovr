@@ -47,26 +47,34 @@ reviewer. You are NOT implementing anything.
    question for the human.** Go and read it; spend the human's attention on what only they
    know.
 3. **Work out the approach by interviewing the human.** This is the phase's real work, and it
-   happens *before* `spec.md` exists — not at the gate, and not in your own head. Walk the
-   design tree branch by branch through the ask channel in step 1, resolving intent,
-   constraints, alternatives and the boundary of what is in scope. How to ask:
+   happens *before* `spec.md` exists. Walk the design tree branch by branch through the ask
+   channel in step 1, resolving intent, constraints, alternatives and the boundary of what is
+   in scope. How to ask:
 
-   - **One decision per ask, in dependency order.** A question whose answer changes what you
-     would ask next waits for that answer — that ordering is the whole point of interviewing
-     rather than sending a questionnaire. Genuinely independent questions can go out together;
-     the review page shows the human one pending question at a time with a `1 of N` counter,
-     so a batch is a queue they have to grind through, not a form they fill in at a glance.
-   - **Every ask carries your recommendation.** `--option <value>=<label>` with
-     `--recommend <value>` for a closed choice; for an open one, say what you propose and why
-     in the question itself. "What should we do here?" hands the design back to the human.
-     "I propose X because Y — or Z if you would rather trade A for B" is a decision they can
-     make in one click.
+   - **One question at a time, in dependency order.** Default to a single outstanding ask. A
+     question whose answer changes what you would ask next *waits* for that answer — that
+     ordering is the whole point of interviewing rather than sending a questionnaire.
+     Genuinely independent questions may go out together, but keep the batch small: the review
+     page shows one pending question at a time behind a `1 of N` counter, so five at once is a
+     queue to grind through, not a form to fill in at a glance.
+   - **Offer the real alternatives, and recommend one.** Where there is a genuine choice, put
+     2–3 approaches on the ask with what each one costs — `--option <value>=<label>` per
+     approach, `--recommend <value>` for yours. One option is not a choice; it collects assent
+     to a decision you already made. Where there is no closed set, say what you propose and
+     why in the question itself. "What should we do here?" hands the design back to the human.
+     "X, because Y — or Z if you would rather trade A for B" is a decision they can make in
+     one click.
    - **Every ask stands alone.** The human answers in a browser, with no chat transcript and
      no memory of what you just read. Put what is needed to decide into `--context <text>` or
      `--context-file <path>`: what the code actually does today, the alternatives you weighed,
      what each one costs.
-   - **Stop when the design is decided, not when you run out of questions.** If you could not
-     write down the spec's interfaces without guessing at one, you are still interviewing.
+   - **Stop when the design is decided, not when you run out of questions — and not before
+     that.** Under-interviewing is the failure to expect: it feels like progress, and it is
+     where the guesses come from. The test is concrete — if you could not write down the
+     spec's interfaces without guessing at one of them, you are still interviewing. Asking
+     less than a chat-based grilling would is not a licence to ask less than that; it is why
+     step 2 comes first, so that the questions you do spend are the ones only the human can
+     answer.
 
    `~/.local/share/drovr/runs/<run>/interview.jsonl` is the append-only record of everything
    asked and answered. It is where the alternatives and the reasoning live — which is what
