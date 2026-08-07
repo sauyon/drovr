@@ -45,11 +45,14 @@ reviewer. You are NOT implementing anything.
    read-only explorers (explore-mcp) for fan-out investigation — do not spawn parallel
    writers, and do not edit code in this phase.
 3. **Work out the approach.** Surface the real intent, constraints, alternatives, and a
-   recommended design; resolve ambiguity before writing the spec. Your channel to the human
-   is the review gate below (the reviewer responds via `feedback.json`; they may also
-   `drovr attach` to the pane) — not a private chat. Converge the design through that gate.
+   recommended design; resolve ambiguity before writing the spec. You have **two** channels to
+   the human and neither is a private chat: the **ask channel** in step 1, for the decisions on
+   the way to the spec, and the review gate below (the reviewer responds via `feedback.json`;
+   they may also `drovr attach` to the pane), for the finished spec. Ask through the first;
+   converge the design through the second.
 4. **Write the spec** to `~/.local/share/drovr/runs/<run>/spec.md` — a concrete, reviewable
-   design: problem, approach, interfaces/contracts, scope boundaries, open questions.
+   design: problem, approach, interfaces/contracts, scope boundaries. **A spec never carries
+   open questions**: resolve them through the ask channel *before* the spec reaches the gate.
 
 ## The review gate — the discipline that matters
 

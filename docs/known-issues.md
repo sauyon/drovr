@@ -753,8 +753,10 @@ that use and the acceptance gate, so a clean author-run verdict was read as perm
 done — and `drovr code-review run` offers no signal to tell the two uses apart.
 
 `skills/pipeline/SKILL.md` said the driver runs the panel; it never said an author-run panel is
-*not* the gate. `phase-prompts/implement-task.md` step 5 told the task agent to self-review with
-`drovr:code-review`, which reads as licence to substitute the panel for the decision.
+*not* the gate. `phase-prompts/implement-task.md`'s *"Self-review before reporting done"* step told
+the task agent to self-review with `drovr:code-review`, which reads as licence to substitute the
+panel for the decision. (Named by title, not by number: that file's steps renumber whenever one is
+inserted, and a stale number sends a reader to the wrong step with no sign anything is wrong.)
 
 Two nearby effects worth knowing:
 
