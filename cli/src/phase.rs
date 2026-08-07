@@ -9265,9 +9265,10 @@ mod capture_tests {
     /// What that trades away, stated so the next author does not have to find it:
     /// two calls in ONE test now share a root, where the old per-call redirect
     /// gave each its own. Calling this twice with the SAME `name` therefore
-    /// inherits the first run's `state.json` instead of a scrubbed directory.
-    /// Every caller here passes distinct names; give a second call a distinct
-    /// name too, rather than reintroducing a scrub.
+    /// inherits the first run's whole directory instead of a scrubbed one — its
+    /// `state.json`, its `{phase}-HANDOFF.md`, its run lock. Every caller here
+    /// passes distinct names; give a second call a distinct name too, rather
+    /// than reintroducing a scrub.
     fn capture_run(env: &TestEnv, name: &str) -> RunState {
         // A token or profile left behind by an earlier call under the same
         // environment would silently change what the code under test sees.
