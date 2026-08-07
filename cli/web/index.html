@@ -527,6 +527,71 @@
     letter-spacing: .03em;
   }
 
+  /* ---- The interview (the agent's live ask channel) ---- */
+  /* The accent edge is what separates this from the questions panel below it: an
+     agent is BLOCKED on this one, waiting in `drovr ask wait`. */
+  .interview-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+  .interview-panel .panel-title { margin-bottom: 12px; }
+  .interview-count {
+    margin-left: 8px;
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 0.78rem;
+  }
+  .interview-question {
+    font-size: 0.92rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text);
+  }
+  .interview-context {
+    font-size: 0.86rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+  }
+  .interview-recommend {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .interview-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .interview-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.88rem;
+  }
+  .interview-row label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    cursor: pointer;
+  }
+  .interview-row-other input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.86rem;
+  }
+  .interview-row-submit { margin-top: 6px; }
+
   /* ---- Form / controls ---- */
   .form-section { margin-top: 24px; }
 
@@ -978,6 +1043,15 @@
     <strong>Agent change summary</strong>
     <span id="summary-text"></span>
   </div>
+
+  <!-- The interview: the agent's live ask channel (`drovr ask`), populated
+       dynamically and polled on its own 2s timer. Above the open questions and
+       everything else because an agent is BLOCKED in `drovr ask wait` on it —
+       nothing else on this page is holding a run up right now. It renders
+       independently of the review gate: a question can arrive at any point in a
+       run's life, including on a run whose spec is already approved and whose
+       gate will never move again. -->
+  <div id="interview-area"></div>
 
   <!-- Open questions (multiple choice) — populated dynamically. Sits at the TOP
        of the page, above the spec and the session mirror: the agent is blocked on
@@ -2056,6 +2130,259 @@ function blankCustomAnswer() {
   return null;
 }
 
+// ---- The interview (the agent's live ask channel) ----
+// The agent posts a question with `drovr ask` and blocks in `drovr ask wait`;
+// this panel is the human's side of that channel. Two things separate it from the
+// questions panel above:
+//
+//  * it is NOT gated on the review state. A question arrives whenever the agent
+//    has one — mid-plan, mid-implement, on a run whose spec was approved turns ago
+//    and whose gate will never move again — so it polls on its own timer instead
+//    of rendering out of refresh()'s state branches. Only `cancelled` mutes it.
+//  * it answers ONE ask at a time, straight to the server (`POST answer`), rather
+//    than collecting answers for the decision form at the bottom of the page. The
+//    agent is waiting on this one answer; there is nothing to batch it with.
+var currentInterview = [];   // the whole folded array from GET interview
+var currentAsk = null;       // the oldest entry still unanswered, or null
+// The ask id the CURRENT DOM was built from. See renderInterview: this panel
+// holds the controls the human is USING and is repainted by a 2s poll, so what
+// gets rebuilt has to be decided, not assumed.
+var renderedAskId = null;
+var answerInFlight = false;  // true between the POST and its response
+var interviewMuted = false;  // true only while the run is `cancelled`
+var interviewTimer = null;
+// Whether the LAST poll failed, so a recovery can clear the message it left
+// behind without also wiping a submit error the human has not read yet.
+var interviewPollFailed = false;
+
+// `read` returns seq order, so the first unanswered entry is the oldest one. The
+// server always sends `answer: null` when there is none; `undefined` is tolerated
+// so a hand-built array (a test, a scripted render) folds the same way.
+function pendingAsks(asks) {
+  return (asks || []).filter(function(a) {
+    return a && (a.answer === null || a.answer === undefined);
+  });
+}
+
+function renderInterview(asks) {
+  // Mid-POST the rows are disabled and submitAnswer's own re-render is already
+  // on its way. Repainting here re-enables the button underneath an in-flight
+  // request, which is a double-submit window.
+  if (answerInFlight) return;
+
+  currentInterview = asks || [];
+  var area = document.getElementById('interview-area');
+  var pending = pendingAsks(currentInterview);
+  var ask = interviewMuted ? null : (pending[0] || null);
+  currentAsk = ask;
+  if (!ask) { area.innerHTML = ''; renderedAskId = null; applyNavCursor(false); return; }
+
+  var countText = '1 of ' + pending.length;
+
+  // ⚠ The rows are what the human is TYPING INTO and PICKING FROM, and this runs
+  // every 2s. A rebuild on every tick wipes the characters going into
+  // #interview-text (a multi-word answer takes longer than 2s) and — worse,
+  // because it is silent — reverts a hand-picked radio to the `recommend`
+  // preselection: the human picks `memory`, does not notice the flicker, clicks
+  // Answer, and `redis` is appended to the log with no error anywhere.
+  //
+  // So the rows are rebuilt only when the ASK changes; an unchanged ask updates
+  // the count and nothing else. This is the same split pollPane makes one panel
+  // down — the poll owns the read-only #session-view and never touches the
+  // sibling #session-text the human types into.
+  if (ask.id === renderedAskId) {
+    var countEl = area.querySelector('.interview-count');
+    if (countEl) countEl.textContent = countText;
+    applyNavCursor(false);
+    return;
+  }
+
+  var opts = ask.options || [];
+  // A `recommend` naming an offered option preselects it. One that names nothing
+  // offered (the free-text case) is a suggestion, not a pick: show it, but leave
+  // every radio unchecked and never prefill the text box — an untouched question
+  // must read as unanswered, the same rule the questions panel's Other follows.
+  var recIsOption = false;
+  opts.forEach(function(o) { if (ask.recommend && o.value === ask.recommend) recIsOption = true; });
+
+  var html = '<div class="interview-panel">';
+  html += '<div class="panel-title">Question from the agent' +
+          '<span class="interview-count">' + countText + '</span></div>';
+  html += '<div class="interview-question">' + escHtml(ask.question) + '</div>';
+  if (ask.context) html += '<div class="interview-context">' + escHtml(ask.context) + '</div>';
+  if (ask.recommend && !recIsOption) {
+    html += '<div class="interview-recommend">recommended: ' + escHtml(ask.recommend) + '</div>';
+  }
+  html += '<div class="interview-rows">';
+  opts.forEach(function(o, i) {
+    var inputId = 'iv_opt_' + i;
+    var isRec = recIsOption && o.value === ask.recommend;
+    html += '<div class="interview-row" data-value="' + escHtml(o.value) + '">';
+    html += '<input type="radio" id="' + inputId + '" name="iv_answer" value="' +
+            escHtml(o.value) + '"' + (isRec ? ' checked' : '') + '>';
+    html += '<label for="' + inputId + '">' + escHtml(o.label);
+    if (isRec) html += ' <span class="rec-badge">recommended</span>';
+    html += '</label></div>';
+  });
+  // Free-text escape hatch, exactly as the questions panel has one: the offered
+  // options are never exhaustive. Typing selects the radio, so the text cannot be
+  // silently ignored. An ask with no options at all is just this row.
+  html += '<div class="interview-row interview-row-other">';
+  html += '<input type="radio" id="iv_other" name="iv_answer" value="' + OTHER_SENTINEL + '">';
+  html += '<label for="iv_other">' + (opts.length ? 'Other' : 'Answer') + '</label>';
+  html += '<input type="text" id="interview-text" aria-label="Custom answer" ' +
+          'placeholder="type your own answer…" ' +
+          'oninput="document.getElementById(\'iv_other\').checked = true">';
+  html += '</div>';
+  html += '<div class="interview-row interview-row-submit">' +
+          '<button class="primary" id="interview-answer-btn" onclick="submitAnswer()">Answer</button></div>';
+  html += '</div>';
+  html += '<div id="interview-error" class="error-msg" style="display:none"></div>';
+  html += '</div>';
+  area.innerHTML = html;
+  renderedAskId = ask.id;
+  applyNavCursor(false);
+}
+
+// `interviewMuted` is deliberately NOT reset here: refresh() sets it and then
+// calls this on the cancelled branch, so clearing it would unmute the run it just
+// muted and the next poll would paint the panel straight back. route() owns the
+// cross-run reset instead.
+function clearInterview() {
+  currentInterview = [];
+  currentAsk = null;
+  renderedAskId = null;
+  answerInFlight = false;
+  document.getElementById('interview-area').innerHTML = '';
+  // As clearQuestions does: this drives renderKeyhint() and announceCursor(null),
+  // so skipping it leaves stale keyboard hints and a stale screen-reader
+  // announcement behind after a cancel or a run switch.
+  applyNavCursor(false);
+}
+
+// A failure with nowhere to show it is invisible, which is the defect this whole
+// panel exists to retire — so when there is no panel on screen to carry the
+// message, give it a container of its own. That container holds no question, so
+// renderedAskId stays null and the next good poll rebuilds over it.
+function showInterviewError(msg) {
+  var el = document.getElementById('interview-error');
+  if (!el) {
+    document.getElementById('interview-area').innerHTML =
+      '<div class="interview-panel"><div id="interview-error" class="error-msg"></div></div>';
+    el = document.getElementById('interview-error');
+  }
+  el.textContent = msg;
+  el.style.display = '';
+}
+
+async function pollInterview(gen) {
+  if (gen !== routeGen) return;
+  try {
+    var r = await fetch(api('interview'));
+    if (gen !== routeGen) return;
+    // The `r.ok` check is NOT the sibling pollers' pattern, and it is load-bearing
+    // here: `fetch` RESOLVES on 500, and this endpoint answers an unreadable log
+    // with an object rather than an array. Letting that reach array-shaped logic
+    // throws before the re-arm below and stops the poll silently and permanently —
+    // strictly worse than the empty list the 500 exists to prevent. Neither
+    // pollAlarms nor pollPane needs this; their endpoints cannot fail structurally.
+    if (!r.ok) {
+      var msg = 'The interview log could not be read.';
+      try {
+        var errBody = await r.json();
+        if (errBody && errBody.error) msg = errBody.error;
+      } catch (e) { /* not JSON; keep the generic message */ }
+      if (gen === routeGen) { interviewPollFailed = true; showInterviewError(msg); }
+    } else {
+      var data = await r.json();
+      if (gen === routeGen) {
+        // Only a recovery clears the message: a submit error the human has not
+        // read yet must survive the next tick.
+        if (interviewPollFailed) {
+          interviewPollFailed = false;
+          var errEl = document.getElementById('interview-error');
+          if (errEl) errEl.style.display = 'none';
+        }
+        renderInterview(data);
+      }
+    }
+  } catch (e) { /* transient; the next tick recovers */ }
+  if (gen === routeGen) interviewTimer = setTimeout(function(){ pollInterview(gen); }, 2000);
+}
+
+async function submitAnswer() {
+  var ask = currentAsk;
+  if (!ask || answerInFlight) return;
+  var area = document.getElementById('interview-area');
+  var errEl = document.getElementById('interview-error');
+  if (errEl) errEl.style.display = 'none';
+
+  var checked = area.querySelector('input[type="radio"]:checked');
+  if (!checked) { showInterviewError('Pick an answer, or type one.'); return; }
+  var text;
+  if (checked.value === OTHER_SENTINEL) {
+    var box = document.getElementById('interview-text');
+    text = box ? box.value.trim() : '';
+    // The server accepts an empty answer — "I have nothing to add" is a decision
+    // the human is entitled to make. What this refuses is the ACCIDENTAL empty
+    // one: Other explicitly chosen with nothing typed.
+    if (!text) {
+      showInterviewError('Type an answer, or pick one of the options.');
+      if (box) box.focus();
+      return;
+    }
+  } else {
+    text = checked.value;
+  }
+
+  var btn = document.getElementById('interview-answer-btn');
+  answerInFlight = true;
+  if (btn) btn.disabled = true;
+  var status = 0, body = null;
+  try {
+    var r = await fetch(api('answer'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: ask.id, answer: text })
+    });
+    status = r.status;
+    try { body = await r.json(); } catch (e) { body = null; }
+  } catch (e) {
+    status = 0;                      // network failure; nothing was recorded
+  } finally {
+    answerInFlight = false;
+  }
+
+  if (status === 200) {
+    // ONE direct fetch, deliberately not pollInterview(): that re-arms its own
+    // timer, so calling it here stacks a second chain on top of the tick already
+    // scheduled — and that scheduled tick is what keeps the panel live afterwards.
+    try {
+      var r2 = await fetch(api('interview'));
+      if (r2.ok) renderInterview(await r2.json());
+    } catch (e) { /* the scheduled tick picks it up */ }
+    return;
+  }
+
+  if (status === 409) {
+    // The run was cancelled, so `drovr ask wait` has already exited 5 and nobody
+    // is listening. Stop offering the answer — and say why, in place of the
+    // question rather than beside a control that no longer does anything.
+    interviewMuted = true;
+    clearInterview();
+    showInterviewError('This run was cancelled — the agent is no longer waiting for an answer.');
+    return;
+  }
+
+  // Never a silently disabled button: a failure the human cannot see is the exact
+  // defect this panel retires. The server's `error` is a fixed string that never
+  // echoes the request, so showing it verbatim is safe.
+  if (btn) btn.disabled = false;
+  showInterviewError((body && body.error)
+    ? body.error
+    : 'The answer could not be sent, and was not recorded. It is still unanswered.');
+}
+
 // ---- State ----
 var pollTimer = null;
 var currentDocText = '';
@@ -2155,6 +2482,17 @@ async function refresh() {
 
   // questions
   renderQuestions(questionsData);
+
+  // The interview, by contrast, is NOT rendered from here — pollInterview owns it,
+  // so a question posted while the human sits on the page appears without any gate
+  // transition. All this branch decides is whether anyone is still listening:
+  // `cancelled` means `drovr ask wait` has exited 5 and the agent is gone, so the
+  // panel is muted. Every other state — idle, ready, waiting, approved — keeps it,
+  // and `waiting`/`approved` are the load-bearing ones: an agent asking mid-phase
+  // is exactly when the gate is not at `ready`. This runs BEFORE the state
+  // branches below, each of which returns.
+  interviewMuted = (state === 'cancelled');
+  if (interviewMuted) clearInterview();
 
   // Any re-render disarms Cancel: a half-armed button must never carry over a
   // state change or a navigation to another run.
@@ -3213,6 +3551,7 @@ async function route() {
   clearTimeout(paneTimer);
   clearTimeout(agentsTimer);
   clearTimeout(alarmsTimer);
+  clearTimeout(interviewTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   // Only a real navigation resets the cursor. route() also re-runs every 2s to
@@ -3235,7 +3574,8 @@ async function route() {
   if (!currentRun) {
     // Session list landing view.
     DETAIL_PANELS.forEach(hideEl);
-    clearQuestions();           // dynamic container, not in DETAIL_PANELS
+    clearQuestions();           // dynamic containers, not in DETAIL_PANELS
+    clearInterview();
     hideEl('back-link');
     document.getElementById('turn-badge').textContent = '';
     showEl('run-list');
@@ -3248,8 +3588,11 @@ async function route() {
   hideEl('run-list');
   // Drop the previous run's questions immediately: refresh() below re-renders
   // them, but if it throws mid-flight the stale panel would otherwise stay live
-  // and its answers could be submitted against THIS run.
+  // and its answers could be submitted against THIS run. The interview panel is
+  // the same hazard with a sharper edge — its Answer button POSTs straight to
+  // api('answer'), which is already addressing this run.
   clearQuestions();
+  clearInterview();
   showEl('back-link');
   // Everything below is a CROSS-RUN reset, so it is gated on the run actually
   // changing. `#/runs/<run>?task=<t>` is a supported URL (see reviewTask() and the
@@ -3265,6 +3608,12 @@ async function route() {
     hideEl('doc-panel');
     document.getElementById('doc-content').innerHTML = '';
     currentDocText = '';   // keep it in step with the DOM it describes
+    // The mute belongs to the run being left, and nothing else resets it:
+    // clearInterview deliberately does not (refresh() would unmute the run it had
+    // just muted). Carrying it across would hide a live question on the run being
+    // entered until its first refresh() lands. Same-run re-entry — `?task=<t>`,
+    // back/forward — keeps it, which is what makes it stable there.
+    interviewMuted = false;
     // The review panel is fetched by refreshReview() behind two awaits, so on a
     // direct run-to-run jump it would otherwise keep painting the OLD task's
     // findings and diff under the new run's name until those resolve.
@@ -3305,6 +3654,11 @@ async function route() {
   pollAgents(routeGen);
   pollPane(routeGen);
   pollAlarms(routeGen);
+  // Polled like its three siblings and for the same reason: a question posted
+  // while the human sits on the page has to appear on its own. It cannot wait on
+  // a gate transition — on a run whose spec is already approved, the gate may
+  // never move again.
+  pollInterview(routeGen);
   await refresh();
 }
 

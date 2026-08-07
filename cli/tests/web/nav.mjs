@@ -159,6 +159,17 @@ const checkedIn = qi => evaluate(`
   if (!it) return null;
   var r = it.querySelector('input[type="radio"]:checked');
   return r ? r.value : null;`);
+// The interview panel renders ONE pending ask at a time, so these are singular by
+// construction — there is no per-question index to pass.
+const ivQuestion = () => evaluate(`
+  var el = document.querySelector('#interview-area .interview-question');
+  return el ? el.textContent : null;`);
+const ivCount = () => evaluate(`
+  var el = document.querySelector('#interview-area .interview-count');
+  return el ? el.textContent : null;`);
+const ivChecked = () => evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return r ? r.value : null;`);
 const hash = () => evaluate(`return location.hash;`);
 const docText = () => evaluate(`return (document.getElementById('doc-content').textContent || '').trim();`);
 const filterOpen = () => evaluate(`return document.getElementById('nav-filter').style.display !== 'none';`);
@@ -1400,6 +1411,124 @@ check('Escape leaves the text box', await activeId(), 'body');
 check('collectAnswers maps every question to its answer',
   await evaluate(`return collectAnswers();`),
   { cache: 'memory', retry: 'linear backoff' });
+
+console.log('\n== run detail: the interview ==');
+// The agent's live ask channel (`drovr ask` / `ask wait`), which is deliberately
+// NOT tied to the review gate: a question can arrive at any point in a run's life,
+// so this panel polls on its own 2s timer rather than rendering out of refresh().
+await waitFor(ivQuestion, q => !!q, 8000, 'interview panel');
+check('the panel shows the oldest pending question', await ivQuestion(),
+  'Which cache backend should the deploy use?');
+check('the count reads the pending total', await ivCount(), '1 of 3');
+check('the recommended option is preselected', await ivChecked(), 'redis');
+check('the context block renders', await evaluate(`
+  var el = document.querySelector('#interview-area .interview-context');
+  return el ? el.textContent : null;`), 'The rollout runs in three regions.');
+
+// Other checked with an empty box is an explicit half-answer, refused in the
+// browser with no request at all. The SERVER accepts an empty answer — "nothing
+// to add" is a decision the human is entitled to make — so what this blocks is
+// the accidental empty one, not the deliberate one.
+check('Other with an empty box is refused', await evaluate(`
+  document.getElementById('iv_other').checked = true;
+  document.getElementById('interview-text').value = '';
+  submitAnswer();
+  var err = document.getElementById('interview-error');
+  return err.style.display !== 'none' && err.textContent;`),
+  'Type an answer, or pick one of the options.');
+check('...and nothing advanced', await ivQuestion(), 'Which cache backend should the deploy use?');
+check('...and the box it tells you to fill gets the focus', await activeId(), 'interview-text');
+// Hand focus back, as the questions section does: the navigator goes inert while
+// a text box holds it.
+await evaluate(`document.getElementById('interview-text').blur(); return 1;`);
+
+// ⚠ The repaint checks. This panel holds the controls the human is USING and a 2s
+// poll repaints it, so a renderInterview that rebuilds on every tick reverts a
+// hand-picked radio to the `recommend` default — and the human, who did not
+// notice the flicker, then logs an answer they never chose, with no error
+// anywhere. Both of these pass trivially against a rebuild-always version only if
+// the tick happens to miss, which is why they call renderInterview DIRECTLY.
+check('a hand-picked option survives a repaint of the same ask', await evaluate(`
+  document.querySelector('#interview-area input[value="memory"]').checked = true;
+  renderInterview(currentInterview);
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return r ? r.value : null;`), 'memory');
+check('half-typed text survives it too, in the very same node', await evaluate(`
+  var n = document.getElementById('interview-text');
+  n.value = 'half-typed answ';
+  renderInterview(currentInterview);
+  var after = document.getElementById('interview-text');
+  return { same: after === n, value: after.value };`),
+  { same: true, value: 'half-typed answ' });
+
+// End to end, and the point of the two checks above: the HAND-PICKED value is
+// what reaches the log, not the recommended one it would have been reverted to.
+await evaluate(`document.getElementById('interview-answer-btn').click(); return 1;`);
+await waitFor(ivQuestion, q => q === 'Retry policy on a failed rollout?', 8000, 'the next question');
+check('answering advances to the next pending question', await ivQuestion(),
+  'Retry policy on a failed rollout?');
+check('...and the count drops with it', await ivCount(), '1 of 2');
+check('...and it has no context block of its own', await evaluate(`
+  return !!document.querySelector('#interview-area .interview-context');`), false);
+check('the answer really landed in the log', await evaluate(`
+  return fetch(api('interview')).then(function(r){ return r.json(); }).then(function(a){
+    var ask0 = a.filter(function(x){ return x.id === 'ask-0'; })[0];
+    return { answer: ask0.answer, answered: ask0.answered_at !== null };
+  });`), { answer: 'memory', answered: true });
+
+// ask-2 carries no options at all — a plain free-text ask.
+await evaluate(`
+  document.querySelector('#interview-area input[value="exp"]').checked = true;
+  document.getElementById('interview-answer-btn').click();
+  return 1;`);
+await waitFor(ivQuestion, q => q === 'Anything else the plan phase should know?', 8000,
+  'the free-text question');
+check('a question with no options is a bare free-text row', await evaluate(`
+  return { optionRows: document.querySelectorAll('#interview-area .interview-row[data-value]').length,
+           label: document.querySelector('#interview-area label[for="iv_other"]').textContent,
+           count: document.querySelector('#interview-area .interview-count').textContent };`),
+  { optionRows: 0, label: 'Answer', count: '1 of 1' });
+
+console.log('\n== run detail: the interview is not gated on the review state ==');
+// `waiting` and `approved` are the load-bearing states: an agent asking mid-phase
+// is exactly when the gate is NOT at `ready`, and the gate on an approved spec may
+// never move again. Only `cancelled` mutes the panel — `drovr ask wait` exits 5 on
+// that marker, so nobody is listening. An implementation that inverted this would
+// pass every other check in this section.
+// Only the state endpoint is stubbed; everything else still hits the real server.
+const withState = state => evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    window.fetch = function(url, opts) {
+      if (String(url).indexOf('/state') !== -1) {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ state: ${JSON.stringify(state)}, turn: 0 }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    // refresh() arms pollState on 'waiting'; drop it, or that chain outlives the stub.
+    try { await refresh(); } finally { window.fetch = saved; clearTimeout(pollTimer); }
+    return { rendered: !!document.querySelector('#interview-area .interview-question'),
+             muted: interviewMuted };
+  })();`);
+check('a `waiting` gate keeps the panel', await withState('waiting'), { rendered: true, muted: false });
+check('an `approved` one keeps it too', await withState('approved'), { rendered: true, muted: false });
+check('a cancelled run clears it', await withState('cancelled'), { rendered: false, muted: true });
+check('...and answering a cleared panel posts nothing', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, sent = 0;
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') { sent++; }
+      return saved.apply(window, arguments);
+    };
+    try { await submitAnswer(); } finally { window.fetch = saved; }
+    return sent;
+  })();`), 0);
+// Back to the run's real state, and let the poll re-arm the panel for the sections
+// below (which navigate away from and back to this run).
+await evaluate(`interviewMuted = false; return refresh().then(function(){ return 1; });`);
+await waitFor(ivQuestion, q => !!q, 8000, 'the interview panel again');
+await waitFor(cursorQuestion, q => !!q, 8000, 'the questions panel again');
 
 console.log('\n== run detail: answers cannot be silently dropped ==');
 // answers is keyed by question id, so two questions sharing one cannot both be
