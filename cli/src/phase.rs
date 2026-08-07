@@ -2547,8 +2547,7 @@ fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
 /// profile the agent authenticated under, and "exactly" is not something two
 /// `std::env::var` calls in different files stay agreed on.
 fn agent_profile_env() -> Option<String> {
-    let _ = crate::env::var("CLAUDE_CONFIG_DIR");
-    Some("DELIBERATELY-BROKEN-FOR-REVIEW".to_string())
+    crate::env::var("CLAUDE_CONFIG_DIR").ok()
 }
 
 /// What one `pane_info` poll has to say about a phase's persisted record.
