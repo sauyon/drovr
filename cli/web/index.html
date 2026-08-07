@@ -2154,6 +2154,12 @@ var interviewTimer = null;
 // Whether the LAST poll failed, so a recovery can clear the message it left
 // behind without also wiping a submit error the human has not read yet.
 var interviewPollFailed = false;
+// A message that stands in PLACE of a question rather than beside one — today,
+// only the cancellation explanation. It lives here rather than in the DOM because
+// the no-question branch of renderInterview OWNS what this container says, and it
+// repaints every 2s: a notice written straight into the panel is erased two
+// seconds after the human was told, which is worse than never having said it.
+var interviewNotice = '';
 
 // `read` returns seq order, so the first unanswered entry is the oldest one. The
 // server always sends `answer: null` when there is none; `undefined` is tolerated
@@ -2175,7 +2181,15 @@ function renderInterview(asks) {
   var pending = pendingAsks(currentInterview);
   var ask = interviewMuted ? null : (pending[0] || null);
   currentAsk = ask;
-  if (!ask) { area.innerHTML = ''; renderedAskId = null; applyNavCursor(false); return; }
+  if (!ask) {
+    area.innerHTML = interviewNotice
+      ? '<div class="interview-panel"><div id="interview-error" class="error-msg">' +
+        escHtml(interviewNotice) + '</div></div>'
+      : '';
+    renderedAskId = null;
+    applyNavCursor(false);
+    return;
+  }
 
   var countText = '1 of ' + pending.length;
 
@@ -2248,11 +2262,21 @@ function renderInterview(asks) {
 // calls this on the cancelled branch, so clearing it would unmute the run it just
 // muted and the next poll would paint the panel straight back. route() owns the
 // cross-run reset instead.
+//
+// `answerInFlight` IS reset, and that is also deliberate. Holding it across a
+// teardown would freeze the NEXT run's panel behind a POST that no longer
+// concerns it — renderInterview returns early while it is set — for as long as
+// that request takes to settle, which a hung one never does. The two things the
+// flag guards are covered without it: a late response cannot touch the page
+// (submitAnswer pins `routeGen` and returns), and the only re-enabled-button
+// window left is a re-entry to the SAME run mid-POST, where a second answer to
+// the same ask is well-defined — the fold takes the last one.
 function clearInterview() {
   currentInterview = [];
   currentAsk = null;
   renderedAskId = null;
   answerInFlight = false;
+  interviewNotice = '';
   document.getElementById('interview-area').innerHTML = '';
   // As clearQuestions does: this drives renderKeyhint() and announceCursor(null),
   // so skipping it leaves stale keyboard hints and a stale screen-reader
@@ -2282,10 +2306,13 @@ async function pollInterview(gen) {
     if (gen !== routeGen) return;
     // The `r.ok` check is NOT the sibling pollers' pattern, and it is load-bearing
     // here: `fetch` RESOLVES on 500, and this endpoint answers an unreadable log
-    // with an object rather than an array. Letting that reach array-shaped logic
-    // throws before the re-arm below and stops the poll silently and permanently —
-    // strictly worse than the empty list the 500 exists to prevent. Neither
-    // pollAlarms nor pollPane needs this; their endpoints cannot fail structurally.
+    // with an OBJECT rather than an array. Without the check that object reaches
+    // pendingAsks, which throws on it — the re-arm below is outside the try, so
+    // the poll survives, but every tick fails the same way and the panel just sits
+    // there showing the last question it managed to read, or nothing, saying
+    // nothing. An unreadable interview log presented as an ordinary quiet page is
+    // exactly what T4's 500 exists to prevent, one layer up. Neither pollAlarms nor
+    // pollPane needs this; their endpoints cannot fail structurally.
     if (!r.ok) {
       var msg = 'The interview log could not be read.';
       try {
@@ -2313,21 +2340,43 @@ async function pollInterview(gen) {
 async function submitAnswer() {
   var ask = currentAsk;
   if (!ask || answerInFlight) return;
+  // Pin the view this answer belongs to, BEFORE any await. `api()` reads the
+  // mutable currentRun, and every branch below runs after a network round trip —
+  // by which time the human may be on another run. The URLs are snapshotted so a
+  // POST can never address the run that slid in behind it, and `gen` gates every
+  // write to the page: without it, a 409 for run A's cancellation mutes run B's
+  // panel, and nothing on an idle/ready run ever unmutes it.
+  var gen = routeGen;
+  var answerUrl = api('answer');
+  var interviewUrl = api('interview');
   var area = document.getElementById('interview-area');
   var errEl = document.getElementById('interview-error');
   if (errEl) errEl.style.display = 'none';
+  // Whatever the last poll failure left on screen is stale the moment the human
+  // submits — and clearing the flag here is what stops a recovering poll from
+  // wiping the submit error this call is about to show.
+  interviewPollFailed = false;
 
+  var opts = ask.options || [];
   var checked = area.querySelector('input[type="radio"]:checked');
-  if (!checked) { showInterviewError('Pick an answer, or type one.'); return; }
+  // An ask with no options has nothing to pick, so "pick one" is not advice — it
+  // names a control that is not on screen. Both refusals below say what this ask
+  // actually offers.
+  if (!checked && opts.length) { showInterviewError('Pick an answer, or type one.'); return; }
   var text;
-  if (checked.value === OTHER_SENTINEL) {
+  if (!checked || checked.value === OTHER_SENTINEL) {
     var box = document.getElementById('interview-text');
     text = box ? box.value.trim() : '';
     // The server accepts an empty answer — "I have nothing to add" is a decision
     // the human is entitled to make. What this refuses is the ACCIDENTAL empty
-    // one: Other explicitly chosen with nothing typed.
+    // one: the free-text row explicitly chosen with nothing typed. On an ask with
+    // no options that makes the deliberate empty answer unreachable from the
+    // browser; the plan specifies this refusal unconditionally, and giving that
+    // answer its own affordance is UI nobody has agreed to yet.
     if (!text) {
-      showInterviewError('Type an answer, or pick one of the options.');
+      showInterviewError(opts.length
+        ? 'Type an answer, or pick one of the options.'
+        : 'Type an answer.');
       if (box) box.focus();
       return;
     }
@@ -2340,7 +2389,7 @@ async function submitAnswer() {
   if (btn) btn.disabled = true;
   var status = 0, body = null;
   try {
-    var r = await fetch(api('answer'), {
+    var r = await fetch(answerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: ask.id, answer: text })
@@ -2352,15 +2401,25 @@ async function submitAnswer() {
   } finally {
     answerInFlight = false;
   }
+  // Navigated away mid-flight. The answer landed (or did not) on the run it was
+  // addressed to; this page is now showing a different one and owes it nothing.
+  if (gen !== routeGen) return;
 
   if (status === 200) {
     // ONE direct fetch, deliberately not pollInterview(): that re-arms its own
     // timer, so calling it here stacks a second chain on top of the tick already
     // scheduled — and that scheduled tick is what keeps the panel live afterwards.
+    var asks = null;
     try {
-      var r2 = await fetch(api('interview'));
-      if (r2.ok) renderInterview(await r2.json());
-    } catch (e) { /* the scheduled tick picks it up */ }
+      var r2 = await fetch(interviewUrl);
+      if (r2.ok) asks = await r2.json();
+    } catch (e) { /* handled below, same as a non-ok answer */ }
+    if (gen !== routeGen) return;
+    if (asks) { renderInterview(asks); return; }
+    // The answer landed; only the read-back did not. Re-enable rather than leave a
+    // dead button over a question that has already been answered — the scheduled
+    // tick repaints within 2s, and until it does the control still works.
+    if (btn) btn.disabled = false;
     return;
   }
 
@@ -2370,7 +2429,11 @@ async function submitAnswer() {
     // question rather than beside a control that no longer does anything.
     interviewMuted = true;
     clearInterview();
-    showInterviewError('This run was cancelled — the agent is no longer waiting for an answer.');
+    // AFTER clearInterview, which resets it: this notice has to outlive the
+    // question it replaces, and the 2s poll repaints over anything left loose in
+    // the DOM. renderInterview is what paints it, so it survives every tick.
+    interviewNotice = 'This run was cancelled — the agent is no longer waiting for an answer.';
+    renderInterview(currentInterview);
     return;
   }
 

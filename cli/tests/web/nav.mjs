@@ -1488,6 +1488,140 @@ check('a question with no options is a bare free-text row', await evaluate(`
            label: document.querySelector('#interview-area label[for="iv_other"]').textContent,
            count: document.querySelector('#interview-area .interview-count').textContent };`),
   { optionRows: 0, label: 'Answer', count: '1 of 1' });
+// ...so its refusal must not name options that are not on screen. "or pick one of
+// the options" is not advice when there is nothing to pick — it points at a
+// control the human cannot find.
+check('...and its refusal names only what it actually offers', await evaluate(`
+  document.getElementById('interview-text').value = '   ';
+  submitAnswer();
+  var err = document.getElementById('interview-error');
+  return err.style.display !== 'none' && err.textContent;`), 'Type an answer.');
+await evaluate(`
+  document.getElementById('interview-text').value = '';
+  document.getElementById('interview-text').blur();
+  return 1;`);
+
+// A poll recovery clears the message the FAILED poll left behind — and nothing
+// else. A submit failure the human has not read yet must survive the next tick,
+// or the only evidence that the answer was not recorded disappears within 2s.
+check('a recovering poll does not wipe an unread submit error', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    // 1. a read failure, so the recovery path is armed
+    window.fetch = function() {
+      return Promise.resolve({ ok: false, status: 500,
+        json: function() { return Promise.resolve({ ok: false, error: 'interview log unreadable' }); } });
+    };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var afterRead = document.getElementById('interview-error').textContent;
+    // 2. a failed submit on top of it
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 500,
+          json: function() { return Promise.resolve({ ok: false, error: 'could not append the answer' }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'a real answer';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var afterSubmit = document.getElementById('interview-error').textContent;
+    // 3. the read recovers
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var afterRecovery = document.getElementById('interview-error');
+    document.getElementById('interview-text').value = '';
+    return { afterRead: afterRead, afterSubmit: afterSubmit,
+             stillShown: afterRecovery.style.display !== 'none' && afterRecovery.textContent };
+  })();`), {
+    afterRead: 'interview log unreadable',
+    afterSubmit: 'could not append the answer',
+    stillShown: 'could not append the answer',
+  });
+
+// The POST is addressed to the run that was on screen when the button was
+// clicked, and its response belongs to that run too. A 409 says THAT run was
+// cancelled — applying it to whatever is on screen now mutes a live run's panel,
+// and nothing on an idle/ready run ever unmutes it: the human simply stops being
+// asked, with no error and no way back short of re-entering the run.
+check('a response that lands after a navigation touches nothing', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, url = null, release;
+    var gate = new Promise(function(r) { release = r; });
+    window.fetch = function(u, opts) {
+      if (opts && opts.method === 'POST') {
+        url = String(u);
+        return gate.then(function() {
+          return { ok: false, status: 409, json: function() {
+            return Promise.resolve({ ok: false, error: 'this run was cancelled' }); } };
+        });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'an answer overtaken by a navigation';
+    document.getElementById('iv_other').checked = true;
+    var posting = submitAnswer();
+    routeGen++;                    // the human left while the POST was in flight
+    release();
+    await posting;
+    window.fetch = saved;
+    var err = document.getElementById('interview-error');
+    var got = { sentToThisRun: /\\/runs\\/alpha-deploy\\/answer$/.test(url),
+                muted: interviewMuted,
+                errorShown: !!err && err.style.display !== 'none',
+                stillAsking: !!document.querySelector('#interview-area .interview-question') };
+    // Put the generation back and restart the chain the bump above stranded.
+    routeGen--;
+    clearTimeout(interviewTimer);
+    pollInterview(routeGen);
+    // Null-guarded on purpose: a build WITHOUT the generation check tears the
+    // panel down here, and this teardown throwing would abort the whole driver
+    // instead of letting the check above report what went wrong.
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    return got;
+  })();`), { sentToThisRun: true, muted: false, errorShown: false, stillAsking: true });
+
+// A live 409 — the run was cancelled while the human had the question on screen.
+// The explanation replaces the question, so it has to survive the repaint that
+// takes the question away: written loose into the DOM it is erased by the next
+// tick, under two seconds after the human was told, and the panel goes blank with
+// nothing to say why. This is the ONE status the plan says to explain.
+check('a cancellation explanation outlives the poll that clears the question', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 409, json: function() {
+          return Promise.resolve({ ok: false, error: 'this run was cancelled' }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'too late';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var shown = document.getElementById('interview-error');
+    var immediately = !!shown && shown.style.display !== 'none' && shown.textContent;
+    // The tick that would erase it, run for real rather than waited out.
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var after = document.getElementById('interview-error');
+    var got = { immediately: immediately,
+                afterATick: !!after && after.textContent,
+                askGone: !document.querySelector('#interview-area .interview-question') };
+    // Undo the mute and let the panel come back for the sections below.
+    interviewMuted = false;
+    clearInterview();
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    immediately: 'This run was cancelled — the agent is no longer waiting for an answer.',
+    afterATick: 'This run was cancelled — the agent is no longer waiting for an answer.',
+    askGone: true,
+  });
 
 console.log('\n== run detail: the interview is not gated on the review state ==');
 // `waiting` and `approved` are the load-bearing states: an agent asking mid-phase
