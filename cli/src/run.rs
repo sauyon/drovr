@@ -2044,11 +2044,25 @@ mod tests {
     /// reported, because "which side lost" varies run to run and neither is
     /// the interesting fact.
     ///
-    /// `ENV_LOCK` is held for the duration and `XDG_DATA_HOME` is restored
-    /// before the assertion, exactly as
-    /// [`data_dir_refuses_to_resolve_inside_the_real_home`] does: this test is
-    /// *supposed* to fail, and a failing test must not leak a foreign data
-    /// root — or a poisoned `ENV_LOCK` — into whatever runs next.
+    /// # Nothing panics while `ENV_LOCK` is held
+    ///
+    /// This test is *supposed* to fail, so its failure path is a path it takes
+    /// every time — not an edge case. Both of its panics are therefore pushed
+    /// past the end of the critical section: the threads are joined into
+    /// `Result`s rather than unwrapped in place, `XDG_DATA_HOME` is restored
+    /// the way [`data_dir_refuses_to_resolve_inside_the_real_home`] restores
+    /// it, and the guard is dropped explicitly — and only *then* is anything
+    /// asserted or unwrapped.
+    ///
+    /// The order matters both ways. A panic under the guard poisons `ENV_LOCK`
+    /// for every other test in the process, turning one honest failure into a
+    /// cascade of `PoisonError`s that say nothing (`code_review.rs` reaches for
+    /// `into_inner` to survive exactly that; not poisoning it in the first
+    /// place is better). And a panic before the restore leaves a foreign
+    /// `XDG_DATA_HOME` behind for whatever runs next. A worker can panic too —
+    /// `data_dir` calls [`refuse_home_data_root`], which is a `panic!` — so
+    /// `join`'s `Err` has to survive to the far side of the cleanup rather
+    /// than short-circuit it.
     #[test]
     #[ignore = "demonstrates the race this branch removes; un-ignored at T13"]
     fn data_root_is_not_shared_between_threads() {
@@ -2056,7 +2070,7 @@ mod tests {
         /// `docs/test-isolation/race-red.txt` for the observed failure ratio.
         const ITERATIONS: usize = 20_000;
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let lock = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("XDG_DATA_HOME").ok();
 
         // Held to the end of the test: dropping a `TempDir` deletes it, and a
@@ -2075,12 +2089,16 @@ mod tests {
                     // Line the threads up so the writes actually interleave;
                     // staggered, each could finish before the other starts.
                     barrier.wait();
+                    // `data_dir()` is `<XDG_DATA_HOME>/drovr` exactly, so the
+                    // expected value is exact too. A prefix test would also
+                    // accept a root that merely nests under ours.
+                    let mine = root.join("drovr");
                     let mut stolen = 0usize;
                     for _ in 0..ITERATIONS {
                         unsafe {
                             std::env::set_var("XDG_DATA_HOME", &root);
                         }
-                        if !data_dir().starts_with(&root) {
+                        if data_dir() != mine {
                             stolen += 1;
                         }
                     }
@@ -2089,18 +2107,24 @@ mod tests {
             })
             .collect();
 
-        let observed: Vec<usize> = handles
-            .into_iter()
-            .map(|h| h.join().expect("neither thread may panic"))
-            .collect();
+        // Collected, not unwrapped: a worker panic must not short-circuit the
+        // cleanup below. See the doc comment.
+        let joined: Vec<std::thread::Result<usize>> =
+            handles.into_iter().map(|h| h.join()).collect();
 
-        // Restore before asserting — see the doc comment.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("XDG_DATA_HOME", v),
                 None => std::env::remove_var("XDG_DATA_HOME"),
             }
         }
+        drop(lock);
+
+        // Past this line the critical section is over and panicking is safe.
+        let observed: Vec<usize> = joined
+            .into_iter()
+            .map(|r| r.expect("neither thread may panic"))
+            .collect();
 
         assert_eq!(
             observed.iter().sum::<usize>(),
