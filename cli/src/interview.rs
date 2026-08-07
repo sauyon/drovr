@@ -49,12 +49,6 @@
 //! the single-writer discipline — only the agent side calls [`append_ask`], and it calls
 //! it one at a time. Answers allocate nothing, so the server never races for a `seq`.
 
-// The module lands ahead of its callers: `drovr ask` (T3) and the server's `GET
-// interview` / `POST answer` (T4) are the consumers, and until they exist every item here
-// is dead to the non-test build. Delete this allow once the server route lands — by then
-// nothing in here should be unreachable, and a fresh warning would be a real finding.
-#![allow(dead_code)]
-
 use crate::brief::MAX_CONTEXT;
 use std::collections::HashMap;
 use std::fs::OpenOptions;

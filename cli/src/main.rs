@@ -2160,9 +2160,11 @@ fn validate_ask_request(
 ///
 /// The marker `handle_post_submit` writes (`cli/src/review.rs`), read off disk rather
 /// than from the server, so `ask wait` needs nothing running to see it. One predicate
-/// for the three places that ask — `cmd_ask`, and `cmd_ask_wait` before and inside its
-/// loop — because a condition spelled out per call site is one that drifts.
-fn run_is_cancelled(dir: &std::path::Path) -> bool {
+/// for the four places that ask — `cmd_ask`, `cmd_ask_wait` before and inside its loop,
+/// and the server's `POST answer` — because a condition spelled out per call site is one
+/// that drifts. `pub(crate)` for that last caller, running the same direction
+/// `close_run_panes` already does: crate root down into `review`.
+pub(crate) fn run_is_cancelled(dir: &std::path::Path) -> bool {
     dir.join("cancelled").exists()
 }
 
