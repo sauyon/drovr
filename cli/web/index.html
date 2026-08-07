@@ -2459,7 +2459,14 @@ async function submitAnswer() {
       if (r2.ok) asks = await r2.json();
     } catch (e) { /* handled below, same as a non-ok answer */ }
     if (gen !== routeGen) return;
-    if (asks) { renderInterview(asks); return; }
+    if (asks) {
+      // Guarded like the poll's own render: this one is on the SUCCESS path, and
+      // an unhandled throw here rejects submitAnswer's promise with the button
+      // still disabled and nothing said — a silently dead control reporting a
+      // successful answer, which is the exact defect this panel retires. Falls
+      // through to the same message instead.
+      try { renderInterview(asks); return; } catch (e) { /* say so below */ }
+    }
     // The answer landed; only the read-back did not. Say so — the question is
     // still on screen and looks unanswered, which reads as "nothing happened" and
     // invites a resubmit. Re-enable too, rather than leave a dead button over it.

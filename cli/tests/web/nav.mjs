@@ -1636,6 +1636,43 @@ check('an answer whose read-back fails still says it was recorded', await evalua
     said: 'Your answer was recorded. The question could not be reloaded; retrying…',
     buttonUsable: true,
   });
+// The same guarantee one step later: the read-back SUCCEEDS and painting it is
+// what fails. Unguarded, that rejects submitAnswer's promise with the button
+// still disabled and nothing said — a dead control reporting a successful answer.
+check('...and so does one whose read-back cannot be painted', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, savedRender = renderInterview;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ ok: true, id: currentAsk.id }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    window.renderInterview = function() { throw new Error('forced render failure'); };
+    document.getElementById('interview-text').value = 'recorded but not painted';
+    document.getElementById('iv_other').checked = true;
+    var threw = false;
+    try { await submitAnswer(); } catch (e) { threw = true; }
+    window.renderInterview = savedRender;
+    window.fetch = saved;
+    var el = document.getElementById('interview-error');
+    var btn = document.getElementById('interview-answer-btn');
+    var got = { rejected: threw,
+                said: !!el && el.style.display !== 'none' && el.textContent,
+                buttonUsable: !!btn && !btn.disabled };
+    interviewMsg = null; paintInterviewMsg();
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    clearTimeout(interviewTimer);
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    rejected: false,
+    said: 'Your answer was recorded. The question could not be reloaded; retrying…',
+    buttonUsable: true,
+  });
 
 // The POST is addressed to the run that was on screen when the button was
 // clicked, and its response belongs to that run too. A 409 says THAT run was
