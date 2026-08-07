@@ -71,10 +71,10 @@ reviewer. You are NOT implementing anything.
    - **Stop when the design is decided, not when you run out of questions — and not before
      that.** Under-interviewing is the failure to expect: it feels like progress, and it is
      where the guesses come from. The test is concrete — if you could not write down the
-     spec's interfaces without guessing at one of them, you are still interviewing. Asking
-     less than a chat-based grilling would is not a licence to ask less than that; it is why
-     step 2 comes first, so that the questions you do spend are the ones only the human can
-     answer.
+     spec's interfaces without guessing at one of them, you are still interviewing. This
+     interview is more economical than a chat-based grilling only because step 2 comes first,
+     so the questions you spend are the ones only the human can answer — that is not a licence
+     to fall short of the test.
 
    `~/.local/share/drovr/runs/<run>/interview.jsonl` is the append-only record of everything
    asked and answered. It is where the alternatives and the reasoning live — which is what
