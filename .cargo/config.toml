@@ -1,11 +1,30 @@
 # Every process cargo launches from this repo — build scripts, test binaries, and the
-# children those spawn — gets a scratch XDG_DATA_HOME under the repo. `cli/tests/*` exec the
-# BUILT binary, compiled without cfg(test), so the in-process capability
-# (cli/src/test_env.rs) provably cannot reach them; this covers that disjoint path.
+# children those spawn — gets a scratch XDG_DATA_HOME under the repo, so a test run cannot
+# reach the real ~/.local/share/drovr. (`cargo test` destroyed it twice; see
+# docs/known-issues.md.) `cli/tests/*` exec the BUILT binary, compiled without cfg(test), so
+# the in-process test capability cannot reach them — this covers that disjoint path.
+#
 # Cost: `cargo run -- <anything>` from this repo sees an empty data root, not your real one.
 #
 # `relative = true` resolves against the parent of this `.cargo` directory, so the value is
 # <repo>/target/cargo-xdg-data while cargo builds into <repo>/cli/target. `cargo clean` (run
-# from cli/) therefore does NOT sweep it; `.gitignore`'s bare `target/` does ignore it.
+# from cli/) therefore does NOT sweep it; `.gitignore`'s bare `target/` does ignore it. Unlike
+# the per-test tempdirs, this root is durable and shared across runs — a stale server.addr /
+# server.pid can outlive the run that wrote it.
+#
+# This does NOT subsume per-test pinning, and tests must keep doing it:
+#   - cargo discovers this file by CWD ANCESTRY, so `cargo test --manifest-path <repo>/cli`
+#     from elsewhere, or running a target/debug/deps binary directly, never sees it;
+#   - a test that set_var's XDG_DATA_HOME at runtime overrides it for itself and its children;
+#   - panes created by an already-running herdr daemon inherit that daemon's environment,
+#     not cargo's — which is why the tests pin HERDR_SOCKET_PATH at a dead socket.
+#
+# Interaction with run.rs's cfg(test) refuse_home_data_root guard, which panics when the data
+# root resolves inside $HOME: in a checkout under $HOME (the normal case) this forced value is
+# itself inside $HOME, so an unpinned unit test aborts rather than using this root — the root
+# is a tripwire for cfg(test) code, not a working scratch dir. Where the checkout is NOT under
+# $HOME (the nix sandbox: HOME=/homeless-shelter, src=/build/source) the guard cannot fire and
+# an unpinned test would silently share this root instead. Both arms are reasons the per-test
+# pinning above stays load-bearing until the guard moves to the write path.
 [env]
 XDG_DATA_HOME = { value = "target/cargo-xdg-data", relative = true, force = true }
