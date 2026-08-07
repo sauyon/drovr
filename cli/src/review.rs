@@ -869,6 +869,18 @@ fn handle_get_interview(req: Request, p: &RunPaths) {
 /// No per-run lock: answers allocate no `seq`, an append is `O_APPEND` plus one
 /// `write_all`, and the fold takes the last answer per id, so two concurrent
 /// answers are well-defined without one.
+///
+/// **Unthrottled, deliberately.** Nothing here rate-limits appends or refuses a
+/// second answer to an id, so a local caller can spend a run's whole
+/// [`interview::MAX_LOG`] budget on ~16 max-size answers and jam that run's
+/// channel. That is accepted rather than overlooked. `MAX_LOG` is the one
+/// authoritative bound, and a rate limiter beside it would be a second,
+/// heuristic one; the trust boundary is the server's existing one, where a local
+/// caller already reaches `POST submit` (which can *cancel* the run outright) and
+/// `POST send` (which types into the agent's terminal) — both strictly stronger
+/// than filling a log. Re-answering, in particular, is not a defect to close: it
+/// is the documented "last answer wins" contract, and a human correcting a
+/// mis-click depends on it.
 fn handle_post_answer(mut req: Request, p: &RunPaths) {
     if crate::run_is_cancelled(&p.dir) {
         respond_json_err(req, 409, "this run was cancelled");
@@ -4316,6 +4328,53 @@ mod tests {
         assert!(
             crate::interview::read(&dir).unwrap()[0].answer.is_none(),
             "no malformed request appended anything"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_refuses_an_answer_before_it_parses_one() {
+        // The ordering the handler's doc claims, pinned. Cancellation is a fact
+        // about the RUN and outranks any complaint about the request: moving the
+        // marker check below `parse_answer` would answer 400 here and still pass
+        // every other test in this file, silently retiring the contract.
+        let tmp = make_root("answer-cancel-first");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        fs::write(dir.join("cancelled"), b"").unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        for body in ["not json", "{}", r#"{"id":"","answer":"x"}"#] {
+            let (status, resp) = http_post(&addr, "/api/runs/r/answer", "application/json", body);
+            assert_eq!(status, 409, "cancellation outranks a bad body: {body} -> {resp}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_answer_is_400_and_appends_nothing() {
+        // The `InvalidInput` arm of the handler's error mapping. Without this,
+        // deleting that arm — so an over-cap answer fell through to a generic
+        // 500 — would not fail a single test.
+        let tmp = make_root("answer-oversized");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let huge = "x".repeat(crate::interview::MAX_FIELD as usize + 1);
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &serde_json::json!({"id": ask.id, "answer": huge}).to_string(),
+        );
+        assert_eq!(status, 400, "an over-cap answer is a bad request, not a 500");
+        assert!(body.contains(r#""ok":false"#), "body={body}");
+        assert!(
+            !body.contains("xxxx"),
+            "the refusal must not echo the answer: {body}"
+        );
+        assert!(
+            crate::interview::read(&dir).unwrap()[0].answer.is_none(),
+            "the log is append-only, so a refused answer must append nothing"
         );
     }
 
