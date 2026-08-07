@@ -385,6 +385,76 @@ grep -ac '<a-string-you-just-added>' cli/target/debug/drovr    # -a: it's a bina
 `grep` without `-a` prints nothing useful here and reads as "not present" either way.
 `cli/tests/web_nav.rs` has the same exposure — it drives whatever HTML was compiled in.
 
+## An interrupted `cargo test` can wedge the whole bin suite permanently — OPEN
+
+**Severity:** high (225 of 803 tests fail, on every subsequent run, in every worktree on the
+machine, and none of the 225 failure messages names the cause. It stays wedged until someone
+chmods a directory back).
+**Found:** 2026-08-07, run `ask-channel`, task 8 — after a `drovr code-review run` was killed
+by a 10-minute shell timeout mid-suite.
+
+### Symptom
+
+`cargo test --bin drovr` reports a few hundred failures across `phase::`, `run::`, `review::`
+and the root `tests::` module. Almost all of them are:
+
+```
+called `Result::unwrap()` on an `Err` value: PoisonError { .. }
+```
+
+Re-running does not help. Running any one of the 225 alone passes. The suite was green minutes
+earlier and nothing in the working tree changed.
+
+### Root cause
+
+Two ordinary things that are fine apart.
+
+1. **`phase.rs`'s `capture_run` isolates onto a FIXED path**, not a fresh tempdir:
+   `set_var("XDG_DATA_HOME", format!("/tmp/drovr-capture-test-{name}"))`. Every run of the
+   suite — and every worktree on the machine — shares it.
+2. **`a_capture_whose_save_failed_is_also_retried` chmods that run dir read-only** (`0o555`) on
+   purpose, to force a save failure, and restores it at the end of the test.
+
+Kill the process between those two points and `/tmp/drovr-capture-test-save-fails/drovr/runs/save-fails`
+is left at `dr-xr-xr-x` **forever**. The next run's `capture_run` does
+`remove_dir_all(run_dir(name))` into it, `phase_start` then fails with `PermissionDenied`, and
+the test panics **while holding `ENV_LOCK`** — poisoning the process-global mutex. Every other
+test that takes `ENV_LOCK` (which is nearly all of them, since it guards the `XDG_DATA_HOME`
+mutation) then dies on `.lock().unwrap()`.
+
+So one leftover directory bit produces hundreds of failures whose messages point at the mutex,
+not at the directory. The three earlier "flakes" this task recorded — ten `code_review::tests`
+in one run, one `herdr::tests` in another — were the same cascade landing on a different
+thread schedule.
+
+### Workaround
+
+```
+chmod u+w /tmp/drovr-capture-test-save-fails/drovr/runs/save-fails
+```
+
+Or delete `/tmp/drovr-capture-test-*` entirely; the tests recreate them. **Check first that no
+other agent's suite is mid-run** — the path is shared across worktrees, which is half the bug.
+
+### Diagnosis, when it happens again
+
+The poison messages are noise. Find the one panic that is **not** a `PoisonError`:
+
+```
+cargo test --manifest-path cli/Cargo.toml --bin drovr > /tmp/bin.log 2>&1
+grep -A2 'panicked at' /tmp/bin.log | grep -v PoisonError | grep -A2 'panicked at'
+```
+
+### Fix directions (none applied)
+
+1. **Isolate onto a tempdir**, as the other helpers do, so nothing is shared or persistent.
+   `capture_run`'s fixed path is the whole reason a leftover can outlive the process.
+2. **Restore the mode from a guard**, not from a straight-line statement, so a panic or a
+   kill still puts it back.
+3. **Recover from a poisoned `ENV_LOCK`** (`unwrap_or_else(|e| e.into_inner())`) so one
+   panicking test fails one test. This alone would have turned 225 failures into 1 — and the
+   1 would have named the directory.
+
 ## `cli/tests/web_nav.rs` can fail with a CDP timeout even though nothing changed
 
 **Severity:** low (a flaky test, not a product bug — but it makes `cargo test` red and can be
