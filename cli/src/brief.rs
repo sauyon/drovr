@@ -582,23 +582,31 @@ mod tests {
         );
     }
 
-    /// Every `<...>` on one line of `body`, in order, duplicates included.
+    /// Every `<...>` in `body`, in order, duplicates included.
     ///
     /// Crude on purpose: the templates are prose, and the only thing this has to
-    /// separate is "angle-bracket token" from "not one". A run spanning a newline
-    /// is dropped, because in Markdown that is a stray `<` meeting a block-quote
-    /// `>` two lines down, not a token anyone wrote.
+    /// separate is "angle-bracket token" from "not one".
+    ///
+    /// **Scanned per line**, which is the whole of its robustness. A token never
+    /// spans a newline, while a stray `<` — a less-than in prose, say — does meet
+    /// a Markdown block-quote `>` two lines down. Scanning the body whole, that
+    /// stray would swallow everything between the two and resume after the `>`,
+    /// silently dropping every real token in between: the guard would keep
+    /// passing over a corpus it had quietly stopped checking. Per line, a stray
+    /// `<` costs at most the rest of its own line.
+    ///
+    /// Slicing is at `<` and `>`, both ASCII, so the byte offsets `find` returns
+    /// are always char boundaries however much non-ASCII prose surrounds them.
     fn angle_tokens(body: &str) -> Vec<&str> {
         let mut out = Vec::new();
-        let mut rest = body;
-        while let Some(open) = rest.find('<') {
-            let Some(len) = rest[open..].find('>') else { break };
-            let end = open + len + 1;
-            let token = &rest[open..end];
-            if !token.contains('\n') {
-                out.push(token);
+        for line in body.lines() {
+            let mut rest = line;
+            while let Some(open) = rest.find('<') {
+                let Some(len) = rest[open..].find('>') else { break };
+                let end = open + len + 1;
+                out.push(&rest[open..end]);
+                rest = &rest[end..];
             }
-            rest = &rest[end..];
         }
         out
     }
