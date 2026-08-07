@@ -44,18 +44,42 @@
 //! test in [`crate::env`], which scans for `std::env::var` only. That is a
 //! standing gap in the scan, not a licence: `std::env::temp_dir()` also appears
 //! in `main.rs::cleanup_scratch`, which task 9 migrates.
+//!
+//! Neither bootstrap read takes `ENV_LOCK`, deliberately. No test in the suite
+//! writes `HOME` or `PATH`, so there is no same-key race to lose; the residual
+//! — that any concurrent `set_var` anywhere can in principle disturb the
+//! environ table — is the crate-wide condition this run is removing, shared
+//! with every existing environment read in every test, and it reaches zero when
+//! the last `set_var` goes. Taking `ENV_LOCK` here would instead be a new
+//! hazard: [`TestEnv::new`] is called from tests that may still hold it during
+//! tasks 6–12, and `std::sync::Mutex` is not reentrant.
+//!
+//! The temp-root exemption reads the *real* `TMPDIR`, so a test that changed
+//! `TMPDIR` process-globally would move it. That is correct rather than a hole:
+//! `tempfile` reads the same source, so the exemption has to track wherever
+//! scratch dirs are actually being created. Nothing in the suite writes
+//! `TMPDIR`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
-/// The two keys the home check applies to — the only ones that name a root
-/// drovr will go on to create and delete files under.
+/// The keys the home check applies to — the ones that name a root drovr will
+/// go on to create and delete files under.
+///
+/// `HOME` is in the list because it names those roots too, one indirection
+/// further out: `data_dir()` falls back to `$HOME/.local/share` when
+/// `XDG_DATA_HOME` is absent, and config resolution has the same fallback.
+/// Guarding only the XDG pair would leave `unset(XDG_DATA_HOME)` plus
+/// `set(HOME, <the real home>)` as an unguarded route to exactly the directory
+/// the guard exists for.
 const DATA_KEY: &str = "XDG_DATA_HOME";
 const CONFIG_KEY: &str = "XDG_CONFIG_HOME";
+const HOME_KEY: &str = "HOME";
+const GUARDED_KEYS: &[&str] = &[DATA_KEY, CONFIG_KEY, HOME_KEY];
 
 /// A scratch environment installed on THIS thread.
 ///
@@ -67,6 +91,7 @@ const CONFIG_KEY: &str = "XDG_CONFIG_HOME";
 /// thread boundary with [`TestEnv::handle`], which is the supported way.
 pub struct TestEnv {
     cur: Arc<Overlay>,
+    frame: FrameId,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -83,7 +108,7 @@ pub struct EnvHandle(Arc<Overlay>);
 /// [`INSTALLED`] on whichever thread it happens to run on, so it must not be
 /// the wrong one.
 pub struct EnteredEnv {
-    cur: Arc<Overlay>,
+    frame: FrameId,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -112,22 +137,35 @@ pub(crate) struct Overlay {
 /// `PhantomData` marker for a `Send` one is an easy, silent regression; this
 /// makes it a build failure.
 ///
-/// The inherent `const` shadows the blanket trait `const` only when `T: Send`,
-/// which is what turns a negative bound — otherwise inexpressible on stable —
-/// into a value.
+/// `!Sync` matters just as much and is easy to overlook: `thread::scope` shares
+/// a `&TestEnv` with a child thread without moving it, so a `Sync` `TestEnv`
+/// would let a worker call `set()` on an overlay whose stack frame belongs to
+/// another thread. `PhantomData<*const ()>` denies both, which is why it is
+/// that marker and not, say, `PhantomData<Cell<()>>`.
+///
+/// The inherent `const` shadows the blanket trait `const` only when the bound
+/// holds, which is what turns a negative bound — otherwise inexpressible on
+/// stable — into a value.
 const _: () = {
     struct Probe<T>(PhantomData<T>);
-    trait MaybeSend {
+    trait Maybe {
         const SEND: bool = false;
+        const SYNC: bool = false;
     }
-    impl<T> MaybeSend for Probe<T> {}
+    impl<T> Maybe for Probe<T> {}
     impl<T: Send> Probe<T> {
         const SEND: bool = true;
     }
+    impl<T: Sync> Probe<T> {
+        const SYNC: bool = true;
+    }
 
     assert!(!Probe::<TestEnv>::SEND, "TestEnv must not be Send");
+    assert!(!Probe::<TestEnv>::SYNC, "TestEnv must not be Sync");
     assert!(!Probe::<EnteredEnv>::SEND, "EnteredEnv must not be Send");
+    assert!(!Probe::<EnteredEnv>::SYNC, "EnteredEnv must not be Sync");
     assert!(Probe::<EnvHandle>::SEND, "EnvHandle must be Send");
+    assert!(Probe::<EnvHandle>::SYNC, "EnvHandle must be Sync");
 };
 
 thread_local! {
@@ -143,26 +181,44 @@ thread_local! {
     /// reintroduced through its own `Drop`. Removing *one's own* entry, wherever
     /// it sits, is correct for any drop order rather than loud about the wrong
     /// ones.
-    static INSTALLED: RefCell<Vec<Arc<Overlay>>> = const { RefCell::new(Vec::new()) };
+    static INSTALLED: RefCell<Vec<(FrameId, Arc<Overlay>)>> = const { RefCell::new(Vec::new()) };
+
+    /// Frame identities are handed out per thread, so the counter is too.
+    static NEXT_FRAME: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Push `o` onto this thread's stack, making it what [`current`] answers.
-fn install(o: &Arc<Overlay>) {
-    INSTALLED.with(|s| s.borrow_mut().push(Arc::clone(o)));
-}
-
-/// Remove the topmost entry that IS `o` (by pointer, not by value).
+/// Which installation a guard is responsible for undoing.
 ///
-/// Topmost, so that entering the same overlay twice on one thread — legal, and
-/// what `env.handle().enter()` on the installing thread does — pops one nesting
-/// level rather than the wrong one.
+/// Distinct from the overlay's identity: one overlay can be installed more than
+/// once on a thread, and each guard must undo its own push.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrameId(u64);
+
+/// Push `o` onto this thread's stack and return the frame's identity.
+fn install(o: &Arc<Overlay>) -> FrameId {
+    let id = NEXT_FRAME.with(|n| {
+        let id = n.get();
+        n.set(id + 1);
+        FrameId(id)
+    });
+    INSTALLED.with(|s| s.borrow_mut().push((id, Arc::clone(o))));
+    id
+}
+
+/// Remove the frame `id` names, wherever it currently sits.
+///
+/// By frame, not by overlay: the same overlay can legitimately appear twice on
+/// one thread — `env.handle().enter()` on the installing thread does exactly
+/// that — and then "the topmost entry holding this overlay" is not necessarily
+/// the entry this guard pushed. Popping the wrong twin would leave a live guard
+/// resolving somebody else's overlay, silently.
 ///
 /// `try_with`, not `with`: a guard dropped during thread teardown, after the
 /// thread-local is gone, must not turn into a second panic.
-fn uninstall(o: &Arc<Overlay>) {
+fn uninstall(id: FrameId) {
     let _ = INSTALLED.try_with(|s| {
         let mut stack = s.borrow_mut();
-        if let Some(i) = stack.iter().rposition(|x| Arc::ptr_eq(x, o)) {
+        if let Some(i) = stack.iter().rposition(|(x, _)| *x == id) {
             stack.remove(i);
         }
     });
@@ -208,9 +264,10 @@ impl TestEnv {
             vars: RwLock::new(vars),
             tmp,
         });
-        install(&cur);
+        let frame = install(&cur);
         TestEnv {
             cur,
+            frame,
             _not_send: PhantomData,
         }
     }
@@ -296,16 +353,15 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        uninstall(&self.cur);
+        uninstall(self.frame);
     }
 }
 
 impl EnvHandle {
     /// Install the same overlay on the calling thread; uninstalls on drop.
     pub fn enter(&self) -> EnteredEnv {
-        install(&self.0);
         EnteredEnv {
-            cur: Arc::clone(&self.0),
+            frame: install(&self.0),
             _not_send: PhantomData,
         }
     }
@@ -313,7 +369,7 @@ impl EnvHandle {
 
 impl Drop for EnteredEnv {
     fn drop(&mut self) {
-        uninstall(&self.cur);
+        uninstall(self.frame);
     }
 }
 
@@ -334,7 +390,7 @@ impl Overlay {
 /// The innermost overlay installed on this thread, if any. The shim's door.
 pub(crate) fn current() -> Option<Arc<Overlay>> {
     INSTALLED
-        .try_with(|s| s.borrow().last().cloned())
+        .try_with(|s| s.borrow().last().map(|(_, o)| Arc::clone(o)))
         .unwrap_or(None)
 }
 
@@ -444,9 +500,29 @@ fn is_forbidden_root(value: &Path, home: &Path, temp_root: &Path) -> bool {
 ///
 /// `$HOME` unset ⇒ nothing to protect ⇒ no check.
 fn refuse_home_root(key: &str, value: &Path) {
-    if key != DATA_KEY && key != CONFIG_KEY {
+    if !GUARDED_KEYS.contains(&key) {
         return;
     }
+
+    // Absolute only, and this check comes first because it is unconditional —
+    // it does not depend on $HOME being set or on where the check happens to
+    // be standing. A relative value cleared against today's working directory
+    // and then STORED relative is a time-of-check/time-of-use hole: set it
+    // while the process sits in /tmp, `chdir` to $HOME, and the same stored
+    // value now names the live data root, having been validated against
+    // somewhere else entirely. Refusing the shape closes that outright, and
+    // costs nothing: every root drovr's tests name is a TempDir path.
+    if value.is_relative() {
+        panic!(
+            "drovr test guard: TestEnv::set({key}, {}) — a root must be an absolute path. \
+             A relative one is resolved against the working directory at USE time, not at \
+             this call, so it can be checked in one place and land in another. Pass an \
+             absolute path: TestEnv::new() already seeded a scratch dir, and \
+             TestEnv::path() is its root.",
+            value.display(),
+        );
+    }
+
     let Some(home) = real_home() else {
         return;
     };
@@ -729,34 +805,75 @@ mod tests {
         );
     }
 
-    /// ...and the check therefore refuses one that lands under `$HOME`.
+    /// ...and a guarded key refuses one outright, whatever it resolves to today.
     ///
-    /// `cargo test` runs with `cli/` as its working directory, so on a checkout
-    /// under `$HOME` — the ordinary case, including this one — a relative value
-    /// names a path inside the real home. Skipped where that premise does not
-    /// hold rather than asserted blind.
+    /// Checking a relative value against the working directory and then storing
+    /// it relative would be a time-of-check/time-of-use hole: `set` in `/tmp`,
+    /// `chdir` to `$HOME`, and the same stored value now names the live data
+    /// root while the check that cleared it looked somewhere else entirely.
+    /// Refusing the shape closes that without needing to reason about it.
     #[test]
-    fn a_relative_root_under_the_real_home_is_refused() {
+    fn a_relative_root_is_refused_outright() {
+        for key in [DATA_KEY, CONFIG_KEY, HOME_KEY] {
+            let env = TestEnv::new();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.set(key, "drovr_relative_probe/data");
+            }))
+            .expect_err("a relative root must be refused");
+            let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("must be an absolute path"), "{key}: {msg}");
+        }
+    }
+
+    /// `HOME` is a root-naming key too, so it is guarded like the XDG pair.
+    ///
+    /// `data_dir()` falls back to `$HOME/.local/share` when `XDG_DATA_HOME` is
+    /// absent, and config resolution has the same fallback. Guarding only the
+    /// XDG pair would leave `unset(XDG_DATA_HOME)` + `set(HOME, <real home>)`
+    /// as an unguarded route to exactly the directory this guard exists for.
+    #[test]
+    fn setting_home_to_the_real_home_is_refused() {
         let Some(home) = real_home() else {
-            eprintln!("skipped: HOME is unset");
+            eprintln!("skipped: HOME is unset, so there is no real home to protect");
             return;
         };
-        let cwd = canonical_ish(&std::env::current_dir().expect("a working directory"));
-        if !is_forbidden_root(
-            &cwd,
-            &canonical_ish(&home),
-            &canonical_ish(&std::env::temp_dir()),
-        ) {
-            eprintln!("skipped: this checkout is not inside $HOME");
-            return;
-        }
         let env = TestEnv::new();
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            env.set(DATA_KEY, "drovr_relative_probe/data");
+            env.set(HOME_KEY, &home);
         }))
-        .expect_err("a relative value must be resolved before the check, not waved through");
+        .expect_err("naming the real home as HOME must be refused");
         let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(msg.contains("inside the real home directory"), "{msg}");
+    }
+
+    /// Each guard uninstalls the frame IT pushed, not merely one that happens
+    /// to carry the same overlay.
+    ///
+    /// `entered` re-installs `outer`'s overlay ON TOP of `inner`, so the stack
+    /// holds that overlay twice. Dropping `outer` must remove `outer`'s own
+    /// frame — the bottom one — and leave the guard's on top; matching by
+    /// overlay identity alone would pop the guard's frame and silently switch
+    /// reads to `inner` while the guard is still live.
+    #[test]
+    fn a_guard_uninstalls_its_own_frame_not_a_twin() {
+        let outer = TestEnv::new();
+        outer.set(PROBE, "outer");
+        let inner = TestEnv::new();
+        inner.set(PROBE, "inner");
+        let entered = outer.handle().enter();
+        assert_eq!(crate::env::var(PROBE).as_deref(), Ok("outer"));
+
+        drop(outer);
+        assert_eq!(
+            crate::env::var(PROBE).as_deref(),
+            Ok("outer"),
+            "the still-live entered guard keeps its own overlay on top",
+        );
+
+        drop(entered);
+        assert_eq!(crate::env::var(PROBE).as_deref(), Ok("inner"));
+        drop(inner);
+        assert!(current().is_none());
     }
 
     #[test]
