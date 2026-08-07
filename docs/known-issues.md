@@ -2105,6 +2105,73 @@ also picks a phase to attach to before failing — it announced `implement-task-
 latest phases are far later — so whatever replaces the TUI path should make the phase-selection
 rule visible rather than inheriting it silently.
 
+## `cargo test` deleted the real `~/.local/share/drovr`, twice (2026-08-06)
+
+**Severity:** critical — it destroyed the run directories of **every** run on the machine
+(~65), including four other agents' in-flight work. No code was lost; git was untouched.
+**Found:** 2026-08-06, run `brainstorm-rework`, during task 3.
+
+### Symptom
+
+`~/.local/share/drovr/` vanished entirely — every run's `spec.md`, `plan.md`, `*-HANDOFF.md`,
+`feedback.json` and `state.json`. drovr then silently recreated an empty data root and carried
+on, so the first visible sign was `drovr phase wait` exiting 1 with
+`failed to load run '<run>': No such file or directory`.
+
+### What is established
+
+It happened **twice**, and both times correlate exactly with a `cargo test` run from the
+`brainstorm-rework` worktree (session timestamps UTC, machine local PDT):
+
+| `~/.local/share` mtime | command |
+| --- | --- |
+| 16:15 | `cargo test --bin drovr ask_cannot` at 16:15:14 |
+| 16:27:10 | `cargo test` (full suite) at 16:27:03 |
+
+No other command in any of the 40 Claude sessions active that day touches the path.
+
+**Ruled out, each with evidence.** `home-manager switch` — it ran three times at 17:21–17:23,
+modified `~/.local/share`, and a canary planted inside `drovr/` survived all three. Mount
+shadowing (`/home` ext4 under the `/home/sauyon` btrfs mount) — a `mount --bind /home` showed
+the underlying directory empty. `drovr cleanup --purge` traversal — `validate_run_name` rejects
+it. The `ask` e2e fixtures — properly `TempDir`-isolated. The archive endpoint — flips a flag,
+does not delete.
+
+### Not reproducible on demand
+
+Each of the seven test binaries was run separately against a planted canary, then the full
+`cargo test` was run: **the canary survived all eight.** So this is an interleaving, not a
+straight-line bug. Two documented hazards in this same file are the likely substrate — "Test
+suite flakes under parallel `cargo test`; needs `--test-threads=1`" and "A panicking test can
+poison `ENV_LOCK` for the whole suite" — and the task was in a **mutation-testing window** at
+the time, deliberately running with guards disabled (`if false && !dir.is_dir()`) to watch them
+fail.
+
+### Root cause that does not depend on finding the test
+
+`data_dir()` (`cli/src/run.rs`) resolves `XDG_DATA_HOME`, **falling back to
+`$HOME/.local/share`**, and `cmd_list` repeats the same fallback inline. Tests redirect it by
+mutating that variable *process-globally* under `ENV_LOCK` — a convention carried in a doc
+comment (`cleanup_scratch`: "Callers must hold `ENV_LOCK`"), enforced by nothing. Any test that
+loses that race resolves the **live** data root instead of a scratch one, and a fallback that
+silently succeeds is what turns a lost race into deletion rather than a failure.
+
+### Fix shape
+
+Make the test path fail closed rather than fall back. A test-only guard — e.g. `data_dir()`
+panicking when a `DROVR_TEST_DATA_ROOT` (or equivalent) is unset under `cfg(test)` — converts
+"quietly operate on the human's data" into "the test fails immediately". That is one
+authoritative mechanism, in place of a convention plus a comment.
+
+Until that lands: **do not run `cargo test` in a drovr worktree while runs you care about
+exist**, and treat run directories as expendable — see the follow-up below.
+
+### The lesson that outlives the bug
+
+**Run directories had no backing store.** `spec.md`, `plan.md` and every handoff lived only
+under `~/.local/share/drovr/`, never in git, so a single bad interleaving erased design work
+that no amount of `git fsck` could bring back. Artifacts worth keeping belong in the repo.
+
 ## Follow-ups
 
 Wanted work that is not a defect — nothing here is broken today.
