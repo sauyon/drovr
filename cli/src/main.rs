@@ -2013,13 +2013,16 @@ fn cmd_review(sub: ReviewCmd) {
             }
             match review_wait(&run, timeout_ms) {
                 Ok(WaitOutcome::Approved) => {
-                    // Approval can carry answers: the reviewer may have answered
-                    // the spec's open questions on the way to approving, and
-                    // feedback.json is the only place those land. Say so, or the
-                    // agent moves on and re-asks the human what they just told us.
-                    println!(
-                        "review approved for run '{run}' (any answers to open questions are in feedback.json)"
-                    );
+                    // This used to add "(any answers to open questions are in
+                    // feedback.json)". A spec no longer HAS open questions — they
+                    // are asked with `drovr ask` and answered one at a time into
+                    // `interview.jsonl` — and the review page no longer submits
+                    // any (`answers: {}`, `cli/web/index.html`). Pointing the
+                    // agent at `feedback.json#answers` on approval now sends it
+                    // to an empty map looking for decisions it already has, and
+                    // contradicts `phase-prompts/brainstorm.md`, which tells it
+                    // outright that question answers never land there.
+                    println!("review approved for run '{run}'");
                 }
                 Ok(WaitOutcome::ChangesRequested) => {
                     println!("review: changes requested for run '{run}' (see feedback.json)");

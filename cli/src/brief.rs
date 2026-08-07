@@ -582,32 +582,78 @@ mod tests {
         );
     }
 
+    /// Every `<...>` on one line of `body`, in order, duplicates included.
+    ///
+    /// Crude on purpose: the templates are prose, and the only thing this has to
+    /// separate is "angle-bracket token" from "not one". A run spanning a newline
+    /// is dropped, because in Markdown that is a stray `<` meeting a block-quote
+    /// `>` two lines down, not a token anyone wrote.
+    fn angle_tokens(body: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(open) = rest.find('<') {
+            let Some(len) = rest[open..].find('>') else { break };
+            let end = open + len + 1;
+            let token = &rest[open..end];
+            if !token.contains('\n') {
+                out.push(token);
+            }
+            rest = &rest[end..];
+        }
+        out
+    }
+
     /// Substitution is an allowlist, never "replace anything in angle brackets".
     ///
-    /// Asserted on a **single line of brainstorm.md that carries both kinds**: the
-    /// `drovr review summary` command, where `<run>` is a placeholder and
-    /// `<one line: what changed since last version>` is the reviewer-facing prompt
-    /// text the agent is meant to replace by hand. Composing that one line is the
-    /// whole distinction, so a regression cannot pass half of it. Pinning the
-    /// composed line whole also refuses the opposite failure — a `<run>` left
-    /// unsubstituted inside a command the agent is told to run verbatim.
+    /// **Derived from the template**, so it pins the rule and not a sentence: the
+    /// non-placeholders are whatever `brainstorm.md` currently carries besides
+    /// `<run>` and `<N>`, and every one of them must survive composition
+    /// verbatim. A reworded placeholder is then just a different token that still
+    /// has to survive — which is the point, since this file has no business
+    /// failing over the prompt's copy-editing.
+    ///
+    /// Both halves, because half of an allowlist is not one. `<run>` must be
+    /// **gone** from the composed brief — the ask directive tells the agent to run
+    /// `drovr ask <run> …` verbatim, and an unsubstituted one there is a command
+    /// that errors — while `<what you need decided>` beside it must remain.
     ///
     /// (This previously pinned `answers[<id>]`, prose about the retired
     /// `questions.json` answer map. That text is gone with the channel; the guard
-    /// is not, so it moved to a non-placeholder that the prompt still carries.)
+    /// is not.)
     #[test]
     fn composition_leaves_non_placeholder_angle_brackets_alone() {
         let _lock = ENV_LOCK.lock().unwrap();
         isolate("composition_leaves_non_placeholder_angle_brackets_alone");
         let run = make_run();
         let brief = compose_phase_brief(&run, "brainstorm", None).unwrap();
+
+        // The editorial comment is stripped before substitution, so tokens inside
+        // it are absent from the brief for an unrelated reason and would report a
+        // failure this test is not about.
+        let mut prose: Vec<&str> = angle_tokens(strip_editorial_comment(BRAINSTORM))
+            .into_iter()
+            .filter(|token| *token != "<run>" && *token != "<N>")
+            .collect();
+        prose.sort_unstable();
+        prose.dedup();
         assert!(
-            brief.contains(&format!(
-                "drovr review summary {} \"<one line: what changed since last version>\"",
-                run.name
-            )),
-            "one line must come out half-substituted — `<run>` replaced, the prose \
-             placeholder beside it untouched: {brief}"
+            !prose.is_empty(),
+            "brainstorm.md carries no angle-bracket prose outside the substituted \
+             placeholders, so the survival assertion below would pass having checked \
+             nothing"
+        );
+
+        for token in &prose {
+            assert!(
+                brief.contains(token),
+                "`{token}` is prose, not a placeholder, and composition ate it — \
+                 substitution must stay an allowlist: {brief}"
+            );
+        }
+        assert!(
+            !brief.contains("<run>"),
+            "an unsubstituted `<run>` reached the agent, inside commands it is told \
+             to run verbatim: {brief}"
         );
     }
 

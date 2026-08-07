@@ -6842,18 +6842,29 @@ fn ask_directive_check_rejects_a_rewording() {
 /// to reach it.
 const RETIRED_QUESTIONS_FILE: &str = "questions.json";
 
-/// Every line of `body` that names `needle`, 1-indexed.
+/// Every `file:line: text` in `files` that names `needle`, case-insensitively.
 ///
-/// A named helper rather than an inline loop so
-/// [`no_phase_prompt_mentions_questions_json`] can run it over a document it
-/// built itself before running it over the repo — see that test's non-vacuity
-/// case.
-fn lines_naming<'a>(body: &'a str, needle: &str) -> Vec<(usize, &'a str)> {
-    body.lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains(needle))
-        .map(|(i, line)| (i + 1, line.trim()))
-        .collect()
+/// `files` is `(display name, body)`, so the caller decides whether the bodies
+/// came off disk or out of the test — which is what lets
+/// [`no_phase_prompt_mentions_questions_json`] run **this whole function**, not
+/// just a fragment of it, over a document it built itself before running it over
+/// the repo.
+///
+/// Case-insensitive because the failure is copy-paste from an older prompt or an
+/// older branch, and a needle that is a filename is exactly the kind of token a
+/// re-typing hand gets the case wrong on. There is no plausible false positive:
+/// nothing else in a phase-prompt spells this word.
+fn mentions_of(needle: &str, files: &[(String, String)]) -> Vec<String> {
+    let needle = needle.to_ascii_lowercase();
+    let mut hits = Vec::new();
+    for (name, body) in files {
+        for (i, line) in body.lines().enumerate() {
+            if line.to_ascii_lowercase().contains(&needle) {
+                hits.push(format!("  {name}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    hits
 }
 
 /// Decision 5 of `docs/interactive-brainstorm.md`: `questions.json` is
@@ -6881,32 +6892,54 @@ fn lines_naming<'a>(body: &'a str, needle: &str) -> Vec<(usize, &'a str)> {
 /// check pass having read nothing.
 #[test]
 fn no_phase_prompt_mentions_questions_json() {
-    // Non-vacuity, through the same code path the repo scan uses below. An
-    // absence check that came back clean because it was looking in the wrong
-    // place, or for a needle it could never match, is indistinguishable from one
-    // that came back clean because the text is gone.
-    let reintroduced = format!(
+    // ONE scanner, closing over the needle, so the canary below and the repo scan
+    // cannot come apart. Passing the needle at each call site instead would leave
+    // the failure this test exists to refuse still reachable: mistype it in the
+    // repo scan only, and the canary keeps passing while the scan matches
+    // nothing — a green absence check that read every file and looked for the
+    // wrong word.
+    let scan = |files: &[(String, String)]| mentions_of(RETIRED_QUESTIONS_FILE, files);
+
+    // The canary: the real scanner, over a document holding the bullet this test
+    // exists to refuse. A clean result over the repo means "the text is gone"
+    // only if a scan that SHOULD fire demonstrably does.
+    //
+    // Spelled out as a LITERAL, deliberately NOT built from
+    // RETIRED_QUESTIONS_FILE. A canary written out of the same const it is
+    // canarying agrees with a typo in that const: misspell it, and the canary's
+    // document carries the misspelling too, the scan finds it, and this check
+    // goes green having searched every phase-prompt for a word that appears in
+    // none of them — while the real bullet sits there. `questions.json` is a
+    // fixed historical filename; hard-coding it here costs nothing and closes
+    // that.
+    let canary = vec![(
+        "canary.md".to_string(),
         "- (Optional) To ask the reviewer multiple-choice questions, write\n  \
-         `~/.local/share/drovr/runs/<run>/{RETIRED_QUESTIONS_FILE}`. It MUST be a bare \
-         JSON array\n"
-    );
+         `~/.local/share/drovr/runs/<run>/questions.json`. It MUST be a bare JSON array\n"
+            .to_string(),
+    )];
     assert_eq!(
-        lines_naming(&reintroduced, RETIRED_QUESTIONS_FILE).len(),
-        1,
-        "the scan below cannot see a reintroduced `{RETIRED_QUESTIONS_FILE}` bullet, so \
-         a clean result over the repo would mean nothing"
+        scan(&canary),
+        vec![
+            "  canary.md:2: `~/.local/share/drovr/runs/<run>/questions.json`. It MUST be \
+             a bare JSON array"
+                .to_string()
+        ],
+        "the scanner did not report a reintroduced `questions.json` bullet exactly as \
+         the repo scan below would, so a clean result there would mean nothing. If \
+         RETIRED_QUESTIONS_FILE was edited, that is the bug this case exists to catch."
     );
 
-    let mut offenders = Vec::new();
-    for path in phase_prompt_files() {
-        let body = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        for (line_no, line) in lines_naming(&body, RETIRED_QUESTIONS_FILE) {
-            offenders.push(format!("  {name}:{line_no}: {line}"));
-        }
-    }
+    let prompts: Vec<(String, String)> = phase_prompt_files()
+        .into_iter()
+        .map(|path| {
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (path.file_name().unwrap().to_string_lossy().into_owned(), body)
+        })
+        .collect();
 
+    let offenders = scan(&prompts);
     assert!(
         offenders.is_empty(),
         "phase-prompt(s) still name the retired `{RETIRED_QUESTIONS_FILE}`:\n{}\n\n\
