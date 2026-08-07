@@ -77,8 +77,8 @@ reviewer. You are NOT implementing anything.
      to fall short of the test.
 
    `~/.local/share/drovr/runs/<run>/interview.jsonl` is the append-only record of everything
-   asked and answered. It is where the alternatives and the reasoning live — which is what
-   lets step 4 be as short as it is.
+   asked and answered — the durable trace of how the design got decided, and what lets step 4
+   be as short as it is.
 
    You have **two** channels to the human and neither is a private chat: the ask channel, for
    the decisions on the way to the spec, and the review gate below (the reviewer responds via
@@ -88,10 +88,15 @@ reviewer. You are NOT implementing anything.
    answers in one click.
 4. **Write the spec** to `~/.local/share/drovr/runs/<run>/spec.md`. It is a **decision
    record**, not a discussion: what was decided, the interfaces and contracts it binds, and
-   what is out of scope. The alternatives you weighed and the reasoning behind each choice are
-   already in `interview.jsonl` and are not retold here — the reviewer is approving decisions,
-   and the plan phase inherits interfaces. Every line that is not a decision, an interface or
-   a scope boundary is a line every later phase has to read past.
+   what is out of scope. The reviewer is approving decisions and the plan phase inherits
+   interfaces, so every line that is none of those three is a line every later phase reads
+   past. The alternatives you weighed and how you got there are not retold here.
+
+   **Write it for a reviewer who was not in the interview** — which may be who you get. The
+   log is on disk and served at `GET /api/runs/<run>/interview`, but the review page does
+   **not** render it: only a still-pending question shows there. So a decision the reviewer
+   could not judge without knowing why gets its reason, in a line. That is not a retelling —
+   the options you rejected and the exploration behind them still stay in the log.
 
    **A spec never carries open questions.** No "Open questions" section, no TBD, no "to be
    decided during implementation". An unresolved question is an ask you have not posted yet:
