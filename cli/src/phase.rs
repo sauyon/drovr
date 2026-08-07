@@ -9250,16 +9250,22 @@ mod capture_tests {
     use super::*;
     use crate::config::AgentLaunch;
     use crate::herdr::{AgentSession, FakeHerdr, PaneInfo, SessionId};
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
 
-    fn capture_run(name: &str) -> RunState {
-        // Caller must hold ENV_LOCK. Mirrors `phase::tests::make_run`.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-capture-test-{name}"));
-            std::env::remove_var(PASS_ENV);
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        let _ = std::fs::remove_dir_all(run_dir(name));
+    /// Mirrors `phase::tests::make_run`; see its doc comment for why the
+    /// `&TestEnv` is the contract and not a decoration.
+    ///
+    /// The old `remove_dir_all` of `/tmp/drovr-capture-test-{name}` is gone with
+    /// the process-global redirect it scrubbed: that root was shared with every
+    /// other run of the suite and every other checkout on the machine
+    /// (`docs/known-issues.md`, "Two test binaries on one machine fight over the
+    /// fixed `/tmp/drovr-*-test-*` scratch roots"). A `TestEnv` root is per-test
+    /// and already empty.
+    fn capture_run(env: &TestEnv, name: &str) -> RunState {
+        // A token or profile left behind by an earlier call under the same
+        // environment would silently change what the code under test sees.
+        env.unset(PASS_ENV);
+        env.unset("CLAUDE_CONFIG_DIR");
         RunState {
             name: name.to_owned(),
             task: "test task".into(),
@@ -9312,9 +9318,9 @@ mod capture_tests {
         // agent is alive; a reaper reading at teardown time would get nothing.
         // So: once captured, a later poll that reports no session — an exited
         // agent — and a poll that fails outright must both LEAVE IT ALONE.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("session-survives");
+        let mut run = capture_run(&env, "session-survives");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9354,7 +9360,7 @@ mod capture_tests {
         // unattributed id cannot be checked at all. None of the three may reach
         // `state.json`, because everything downstream of it treats what it finds
         // there as resumable.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let cases: [(&str, AgentSession); 3] = [
             (
                 "path",
@@ -9370,7 +9376,7 @@ mod capture_tests {
         ];
         for (label, session) in cases {
             let h = FakeHerdr::new();
-            let mut run = capture_run(&format!("unusable-{label}"));
+            let mut run = capture_run(&env, &format!("unusable-{label}"));
             phase_start(&h, &mut run, "plan", None).unwrap();
             let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9403,9 +9409,9 @@ mod capture_tests {
         // 7200 saves. Worse than the I/O: every save is a whole-file write, so a
         // no-op one is a chance to clobber a concurrent writer for nothing.
         use std::os::unix::fs::MetadataExt;
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("save-guard");
+        let mut run = capture_run(&env, "save-guard");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("save-guard").join("state.json");
@@ -9443,9 +9449,9 @@ mod capture_tests {
         // would write an hour-old whole-file snapshot over whatever else the run
         // did meanwhile — the state-clobbering race the wait outcomes were
         // reworked to avoid. So the write goes through freshly loaded state.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("no-clobber");
+        let mut run = capture_run(&env, "no-clobber");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9487,9 +9493,9 @@ mod capture_tests {
         // that sees the pane commonly records only the tab, and the session
         // arrives on a later poll with everything else identical. If the guard
         // says "nothing new" there, the session is never captured at all.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("session-after-tab");
+        let mut run = capture_run(&env, "session-after-tab");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9568,9 +9574,9 @@ mod capture_tests {
         // never reached disk, or the guard sees "nothing new" on every later
         // poll and the session is lost for the life of the phase.
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("save-fails");
+        let mut run = capture_run(&env, "save-fails");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let dir = run_dir("save-fails");
@@ -9617,9 +9623,9 @@ mod capture_tests {
         // transient failure at the moment a session first appears would lose it
         // for the whole phase. A session id does not change again to re-trigger
         // the guard, and this is the only window in which it can be read at all.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("persist-retry");
+        let mut run = capture_run(&env, "persist-retry");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("persist-retry").join("state.json");
@@ -9664,9 +9670,9 @@ mod capture_tests {
         // from what it happens to know: a rebuilt one carries `profile: None`,
         // and the caller's next `run.save()` would write that over the real
         // profile, which is exactly what a resume needs to find the session.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("adopt-from-disk");
+        let mut run = capture_run(&env, "adopt-from-disk");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9704,9 +9710,9 @@ mod capture_tests {
         // already carries exactly this capture, because another writer got there
         // first. Writing anyway would be a whole-file save with nothing to say.
         use std::os::unix::fs::MetadataExt;
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("already-on-disk");
+        let mut run = capture_run(&env, "already-on-disk");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let state = run_dir("already-on-disk").join("state.json");
@@ -9745,9 +9751,9 @@ mod capture_tests {
         // writer rewrote the run). There is nothing to record it against, so the
         // capture is dropped rather than re-creating the phase — and the wait it
         // is running inside must survive it.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("vanished-on-capture");
+        let mut run = capture_run(&env, "vanished-on-capture");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9777,9 +9783,9 @@ mod capture_tests {
         //
         // The fix is the same: poll at the top of the loop, before any branch
         // that can return.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("wait-marker-first");
+        let mut run = capture_run(&env, "wait-marker-first");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         write_handoff(&run, "plan");
@@ -9787,7 +9793,7 @@ mod capture_tests {
 
         // The agent finished before this wait ever started, and the ONLY poll
         // this wait will make is the one carrying the session.
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
 
         assert_eq!(
@@ -9819,9 +9825,9 @@ mod capture_tests {
         // that runs for the whole life of a phase, and so is the loop that
         // actually watches an agent exit. `POLL_INTERVAL` is not injectable
         // here, so the timeout is sized to buy exactly two polls.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("wait-keeps-session");
+        let mut run = capture_run(&env, "wait-keeps-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
 
@@ -9856,9 +9862,9 @@ mod capture_tests {
         // are explicitly TOLD to exit — so they are the panes most certain to have
         // lost their session by the time anything wants it. The readiness gate is
         // the only poll they ever get.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("reviewer-capture");
+        let mut run = capture_run(&env, "reviewer-capture");
         let phase = "review:task-1:1:correctness";
         spawn_reviewer(
             &h,
@@ -9903,9 +9909,9 @@ mod capture_tests {
         //
         // The pane is derived from the phase now, so the mismatch is not
         // expressible. This pins that the derivation picks the RIGHT pane.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("derive-pane");
+        let mut run = capture_run(&env, "derive-pane");
         phase_start(&h, &mut run, "plan", None).unwrap();
         phase_start(&h, &mut run, "implement", None).unwrap();
         let plan_pane = run.phases[0].pane_id().unwrap().to_owned();
@@ -9983,9 +9989,9 @@ mod capture_tests {
         // The lesson, and why this test exists rather than just the fix: when
         // the rule is "attribute from what is on disk", sweep EVERY branch that
         // resolves the value, not the one the reviewer happened to cite.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("legacy-fallback-source");
+        let mut run = capture_run(&env, "legacy-fallback-source");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().unwrap().to_owned();
 
@@ -10025,9 +10031,9 @@ mod capture_tests {
         // by the resume rule's own (correct) logic, and silently never capture
         // the session of the pane MOST certain to have exited by the time
         // anything wants it. So the check is against the phase's own backend.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("cross-backend-reviewer");
+        let mut run = capture_run(&env, "cross-backend-reviewer");
         assert_eq!(run.agent.as_deref(), Some("claude"), "the RUN is claude");
         let phase = "review:task-1:1:correctness";
         spawn_reviewer(
@@ -10068,9 +10074,9 @@ mod capture_tests {
         // that phase would sit there advertising the PREVIOUS pass's
         // conversation as resumable — the one state the clear exists to prevent,
         // reachable on the one path that skips it.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("failed-launch-session");
+        let mut run = capture_run(&env, "failed-launch-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
@@ -10112,9 +10118,9 @@ mod capture_tests {
         // point a resume at a conversation that is no longer this phase's — the
         // one case where clearing is right, and it clears on EVIDENCE of a
         // relaunch, never on a poll's silence.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("new-pass-session");
+        let mut run = capture_run(&env, "new-pass-session");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(attached(&pane, AgentStatus::Idle));
@@ -10155,14 +10161,14 @@ mod capture_tests {
         // pass token is a statement about drovr's own bookkeeping and says
         // nothing about whether the agent is alive — so it must not take the
         // session down with it.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("token-lost-capture");
+        let mut run = capture_run(&env, "token-lost-capture");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
 
         // A lossy writer drops the token from disk; the waiter still holds it.
         let mut lossy = RunState::load("token-lost-capture").unwrap();
@@ -10191,12 +10197,10 @@ mod capture_tests {
         // one profile is invisible to a process holding another. The launch is
         // the only moment the profile is knowable: a later `drovr` may run from a
         // plain shell with none set.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("launch-profile");
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/u/.config/claude-work");
-        }
+        let mut run = capture_run(&env, "launch-profile");
+        env.set("CLAUDE_CONFIG_DIR", "/home/u/.config/claude-work");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             phase_start(&h, &mut run, "plan", None).unwrap();
             spawn_reviewer(
@@ -10217,14 +10221,12 @@ mod capture_tests {
                 "a reviewer is resumed the same way, so it needs the same profile"
             );
         }));
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
+        env.unset("CLAUDE_CONFIG_DIR");
         result.unwrap();
 
         // No profile set → None, which means "whatever the default profile is",
         // exactly as the launch itself inlines nothing.
-        let mut run = capture_run("launch-profile-default");
+        let mut run = capture_run(&env, "launch-profile-default");
         phase_start(&h, &mut run, "plan", None).unwrap();
         assert!(
             run.phases[0]
@@ -10244,9 +10246,9 @@ mod capture_tests {
     /// (`phase::reap_tests`); this pins that the poll is not one of them.
     #[test]
     fn capture_never_reaps_a_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = capture_run("no-reaping");
+        let mut run = capture_run(&env, "no-reaping");
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pane = run.phases[0].pane_id().map(str::to_owned).unwrap();
         h.push_pane_info(session_less(&pane, AgentStatus::Unknown));
@@ -10273,14 +10275,10 @@ mod capture_tests {
         std::fs::write(&hp, "## Objective\nreal handoff\n").unwrap();
     }
 
-    fn agent_signals_done(run: &RunState, phase: &str, token: &PassToken) {
-        unsafe {
-            std::env::set_var(PASS_ENV, token.as_str());
-        }
+    fn agent_signals_done(env: &TestEnv, run: &RunState, phase: &str, token: &PassToken) {
+        env.set(PASS_ENV, token.as_str());
         phase_done(run, phase).unwrap();
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        env.unset(PASS_ENV);
     }
 }
 
@@ -10289,25 +10287,19 @@ mod rehydrate_tests {
     use super::*;
     use crate::herdr::{FakeHerdr, SessionId};
     use crate::run::PhaseAgent;
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
 
     /// A run whose config is the built-in map, whatever the developer's own
     /// `~/.config/drovr/config.toml` says. Rehydrate composes from config, so a
     /// user-configured `resume_flag` would otherwise decide these assertions.
     ///
-    /// Returns the tempdir guard: dropping it removes the config home, so the
-    /// caller must bind it.
-    fn rehydrate_run(name: &str) -> (RunState, tempfile::TempDir) {
-        // Caller must hold ENV_LOCK.
-        let cfg_home = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-rehydrate-test-{name}"));
-            std::env::set_var("XDG_CONFIG_HOME", cfg_home.path());
-            std::env::remove_var(PASS_ENV);
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        let _ = std::fs::remove_dir_all(run_dir(name));
-        let run = RunState {
+    /// The config home is `env.config_root()`, which `TestEnv` already seeds and
+    /// owns for the test's lifetime — so this no longer mints a `TempDir` of its
+    /// own, and no longer returns a guard the caller has to bind.
+    fn rehydrate_run(env: &TestEnv, name: &str) -> RunState {
+        env.unset(PASS_ENV);
+        env.unset("CLAUDE_CONFIG_DIR");
+        RunState {
             name: name.to_owned(),
             task: "test task".into(),
             agent: Some("claude".into()),
@@ -10322,8 +10314,7 @@ mod rehydrate_tests {
             worktree_branch: None,
             archived: false,
             retired_panes: vec![],
-        };
-        (run, cfg_home)
+        }
     }
 
     /// A phase that ran, was captured, and has since had its pane closed —
@@ -10374,8 +10365,8 @@ mod rehydrate_tests {
 
     #[test]
     fn rehydrate_resumes_the_recorded_session_in_a_fresh_tab() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-resume");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-resume");
         run.phases
             .push(reaped_phase("plan", "claude", Some("/tmp/prof"), Some("sess-abc")));
         run.save().unwrap();
@@ -10430,11 +10421,9 @@ mod rehydrate_tests {
         // authenticated under. claude resolves a session beneath
         // `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`, so reading the wrong one
         // silently finds NOTHING and the resume degrades to a blank agent.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-profile");
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/the-servers-profile");
-        }
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-profile");
+        env.set("CLAUDE_CONFIG_DIR", "/tmp/the-servers-profile");
         run.phases.push(reaped_phase(
             "plan",
             "claude",
@@ -10470,9 +10459,7 @@ mod rehydrate_tests {
         run.save().unwrap();
         phase_rehydrate(&h2, &mut run, "replan").unwrap();
         let relaunch = pane_run_call(&h2);
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
+        env.unset("CLAUDE_CONFIG_DIR");
         assert!(
             !relaunch.contains("CLAUDE_CONFIG_DIR"),
             "a phase that recorded no profile is launched under the DEFAULT one, \
@@ -10494,8 +10481,8 @@ mod rehydrate_tests {
         //
         // Same class as #4 — two answers to one question — so it is fixed with
         // ONE predicate at both gates, not a third check.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-impostor");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-impostor");
 
         // (a) the creation gate refuses to mint one in the first place.
         let h = FakeHerdr::new();
@@ -10554,8 +10541,8 @@ mod rehydrate_tests {
         //
         // Such an entry is malformed state (`spawn_reviewer` cannot make one),
         // and the point is not which answer it gets but that it gets ONE.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-one-predicate");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-one-predicate");
         run.review_phases
             .push(reaped_phase("legacy-not-prefixed", "claude", None, Some("s")));
         run.save().unwrap();
@@ -10593,8 +10580,8 @@ mod rehydrate_tests {
         // that can never appear. Bringing an agent back unable to do the one
         // thing it exists for is a worse outcome than refusing, so the
         // predicate refuses — and NOTHING is launched.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-reviewer");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-reviewer");
         run.review_phases.push(reaped_phase(
             "review:task-1:1:security",
             "claude",
@@ -10621,9 +10608,9 @@ mod rehydrate_tests {
 
     #[test]
     fn a_subcommand_backend_is_resumed_after_the_command() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, cfg) = rehydrate_run("rh-subcommand");
-        let dir = cfg.path().join("drovr");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-subcommand");
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -10652,8 +10639,8 @@ mod rehydrate_tests {
 
     #[test]
     fn no_session_reseeds_instead_of_emitting_a_bare_flag() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-noseed");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-noseed");
         let mut p = reaped_phase("plan", "claude", None, None);
         p.handoff_doc = Some("/tmp/seed.md".into());
         run.phases.push(p);
@@ -10694,8 +10681,8 @@ mod rehydrate_tests {
         // codex ships with NEITHER resume field, deliberately: an unverified
         // guess at its argument order composes a wrong command line, where a
         // reseed merely costs the conversation.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-nosurface");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-nosurface");
         run.agent = Some("codex".into());
         let mut p = reaped_phase("plan", "codex", None, Some("sess-cx"));
         p.handoff_doc = Some("/tmp/seed.md".into());
@@ -10724,8 +10711,8 @@ mod rehydrate_tests {
 
     #[test]
     fn rehydrate_refuses_a_phase_that_still_holds_a_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-live");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-live");
         let mut p = Phase::new("plan");
         p.status = PhaseStatus::Running;
         p.set_pane("ws-rh:p7");
@@ -10763,8 +10750,8 @@ mod rehydrate_tests {
         // is in state.json" is not "the phase has an agent to bring back".
         // Rehydrating one would launch a brand-new agent out of pipeline order
         // — under a command that says it recovers an old one.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-placeholder");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-placeholder");
         run.phases.push(Phase::new("plan")); // Pending, no pane, never reaped
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -10800,8 +10787,8 @@ mod rehydrate_tests {
         // The fake reports a session DERIVED from the pane, so a relaunch onto a
         // new pane yields a DIFFERENT id — precisely what a fresh conversation
         // looks like from the outside.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-other-session");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-other-session");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -10857,10 +10844,10 @@ mod rehydrate_tests {
         // away? Here — the one value the whole operation exists to use.
         //
         // Asserted on DISK, because that is where the damage was.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
 
         // (a) the agent comes up, in someone else's conversation.
-        let (mut run, _cfg) = rehydrate_run("rh-keep-unconfirmed");
+        let mut run = rehydrate_run(&env, "rh-keep-unconfirmed");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -10891,7 +10878,7 @@ mod rehydrate_tests {
 
         // (b) and the same when the agent never comes up at all — that path
         // never reaches the confirmation loop, so it is a separate hole.
-        let (mut run, _cfg2) = rehydrate_run("rh-keep-never-ready");
+        let mut run = rehydrate_run(&env, "rh-keep-never-ready");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-stale")));
         run.save().unwrap();
@@ -10946,8 +10933,8 @@ mod rehydrate_tests {
         // and closing it would destroy the very agent they were pointed at.
         // `NeverReady { resuming: true }` keeps its pane for the other half of
         // the rule — drovr observed nothing, and nothing is not evidence.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-give-back");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-give-back");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -11012,8 +10999,8 @@ mod rehydrate_tests {
         // wiring is pinned deterministically rather than by racing a clock: the
         // agent is up on the FIRST poll (readiness returns before it ever tests
         // the deadline), which leaves the shared budget already gone.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-starved-confirm");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-starved-confirm");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -11057,8 +11044,8 @@ mod rehydrate_tests {
         // `a_session_that_shows_up_a_poll_late_is_still_a_confirmed_resume`
         // covers from the other side — there the id eventually arrives; here
         // the budget runs out first.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-no-session-seen");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-no-session-seen");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -11124,8 +11111,8 @@ mod rehydrate_tests {
         // DOES describe the fresh agent — the pane is the phase's, the note
         // tells the operator to `phase send` it, and taking it away would
         // destroy a working agent to satisfy a tidiness rule.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-keep-reseed");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-keep-reseed");
         let mut p = reaped_phase("plan", "claude", None, None); // no session → reseed
         p.handoff_doc = Some("/tmp/seed.md".into());
         run.phases.push(p);
@@ -11170,8 +11157,8 @@ mod rehydrate_tests {
         // the id it was told to resume, that IS the conversation coming back,
         // and it must still be reported as such. Without this, "never claim
         // Resumed" would pass trivially.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-confirmed");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-confirmed");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -11197,8 +11184,8 @@ mod rehydrate_tests {
         // the same one-poll lag that cost reviewers their captured sessions.
         // Confirmation must therefore keep looking until the deadline rather
         // than judging the resume on a single sample.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-late-session");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-late-session");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
         run.save().unwrap();
@@ -11231,8 +11218,8 @@ mod rehydrate_tests {
         // finds no conversation, and errors out or parks. Reporting `Resumed`
         // there would claim "same conversation, same agent" on the strength of
         // a spawn, and hand a driver exit 0 for an agent that was never resumed.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-resume-dead");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-resume-dead");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-stale")));
         run.save().unwrap();
@@ -11306,8 +11293,8 @@ mod rehydrate_tests {
         // none — and this branch had NO coverage at all, which is how the note
         // came to claim "its seed was NOT re-sent" for a phase that never had
         // one to send.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-no-seed");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-no-seed");
         // No session (→ reseed) and no handoff_doc (→ nothing to reseed WITH).
         run.phases.push(reaped_phase("plan", "claude", None, None));
         run.save().unwrap();
@@ -11336,7 +11323,7 @@ mod rehydrate_tests {
 
         // (b) and when it ALSO never becomes ready, the note must not blame a
         // send that never happened.
-        let (mut run, _cfg2) = rehydrate_run("rh-no-seed-stuck");
+        let mut run = rehydrate_run(&env, "rh-no-seed-stuck");
         run.phases.push(reaped_phase("plan", "claude", None, None));
         run.save().unwrap();
         let h2 = FakeHerdr::new();
@@ -11385,8 +11372,8 @@ mod rehydrate_tests {
         // created — `drovr attach <run>` would NOT find it, because
         // `live_agent_pane` skips `Done` phases and `Done` is the usual reason a
         // phase was reaped in the first place.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-not-ready");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-not-ready");
         let mut p = reaped_phase("plan", "claude", None, None); // no session → reseed
         p.handoff_doc = Some("/tmp/seed.md".into());
         run.phases.push(p);
@@ -11453,8 +11440,8 @@ mod rehydrate_tests {
         // nothing happened about a live pane — and the retry that invites is
         // then refused with `HoldsPane`, sending the operator to look at a pane
         // they were just told did not exist.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-stuck-marker");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-stuck-marker");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-sm")));
         run.save().unwrap();
@@ -11494,8 +11481,8 @@ mod rehydrate_tests {
         // that would leave a phase claiming a pane that no longer exists —
         // `rehydratable` then answers `HoldsPane` forever and nothing clears
         // the registration, which is a phase no rehydrate can ever recover.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-surrender");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-surrender");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-s")));
         run.save().unwrap();
@@ -11540,8 +11527,8 @@ mod rehydrate_tests {
         //
         // So the failure is an `Err`, and its text names the one thing that
         // actually clears it.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-stuck-release");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-stuck-release");
         let mut p = reaped_phase("plan", "claude", None, Some("sess-abc"));
         p.set_pane("ws-rh:doomed");
         run.phases.push(p);
@@ -11583,8 +11570,8 @@ mod rehydrate_tests {
         // polling has happened and capture persists through a copy of its own,
         // so the caller's `RunState` is not the state to write back. Same rule
         // as `surrender_unrecordable_pane`.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-released");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-released");
         let mut p = reaped_phase("plan", "claude", None, Some("sess-abc"));
         p.set_pane("ws-rh:doomed");
         run.phases.push(p);
@@ -11625,8 +11612,8 @@ mod rehydrate_tests {
         // The lock is what serializes them, and the RE-READ under it is what
         // makes serializing enough: the loser must see what the winner wrote,
         // or it simply launches second.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-concurrent");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-concurrent");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-c")));
         run.save().unwrap();
@@ -11679,8 +11666,8 @@ mod rehydrate_tests {
         // "Never live-but-unrecorded" is the invariant. When `state.json`
         // cannot be written at all, the only way to keep it is to not leave the
         // pane live.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-unsaveable");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-unsaveable");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-u")));
         run.save().unwrap();
@@ -11736,8 +11723,8 @@ mod rehydrate_tests {
         // marker's token mismatch) and THEN failed to relaunch left a phase
         // neither complete-provable nor running: `phase wait` blocks forever and
         // the only way out is hand-editing the run dir.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-keeps-evidence");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-keeps-evidence");
         let mut p = reaped_phase("plan", "claude", None, Some("sess-e"));
         p.pass = crate::run::PassToken::new("the-pass-that-finished-it".into());
         run.phases.push(p);
@@ -11779,8 +11766,8 @@ mod rehydrate_tests {
         // already replaced the agent record), and it must dispose of its orphan
         // the same way — a pane drovr opened and never recorded is one cleanup
         // protects as the human's, forever, while it blocks `workspace_close`.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-reseed-failed");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-reseed-failed");
         run.phases
             .push(reaped_phase("plan", "claude", None, None)); // no session → reseed
         run.save().unwrap();
@@ -11813,8 +11800,8 @@ mod rehydrate_tests {
         // because both are written only after the launch succeeds. Relaunching
         // it here would be `phase start` under a name that promises recovery,
         // and would silently drop the seed the original call was given.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-failed-start");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-failed-start");
         let mut p = Phase::new("plan");
         p.status = PhaseStatus::Running; // what phase_start persisted…
         run.phases.push(p); // …and then the launch failed.
@@ -11865,8 +11852,8 @@ mod rehydrate_tests {
     fn rehydrate_of_an_unknown_phase_does_not_append_it() {
         // `phase_start` appends any name it is given; rehydrate must not, or a
         // typo (or an HTTP caller) silently creates a phase.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-unknown");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-unknown");
         run.phases.push(reaped_phase("plan", "claude", None, Some("s1")));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -11882,8 +11869,8 @@ mod rehydrate_tests {
     fn rehydrate_clears_the_stale_marker_and_mints_a_new_pass() {
         // The old pass's marker would otherwise complete the next `phase wait`
         // instantly, off work that predates this rehydrate.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-marker");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-marker");
         let mut p = reaped_phase("plan", "claude", None, Some("sess-m"));
         p.pass = crate::run::PassToken::new("old-pass".into());
         run.phases.push(p);
@@ -11916,8 +11903,8 @@ mod rehydrate_tests {
         // Same class as `phase_start`'s: a pane drovr opened and never recorded
         // is one `drovr cleanup` protects as the human's, forever — and it
         // blocks `workspace_close` for the whole run.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-failed-launch");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-failed-launch");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-f")));
         run.save().unwrap();
@@ -11962,8 +11949,8 @@ mod rehydrate_tests {
         // cannot account for — `surrender_misattributed_pane`), or a reap,
         // which has its own triggers and its own tests. Each has its own test;
         // this one pins the success path.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = rehydrate_run("rh-no-close");
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-no-close");
         run.phases
             .push(reaped_phase("plan", "claude", None, Some("sess-n")));
         run.save().unwrap();
@@ -11991,24 +11978,16 @@ mod rehydrate_tests {
 mod reap_tests {
     use super::*;
     use crate::herdr::{FakeHerdr, SessionId};
-    use crate::test_util::ENV_LOCK;
-
+    use crate::test_env::TestEnv;
 
     /// A run set up the way reaping meets one: its own data dir, its own config
     /// dir (so `reap_finished_panes` is the built-in default and not whatever
     /// the developer running the tests has configured), and a root shell that is
-    /// nobody's phase.
-    fn reap_run(name: &str) -> (RunState, tempfile::TempDir) {
-        // Caller must hold ENV_LOCK.
-        let cfg_home = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-reap-test-{name}"));
-            std::env::set_var("XDG_CONFIG_HOME", cfg_home.path());
-            std::env::remove_var(PASS_ENV);
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        let _ = std::fs::remove_dir_all(run_dir(name));
-        let run = RunState {
+    /// nobody's phase. Both roots come from `env`.
+    fn reap_run(env: &TestEnv, name: &str) -> RunState {
+        env.unset(PASS_ENV);
+        env.unset("CLAUDE_CONFIG_DIR");
+        RunState {
             name: name.to_owned(),
             task: "test task".into(),
             agent: Some("claude".into()),
@@ -12023,8 +12002,7 @@ mod reap_tests {
             worktree_branch: None,
             archived: false,
             retired_panes: vec![],
-        };
-        (run, cfg_home)
+        }
     }
 
     /// A finished phase still holding its pane — what reaping exists to find.
@@ -12036,8 +12014,8 @@ mod reap_tests {
         p
     }
 
-    fn write_config(cfg_home: &tempfile::TempDir, body: &str) {
-        let path = cfg_home.path().join("drovr/config.toml");
+    fn write_config(env: &TestEnv, body: &str) {
+        let path = env.config_root().join("drovr/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
@@ -12052,8 +12030,8 @@ mod reap_tests {
     /// The supersession trigger, and the three phases it must leave alone.
     #[test]
     fn a_launch_reaps_the_finished_phases_it_supersedes_and_nothing_else() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-supersede");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-supersede");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         // Failed keeps its pane: that pane is what a human attaches to in order
         // to find out what went wrong.
@@ -12097,8 +12075,8 @@ mod reap_tests {
     /// evidence the run has moved past anything.
     #[test]
     fn a_launch_that_fails_reaps_nothing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-launch-failed");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-launch-failed");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12122,8 +12100,8 @@ mod reap_tests {
     /// not close the pane the launch is about to reuse.
     #[test]
     fn a_launch_never_reaps_the_phase_it_is_re_entering() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-reentry");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-reentry");
         run.phases.push(finished_phase("implement", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12144,9 +12122,10 @@ mod reap_tests {
     /// The opt-out. Everything else about the launch is unchanged.
     #[test]
     fn reaping_is_off_when_the_config_turns_it_off() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, cfg) = reap_run("reap-opt-out");
-        write_config(&cfg, "reap_finished_panes = false\n");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-opt-out");
+        write_config(&env, "reap_finished_panes = false
+");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12179,8 +12158,8 @@ mod reap_tests {
     /// human's, is never closed, and blocks `workspace_close` for the whole run.
     #[test]
     fn a_pane_that_cannot_be_closed_leaves_its_phase_exactly_as_it_was() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-close-fails");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-close-fails");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12216,8 +12195,8 @@ mod reap_tests {
     /// started is unaffected, and `phase_start` still succeeds.
     #[test]
     fn a_reap_that_fails_never_fails_the_phase_that_triggered_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-best-effort");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-best-effort");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12242,8 +12221,8 @@ mod reap_tests {
     /// move the user's view.
     #[test]
     fn a_reap_restores_the_focus_its_close_disturbed() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-focus");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-focus");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12270,8 +12249,8 @@ mod reap_tests {
     /// downgrade.
     #[test]
     fn a_reap_banks_the_session_before_it_closes_the_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-capture");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-capture");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12304,8 +12283,8 @@ mod reap_tests {
     /// Idempotent: the second reap of one phase emits no close at all.
     #[test]
     fn reaping_a_phase_twice_closes_one_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-twice");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-twice");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12337,8 +12316,8 @@ mod reap_tests {
     /// it — `rehydratable` answered `HoldsPane` forever.
     #[test]
     fn a_phase_whose_pane_herdr_has_lost_is_released_by_a_reap() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-lost-pane");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-lost-pane");
         run.phases.push(finished_phase("plan", "ws-rp:p1"));
         run.save().unwrap();
         assert_eq!(
@@ -12379,8 +12358,8 @@ mod reap_tests {
     /// strands a pane that may be perfectly alive.
     #[test]
     fn a_reap_that_cannot_reach_herdr_changes_nothing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-unreadable");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-unreadable");
         run.phases.push(finished_phase("plan", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12407,8 +12386,8 @@ mod reap_tests {
     /// when its last pane closes, so this one takes the run with it.
     #[test]
     fn a_reap_refuses_the_workspaces_root_shell() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-root");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-root");
         // Only a `state.json` from the build where the first phase claimed the
         // root pane looks like this. Such a run still loads and still works.
         run.phases.push(finished_phase("plan", "ws-rp:root"));
@@ -12432,8 +12411,8 @@ mod reap_tests {
     /// review server rehydrates from another process meanwhile.
     #[test]
     fn a_reap_reads_the_run_from_disk_before_it_decides() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-stale-copy");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-stale-copy");
         run.phases.push(finished_phase("plan", "ws-rp:old"));
         run.save().unwrap();
 
@@ -12471,8 +12450,8 @@ mod reap_tests {
             }
         }
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("reap-unsaveable");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "reap-unsaveable");
         run.phases.push(finished_phase("plan", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12518,8 +12497,8 @@ mod reap_tests {
     /// reaping exists to stop.
     #[test]
     fn a_retired_pane_is_closed_by_the_sweep() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-closes");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-closes");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12543,8 +12522,8 @@ mod reap_tests {
     /// close it, and refuse `workspace_close` for the whole run.
     #[test]
     fn a_retired_pane_that_cannot_be_closed_stays_recorded() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-close-fails");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-close-fails");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12572,8 +12551,8 @@ mod reap_tests {
     /// nothing left to probe, let alone close.
     #[test]
     fn sweeping_twice_closes_one_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-twice");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-twice");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12604,8 +12583,8 @@ mod reap_tests {
     /// retirement list. herdr destroys a workspace when its last pane closes.
     #[test]
     fn the_sweep_never_closes_the_workspaces_root_shell() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-root");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-root");
         // Only a `state.json` from the build where the first phase claimed the
         // root pane reaches this: releasing or surrendering that phase retires
         // the pane it was holding, which is the root shell.
@@ -12633,8 +12612,8 @@ mod reap_tests {
     /// It is also the guard against herdr reissuing a closed pane's id.
     #[test]
     fn the_sweep_leaves_a_pane_a_phase_still_records() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-still-held");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-still-held");
         run.phases.push(finished_phase("implement", "ws-rp:p1"));
         run.retire_pane("ws-rp:p1");
         run.save().unwrap();
@@ -12660,8 +12639,8 @@ mod reap_tests {
     /// that clears a phase's registration.
     #[test]
     fn a_retired_pane_herdr_has_lost_is_forgotten_without_a_close() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-lost");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-lost");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12688,8 +12667,8 @@ mod reap_tests {
     /// pane that may be perfectly alive.
     #[test]
     fn a_sweep_that_cannot_reach_herdr_forgets_nothing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-unreadable");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-unreadable");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12711,8 +12690,8 @@ mod reap_tests {
     /// bookkeeping.
     #[test]
     fn a_sweep_restores_the_focus_its_close_disturbed() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-focus");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-focus");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12737,8 +12716,8 @@ mod reap_tests {
     /// panel retires panes from its own stale snapshot.
     #[test]
     fn a_sweep_reads_the_run_from_disk_before_it_decides() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-stale-copy");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-stale-copy");
         run.save().unwrap();
 
         // Another process retired a pane this copy has never heard of.
@@ -12764,8 +12743,8 @@ mod reap_tests {
     /// supersession reap: a launch is the run provably moving on.
     #[test]
     fn a_launch_sweeps_the_runs_retired_panes() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-on-launch");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-on-launch");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12783,8 +12762,8 @@ mod reap_tests {
     /// anything must not turn a started phase into a failed command.
     #[test]
     fn a_sweep_that_fails_never_fails_the_phase_that_triggered_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, _cfg) = reap_run("sweep-best-effort");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-best-effort");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12806,9 +12785,10 @@ mod reap_tests {
     /// close.
     #[test]
     fn sweeping_is_off_when_the_config_turns_reaping_off() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (mut run, cfg) = reap_run("sweep-opt-out");
-        write_config(&cfg, "reap_finished_panes = false\n");
+        let env = TestEnv::new();
+        let mut run = reap_run(&env, "sweep-opt-out");
+        write_config(&env, "reap_finished_panes = false
+");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
