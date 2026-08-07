@@ -2038,13 +2038,15 @@ mod tests {
     /// no longer able to see each other's root.
     ///
     /// The observation is deliberately one-way: a thread counts only the
-    /// iterations where `data_dir()` did NOT start with the root that same
-    /// thread had just set. Zero means no thread ever saw another's root; any
+    /// iterations where `data_dir()` was NOT exactly `<its own root>/drovr`.
+    /// Equality, not a prefix — `data_dir()` is defined as precisely that
+    /// join, and a prefix test would also accept a root nested *under* this
+    /// thread's own. Zero means no thread ever saw another's root; any
     /// non-zero count is the race, caught in the act. Both threads' counts are
     /// reported, because "which side lost" varies run to run and neither is
     /// the interesting fact.
     ///
-    /// # Nothing panics while `ENV_LOCK` is held
+    /// # Every panic on a path this test takes is ordered outside `ENV_LOCK`
     ///
     /// This test is *supposed* to fail, so its failure path is a path it takes
     /// every time — not an edge case. Both of its panics are therefore pushed
@@ -2052,7 +2054,9 @@ mod tests {
     /// `Result`s rather than unwrapped in place, `XDG_DATA_HOME` is restored
     /// the way [`data_dir_refuses_to_resolve_inside_the_real_home`] restores
     /// it, and the guard is dropped explicitly — and only *then* is anything
-    /// asserted or unwrapped.
+    /// asserted or unwrapped. The scratch roots are built *before* the lock is
+    /// taken for the same reason, so `tempdir()` failing cannot poison it
+    /// either.
     ///
     /// The order matters both ways. A panic under the guard poisons `ENV_LOCK`
     /// for every other test in the process, turning one honest failure into a
@@ -2063,6 +2067,12 @@ mod tests {
     /// `data_dir` calls [`refuse_home_data_root`], which is a `panic!` — so
     /// `join`'s `Err` has to survive to the far side of the cleanup rather
     /// than short-circuit it.
+    ///
+    /// What is left under the guard is `thread::spawn` itself, which panics
+    /// only if the OS refuses a thread. That is an unrecoverable setup failure
+    /// rather than an outcome this test reports, and there is nowhere earlier
+    /// to move it: the spawned closures are what must run under the lock.
+    /// Poisoning on that path is accepted, deliberately and narrowly.
     #[test]
     #[ignore = "demonstrates the race this branch removes; un-ignored at T13"]
     fn data_root_is_not_shared_between_threads() {
@@ -2070,15 +2080,18 @@ mod tests {
         /// `docs/test-isolation/race-red.txt` for the observed failure ratio.
         const ITERATIONS: usize = 20_000;
 
-        let lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("XDG_DATA_HOME").ok();
-
-        // Held to the end of the test: dropping a `TempDir` deletes it, and a
-        // thread still resolving under a deleted root proves nothing.
+        // Built before the lock is taken: `tempdir()` touches no environment
+        // variable, and its `expect` is one more panic that would otherwise
+        // land inside the critical section. Held to the end of the test —
+        // dropping a `TempDir` deletes it, and a thread still resolving under
+        // a deleted root proves nothing.
         let dirs: Vec<tempfile::TempDir> = (0..2)
             .map(|_| tempfile::tempdir().expect("scratch data root"))
             .collect();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(dirs.len()));
+
+        let lock = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
 
         let handles: Vec<_> = dirs
             .iter()
