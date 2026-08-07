@@ -196,14 +196,6 @@ impl RunPaths {
     fn cancelled(&self) -> PathBuf {
         self.dir.join("cancelled")
     }
-    /// Deleted in T6, together with the panel that reads it — not here. The
-    /// page's `refresh()` fetches this route and `.catch(() => [])`s a failure,
-    /// so removing it ahead of its reader renders an empty questions panel
-    /// instead of an error: the same silent-degradation defect
-    /// [`handle_get_interview`] answers 500 to avoid, one panel over.
-    fn questions(&self) -> PathBuf {
-        self.dir.join("questions.json")
-    }
     fn review_state(&self) -> PathBuf {
         self.dir.join("review.state.json")
     }
@@ -746,13 +738,6 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
         (Method::Get, "summary") => {
             let text = fs::read_to_string(p.summary()).unwrap_or_default();
             respond_str(req, 200, "text/plain; charset=utf-8", text);
-        }
-
-        // GET questions — questions.json (or empty array). Retired in T6 with
-        // the panel that reads it; see `RunPaths::questions`.
-        (Method::Get, "questions") => {
-            let body = fs::read_to_string(p.questions()).unwrap_or_else(|_| "[]".into());
-            respond_str(req, 200, "application/json", body);
         }
 
         // GET interview — the folded interview.jsonl (see [`handle_get_interview`]).
@@ -4165,31 +4150,24 @@ mod tests {
         assert_eq!(body, "v2", "post-submit revision must diff against v2");
     }
 
-    #[test]
-    fn questions_empty_when_no_file() {
-        let tmp = make_root("questions");
-        make_run(tmp.path(), "r", b"# Spec");
-        let addr = start_server(tmp.path().to_path_buf());
-
-        let (status, body) = http_get(&addr, "/api/runs/r/questions");
-        assert_eq!(status, 200);
-        assert_eq!(body.trim(), "[]");
-    }
-
-    #[test]
-    fn questions_served_when_file_present() {
-        let tmp = make_root("questions-present");
-        let dir = make_run(tmp.path(), "r", b"# Spec");
-        let q_json = r#"[{"id":"q1","prompt":"Which?","options":[{"value":"a","label":"A"}]}]"#;
-        fs::write(dir.join("questions.json"), q_json).unwrap();
-        let addr = start_server(tmp.path().to_path_buf());
-
-        let (status, body) = http_get(&addr, "/api/runs/r/questions");
-        assert_eq!(status, 200);
-        assert!(body.contains("q1"), "body={body}");
-    }
-
     // ---- the interview channel: GET interview / POST answer ----------------
+
+    #[test]
+    fn the_retired_questions_route_is_gone_not_quietly_empty() {
+        // `GET questions` and the panel that read it were deleted together. The
+        // page's `refresh()` used to `.catch(() => [])` this route, so a 200
+        // serving `[]` from a route nobody reads and a 404 are indistinguishable
+        // from the browser — but they are not the same to whatever else might
+        // still be pointed at it, and a live route is a reader waiting to happen.
+        let tmp = make_root("questions-retired");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("questions.json"), r#"[{"id":"q1","prompt":"Which?"}]"#).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_get(&addr, "/api/runs/r/questions");
+        assert_eq!(status, 404, "body={body}");
+        assert!(!body.contains("q1"), "must not serve the file either: {body}");
+    }
 
     #[test]
     fn interview_is_empty_array_when_no_log() {

@@ -78,9 +78,8 @@ fn http_get_ok(addr: &str, path: &str) -> bool {
 }
 
 /// The fixture the driver's assertions are written against: five runs so the
-/// list has something to move over and re-sort, one carrying the three open
-/// questions AND the three interview asks the detail-view checks answer, and one
-/// with no spec at all.
+/// list has something to move over and re-sort, one carrying the three interview
+/// asks the detail-view checks answer, and one with no spec at all.
 fn seed_runs(runs_root: &PathBuf) {
     // A run whose gate was never opened, so it has NO spec.md at all — the state
     // a run sits in between `drovr new` and the first `review summary`. The
@@ -192,13 +191,6 @@ fn seed_runs(runs_root: &PathBuf) {
     .unwrap();
     fs::write(alpha.join("summary.txt"), "spec drafted and ready for review").unwrap();
     fs::write(alpha.join("review.state.json"), r#"{"state":"ready","turn":0}"#).unwrap();
-    fs::write(
-        runs_root.join("alpha-deploy").join("questions.json"),
-        r#"[{"id":"cache","prompt":"Which cache backend should the deploy use?","options":[{"value":"redis","label":"Redis","recommended":true},{"value":"memory","label":"In-memory"},{"value":"none","label":"No cache"}]},
- {"id":"retry","prompt":"Retry policy on a failed rollout?","options":[{"value":"exp","label":"Exponential backoff"},{"value":"fixed","label":"Fixed 5s"}]},
- {"id":"notes","prompt":"Anything else the plan phase should know?","options":[]}]"#,
-    )
-    .unwrap();
     // The interview channel (`drovr ask`), which the detail-view checks answer.
     // This is `append_ask`'s ON-DISK shape, where field PRESENCE is the
     // discriminator: an unanswered ask carries no `answer`/`answered_at` key at
