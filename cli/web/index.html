@@ -1983,13 +1983,18 @@ function needsWrittenFeedback(feedbackVal) {
 // what reaches the log.
 var OTHER_SENTINEL = '__drovr_other__';
 
-// The KIND of the two answer rows that are not options, carried as a
-// machine-readable attribute — `data-row-kind` — and deliberately NOT as the
-// `.interview-row-*` CSS classes those rows also have. activateCursorRow reads a
-// row's BEHAVIOUR off this, and the classes exist to style it: keyed on the
-// class, a stylesheet rename by someone who never opens this JS would silently
-// change what Enter does on that row. This is the counterpart of the `data-value`
-// the option rows already carry.
+// The KIND of an answer row, carried as a machine-readable attribute —
+// `data-row-kind` — and deliberately NOT as the `.interview-row-*` CSS classes
+// those rows also have. activateCursorRow reads a row's BEHAVIOUR off this, and
+// the classes exist to style it: keyed on the class, a stylesheet rename by
+// someone who never opens this JS would silently change what Enter does.
+//
+// EVERY row carries one, options included. Inferring "option" from the absence of
+// the attribute would make it a kind by convention — a third state nothing
+// declares, that every future handler has to know about and the next row type
+// added would silently join. `data-value` stays, but as the option's PAYLOAD
+// only; this attribute is the single thing that says what a row is.
+var ROW_KIND_OPTION = 'option';
 var ROW_KIND_OTHER = 'other';
 var ROW_KIND_SUBMIT = 'submit';
 function rowKind(el) { return el.getAttribute('data-row-kind'); }
@@ -2101,7 +2106,8 @@ function renderInterview(asks) {
   opts.forEach(function(o, i) {
     var inputId = 'iv_opt_' + i;
     var isRec = recIsOption && o.value === ask.recommend;
-    html += '<div class="interview-row" data-value="' + escHtml(o.value) + '">';
+    html += '<div class="interview-row" data-row-kind="' + ROW_KIND_OPTION +
+            '" data-value="' + escHtml(o.value) + '">';
     html += '<input type="radio" id="' + inputId + '" name="iv_answer" value="' +
             escHtml(o.value) + '"' + (isRec ? ' checked' : '') + '>';
     html += '<label for="' + inputId + '">' + escHtml(o.label);
@@ -3665,9 +3671,10 @@ var listFetchSeq = 0;
 var INTERVIEW_ROW_SEL = '#interview-area .interview-row';
 // The option rows alone, which is a different index space: `1`-`9` count options,
 // and counting the free-text and submit rows among them would put a digit on a
-// row with no option to pick. `data-value` is on option rows only — see
-// renderInterview.
-var INTERVIEW_OPTION_SEL = INTERVIEW_ROW_SEL + '[data-value]';
+// row with no option to pick. Selected by KIND, the same attribute
+// activateCursorRow branches on, so the digits and Enter can never disagree about
+// what an option row is.
+var INTERVIEW_OPTION_SEL = INTERVIEW_ROW_SEL + '[data-row-kind="option"]';
 
 // Rows inside a COLLAPSED "Completed" group are deliberately excluded: they are
 // not on screen, and j/k must never park the cursor somewhere invisible. The two
@@ -3823,11 +3830,15 @@ function activateCursorRow() {
   if (!currentRun) { location.hash = el.getAttribute('href'); return; }
   var kind = rowKind(el);
   if (kind === ROW_KIND_SUBMIT) { submitAnswer(); return; }
-  // Checked BEFORE the radio below, not after: the free-text row carries both a
+  // Checked BEFORE the option branch, not after: the free-text row carries both a
   // radio and the box, and activating it has to reach the box — selecting its
   // radio and stopping would arm an empty custom answer that submitAnswer then
   // refuses.
   if (kind === ROW_KIND_OTHER) { focusCustomAnswer(); return; }
+  // Every kind is named, so an unrecognised one does nothing rather than falling
+  // into whichever branch happens to be last. A row type added without a case
+  // here is inert, which is visible; picking a radio it did not mean to is not.
+  if (kind !== ROW_KIND_OPTION) return;
   var radio = el.querySelector('input[type="radio"]');
   if (!radio) return;
   radio.checked = true;
