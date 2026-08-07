@@ -9261,6 +9261,13 @@ mod capture_tests {
     /// (`docs/known-issues.md`, "Two test binaries on one machine fight over the
     /// fixed `/tmp/drovr-*-test-*` scratch roots"). A `TestEnv` root is per-test
     /// and already empty.
+    ///
+    /// What that trades away, stated so the next author does not have to find it:
+    /// two calls in ONE test now share a root, where the old per-call redirect
+    /// gave each its own. Calling this twice with the SAME `name` therefore
+    /// inherits the first run's `state.json` instead of a scrubbed directory.
+    /// Every caller here passes distinct names; give a second call a distinct
+    /// name too, rather than reintroducing a scrub.
     fn capture_run(env: &TestEnv, name: &str) -> RunState {
         // A token or profile left behind by an earlier call under the same
         // environment would silently change what the code under test sees.
@@ -10296,6 +10303,10 @@ mod rehydrate_tests {
     /// The config home is `env.config_root()`, which `TestEnv` already seeds and
     /// owns for the test's lifetime — so this no longer mints a `TempDir` of its
     /// own, and no longer returns a guard the caller has to bind.
+    ///
+    /// Two calls in one test share that config home and the data root, so a
+    /// repeated `name` inherits the earlier run rather than a scrubbed
+    /// directory — see `capture_tests::capture_run` for the full note.
     fn rehydrate_run(env: &TestEnv, name: &str) -> RunState {
         env.unset(PASS_ENV);
         env.unset("CLAUDE_CONFIG_DIR");
@@ -11984,6 +11995,9 @@ mod reap_tests {
     /// dir (so `reap_finished_panes` is the built-in default and not whatever
     /// the developer running the tests has configured), and a root shell that is
     /// nobody's phase. Both roots come from `env`.
+    ///
+    /// Two calls in one test share those roots, so a repeated `name` inherits
+    /// the earlier run — see `capture_tests::capture_run` for the full note.
     fn reap_run(env: &TestEnv, name: &str) -> RunState {
         env.unset(PASS_ENV);
         env.unset("CLAUDE_CONFIG_DIR");
@@ -12124,8 +12138,7 @@ mod reap_tests {
     fn reaping_is_off_when_the_config_turns_it_off() {
         let env = TestEnv::new();
         let mut run = reap_run(&env, "reap-opt-out");
-        write_config(&env, "reap_finished_panes = false
-");
+        write_config(&env, "reap_finished_panes = false\n");
         run.phases.push(finished_phase("brainstorm", "ws-rp:p1"));
         run.save().unwrap();
         let h = FakeHerdr::new();
@@ -12787,8 +12800,7 @@ mod reap_tests {
     fn sweeping_is_off_when_the_config_turns_reaping_off() {
         let env = TestEnv::new();
         let mut run = reap_run(&env, "sweep-opt-out");
-        write_config(&env, "reap_finished_panes = false
-");
+        write_config(&env, "reap_finished_panes = false\n");
         run.retire_pane("ws-rp:p9");
         run.save().unwrap();
         let h = FakeHerdr::new();
