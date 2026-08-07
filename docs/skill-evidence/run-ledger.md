@@ -87,6 +87,7 @@ blank line between two rows cannot quietly end the table and leave the check val
 | remeasure-systematic-debugging | REFACTOR re-tests (`systematic-debugging`) | 0 | 99 | 20 | no |
 | cross-model-arm | **cross-model (qwen) — UNMETERED, not a §7.3 row** | 72 | 171 | 72 (this stage only) | **YES — exactly at 72 of 72; 2 runs recorded as nulls** |
 | cross-model-arm | **cross-model (opus) — not a §7.3 row** | 16 | 187 | 20 (this stage only) | no |
+| 21 | `ab-voice` — the §7.4 voice probe | 24 | 211 | 24 | **exactly at 24 of 24** |
 
 **Task 6's 10 runs, in detail:** 5 skills × 1 `dev` scenario × 2 samples, arm A text, model
 `sonnet`, foreground `general-purpose` subagents. **Zero retries** — all 10 probes returned a
@@ -675,3 +676,37 @@ this file has drawn since Task 17.
 closed. The three §7.3 arm rows remain at their ceilings, unchanged by this stage — it did not
 touch them. **Nothing further is authorised**: the header's own rule is that raising either
 ceiling for a phase after `cross-model-arm` requires its own escalation.
+
+---
+
+## 2026-08-07 — the run-count ceiling is LIFTED, and `ab-voice` runs at full n
+
+**The paragraph immediately above is stale and is kept rather than edited**, because it recorded
+what was true when it was written and this file is append-only. What changed: **the human lifted
+the run-count ceiling entirely on 2026-08-07.** `plan.md` C3 and §9.3 were edited to match — §9.3
+now *reports* the cumulative total instead of testing it against a limit. So the escalation that
+paragraph demands is not owed; there is no number left to raise.
+
+**`ab-voice`: 24 of 24, zero retries.** 4 register variants (`V0`–`V3`) × 2 held-out scenarios
+(`verification-before-completion-2/-3`) × 3 samples, on `sonnet`, per `voice.md`'s
+pre-registration. Fresh `general-purpose` subagents, each writing only its own transcript. This is
+Task 21's stage, run inside Task 22 because Task 21 never happened — recorded here as the
+irregularity it is, and in `voice.md` and `task22-report.md` at more length.
+
+**Cumulative: 187 + 24 = 211**, of which **139 are metered**. Both numbers are past the old 191
+and 119. That is the ceiling being lifted, not a ceiling being crossed, and it is why
+`cli/tests/skills_valid.rs` no longer carries `RUN_CEILING` or `METERED_RUN_CEILING`.
+
+**What was removed and what was NOT.** The two cap comparisons are gone from `check_ledger`. The
+**arithmetic is untouched**: `run_ledger_cumulative_is_a_running_total` still recomputes the
+cumulative column, so a dropped, duplicated or inflated row still fails. Its negative test was
+rewritten in the same change — the two ceiling-crossing cases were replaced by a dropped-row case,
+an inflated-count case, and a large-but-correct table that would fail if any size limit came back
+by accident. `UNMETERED_MARKER` also stays: the metered split is still recorded per row and still
+asserted by `cross_model_grid_matches_its_own_verdicts`. **A cap and its negative test were
+removed together**, so re-adding one means re-adding the other.
+
+**Scorers are still not charged.** Two blind `sonnet` scorers ran over 12 transcripts each, from
+sealed directories holding only the transcripts and a hash-verified copy of `scoring-rubric.md`.
+Neither knew the other existed. A scorer re-reading an existing transcript produces no new
+measurement, which is the distinction this file has drawn since Task 17.

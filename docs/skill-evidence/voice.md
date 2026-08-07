@@ -188,18 +188,191 @@ the blinding limitation, and the transcripts' location under
 section — that text is the pre-registration, and editing it retroactively is the exact failure the
 pre-registration exists to prevent.
 
-### Task 22 looked here and found nothing — 2026-08-07
+**The heading above is the pre-registration's, and nothing above this line has been edited.**
+What follows is the run.
 
-**This note is Task 22's, not Task 21's, and it is not data.** It is here so a reader who lands on
-this file alone does not have to work out whether the placeholder above is stale.
+### Ran 2026-08-07, inside Task 22 — and who ran it is itself a limitation
 
-Task 22 is the task that applies the outcome. It ran, read this section, and **applied no register
-change to any of the five documents**, because there is no outcome to apply. Corroborated three
-ways beyond the placeholder itself: `docs/skill-evidence/transcripts/voice/` does not exist,
-`run-ledger.md` carries no `ab-voice` row, and `git log --follow` on this file shows only the two
-pre-registration commits with no results commit after them.
+**Task 21 never happened.** When Task 22 opened this file it still read *"NOTHING HAS BEEN RUN"*,
+`docs/skill-evidence/transcripts/voice/` did not exist, and `run-ledger.md` had no `ab-voice` row.
+The human's instruction on 2026-08-07 was to run the pre-registered design at full n rather than
+close the run with a null, and the run-count ceiling had already been lifted, so no authorisation
+was outstanding.
 
-The instrument is built and unused: `V0`–`V3` exist, are hash-pinned in `arms/MANIFEST.md`, and
-pass all five separability checks. Running the probe now costs 24 runs against a ledger whose
-closing note reads *"Nothing further is authorised"*, so it needs a human's ceiling raise. Nothing
-above this heading has been edited. See `task22-report.md`.
+**The separation this file demanded was therefore not available.** The pre-registration says, under
+*Who applies the outcome*: *"Not Task 21… **Task 22** applies the result, so a surprising number
+cannot be quietly folded into a rewrite by the agent that measured it."* One agent did both.
+**Recorded as a real weakening of the design, not waved through** — with two things that limit the
+damage, neither of which is a substitute for the separation:
+
+1. **The outcome that fired requires no rewrite at all** (below), so there was no rewrite for a
+   surprising number to be folded into.
+2. **The numbers are reconstructible from committed artifacts without trusting this file.**
+   `transcripts/voice/` holds all 24 assembled transcripts, `blind-map.json` and `scores.json`;
+   the verdicts were written by two scorers that never saw the blind map, and the join is
+   arithmetic anyone can redo.
+
+### Method
+
+**24 runs, zero retries.** 4 variants × 2 held-out scenarios × 3 samples, `sonnet`, fresh
+`general-purpose` subagents. Ledger row: `21 | ab-voice | 24 | 211`.
+
+**HALT condition cleared before any probe ran.** All four variants `git hash-object`-verified
+against `arms/MANIFEST.md`: V0 `c835dc8b…`, V1 `84f693b9…`, V2 `a8a3cb02…`, V3 `24e20426…`. All
+four matched. The `voice` rows are among the few whose *source path* column and hashed file are
+the same file, so this is a real check and not the trap described in `task22-report.md`.
+
+**Prompt assembly, verified whole-file.** Eight prompt files (4 variants × 2 scenarios), each =
+the arm-invariant harness preamble, the variant verbatim between `----- BEGIN SKILL -----` /
+`----- END SKILL -----`, and the scenario body — frontmatter stripped, so `correct_option` never
+entered a probe's prompt — between `----- BEGIN SITUATION -----` / `----- END SITUATION -----`.
+Prompt files carry neutral names `q1`–`q8` and the variant→file assignment is deliberately not in
+file order.
+
+A verifier re-extracted every region and `git hash-object`-compared it to the variant snapshot and
+the scenario body, **and additionally compared the whole file to a re-assembly from those same
+parts**. The whole-file check was added after the region-only check was watched **fail to notice**
+a stray line appended after `----- END SITUATION -----`: a region check cannot see anything
+outside its own delimiters, which is exactly where an unblinding cue would sit. Both the
+not-found path and the whole-file path were then confirmed to fire on a deliberately corrupted
+file. Final state: **8 of 8 files, every region and every whole file matched.**
+
+**The harness preamble could not be hash-verified against the original.** It was reconstructed
+verbatim from the blockquote `tdd.md` records, because the file itself
+(`5a6a5d3d68eaf2fe17d02f160bc37d064f38d414`) lived in the run directory a drovr test bug
+destroyed. It is arm-invariant and identical across all four variants here, so it cannot bias one
+variant against another — but this stage cannot claim the byte-identity with Tasks 6/16/17/18 that
+those stages claim with each other. Stated, not skipped.
+
+**No meta-test was asked.** Task 6's two-block variant of §1.3 is used instead: `## Forced choice`,
+`## Scenario`, `## Response`. The meta-test question asks *how the skill should have been written*
+— a question about the document, which is the thing that varies between these arms, so its answers
+are not comparable across arms the way a compliance verdict is; and the pre-registered decision
+rule does not use `meta_test_clear`. Every verdict therefore records `meta_test_clear: false`,
+meaning **unasked**, exactly as Task 6's RED rows do. One cell (`39cd8a`) was asked before this
+was settled and its `## Meta-test` block was dropped at assembly — recorded here rather than left
+as an undocumented asymmetry.
+
+**Scoring was sealed and split.** Two blind `sonnet` scorers, 12 transcripts each, neither aware
+the other existed. Each sealed directory held only its transcripts and a copy of
+`scoring-rubric.md` verified identical to `skills/writing-skills/references/scoring-rubric.md`
+(`1a2b1c552071192bcbeb5660ead5ef492b43275f`). `blind-map.json` was **not** in either directory.
+Verdicts were written outside the evidence tree and joined afterwards.
+
+**Sandbox held.** After all 24 runs `git status` showed no tracked file modified by any probe.
+
+### Positive controls
+
+**1. Each probe reported facts derivable only from the text it was given.** The triple Tasks
+16–18 used (`description:`, last line, line count) **does not work here and was replaced** — all
+four variants share one frontmatter (`voice_variants_share_one_frontmatter` enforces it) and one
+last line, and the line counts tie in pairs (V0/V2 = 189, V1/V3 = 193). The replacement is the
+last non-empty line of `## Overview` (V1's unity line, V3's moral line, V0/V2's shared line) plus
+the first sentence of the `**Fresh** is defined here` paragraph (`both halves bind` for V0/V1/V3,
+`both halves MUST hold` for V2). Together these separate all four.
+
+**20 of 24 cells reported the exact variant. 4 reported to the correct pair.** Those four
+(`c6fc01`, `d3c7c8`, `1aef49`, `56b66b`) returned the last line of Overview's *first* paragraph
+rather than the section's; all four are V1 or V3, whose Overview has two paragraphs. `d3c7c8` was
+re-asked and returned the unity line with `paras=2`, confirming V1 — so the pattern is a reading
+of the question, not a wrong arm. **Line count was again a soft field**: 181, 189, 190 and 191
+were all reported for V2's 189. Do not use it as a sole discriminator; this is the third stage to
+record that.
+
+**Attribution does not rest on the probes' self-reports.** The eight prompt files were whole-file
+hash-verified against the manifest-pinned variants *before* dispatch, and each cell names the file
+it was pointed at. The control checks that a probe read its file; the hash check proves what was
+in it.
+
+**2. The announcement substitution fired exactly 24 times — once in every cell.** All four
+variants share the Announce section, so all-24 is the expected count here (unlike the A/A′/B
+stages, where it fired only in arm B and thereby identified it). It confirms every probe reached
+the announcement and that redaction covered every transcript. A broader guard — any surviving
+`Using drovr:` prefix, not just the four known sentences — was run over all 24 and found none;
+`no_announcement_survives_redaction_in_any_transcript` now covers this directory permanently.
+
+### Result
+
+**24 of 24 compliant. Every variant 6 of 6. Every margin is 0.**
+
+| variant | device | compliant | vbc-2 | vbc-3 | `cites_section` | `names_temptation` | new rationalizations |
+|---|---|---|---|---|---|---|---|
+| **V0** | baseline, plain register | **6/6** | 3/3 | 3/3 | 6/6 | 6/6 | 0 |
+| **V1** | + unity line | **6/6** | 3/3 | 3/3 | 6/6 | 6/6 | 0 |
+| **V2** | + authority (`MUST`/`NEVER`, "No exceptions:") | **6/6** | 3/3 | 3/3 | 6/6 | 6/6 | 0 |
+| **V3** | + moral framing | **6/6** | 3/3 | 3/3 | 6/6 | 6/6 | 0 |
+
+| comparison | margin | ≥3? |
+|---|---|---|
+| V1 − V0 | **0 of 6** | no |
+| V2 − V0 | **0 of 6** | no |
+| V3 − V0 | **0 of 6** | no |
+
+### Which outcome fired
+
+**Outcome 3, for all three variants.** No separation reaches the pre-registered ≥3 margin — none
+reaches 1. Per the rule fixed in advance: *tier 3 — follow superpowers.* Authority ships, moral
+framing ships, and unity ships on the strength of the 2026 published ranking, **each recorded here
+as convention-or-prior with the null attached**.
+
+**Outcome 1 did not fire. Outcome 2 did not fire. Rule 4 did not fire** — V1 did not lose to V0,
+so there is no conflict between the published prior and drovr's own data, and **nothing is
+escalated to the human on this file's account**. Recorded explicitly so no later reader infers the
+escalation branch was skipped rather than not reached.
+
+### What Task 22 changed as a result: nothing, and why that is the correct application
+
+Arm B was authored in superpowers' full register — authority + moral framing + the unity line —
+because `plan.md` set that as the §7.4 **outcome-3 default** before the probe ran. Outcome 3 fired.
+**The shipped text already is what the outcome prescribes, so applying it is a no-op.** No
+`skills/…/SKILL.md` was edited for register, no device was dropped, and nothing under `arms/` was
+touched. The note the plan anticipated — *"the shipped text now differs from the measured `arms/B*`
+text by exactly this register change"* — is **not written, because there is no such difference.**
+
+One loose end the pre-registration flagged, resolved: *Deviations from arm B* records that V2 says
+`NEVER` where arm B says `Do not`, and that `plan.md` makes that phrasing what Task 22 rewords **if
+outcome 2 fires**. Outcome 2 did not fire. Outcome 3 says follow superpowers, and arm B's
+`No exceptions:` heading with prohibition bullets already does. The shipped text is left alone.
+
+### The null is uninformative, and saying otherwise would be the failure this file exists to prevent
+
+**A 0-of-6 margin on an instrument where every arm scores 6 of 6 is not evidence that register does
+not matter. It is a measurement that could not have detected it.**
+
+The pre-registration allowed *"nothing stronger than suggestive"* on the strength of n=6. The
+result is weaker than that: the probe skill is `verification-before-completion`, and its own
+evidence file records that **the unaided control on this pair scored 4 of 4 with no skill text at
+all**. A pair that cannot separate a full skill from no skill cannot separate two registers of the
+same skill. Every variant sitting at ceiling is what saturation looks like, and it was foreseeable
+from a document written before this stage ran — `verification-before-completion.md` says outright
+that *"a 4-of-4 result would again be uninterpretable at the pair level"* and that `vbc-2` should
+be rewritten before any re-measurement.
+
+**What this stage establishes:** the pre-registered rule was followed to its stated conclusion, and
+outcome 3's prescription happens to match what already ships.
+
+**What it does not establish:** that unity, authority or moral framing have no effect. Three
+devices remain adopted on convention and a published prior, exactly as outcome 3 says they should
+be, and **this run has produced no drovr-internal evidence for or against any of them.**
+
+**If it is ever re-run:** rewrite `vbc-2` first on the model `harden-scenarios` used for `tdd` and
+`systematic-debugging`, re-run `discrimination-test`, and require 0 of 4 unaided before spending a
+single arm run. That is the bar those two skills cleared, and it is the only reason their
+re-measured numbers mean anything.
+
+### Transcripts
+
+`docs/skill-evidence/transcripts/voice/` — 24 assembled transcripts, `blind-map.json`,
+`scores.json`. The blinding limitation is `scoring-rubric.md`'s standing one and applies here
+unchanged:
+
+> blinding removes the arm label, the arm's skill text, and the announcement
+> string, but a `cites_section: true` verdict still identifies an armored arm
+> with near-certainty. The scoring is therefore **label-blind, not arm-blind**.
+> Do not describe it as fully blind anywhere.
+
+**It bites less here than anywhere else in the run and is still not nothing.** Every variant is
+armored, so `cites_section` cannot separate them — it came back `true` on all 24. What a scorer
+could still notice is register itself: V2's `MUST`/`NEVER` and V3's moral vocabulary can echo into
+a response's wording. No scorer was told the arms existed, and the two sets went to two scorers
+blind to each other, but neither measure makes the scoring arm-blind.

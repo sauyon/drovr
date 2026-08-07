@@ -94,19 +94,38 @@ phase's no-skill control, which is an instrument measurement and enters no pre-r
 
 ---
 
-## The voice probe (§7.4) — PRE-REGISTERED, NEVER RUN
+## The voice probe (§7.4) — RUN 2026-08-07, outcome 3, no change to any document
 
 `voice.md` is a genuine pre-registration: the rule, the ≥3-of-6 margin, the four outcomes and the
 escalation branch were all fixed by Task 15 before any run existed, and `git log --follow` shows
-the pre-registration commits (`5cc7412`, `cc8a317`) with no results commit after them.
+the pre-registration commits (`5cc7412`, `cc8a317`) preceding the results commit.
 
-**Task 21 never ran.** `voice.md`'s `## Results` section still reads *"NOT YET RUN. Nothing has
-been run. This section is a placeholder for Task 21 and holds no data."*
-`docs/skill-evidence/transcripts/voice/` does not exist, and `run-ledger.md` carries no `ab-voice`
-row. The four variants `V0`–`V3` exist, are hash-pinned in `arms/MANIFEST.md`, and pass all five
-separability checks — the instrument was built and never used.
+**Task 21 never ran; Task 22 ran the probe.** That collapses the separation `voice.md` demanded
+between the agent that measures and the agent that applies — recorded there in full as a real
+weakening of the design.
 
-**Consequence:** Task 22 applied no register change to any document. See `task22-report.md`.
+| variant | device | compliant | margin vs V0 |
+|---|---|---|---|
+| V0 | baseline, plain register | **6/6** | — |
+| V1 | + unity line | **6/6** | **0** |
+| V2 | + authority (`MUST`/`NEVER`, "No exceptions:") | **6/6** | **0** |
+| V3 | + moral framing | **6/6** | **0** |
+
+**Outcome 3 fired for all three variants** — no separation reaches the pre-registered ≥3 margin,
+and none reaches 1. Per the rule: tier 3, follow superpowers. Authority, moral framing and unity
+all ship, **each as convention-or-prior with the null attached**. Outcomes 1 and 2 did not fire,
+and **rule 4 did not fire** — V1 did not lose to V0, so nothing escalated.
+
+**What shipped as a result: nothing.** Arm B was already authored in the outcome-3 default
+register, so applying the outcome is a no-op. No `skills/…/SKILL.md` was edited for register and
+nothing under `arms/` was touched.
+
+**The null is uninformative, and this index will not record it as a finding.** All four variants
+sat at ceiling because the probe skill's own held-out pair is saturated — its unaided control
+scored **4 of 4 with no skill text at all**. A pair that cannot separate a full skill from no
+skill cannot separate two registers of one. This run has produced **no drovr-internal evidence for
+or against unity, authority or moral framing**; all three remain adopted on convention and a
+published prior.
 
 ---
 
@@ -126,14 +145,17 @@ Two cells therefore carry n=7 rather than n=8.
 
 ## Run cost
 
-**187 probe runs, cumulative, as `run-ledger.md`'s final row records.** Reported, not tested
-against a limit — the run-count ceiling was lifted by the human on 2026-08-07. The ledger's
-cumulative column is still checked as arithmetic by
-`run_ledger_cumulative_is_a_running_total`, so a dropped or inflated row is still caught.
+**211 probe runs, cumulative, as `run-ledger.md`'s final row records** — 187 through
+`cross-model-arm`, plus `ab-voice`'s 24. Reported, not tested against a limit: the run-count
+ceiling was lifted by the human on 2026-08-07, and `RUN_CEILING` / `METERED_RUN_CEILING` were
+removed from `cli/tests/skills_valid.rs` in the same change that spent past them. The ledger's
+cumulative column is still checked as arithmetic by `run_ledger_cumulative_is_a_running_total`,
+so a dropped, duplicated or inflated row is still caught — that guard was strengthened, not
+loosened, when the caps went.
 
-Scorers are not charged: 78 blind scorer passes ran, plus a second independent pass over 16 of
-them which agreed 16 of 16. A scorer re-reading an existing transcript produces no new
-measurement.
+Scorers are not charged: 78 blind scorer passes through `cross-model-arm`, plus a second
+independent pass over 16 of them which agreed 16 of 16, plus 2 more for `ab-voice`. A scorer
+re-reading an existing transcript produces no new measurement.
 
 ---
 
@@ -147,7 +169,8 @@ Carried forward from the per-skill files rather than restated more weakly:
    announcement string, but a `cites_section: true` verdict identifies an armored arm with near
    certainty, and an armored agent's prose reads differently. Do not describe the scoring as fully
    blind anywhere.
-3. **Two skills of five were never measured**, and one probe (voice) was pre-registered and never
-   run. Three of the run's eight planned measurement stages did not happen.
+3. **Two skills of five were never measured**, and their measurement is decision-deferred by the
+   human pending a scenario rewrite. The voice probe ran but on a saturated instrument, so its
+   null carries no information.
 4. **The RED baselines were not blinded at all** and were read by the orchestrator, who knew the
    arm.

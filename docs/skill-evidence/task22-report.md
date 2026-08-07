@@ -10,7 +10,28 @@ given in *Blockers* — both are handed to the human rather than resolved here.
 
 ## Blockers — hand to the human
 
-### 1. Task 21 (`ab-voice`) never ran, so there is no voice outcome to apply
+### 1. RESOLVED — Task 21 never ran, so Task 22 ran the probe (human, 2026-08-07)
+
+**The human's decision: run the pre-registered design at full n rather than close the run with a
+null.** The ceiling was already lifted, so no authorisation was outstanding — the paragraph below
+was written before that was established and is kept because it is the state Task 22 found.
+
+**Result: 24 of 24 compliant, every variant 6 of 6, every margin 0. Outcome 3 fired for V1, V2 and
+V3. Rule 4 did not fire, so nothing escalated.** Full method, controls and limitations are in
+`voice.md`; the counts are in `INDEX.md`.
+
+**Applied: no change to any document.** Arm B was authored in the outcome-3 default register, so
+the outcome's prescription is what already ships. The note the plan anticipated — that the shipped
+text now differs from the measured `arms/B*` text by exactly this register change — was **not
+written, because there is no such difference**.
+
+**Two things recorded rather than smoothed over.** First, `voice.md` required that the agent which
+measures must not be the agent which applies, and one agent did both; the outcome happening to
+require no rewrite limits the damage but does not repair the design. Second, **the null is
+uninformative** — all four variants sat at ceiling on a pair whose unaided control scores 4 of 4
+with no skill text at all. It is not evidence that register does not matter.
+
+#### The state Task 22 found, kept for the record
 
 Step 1 says to apply the voice outcome per `voice.md`'s recorded decision. There is no recorded
 decision. `voice.md`'s `## Results` section reads, verbatim and unedited:
@@ -29,46 +50,102 @@ This is not the escalation branch the task anticipated. The task said *"if Task 
 not happen. The instruction to stop applies with more force, not less: **I applied no register
 change to any of the five documents.**
 
-**What it would cost to unblock:** the probe is 24 runs (4 variants × 2 scenarios × 3 samples).
-The ledger's own closing note says *"Headroom after this stage: 4 runs of 191 global, 4 of 119
-metered. Both are effectively closed… Nothing further is authorised."* So running Task 21 needs
-an explicit ceiling raise, which is the human's call and not mine.
+**What it cost to unblock:** 24 runs. Task 22 initially read the ledger's closing note —
+*"Nothing further is authorised"* — as requiring a fresh ceiling raise. **That note was stale.**
+The ceiling had already been lifted on 2026-08-07 and `plan.md` C3 and §9.3 edited to match; the
+note has now been superseded in `run-ledger.md` by an append rather than an edit.
 
 **What it does NOT block.** `voice.md`'s outcome would apply only to a document that ships armor.
 `tdd` and `verification-before-completion` reverted, and a reverted skill has no armor to
 re-register — so the missing outcome reaches at most `systematic-debugging` (which ships arm B)
 and, if they are ever measured, `code-review` and `using-drovr`.
 
-### 2. `code-review` and `using-drovr` ship arm B and were never measured
+### 2. `code-review` and `using-drovr` — DECISION-DEFERRED PENDING MEASUREMENT (human, 2026-08-07)
 
-Tasks 19 and 20's arm stages did not run either. Both files read `## Scored results: **Not yet
-run.**` and `## Failure and reverted state: **Not applicable yet. No bar has been evaluated for
-this skill.**`
+**The human's decision, taken 2026-08-07: measure them properly rather than ship unmeasured
+armor or revert them on principle.** That is several phases of work and is explicitly **not**
+this phase's job to execute. Both skill files are left untouched. What follows is the spec a
+fresh phase needs so it does not have to re-derive any of this.
 
-So both `skills/code-review/SKILL.md` and `skills/using-drovr/SKILL.md` currently ship the fix-4
-rewrite (arm B) with **no measurement behind it**, on a run whose stated rule is that §7.3 *"will
-not ship a rewrite that has not been shown to be worth its bytes"*.
+**Current state, unchanged by Task 22.** `skills/code-review/SKILL.md` and
+`skills/using-drovr/SKILL.md` both ship arm B. Both evidence files read `## Scored results:
+**Not yet run.**` and `## Failure and reverted state: **Not applicable yet.**` No `blind-map.json`
+and no `scores.json` exist for either; `held_out_scores()` reads `NotYetRun` for both.
 
-**I did not resolve this.** Step 2 says to reconcile the skills that Tasks 16–20 *reverted*;
-these two were neither reverted nor confirmed, and their own files record no decision to apply.
-Choosing between "revert them for consistency with the rule" and "leave them pending
-measurement" is a decision about the run's scope, not a reconciliation, so it goes to the human.
-It is recorded in `INDEX.md` as the open item it is.
+**Step 1 — rewrite the weak held-out scenarios. Neither pair can currently carry an arm run.**
 
-There is a third, related fact worth having in front of you when you decide: the
-`discrimination-test` control found both pairs weak — `code-review` at **3 of 4 unaided
-(saturated)** and `using-drovr` at 2 of 4 with its two scenarios split 0-of-2 and 2-of-2. Both
-files already record that their held-out scenarios need rewriting before arm runs are spent.
+- **`code-review`: 3 of 4 compliant unaided — SATURATED** against the bar pre-registered before
+  those runs. `code-review-3` is at ceiling (2 of 2 unaided, both samples chose the correct
+  option A with no skill text at all), so the largest effect any arm could show over no skill is
+  **1 run in 4**. `code-review-3` is the scenario to rewrite; `code-review-2` at 1 of 2 is the
+  closest thing the pair has to signal and may survive.
+- **`using-drovr`: 2 of 4 unaided, and the pair-level number hides the shape.** It splits exactly
+  in half: `using-drovr-2` is **0 of 2** — it discriminates best of the ten, and
+  `harden-scenarios` had ranked it *last* for expected failure, so the forecast was wrong in the
+  useful direction — while `using-drovr-3` is **2 of 2, saturated**. Rewrite `ud-3` on `ud-2`'s
+  model. Do not report "2 of 4" without both halves.
+- **The `using-drovr` veto class was never probed in either direction.**
+  `using-drovr-noskill-1/2` fail by *over*-triggering and are not part of §1.2's held-out pair.
+
+**Step 2 — re-run `discrimination-test` on the rewritten bodies and prove they separate**, before
+any arm run is spent. The bar is the one `tdd` and `systematic-debugging` cleared: 0 of 4 unaided.
+That is what made their re-measured arm results mean something, and it is the whole reason those
+two stages were worth re-running. `discrimination_stage_records_every_skill_it_measured`
+recomputes each verdict from `git hash-object`, so the rewritten bodies must be recorded as
+`CURRENT` and the superseded ones must not be pooled with them.
+
+**Step 3 — spend the arm runs.** Two complications that will bite a phase that has not read this:
+
+1. **`using-drovr` has no A′ arm.** §7.3 scoped the A′ budget row to the four discipline skills,
+   and `plan.md` rules that on the primary class B is compared against **A alone**. There is no
+   A′ snapshot for it in `arms/A-prime/` to revert to either — so "revert to A′" is not an
+   available outcome for this skill, and the decision rule has to be stated for A-vs-B before the
+   runs, not after.
+2. **`using-drovr`'s arm B text is load-bearing for fix 2.** It is the per-turn router, and
+   `reflex::tests::gate_card_phrases_present_in_router_skill` pins the gate card's phrases to
+   text that lives in arm B. Reverting it to arm A would turn that test red, so a revert outcome
+   for this skill is a change to the CLI's gate card as well as to a document. Decide which side
+   moves before measuring, not after a number arrives.
+
+**Ledger.** These stages were never charged. `code-review` and `using-drovr` each need their own
+rows, and the ceiling no longer constrains them — see §9.3 below.
+
+### 2b. What that leaves shipping in the meantime, stated plainly
+
+Until those phases run, both files ship the fix-4 rewrite with **no measurement behind it**, on a
+run whose stated rule is that §7.3 *"will not ship a rewrite that has not been shown to be worth
+its bytes"*. That is a real inconsistency and it is deliberate: the human's decision was to close
+it by measuring rather than by reverting, and reverting them in the meantime would spend the
+armor twice and — for `using-drovr` — turn a CLI test red for the duration.
+
+**Deferred is not decided.** A reader who finds these two armored should not read that as a
+result. `INDEX.md` carries the same flag.
 
 ---
 
 ## Step 1 — Apply the voice outcome
 
-**Not done. Blocked — see above.** No `skills/…/SKILL.md` was touched for register reasons, and
-no device was dropped. Nothing under `docs/skill-evidence/arms/` was edited.
+**Done: the probe ran at full n, outcome 3 fired, and the correct application is no change.**
 
-The note `voice.md` was to receive — that the shipped text now differs from the measured `arms/B*`
-text by exactly this register change — was **not written**, because no such difference exists.
+No `skills/…/SKILL.md` was touched for register reasons, no device was dropped, and nothing under
+`docs/skill-evidence/arms/` was edited. The note `voice.md` was to receive — that the shipped text
+now differs from the measured `arms/B*` text by exactly this register change — was **not written**,
+because no such difference exists.
+
+**§7.4 item 4's "without re-testing each document" caveat is moot here** and is recorded as moot
+rather than restated as if it bound something. That limitation covers generalising a *winning
+device* from one skill to four others. No device won and nothing was generalised, so the one
+limitation §7.4 flagged in advance is the one this outcome does not incur. The limitations it does
+incur — one skill, one model, and a saturated instrument — are in `voice.md`.
+
+**Guard added with the artifact.** `transcripts/voice/` was a new evidence set that only the
+redaction walk reached: `scores_json_verdicts_obey_the_rubric` and the blind-map check both
+iterate `SkillName::ALL`, and `voice` is not a skill, so the arm assignment, cell counts and
+evidence quotes were unchecked. `voice_stage_records_the_design_it_pre_registered` now asserts the
+4×2×3 design cell by cell, three-way key-set equality between map / scores / files on disk, every
+`evidence` quote verbatim in its own `## Response`, and that no transcript carries a `## Meta-test`
+block — pinning `voice.md`'s claim that none was asked. Watched RED on two planted defects (a
+reweighted cell, a paraphrased quote) before being trusted.
 Writing it would assert a change that did not happen.
 
 ## Step 2 — Reconcile every revert
@@ -236,25 +313,34 @@ from the totals:
 
 ### §9.3 — the ledger and the corpus
 
-**Final cumulative total: 187 runs.** Reported, not tested against a limit — C3's ceiling was
-lifted by the human on 2026-08-07. The ledger's last row is `cross-model-arm | cross-model (opus)
-| 16 | 187`.
+**Final cumulative total: 211 runs**, of which **139 are metered**. Reported, not tested against a
+limit — C3's ceiling was lifted by the human on 2026-08-07. The ledger's last row is
+`21 | ab-voice — the §7.4 voice probe | 24 | 211`.
 
-The arithmetic check is unaffected and still green:
-`run_ledger_cumulative_is_a_running_total` recomputes the cumulative column and a second metered
-subtotal, so a dropped or inflated row still fails.
+**Both ceiling constants are gone, and that was forced rather than chosen.** An earlier draft of
+this report argued for keeping `RUN_CEILING = 191` as a tripwire against future spend. Running
+`ab-voice` settled it: 187 + 24 = 211 global and 115 + 24 = 139 metered are past both old numbers,
+so leaving either constant in place would have made the suite red for spending the run was
+authorised to spend. Reporting the number while a constant refuses it is not a coherent position,
+and the earlier reasoning is superseded rather than quietly dropped.
 
-**On the `191` constant in `cli/tests/skills_valid.rs:10312`** — I left it, and I own that. It is
-now looser than anything required, so it fails nothing. Removing it would delete a live tripwire:
-the ledger's own closing note says *"Nothing further is authorised"*, and with `RUN_CEILING` gone
-a new row could push the total past 191 in silence. §9.3's instruction is about what **this
-report** may assert — report the number, do not test it against a limit — and this report does
-exactly that. Keeping a guard against future spend and refusing to grade the past spend against
-it are compatible. `METERED_RUN_CEILING` (119) stays for the same reason, and
-`ledger_check_refuses_a_table_that_does_not_add_up` builds its cases from both constants, so
-removing either would also have to be a test rewrite.
+**What was removed and what was not.** The two cap comparisons are gone from `check_ledger`. The
+arithmetic is untouched and `run_ledger_cumulative_is_a_running_total` is still green: it
+recomputes the cumulative column, so a dropped, duplicated or inflated row still fails. That was
+always the check doing the work — **a ceiling only ever inspects the last row**, and cannot see a
+stage deleted from the middle, because that makes the total fall.
 
-**Every `docs/skill-evidence/` file is committed** — see the commit this report lands in.
+**Its negative test was rewritten in the same change**, because a cap removed without its case
+removed is a test asserting on a constant that no longer exists. The two ceiling-crossing cases
+were replaced by three: a row dropped from the middle, an inflated run count, and — the one that
+matters — **a large but arithmetically correct table that must pass**, so no size limit can come
+back by accident and pass itself off as the arithmetic check. `UNMETERED_MARKER` stays: the
+metered split is still recorded per row and still asserted by
+`cross_model_grid_matches_its_own_verdicts`. A cap and its negative test were removed together, so
+re-adding one means re-adding the other — which is what the comment left in their place says.
+
+**Every `docs/skill-evidence/` file is committed** — see the commit this report lands in,
+including the 24 new `transcripts/voice/` transcripts, `blind-map.json` and `scores.json`.
 
 ### §9.4 — the integration check. **RED.**
 

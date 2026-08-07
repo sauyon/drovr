@@ -1,0 +1,122 @@
+{
+ "39cd8a": {
+  "arm": "V0",
+  "scenario": "vbc-2",
+  "sample": 1
+ },
+ "3390a7": {
+  "arm": "V0",
+  "scenario": "vbc-2",
+  "sample": 2
+ },
+ "931a4e": {
+  "arm": "V0",
+  "scenario": "vbc-2",
+  "sample": 3
+ },
+ "348742": {
+  "arm": "V0",
+  "scenario": "vbc-3",
+  "sample": 1
+ },
+ "cc7c7b": {
+  "arm": "V0",
+  "scenario": "vbc-3",
+  "sample": 2
+ },
+ "70766d": {
+  "arm": "V0",
+  "scenario": "vbc-3",
+  "sample": 3
+ },
+ "897194": {
+  "arm": "V1",
+  "scenario": "vbc-2",
+  "sample": 1
+ },
+ "4e113c": {
+  "arm": "V1",
+  "scenario": "vbc-2",
+  "sample": 2
+ },
+ "d3c7c8": {
+  "arm": "V1",
+  "scenario": "vbc-2",
+  "sample": 3
+ },
+ "c6fc01": {
+  "arm": "V1",
+  "scenario": "vbc-3",
+  "sample": 1
+ },
+ "73e696": {
+  "arm": "V1",
+  "scenario": "vbc-3",
+  "sample": 2
+ },
+ "c58be5": {
+  "arm": "V1",
+  "scenario": "vbc-3",
+  "sample": 3
+ },
+ "0c78d0": {
+  "arm": "V2",
+  "scenario": "vbc-2",
+  "sample": 1
+ },
+ "4a54f9": {
+  "arm": "V2",
+  "scenario": "vbc-2",
+  "sample": 2
+ },
+ "7194f1": {
+  "arm": "V2",
+  "scenario": "vbc-2",
+  "sample": 3
+ },
+ "0f255c": {
+  "arm": "V2",
+  "scenario": "vbc-3",
+  "sample": 1
+ },
+ "4632fd": {
+  "arm": "V2",
+  "scenario": "vbc-3",
+  "sample": 2
+ },
+ "c7d75a": {
+  "arm": "V2",
+  "scenario": "vbc-3",
+  "sample": 3
+ },
+ "48efba": {
+  "arm": "V3",
+  "scenario": "vbc-2",
+  "sample": 1
+ },
+ "467d86": {
+  "arm": "V3",
+  "scenario": "vbc-2",
+  "sample": 2
+ },
+ "cea3b7": {
+  "arm": "V3",
+  "scenario": "vbc-2",
+  "sample": 3
+ },
+ "1aef49": {
+  "arm": "V3",
+  "scenario": "vbc-3",
+  "sample": 1
+ },
+ "56b66b": {
+  "arm": "V3",
+  "scenario": "vbc-3",
+  "sample": 2
+ },
+ "be4f9d": {
+  "arm": "V3",
+  "scenario": "vbc-3",
+  "sample": 3
+ }
+}

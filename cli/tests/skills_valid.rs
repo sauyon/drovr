@@ -1341,6 +1341,258 @@ fn voice_snapshots_match_manifest() {
     }
 }
 
+/// One `blind-map.json` entry for the voice stage.
+///
+/// A separate type from [`BlindMapEntry`] because the arm vocabularies are
+/// disjoint: that one names A / A-prime / B / B-r*i* / none, this one names the
+/// four register variants. Sharing a type would mean widening the skill stages'
+/// arm set to admit `V0`, which is exactly the loosening that lets a
+/// mis-transcribed arm land in the wrong stage and still parse.
+#[derive(serde::Deserialize)]
+struct VoiceCell {
+    arm: String,
+    scenario: String,
+    sample: u32,
+}
+
+/// One `scores.json` verdict for the voice stage.
+///
+/// Deliberately **not** [`Verdict`]: that type's `check_rubric_rules` encodes the
+/// A/A′/B stages' recording rules, including ones this stage does not use.
+struct VoiceVerdict {
+    transcript_id: String,
+    compliant: bool,
+    meta_test_clear: bool,
+    evidence: String,
+}
+
+impl<'de> serde::Deserialize<'de> for VoiceVerdict {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            transcript_id: String,
+            compliant: bool,
+            meta_test_clear: bool,
+            evidence: String,
+        }
+        let r = Raw::deserialize(d)?;
+        Ok(VoiceVerdict {
+            transcript_id: r.transcript_id,
+            compliant: r.compliant,
+            meta_test_clear: r.meta_test_clear,
+            evidence: r.evidence,
+        })
+    }
+}
+
+/// spec §7.4: the voice stage's transcripts, blind map and scores describe the
+/// **pre-registered design** and each other, and nothing else does.
+///
+/// **Why this test exists at all.** `scores_json_verdicts_obey_the_rubric` and
+/// `blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts` both iterate
+/// [`SkillName::ALL`], and `voice` is not a skill — so when Task 22 landed
+/// `transcripts/voice/`, the only guard that reached it was the redaction walk.
+/// The arm assignment, the cell counts and the evidence quotes were unchecked. A
+/// set was extended; this is its guard.
+///
+/// **What it pins that prose cannot.** `voice.md` reports "6 per variant, 24
+/// total, every margin 0". That claim is only meaningful if the blind map really
+/// holds 6 cells per variant — a map with 7 V0 cells and 5 V1 cells would produce
+/// a different set of margins from the same transcripts, and no reader could tell
+/// from the write-up. The design is asserted here, in the shape §7.4 fixed in
+/// advance, rather than trusted from the document that reports its result.
+#[test]
+fn voice_stage_records_the_design_it_pre_registered() {
+    let dir = evidence_dir().join("transcripts").join(VOICE_ARM);
+    if !dir.is_dir() {
+        // The stage is allowed not to have run — but if it has, everything below
+        // is mandatory. Absence is the one legal shape, and it is total: a
+        // directory holding a blind map and no scores is not "not yet run".
+        return;
+    }
+
+    let map_path = dir.join("blind-map.json");
+    let scores_path = dir.join("scores.json");
+    for p in [&map_path, &scores_path] {
+        assert!(
+            p.is_file(),
+            "{} exists, so the voice stage ran — but {} is missing. A scored stage's \
+             verdicts are attributable only alongside its arm assignment.",
+            dir.display(),
+            p.display()
+        );
+    }
+
+    let map: HashMap<String, VoiceCell> =
+        serde_json::from_str(&fs::read_to_string(&map_path).expect("read blind map"))
+            .unwrap_or_else(|e| panic!("{}: {e}", map_path.display()));
+    let verdicts: Vec<VoiceVerdict> =
+        serde_json::from_str(&fs::read_to_string(&scores_path).expect("read scores"))
+            .unwrap_or_else(|e| panic!("{}: {e}", scores_path.display()));
+
+    // The design, exactly as §7.4 fixed it: 4 variants x 2 held-out scenarios x
+    // 3 samples. Asserted cell by cell rather than as a total, because 24 is also
+    // what 4 x 6 lopsided cells adds up to.
+    let variants: Vec<&str> = std::iter::once(VOICE_BASELINE)
+        .chain(VOICE_VARIANTS.iter().map(|v| v.name))
+        .collect();
+    for variant in &variants {
+        for scenario in ["vbc-2", "vbc-3"] {
+            let mut samples: Vec<u32> = map
+                .values()
+                .filter(|c| c.arm == *variant && c.scenario == scenario)
+                .map(|c| c.sample)
+                .collect();
+            samples.sort_unstable();
+            assert_eq!(
+                samples,
+                vec![1, 2, 3],
+                "{}: variant {variant} on {scenario} must carry samples 1,2,3 — §7.4's \
+                 design is 4 variants x 2 scenarios x 3 samples, and an uneven cell \
+                 silently reweights every margin computed from it",
+                map_path.display()
+            );
+        }
+    }
+    // …and no cell outside the design. The loop above cannot see a fifth arm.
+    let mut stray: Vec<&str> = map
+        .values()
+        .map(|c| c.arm.as_str())
+        .filter(|a| !variants.contains(a))
+        .collect();
+    stray.sort_unstable();
+    stray.dedup();
+    assert!(
+        stray.is_empty(),
+        "{}: arm(s) {stray:?} are not registered voice variants",
+        map_path.display()
+    );
+    assert_eq!(map.len(), 24, "{}: expected 24 cells", map_path.display());
+
+    // Key-set equality in all three directions. A transcript nobody scored and a
+    // verdict for a transcript that is not there are both silent today.
+    let mapped: HashSet<&str> = map.keys().map(String::as_str).collect();
+    let mut scored: Vec<&str> = verdicts.iter().map(|v| v.transcript_id.as_str()).collect();
+    scored.sort_unstable();
+    let unique: HashSet<&str> = scored.iter().copied().collect();
+    assert_eq!(
+        scored.len(),
+        unique.len(),
+        "{}: two verdicts for one transcript",
+        scores_path.display()
+    );
+    assert_eq!(
+        unique, mapped,
+        "{} and {} disagree about which transcripts exist",
+        scores_path.display(),
+        map_path.display()
+    );
+    let on_disk: HashSet<String> = markdown_files(&dir)
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+    let on_disk: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
+    assert_eq!(
+        on_disk, mapped,
+        "{} holds transcript files the blind map does not name (or vice versa)",
+        dir.display()
+    );
+
+    // Every `evidence` quote is verbatim in its own transcript's `## Response`.
+    // The field exists so a reader can re-derive the verdict instead of trusting
+    // the scorer, and a paraphrase cannot be located — the same rule
+    // `Verdict::check_rubric_rules` enforces for the skill stages.
+    for v in &verdicts {
+        let body = fs::read_to_string(dir.join(format!("{}.md", v.transcript_id)))
+            .unwrap_or_else(|e| panic!("{}: {e}", v.transcript_id));
+        assert!(
+            !v.evidence.trim().is_empty(),
+            "{}: empty `evidence`",
+            v.transcript_id
+        );
+        assert!(
+            response_block(&body).contains(v.evidence.trim()),
+            "{}: `evidence` is not verbatim in its ## Response: {:?}",
+            v.transcript_id,
+            v.evidence
+        );
+        // `voice.md` records that no meta-test was asked in this stage and that
+        // every row therefore reads `false` meaning UNASKED. Pinned here so the
+        // document and the data cannot drift apart: a later stage that does ask
+        // must change both.
+        assert!(
+            !v.meta_test_clear,
+            "{}: `meta_test_clear` is true, but voice.md records this stage as having \
+             asked no meta-test. Update both or neither.",
+            v.transcript_id
+        );
+        assert!(
+            !body.contains("## Meta-test"),
+            "{}: carries a ## Meta-test block, which voice.md says this stage did not \
+             collect",
+            v.transcript_id
+        );
+    }
+
+    // **`voice.md`'s result table must equal the data it reports on.** Modelled on
+    // `cross_model_grid_matches_its_own_verdicts`, and for the same reason: the
+    // per-variant counts are what the §7.4 decision rule is applied to, and a
+    // write-up is the one artifact in this run that can be edited without
+    // touching a single measurement. Recomputing them here means a hand-typed
+    // "6/6" that does not match `scores.json` is a failing test rather than a
+    // claim nobody can check.
+    //
+    // The counts are read OUT of the document rather than hard-coded into this
+    // test, so a legitimate re-run updates one file and stays green.
+    let doc_path = evidence_dir().join("voice.md");
+    let doc = fs::read_to_string(&doc_path).expect("read voice.md");
+    let mut checked = 0;
+    for variant in &variants {
+        let mut want = None;
+        for line in doc.lines().filter(|l| l.starts_with('|')) {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            // `| **V0** | device | **6/6** | …`
+            if cells.len() > 3
+                && cells[1].trim_matches('*') == *variant
+                && let Some((n, d)) = cells[3].trim_matches('*').split_once('/')
+                && let (Ok(n), Ok(d)) = (n.parse::<usize>(), d.parse::<usize>())
+            {
+                want = Some((n, d));
+            }
+        }
+        let (reported, of) = want.unwrap_or_else(|| {
+            panic!(
+                "{}: no result row for variant {variant} with an `n/d` compliant cell — \
+                 the stage ran, so the document must report it",
+                doc_path.display()
+            )
+        });
+        let cells: Vec<&str> = map
+            .iter()
+            .filter(|(_, c)| c.arm == *variant)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let actual = verdicts
+            .iter()
+            .filter(|v| cells.contains(&v.transcript_id.as_str()) && v.compliant)
+            .count();
+        assert_eq!(
+            (actual, cells.len()),
+            (reported, of),
+            "{}: reports {variant} at {reported}/{of}, but scores.json joined to \
+             blind-map.json gives {actual}/{}",
+            doc_path.display(),
+            cells.len()
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        variants.len(),
+        "every registered variant must have a reported row"
+    );
+}
+
 /// What this repository can say about one manifest row's `<commit>:<path>`.
 ///
 /// **`Undetermined` is a separate answer from the two absences, and that is the
@@ -10318,35 +10570,39 @@ fn blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts() {
 // The run ledger's arithmetic
 // ---------------------------------------------------------------------------
 
-/// The hard ceiling on **all** probe runs across the whole run, metered or not.
-///
-/// spec §7.3 froze this at 122 for a **sonnet-only** design. The `cross-model-arm`
-/// phase adds a factor §7.3 never budgeted — probe model — and the human raised the
-/// ceiling on 2026-08-06 to pay for it. The new value is derived, not chosen:
-/// 99 already spent + 20 metered (`opus`) + 72 unmetered (`qwen`) = 191. The full
-/// derivation, and who authorised it, is in `run-ledger.md`'s prose header; this
-/// constant and that prose move together or the raise is silent in one of them.
-const RUN_CEILING: u32 = 191;
-
-/// The hard ceiling on the runs that **cost metered budget** — every row except the
-/// ones the ledger marks [`UNMETERED_MARKER`].
-///
-/// **Why a second constant rather than only lifting [`RUN_CEILING`].** The
-/// cross-model phase's `qwen` arm is on a model the human declared unlimited, so its
-/// 72 runs belong in the ledger (it records what happened, not only what cost money)
-/// but must not buy metered headroom. Raising `RUN_CEILING` alone from 122 to 191
-/// would have handed the run 69 unaudited metered runs — a set extended without its
-/// guard extended, which is this run's own recurring defect. Derived the same way:
-/// 99 spent + 20 (`opus`: 16 planned + a 4-run retry allowance, one per condition,
-/// because a failed probe in a 4-run cell voids the cell rather than shrinking it).
-const METERED_RUN_CEILING: u32 = 119;
+// There is no `RUN_CEILING` and no `METERED_RUN_CEILING`, and their absence is a
+// decision rather than an omission.
+//
+// spec §7.3 froze a 122-run ceiling for a sonnet-only design; `cross-model-arm`
+// raised it to 191 with a second, metered ceiling of 119 beside it so unmetered
+// `qwen` runs could not buy metered headroom. **The human lifted the run-count
+// ceiling entirely on 2026-08-07**, and `plan.md` C3 and §9.3 were edited to
+// match: §9.3 now *reports* the cumulative total instead of testing it against a
+// limit. Task 22's `ab-voice` stage then took the total past both old numbers
+// (187 + 24 = 211 global, 115 + 24 = 139 metered), so leaving either constant in
+// place would have made the suite red for spending the run was authorised to
+// spend.
+//
+// **What did NOT go away is the arithmetic.** [`check_ledger`] still recomputes
+// the cumulative column as a running total, so a dropped, duplicated or inflated
+// row still fails — the property that actually protects the evidence, and the one
+// a ceiling never checked. [`UNMETERED_MARKER`] also stays: the metered/unmetered
+// split is still recorded per row and still asserted by
+// `cross_model_grid_matches_its_own_verdicts`; what is gone is only the cap.
+//
+// A ceiling belongs here again the day someone sets a new budget. Re-adding one
+// means re-adding its negative test in
+// `ledger_check_refuses_a_table_that_does_not_add_up`, which is why the two were
+// removed together.
 
 /// The substring a ledger row's `stage` cell carries when its runs are unmetered.
 ///
-/// **Absence means metered.** A row that forgets the marker is counted against
-/// [`METERED_RUN_CEILING`], which can only trip the ceiling *early*. The opposite
-/// default — infer "unmetered" from the model named in the cell — would let a typo
-/// buy budget silently, which is the direction that cannot be recovered from.
+/// **Absence means metered.** The opposite default — infer "unmetered" from the
+/// model named in the cell — would let a typo silently reclassify real spend,
+/// which is the direction that cannot be recovered from. The marker no longer
+/// gates a ceiling (there is none), but it is still the record of which runs cost
+/// budget, and `cross_model_grid_matches_its_own_verdicts` still asserts each
+/// model's rows sit on the correct side of it.
 const UNMETERED_MARKER: &str = "UNMETERED";
 
 /// One data row of `run-ledger.md`'s budget table.
@@ -10497,9 +10753,8 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
     let columns = columns.ok_or_else(|| {
         format!(
             "no budget table found: no row carries all of [{TASK:?}, {STAGE:?}, {RUNS:?}, \
-             {CUMULATIVE:?}]. The ledger is the only mechanism tracking spec §7.3's \
-             {RUN_CEILING}-run ceiling, so a table this parser cannot find is a ceiling \
-             nothing tracks."
+             {CUMULATIVE:?}]. The ledger is the only record of what this run spent, so a \
+             table this parser cannot find is a spend nothing accounts for."
         )
     })?;
 
@@ -10549,19 +10804,16 @@ fn parse_ledger(text: &str) -> Result<Vec<LedgerRow>, String> {
 }
 
 /// The invariant the ledger states about itself and nothing checked:
-/// `cumulative` is the running total of `runs this stage`, and neither the global
-/// ceiling nor the **metered** ceiling is crossed.
+/// `cumulative` is the running total of `runs this stage`.
 ///
-/// **Two ceilings, because the run now spends two currencies.** Every row through
-/// `remeasure-systematic-debugging` was a metered Claude run and one number could
-/// guard them all. The `cross-model-arm` phase adds `qwen` runs on a model the human
-/// declared unlimited: they are real runs and belong in `cumulative`, but charging
-/// them against the metered budget would be a lie in one direction and leaving them
-/// out of the table would be a lie in the other. So `cumulative` keeps counting
-/// everything against [`RUN_CEILING`], and a second subtotal — every row whose stage
-/// cell does **not** carry [`UNMETERED_MARKER`] — is held to
-/// [`METERED_RUN_CEILING`]. Raising the first without the second is exactly the
-/// vacuous-guard move this file exists to prevent.
+/// **This is arithmetic, not a budget.** The run-count ceiling was lifted on
+/// 2026-08-07 (see the note above [`UNMETERED_MARKER`]), so there is nothing here
+/// comparing the total against a limit. What remains is the property that
+/// actually protects the evidence: every row's `cumulative` equals the sum of the
+/// `runs this stage` column up to and including it. A row silently dropped, added
+/// twice, or written with an inflated count breaks that equality and is reported —
+/// and that was always the check doing the work, because a ceiling only ever
+/// notices the very last row.
 ///
 /// Returns complaints rather than asserting, following [`check_blind_map`]: a
 /// check that panics can only ever be observed to *pass* on a legal corpus, and
@@ -10588,12 +10840,8 @@ fn check_ledger(text: &str) -> Vec<String> {
         return wrong;
     }
     let mut running = 0u32;
-    let mut metered = 0u32;
     for row in &rows {
         running += row.runs;
-        if !row.stage.contains(UNMETERED_MARKER) {
-            metered += row.runs;
-        }
         if row.cumulative != running {
             wrong.push(format!(
                 "task {} / {:?}: cumulative is {} but the running total of `runs this stage` \
@@ -10601,21 +10849,6 @@ fn check_ledger(text: &str) -> Vec<String> {
                 row.task, row.stage, row.cumulative,
             ));
         }
-    }
-    let last = rows[rows.len() - 1].cumulative;
-    if last > RUN_CEILING {
-        wrong.push(format!(
-            "the ledger's final cumulative is {last}, over the run's {RUN_CEILING}-run \
-             ceiling — the standing rule is to halt and record a null, not to extend"
-        ));
-    }
-    if metered > METERED_RUN_CEILING {
-        wrong.push(format!(
-            "the ledger's metered runs total {metered}, over the {METERED_RUN_CEILING}-run \
-             metered ceiling. A row is metered unless its stage cell says \
-             {UNMETERED_MARKER:?}, so this counts rows that forgot the marker — check those \
-             before raising anything"
-        ));
     }
     wrong
 }
@@ -10655,82 +10888,49 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
         check_ledger(&drifted)
     );
 
-    // The global ceiling is crossed. The expected value is read from the constant,
-    // never spelled out: a literal here would have to be hand-edited in lockstep
-    // with every ceiling raise, and the one that got forgotten would leave this
-    // asserting against a ceiling nothing enforces.
-    let over = format!(
-        "{header}| 6 | RED | {} | {} | 10 | {UNMETERED_MARKER} |\n",
-        RUN_CEILING + 1,
-        RUN_CEILING + 1
+    // **A dropped row.** The ceilings are gone (see the note above
+    // `UNMETERED_MARKER`), so this is the case that now carries the weight they
+    // used to share: a stage deleted from the middle of the table leaves every
+    // later `cumulative` too high by that stage's run count. A ceiling could never
+    // have caught this — the total only *falls* — which is why removing the caps
+    // costs the ledger nothing it was actually relying on.
+    let dropped = format!(
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n| 17 | Arm A | 4 | 18 | 20 | no |\n"
     );
-    let ceiling = RUN_CEILING.to_string();
     assert!(
-        check_ledger(&over)
+        check_ledger(&dropped)
             .iter()
-            .any(|c| c.contains("final cumulative") && c.contains(&ceiling)),
-        "{:?}",
-        check_ledger(&over)
+            .any(|c| c.contains("cumulative is 18") && c.contains("running total")),
+        "a row deleted from the middle must break the arithmetic: {:?}",
+        check_ledger(&dropped)
     );
 
-    // **The metered ceiling is crossed while the global one is not.** This is the
-    // case the single-ceiling check could not see, and the reason the second
-    // constant exists: unmetered rows may run the cumulative up to `RUN_CEILING`,
-    // so a metered overrun below that number is invisible without its own subtotal.
-    let metered_over = format!(
-        "{header}| x | qwen {UNMETERED_MARKER} | 60 | 60 | n/a | n/a |\n\
-         | y | opus | {} | {} | n/a | no |\n",
-        METERED_RUN_CEILING + 1,
-        METERED_RUN_CEILING + 61
+    // **An inflated run count**, the opposite direction: the row claims more runs
+    // than its own cumulative step accounts for.
+    let inflated = format!(
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n| 16 | Arm A | 40 | 14 | 20 | no |\n"
     );
     assert!(
-        METERED_RUN_CEILING + 61 <= RUN_CEILING,
-        "this case must stay UNDER the global ceiling or it proves nothing about the \
-         metered one: {METERED_RUN_CEILING} + 61 vs {RUN_CEILING}"
-    );
-    let metered_ceiling = METERED_RUN_CEILING.to_string();
-    let wrong = check_ledger(&metered_over);
-    assert!(
-        wrong
+        check_ledger(&inflated)
             .iter()
-            .any(|c| c.contains("metered runs total") && c.contains(&metered_ceiling)),
-        "{wrong:?}"
-    );
-    assert!(
-        !wrong.iter().any(|c| c.contains("final cumulative")),
-        "the global ceiling must not be what fired here: {wrong:?}"
+            .any(|c| c.contains("cumulative is 14") && c.contains("runs this stage` is 50")),
+        "an inflated run count must break the arithmetic: {:?}",
+        check_ledger(&inflated)
     );
 
-    // …and the control for it: the SAME run counts, with the metered spend moved
-    // onto the unmetered row, are legal. Without this the case above would pass on
-    // a check that simply refused every large table.
-    let metered_ok = format!(
-        "{header}| x | qwen {UNMETERED_MARKER} | {} | {} | n/a | n/a |\n\
-         | y | opus | 60 | {} | n/a | no |\n",
-        METERED_RUN_CEILING + 1,
-        METERED_RUN_CEILING + 1,
-        METERED_RUN_CEILING + 61
+    // **A large, correct table is still legal.** Without this, every case above
+    // would pass on a check that simply refused any table over some size — which
+    // is precisely what the removed ceilings did, and precisely what must not
+    // come back by accident.
+    let big = format!(
+        "{header}| x | qwen {UNMETERED_MARKER} | 900 | 900 | n/a | n/a |\n\
+         | y | opus | 600 | 1500 | n/a | no |\n"
     );
     assert!(
-        check_ledger(&metered_ok).is_empty(),
-        "an unmetered row must not consume metered budget: {:?}",
-        check_ledger(&metered_ok)
-    );
-
-    // A row that forgets the marker is METERED, not unmetered. The fail-safe
-    // direction, asserted rather than assumed — the opposite default would let a
-    // typo buy budget silently.
-    let unmarked = format!(
-        "{header}| x | qwen (unlimited, no marker) | {} | {} | n/a | n/a |\n",
-        METERED_RUN_CEILING + 1,
-        METERED_RUN_CEILING + 1
-    );
-    assert!(
-        check_ledger(&unmarked)
-            .iter()
-            .any(|c| c.contains("metered runs total")),
-        "{:?}",
-        check_ledger(&unmarked)
+        check_ledger(&big).is_empty(),
+        "an arithmetically correct ledger must pass at ANY size now that the \
+         ceilings are lifted: {:?}",
+        check_ledger(&big)
     );
 
     // A header with no data rows tracks nothing.
@@ -10776,17 +10976,21 @@ fn ledger_check_refuses_a_table_that_does_not_add_up() {
     // A blank line between rows must NOT end the table. This is the one case
     // that could make the check pass on a strict prefix: without it, the row
     // below the gap is never read and the arithmetic closes on the two rows
-    // above it. Its run count is sized off the constant so a later raise cannot
-    // quietly drop it under the ceiling and make this assert on nothing.
+    // above it.
+    //
+    // **It used to prove that through the ceiling and now proves it through the
+    // arithmetic**, which is strictly better: the row below the gap carries a
+    // cumulative that is wrong *only if you read it*, so a parser that stops at
+    // the blank line reports nothing and this assert fails. Sizing the case off a
+    // ceiling constant, as it did before, meant the case silently weakened every
+    // time the ceiling moved.
     let gapped = format!(
-        "{header}| 6 | RED | 10 | 10 | 10 | no |\n\n| 16 | Arm A | {} | {} | 20 | no |\n",
-        RUN_CEILING,
-        RUN_CEILING + 10
+        "{header}| 6 | RED | 10 | 10 | 10 | no |\n\n| 16 | Arm A | 4 | 99 | 20 | no |\n"
     );
     assert!(
         check_ledger(&gapped)
             .iter()
-            .any(|c| c.contains("final cumulative") && c.contains(&ceiling)),
+            .any(|c| c.contains("cumulative is 99") && c.contains("runs this stage` is 14")),
         "a blank line inside the table truncated it: {:?}",
         check_ledger(&gapped)
     );
