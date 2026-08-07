@@ -29,7 +29,8 @@ with its unguarded double-provision race), and one was corrected in place under 
 (panel-never-completes, whose diagnostics are still good). **Five** lessons were lifted out of
 deleted entries into a new **`## Lessons kept from retired issues`** section, which replaced
 `## Resolved` and also carries that section's one surviving bullet. Measured against the file as
-this run found it (`eb3b917`): **87 → 78 sections, 4268 → 3942 lines.**
+this run found it (`eb3b917`): **87 → 78 sections**, and roughly 330 lines shorter. Trust the
+section count; re-derive the line count if you need one, since ordinary edits move it.
 
 Consequences for the counts below, which have **not** been recomputed: class **B — already
 fixed** is by construction now near-empty and is no longer a category this file's policy allows
