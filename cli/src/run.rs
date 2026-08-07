@@ -2017,6 +2017,103 @@ mod tests {
         );
     }
 
+    /// Two threads, each pointing `XDG_DATA_HOME` at its own root, each
+    /// re-reading `data_dir()` N times. Against the process-global `set_var`
+    /// implementation one thread observes the other's root. Un-ignored and
+    /// rewritten in `TestEnv` terms at T13, where it must pass.
+    ///
+    /// This is the race itself, in miniature and on purpose. The two threads
+    /// stand in for two tests running concurrently under `cargo test`: both
+    /// redirect the data root the only way today's code allows — by mutating
+    /// the variable for the WHOLE PROCESS — and `ENV_LOCK` is the only thing
+    /// keeping them apart. Nothing in the type system makes holding it
+    /// mandatory, so "hold ENV_LOCK" is a convention, and a convention is
+    /// exactly what this test declines to follow.
+    ///
+    /// It is `#[ignore]`d because it is *expected to fail* for the whole of
+    /// this branch: it documents the defect while the fix is built, and the
+    /// suite must stay green meanwhile. Its recorded red output is spec §7's
+    /// first artifact. At T13 the body is rewritten against the scoped
+    /// `TestEnv` handle and the `#[ignore]` comes off — the same two threads,
+    /// no longer able to see each other's root.
+    ///
+    /// The observation is deliberately one-way: a thread counts only the
+    /// iterations where `data_dir()` did NOT start with the root that same
+    /// thread had just set. Zero means no thread ever saw another's root; any
+    /// non-zero count is the race, caught in the act. Both threads' counts are
+    /// reported, because "which side lost" varies run to run and neither is
+    /// the interesting fact.
+    ///
+    /// `ENV_LOCK` is held for the duration and `XDG_DATA_HOME` is restored
+    /// before the assertion, exactly as
+    /// [`data_dir_refuses_to_resolve_inside_the_real_home`] does: this test is
+    /// *supposed* to fail, and a failing test must not leak a foreign data
+    /// root — or a poisoned `ENV_LOCK` — into whatever runs next.
+    #[test]
+    #[ignore = "demonstrates the race this branch removes; un-ignored at T13"]
+    fn data_root_is_not_shared_between_threads() {
+        /// Reads per thread. Tuned upward until the race lost reliably; see
+        /// `docs/test-isolation/race-red.txt` for the observed failure ratio.
+        const ITERATIONS: usize = 20_000;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+
+        // Held to the end of the test: dropping a `TempDir` deletes it, and a
+        // thread still resolving under a deleted root proves nothing.
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| tempfile::tempdir().expect("scratch data root"))
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(dirs.len()));
+
+        let handles: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                let root = dir.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Line the threads up so the writes actually interleave;
+                    // staggered, each could finish before the other starts.
+                    barrier.wait();
+                    let mut stolen = 0usize;
+                    for _ in 0..ITERATIONS {
+                        unsafe {
+                            std::env::set_var("XDG_DATA_HOME", &root);
+                        }
+                        if !data_dir().starts_with(&root) {
+                            stolen += 1;
+                        }
+                    }
+                    stolen
+                })
+            })
+            .collect();
+
+        let observed: Vec<usize> = handles
+            .into_iter()
+            .map(|h| h.join().expect("neither thread may panic"))
+            .collect();
+
+        // Restore before asserting — see the doc comment.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        assert_eq!(
+            observed.iter().sum::<usize>(),
+            0,
+            "data_dir() resolved another thread's data root: {observed:?} of \
+             {ITERATIONS} reads per thread saw a root the reading thread had \
+             not set. XDG_DATA_HOME is process-global, so two tests \
+             redirecting it concurrently share one slot and the loser writes \
+             into the winner's directory — silently, which is why this went \
+             unnoticed until it deleted the live data root."
+        );
+    }
+
     #[test]
     fn list_runs_finds_dirs_with_state_json() {
         let _lock = ENV_LOCK.lock().unwrap();

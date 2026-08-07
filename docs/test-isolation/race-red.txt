@@ -1,0 +1,167 @@
+================================================================================
+race-red.txt — the XDG_DATA_HOME race, watched failing (run enforce-env-lock, T3)
+================================================================================
+
+WHAT THIS IS
+  spec.md §7 artifact 1. A fix for a race nobody watched fail is not
+  trustworthy, so this is the race failing, on the record, before the fix
+  exists. The test is
+  `cli/src/run.rs::run::tests::data_root_is_not_shared_between_threads`.
+
+  It is `#[ignore]`d for the whole of this branch. It is EXPECTED TO FAIL from
+  T3 through T12; the suite stays green because it never runs. At T13 its body
+  is rewritten against the scoped `TestEnv` handle, the `#[ignore]` comes off,
+  and it must PASS. Until then, this file is the only evidence it ever ran.
+
+WHAT IT PROVES — AND WHAT IT DOES NOT
+  Proves: `XDG_DATA_HOME` is a single process-global slot, so two concurrent
+  redirections share it and one thread resolves the other thread's data root.
+  It is a race by construction, and it loses, in the open, thousands of times
+  per run.
+
+  Does NOT prove: that this is the cause of any particular observed flake.
+  T2's baseline recorded 8/8 green parallel runs — the documented flake did not
+  reproduce. That ruling stands. This file demonstrates the MECHANISM; it does
+  not license a later claim that removing the mechanism fixed a flake that was
+  never watched failing.
+
+WHEN / WHERE
+  recorded:    2026-08-06
+  worktree:    /home/sauyon/devel/drovr/.drovr/wt/enforce-env-lock
+  branch:      drovr/enforce-env-lock
+  HEAD at capture: a4d568c509d3b4ce4ab45006b6a2cde336570431
+                   (the T3 test was in the working tree, uncommitted at capture
+                   time; it is committed by the same commit that adds this file)
+  review base: a4d568c509d3b4ce4ab45006b6a2cde336570431 (task-3-base.sha)
+  toolchain:   export PATH=/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin:\
+/nix/store/l3gishxdaxhnaxczyw0jw7dcy9p4rhcs-rustc-1.97.0/bin:$PATH
+               (cargo 1.97.0 / rustc 1.97.0)
+  machine:     Linux 7.1.5-arch1-2, glibc; local worktree, not the nix sandbox.
+
+HOW TO REPRODUCE
+  cd cli
+  cargo test --bin drovr -- --ignored data_root_is_not_shared_between_threads
+  # exits 101; the assertion below is the whole point
+
+
+--------------------------------------------------------------------------------
+§1  FAILURE RATIO  (the plan asks for the ratio, not just a failure)
+--------------------------------------------------------------------------------
+
+  Ten consecutive invocations of the command above, at the shipped
+  `ITERATIONS = 20_000`:
+
+    run  1: FAILED   stolen reads [1417, 1694]   total 3111
+    run  2: FAILED   stolen reads [4112, 3705]   total 7817
+    run  3: FAILED   stolen reads [5071, 4376]   total 9447
+    run  4: FAILED   stolen reads [1391, 1460]   total 2851
+    run  5: FAILED   stolen reads [2997, 3010]   total 6007
+    run  6: FAILED   stolen reads [3666, 2977]   total 6643
+    run  7: FAILED   stolen reads [3776, 3055]   total 6831
+    run  8: FAILED   stolen reads [2572, 2309]   total 4881
+    run  9: FAILED   stolen reads [2256, 2084]   total 4340
+    run 10: FAILED   stolen reads [5001, 5349]   total 10350
+
+  RATIO: 10 / 10 failed.  Required by the plan: >= 9 / 10.
+
+  "Stolen reads" is per-thread: the count of iterations where `data_dir()` did
+  NOT start with the root that same thread had just set. The pair is reported
+  because which side loses varies run to run, and neither side is the
+  interesting fact. Roughly 15-26% of all reads were stolen; the two threads
+  lose at about the same rate, which is what a symmetric race looks like.
+
+  Runtime: 0.04-0.07s. The count is not a performance concern.
+
+ITERATION-COUNT TUNING (all on this machine, 10 invocations each)
+    ITERATIONS =  1_000  ->  10/10 failed
+    ITERATIONS =  5_000  ->  10/10 failed
+    ITERATIONS = 20_000  ->  10/10 failed   <- shipped
+
+  1_000 (the plan's floor) already saturates here. 20_000 was kept anyway: the
+  overlap window is what makes the race observable, and a machine with fewer
+  cores, a slower allocator, or a busier scheduler — the nix sandbox, or CI —
+  has a narrower one. The cost of the headroom is ~0.03s, and at T13 this same
+  count becomes the strength of the PASSING assertion rather than of a failure.
+  Do not lower it at T13 to make the test cheap; the count IS the evidence.
+
+
+--------------------------------------------------------------------------------
+§2  VERBATIM RED OUTPUT
+--------------------------------------------------------------------------------
+
+$ cd cli
+$ cargo test --bin drovr -- --ignored data_root_is_not_shared_between_threads
+   Compiling drovr v0.2.0 (/home/sauyon/devel/drovr/.drovr/wt/enforce-env-lock/cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.96s
+     Running unittests src/main.rs (target/debug/deps/drovr-b62291024005c9ca)
+
+running 1 test
+test run::tests::data_root_is_not_shared_between_threads ... FAILED
+
+failures:
+
+---- run::tests::data_root_is_not_shared_between_threads stdout ----
+
+thread 'run::tests::data_root_is_not_shared_between_threads' (2308610) panicked at src/run.rs:2105:9:
+assertion `left == right` failed: data_dir() resolved another thread's data root: [3398, 3324] of 20000 reads per thread saw a root the reading thread had not set. XDG_DATA_HOME is process-global, so two tests redirecting it concurrently share one slot and the loser writes into the winner's directory — silently, which is why this went unnoticed until it deleted the live data root.
+  left: 6722
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    run::tests::data_root_is_not_shared_between_threads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 708 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--bin drovr`
+$ echo $?
+101
+
+
+--------------------------------------------------------------------------------
+§3  THE SUITE IS STILL GREEN  (the `#[ignore]` is doing its job)
+--------------------------------------------------------------------------------
+
+  Both runs from `cli/`, plain `cargo test`, NO `XDG_DATA_HOME=$(mktemp -d)`
+  prefix — matching baseline-before.txt exactly, so the numbers are comparable.
+
+  PARALLEL   `cargo test`                     exit 0
+    708 passed; 0 failed; 1 ignored      (bin drovr — the 1 ignored is this test)
+      1 passed; 0 failed; 0 ignored
+      3 passed; 0 failed; 0 ignored
+      7 passed; 0 failed; 0 ignored
+      2 passed; 0 failed; 0 ignored
+      6 passed; 0 failed; 0 ignored
+      2 passed; 0 failed; 0 ignored
+      1 passed; 0 failed; 0 ignored
+    ------------------------------------------------------------------
+    TOTAL   730 passed; 0 failed        <- baseline §4 requires 730 / 0.  MATCH.
+
+  SERIAL     `cargo test -- --test-threads=1`  exit 0
+    TOTAL   730 passed; 0 failed        <- MATCH.
+
+  Warnings: 0 in both.
+
+  The count does not move because the new test is `#[ignore]`d: it appears as
+  `1 ignored`, never as a 731st pass. A run reporting anything other than
+  730 / 0 is a real regression against the baseline — see
+  docs/test-isolation/baseline-before.txt §4.
+
+  Canary `~/.local/share/drovr/canary.txt` present and mtime unchanged
+  (2026-08-06 20:33) after every run above.
+
+
+--------------------------------------------------------------------------------
+§4  WHAT T13 MUST DO WITH THIS
+--------------------------------------------------------------------------------
+
+  1. Rewrite the body against the scoped `TestEnv` handle. Keep the two
+     threads, the `Barrier`, and `ITERATIONS = 20_000` — the shape is the
+     evidence. Only the redirection mechanism changes.
+  2. Remove the `#[ignore]` attribute and its reason string.
+  3. The suite must then report 731 passed / 0 failed / 0 ignored: the same
+     730 as the baseline, plus this test now passing. 730 with 1 ignored means
+     the `#[ignore]` was not removed.
+  4. Do NOT claim this fixed an observed flake. See "WHAT IT PROVES — AND WHAT
+     IT DOES NOT" above, and baseline-before.txt §1b.
