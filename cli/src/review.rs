@@ -1069,8 +1069,8 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
 /// records the new ids. What it cannot restore is the *agents* — every pane died
 /// with the workspace, so a phase that was `Running` when it was archived comes
-/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
-/// archived run does not make it runnable again — FIXED 2026-08-02".
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Losing a run's
+/// herdr workspace — what the repair does, and what it still does not".
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
 /// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive

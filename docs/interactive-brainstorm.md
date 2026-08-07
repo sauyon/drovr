@@ -72,8 +72,10 @@ Server: `GET interview` and `POST answer`; `GET questions` is deleted. `POST ans
 and does not touch `review.state.json`. UI: an interview panel replaces the questions panel and
 `renderQuestions()`.
 
-Retires `known-issues.md`, *"Review-server Submit button does nothing when `questions.json` is
-not a bare array"* — by deletion rather than by fix.
+Retired `known-issues.md`'s *"Review-server Submit button does nothing when `questions.json` is
+not a bare array"* — **by deletion rather than by fix**, so that heading is gone from
+`known-issues.md` and searching for it will find nothing. The schema cannot recur because the
+schema no longer exists.
 
 ## The spec-authoring change
 
@@ -142,8 +144,9 @@ These bind, and the plan's text does not:
 
 Two things a reader will reasonably expect to find and will not:
 
-1. **The spec-length A/B was deliberately out of scope for this run** — no arm was written, no
-   fixture scored, no outcome applied. The frozen ledger under `docs/skill-evidence/spec-length/`
+1. **The spec-length A/B was deliberately out of scope for this run** — no *candidate* arm was
+   written (only the control `S0`, which T1 froze), no fixture scored, no outcome applied. The
+   frozen ledger under `docs/skill-evidence/spec-length/`
    is **unscored** — T1 of this run is what created it (3 fixtures, 230 ledger rows, control arm
    `S0`), and nothing since has touched it. Everything the A/B needs exists; nobody has run it.
    The freeze-precedes-every-arm ordering still holds, so it can be picked up as-is.
@@ -155,8 +158,9 @@ Two things a reader will reasonably expect to find and will not:
    the reviewer is a real, unowned follow-up.
 
 **One cost, stated plainly.** The run's goal was shorter *specs*, and `brainstorm.md` itself got
-longer: **103 lines on `main` → 160 here.** Only 25 of those 57 lines are this run's (the base it
-branched from already carried 135, from the unlanded ask-directive work underneath); T8 added the
-interview loop and the decision-record framing. A longer prompt costs context in **every**
-brainstorm phase, forever, and that is a real price paid up front against a spec-length saving
-that has not yet been measured. Only the A/B in (1) can say whether the trade pays.
+longer: **103 lines on `main` → 160 here.** Ten of those 57 came with the unlanded branch this
+run sits on (which carried 113); the other **47 are this run's own** — T7 added the ask directive
+(113 → 135) and T8 the interview loop and decision-record framing (135 → 160). A longer prompt
+costs context in **every** brainstorm phase, forever, and that is a real price paid up front
+against a spec-length saving that has not yet been measured. Only the A/B in (1) can say whether
+the trade pays.

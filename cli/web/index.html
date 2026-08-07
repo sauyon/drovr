@@ -481,7 +481,8 @@
 
   /* ---- The interview (the agent's live ask channel) ---- */
   /* The accent edge is what separates this from every other panel on the page: it
-     is the only one where a run is waiting on the human rather than the reverse. */
+     is the only one a run can be waiting on OUTSIDE the review gate — it is live at
+     any state, and the gate is not. */
   .interview-panel {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1000,8 +1001,9 @@
 
   <!-- The interview: the agent's live ask channel (`drovr ask`), populated
        dynamically and polled on its own 2s timer. Above everything else on the
-       page because it is the one thing here a run may be waiting on: until it is
-       answered the agent cannot settle the decision it asked about. It renders
+       page because it is the one thing here a run may be waiting on outside the
+       review gate below: until it is answered the agent cannot settle the decision
+       it asked about, whatever state the gate is in. It renders
        independently of the review gate: a question can arrive at any point in a
        run's life, including on a run whose spec is already approved and whose
        gate will never move again. -->
@@ -1983,11 +1985,12 @@ function needsWrittenFeedback(feedbackVal) {
 //    and whose gate will never move again — so it polls on its own timer instead
 //    of rendering out of refresh()'s state branches. Only `cancelled` mutes it.
 //  * it answers ONE ask at a time, straight to the server (`POST answer`), rather
-//    than collecting a form and submitting it with a decision. The phase prompts
-//    do allow a small batch of genuinely independent questions, which is what the
-//    `1 of N` counter counts — this panel serialises such a batch instead of
-//    rendering it, so each answer is durable the moment it is given and none of
-//    them ride on a gate submission that may never come.
+//    than collecting a form and submitting it with a decision. `brainstorm.md` lets
+//    genuinely independent questions go out together; the `1 of N` counter is wider
+//    than that, counting every ask still pending on the run whatever phase or agent
+//    posted it and however far apart in time. This panel serialises all of them, so
+//    each answer is durable the moment it is given and none of them ride on a gate
+//    submission that may never come.
 //
 // Value carried by the "Other" radio. A reserved sentinel, never a legal option
 // `value`: submitAnswer swaps it for the text the human typed, so it is never

@@ -61,19 +61,25 @@ The review server is **always on** — you do not start it per run. `drovr revie
 single writer of `spec.md`; you convey the reviewer's decisions. The run's page lives at
 `http://127.0.0.1:8791/#/runs/<run>` (the root `/` is the session list of all runs).
 
-1. **Nothing to start.** The agent's first `drovr review summary` brings the server up if it
-   isn't already. Use a Tailscale host instead of localhost only on a trusted tailnet — there
-   is no auth (`drovr serve --host <tailscale-host>` if you want to pre-bind it). **Do NOT
-   hand the human the run URL yet** — the page is EMPTY until the first summary lands, and an
-   empty page reads as "the tool is broken."
+1. **Nothing to start.** The agent's first `drovr ask` or `drovr review summary` brings the
+   server up if it isn't already. Use a Tailscale host instead of localhost only on a trusted
+   tailnet — there is no auth (`drovr serve --host <tailscale-host>` if you want to pre-bind it).
 
-1b. **Wait for the first summary before announcing the URL or starting `review wait`.** The
-   brainstorm agent writes `spec.md` then runs `drovr review summary`, flipping state
-   `idle → ready`. Only once `spec.md` exists **and** state reports `ready` do you give the
-   human the URL and start `drovr review wait`. Until then there is nothing to review and a
-   `review wait` against a specless run just churns. If the agent stalls without producing a
-   spec, inspect its pane (`drovr attach <run>`) — do not point the human at an empty page.
-   (Background a poll on the run's state for the `ready` transition; don't busy-wait inline.)
+1b. **Two different things put the human on that page, and only one of them waits for the
+   spec.** Do not conflate them:
+
+   - **A pending ask.** The brainstorm agent interviews the human *before* it writes the spec,
+     so the page carries a question long before `spec.md` exists. `drovr ask` prints the URL
+     itself and the agent hands it over — **you do not gate that on state**, and you stay out of
+     the interview (see step 5). A page with a pending ask is not empty and not broken.
+   - **The review gate.** Here the old caution still holds: with no spec and no ask, the page has
+     nothing on it, and an empty page reads as "the tool is broken." The brainstorm agent writes
+     `spec.md` then runs `drovr review summary`, flipping state `idle → ready`. Only once
+     `spec.md` exists **and** state reports `ready` do you announce it *as a review* and start
+     `drovr review wait` — before that there is nothing to review and the wait just churns. If
+     the agent stalls without producing a spec **and** without asking anything, inspect its pane
+     (`drovr attach <run>`). (Background a poll on the run's state for the `ready` transition;
+     don't busy-wait inline.)
 
 2. **Per-run state machine** (`/api/runs/<run>/state` → `{state, turn}`; files in the run dir):
 

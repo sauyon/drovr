@@ -1,5 +1,13 @@
 # Known issues
 
+**A fixed defect is DELETED from this file, not annotated as fixed.** What made an entry worth
+recording was the live bug; once the fix is in the code and pinned by a test, the entry is a
+record of the past that every reader has to work out no longer applies. Two exceptions, and only
+these two: an entry that is still **partly open** stays, retitled so the heading says which half
+is live (three below do); and a retiree whose value was never the defect — an expensive root
+cause guarded by nothing, or a rule that stops a settled bug being re-filed — moves to
+**`## Lessons kept from retired issues`**. Before adding a `— FIXED` marker, delete instead.
+
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
 **Status:** open, pre-existing — the `UserPromptSubmit` per-turn gate inherits the gap
@@ -629,7 +637,8 @@ Two nearby effects worth knowing:
 - **The first of the five was vacuous, so only four were real passes.** Panel 1's head equalled
   the recorded base (`5c8a7da`), so it reviewed an empty diff and reported clean from all four
   angles. The agent caught this itself. It is a *different* defect class, recorded above — see
-  "The panel reviews `base..HEAD`". It does not weaken this entry, because this entry's evidence
+  "The panel can review less than you think — the PARTIAL commit is still open". It does not
+  weaken this entry, because this entry's evidence
   is the controlled 5-vs-6 comparison, not the count.
 - **Cost.** Task 3 was reviewed 6×. Of the five author-run rounds, three (panels 2–4) returned
   findings; panel 1 was the vacuous one and panel 5 was clean. The sixth is the one that decided
@@ -812,68 +821,6 @@ files nobody touched, which then collide with other worktrees working on those f
 **Do not:** run `cargo fmt`, or `rustfmt` on `main.rs`, unless you intend to reformat the crate.
 If you do it by accident, `git checkout --` the files you did not edit.
 
-## The findings channel loses reviewer output two ways (2026-07-26/27)
-
-**Severity:** high — it fails the panel on any real diff, and both modes look like "the reviewer
-produced nothing" rather than "drovr could not read it".
-**Found:** run `structural-briefs`, task `branch`, 4 cursor reviewers over a 1152-line diff.
-Panel exit 1: `reviewer 'review:branch:1:error-handling' produced no findings JSON (no file
-written and none found in its transcript)` — while that reviewer's JSON was plainly visible in
-its pane.
-
-### 1. Reviewers emit UNFENCED JSON; the extractor only reads fences
-
-`extract_findings_json` walks ` ``` ` fences and takes the last block whose body starts with `{`.
-The cursor reviewers printed `Review complete. Findings below.` followed by a bare top-level JSON
-object — no fence. The only fenced block in the transcript was the *schema* echoed from the seed.
-So extraction found nothing even though valid findings were on screen.
-
-**FIXED** (`829a155`, hardened again in `1022510`): a fenced candidate must now PARSE as a
-`Review` — the seed's echoed schema is not JSON, and it was shadowing real findings — and when no
-fenced block yields one, `last_review_object` takes the last balanced `{...}` that parses. Its
-candidate starts are braces that begin a line, tried last-first: trying every brace was quadratic
-on a transcript full of code, and an unbalanced brace in prose could swallow the rest of the input
-so the real object was never attempted.
-
-### 2. The pane transcript is LOSSY, so JSON cannot be reconstructed from it at all
-
-`herdr agent read` (any `--source`, including `recent-unwrapped`, `--lines 800`) truncates long
-lines **mid-word**:
-
-```
-"rationale": "resolve_context treats trimmed-empty supplied context as None and falls th... A driver pas
-code-review's explicit recording semantics and dangerous on fix-loop re-runs."
-```
-
-Text is missing between `A driver pas` and `code-review's`, so the JSON is unparseable no matter
-how it is extracted. A `rationale` of any length — i.e. every useful finding — can hit this.
-
-This is the deeper form of the already-noted "make the findings channel durable, not a viewport":
-the viewport is not merely small, it is *destructive*.
-
-**Also ruled out as an escape:** asking the reviewer to write the JSON to a file. The reviewers
-run read-only (`cursor --mode plan`), which refuses the write. They fall back to printing, which
-is where the truncation is.
-
-**What actually worked** (both rounds, and it is the current workaround): tell the reviewer, via
-`--context`, to print one line per finding as `SEVERITY|file:line|summary` with every line under
-100 characters. Short lines wrap instead of truncating, so they survive. Rationale is lost, which
-is a real cost — the summary alone is usually enough to act on, but not always.
-
-**There IS a durable channel, found 2026-07-27:** a cursor reviewer in `--mode plan` saves its
-work to `~/.cursor/plans/<title>-<id>.plan.md` and prints the path
-(`Saved to home/sauyon/.cursor/plans/Security Review Findings-4ea3cb76.plan.md`). That file holds
-the FULL review — untruncated rationale, the "no finding" verifications, findings separated from
-nits — and is incomparably better than anything scraped from a pane. Round 5's security findings
-were only fully legible there.
-
-**Fix ideas, in order of preference:** (1) harvest the plan file: match the newest
-`~/.cursor/plans/*.plan.md` for the reviewer (title + mtime) and parse findings from it, falling
-back to the transcript. Cursor-specific, so it needs a per-agent hook rather than a hard-coded
-path; (2) any other channel drovr controls — the reviewer runs in a pane drovr spawned, so a file
-it is *permitted* to write beats scraping; (3) instruct short lines in the seed rather than in
-per-invocation context; (4) accept unfenced JSON — done, necessary but not sufficient.
-
 ## One failing test cascades: a panic while holding `ENV_LOCK` poisons it (2026-07-27)
 
 **Severity:** low, but it wastes debugging time.
@@ -1053,9 +1000,14 @@ JSON (no file written and none found in its transcript)
 `obtain_findings_json` could not see it because `agent_read` reads
 `source:"recent"` — a *viewport* snapshot, not the full scrollback. Cursor renders long tool output
 collapsed (`… NN output lines hidden · ctrl+o to expand`) and keeps scrolling, so by the time the
-panel reads the pane the emitted JSON has left the recent window. The file fallback never helps
-either: the reviewer seed says *"Emit the fenced JSON, then exit"*, so reviewers deliberately write
-**no** `<task>-review-<angle>.json` file — the transcript is the only channel, and it is lossy.
+panel reads the pane the emitted JSON has left the recent window.
+
+**That half is now fixed and the description above is history.** At the time, the reviewer seed
+said *"Emit the fenced JSON, then exit"*, so reviewers wrote **no** `<task>-review-<angle>.json`
+and the lossy transcript was the only channel. Fix idea 1 below shipped: reviewers now submit
+through the MCP `submit_findings` tool, which performs the write for them, `obtain_findings_json`
+prefers that file, and `code_review::delivered_review` treats it as the completion signal. The
+seed now asserts the opposite of what it used to — reviewers are told *not* to print JSON.
 
 **Correction to an easy misdiagnosis:** cursor reviewers *do* reach `done`. In pass 1 they merely
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
@@ -1095,9 +1047,10 @@ missed, including a test that passed while allocating ~300 MB of grammar.
 
 ### Fix ideas (from the 2026-07-25 dogfood)
 
-1. **Make the findings channel durable, not a viewport.** Have the reviewer seed instruct writing
-   `<run_dir>/<task>-review-<angle>.json` *and* echoing it, then prefer the file. The file fallback
-   in `obtain_findings_json` already exists but is dead code today because nothing writes the file.
+1. **Make the findings channel durable, not a viewport.** — **SHIPPED**, in the form of fix idea 2
+   rather than as written here: reviewers run read-only and so cannot write the file themselves, so
+   `drovr mcp-findings` exposes a single `submit_findings` tool and drovr performs the write. The
+   file is now the primary channel and the completion signal, not a fallback.
 2. If the transcript must stay the channel, read full scrollback rather than
    `source:"recent"`, and fail with the captured transcript attached so the driver can hand-merge.
 3. Submit the seed reliably (see the entry below) — one fix removes failure mode 1 for the panel,
@@ -1427,7 +1380,8 @@ at its composer. Two narrow cases fall outside it:
 
 - pane already `working` — `wait_agent_ready` admits `working`, so this is reachable when a send
   targets a busy agent. `Ok` there proves nothing about this payload.
-- pane already `done` — very narrow, because `done` is momentary (see the EDGE entry below): an
+- pane already `done` — very narrow, because `done` is momentary (see *"herdr's `agent_status:
+  "done"` is an EDGE, not a level"* under "Lessons kept from retired issues"): an
   agent parked at its prompt reads `idle`, so the driver's post-`phase wait` re-entry send
   almost always lands on `idle`.
 
@@ -1992,16 +1946,18 @@ Wanted work that is not a defect — nothing here is broken today.
 
   Recorded rather than built because it changes what a "run" is at the top. The stated blocker
   is now **cleared**: the interactive-brainstorm work (`drovr ask` / `ask wait`, the interview
-  panel) landed 2026-08-07, so the orchestrator would have a channel to the human — an
-  orchestrator without one is strictly worse than a human driving by hand, which is the exact
-  trap that produced this entry.
+  panel) landed on `drovr/ask-channel` 2026-08-07 — not yet on `main` — so the orchestrator would
+  have a channel to the human. An orchestrator without one is strictly worse than a human driving
+  by hand, which is the exact trap that produced this entry.
 
-  Of the two consequences of the present shape recorded here, one is gone and one is not.
-  **Still true:** a brainstorm conducted in the human's chat session leaves the run with **zero
-  agent panes**, so `/api/runs/<run>/agents` answers `nodes: []` and the review UI reports "no
-  live pane" on a run that is actively at its gate. **No longer true:** that the interview lands
-  in the driver's context. It is answered in the web UI and read back by the phase agent that
-  posted it; `skills/pipeline/SKILL.md` now tells the driver to stay out of it.
+  The two consequences recorded here are consequences of two *different* setups, and only one is
+  now addressed. **Still true, for a brainstorm conducted in the human's chat session:** the run
+  has **zero agent panes**, so `/api/runs/<run>/agents` answers `nodes: []` and the review UI
+  reports "no live pane" on a run that is actively at its gate — and with no phase agent, there
+  is nobody but the driver to hold the Q&A, so the interview does still land in its context.
+  Those are the same root, not two findings. **Addressed, once brainstorm runs as a phase
+  agent:** the interview is answered in the web UI and read back by the agent that posted it, and
+  `skills/pipeline/SKILL.md` tells the driver to stay out of it.
 
 ## drovr never moves the driver out of the invoking checkout
 
@@ -2966,8 +2922,10 @@ list, it has become an issue again and belongs above.
   regression"), none with measurements behind it. Ruled out and not worth re-testing: the drovr
   server, CDP socket topology, `--headless` vs `=old`/`=new`, `--no-sandbox`,
   `--disable-dev-shm-usage`, `NetworkServiceInProcess`, `--no-proxy-server`, enterprise policy,
-  machine load, and any chromium wrapper or flag file. Diagnose with
-  `--log-net-log --net-log-capture-mode=Everything`.
+  machine load, the agent tool sandbox, and any chromium wrapper or flag file. Diagnose with
+  `--log-net-log --net-log-capture-mode=Everything`; the check that **confirms** it rather than
+  suggesting it is `ReadAlias("default")` on `org.freedesktop.secrets` returning `/`, i.e. there
+  is no unlocked default collection.
 - **herdr's `agent_status: "done"` is an EDGE, not a level** (retired 2026-07-27). It is
   reported only for the moment a turn ends; an agent parked at its prompt reports `"idle"`.
   Anything that polls for it will miss it and can never recover — which is what hung the review
@@ -2976,7 +2934,26 @@ list, it has become an issue again and belongs above.
   A parseable findings file finishes an angle whatever the pane says
   (`code_review::delivered_review`); herdr is consulted for exactly one question the artifact
   cannot answer — has a reviewer finished *without* delivering? Do not reintroduce a
-  liveness-based completion test anywhere.
+  liveness-based **completion** test. `agent_status` for readiness and blocked-detection is fine
+  and still in use (`cli/src/phase.rs`); it is completion, and only completion, that must come
+  from the artifact.
+- **`herdr agent read` is a LOSSY viewport — it truncates long lines mid-word** (retired
+  2026-07-27, when the findings channel stopped being a pane scrape). Every `--source`, including
+  `recent-unwrapped` with `--lines 800`. Text simply goes missing mid-token, so anything
+  structured read back from a pane — JSON above all — can be unparseable no matter how it is
+  extracted. Two consequences that still bind: **never make a pane transcript the durable channel
+  for anything** (this is why reviewers submit through the `submit_findings` MCP tool and drovr
+  does the write), and any check that looks for a payload in a pane must compare a **capped
+  prefix**, never the whole string — which is exactly what `pane_shows_payload`
+  (`cli/src/phase.rs`) does and why. If you must get text out of a pane, keep lines under ~100
+  chars: short lines wrap instead of truncating.
+- **A cursor reviewer in `--mode plan` writes its full output to a file** (recorded 2026-07-27;
+  never harvested). It saves to `~/.cursor/plans/<title>-<id>.plan.md` and prints the path. That
+  file holds the untruncated review — full rationale, the "no finding" verifications, findings
+  separated from nits — and is far better than anything scraped from a pane. drovr does not read
+  it: `submit_findings` solved the problem a different way. Recorded because it is the obvious
+  channel to reach for if a read-only agent ever needs to return more than a tool call can carry,
+  and because it is not discoverable without knowing it exists.
 - **A skill's `description:` is a trigger, not a summary** (retired 2026-08-04; pinned by
   `cli/tests/skills_valid.rs::no_phase_scoped_description_literals`). It is the line that
   decides whether the skill is read at all, so a precondition written into it is a precondition
@@ -3127,6 +3104,10 @@ restores the workspace or exits non-zero; it no longer prints a resume it cannot
   attempt makes a *second* replacement) while the first stood in the switcher with nothing
   pointing at it. If the close also fails, the message names the id and the label to close by
   hand.
+- **A ZOMBIE needs no repair, and gets none.** A run archived while `workspace_close` failed
+  still has a live workspace and live panes recorded — the state the UI flags as anomalous.
+  `ensure_workspace` no-ops when `workspace_exists` says alive, so restoring one and running
+  `drovr phase start` reuses what is there and works, as it always did.
 - **A run with no `project_dir`** (created before that field existed) still cannot be repaired
   — there is no cwd to open a workspace in. The error names that field and its path rather
   than telling you to start over. Every site that refuses for this reason now raises the same
