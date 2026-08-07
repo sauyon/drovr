@@ -6540,6 +6540,271 @@ fn task_binding_check_rejects_a_reworded_directive() {
     );
 }
 
+/// The ask-channel directive (`docs/interactive-brainstorm.md` decision 7),
+/// carried verbatim up to wrapping and indentation by every phase-prompt that
+/// briefs a **writer**.
+///
+/// **It is a RAW string literal, and that is not a style choice.** The text
+/// carries a wrapped shell command whose lines end in a trailing `\`. In a
+/// non-raw Rust literal, a `\` immediately before a newline is the
+/// line-continuation escape: it would delete the backslash, the newline, **and
+/// all leading whitespace on the next line**, silently merging the three command
+/// lines into one and erasing every backslash from the constant — with no
+/// compile error. `cli/src/main.rs`'s `ASK_USAGE` uses exactly that idiom on
+/// purpose, one screen away from this work, so the wrong precedent is the one
+/// sitting closest to hand. The damage would surface here as
+/// [`ask_channel_directive_present`] reporting *"quotes a DIFFERENT directive"*,
+/// which reads like a wording bug and is not.
+///
+/// Two interface facts it must keep right, both of which drifted from the plan
+/// during T3 and bind for everything downstream:
+///
+/// - `--context <text>` and `--context-file <path>` are **separate** flags.
+/// - `ask wait` with nothing outstanding prints the **folded interview**, not a
+///   bare `[]` — which is what makes the re-arm race survivable.
+const ASK_CHANNEL_DIRECTIVE: &str = r#"
+**Ask the human when you need to, mid-phase — do not guess and write the guess down.** Two
+triggers, either one is enough: **new information is discovered** that the spec or plan did not
+anticipate, or **a question is found** that you cannot resolve from the code or the run's
+artifacts. Post it and carry on with whatever does not depend on the answer:
+
+    drovr ask <run> --question "<what you need decided>" \
+      [--context <text> | --context-file <path>] \
+      [--option <value>=<label>]... [--recommend <value>]
+
+`ask` returns immediately, printing the ask id and the page to point the human at. Then
+background `drovr ask wait <run> [--timeout-ms <ms>]` and end your turn: `0` answered, `2`
+timeout — re-arm, the question is still on disk and still on screen — `5` the run was cancelled,
+`1` error. On `0` stdout carries the answers as JSON: the asks that wait was armed on, each with
+its latest answer, or — when nothing was outstanding — the whole folded interview, which is how
+a wait re-armed just after the human answered still hands you the answer. A timeout costs
+nothing; a guess costs the run.
+"#;
+
+/// The phase-prompts that must **not** carry [`ASK_CHANNEL_DIRECTIVE`], each with
+/// the reason.
+///
+/// An exclusion is a decision, so it is recorded rather than left as an absence:
+/// otherwise a prompt excluded on purpose and a prompt forgotten by accident are
+/// the same observation. Asserted against the directory in **both** directions —
+/// an entry naming no file fails, so an exclusion cannot outlive a rename.
+const ASK_DIRECTIVE_EXCLUSIONS: &[(&str, &str)] = &[(
+    "review-angle.md",
+    "briefs read-only panel reviewers that report through a findings file and never write \
+     — they have no run-scoped write channel, and `drovr ask` is a write",
+)];
+
+/// [`ASK_CHANNEL_DIRECTIVE`] in comparable form.
+fn canonical_ask_directive() -> Quote {
+    Quote::new(ASK_CHANNEL_DIRECTIVE)
+}
+
+/// Every `.md` under `skills/pipeline/phase-prompts`, sorted, asserted non-empty.
+///
+/// Shared by both ask-channel checks so neither can end up reading a different
+/// corpus from the other, and **derived** for the same reason
+/// [`task_binding_directive_present`]'s is: a phase-prompt added later must be
+/// required to carry the directive the day it lands, not the day someone
+/// remembers to extend a const.
+fn phase_prompt_files() -> Vec<PathBuf> {
+    let dir = skills_dir().join(PHASE_PROMPTS_DIR);
+    let entries = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read phase-prompts dir {}: {e}", dir.display()));
+    let mut prompts: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("read_dir entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    prompts.sort();
+    assert!(
+        !prompts.is_empty(),
+        "no `.md` files under {} — the derived corpus is empty, so every assertion \
+         over it would pass having read nothing",
+        dir.display()
+    );
+    prompts
+}
+
+/// Decision 7 of `docs/interactive-brainstorm.md`: every phase-prompt except the
+/// recorded exclusions quotes [`ASK_CHANNEL_DIRECTIVE`] exactly once, and each
+/// exclusion quotes it exactly zero times.
+///
+/// **The exclusion half is what makes silence mean something.** A check that only
+/// asserted presence could not tell `review-angle.md` — excluded on purpose,
+/// because it briefs read-only reviewers with no write channel — from a prompt
+/// nobody got to. Pairing the derived directory read with an exclusion table
+/// asserted in both directions makes "missing entirely" unrepresentable: a new
+/// phase-prompt fails until it carries the text or is excluded by name, and an
+/// exclusion that stops naming a real file fails outright.
+///
+/// **What this checks is the text, not a few keywords.** The wording carries the
+/// exit-code contract (`0`/`2`/`5`/`1`), the two separate context flags, and the
+/// fact that a timeout costs nothing — a prompt that kept the phrase "drovr ask"
+/// and lost those has lost the directive.
+/// [`ask_directive_check_rejects_a_rewording`] pins that.
+#[test]
+fn ask_channel_directive_present() {
+    let canon = canonical_ask_directive();
+    assert!(
+        !canon.as_str().is_empty(),
+        "ASK_CHANNEL_DIRECTIVE is empty; every comparison below would be vacuous"
+    );
+
+    let prompts = phase_prompt_files();
+    let present: HashSet<String> = prompts
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let excluded: HashSet<String> = ASK_DIRECTIVE_EXCLUSIONS
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+
+    let mut phantom: Vec<&String> = excluded.difference(&present).collect();
+    phantom.sort();
+    assert!(
+        phantom.is_empty(),
+        "ASK_DIRECTIVE_EXCLUSIONS entries naming no phase-prompt: {phantom:?}\n\
+         The table is asserting absence about files that are not there. If a \
+         prompt was renamed, rename its entry; if it was deleted, delete its \
+         entry — do not leave an exclusion standing for nothing.",
+    );
+
+    let mut wrong = Vec::new();
+    for path in &prompts {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let excuse = ASK_DIRECTIVE_EXCLUSIONS
+            .iter()
+            .find(|(entry, _)| *entry == name)
+            .map(|(_, why)| *why);
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+        let quotes = block_quotes(&contents);
+        let found = quotes.iter().filter(|quote| **quote == canon).count();
+        match (excuse, found) {
+            (None, 1) | (Some(_), 0) => continue,
+            (None, 0) => {
+                // The likely failure is a rewording, not an omission, so show the
+                // drifting block rather than only the count.
+                let near = quotes
+                    .iter()
+                    .find(|quote| quote.as_str().contains("drovr ask"));
+                wrong.push(match near {
+                    Some(drifted) => format!(
+                        "{}: briefs a writer, so it must carry the ask directive, but it \
+                         quotes a DIFFERENT one:\n    {}",
+                        path.display(),
+                        drifted.as_str()
+                    ),
+                    None => format!(
+                        "{}: briefs a writer, so it must carry the ask directive, and it \
+                         does not quote it at all",
+                        path.display()
+                    ),
+                });
+            }
+            (None, n) => wrong.push(format!(
+                "{}: quotes the ask directive {n} times, expected once",
+                path.display()
+            )),
+            (Some(why), n) => wrong.push(format!(
+                "{}: quotes the ask directive {n} time(s), expected none — it is a \
+                 recorded exclusion ({why}). If that judgement has changed, delete its \
+                 ASK_DIRECTIVE_EXCLUSIONS entry in the SAME commit as the text.",
+                path.display()
+            )),
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} phase-prompt(s) disagree with the ask-channel contract:\n{}\n\n\
+         The canonical text is ASK_CHANNEL_DIRECTIVE and it is the whole contract — \
+         quote it, do not reword it, do not drop the exit codes, and do not collapse \
+         `--context` and `--context-file` into one flag. Re-wrapping and indenting are \
+         fine; `Quote::new` folds both. Do NOT touch the step-0 task-binding block to \
+         make room: `task_binding_directive_present` requires it verbatim.",
+        wrong.len(),
+        wrong.join("\n"),
+    );
+}
+
+/// [`block_quotes`] recovers the ask directive from the shape the prompts carry
+/// it in, and [`ask_channel_directive_present`]'s comparison refuses a rewording.
+///
+/// Presence of a few keywords is not presence of the contract, and this is the
+/// case that says so. Both variants are built **from**
+/// [`ASK_CHANNEL_DIRECTIVE`] or asserted against it, so neither can drift away
+/// from the const it is about.
+#[test]
+fn ask_directive_check_rejects_a_rewording() {
+    let canon = canonical_ask_directive();
+
+    // The shape the prompts use: indented inside a numbered step, prose either
+    // side. Blank lines inside the quote stay inside it — a `>`-only line is
+    // still a quote line, and the directive has two of them around its command
+    // block.
+    let indented: String = ASK_CHANNEL_DIRECTIVE
+        .trim()
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                "   >\n".to_string()
+            } else {
+                format!("   > {line}\n")
+            }
+        })
+        .collect();
+    let page = format!("1. **Ask when you need to.**\n\n{indented}\n2. Next step.\n");
+    assert_eq!(
+        block_quotes(&page),
+        vec![canon.clone()],
+        "the extractor did not recover the ask directive from the shape the \
+         phase-prompts use to carry it — a blank `>` line must not split the quote"
+    );
+
+    // A one-word change, made FROM the const so it cannot drift into agreement.
+    // The word chosen is the exact drift this directive exists to pin: collapsing
+    // `--context-file <path>` back into the plan's mistaken `--context <path>`.
+    let one_word = ASK_CHANNEL_DIRECTIVE.replace("--context-file <path>", "--context <path>");
+    assert_ne!(
+        one_word, ASK_CHANNEL_DIRECTIVE,
+        "the one-word rewording changed nothing, so the assertion below is vacuous \
+         — the phrase it edits is no longer in the directive (mind the line wrap: \
+         `replace` does not see across a newline)"
+    );
+    assert_ne!(
+        Quote::new(&one_word),
+        canon,
+        "a one-word rewording compared equal to the canonical text — the \
+         comparison is not checking the wording"
+    );
+
+    // A paraphrase carrying every keyword a substring check would have looked
+    // for. It must NOT be accepted as the directive.
+    let paraphrase = "If new information is discovered, or you find a question you cannot \
+                      answer, run `drovr ask <run> --question ...` and then background \
+                      `drovr ask wait <run>`.";
+    for fragment in [
+        "new information",
+        "find a question",
+        "drovr ask",
+        "ask wait",
+    ] {
+        assert!(
+            paraphrase.contains(fragment),
+            "this case only refutes a keyword check if it carries every keyword such \
+             a check would look for; it is missing `{fragment}`"
+        );
+    }
+    assert_ne!(
+        Quote::new(paraphrase),
+        canon,
+        "a paraphrase carrying every obvious keyword compared equal to the canonical \
+         text — the comparison is not checking the wording"
+    );
+}
+
 /// The evidence corpus is the only citable record behind every numeric or
 /// comparative claim drovr's skill text makes (spec §2.1 exception 1). It is
 /// prose, so nothing else in this suite would notice it going missing — a task

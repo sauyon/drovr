@@ -24,22 +24,41 @@ tasks; later tasks run as their own fresh phases.
    > repo root otherwise, and tick items there. An untracked checklist decays with the context
    > window; that decay is the exact failure drovr exists to fight.
 
-1. **Read** the task brief and the accumulated interfaces in the `## Context from the driver`
+1. **Keep the ask channel open — the whole phase, not just at a gate.**
+
+   > **Ask the human when you need to, mid-phase — do not guess and write the guess down.** Two
+   > triggers, either one is enough: **new information is discovered** that the spec or plan did not
+   > anticipate, or **a question is found** that you cannot resolve from the code or the run's
+   > artifacts. Post it and carry on with whatever does not depend on the answer:
+   >
+   >     drovr ask <run> --question "<what you need decided>" \
+   >       [--context <text> | --context-file <path>] \
+   >       [--option <value>=<label>]... [--recommend <value>]
+   >
+   > `ask` returns immediately, printing the ask id and the page to point the human at. Then
+   > background `drovr ask wait <run> [--timeout-ms <ms>]` and end your turn: `0` answered, `2`
+   > timeout — re-arm, the question is still on disk and still on screen — `5` the run was cancelled,
+   > `1` error. On `0` stdout carries the answers as JSON: the asks that wait was armed on, each with
+   > its latest answer, or — when nothing was outstanding — the whole folded interview, which is how
+   > a wait re-armed just after the human answered still hands you the answer. A timeout costs
+   > nothing; a guess costs the run.
+
+2. **Read** the task brief and the accumulated interfaces in the `## Context from the driver`
    section, then read the real code you
    will touch (read-only explorers for anything you only need to understand, not change).
-2. **Record the review base — before writing any code.** Run
+3. **Record the review base — before writing any code.** Run
    `drovr code-review base <run> task-<N>` so `HEAD` is captured as this task's pre-task SHA
    (the automatic review panel diffs `base..HEAD`). Do this first; editing before recording
    would move the base past your own changes. **Re-entry:** if this message seeds you with a
    `~/.local/share/drovr/runs/<run>/task-<N>-review.json` (the driver re-entered you after the
    panel found changes), do NOT re-record the base — fix **every Important AND every nit** in
-   that file, then run the rest of the steps (verify, self-review, report — steps 4–7).
-3. **Implement test-first — apply `drovr:tdd`.** The test to write first is the one named in
+   that file, then run the rest of the steps (verify, self-review, report — steps 5–8).
+4. **Implement test-first — apply `drovr:tdd`.** The test to write first is the one named in
    this task's verification; keep it scoped to this task's interfaces so the folded-forward
    contracts stay accurate.
-4. **Verify before claiming done — apply `drovr:verification-before-completion`** on this
+5. **Verify before claiming done — apply `drovr:verification-before-completion`** on this
    task's tests and the build/linter.
-5. **Self-review before reporting done — apply `drovr:code-review`** (read-only review
+6. **Self-review before reporting done — apply `drovr:code-review`** (read-only review
    subagents, foreground). Do NOT declare the task done off your own judgment. The skill has
    the how-to and the check order; the one constraint below is repeated here because the whole
    run depends on it: **run the review subagents in the
@@ -56,9 +75,9 @@ tasks; later tasks run as their own fresh phases.
 
    So `drovr code-review run <run> task-<N>` is yours to use, freely — but a clean verdict
    from a panel *you* invoked buys you a fix list, not a finish. You are done when this task's
-   own verification passes (step 4) and you have resolved what review found; never *because* a
-   panel came back clean, and never with a panel standing in for step 4. Record each one in your
-   report's `## Author-run panels` table (step 6). The driver runs its own panel after you
+   own verification passes (step 5) and you have resolved what review found; never *because* a
+   panel came back clean, and never with a panel standing in for step 5. Record each one in your
+   report's `## Author-run panels` table (step 7). The driver runs its own panel after you
    report, and that verdict is the one that decides whether the task advances — it has already
    caught an Important on the identical commit an author-run panel called clean.
 
@@ -73,7 +92,7 @@ tasks; later tasks run as their own fresh phases.
    same command resumes the panel in flight, so a slow one costs you a loop, not a stall. Do not
    background it and do not yield waiting on it — the driver may background its waits because it
    can end its turn; you cannot.
-6. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
+7. **Write a task report** to `~/.local/share/drovr/runs/<run>/task<N>-report.md`:
    - what changed (files + the interfaces you actually implemented, verbatim),
    - test/verification output proving it works,
    - the self-review: what the review subagents found and how you resolved each Critical/
@@ -106,7 +125,7 @@ tasks; later tasks run as their own fresh phases.
    - any interface that drifted from the plan, and why (the next task binds to reality, not
      the plan's guess),
    - anything the final review phase should still scrutinize.
-7. **Author your handoff, then signal completion — your FINAL actions, in order.**
+8. **Author your handoff, then signal completion — your FINAL actions, in order.**
    a. **Author the handoff.** Compress your own context — you hold the whole session — into the
       fixed 7-section handoff (see `drovr:handoff` / the handoff template) and write it to
       `~/.local/share/drovr/runs/<run>/implement-task-<N>-HANDOFF.md`, **git pointers

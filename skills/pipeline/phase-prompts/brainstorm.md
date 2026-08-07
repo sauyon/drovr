@@ -22,14 +22,33 @@ reviewer. You are NOT implementing anything.
    > repo root otherwise, and tick items there. An untracked checklist decays with the context
    > window; that decay is the exact failure drovr exists to fight.
 
-1. **Investigate read-only first.** Understand the task against the real codebase. Use
+1. **Keep the ask channel open — the whole phase, not just at a gate.**
+
+   > **Ask the human when you need to, mid-phase — do not guess and write the guess down.** Two
+   > triggers, either one is enough: **new information is discovered** that the spec or plan did not
+   > anticipate, or **a question is found** that you cannot resolve from the code or the run's
+   > artifacts. Post it and carry on with whatever does not depend on the answer:
+   >
+   >     drovr ask <run> --question "<what you need decided>" \
+   >       [--context <text> | --context-file <path>] \
+   >       [--option <value>=<label>]... [--recommend <value>]
+   >
+   > `ask` returns immediately, printing the ask id and the page to point the human at. Then
+   > background `drovr ask wait <run> [--timeout-ms <ms>]` and end your turn: `0` answered, `2`
+   > timeout — re-arm, the question is still on disk and still on screen — `5` the run was cancelled,
+   > `1` error. On `0` stdout carries the answers as JSON: the asks that wait was armed on, each with
+   > its latest answer, or — when nothing was outstanding — the whole folded interview, which is how
+   > a wait re-armed just after the human answered still hands you the answer. A timeout costs
+   > nothing; a guess costs the run.
+
+2. **Investigate read-only first.** Understand the task against the real codebase. Use
    read-only explorers (explore-mcp) for fan-out investigation — do not spawn parallel
    writers, and do not edit code in this phase.
-2. **Work out the approach.** Surface the real intent, constraints, alternatives, and a
+3. **Work out the approach.** Surface the real intent, constraints, alternatives, and a
    recommended design; resolve ambiguity before writing the spec. Your channel to the human
    is the review gate below (the reviewer responds via `feedback.json`; they may also
    `drovr attach` to the pane) — not a private chat. Converge the design through that gate.
-3. **Write the spec** to `~/.local/share/drovr/runs/<run>/spec.md` — a concrete, reviewable
+4. **Write the spec** to `~/.local/share/drovr/runs/<run>/spec.md` — a concrete, reviewable
    design: problem, approach, interfaces/contracts, scope boundaries, open questions.
 
 ## The review gate — the discipline that matters

@@ -23,12 +23,31 @@ implementation plan broken into independently-executable tasks. You are NOT impl
    > repo root otherwise, and tick items there. An untracked checklist decays with the context
    > window; that decay is the exact failure drovr exists to fight.
 
-1. **Read the approved spec** at `~/.local/share/drovr/runs/<run>/spec.md` and the brainstorm
+1. **Keep the ask channel open — the whole phase, not just at a gate.**
+
+   > **Ask the human when you need to, mid-phase — do not guess and write the guess down.** Two
+   > triggers, either one is enough: **new information is discovered** that the spec or plan did not
+   > anticipate, or **a question is found** that you cannot resolve from the code or the run's
+   > artifacts. Post it and carry on with whatever does not depend on the answer:
+   >
+   >     drovr ask <run> --question "<what you need decided>" \
+   >       [--context <text> | --context-file <path>] \
+   >       [--option <value>=<label>]... [--recommend <value>]
+   >
+   > `ask` returns immediately, printing the ask id and the page to point the human at. Then
+   > background `drovr ask wait <run> [--timeout-ms <ms>]` and end your turn: `0` answered, `2`
+   > timeout — re-arm, the question is still on disk and still on screen — `5` the run was cancelled,
+   > `1` error. On `0` stdout carries the answers as JSON: the asks that wait was armed on, each with
+   > its latest answer, or — when nothing was outstanding — the whole folded interview, which is how
+   > a wait re-armed just after the human answered still hands you the answer. A timeout costs
+   > nothing; a guess costs the run.
+
+2. **Read the approved spec** at `~/.local/share/drovr/runs/<run>/spec.md` and the brainstorm
    handoff in the `## Context from the driver` section. If that section says none was
    supplied, run `drovr collect <run> brainstorm` yourself. Read the real source (read-only
    explorers for fan-out) so tasks bind to
    actual signatures, not guesses.
-2. **Write the plan** to `~/.local/share/drovr/runs/<run>/plan.md` as an ordered task list.
+3. **Write the plan** to `~/.local/share/drovr/runs/<run>/plan.md` as an ordered task list.
    For **each task** give:
    - a one-line objective,
    - the **interfaces it introduces or depends on** (exact signatures, schemas, file paths) —
@@ -36,7 +55,7 @@ implementation plan broken into independently-executable tasks. You are NOT impl
    - its verification (which test(s) prove it), and
    - dependencies on earlier tasks.
    Order tasks so each depends only on interfaces defined by earlier ones.
-3. **Self-review before finishing — REQUIRED.** There is no human gate here, so do not sign
+4. **Self-review before finishing — REQUIRED.** There is no human gate here, so do not sign
    off on your own judgment alone. Launch one or more **read-only** review subagents (Claude
    Code Agent tool, `subagent_type: general-purpose`, model `sonnet`) to adversarially review
    the plan: are the tasks independent, correctly ordered, each small enough for one
@@ -45,7 +64,7 @@ implementation plan broken into independently-executable tasks. You are NOT impl
    in the FOREGROUND (blocking) — do NOT set `run_in_background` or yield waiting on them; a
    backgrounded subagent parks you mid-turn, which drovr cannot tell from completion.** Address
    every Critical/Important finding before finishing.
-4. **Author your handoff, then signal completion — your FINAL actions, in order.**
+5. **Author your handoff, then signal completion — your FINAL actions, in order.**
    a. **Author the handoff.** Compress your own context into the fixed 7-section handoff (see
       `drovr:handoff` / the handoff template) and write it to
       `~/.local/share/drovr/runs/<run>/plan-HANDOFF.md`, **git pointers mandatory**. The
