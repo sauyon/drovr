@@ -528,8 +528,11 @@ supervised across logins/reboots, install the `systemd --user` unit at
    answering appends to `interview.jsonl` and does not touch the run's review
    state, so it works at any point in the run's life, including before a spec
    exists and after one is approved. The one run *state* that refuses is a
-   cancelled run (409). Otherwise: 400 for a malformed body or a log that is
-   full, 404 for an unknown ask id, and 500 if the append itself fails.
+   cancelled run (409). Otherwise: **400** for a malformed body, an over-long
+   answer, or an append that would push the log past its cap; **404** for an
+   unknown ask id — or an unknown run; **500** if the log itself is unusable
+   (already over-cap, a symlink, not a regular file) or the append fails; and
+   **403** if the host/origin write guard refuses the POST.
 3. The driver posts a summary, then **waits** for the reviewer instead of
    busy-polling state:
    ```

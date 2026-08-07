@@ -481,9 +481,11 @@
 
   /* ---- The interview (the agent's live ask channel) ---- */
   /* The accent edge is what separates this from the read-only panels around it: it
-     carries a question the run ITSELF posted and cannot settle without. The gate and
-     the live-session panel are the other two blocking surfaces; unlike the gate, this
-     one is live at any run state. */
+     carries a question the run ITSELF posted and cannot settle without. Two other
+     things here can want a human — the review gate below, and a blocked agent (the
+     Agents panel's `needs-human` badge, answered in the live-session panel). Unlike
+     the gate, this one is live at any run state; unlike a blocked agent, the run
+     asked for it explicitly. */
   .interview-panel {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1004,8 +1006,9 @@
        dynamically and polled on its own 2s timer. Above everything else on the
        page because it carries a question the run itself posted: until it is
        answered the agent cannot settle the decision it asked about, whatever state
-       the gate below is in. (The gate and the live-session panel can also want a
-       human; this is the only one the run asked for explicitly.) It renders
+       the gate below is in. (The gate, and a blocked agent surfaced by the Agents
+       panel, can also want a human — but this is the only one the run asked for
+       explicitly, and the only one nothing raises an alarm for.) It renders
        independently of the review gate: a question can arrive at any point in a
        run's life, including on a run whose spec is already approved and whose
        gate will never move again. -->

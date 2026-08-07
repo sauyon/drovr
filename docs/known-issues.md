@@ -1075,9 +1075,10 @@ the plumbing around them fails.
 
 Reading a reviewer pane (`herdr agent read <pane>`) shows the full seed rendered in the composer
 with the correct `base..head` scope, so seeding and scope selection are fine; only the submit
-keystroke is missing. Fixing "`drovr phase send` returns success with the prompt left
-unsubmitted" (below) fixes the panel too — they are one bug, and the panel is simply its most
-visible victim. Keep the self-spawned-reviewer workaround above until that lands.
+keystroke is missing. This is the same bug as *"`drovr phase send`: the false success is fixed;
+`until` is still a LEVEL, not an edge"* (below) — the panel is simply its most visible victim.
+The false-success half landed 2026-07-30; the underlying race did not, so keep the
+self-spawned-reviewer workaround above.
 
 ## A reviewer's `submit_findings` tool can be DEFERRED, so a tool-search outage loses the review
 
@@ -2136,7 +2137,12 @@ failed prune still leaves the run correctly marked — is enforced by constructi
 rather than by a test. `cleanup_marks_the_run_archived` (`cli/src/main.rs`) covers the
 run-to-completion path only.
 
-## The session list rebuilds via `innerHTML` every 2s, which is what makes rows "vanish"
+## The session list rebuilds via `innerHTML` every 2s — the "vanishing rows" are fixed, the rebuild is not
+
+**Kept, partly fixed.** Fixed entries are deleted from this file; this one stays because only the
+symptom closed. The wholesale rebuild is still what `renderRunList` does, it is still the root of
+a bug class, and one consequence below is live and unfixed: **real Tab focus on a row control is
+destroyed on the next tick.** The `### Fix idea` (diff-and-patch keyed rows) is unimplemented.
 
 **Severity:** low as shipped (the symptoms are fixed), but it is the root of a whole bug class.
 **Found:** 2026-07-25, design review after the archive button.
@@ -3873,8 +3879,8 @@ a state that is not the one it is guarding against.
 
 ### Impact
 
-Worse than the phase-level variant (*"`drovr phase send` returns success with the prompt left
-unsubmitted"* above) on three counts:
+Worse than the phase-level variant (*"`drovr phase send`: the false success is fixed; `until` is
+still a LEVEL, not an edge"* above) on three counts:
 
 - A phase whose seed is left unsubmitted is recoverable by hand
   (`drovr phase brief … | drovr phase send … -`). **A reviewer pane is not** — drovr says so

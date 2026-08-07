@@ -338,7 +338,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Mistake | Fix |
 |---|---|
 | Manually babysitting a per-run server | The server is always on and auto-starts on demand; just run `drovr review summary`/`wait`. |
-| Announcing the URL / starting `review wait` before the first summary | Wait for `spec.md` + state = `ready`; an empty page reads as broken and a specless `review wait` churns. |
+| Announcing the URL **as a review** / starting `review wait` before the first summary | Wait for `spec.md` + state = `ready` **before calling it a review**; an empty page reads as broken and a specless `review wait` churns. A **pending ask** is the separate case — hand that link over immediately, ungated on state (step 1b). |
 | Agent edits `spec.md` but reviewer sees nothing | Agent must run `drovr review summary` after each edit. |
 | Busy-polling state for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |
