@@ -342,8 +342,8 @@ is hidden on macOS where it does not apply.
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
-| `drovr ask <run> --question <text\|@file> [--context <text> \| --context-file <path>] [--option <value>=<label>]... [--recommend <value>]` | Post one question for the human and **return immediately** — it never blocks. Prints the ask id and the run's page URL, and appends a pending record to `interview.jsonl`. `--context` and `--context-file` are mutually exclusive; `@<path>` on `--question` reads the text from a file (`@@` escapes a leading `@`). Run by phase agents, not by the driver. |
-| `drovr ask wait <run> [--timeout-ms N]` | Block until every question outstanding when it started has an answer, then print the folded interview as JSON. A file poller, so it needs no server. Exit 0 = answered (also the case when nothing was pending — it prints the fold, not a bare `[]`), 2 = timeout (re-run to resume; the question is still on disk and still on screen), 5 = run cancelled, 1 = error. |
+| `drovr ask <run> --question <text\|@file> [--context <text> \| --context-file <path>] [--option <value>=<label>]... [--recommend <value>]` | Post one question for the human and **return immediately** — it never blocks. Appends a pending record to `interview.jsonl` and prints three lines: the ask id, then the run's page URL (or, if the review server is not up, a note that the question is on disk and will appear when it is), then the `drovr ask wait` command to background. `--context` and `--context-file` are mutually exclusive; `@<path>` on `--question` reads the text from a file (`@@` escapes a leading `@`). Exit 0 = posted, 5 = the run was cancelled (terminal — stop work), 1 = error. Run by phase agents, not by the driver. |
+| `drovr ask wait <run> [--timeout-ms N]` | Block until every question **that was outstanding when it started** has an answer, then print those asks — each with its latest answer — as JSON. Not the whole log: earlier answered asks are not included, except in the nothing-was-pending case, which prints the entire folded interview rather than a bare `[]`. A file poller, so it needs no server. Exit 0 = answered, 2 = timeout (re-run to resume; the question is still on disk and still on screen), 5 = run cancelled, 1 = error, including a run dir that is not there. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
 | `drovr reflex --gate` | Render the per-turn gate card JSON (`UserPromptSubmit`). Run by the `user-prompt` hook; reads the hook payload on **stdin** to find `transcript_path`. Prints nothing when `enabled` or `per_turn` is false, or when the previous turn already invoked a `drovr:*` skill **successfully** (a failed call still gets a card). Exactly one of `--skill` / `--gate` is required. |
 
@@ -526,8 +526,8 @@ supervised across logins/reboots, install the `systemd --user` unit at
    panel**: whenever an agent has posted a question with `drovr ask`, it appears
    there and you answer it in place. That is a different channel from the gate —
    answering appends to `interview.jsonl` and does not touch the run's review
-   state, so it works at any time, including before a spec exists and after one
-   is approved.
+   state, so it works at any point in the run's life, including before a spec
+   exists and after one is approved. The one refusal is a cancelled run (409).
 3. The driver posts a summary, then **waits** for the reviewer instead of
    busy-polling state:
    ```

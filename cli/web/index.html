@@ -480,8 +480,8 @@
   }
 
   /* ---- The interview (the agent's live ask channel) ---- */
-  /* The accent edge is what separates this from every other panel on the page: an
-     agent is BLOCKED on this one, waiting in `drovr ask wait`. */
+  /* The accent edge is what separates this from every other panel on the page: it
+     is the only one where a run is waiting on the human rather than the reverse. */
   .interview-panel {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1000,8 +1000,8 @@
 
   <!-- The interview: the agent's live ask channel (`drovr ask`), populated
        dynamically and polled on its own 2s timer. Above everything else on the
-       page because an agent is BLOCKED in `drovr ask wait` on it — nothing else
-       here is holding a run up right now. It renders
+       page because it is the one thing here a run may be waiting on: until it is
+       answered the agent cannot settle the decision it asked about. It renders
        independently of the review gate: a question can arrive at any point in a
        run's life, including on a run whose spec is already approved and whose
        gate will never move again. -->
@@ -1965,8 +1965,15 @@ function needsWrittenFeedback(feedbackVal) {
 }
 
 // ---- The interview (the agent's live ask channel) ----
-// The agent posts a question with `drovr ask` and blocks in `drovr ask wait`;
-// this panel is the human's side of that channel, and the page's ONLY question
+// The agent posts a question with `drovr ask`, which returns IMMEDIATELY, and
+// picks the answer up later through a backgrounded `drovr ask wait` — post and
+// wait are split precisely so nothing blocks while the human is away. So do not
+// assume a live waiter behind what is on screen: a pending ask can sit here with
+// no `ask wait` armed at all (between an exit-2 timeout and the re-arm, or from an
+// agent that posted and moved on). It is still worth answering — the answer is
+// durable, and the wait is re-armable.
+//
+// This panel is the human's side of that channel, and the page's ONLY question
 // channel — it replaced a `questions.json` panel that rendered a whole batch out
 // of the review gate and submitted the answers with the decision form. Two things
 // define it, and both are what that batch panel could not do:
@@ -1975,8 +1982,12 @@ function needsWrittenFeedback(feedbackVal) {
 //    has one — mid-plan, mid-implement, on a run whose spec was approved turns ago
 //    and whose gate will never move again — so it polls on its own timer instead
 //    of rendering out of refresh()'s state branches. Only `cancelled` mutes it.
-//  * it answers ONE ask at a time, straight to the server (`POST answer`). The
-//    agent is waiting on this one answer; there is nothing to batch it with.
+//  * it answers ONE ask at a time, straight to the server (`POST answer`), rather
+//    than collecting a form and submitting it with a decision. The phase prompts
+//    do allow a small batch of genuinely independent questions, which is what the
+//    `1 of N` counter counts — this panel serialises such a batch instead of
+//    rendering it, so each answer is durable the moment it is given and none of
+//    them ride on a gate submission that may never come.
 //
 // Value carried by the "Other" radio. A reserved sentinel, never a legal option
 // `value`: submitAnswer swaps it for the text the human typed, so it is never

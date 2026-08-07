@@ -1,13 +1,40 @@
 # known-issues.md triage — 2026-08-06
 
-Against `docs/known-issues.md` on `drovr/brainstorm-rework` (base: `drovr/skill-stickiness`,
-current with main): **4107 lines, 87 `##` sections.**
+**This is a dated SNAPSHOT, and `known-issues.md` has moved since. Every number and every
+`L<n>` below describes the file as it stood on 2026-08-06 — do not read them as current.**
+Snapshot state: `docs/known-issues.md` on `drovr/brainstorm-rework` (base:
+`drovr/skill-stickiness`, current with main), **4107 lines, 87 `##` sections**.
 
 Method: every section's heading, `**Status:**` and `**Severity:**` line read; the 12 sections
 carrying neither were read in full. Sections were **not** read end-to-end — classification is
 from stated severity and self-description, so a few calls may move on closer reading.
 
-## Counts
+## How to use the `L<n>` references
+
+They are **line numbers into the 2026-08-06 snapshot**, not into the file you have. They were
+already drifting when this was written, and the 2026-08-07 change below moved everything after
+the old `L494` up by ~300 lines. Resolve an `L<n>` by its quoted description against the
+current **headings** — which is the repo rule for citing `known-issues.md` anyway. Treat an
+`L<n>` as an id, never as a location.
+
+## What changed since the snapshot
+
+**2026-08-07 — fixed entries are now deleted, not annotated.** `known-issues.md` went
+87 → **79** sections (4268 → 3961 lines as of that change). Seven entries whose defect was
+fixed were removed outright; three more that were marked FIXED were **kept and retitled**
+because each still carries live open content (the cross-run-state bug *class* with open
+follow-ups, the panel's still-open *partial*-commit hazard, and the workspace-repair contract
+with its unguarded double-provision race). Two lessons were lifted out of deleted entries into
+a new **`## Lessons kept from retired issues`** section, which replaced `## Resolved`.
+
+Consequences for the counts below, which have **not** been recomputed: class **B — already
+fixed** is by construction now near-empty and is no longer a category this file's policy allows
+to accumulate; the `meta` row's `Resolved` is now that Lessons section; and the class-A total
+and severity split lost the retired `questions.json` Submit entry (class A, high). Re-run the
+triage rather than adjusting these by hand — a snapshot patched in place is worse than a stale
+one honestly labelled.
+
+## Counts (as of the 2026-08-06 snapshot)
 
 | class | n | meaning |
 |---|---|---|

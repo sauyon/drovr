@@ -103,8 +103,10 @@ decision has quietly vanished. So:
 
 **Ordering is load-bearing:** the freeze precedes every candidate arm. Implemented in T1 and
 enforced by `freeze_precedes_every_candidate_arm`, with `descends_from_separates_an_ordered_arm_from_a_pre_freeze_one`
-and `freeze_rows_still_hash_to_their_files` alongside it. As frozen: 3 fixtures, **233 ledger
-rows** (92 / 85 / 56), control arm `S0`.
+and `freeze_rows_still_hash_to_their_files` alongside it. As frozen: 3 fixtures, **230 ledger
+rows** (91 / 84 / 55), control arm `S0`. Those are the ledgers' own `**Closed list: N rows.**`
+declarations, which are authoritative; counting table rows gives 233 because it picks up each
+file's header.
 
 `S0` is a measurement baseline and **never ships** — it mandates the very "open questions"
 section decision 6 forbids.
@@ -142,9 +144,9 @@ Two things a reader will reasonably expect to find and will not:
 
 1. **The spec-length A/B was deliberately out of scope for this run** — no arm was written, no
    fixture scored, no outcome applied. The frozen ledger under `docs/skill-evidence/spec-length/`
-   is untouched and still awaits it: 3 fixtures, 233 ledger rows, control arm `S0`. Everything
-   the A/B needs exists; nobody has run it. The ordering guarantee still holds, so it can be run
-   whenever someone picks it up.
+   is **unscored** — T1 of this run is what created it (3 fixtures, 230 ledger rows, control arm
+   `S0`), and nothing since has touched it. Everything the A/B needs exists; nobody has run it.
+   The freeze-precedes-every-arm ordering still holds, so it can be picked up as-is.
 2. **The review page cannot show an *answered* interview.** The panel renders only the pending
    ask and empties itself once nothing is pending; `interview.jsonl` is on disk and served at
    `GET /api/runs/<run>/interview`, but a human reviewing the spec never sees the Q&A that

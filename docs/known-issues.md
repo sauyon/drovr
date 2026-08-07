@@ -1,51 +1,5 @@
 # Known issues
 
-## Four methodology skills tell an agent working inline that they do not apply — FIXED 2026-08-04
-
-**Status:** fixed on `drovr/skill-stickiness` (spec §3, fix 1). The five `description:` lines
-are un-scoped and the four body phase-framings are demoted to *additional* consequences.
-Regression check: `cli/tests/skills_valid.rs::no_phase_scoped_description_literals`.
-
-**Severity:** medium (silent, and it disables the discipline exactly when nothing else is
-watching — an agent working inline skips the skill and no error is produced anywhere).
-**Found:** 2026-08-01, run `skill-stickiness`, reading the four `description:` lines against
-`skills/using-drovr/SKILL.md`'s escalation contract.
-
-### Symptom
-
-An agent working inline — not inside a `drovr phase` — reads `drovr:tdd`'s trigger, sees *"in a
-drovr phase"*, and correctly concludes the skill does not apply to what it is doing. Same for
-`systematic-debugging`, `verification-before-completion` (*"a drovr task"*) and `code-review`
-(*"a drovr phase has produced"*). The skills load, their bodies are correct, and the agent
-never reaches them.
-
-### Root cause
-
-Two documents disagreed, and the losing one was the one the agent reads first.
-`skills/using-drovr/SKILL.md` makes inline work the **default** — *"Default: do the work inline
-in this session. Do not reach for phases for a task that fits"* — while four of the five skills
-it routes to scoped their own trigger to a phase. A `description:` is a **trigger, not a
-summary**: it is the line that decides whether the skill is read at all, so a precondition
-written into it is a precondition on the whole discipline. Nothing detected the contradiction
-because each file was internally consistent; the defect lived in the gap between them.
-
-The fifth skill, `using-drovr` itself, had the adjacent version of the same trap: its
-description *summarised* the router instead of triggering it, giving the agent a shortcut it
-could take **instead of** reading the skill.
-
-### Fix
-
-`skills/*/SKILL.md:3` for all five now state an unconditional trigger (spec §3's table,
-verbatim). Every remaining drovr-phase reference in the four bodies is reworded as a
-clearly-marked *additional* consequence — *"Inside a drovr phase this also binds the next
-phase's contract"* — never a precondition. `systematic-debugging`'s read-only-explorer rule was
-already unconditional and is unchanged.
-
-`no_phase_scoped_description_literals` asserts the three literals are absent from every
-`skills/*/SKILL.md`. Because an absence check passes just as happily when it reads nothing, it
-runs the same matcher over the frozen pre-fix snapshots in `docs/skill-evidence/arms/A/`, where
-every literal must still be found, and fails if the matcher comes back empty there.
-
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
 **Status:** open, pre-existing — the `UserPromptSubmit` per-turn gate inherits the gap
@@ -151,9 +105,15 @@ touch ~/.local/share/drovr/runs/<run>/<phase>.done
 An empty marker is accepted for a phase with no recorded `pass`, which is exactly the pre-token
 case.
 
-## Review UI presents one run's state as another's (spec, feedback, annotations, findings) — FIXED 2026-07-25
+## Cross-run state leaks in the review UI — a bug CLASS, with follow-ups still open
 
-**Status:** fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
+**Kept, though its original defect is fixed.** Fixed entries are deleted from this file; this one
+stays because the defect was never the point — the same mistake was found **five** times in the
+one page (the spec panel, annotations, three more sites the review panel caught on the fix, and a
+sixth the fix itself introduced), and `### Still open (follow-ups, not blocking)` below is live.
+Read it as "here is a mistake this page keeps making", not as a bug to reproduce.
+
+**Status:** the original defect is fixed on `drovr/review-ui-stale-doc`. `refresh()` now clears and hides the doc
 panel in the empty case, and `route()` no longer shows it. Regression checks: "a run with no
 spec shows no doc at all" / "...and does not claim to be showing a spec" in
 `cli/tests/web/nav.mjs`, against a new `epsilon-nospec` fixture run seeded with `state.json`
@@ -317,43 +277,6 @@ driver can tell "this run has rendered" from "nothing has rendered yet" — an e
 `currentDocText` cannot distinguish the two, and waiting on it made the check vacuous under a
 real page reload.
 
-## The agent's change summary is hidden on the first review — FIXED 2026-07-25
-
-**Status:** fixed on `feat/questions-ui`. The banner is gated on `summaryText` alone;
-the `turn > 0` clause is gone. Regression check: "the agent change summary shows on the
-first review (turn 0)" in `cli/tests/web/nav.mjs`, whose fixture seeds a `ready` run at
-turn 0 with a posted summary.
-
-**Severity:** medium (on turn 0 the reviewer sees a spec with no statement of what the agent did or is asking — exactly the turn where that context is most needed).
-**Found:** 2026-07-25, QA'ing a full gate cycle on a throwaway run (`qa-cache`): `drovr review summary` succeeded, `GET /api/runs/<run>/summary` returned the text, and the banner still did not render.
-
-### Symptom
-
-The brainstorm agent posts a summary, the run flips to `ready`, and the reviewer opens the
-page — but the "Agent change summary" banner is not shown. It appears only from the second
-review turn onward (after one request-changes round trip).
-
-### Root cause
-
-`cli/web/index.html:1643` gates the banner on the turn counter:
-
-```js
-if (summaryText && turn > 0) { ... showEl('summary-banner'); }
-else { hideEl('summary-banner'); }
-```
-
-`turn` only increments when the reviewer submits, so it is `0` for the whole first review.
-The `turn > 0` test appears to be aimed at "only show a summary once there is a previous
-version to describe", but the summary is not a diff — `review summary` is the agent's own
-statement of what it wants reviewed, and it is equally meaningful on turn 0. Introduced in
-`8f98013` (interactive review server), unrelated to the questions/navigation work.
-
-### Fix
-
-Dropped the `turn > 0` clause and gated on `summaryText` alone. The empty-summary case is
-already covered by the same condition, so a run that never posted a summary still shows no
-banner.
-
 ## Editing `cli/web/index.html` can silently test the OLD page
 
 **Severity:** low (no runtime bug — but it wastes debugging cycles and can make a real fix look broken).
@@ -491,55 +414,6 @@ worktrees' parked work.) If it fails identically with your changes reverted, it 
 `web_nav` is the only browser-dependent test in the suite; the other four binaries
 (`e2e`, `reflex_hook`, `skills_valid`, and the unit tests) are hermetic.
 
-## `approve` discards the reviewer's question answers — FIXED 2026-07-25
-
-**Status:** fixed on `feat/questions-ui`. `handle_post_submit`'s approve branch now
-writes the same `feedback.json` the request-changes branch does
-(`{turn, decision:"approve", feedback, answers, annotations}`), with the turn advanced so a
-driver can tell this turn's answers from a stale previous turn's. Regression test:
-`review::tests::submit_approve_persists_question_answers`.
-
-**Severity:** medium (multiple-choice answers on the spec gate are silently lost on approval, so the downstream plan phase never sees the reviewer's picks).
-**Found:** 2026-07-24, run `gpu-deploy-view` — reviewer answered 4 open questions and approved; no answers were persisted anywhere.
-**Re-verified against source 2026-07-25:** still live at that point; fixed later the same day (see Status above).
-
-The Symptom and Root cause below describe the behaviour **before** the fix, kept for history.
-
-**`answers` is now always `{}`.** The interview channel replaced `questions.json`, so the review
-page no longer populates that field; questions are asked with `drovr ask` and answered into
-`interview.jsonl`, never here. The field and the regression test above stay for wire
-compatibility — the fix this entry records is still in the code, which is why the entry is kept
-rather than retired.
-
-### Symptom
-
-When the reviewer **approves**, `questions.json` answers (and annotations) chosen in the
-UI are not written to disk. The run dir gets only a 9-byte `approved` marker; `feedback.json`
-is left at whatever the previous turn wrote (often empty). Callers driving the pipeline can
-recover the *decision* (approved) but not *which options the reviewer selected* — they have
-to re-ask the human out-of-band.
-
-### Root cause
-
-In `handle_post_submit` (`POST /api/runs/<run>/submit`, `cli/src/review.rs:808`) the
-`decision == "approve"` branch (`cli/src/review.rs:837`) writes only the `approved` marker
-and returns — even though `answers`/`annotations` were parsed off the request body
-(`cli/src/review.rs:813-821`). The branch that persists `feedback.json` — including
-`answers` and `annotations` — ran only for the **request-changes** path (now
-`cli/src/review.rs:895-902`; the fix inserted the approve-side write above it). So answers
-survived a "request changes" but were dropped on "approve".
-
-### Fix
-
-Mirrored the request-changes persistence: on approve, write `feedback.json` carrying
-`{turn, decision:"approve", feedback, answers, annotations}`. The consuming half was wired
-too — at the time, `drovr review wait` named `feedback.json` in its approval message and the
-brainstorm phase prompt told the agent to fold the answers into `spec.md` rather than re-ask.
-**Neither is true any more**, and this paragraph is history: the ask channel took the question
-half over, so the approval message no longer points at `feedback.json` and the brainstorm
-prompt no longer mentions folding answers. Only the `feedback`/`annotations` half of this
-persistence is live behaviour today.
-
 ## Serving a spec doesn't start a watcher — the reviewer's decision gets missed
 
 **Severity:** medium (a driver that serves a spec for review but never runs `drovr review wait` is not notified when the human acts; it only learns the outcome if it happens to poll `/state`).
@@ -579,7 +453,13 @@ polling is the anti-pattern the skill already names, reached here by the routing
    shell it dies (SIGTERM 143) when that shell is torn down, taking the gate down mid-review.
    Launch it detached (`setsid`/`nohup`) when it must outlive the turn.
 
-## The panel reviews `base..HEAD`, so an empty diff comes back clean from every angle — FIXED 2026-08-02
+## The panel can review less than you think — the PARTIAL commit is still open
+
+**Kept, though the empty-range half is fixed.** Fixed entries are deleted from this file; this
+one stays because only half of it closed. An **empty** `base..HEAD` is now refused outright
+(see the fix section below), but the **partial** commit — a real, non-empty range that is
+missing the work you did not commit — is open and deliberately unguarded. That is the live
+hazard, and it is why "commit everything first" is a rule and not advice.
 
 **Severity:** high — it manufactured the exact signal the pipeline uses to advance a task, and a
 vacuous clean is indistinguishable from a real one.
@@ -1005,46 +885,6 @@ round-1 review findings: one genuine assertion failure in `brief::tests` surface
 failures, two of which passed in isolation.
 
 If a run reports N failures, re-run the first one alone before believing the other N-1.
-
-## `web_keyboard_navigation` hung on every run: Chromium's cookie store waits on the keyring (2026-08-01) — FIXED
-
-**Cause: `--password-store=basic` was missing from the test's chromium launch.** Fixed in
-`cli/tests/web_nav.rs`; the suite went from failing every run to passing three for three in ~13s.
-
-**The mechanism**, from a full NetLog (`--log-net-log --net-log-capture-mode=Everything`):
-
-1. `COOKIE_PERSISTENT_STORE_LOAD` begins at startup and never ends.
-2. Every `URL_REQUEST` that needs cookies (`privacy_mode: disabled`) stalls at
-   `COMPUTED_PRIVACY_MODE` — where `URLRequestHttpJob` calls into the cookie store — and never
-   reaches `HTTP_TRANSACTION_SEND_REQUEST`.
-3. The cookie store is loading its encryption key through OSCrypt, which on Linux asks the Secret
-   Service over D-Bus. `ReadAlias("default")` on `org.freedesktop.secrets` returns `/`: there is
-   no unlocked default collection. `gnome-keyring-daemon` runs with `--components=secrets` but the
-   keyring was never unlocked or aliased, and with `XDG_CURRENT_DESKTOP`/`DESKTOP_SESSION` empty
-   there is no prompter to answer. **That call has no timeout.**
-
-Every symptom follows, and each one is what made this look like something else:
-
-| Symptom | Why |
-|---|---|
-| `file://` and `about:blank#x` navigate instantly | they never touch the cookie store |
-| the target server logs **zero** requests | the TCP connection IS established — NetLog shows `TCP_CONNECT` completing — but no HTTP request is ever written to the socket |
-| `curl` to the same port works | different process, no keyring involved |
-| the DevTools session looks dead | it is not: `Page.navigate` never resolves and later commands queue behind it. `/json/list` still answers |
-| chromium's own background traffic succeeds | that traffic is `privacy_mode: enabled`, i.e. cookieless |
-
-**Three wrong diagnoses were recorded here before this one** — "environmental", then "load
-sensitivity in a fixed 20s CDP deadline", then "a Chromium 150 regression". None had measurements
-behind them. Ruled out along the way and worth not re-testing: the drovr server, CDP socket
-topology (flattened browser-endpoint sessions behave identically), `--headless` vs `=old`/`=new`,
-`--no-sandbox`, `--disable-dev-shm-usage`, `NetworkServiceInProcess`, `--no-proxy-server`,
-enterprise policy, machine load, the agent tool sandbox, and any chromium wrapper or flag file
-(`/usr/bin/chromium` is Arch's launcher and injects nothing; no `chromium-flags.conf` exists).
-
-**The general lesson for headless Chromium on Linux:** always pass `--password-store=basic`. A
-machine with no unlocked keyring turns every cookie-bearing request into an untimed wait, and the
-failure presents as a network or browser fault rather than a credential-store one.
-
 
 ## `review::tests::lock_records_our_pid_and_releases_on_drop` is flaky, cause UNKNOWN (2026-07-26, 2026-08-01)
 
@@ -1695,43 +1535,6 @@ Make `review wait` treat a transient connect failure as retryable (re-run `ensur
 resume) rather than a hard error, so a server restart doesn't surface as a spurious terminal
 exit.
 
-## herdr's `agent_status: done` is an EDGE, not a level — FIXED 2026-07-27
-
-**Severity:** was high — a reviewer that did everything right hung its panel forever.
-**Found:** 2026-07-27, running the round-2 review panel for `land-mcp-findings`.
-
-### Symptom
-
-Four cursor reviewers all delivered valid findings files. The panel reported *"3 of 4 angles
-finished; still waiting on error-handling"* and timed out (exit 2) on two consecutive runs,
-with `branch-review-2-error-handling.json` sitting complete and parseable on disk the whole
-time. `state.json` had that angle `Running`; the other three `Done`.
-
-### Cause
-
-herdr reports `agent_status: "done"` for only a moment as a turn ends; an agent parked at its
-prompt reports `"idle"`. All four finished panes read `idle` when inspected afterwards. The
-panel's completion test was `done_marker exists || agent_status == Done`, and the marker never
-fires for reviewers — their seed forbids `drovr phase done` (confirmed: zero `.done` files in
-the run dir). So the only signal was that momentary edge. Three angles were polled while it
-was showing; the fourth was not, and no later poll could ever recover it. On resume, the
-banking branch was gated on `status == Done`, so a stuck `Running` angle could not be rescued
-by its own file either. Two gates, both asking the pane, both unrecoverable once missed.
-
-### Fix
-
-Completion is the artifact. A parseable `<task>-review-<iter>-<angle>.json` finishes the
-angle at both gates, whatever the pane says (`code_review::delivered_review`). herdr is now
-consulted for exactly one question the artifact cannot answer: has a reviewer finished
-*without* delivering? The server's write is atomic (temp + rename) so a file in flight cannot
-be read as a delivery.
-
-### Not affected: ordinary phases
-
-`phase.rs` uses `agent_status` for readiness and blocked-detection, never for completion —
-a phase agent completes by running `drovr phase done`, which drops the marker the wait polls.
-Only the review panel depended on the edge, because only reviewers are told not to run it.
-
 ## `main` is not `cargo fmt` clean, and formatting one file reformats the whole crate
 
 **Severity:** medium — the last branch that got this wrong had to be rebuilt from scratch
@@ -2187,14 +1990,18 @@ Wanted work that is not a defect — nothing here is broken today.
   the agent tree, attachable, reapable, and resumable. A human then talks *to* a run rather
   than *being* its driver.
 
-  Recorded rather than built because it changes what a "run" is at the top, and because the
-  in-flight interactive-brainstorm work (`drovr ask`) has to land first: an orchestrator with
-  no channel to the human is strictly worse than a human driving by hand, which is the exact
-  trap that produced this entry. Two known consequences of the present shape, both observed on
-  this run: a brainstorm conducted in the human's chat session leaves the run with **zero agent
-  panes**, so `/api/runs/<run>/agents` answers `nodes: []` and the review UI reports "no live
-  pane" on a run that is actively at its gate; and the interview itself lands in the driver's
-  context, which is the context-rot drovr exists to prevent.
+  Recorded rather than built because it changes what a "run" is at the top. The stated blocker
+  is now **cleared**: the interactive-brainstorm work (`drovr ask` / `ask wait`, the interview
+  panel) landed 2026-08-07, so the orchestrator would have a channel to the human — an
+  orchestrator without one is strictly worse than a human driving by hand, which is the exact
+  trap that produced this entry.
+
+  Of the two consequences of the present shape recorded here, one is gone and one is not.
+  **Still true:** a brainstorm conducted in the human's chat session leaves the run with **zero
+  agent panes**, so `/api/runs/<run>/agents` answers `nodes: []` and the review UI reports "no
+  live pane" on a run that is actively at its gate. **No longer true:** that the interview lands
+  in the driver's context. It is answered in the web UI and read back by the phase agent that
+  posted it; `skills/pipeline/SKILL.md` now tells the driver to stay out of it.
 
 ## drovr never moves the driver out of the invoking checkout
 
@@ -2262,46 +2069,6 @@ main checkout for the rest of the run.
 
 Neither removes the underlying limit — a CLI still cannot move its parent — so both are ways of
 making the documented step harder to miss, not a substitute for it.
-
-## A phase name registered in BOTH lists resolves to the wrong phase — FIXED 2026-07-26
-
-Found by a review subagent during task 1's second fixes round of the phase-reap work; the gap itself
-predates that work.
-
-### Symptom
-
-`drovr phase start <run> review:t:1:correctness` — pointing `phase start` at a name a REVIEWER
-already holds — silently deleted that reviewer's `<phase>.done` marker, launched a second agent, and
-appended a second `Phase` entry under the same name in `run.phases`.
-
-From then on `RunState::find_phase` (which searches `phases` before `review_phases` and returns the
-first match) resolved that reviewer to the impostor: `phase send` reached the wrong pane,
-`phase done` from the reviewer's own pane was rejected as a token mismatch and demanded a
-pipeline-only `-HANDOFF.md`, and `code-review`'s wait polled the wrong pane and could time out on a
-reviewer that had actually finished.
-
-### Root cause
-
-`find_phase_idx` searches `run.phases` only, so a reviewer's name looked brand new to `phase_start`.
-Neither creation site checked the other list.
-
-### Fix
-
-`require_name_unclaimed` (`cli/src/phase.rs`) refuses a name the OTHER list already holds, at both
-creation sites, before any side effect. Pinned by
-`a_name_a_reviewer_already_holds_cannot_become_a_pipeline_phase` and
-`a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer`.
-
-**The same list counts too.** Two entries under one name means `find_phase` resolves to whichever
-was pushed first, so the second reviewer's pane is unreachable — the same corruption, within one
-list. main's panel resume re-spawns under the same `review:<task>:<iter>:<angle>` name and already
-drops the stale entry first (`run.review_phases.retain(|p| p.name != phase)`, "so `find_phase` cannot
-resolve to the replaced pane"), so merging it is safe; the guard makes that ordering a requirement
-rather than a convention. Pinned by `a_reviewer_must_be_de_registered_before_it_is_re_spawned`.
-
-Not reachable from drovr's own naming — reviewer names carry a `review:` prefix that pipeline names
-do not use — but the recovery commands drovr prints are bare `drovr phase start <run> <phase>`, so a
-human or a driver pasting one against the wrong name hit it with no guard.
 
 ## A `<task>` or a review `angle` with a space or a shell metacharacter no longer produces a phase
 
@@ -2454,45 +2221,6 @@ as verified.
 2. Or have `handle_archive` record `workspace_closed: false` durably in `state.json`, making a
    zombie a fact about the run rather than something re-derived from herdr on every poll.
    (2) is the stronger fix: it survives herdr being down entirely.
-
-## Restoring an archived run does not make it runnable again — FIXED 2026-08-02
-
-**Severity:** low (restore is for undoing a misclick), but the naming invites the wrong
-expectation.
-**Found:** 2026-07-25, re-reviewing the archive button.
-**Fixed:** 2026-08-02 by fix idea 1 below — `phase_start` now re-provisions a workspace that
-is gone (`phase::ensure_workspace`), so Restore does mean what it looks like it means. The
-archived run's *panes* are still gone: a phase that was `Running` when it was archived comes
-back `Failed` and has to be restarted. See "A run whose herdr workspace disappears is
-unrecoverable through drovr's own commands" at the end of this file.
-
-### What it used to do (before 2026-08-02)
-
-`POST /api/runs/<run>/archive {"archived":false}` — the UI's Restore button — cleared the flag
-and moved the row back to the active list, but could not bring the run back: archiving closed
-the run's herdr workspace and nothing recreated one. `phase_start` only reused a recorded
-`pane_id`, then `root_pane`, then `tab_create` against the run's existing `workspace` id; all
-three are dead after a close, and the only code that created a workspace was `cmd_new`. So
-`drovr phase start` on a restored run failed. Continuing meant a new run seeded from the
-handoff.
-
-One exception, and it is exactly the row the UI flags as anomalous: a ZOMBIE — archived while
-`workspace_close` failed — still has a live workspace and live panes recorded. Restoring one
-and running `drovr phase start` reused them and worked, then as now.
-
-### What it does now
-
-Restore clears the flag; the next `drovr phase start` finds no live workspace and builds one
-(`phase::ensure_workspace`), in the run's `project_dir`, writing the new ids back. The panes
-are still gone, so a phase that was `Running` when it was archived comes back `Failed` and has
-to be restarted — Restore recovers the run, not its agents.
-
-**Restore is required, not optional.** `ensure_workspace` refuses to re-provision a run that is
-still `archived`: the destroyed workspace used to be the only thing enforcing that decision,
-and a repair that silently overrode it would start a live agent on a run the UI shows as filed
-away. `drovr phase start` on an archived run therefore says so and names the Restore button.
-`code_review_run` has its own archived check, and that one is now load-bearing for the same
-reason.
 
 ## The review server still has no authentication (cross-origin writes blocked; direct ones are not)
 
@@ -3215,8 +2943,46 @@ running.
 2. Or ask herdr whether the workspace is empty after the pane closes (`workspace.get`
    `pane_count`) and close it only on a definitive zero.
 
-## Resolved
+## Lessons kept from retired issues
 
+**A fixed defect is deleted from this file, not annotated as fixed.** What made an entry worth
+recording was the live bug; once the fix is in the code and pinned by a test, the entry is a
+record of the past and every reader has to work out that it no longer applies. This section is
+the exception: the few retired issues whose value was never the defect — a root cause that was
+expensive to find and is guarded by nothing, or a rule that keeps someone from re-filing a bug
+that has already been settled. Keep these short. If a lesson grows a reproduction and a fix
+list, it has become an issue again and belongs above.
+
+- **Headless Chromium on Linux: always pass `--password-store=basic`** (retired 2026-08-01;
+  the flag is in `cli/tests/web_nav.rs`). Without it, Chromium's cookie store loads its
+  encryption key through OSCrypt, which asks the Secret Service over D-Bus; on a machine with
+  no unlocked keyring and no prompter that call **has no timeout**, so every cookie-bearing
+  request stalls forever at `COMPUTED_PRIVACY_MODE` and never reaches
+  `HTTP_TRANSACTION_SEND_REQUEST`. It presents as a network or browser fault, never as a
+  credential-store one: `file://` navigates instantly, the target server logs zero requests
+  even though `TCP_CONNECT` completed, `curl` to the same port works, and the DevTools session
+  looks dead while `/json/list` still answers. **Three wrong diagnoses were recorded before
+  this one** ("environmental", "load sensitivity in the CDP deadline", "a Chromium 150
+  regression"), none with measurements behind it. Ruled out and not worth re-testing: the drovr
+  server, CDP socket topology, `--headless` vs `=old`/`=new`, `--no-sandbox`,
+  `--disable-dev-shm-usage`, `NetworkServiceInProcess`, `--no-proxy-server`, enterprise policy,
+  machine load, and any chromium wrapper or flag file. Diagnose with
+  `--log-net-log --net-log-capture-mode=Everything`.
+- **herdr's `agent_status: "done"` is an EDGE, not a level** (retired 2026-07-27). It is
+  reported only for the moment a turn ends; an agent parked at its prompt reports `"idle"`.
+  Anything that polls for it will miss it and can never recover — which is what hung the review
+  panel forever on reviewers, who are forbidden from running `drovr phase done` and so have no
+  marker either. The rule that came out of it and still binds: **completion is the artifact.**
+  A parseable findings file finishes an angle whatever the pane says
+  (`code_review::delivered_review`); herdr is consulted for exactly one question the artifact
+  cannot answer — has a reviewer finished *without* delivering? Do not reintroduce a
+  liveness-based completion test anywhere.
+- **A skill's `description:` is a trigger, not a summary** (retired 2026-08-04; pinned by
+  `cli/tests/skills_valid.rs::no_phase_scoped_description_literals`). It is the line that
+  decides whether the skill is read at all, so a precondition written into it is a precondition
+  on the whole discipline — four skills scoped theirs to "in a drovr phase" and silently
+  disabled themselves for inline work. Phase-specific consequences belong in the body, worded
+  as *additional* ("Inside a drovr phase this also binds…"), never as a precondition.
 - **`drovr phase compress` regurgitates the seed instead of the phase's artifact**
   (found 2026-07-24, run `gpu-deploy-view`; resolved by 2026-07-25). Obsolete: there is no
   `drovr phase compress` command any more — `PhaseCmd` is only `start`/`send`/`wait`/`done`
@@ -3268,9 +3034,18 @@ That lock is the *only* check. `server.addr` is read solely to put a URL in the 
   server answered (e.g. a per-server nonce in the response and in a discovery file), not just
   that something did.
 
-## A run whose herdr workspace disappears is unrecoverable through drovr's own commands (2026-08-02) — FIXED
+## Losing a run's herdr workspace — what the repair does, and what it still does not
 
-**Severity:** high — it made a live 23-task run at task 3 (approved spec, plan, two tasks of
+**Kept, though the original defect is fixed.** Fixed entries are deleted from this file; this
+one stays for `### What is still true` below, which is the contract every caller of
+`phase::ensure_workspace` depends on and is documented nowhere else. It carries a live,
+deliberately unguarded race (two drovr processes repairing one run both create a workspace, and
+the loser is never recorded, so nothing reaps it). It is also the durable home for two facts a
+reader will look for under "archive": **Restore is required, not optional** — `ensure_workspace`
+refuses to re-provision a run that is still `archived` — and a phase that was `Running` when its
+workspace went comes back **`Failed`**, not respawned.
+
+**Severity:** was high — it made a live 23-task run at task 3 (approved spec, plan, two tasks of
 committed work) reachable only by hand-editing `state.json`, and the command built for
 recovery reported a resume it had not restored.
 **Found:** 2026-08-02, driving `skill-stickiness`.
@@ -3913,9 +3688,11 @@ once they submit a later round, and `turn` is the only evidence they ever existe
 ### Symptom
 
 The reviewer requests changes on turn 1 with a set of annotations, the agent revises, and the
-reviewer submits again on turn 2. Turn 1's `feedback`, `answers` and `annotations` are gone from
+reviewer submits again on turn 2. Turn 1's `feedback` and `annotations` are gone from
 disk. An agent that wants to check whether it actually addressed every turn-1 annotation has no
 source for them; a human who wants to see what they asked for two rounds ago has none either.
+(`answers` is overwritten too, but nothing is lost there any more: the page always posts `{}`
+since questions moved to `drovr ask` and the append-only `interview.jsonl`.)
 
 ### Root cause
 

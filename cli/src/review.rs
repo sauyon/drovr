@@ -1756,13 +1756,17 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
     }
 
     if decision == "approve" {
-        // Approve is terminal, but not answer-free: the reviewer may have
-        // answered the spec's open questions on the way to approving. Persist
-        // the same feedback.json the request-changes path writes, so the driver
-        // can read the selections instead of re-asking the human. The turn
+        // Persist the same feedback.json the request-changes path writes, so an
+        // approve and a request-changes have one shape between them. The turn
         // advances for the same reason it does there — a driver reading
-        // feedback.json must be able to tell this turn's answers from a stale
-        // previous turn's.
+        // feedback.json must be able to tell this turn from a stale previous one.
+        //
+        // `answers` is VESTIGIAL and the page now always posts `{}`: the reviewer
+        // cannot answer questions at the gate any more, and a spec carries no open
+        // questions to answer (`docs/interactive-brainstorm.md`, locked decision 6).
+        // Questions go out through `drovr ask` and are answered into
+        // `interview.jsonl`, never here. The field and its write stay so the wire
+        // shape is guaranteed rather than conditional; nothing should read them.
         rs.turn += 1;
         let fb_json = serde_json::json!({
             "turn": rs.turn,
@@ -4489,10 +4493,15 @@ mod tests {
 
     #[test]
     fn submit_approve_persists_question_answers() {
-        // Approving is the common path for a spec whose open questions the
-        // reviewer just answered. If the answers only survive `request-changes`,
-        // every approved run silently drops them and the next phase has to
-        // re-ask the human.
+        // A WIRE-SHAPE test, not a workflow one. The reviewer cannot answer
+        // questions at the gate any more (that moved to `drovr ask` /
+        // `interview.jsonl`) and the page always posts `answers: {}`, so nothing
+        // real is riding on this map today. What it pins is that approve and
+        // request-changes write the SAME feedback.json shape: the approve branch
+        // once wrote only the marker, and a field that survives one decision but
+        // not the other is the asymmetry that caused that. It posts a non-empty
+        // map precisely because `{}` would pass whether or not the field is
+        // carried through.
         let tmp = make_root("approve-answers");
         let dir = make_run(tmp.path(), "r", b"# Done");
         let addr = start_server(tmp.path().to_path_buf());
