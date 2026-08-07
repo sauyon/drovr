@@ -1476,6 +1476,29 @@ await press('j');
 check('...then onto the submit row', await cursorRowIndex(), 3);
 await press('k');
 check('k moves back', await cursorRowLabel(), 'Other');
+// The row's OWN label is what gets announced, and with a real count. Pinned here
+// rather than in the assistive-technology section further down: the ask on screen
+// there carries no options, so its free-text row and its submit row both read
+// "Answer" and an announcement check cannot tell which one it named. These four
+// rows all read differently.
+await evaluate(`document.getElementById('nav-live').textContent = ''; return 1;`);
+await press('k');
+check('moving announces the row it landed on, by that row\'s own label',
+  await evaluate(`return document.getElementById('nav-live').textContent;`),
+  'Fixed 5s (2 of 4)');
+await press('j');
+// Enter on the free-text row types into it. That branch is checked BEFORE the
+// generic radio branch, and the order is the whole point: this row carries a
+// radio AND the box, so falling through to the radio would arm an empty custom
+// answer nobody typed — one submitAnswer then refuses, on a question the human
+// thinks they just answered.
+await press('Enter');
+check('Enter on the free-text row goes to the box, it arms no empty answer',
+  await evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return { focused: document.activeElement.id, checked: r ? r.value : null };`),
+  { focused: 'interview-text', checked: null });
+await press('Escape');
 await press('2');
 check('2 picks the second option', await ivChecked(), 'fixed');
 check('...and brings the cursor onto the row it picked', await cursorRowIndex(), 1);
@@ -1493,15 +1516,36 @@ await press('k');
 check('the pick survives moving the cursor', await ivChecked(), 'fixed');
 await press('i');
 check('i focuses the free-text box, wherever the cursor is', await activeId(), 'interview-text');
+// ...and brings the cursor with it. Not cosmetic: typing arms the free-text row,
+// so a cursor left behind on an option row is a cursor pointing at an answer that
+// is NOT the armed one — and the next Enter activates the row it points at.
+check('...and moves the cursor onto the row it just armed', await cursorRowIndex(), 2);
 await typeText('linear backoff');
 check('typing a custom answer selects the Other radio', await ivChecked(), '__drovr_other__');
 await press('Escape');
 check('Escape leaves the text box', await activeId(), 'body');
+// The whole sequence a reviewer actually performs: type an answer, leave the box,
+// press Enter. Before the cursor moved with `i`, this checked the option row the
+// cursor had been parked on, silently disarmed the text still visible in the box,
+// and sent that option instead — no error, no highlight change, the typed answer
+// simply gone. Enter here lands back in the box, which is inert and correct.
+await press('Enter');
+check('Enter after typing does not disarm the typed answer', await evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return { armed: r ? r.value : null,
+           text: document.getElementById('interview-text').value };`),
+  { armed: '__drovr_other__', text: 'linear backoff' });
+await press('Escape');
 await evaluate(`document.getElementById('interview-text').value = ''; return 1;`);
 await press('2');
 check('re-picking an option takes the selection back off Other', await ivChecked(), 'fixed');
 // Submit is a row the reviewer has to LAND on, never a stray Enter on an option
-// — and it is the only keyboard path to an answer.
+// — and it is the only keyboard path to an answer. Enter FROM an option row picks
+// that option and stops. Driven from row 0, whose option is NOT the one currently
+// checked: on the row already picked, "it picked it" and "it did nothing" are the
+// same observation, and a build where the option branch just returns would pass.
+await press('k');
+check('the cursor is on the option that is not picked', await cursorRowIndex(), 0);
 await press('Enter');
 // The sleep is load-bearing, and reading the LOG is what makes it decisive.
 // press() returns the moment the keydown is dispatched, so a build that DOES
@@ -1510,11 +1554,15 @@ await press('Enter');
 // build. Wait past a local round trip (the real submit below settles inside one),
 // then ask the server, which cannot be mid-render.
 await sleep(500);
-check('Enter on an option row does not answer the ask', await evaluate(`
+check('Enter on an option row picks it and answers nothing', await evaluate(`
   return fetch(api('interview')).then(function(r){ return r.json(); }).then(function(a){
     var ask1 = a.filter(function(x){ return x.id === 'ask-1'; })[0];
-    return { answer: ask1.answer, onScreen: (document.querySelector('#interview-area .interview-question') || {}).textContent };
-  });`), { answer: null, onScreen: 'Retry policy on a failed rollout?' });
+    var r = document.querySelector('#interview-area input[type="radio"]:checked');
+    return { picked: r ? r.value : null, answer: ask1.answer,
+             onScreen: (document.querySelector('#interview-area .interview-question') || {}).textContent };
+  });`), { picked: 'exp', answer: null, onScreen: 'Retry policy on a failed rollout?' });
+// Back onto the option the submit check below expects to reach the log.
+await press('2');
 await press('G');
 check('G lands on the submit row', await cursorRowIndex(), 3);
 await press('Enter');
@@ -1528,10 +1576,25 @@ check('...and the value under the keyboard\'s own control is what reached the lo
     var ask1 = a.filter(function(x){ return x.id === 'ask-1'; })[0];
     return { answer: ask1.answer, answered: ask1.answered_at !== null };
   });`), { answer: 'fixed', answered: true });
-// applyNavCursor only CLAMPS an out-of-range index, so a cursor parked on the old
-// ask's submit row would silently stay there on an ask with as many rows or more
-// — one Enter away from answering a question the reviewer has not read.
 check('...and the cursor starts over on the new ask\'s first row', await cursorRowIndex(), 0);
+// ...which the check above does NOT actually pin, and neither does the one at the
+// top of this section: the fixture's asks shrink monotonically (5 rows, then 4,
+// then 2), so every real advance ALSO clamps an out-of-range index down, and a
+// reset that never ran would be invisible behind the clamp. The case the reset
+// exists for is the opposite one — a new ask with at least as many rows, where
+// the clamp is a no-op and the stale cursor sits on a row of a question nobody
+// has read yet. Forced here with a synthesised ask, the way the repaint checks
+// above call renderInterview directly.
+check('a new ask with MORE rows still starts the cursor over', await evaluate(`
+  var saved = currentInterview;
+  navCursor = 1;                       // in range for the ask on screen AND the new one
+  renderInterview([{ id: 'ask-synthetic', seq: 9, question: 'A wholly new question?',
+                     options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }]);
+  var rows = document.querySelectorAll('#interview-area .interview-row');
+  var at = null;
+  for (var i = 0; i < rows.length; i++) if (rows[i].classList.contains('nav-cursor')) at = i;
+  renderInterview(saved);              // put the real ask back for the sections below
+  return { rows: rows.length, cursor: at };`), { rows: 4, cursor: 0 });
 
 // ask-2 carries no options at all — a plain free-text ask.
 check('a question with no options is a bare free-text row', await evaluate(`
@@ -2216,9 +2279,14 @@ check('the cursor is exposed as aria-current', await evaluate(`
   return !!document.querySelector('#interview-area .interview-row.nav-cursor[aria-current="true"]');`), true);
 await evaluate(`document.getElementById('nav-live').textContent = ''; return 1;`);
 await press('j');
-const announced = await evaluate(`return document.getElementById('nav-live').textContent || '';`);
-check('moving the cursor announces the row it landed on',
-  announced.indexOf(await cursorRowLabel()) !== -1 && /\(\d+ of \d+\)/.test(announced), true);
+// The exact string, counts included. This ask carries no options, so both of its
+// rows read "Answer" and a substring test cannot say which was named — what this
+// pins is that the submit row, which has no <label> of its own, still announces
+// something rather than a bare " (2 of 2)". WHICH row gets announced is pinned in
+// the keyboard section above, against an ask whose rows all read differently.
+check('the row the cursor landed on is announced, with its position',
+  await evaluate(`return document.getElementById('nav-live').textContent || '';`),
+  'Answer (2 of 2)');
 check('the help is reachable by pointer, not only by its own key',
   await evaluate(`return !!document.querySelector('#keyhint button');`), true);
 check('the help card is a labelled modal dialog', await evaluate(`

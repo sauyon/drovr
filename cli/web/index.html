@@ -1983,15 +1983,16 @@ function needsWrittenFeedback(feedbackVal) {
 // what reaches the log.
 var OTHER_SENTINEL = '__drovr_other__';
 
-// The two answer rows that are not options. These classes are what the keyboard
-// reads a row's KIND from (activateCursorRow), so they are named here rather than
-// written out at each site: renderInterview builds them and activateCursorRow
-// matches them, and a typo in either one would parse fine and silently give that
-// row the wrong behaviour — an Enter on submit that picks a radio instead of
-// answering. The CSS repeats the literals because CSS cannot read these; the
-// `.interview-row-*` rules and these constants must be renamed together.
-var ROW_OTHER = 'interview-row-other';
-var ROW_SUBMIT = 'interview-row-submit';
+// The KIND of the two answer rows that are not options, carried as a
+// machine-readable attribute — `data-row-kind` — and deliberately NOT as the
+// `.interview-row-*` CSS classes those rows also have. activateCursorRow reads a
+// row's BEHAVIOUR off this, and the classes exist to style it: keyed on the
+// class, a stylesheet rename by someone who never opens this JS would silently
+// change what Enter does on that row. This is the counterpart of the `data-value`
+// the option rows already carry.
+var ROW_KIND_OTHER = 'other';
+var ROW_KIND_SUBMIT = 'submit';
+function rowKind(el) { return el.getAttribute('data-row-kind'); }
 
 var currentInterview = [];   // the whole folded array from GET interview
 var currentAsk = null;       // the oldest entry still unanswered, or null
@@ -2110,14 +2111,14 @@ function renderInterview(asks) {
   // Free-text escape hatch: the offered options are never exhaustive. Typing
   // selects the radio, so the text cannot be silently ignored. An ask with no
   // options at all is just this row.
-  html += '<div class="interview-row ' + ROW_OTHER + '">';
+  html += '<div class="interview-row interview-row-other" data-row-kind="' + ROW_KIND_OTHER + '">';
   html += '<input type="radio" id="iv_other" name="iv_answer" value="' + OTHER_SENTINEL + '">';
   html += '<label for="iv_other">' + (opts.length ? 'Other' : 'Answer') + '</label>';
   html += '<input type="text" id="interview-text" aria-label="Custom answer" ' +
           'placeholder="type your own answer…" ' +
           'oninput="document.getElementById(\'iv_other\').checked = true">';
   html += '</div>';
-  html += '<div class="interview-row ' + ROW_SUBMIT + '">' +
+  html += '<div class="interview-row interview-row-submit" data-row-kind="' + ROW_KIND_SUBMIT + '">' +
           '<button class="primary" id="interview-answer-btn" onclick="submitAnswer()">Answer</button></div>';
   html += '</div>';
   html += '<div id="interview-error" class="error-msg" style="display:none"></div>';
@@ -3820,12 +3821,13 @@ function activateCursorRow() {
   var el = navRows()[navCursor];
   if (!el) return;
   if (!currentRun) { location.hash = el.getAttribute('href'); return; }
-  if (el.classList.contains(ROW_SUBMIT)) { submitAnswer(); return; }
+  var kind = rowKind(el);
+  if (kind === ROW_KIND_SUBMIT) { submitAnswer(); return; }
   // Checked BEFORE the radio below, not after: the free-text row carries both a
   // radio and the box, and activating it has to reach the box — selecting its
   // radio and stopping would arm an empty custom answer that submitAnswer then
   // refuses.
-  if (el.classList.contains(ROW_OTHER)) { focusCustomAnswer(); return; }
+  if (kind === ROW_KIND_OTHER) { focusCustomAnswer(); return; }
   var radio = el.querySelector('input[type="radio"]');
   if (!radio) return;
   radio.checked = true;
@@ -3858,11 +3860,27 @@ function pickOption(n) {
 }
 
 // `i` — jump into the ask's free-text box, vim-insert style. One question at a
-// time means one box, so this no longer depends on where the cursor is.
+// time means one box, so WHICH box this reaches no longer depends on the cursor.
+//
+// It moves the cursor onto that row anyway, and that is load-bearing rather than
+// cosmetic — the same invariant pickOption keeps: the cursor and the armed answer
+// must never disagree. Typing in the box selects its radio (the `oninput` in
+// renderInterview), so after `i` the free-text row IS the armed answer. Leaving
+// the cursor on an option row meant the next Enter activated THAT row, checking
+// its radio and silently disarming the text still visibly sitting in the box —
+// and submitAnswer then reads the option. The reviewer types "linear backoff",
+// presses Enter twice, and `exp` reaches the log with nothing said. That is the
+// same failure the render guard exists to retire, arriving by the keyboard.
 function focusCustomAnswer() {
   if (!currentRun) return;
   var box = document.getElementById('interview-text');
-  if (box) { box.focus(); box.select(); }
+  if (!box) return;
+  var rows = navRows();
+  for (var i = 0; i < rows.length; i++) {
+    if (rowKind(rows[i]) === ROW_KIND_OTHER) { cursorTo(i); break; }
+  }
+  box.focus();
+  box.select();
 }
 
 // Clicking is the other way to point at a row. Without this the visual cursor

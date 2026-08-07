@@ -4166,7 +4166,12 @@ mod tests {
 
         let (status, body) = http_get(&addr, "/api/runs/r/questions");
         assert_eq!(status, 404, "body={body}");
-        assert!(!body.contains("q1"), "must not serve the file either: {body}");
+        // Anchored against a LIVE sibling on the same prefix. On its own the 404
+        // above is also what a broken router, a renamed prefix or a mangled path
+        // split would produce, so it would keep passing while every run route on
+        // the server had stopped answering. This says the 404 is about THIS route.
+        let (live, live_body) = http_get(&addr, "/api/runs/r/interview");
+        assert_eq!(live, 200, "sibling run routes must still answer: {live_body}");
     }
 
     #[test]
