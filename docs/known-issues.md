@@ -2902,13 +2902,9 @@ running.
 
 ## Lessons kept from retired issues
 
-**A fixed defect is deleted from this file, not annotated as fixed.** What made an entry worth
-recording was the live bug; once the fix is in the code and pinned by a test, the entry is a
-record of the past and every reader has to work out that it no longer applies. This section is
-the exception: the few retired issues whose value was never the defect — a root cause that was
-expensive to find and is guarded by nothing, or a rule that keeps someone from re-filing a bug
-that has already been settled. Keep these short. If a lesson grows a reproduction and a fix
-list, it has become an issue again and belongs above.
+The second exception named in the policy at the top of this file: retired issues whose value was
+never the defect. **Keep these short.** If a lesson grows a reproduction and a fix list, it has
+become an issue again and belongs above.
 
 - **Headless Chromium on Linux: always pass `--password-store=basic`** (retired 2026-08-01;
   the flag is in `cli/tests/web_nav.rs`). Without it, Chromium's cookie store loads its
