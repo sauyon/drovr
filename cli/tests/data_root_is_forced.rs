@@ -16,14 +16,32 @@ fn cargo_forces_the_data_root_at_the_repo_scratch_path() {
          the repo, and check the file still exists and is not shadowed by cli/.cargo/.",
     );
     let value = Path::new(&raw);
+    let complaint = format!(
+        "XDG_DATA_HOME is {value:?}, which is not this repo's forced scratch root. Either \
+         the repo-root .cargo/config.toml is missing/shadowed, or something overrode it — \
+         in both cases this test run may be pointed at real drovr data.",
+    );
 
-    // Matched by suffix, not by equality: `relative = true` anchors the value at the parent
-    // of `.cargo`, which is the repo root under a different absolute path in the nix sandbox
-    // (/build/source) than it is locally, and either may be reached through a symlink.
-    assert!(
-        value.ends_with("target/cargo-xdg-data"),
-        "XDG_DATA_HOME is {value:?}, which is not the forced scratch root. Either the \
-         repo-root .cargo/config.toml is missing/shadowed, or something overrode it — in \
-         both cases this test run may be pointed at real drovr data.",
+    // Checked against THIS repo's path, not just the "target/cargo-xdg-data" suffix: an
+    // exported XDG_DATA_HOME that happens to end that way would otherwise satisfy a suffix
+    // match with the config absent, which is precisely the state this test exists to catch.
+    //
+    // `relative = true` anchors the value at the parent of `.cargo` — the repo root, which
+    // is /build/source in the nix sandbox and a worktree path locally, and either may be
+    // reached through a symlink. So the two leaf components are matched literally and the
+    // root is compared canonically. Only the root is canonicalized: it always exists,
+    // whereas target/cargo-xdg-data is created lazily by the first process that writes.
+    assert_eq!(value.file_name(), Some("cargo-xdg-data".as_ref()), "{complaint}");
+    let target = value.parent().expect("scratch root has a parent");
+    assert_eq!(target.file_name(), Some("target".as_ref()), "{complaint}");
+
+    let anchor = target.parent().expect("target/ has a parent");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli/ has a parent");
+    assert_eq!(
+        anchor.canonicalize().ok(),
+        repo_root.canonicalize().ok(),
+        "{complaint} It is anchored at {anchor:?}, not at this repo ({repo_root:?}).",
     );
 }
