@@ -44,6 +44,15 @@ pub fn var_os(key: &str) -> Option<OsString> {
 /// semantics.
 #[cfg(test)]
 pub fn var(key: &str) -> Result<String, VarError> {
+    if let Some(overlay) = crate::test_env::current() {
+        // Converted here rather than in the overlay, so that `std::env::var`'s
+        // error semantics stay in one place: absent is NotPresent, non-UTF-8 is
+        // NotUnicode carrying the original bytes.
+        return match overlay.get_os(key) {
+            None => Err(VarError::NotPresent),
+            Some(v) => v.into_string().map_err(VarError::NotUnicode),
+        };
+    }
     // TRANSITIONAL — deleted at T13, which is what makes the capability authoritative.
     // Until then an unmigrated test still reads the process env under ENV_LOCK.
     std::env::var(key)
@@ -52,6 +61,9 @@ pub fn var(key: &str) -> Result<String, VarError> {
 /// Read an environment variable as raw OS bytes.
 #[cfg(test)]
 pub fn var_os(key: &str) -> Option<OsString> {
+    if let Some(overlay) = crate::test_env::current() {
+        return overlay.get_os(key);
+    }
     // TRANSITIONAL — deleted at T13, which is what makes the capability authoritative.
     // Until then an unmigrated test still reads the process env under ENV_LOCK.
     std::env::var_os(key)
@@ -78,15 +90,33 @@ mod tests {
     /// The complete list. Adding to it is a design decision, not a fix for a
     /// failing test — a raw read is invisible to the overlay and therefore
     /// still races.
-    const RAW_EXCEPTIONS: &[RawException] = &[RawException {
-        file: "run.rs",
-        tag: "refuse-home-data-root",
-        why: "refuse_home_data_root must see the REAL $HOME. The cfg(test) shim answers \
-              only from the overlay, which never seeds HOME, so a shimmed read would \
-              return NotPresent and the guard would pass unconditionally for every \
-              migrated test — silently inert for exactly the sweep it backstops. This \
-              exception dies with the function it belongs to.",
-    }];
+    const RAW_EXCEPTIONS: &[RawException] = &[
+        RawException {
+            file: "run.rs",
+            tag: "refuse-home-data-root",
+            why: "refuse_home_data_root must see the REAL $HOME. The cfg(test) shim answers \
+                  only from the overlay, which never seeds HOME, so a shimmed read would \
+                  return NotPresent and the guard would pass unconditionally for every \
+                  migrated test — silently inert for exactly the sweep it backstops. This \
+                  exception dies with the function it belongs to.",
+        },
+        RawException {
+            file: "test_env.rs",
+            tag: "bootstrap-home",
+            why: "TestEnv's home check protects the REAL home, so it must read the real \
+                  HOME. Reading it through the overlay would let a test disable the check \
+                  by naming a different home — the bypass shape this module exists to \
+                  remove. Permanent: it outlives the transitional shim.",
+        },
+        RawException {
+            file: "test_env.rs",
+            tag: "bootstrap-path",
+            why: "PATH is copied verbatim INTO each new overlay so command_available keeps \
+                  finding the agent binaries. A read cannot go through the overlay it is \
+                  itself seeding. Permanent, and deliberately the only key treated this \
+                  way — a hermetic PATH is a separate want.",
+        },
+    ];
 
     /// The comment that claims an exception, e.g. `// ENV-SHIM-RAW-OK: <tag>`.
     const MARKER: &str = "ENV-SHIM-RAW-OK:";
@@ -244,11 +274,43 @@ mod tests {
     /// absent covers the other branch.
     #[test]
     fn without_an_overlay_the_shim_is_std_env() {
+        assert!(
+            crate::test_env::current().is_none(),
+            "this test asserts the NO-overlay branch; an overlay installed on \
+             this thread would make the equality below false by design",
+        );
         assert_eq!(super::var("PATH"), std::env::var("PATH"));
         assert_eq!(super::var_os("PATH"), std::env::var_os("PATH"));
 
         const ABSENT: &str = "DROVR_ENV_SHIM_KEY_THAT_IS_NEVER_SET";
         assert_eq!(super::var(ABSENT), Err(std::env::VarError::NotPresent));
         assert_eq!(super::var_os(ABSENT), None);
+    }
+
+    /// With an overlay installed the shim answers from it, and ONLY from it.
+    ///
+    /// The second half is the load-bearing one. There is no per-key
+    /// fallthrough: a key the overlay does not hold reads as absent even when
+    /// the process environment has it. That is what turns a test which still
+    /// writes the process environment into a loud failure instead of a silent
+    /// pass on somebody else's value.
+    #[test]
+    fn with_an_overlay_the_shim_answers_only_from_it() {
+        const PROBE: &str = "DROVR_ENV_SHIM_PROBE";
+        let env = crate::test_env::TestEnv::new();
+        env.set(PROBE, "from the overlay");
+        assert_eq!(super::var(PROBE).as_deref(), Ok("from the overlay"));
+        assert_eq!(
+            super::var_os(PROBE),
+            Some(std::ffi::OsString::from("from the overlay")),
+        );
+
+        // `HOME` is set in every environment this suite runs in and the overlay
+        // deliberately never seeds it. Guarded rather than asserted, because a
+        // machine without `HOME` has nothing to prove here.
+        if std::env::var_os("HOME").is_some() {
+            assert_eq!(super::var("HOME"), Err(std::env::VarError::NotPresent));
+            assert_eq!(super::var_os("HOME"), None);
+        }
     }
 }

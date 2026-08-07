@@ -14,6 +14,10 @@ mod run;
 /// embedded third-party assets to known-good digests.
 #[cfg(test)]
 mod sha256;
+/// The only door to a test's environment: a thread-scoped overlay that
+/// `crate::env` reads instead of the process environment.
+#[cfg(test)]
+mod test_env;
 mod shell;
 mod worktree;
 
