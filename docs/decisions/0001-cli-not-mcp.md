@@ -50,7 +50,7 @@ either direction.
 
 ### 3. Handing every spawned agent an `--mcp-config` is an active liability
 
-See `docs/known-issues.md`, *"Spawned agents park on the 'New MCP server' approval prompt,
+See `forge.ko.ag/drovr/drovr/issues`, *"Spawned agents park on the 'New MCP server' approval prompt,
 undetected"*. A freshly spawned `claude` can sit on that prompt while herdr reports it `idle`
 rather than `blocked`, so `phase send` readiness checks and blocked-triage both miss it and the
 run wedges silently. The port would have put that failure mode on the critical path of every

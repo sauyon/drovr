@@ -88,7 +88,7 @@ impl RunScan {
     /// and a stale pane id is *permanent*: treating any unreadable pane as
     /// uncertainty would leave such a run flagged uncertain forever and defeat
     /// the cache, since an inconclusive sweep is deliberately never cached. See
-    /// `docs/known-issues.md`, "A partially unreadable sweep is cached as a
+    /// `forge.ko.ag/drovr/drovr/issues`, "A partially unreadable sweep is cached as a
     /// clean answer".
     pub fn inconclusive(&self) -> bool {
         self.attached == 0 && self.unreadable > 0

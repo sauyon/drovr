@@ -2930,7 +2930,7 @@ mod tests {
     #[test]
     fn an_incomplete_rehydrate_never_reports_as_success() {
         use phase::RehydrateOutcome::*;
-        // The failure class `docs/known-issues.md` keeps recording: a driver
+        // The failure class `forge.ko.ag/drovr/drovr/issues` keeps recording: a driver
         // reads an exit code as success and carries on. A rehydrate that
         // brought the pane back without CONFIRMING the agent has its context is
         // NOT success — a `phase wait` after it may block on an agent nobody

@@ -171,7 +171,7 @@ report done.
 
 Both roles use the same command and drovr cannot tell them apart, so the separation is
 yours to keep: run your own panel after every task, no matter what the task report says
-its own panels found. See `docs/known-issues.md` for the run where the author's fifth panel
+its own panels found. See `forge.ko.ag/drovr/drovr/issues` for the run where the author's fifth panel
 came back clean and the driver's sixth, on the identical commit, did not.
 
 After a task's `drovr phase wait` returns done (so the agent has already authored its

@@ -270,7 +270,7 @@ fn web_keyboard_navigation() {
                 // The two flags are per-platform and each is ignored elsewhere:
                 // `--password-store` is Linux/BSD, `--use-mock-keychain` is the macOS
                 // equivalent for the same failure against Keychain. Windows needs neither
-                // (DPAPI does not prompt). See docs/known-issues.md.
+                // (DPAPI does not prompt). See forge.ko.ag/drovr/drovr/issues.
                 "--password-store=basic",
                 "--use-mock-keychain",
                 &format!("--remote-debugging-port={cdp_port}"),

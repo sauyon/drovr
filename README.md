@@ -48,7 +48,7 @@ An opencode review panel moves the checkout's `opencode.json` and `.opencode/`
 aside first (to `*.drovr-backup`, kept and git-excluded, not restored
 afterwards). Both are places a repository under review can redefine the
 read-only agent itself, unlike Claude's and Cursor's read-only modes, which are
-CLI flags. See `docs/known-issues.md` for the probes behind that.
+CLI flags. See `forge.ko.ag/drovr/drovr/issues` for the probes behind that.
 
 Automated review panels prefer Cursor's `agent` command when it is executable
 on `PATH` and its herdr integration is installed, then fall back to the backend
@@ -176,7 +176,7 @@ classified by the same function `drovr phase wait` triages with:
 Routine prompts are *reported* (quietly, so a run that looks slow explains
 itself) but never notified: a badge that fires on every file-edit dialog is a
 badge nobody reads. The corollary — a routine prompt with **no** `phase wait`
-running notifies nobody — is in `docs/known-issues.md`.
+running notifies nobody — is in `forge.ko.ag/drovr/drovr/issues`.
 
 The scan is read-only: it polls each live pane, and reads a pane's contents only
 when that pane came back `blocked`. Unlike the triage inside `phase wait`, it
@@ -201,7 +201,7 @@ phase table, `? unknown` on the session-list badge, and `blocked.inconclusive`
 (plus `inconclusive` on the agent tree) on the wire — which also stops the
 browser from clearing an alarm it already raised. A run whose own `state.json`
 will not parse answers the same way, for the same reason. (A *partial* failure —
-some panes answer, one does not — still reads as conclusive; `docs/known-issues.md`
+some panes answer, one does not — still reads as conclusive; `forge.ko.ag/drovr/drovr/issues`
 says why.)
 
 ### Resuming an agent's session
@@ -541,7 +541,7 @@ prerequisites are absent it prints a skip message and exits cleanly.
 `cargo fmt --check` does not either. Neither can be a pass/fail gate as written,
 and chasing them into the green is a separate, deliberate change — a
 formatting-only commit conflicts with every branch in flight, so it needs a quiet
-moment rather than a branch that happens to notice (see `docs/known-issues.md`).
+moment rather than a branch that happens to notice (see `forge.ko.ag/drovr/drovr/issues`).
 
 **The gate a branch is actually held to: introduce no new finding.** Measure
 before and after, and compare the *sets*, not just the counts — line numbers move
@@ -565,4 +565,4 @@ cargo clippy --all-targets --message-format=short 2>&1 |
 `--message-format=short` prints one `file:line:col: warning: …` per finding, so
 `sort -u` collapses the per-target duplicates; the result is stable across cold
 and warm builds. `cargo fmt` has no equivalent trick — do not run it, and see the
-known-issues entry for why naming a single file reformats the whole crate.
+issue tracker for why naming a single file reformats the whole crate.

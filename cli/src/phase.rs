@@ -164,7 +164,7 @@ fn require_phase_name(phase: &str) -> io::Result<()> {
 /// `:`), and version-ish suffixes. **A `<task>` or a configured `angle` with a
 /// space or a metacharacter now fails here**, which is the point: `<task>` reaches
 /// drovr from the review server's HTTP layer, where it is only checked for path
-/// safety. See `docs/known-issues.md`.
+/// safety. See `forge.ko.ag/drovr/drovr/issues`.
 fn require_new_phase_name(phase: &str) -> io::Result<()> {
     require_phase_name(phase)?;
     if !phase
@@ -589,7 +589,7 @@ pub enum WorkspaceHealing {
 /// needs two concurrent writers on one run, which drovr's single-writer
 /// discipline forbids — and a lock here would close one instance of a race the
 /// rest of the file has everywhere else, which is worse than an honest gap. It is
-/// written up in `docs/known-issues.md`; the loser is labelled `drovr:<run>` like
+/// written up in `forge.ko.ag/drovr/drovr/issues`; the loser is labelled `drovr:<run>` like
 /// any other, so a human can spot the duplicate in herdr's switcher.
 pub fn ensure_workspace<H: Herdr>(h: &H, run: &mut RunState) -> io::Result<WorkspaceHealing> {
     if let Some(ws) = run.workspace.as_deref()
@@ -3382,7 +3382,7 @@ fn pane_shows_payload(pane: &str, text: &str) -> bool {
 /// 4. **The prompt lands but is never submitted.** The payload sits in the
 ///    composer indefinitely and the agent never starts. This is the common case
 ///    on `cursor` and it happens on `claude` too; it is a race, not a function of
-///    the payload (see `docs/known-issues.md`).
+///    the payload (see `forge.ko.ag/drovr/drovr/issues`).
 ///
 /// Cases 3 and 4 both look like "herdr saw no state change", so
 /// [`Herdr::agent_prompt_confirm`] detects them together — and

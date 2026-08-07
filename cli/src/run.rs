@@ -1136,7 +1136,7 @@ impl RunState {
     /// uses [`save`]/[`save_in`], which write it verbatim.
     ///
     /// This narrows the race; it does not close it. A concurrent write landing
-    /// between the re-read and the write is still lost (see docs/known-issues.md
+    /// between the re-read and the write is still lost (see forge.ko.ag/drovr/drovr/issues
     /// — `state.json` has no locking or compare-and-swap). An unreadable
     /// `state.json` leaves the value in hand and proceeds, because this is a WRITE
     /// path: refusing to persist a phase's progress over an unrelated read failure

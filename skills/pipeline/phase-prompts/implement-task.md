@@ -55,7 +55,7 @@ tasks; later tasks run as their own fresh phases.
    Two mechanics if you do run it. **Commit first, and keep committing:** the panel's committed
    scope is `git diff base..HEAD`. Commit nothing and that range contains nothing —
    `drovr code-review run` now refuses that outright (exit 1), because it used to return a clean
-   verdict on it (see `docs/known-issues.md`). Committing *once* is not enough either: whatever
+   verdict on it (see `forge.ko.ag/drovr/drovr/issues`). Committing *once* is not enough either: whatever
    you leave uncommitted after that is outside `base..HEAD`, and while the reviewer's brief does
    put the working tree in scope alongside the diff, it does not reliably reach it — untracked
    files never appear in a `git diff` at all. What you have not committed may not be reviewed.

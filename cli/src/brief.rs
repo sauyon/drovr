@@ -156,7 +156,7 @@ pub fn write_no_follow(path: &Path, contents: &str) -> io::Result<()> {
 /// link planted at the record path made drovr read an arbitrary file and inject it into a
 /// brief. There is no `O_NOFOLLOW` in std, so this is a `symlink_metadata` check — racy in
 /// principle, decisive against a planted link in practice, and the run dir is not a
-/// contested directory (see docs/known-issues.md on what its permissions do and do not
+/// contested directory (see forge.ko.ag/drovr/drovr/issues on what its permissions do and do not
 /// buy).
 fn read_record_no_follow(path: &Path) -> io::Result<Option<String>> {
     let meta = match std::fs::symlink_metadata(path) {

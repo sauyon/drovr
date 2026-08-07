@@ -501,7 +501,7 @@ pub trait Herdr {
     /// pane was not already `working`/`done` when the prompt went out — which is
     /// the normal case, since `phase_send` prompts a pane at its composer. herdr
     /// exposes no edge-triggered form (`AgentPromptWaitOptions` is `{until,
-    /// timeout_ms}` and nothing else). See `docs/known-issues.md`, "`until` is a
+    /// timeout_ms}` and nothing else). See `forge.ko.ag/drovr/drovr/issues`, "`until` is a
     /// LEVEL, not an edge", for why this is documented rather than worked around.
     fn agent_prompt_confirm(
         &self,

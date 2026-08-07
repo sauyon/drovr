@@ -924,7 +924,7 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
 /// records the new ids. What it cannot restore is the *agents* — every pane died
 /// with the workspace, so a phase that was `Running` when it was archived comes
-/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
+/// back `Failed` and has to be restarted. See forge.ko.ag/drovr/drovr/issues, "Restoring an
 /// archived run does not make it runnable again — FIXED 2026-08-02".
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
@@ -994,7 +994,7 @@ fn handle_archive(mut req: Request, ctx: &Arc<Ctx>, run: &str) {
     // so the window is far more reachable than the equivalent one in
     // `cmd_cleanup`. Re-reading narrows it to this function's own last two
     // statements; closing it completely needs locking in `RunState::save`
-    // (docs/known-issues.md).
+    // (forge.ko.ag/drovr/drovr/issues).
     let mut state = load_run_state(&dir).unwrap_or(state);
     state.archived = archived;
     if let Err(e) = state.save_in(&dir) {
@@ -2258,7 +2258,7 @@ pub fn display_addr(addr: &str) -> String {
 /// page URL and the matching `drovr review wait` invocation. This is the moment
 /// the gate actually opens, so it is the only place that can reliably remind a
 /// driver to start the watch — `drovr serve` is global and does not know which
-/// run is being reviewed. See `docs/known-issues.md`, "Serving a spec doesn't
+/// run is being reviewed. See `forge.ko.ag/drovr/drovr/issues`, "Serving a spec doesn't
 /// start a watcher".
 pub fn review_summary(run: &str, text: &str) -> io::Result<String> {
     let addr = ensure_server()?;
@@ -4213,7 +4213,7 @@ mod tests {
     /// Deliberately path-based rather than data-dir based: nothing here touches
     /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
     /// that do — see "Test suite flakes under parallel `cargo test`" in
-    /// `docs/known-issues.md`.
+    /// `forge.ko.ag/drovr/drovr/issues`.
     #[test]
     fn lock_records_our_pid_and_releases_on_drop() {
         let tmp = make_root("lock-claim");

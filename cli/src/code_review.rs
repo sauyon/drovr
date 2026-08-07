@@ -11,7 +11,7 @@
 //! often as it likes, as iteration feedback. Only the pipeline driver's pass is the
 //! acceptance gate: the driver reacts to the outcome and decides whether the task
 //! advances. That separation lives in the skill docs (`drovr:pipeline`,
-//! `drovr:code-review`), not in this module — see `docs/known-issues.md` for the run
+//! `drovr:code-review`), not in this module — see `forge.ko.ag/drovr/drovr/issues` for the run
 //! that made the distinction necessary.
 //!
 //! # Resuming a slow panel
@@ -89,7 +89,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// driver's gate produce the same outcome, deliberately: caller identity here could only
 /// be self-declared, and a forgeable role is worse than an absent one. That separation is
 /// held by the skill docs (`drovr:pipeline`, `drovr:code-review`) and by the driver
-/// re-running the panel itself, unconditionally. See `docs/known-issues.md`.
+/// re-running the panel itself, unconditionally. See `forge.ko.ag/drovr/drovr/issues`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOutcome {
     /// Reviewers examined a non-empty `base..head` and reported no blocking

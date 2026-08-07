@@ -20,7 +20,7 @@ exists. Preserve decisions + interfaces, drop narration.
 > *context rot* (Chroma: output degrades as the window fills), but the fresh reader could only
 > see a lossy pane snapshot via `herdr agent read` — so it summarized the wrong thing (e.g.
 > regurgitating the injected seed instead of the phase's real artifact; see
-> `docs/known-issues.md`). A context-aware author of the *complete* session beats a neutral
+> `forge.ko.ag/drovr/drovr/issues`). A context-aware author of the *complete* session beats a neutral
 > reader of an *incomplete* one. Context rot is mitigated where it matters: compression is
 > recall + selection (rot-resistant), it can happen at the fullness threshold rather than the
 > ceiling, and git pointers make the handoff an index into re-derivable truth, not the sole
