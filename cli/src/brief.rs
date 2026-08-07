@@ -671,12 +671,17 @@ mod tests {
     ///
     /// **And counted against the template's own text**, not the assembled brief.
     /// [`compose_phase_brief`] splices the run's task and the driver's context
-    /// into the middle of the template, and both are free text. A `>=` count over
-    /// the whole brief is therefore paddable: a reviewer demonstrated a real
-    /// dropped `<value>` going undetected because the run's task happened to
-    /// quote `--option <value>=<label>` — not a contrived input in a repo whose
-    /// tasks are often *about* the ask directive. So the fixture is asserted
-    /// disjoint from the corpus first, and the counts are then `==`.
+    /// into the middle of the template, and both are free text. A count over the
+    /// whole brief is therefore paddable: a reviewer demonstrated a real dropped
+    /// `<value>` going undetected because the run's task happened to quote
+    /// `--option <value>=<label>` — not a contrived input in a repo whose tasks
+    /// are often *about* the ask directive.
+    ///
+    /// So the spliced span is **excised** before counting. Asserting the fixture
+    /// disjoint field by field was the first fix and the wrong shape: it closed
+    /// `task` and left `context` open, which a second reviewer caught
+    /// immediately. Excision closes the class, and stays closed when a later
+    /// section is added.
     ///
     /// Both halves, because half of an allowlist is not one. `<run>` must be
     /// **gone** from the composed brief — the ask directive tells the agent to run
@@ -709,17 +714,25 @@ mod tests {
              nothing"
         );
 
+        // Everything `compose_phase_brief` spliced in, cut back out: from the
+        // run's-task heading to the closing `## Done when` it inserts before.
+        // What is left is the template's own text, and only that is this test's
+        // business.
+        let start = brief
+            .find("\n## The run's task")
+            .expect("a composed brief carries the run's task");
+        let end = brief[start..]
+            .find("\n## Done when")
+            .map_or(brief.len(), |i| start + i);
+        assert!(
+            brief[start..end].contains(&run.task),
+            "the excised span is not the driver's sections — the headings this test \
+             splits on have moved: {brief}"
+        );
+        let template_text = format!("{}{}", &brief[..start], &brief[end..]);
+
         for (token, wanted) in &prose {
-            // The spliced-in sections must not be able to pay for a loss in the
-            // template. Checked per token rather than assumed of the fixture, so
-            // a later edit to `make_run()` fails here instead of quietly turning
-            // the count below into an inequality.
-            assert!(
-                !run.task.contains(token),
-                "the fixture's run task quotes `{token}`, which pads the count below and \
-                 can mask a real loss — give make_run() a task with no angle-bracket prose"
-            );
-            let seen = brief.matches(token).count();
+            let seen = template_text.matches(token).count();
             assert_eq!(
                 seen, *wanted,
                 "`{token}` is prose, not a placeholder: the template carries it {wanted} \
