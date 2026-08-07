@@ -1983,6 +1983,16 @@ function needsWrittenFeedback(feedbackVal) {
 // what reaches the log.
 var OTHER_SENTINEL = '__drovr_other__';
 
+// The two answer rows that are not options. These classes are what the keyboard
+// reads a row's KIND from (activateCursorRow), so they are named here rather than
+// written out at each site: renderInterview builds them and activateCursorRow
+// matches them, and a typo in either one would parse fine and silently give that
+// row the wrong behaviour — an Enter on submit that picks a radio instead of
+// answering. The CSS repeats the literals because CSS cannot read these; the
+// `.interview-row-*` rules and these constants must be renamed together.
+var ROW_OTHER = 'interview-row-other';
+var ROW_SUBMIT = 'interview-row-submit';
+
 var currentInterview = [];   // the whole folded array from GET interview
 var currentAsk = null;       // the oldest entry still unanswered, or null
 // The ask id the CURRENT DOM was built from. See renderInterview: this panel
@@ -2100,14 +2110,14 @@ function renderInterview(asks) {
   // Free-text escape hatch: the offered options are never exhaustive. Typing
   // selects the radio, so the text cannot be silently ignored. An ask with no
   // options at all is just this row.
-  html += '<div class="interview-row interview-row-other">';
+  html += '<div class="interview-row ' + ROW_OTHER + '">';
   html += '<input type="radio" id="iv_other" name="iv_answer" value="' + OTHER_SENTINEL + '">';
   html += '<label for="iv_other">' + (opts.length ? 'Other' : 'Answer') + '</label>';
   html += '<input type="text" id="interview-text" aria-label="Custom answer" ' +
           'placeholder="type your own answer…" ' +
           'oninput="document.getElementById(\'iv_other\').checked = true">';
   html += '</div>';
-  html += '<div class="interview-row interview-row-submit">' +
+  html += '<div class="interview-row ' + ROW_SUBMIT + '">' +
           '<button class="primary" id="interview-answer-btn" onclick="submitAnswer()">Answer</button></div>';
   html += '</div>';
   html += '<div id="interview-error" class="error-msg" style="display:none"></div>';
@@ -2563,11 +2573,14 @@ async function submitDecision(forced) {
   var payload = {
     decision: decisionVal,
     feedback: feedbackVal,
-    // Always empty now: the questions panel that filled this is gone, and the
-    // agent's questions are answered live through the interview channel instead.
-    // The KEY stays on the wire — `handle_post_submit` still reads and persists
-    // it into feedback.json, and dropping the field is a server-side change this
-    // page has no business making on its own.
+    // ALWAYS EMPTY from here on, and that is not a placeholder for something this
+    // page forgot to fill. The panel that produced it is gone; the reviewer's
+    // answers to the agent's questions are recorded one at a time by POST answer
+    // into `interview.jsonl`, so `feedback.json#answers` is no longer where any
+    // reader should look for them. The KEY stays on the wire because dropping it
+    // is a server-side contract change — `handle_post_submit` still reads and
+    // persists it and `submit_approve_persists_question_answers` still guards
+    // that — and the plan puts that change out of this task's scope.
     answers: {},
     annotations: collectAnnotations()
   };
@@ -3807,12 +3820,12 @@ function activateCursorRow() {
   var el = navRows()[navCursor];
   if (!el) return;
   if (!currentRun) { location.hash = el.getAttribute('href'); return; }
-  if (el.classList.contains('interview-row-submit')) { submitAnswer(); return; }
+  if (el.classList.contains(ROW_SUBMIT)) { submitAnswer(); return; }
   // Checked BEFORE the radio below, not after: the free-text row carries both a
   // radio and the box, and activating it has to reach the box — selecting its
   // radio and stopping would arm an empty custom answer that submitAnswer then
   // refuses.
-  if (el.classList.contains('interview-row-other')) { focusCustomAnswer(); return; }
+  if (el.classList.contains(ROW_OTHER)) { focusCustomAnswer(); return; }
   var radio = el.querySelector('input[type="radio"]');
   if (!radio) return;
   radio.checked = true;
