@@ -907,8 +907,14 @@ correlating red runs with a spawn, which still has not been done.
 
 ## The code-review panel's stalls — what is fixed, and the unsubmitted seed that is not
 
-**Severity:** medium (the automated review-until-clean panel is unusable; the driver must fall
-back to spawning its own read-only reviewer).
+**Kept, partly fixed.** Fixed entries are deleted from this file; this one stays because two of
+its three halves closed and one did not. **Fixed:** the pane-attach race (commit `c12adb0`, on
+`main`) and the findings channel, which is now the file `submit_findings` writes rather than a
+scraped transcript. **Still live:** the seed that lands in the composer unsubmitted, so the
+reviewer never starts. Its misdiagnosis notes are kept deliberately — the obvious checks lie here.
+
+**Severity:** medium (when it stalls, the automated review-until-clean panel is unusable; the
+driver must fall back to spawning its own read-only reviewer).
 **Found:** 2026-07-24, run `gpu-deploy-view`, tasks 1–2. Only `claude` has a herdr integration
 here (cursor not integrated).
 
