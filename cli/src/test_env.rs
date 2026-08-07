@@ -22,17 +22,28 @@
 //!   when the process environment has it. That is deliberate: it turns a test
 //!   which still writes the process environment into a loud failure rather
 //!   than a quiet pass on somebody else's value.
-//! * **Drop restores.** Nesting is LIFO and `--test-threads=1` cannot leak
+//! * **Drop uninstalls.** Nesting is LIFO and `--test-threads=1` cannot leak
 //!   state forward, because sequential tests on one thread are separated only
-//!   by [`Drop`]. `let _ = TestEnv::new()` uninstalls immediately, and the next
-//!   `data_dir()` then fails rather than resolving anything real — fail-closed
-//!   by construction, so no lint is needed to catch the mis-binding.
+//!   by [`Drop`]. Each guard removes *its own* entry from a per-thread stack,
+//!   so dropping out of construction order — which Rust permits and which the
+//!   type system will not stop — is still correct rather than silently wrong.
+//!   `let _ = TestEnv::new()` uninstalls immediately, and the next `data_dir()`
+//!   then fails rather than resolving anything real — fail-closed by
+//!   construction, so no lint is needed to catch the mis-binding.
 //!
-//! # Two bootstrap reads
+//! # The reads that stay raw
 //!
 //! `PATH` and `HOME` are read from the real process environment here, and
 //! nowhere else in the crate ([`crate::env`]'s `RAW_EXCEPTIONS` names both).
 //! They cannot go through the overlay they are themselves installing.
+//!
+//! [`canonical_ish`] and [`refuse_home_root`] additionally call
+//! `std::env::current_dir()` and `std::env::temp_dir()`. Those are process
+//! state the guard *wants* unoverlaid — it has to compare against the paths the
+//! OS will actually use — but note that neither is caught by the chokepoint
+//! test in [`crate::env`], which scans for `std::env::var` only. That is a
+//! standing gap in the scan, not a licence: `std::env::temp_dir()` also appears
+//! in `main.rs::cleanup_scratch`, which task 9 migrates.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -48,14 +59,13 @@ const CONFIG_KEY: &str = "XDG_CONFIG_HOME";
 
 /// A scratch environment installed on THIS thread.
 ///
-/// Restores the previous overlay on drop, so nesting is LIFO.
+/// Uninstalls on drop, so nesting is LIFO.
 ///
 /// Deliberately `!Send`: moving an installed `TestEnv` to another thread would
-/// make its `Drop` uninstall from the wrong thread's [`CURRENT`], silently
-/// breaking the thread-scoping the whole design rests on. Cross a thread
-/// boundary with [`TestEnv::handle`], which is the supported way.
+/// make its `Drop` uninstall from the wrong thread's [`INSTALLED`] stack,
+/// silently breaking the thread-scoping the whole design rests on. Cross a
+/// thread boundary with [`TestEnv::handle`], which is the supported way.
 pub struct TestEnv {
-    prev: Option<Arc<Overlay>>,
     cur: Arc<Overlay>,
     _not_send: PhantomData<*const ()>,
 }
@@ -69,11 +79,11 @@ pub struct EnvHandle(Arc<Overlay>);
 
 /// The guard [`EnvHandle::enter`] returns; uninstalls on drop.
 ///
-/// `!Send` for the same reason [`TestEnv`] is: its `Drop` restores
-/// [`CURRENT`] on whichever thread it happens to run on, so it must not be the
-/// wrong one.
+/// `!Send` for the same reason [`TestEnv`] is: its `Drop` pops from
+/// [`INSTALLED`] on whichever thread it happens to run on, so it must not be
+/// the wrong one.
 pub struct EnteredEnv {
-    prev: Option<Arc<Overlay>>,
+    cur: Arc<Overlay>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -92,9 +102,70 @@ pub(crate) struct Overlay {
     tmp: tempfile::TempDir,
 }
 
+/// The thread-scoping invariant, checked by the compiler rather than by a doc
+/// comment.
+///
+/// `TestEnv` and `EnteredEnv` must not be `Send`: their `Drop` pops
+/// [`INSTALLED`] on whatever thread it runs on, so a guard that crossed a
+/// thread boundary would uninstall from the wrong stack. `EnvHandle` must be
+/// `Send`, because crossing that boundary is exactly its job. Swapping the
+/// `PhantomData` marker for a `Send` one is an easy, silent regression; this
+/// makes it a build failure.
+///
+/// The inherent `const` shadows the blanket trait `const` only when `T: Send`,
+/// which is what turns a negative bound — otherwise inexpressible on stable —
+/// into a value.
+const _: () = {
+    struct Probe<T>(PhantomData<T>);
+    trait MaybeSend {
+        const SEND: bool = false;
+    }
+    impl<T> MaybeSend for Probe<T> {}
+    impl<T: Send> Probe<T> {
+        const SEND: bool = true;
+    }
+
+    assert!(!Probe::<TestEnv>::SEND, "TestEnv must not be Send");
+    assert!(!Probe::<EnteredEnv>::SEND, "EnteredEnv must not be Send");
+    assert!(Probe::<EnvHandle>::SEND, "EnvHandle must be Send");
+};
+
 thread_local! {
-    /// The overlay installed on this thread, if any.
-    static CURRENT: RefCell<Option<Arc<Overlay>>> = const { RefCell::new(None) };
+    /// Every overlay installed on this thread, innermost last.
+    ///
+    /// A stack rather than a saved "previous overlay" per guard, because Rust
+    /// does not enforce that drops happen in reverse construction order.
+    /// `drop(outer)` while an inner guard is still alive compiles, and so does
+    /// a block that returns the inner `TestEnv` it built; a guard that restored
+    /// a remembered predecessor would then clear the overlay out from under the
+    /// live inner one, and reads would fall silently through to the process
+    /// environment — precisely the failure this module exists to remove,
+    /// reintroduced through its own `Drop`. Removing *one's own* entry, wherever
+    /// it sits, is correct for any drop order rather than loud about the wrong
+    /// ones.
+    static INSTALLED: RefCell<Vec<Arc<Overlay>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push `o` onto this thread's stack, making it what [`current`] answers.
+fn install(o: &Arc<Overlay>) {
+    INSTALLED.with(|s| s.borrow_mut().push(Arc::clone(o)));
+}
+
+/// Remove the topmost entry that IS `o` (by pointer, not by value).
+///
+/// Topmost, so that entering the same overlay twice on one thread — legal, and
+/// what `env.handle().enter()` on the installing thread does — pops one nesting
+/// level rather than the wrong one.
+///
+/// `try_with`, not `with`: a guard dropped during thread teardown, after the
+/// thread-local is gone, must not turn into a second panic.
+fn uninstall(o: &Arc<Overlay>) {
+    let _ = INSTALLED.try_with(|s| {
+        let mut stack = s.borrow_mut();
+        if let Some(i) = stack.iter().rposition(|x| Arc::ptr_eq(x, o)) {
+            stack.remove(i);
+        }
+    });
 }
 
 impl TestEnv {
@@ -137,9 +208,8 @@ impl TestEnv {
             vars: RwLock::new(vars),
             tmp,
         });
-        let prev = CURRENT.with(|c| c.borrow_mut().replace(Arc::clone(&cur)));
+        install(&cur);
         TestEnv {
-            prev,
             cur,
             _not_send: PhantomData,
         }
@@ -226,19 +296,16 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let prev = self.prev.take();
-        // `try_with`, not `with`: dropping during thread teardown, after the
-        // thread-local has been destroyed, must not turn into a second panic.
-        let _ = CURRENT.try_with(|c| *c.borrow_mut() = prev);
+        uninstall(&self.cur);
     }
 }
 
 impl EnvHandle {
     /// Install the same overlay on the calling thread; uninstalls on drop.
     pub fn enter(&self) -> EnteredEnv {
-        let prev = CURRENT.with(|c| c.borrow_mut().replace(Arc::clone(&self.0)));
+        install(&self.0);
         EnteredEnv {
-            prev,
+            cur: Arc::clone(&self.0),
             _not_send: PhantomData,
         }
     }
@@ -246,8 +313,7 @@ impl EnvHandle {
 
 impl Drop for EnteredEnv {
     fn drop(&mut self) {
-        let prev = self.prev.take();
-        let _ = CURRENT.try_with(|c| *c.borrow_mut() = prev);
+        uninstall(&self.cur);
     }
 }
 
@@ -265,9 +331,11 @@ impl Overlay {
     }
 }
 
-/// The overlay installed on this thread, if any. The shim's door.
+/// The innermost overlay installed on this thread, if any. The shim's door.
 pub(crate) fn current() -> Option<Arc<Overlay>> {
-    CURRENT.try_with(|c| c.borrow().clone()).unwrap_or(None)
+    INSTALLED
+        .try_with(|s| s.borrow().last().cloned())
+        .unwrap_or(None)
 }
 
 /// The real `$HOME`, ignoring the overlay.
@@ -276,12 +344,19 @@ pub(crate) fn current() -> Option<Arc<Overlay>> {
 /// to look at the real environment. An overlaid `HOME` would let a test
 /// disable the check by naming a different home, which is the shape of bypass
 /// this whole module exists to remove.
+///
+/// `var_os`, not `var`: a `HOME` that is not valid UTF-8 is *set*, and folding
+/// it in with "unset" would make the one input this function cannot decode also
+/// the one that switches the guard off. A guard that fails open on an encoding
+/// edge case is not a guard. Nothing downstream needs it as a `String` —
+/// [`canonical_ish`] and [`is_forbidden_root`] work on `Path`.
 fn real_home() -> Option<PathBuf> {
     // ENV-SHIM-RAW-OK: bootstrap-home
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => Some(PathBuf::from(h)),
-        _ => None,
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
     }
+    Some(PathBuf::from(home))
 }
 
 /// The real `PATH`, ignoring the overlay. Seeded into every new overlay by
@@ -309,7 +384,22 @@ fn real_path() -> Option<OsString> {
 /// Resolving through the deepest ancestor that *does* exist closes both. The
 /// only unresolvable case left is a path with no existing ancestor at all,
 /// which on a Unix filesystem means none — `/` always exists.
+///
+/// A **relative** value is joined onto the working directory first. Without
+/// that, the ancestor walk bottoms out at `""` and hands back a value that is
+/// still relative, and `Path::starts_with` never matches a relative path
+/// against an absolute `$HOME` — so the guard would wave through exactly the
+/// values it exists to stop, on any machine whose checkout sits under `$HOME`,
+/// which is where a developer's checkout usually is. The OS will resolve the
+/// value against the working directory; the check has to see the same path the
+/// OS will.
 fn canonical_ish(p: &Path) -> PathBuf {
+    if p.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            // `cwd` is absolute, so this recurses at most once.
+            return canonical_ish(&cwd.join(p));
+        }
+    }
     if let Ok(c) = std::fs::canonicalize(p) {
         return c;
     }
@@ -452,6 +542,53 @@ mod tests {
         );
     }
 
+    /// Dropping out of LIFO order uninstalls the right one.
+    ///
+    /// Nothing in the type system forces `drop(outer)` to come after
+    /// `drop(inner)` — `drop(env)` compiles, and a fixture that returns an inner
+    /// `TestEnv` out of a block drops the outer one first. A guard that just
+    /// restored a saved "previous" would clear the overlay out from under the
+    /// still-live inner env, and reads would silently fall through to the
+    /// process environment: exactly the failure this module exists to remove,
+    /// reintroduced through its own `Drop`.
+    #[test]
+    fn dropping_out_of_order_leaves_the_still_live_env_installed() {
+        let outer = TestEnv::new();
+        outer.set(PROBE, "outer");
+        let inner = TestEnv::new();
+        inner.set(PROBE, "inner");
+
+        drop(outer);
+        assert_eq!(crate::env::var(PROBE).as_deref(), Ok("inner"));
+        assert_eq!(
+            crate::env::var(DATA_KEY).map(PathBuf::from),
+            Ok(inner.data_root())
+        );
+
+        drop(inner);
+        assert!(current().is_none(), "the last env out uninstalls cleanly");
+    }
+
+    /// An `EnteredEnv` on the installing thread outlives the `TestEnv`.
+    ///
+    /// The overlay — and the scratch dir inside it — is kept alive by the `Arc`,
+    /// not by the `TestEnv`, so the entered guard keeps resolving after its
+    /// installer is gone.
+    #[test]
+    fn an_entered_guard_outlives_the_test_env_that_created_it() {
+        let env = TestEnv::new();
+        env.set(PROBE, "shared");
+        let entered = env.handle().enter();
+        let root = env.data_root();
+
+        drop(env);
+        assert_eq!(crate::env::var(PROBE).as_deref(), Ok("shared"));
+        assert_eq!(crate::env::var(DATA_KEY).map(PathBuf::from), Ok(root));
+
+        drop(entered);
+        assert!(current().is_none());
+    }
+
     /// A spawned thread that `enter()`s resolves the parent's roots — including
     /// through `run::data_dir`, which is what the migrated fixtures actually
     /// call.
@@ -578,6 +715,50 @@ mod tests {
     /// The seeded roots do not exist yet, so the check compares paths
     /// `fs::canonicalize` refuses outright. Resolving through the deepest
     /// existing parent is what keeps both sides comparable.
+    /// A relative value is resolved the way the OS will resolve it.
+    ///
+    /// Left relative, it could never `starts_with` an absolute `$HOME`, so the
+    /// home check would pass it unconditionally — a hole exactly as wide as
+    /// "the value has not been created yet", which every fresh scratch root is.
+    #[test]
+    fn a_relative_root_is_resolved_against_the_working_directory() {
+        let cwd = std::env::current_dir().expect("a working directory");
+        assert_eq!(
+            canonical_ish(Path::new("drovr_no_such_dir_here/data")),
+            canonical_ish(&cwd).join("drovr_no_such_dir_here/data"),
+        );
+    }
+
+    /// ...and the check therefore refuses one that lands under `$HOME`.
+    ///
+    /// `cargo test` runs with `cli/` as its working directory, so on a checkout
+    /// under `$HOME` — the ordinary case, including this one — a relative value
+    /// names a path inside the real home. Skipped where that premise does not
+    /// hold rather than asserted blind.
+    #[test]
+    fn a_relative_root_under_the_real_home_is_refused() {
+        let Some(home) = real_home() else {
+            eprintln!("skipped: HOME is unset");
+            return;
+        };
+        let cwd = canonical_ish(&std::env::current_dir().expect("a working directory"));
+        if !is_forbidden_root(
+            &cwd,
+            &canonical_ish(&home),
+            &canonical_ish(&std::env::temp_dir()),
+        ) {
+            eprintln!("skipped: this checkout is not inside $HOME");
+            return;
+        }
+        let env = TestEnv::new();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.set(DATA_KEY, "drovr_relative_probe/data");
+        }))
+        .expect_err("a relative value must be resolved before the check, not waved through");
+        let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("inside the real home directory"), "{msg}");
+    }
+
     #[test]
     fn a_not_yet_created_path_canonicalises_through_its_deepest_existing_parent() {
         let tmp = tempfile::TempDir::new().expect("scratch dir");
