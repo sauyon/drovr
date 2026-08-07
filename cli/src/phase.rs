@@ -4712,8 +4712,8 @@ mod tests {
 
     /// Only the fixtures that WRITE the environment take `&TestEnv`.
     ///
-    /// The parameter is not decorative and it is not merely the old "Caller must
-    /// hold ENV_LOCK" comment in parameter form: every write below goes through
+    /// The parameter is not decorative, and it is not merely the old "Caller must
+    /// hold the env mutex" comment in parameter form: every write below goes through
     /// [`TestEnv::set`]/[`TestEnv::unset`], which refuse a `TestEnv` that is not
     /// the innermost one installed on the thread. Hand a fixture the wrong
     /// environment and it panics rather than writing where nothing will read.
