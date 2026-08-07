@@ -6287,9 +6287,29 @@ const SKILL_SITE_STATES: &[(&str, SiteState)] = &[
     ("handoff", SiteState::Covered),
     ("pipeline", SiteState::Covered),
     ("worktrees", SiteState::Covered),
-    ("tdd", SiteState::Covered),
+    (
+        "tdd",
+        SiteState::Deferred {
+            task: "a later phase that revisits fix 4 for this skill — none is scheduled",
+            why: "Task 22 reverted this skill to arm A′ on §7.3's unconditional Arm A \
+                  bar (arm A scored 4/4 held-out). Fix 3's directive reaches a \
+                  discipline skill only inside its fix-4 rewrite, so A′ carries none \
+                  of it and §5 site 2 is now UNAPPLIED here, not merely postponed. \
+                  Recorded rather than dropped because the site is still a §5 site: \
+                  docs/skill-evidence/tdd.md, `## Failure and reverted state`",
+        },
+    ),
     ("systematic-debugging", SiteState::Covered),
-    ("verification-before-completion", SiteState::Covered),
+    (
+        "verification-before-completion",
+        SiteState::Deferred {
+            task: "a later phase that revisits fix 4 for this skill — none is scheduled",
+            why: "same as `tdd`: Task 22 reverted this skill to arm A′ on the Arm A \
+                  bar, and A′ is fix-1-only. See \
+                  docs/skill-evidence/verification-before-completion.md, \
+                  `## Failure and reverted state`",
+        },
+    ),
     ("code-review", SiteState::Covered),
     ("using-drovr", SiteState::Covered),
     (
@@ -7522,12 +7542,14 @@ impl ArmorState {
 const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
     (
         "tdd",
-        ArmorState::Armored(Armor {
-            iron_law: "NO IMPLEMENTATION CODE BEFORE A TEST YOU HAVE WATCHED FAIL.",
-            announce: "Using drovr:tdd — writing the failing test before the implementation.",
-            conditional: ConditionalSection::CycleFlowchart,
-            procedure_steps: 7,
-        }),
+        ArmorState::Pending {
+            task: "a later phase that revisits fix 4 for this skill — none is scheduled",
+            why: "arm B did not ship: §7.3's Arm A bar is unconditional and arm A \
+                  scored 4/4 on the held-out pair, so evaluation stopped at branch \
+                  (a) and this skill reverted to A′. Arm B was not weak — it scored \
+                  4/4 too and never got to compete. \
+                  docs/skill-evidence/tdd.md, `## Failure and reverted state`",
+        },
     ),
     (
         "systematic-debugging",
@@ -7540,21 +7562,16 @@ const SKILL_ARMOR_STATES: &[(&str, ArmorState)] = &[
     ),
     (
         "verification-before-completion",
-        ArmorState::Armored(Armor {
-            iron_law: "NO COMPLETION CLAIM WITHOUT FRESH EVIDENCE PRODUCED IN THIS MESSAGE.",
-            announce: "Using drovr:verification-before-completion — running the checks \
-                       before claiming done.",
-            conditional: ConditionalSection::RequirementsTable {
-                claims: RequirementClaims::Verification {
-                    tests: "The task's tests pass",
-                    build: "It builds",
-                    linter: "The linter is clean",
-                    bug_fixed: "The bug is fixed",
-                    subagent_reported_success: "The subagent reported success",
-                },
-            },
-            procedure_steps: 6,
-        }),
+        ArmorState::Pending {
+            task: "a later phase that revisits fix 4 for this skill — none is scheduled",
+            why: "same branch as `tdd` — arm A scored 4/4 held-out, so §7.3's \
+                  unconditional Arm A bar fired and this skill reverted to A′. \
+                  Note its own file's caveat: the unaided control also scored 4/4, \
+                  so the revert rests on an absence of evidence, not on evidence \
+                  that A′ suffices. \
+                  docs/skill-evidence/verification-before-completion.md, \
+                  `## Failure and reverted state`",
+        },
     ),
     (
         "code-review",

@@ -9,6 +9,97 @@ never the defect — an expensive root cause guarded by nothing, or a rule that 
 being re-filed — moves to **`## Lessons kept from retired issues`**. Before adding a `— FIXED`
 marker, delete instead. If the fix is worth recording, it is worth recording in the code.
 
+## `claude --plugin-dir <checkout>` loads the skills but NOT the hooks — OPEN
+
+**Severity:** medium, and silent in the same way as the entry below it: the plugin's skills
+appear and work, so the session looks correctly wired while neither reflex ever fires.
+**Found:** 2026-08-07, running `spec.md` §9.4's integration check against a worktree.
+
+### Why this one matters more than it looks
+
+`plan.md` Task 22 §9.4 *prescribes* this method — *"run against this worktree with
+`CLAUDE_PLUGIN_ROOT=<worktree>` so it does not depend on the flake pin being bumped"*. So the
+check written to prove fix 2 works was, as specified, running with fix 2's entire hook layer
+absent. Anyone re-running a §9.4-style check inherits that.
+
+### Symptom
+
+```
+claude -p --plugin-dir <worktree> --output-format stream-json --verbose "<prompt>"
+```
+
+`Skill{"skill":"drovr:using-drovr"}` resolves and runs, so the plugin is clearly loaded. But no
+`UserPromptSubmit` hook fires, no `hook_response` for it appears in the stream, and the gate
+card's text (`DROVR GATE`) is nowhere in the session. `hooks/hooks.json` is present and correct
+in the checkout.
+
+### Distinguish it from the entry below
+
+That one is a **packaging** gap — the Nix store path has no `hooks/` directory at all. This one
+happens with a full repo checkout that *does* have `hooks/hooks.json`; `--plugin-dir` simply does
+not register it. Same silent symptom, different cause, and fixing the flake will not fix this.
+
+### Workaround
+
+Wire the two hooks explicitly and pass them with `--settings`, setting `CLAUDE_PLUGIN_ROOT`
+yourself since nothing else will:
+
+```json
+{ "hooks": {
+    "SessionStart":     [ { "matcher": "startup|clear|compact",
+      "hooks": [ { "type": "command", "command": "CLAUDE_PLUGIN_ROOT=<W> <W>/hooks/session-start" } ] } ],
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command",
+      "command": "CLAUDE_PLUGIN_ROOT=<W> <W>/hooks/user-prompt", "timeout": 10 } ] } ] } }
+```
+
+**Verify it rather than assuming it.** Neither hook's output is echoed into `stream-json`, so a
+silent no-op is indistinguishable from a working hook. Wrap each script in a two-line shell
+wrapper that tees its stdout and byte count to a log; correct output is ~9500 bytes for the
+SessionStart reflex and ~646 bytes for the gate envelope.
+
+**And unset `DROVR_PHASE` first.** If you are running the check from inside a drovr phase it is
+set in your shell, the session inherits it, and `hooks/session-start` no-ops by design — the
+suppression contract working correctly, and easy to misread as this bug.
+
+## Nested `claude -p` sessions can lose every tool but `Read` — `classifier unreachable: 404`
+
+**Severity:** medium — blocks any probe that needs a real agent to *act*, while leaving one that
+only needs to observe which skill it reaches for intact.
+**Found:** 2026-08-07, mid-way through `spec.md` §9.4's integration runs. Earlier runs the same
+hour were unaffected, so it appears and disappears on its own.
+
+### Symptom
+
+Every `Bash`, `Write`, `Edit`, `Skill` and `ToolSearch` call in a `claude -p` subprocess returns
+
+```
+classifier unreachable: HTTP Error 404: Not Found
+```
+
+`Read` keeps working. The agent retries each call once, then reports itself blocked. Nothing is
+written to disk, and the parent session is unaffected.
+
+### It is environmental — check before blaming your harness
+
+Two hours were nearly spent bisecting `--plugin-dir`, `--settings` and `DROVR_PHASE` against it.
+None of them matter. The one-line check:
+
+```
+claude -p --permission-mode acceptEdits "run: echo hello" 2>&1 | grep -c 'classifier unreachable'
+```
+
+No plugin, no settings, no drovr. Non-zero means the service is down and no flag will help.
+Related in kind to the `submit_findings`/`ToolSearch` 502 recorded further down this file: the
+same class of classifier outage, a different endpoint and status.
+
+### What a probe can still conclude while it lasts
+
+**Which tools an agent reaches for, and in what order** — the calls are still emitted, and only
+their results fail. §9.4's first-two-tool-calls verdict was recorded through the outage for
+exactly that reason. **What it cannot conclude** is anything about the *effect* of those calls:
+an attempted `Write` before an attempted `Edit` is an ordering, not an applied change. Say which
+of the two you measured.
+
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
 **Status:** open, pre-existing — the `UserPromptSubmit` per-turn gate inherits the gap

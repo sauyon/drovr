@@ -187,3 +187,19 @@ the blinding limitation, and the transcripts' location under
 `docs/skill-evidence/transcripts/voice/`. It must not edit anything above the rule preceding this
 section — that text is the pre-registration, and editing it retroactively is the exact failure the
 pre-registration exists to prevent.
+
+### Task 22 looked here and found nothing — 2026-08-07
+
+**This note is Task 22's, not Task 21's, and it is not data.** It is here so a reader who lands on
+this file alone does not have to work out whether the placeholder above is stale.
+
+Task 22 is the task that applies the outcome. It ran, read this section, and **applied no register
+change to any of the five documents**, because there is no outcome to apply. Corroborated three
+ways beyond the placeholder itself: `docs/skill-evidence/transcripts/voice/` does not exist,
+`run-ledger.md` carries no `ab-voice` row, and `git log --follow` on this file shows only the two
+pre-registration commits with no results commit after them.
+
+The instrument is built and unused: `V0`–`V3` exist, are hash-pinned in `arms/MANIFEST.md`, and
+pass all five separability checks. Running the probe now costs 24 runs against a ledger whose
+closing note reads *"Nothing further is authorised"*, so it needs a human's ceiling raise. Nothing
+above this heading has been edited. See `task22-report.md`.
