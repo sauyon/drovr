@@ -18,8 +18,15 @@ own earlier verdict, the superseding number is the one quoted and the supersessi
 | `tdd` | 0/4 | **4/4** | 2/4 | 4/4 | (a) | **revert to A′** | arm A′ |
 | `systematic-debugging` | 0/4 | 2/4 | 2/4 | **4/4** | (b) | **ship arm B** | arm B |
 | `verification-before-completion` | 4/4 | **4/4** | 4/4 | 4/4 | (a) | **revert to A′** | arm A′ |
-| `code-review` | 3/4 | — | — | — | none | **NOT MEASURED** | arm B, unmeasured |
-| `using-drovr` | 2/4 | — | — | — | none | **NOT MEASURED** | arm B, unmeasured |
+| `code-review` | 3/4 | — | — | — | none | **DEFERRED — measure** | arm B, unmeasured |
+| `using-drovr` | 2/4 | — | — | — | none | **DEFERRED — measure** | arm B, unmeasured |
+
+**"Deferred" is a decision, not a gap.** On **2026-08-07** the human chose to measure these two
+properly rather than ship unmeasured armor or revert them on principle. That is several phases of
+work — rewrite the weak scenarios, re-run discrimination, then spend arm runs — and it is
+explicitly not Task 22's to execute. The spec a fresh phase needs is in `task22-report.md` §2,
+including the two complications that will otherwise be rediscovered the hard way. Both skill files
+are left untouched.
 
 Counts are compliant runs out of 4 on the held-out pair. `unaided` is the `discrimination-test`
 phase's no-skill control, which is an instrument measurement and enters no pre-registered bar.
@@ -70,7 +77,7 @@ phase's no-skill control, which is an instrument measurement and enters no pre-r
   on evidence that A′ suffices** — recorded here in the file's own words so no reader upgrades it.
 - Its own limitations section says `vbc-2` should be rewritten before any re-measurement.
 
-### `code-review` — NOT MEASURED
+### `code-review` — NOT MEASURED, decision-deferred to a measurement phase (human, 2026-08-07)
 
 - `## Scored results` reads **"Not yet run."** No `blind-map.json`, no `scores.json`, no arm
   runs. `held_out_scores()` reads `NotYetRun`. `## Failure and reverted state` reads **"Not
@@ -79,10 +86,14 @@ phase's no-skill control, which is an instrument measurement and enters no pre-r
   bar pre-registered before those runs, and `code-review-3` is saturated at 2 of 2. The recorded
   consequence is that this pair is not worth spending arm runs on until `code-review-3` is
   rewritten.
-- **`skills/code-review/SKILL.md` ships arm B, and arm B was never measured for it.** That is
-  stated here as the open item it is, not resolved. See `task22-report.md`.
+- **`skills/code-review/SKILL.md` ships arm B, and arm B was never measured for it.** Left
+  untouched by Task 22 on the human's decision to close the gap by measuring rather than
+  reverting. **`code-review-3` is the scenario to rewrite first**; `code-review-2` at 1 of 2 is the
+  closest thing the pair has to signal and may survive. Discrimination must reach **0 of 4 unaided**
+  before an arm run is worth spending — the bar `tdd` and `systematic-debugging` cleared, and the
+  only reason their re-measured numbers mean anything. Spec: `task22-report.md` §2.
 
-### `using-drovr` — NOT MEASURED
+### `using-drovr` — NOT MEASURED, decision-deferred to a measurement phase (human, 2026-08-07)
 
 - `## Scored results` reads **"Not yet run."** Same state as `code-review`. Note the plan's ruling
   that this skill would have been compared B-against-A alone, with no A′ arm.
@@ -90,7 +101,16 @@ phase's no-skill control, which is an instrument measurement and enters no pre-r
   half: `using-drovr-2` discriminates at 0 of 2, `using-drovr-3` is saturated at 2 of 2. Reporting
   only "2 of 4" would hide that, so both halves are here.
 - **The veto class (`using-drovr-noskill-1/2`) was never probed in either direction.**
-- **`skills/using-drovr/SKILL.md` ships arm B, and arm B was never measured for it.**
+- **`skills/using-drovr/SKILL.md` ships arm B, and arm B was never measured for it.** Left
+  untouched, same decision and date. **Rewrite `ud-3` on `ud-2`'s model** and require 0 of 4 unaided
+  before spending arm runs. **Two complications a measuring phase must settle before it starts, not
+  after a number arrives:**
+  1. **There is no A′ arm for this skill** — §7.3 scoped that budget row to the four discipline
+     skills, `arms/A-prime/` holds no snapshot for it, and `plan.md` rules it is compared
+     B-against-**A** alone. "Revert to A′" is not an available outcome here.
+  2. **Its arm B text is load-bearing for fix 2.** `gate_card_phrases_present_in_router_skill` pins
+     the CLI's gate-card phrases to text that lives in arm B, so a revert outcome changes the card
+     as well as the document. Decide which side moves first.
 
 ---
 
