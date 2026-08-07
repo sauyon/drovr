@@ -3,7 +3,9 @@
 //! A single long-lived HTTP server serves *every* run under the drovr data
 //! dir. It presents a session-list landing view (`GET /api/runs`) and, per run,
 //! the interactive spec-review surface: read the spec, diff it against the
-//! prior version, answer MC questions, leave per-line annotations, and submit a
+//! prior version, answer the agent's pending interview question (`GET interview`
+//! / `POST answer` — this replaced an MC-questions panel fed by a
+//! `questions.json` the agent wrote), leave per-line annotations, and submit a
 //! decision (approve / request-changes / cancel). The same run-scoped surface also
 //! serves the code-review panel (`/api/runs/<run>/review/{findings,diff}`).
 //!

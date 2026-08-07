@@ -660,14 +660,23 @@ mod tests {
     /// has to survive — which is the point, since this file has no business
     /// failing over the prompt's copy-editing.
     ///
-    /// **Counted, not merely present.** Several tokens repeat (`<value>` four
-    /// times, `<text>`/`<path>`/`<label>` twice each), so a presence check would
-    /// accept a rule that ate three of four `<value>`s and left one standing —
-    /// green, while asserting something weaker than the sentence above. Not
-    /// reachable through today's two literal `str::replace` calls, which are
-    /// all-or-nothing per pattern; asserted anyway, because the whole point of
-    /// deriving the corpus is that the rule outlives the implementation that
-    /// happens to satisfy it.
+    /// **Counted exactly, not merely present.** Several tokens repeat (`<value>`
+    /// four times, `<text>`/`<path>`/`<label>` twice each), so a presence check
+    /// would accept a rule that ate three of four `<value>`s and left one
+    /// standing — green, while asserting something weaker than the sentence
+    /// above. Not reachable through today's two literal `str::replace` calls,
+    /// which are all-or-nothing per pattern; asserted anyway, because the whole
+    /// point of deriving the corpus is that the rule outlives the implementation
+    /// that happens to satisfy it.
+    ///
+    /// **And counted against the template's own text**, not the assembled brief.
+    /// [`compose_phase_brief`] splices the run's task and the driver's context
+    /// into the middle of the template, and both are free text. A `>=` count over
+    /// the whole brief is therefore paddable: a reviewer demonstrated a real
+    /// dropped `<value>` going undetected because the run's task happened to
+    /// quote `--option <value>=<label>` — not a contrived input in a repo whose
+    /// tasks are often *about* the ask directive. So the fixture is asserted
+    /// disjoint from the corpus first, and the counts are then `==`.
     ///
     /// Both halves, because half of an allowlist is not one. `<run>` must be
     /// **gone** from the composed brief — the ask directive tells the agent to run
@@ -701,12 +710,21 @@ mod tests {
         );
 
         for (token, wanted) in &prose {
-            let seen = brief.matches(token).count();
+            // The spliced-in sections must not be able to pay for a loss in the
+            // template. Checked per token rather than assumed of the fixture, so
+            // a later edit to `make_run()` fails here instead of quietly turning
+            // the count below into an inequality.
             assert!(
-                seen >= *wanted,
-                "`{token}` is prose, not a placeholder, and composition ate {} of its \
-                 {wanted} occurrence(s) — substitution must stay an allowlist: {brief}",
-                wanted - seen
+                !run.task.contains(token),
+                "the fixture's run task quotes `{token}`, which pads the count below and \
+                 can mask a real loss — give make_run() a task with no angle-bracket prose"
+            );
+            let seen = brief.matches(token).count();
+            assert_eq!(
+                seen, *wanted,
+                "`{token}` is prose, not a placeholder: the template carries it {wanted} \
+                 time(s) and the composed brief {seen}. Substitution must stay an \
+                 allowlist, and must leave every occurrence alone: {brief}"
             );
         }
         assert!(
