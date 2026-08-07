@@ -20,14 +20,16 @@ current **headings** — which is the repo rule for citing `known-issues.md` any
 ## What changed since the snapshot
 
 **2026-08-07 — fixed entries are now deleted, not annotated.** The policy is stated at the top of
-`known-issues.md` itself. Eight entries whose defect was fixed were removed outright; four more
-that read as fixed were **kept and retitled or corrected in place** because each still carries
-live open content (the cross-run-state bug *class* with open follow-ups, the panel's still-open
-*partial*-commit hazard, the workspace-repair contract with its unguarded double-provision race,
-and the panel-never-completes entry, whose diagnostics are still good). Five lessons were lifted
-out of deleted entries into a new **`## Lessons kept from retired issues`** section, which
-replaced `## Resolved`. Measured on the file as this run found it: **87 → 78 sections, 4184 →
-~3930 lines.**
+`known-issues.md` itself. **Nine** entries whose defect was fixed were removed outright — the
+eight marked FIXED, plus the `questions.json` Submit entry this run retired by deletion. **Four**
+more that read as fixed were kept, because each still carries live open content: three were
+retitled so the heading says which half is live (the cross-run-state bug *class* with open
+follow-ups, the panel's still-open *partial*-commit hazard, and the workspace-repair contract
+with its unguarded double-provision race), and one was corrected in place under its own heading
+(panel-never-completes, whose diagnostics are still good). **Five** lessons were lifted out of
+deleted entries into a new **`## Lessons kept from retired issues`** section, which replaced
+`## Resolved` and also carries that section's one surviving bullet. Measured against the file as
+this run found it (`eb3b917`): **87 → 78 sections, 4268 → 3942 lines.**
 
 Consequences for the counts below, which have **not** been recomputed: class **B — already
 fixed** is by construction now near-empty and is no longer a category this file's policy allows

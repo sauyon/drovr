@@ -3,10 +3,11 @@
 **A fixed defect is DELETED from this file, not annotated as fixed.** What made an entry worth
 recording was the live bug; once the fix is in the code and pinned by a test, the entry is a
 record of the past that every reader has to work out no longer applies. Two exceptions, and only
-these two: an entry that is still **partly open** stays, retitled so the heading says which half
-is live (three below do); and a retiree whose value was never the defect — an expensive root
-cause guarded by nothing, or a rule that stops a settled bug being re-filed — moves to
-**`## Lessons kept from retired issues`**. Before adding a `— FIXED` marker, delete instead.
+these two: an entry that is still **partly open** stays — retitled so the heading says which half
+is live, or corrected in place if the heading was already honest; and a retiree whose value was
+never the defect — an expensive root cause guarded by nothing, or a rule that stops a settled bug
+being re-filed — moves to **`## Lessons kept from retired issues`**. Before adding a `— FIXED`
+marker, delete instead. If the fix is worth recording, it is worth recording in the code.
 
 ## The Nix-installed plugin ships no hooks, so neither reflex ever runs — OPEN
 
