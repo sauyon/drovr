@@ -345,9 +345,11 @@ pub fn compose_phase_brief(
         )
     })?;
 
-    // Substitution is an ALLOWLIST. The templates contain prose that merely looks like a
-    // placeholder — `answers[<id>]` in brainstorm.md describes a JSON shape — so
-    // "replace anything in angle brackets" would corrupt the brief it is composing.
+    // Substitution is an ALLOWLIST. The templates contain angle-bracket text that merely
+    // looks like a placeholder — `"<one line: what changed since last version>"` in
+    // brainstorm.md is what the agent is told to write for itself, and the ask directive's
+    // `--question "<what you need decided>"` likewise — so "replace anything in angle
+    // brackets" would corrupt the brief it is composing.
     let mut body = strip_editorial_comment(template(kind)).replace("<run>", &run.name);
     if let PhaseKind::ImplementTask(n) = kind {
         body = body.replace("<N>", &n.to_string());
@@ -580,17 +582,32 @@ mod tests {
         );
     }
 
-    /// `answers[<id>]` in brainstorm.md is prose about a JSON shape, not a placeholder.
-    /// Substitution is therefore an allowlist, never "replace anything in angle
-    /// brackets".
+    /// Substitution is an allowlist, never "replace anything in angle brackets".
+    ///
+    /// Asserted on a **single line of brainstorm.md that carries both kinds**: the
+    /// `drovr review summary` command, where `<run>` is a placeholder and
+    /// `<one line: what changed since last version>` is the reviewer-facing prompt
+    /// text the agent is meant to replace by hand. Composing that one line is the
+    /// whole distinction, so a regression cannot pass half of it. Pinning the
+    /// composed line whole also refuses the opposite failure — a `<run>` left
+    /// unsubstituted inside a command the agent is told to run verbatim.
+    ///
+    /// (This previously pinned `answers[<id>]`, prose about the retired
+    /// `questions.json` answer map. That text is gone with the channel; the guard
+    /// is not, so it moved to a non-placeholder that the prompt still carries.)
     #[test]
     fn composition_leaves_non_placeholder_angle_brackets_alone() {
         let _lock = ENV_LOCK.lock().unwrap();
         isolate("composition_leaves_non_placeholder_angle_brackets_alone");
-        let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
+        let run = make_run();
+        let brief = compose_phase_brief(&run, "brainstorm", None).unwrap();
         assert!(
-            brief.contains("answers[<id>]"),
-            "prose that merely looks like a placeholder must survive: {brief}"
+            brief.contains(&format!(
+                "drovr review summary {} \"<one line: what changed since last version>\"",
+                run.name
+            )),
+            "one line must come out half-substituted — `<run>` replaced, the prose \
+             placeholder beside it untouched: {brief}"
         );
     }
 

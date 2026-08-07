@@ -6838,6 +6838,86 @@ fn ask_directive_check_rejects_a_rewording() {
     );
 }
 
+/// The retired question channel, by the name a phase-prompt would have to write
+/// to reach it.
+const RETIRED_QUESTIONS_FILE: &str = "questions.json";
+
+/// Every line of `body` that names `needle`, 1-indexed.
+///
+/// A named helper rather than an inline loop so
+/// [`no_phase_prompt_mentions_questions_json`] can run it over a document it
+/// built itself before running it over the repo — see that test's non-vacuity
+/// case.
+fn lines_naming<'a>(body: &'a str, needle: &str) -> Vec<(usize, &'a str)> {
+    body.lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(needle))
+        .map(|(i, line)| (i + 1, line.trim()))
+        .collect()
+}
+
+/// Decision 5 of `docs/interactive-brainstorm.md`: `questions.json` is
+/// **replaced**, not kept alongside. One question channel.
+///
+/// The file no longer exists anywhere on the drovr side — T4 deleted the `GET
+/// questions` route, T6 the review-page panel and `RunPaths::questions()`. So a
+/// phase-prompt that still names it is briefing an agent to write a path nothing
+/// reads, and to answer questions through a UI that no longer renders them. That
+/// failure is silent at the agent: the write succeeds.
+///
+/// **Derived over the directory**, for the reason
+/// [`ask_channel_directive_present`] spells out — a phase-prompt added later is
+/// covered the day it lands, not the day someone remembers a const. There is no
+/// exclusion table and there should not be one: no prompt has a legitimate reason
+/// to name a deleted file, so an exclusion here would only ever be a way to keep
+/// one.
+///
+/// Deliberately a **substring**, not a schema-shaped heuristic. The failure it
+/// guards is the old bullet growing back by copy-paste from an older prompt or an
+/// older branch, and that bullet cannot be written without naming the file. Note
+/// this is the opposite polarity to the other phase-prompt checks: they require
+/// text, this one refuses it, so [`phase_prompt_files`]'s non-empty assertion is
+/// doing more work here than it is there — an empty corpus would make an absence
+/// check pass having read nothing.
+#[test]
+fn no_phase_prompt_mentions_questions_json() {
+    // Non-vacuity, through the same code path the repo scan uses below. An
+    // absence check that came back clean because it was looking in the wrong
+    // place, or for a needle it could never match, is indistinguishable from one
+    // that came back clean because the text is gone.
+    let reintroduced = format!(
+        "- (Optional) To ask the reviewer multiple-choice questions, write\n  \
+         `~/.local/share/drovr/runs/<run>/{RETIRED_QUESTIONS_FILE}`. It MUST be a bare \
+         JSON array\n"
+    );
+    assert_eq!(
+        lines_naming(&reintroduced, RETIRED_QUESTIONS_FILE).len(),
+        1,
+        "the scan below cannot see a reintroduced `{RETIRED_QUESTIONS_FILE}` bullet, so \
+         a clean result over the repo would mean nothing"
+    );
+
+    let mut offenders = Vec::new();
+    for path in phase_prompt_files() {
+        let body = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for (line_no, line) in lines_naming(&body, RETIRED_QUESTIONS_FILE) {
+            offenders.push(format!("  {name}:{line_no}: {line}"));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "phase-prompt(s) still name the retired `{RETIRED_QUESTIONS_FILE}`:\n{}\n\n\
+         That channel is gone: the `GET questions` route, the review-page panel and \
+         `RunPaths::questions()` were all deleted. The replacement is the ask channel \
+         (`drovr ask`), which every writer prompt already carries — delete the mention \
+         rather than repointing it.",
+        offenders.join("\n"),
+    );
+}
+
 /// The evidence corpus is the only citable record behind every numeric or
 /// comparative claim drovr's skill text makes (spec §2.1 exception 1). It is
 /// prose, so nothing else in this suite would notice it going missing — a task
