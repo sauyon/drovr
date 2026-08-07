@@ -491,100 +491,6 @@ worktrees' parked work.) If it fails identically with your changes reverted, it 
 `web_nav` is the only browser-dependent test in the suite; the other four binaries
 (`e2e`, `reflex_hook`, `skills_valid`, and the unit tests) are hermetic.
 
-## Review-server Submit button does nothing when `questions.json` is not a bare array
-
-**Severity:** high (the human spec gate is unusable — the reviewer's decision can never be recorded from the UI).
-**Found:** 2026-07-24, reviewing run `gpu-deploy-view` through `drovr serve` (state `ready`, spec written, open questions present).
-**Re-verified against source 2026-07-25:** still live; line refs and endpoint paths below updated
-(the API is now run-scoped under `/api/runs/<run>/…`).
-
-### Symptom
-
-Clicking **Submit** in the review UI does nothing: no decision is recorded, no error
-message appears, and the button silently greys out (stays `disabled`). Reloading does
-not help. `GET /api/runs/<run>/state` on the server stays `ready`/`idle` — the browser's
-`POST /api/runs/<run>/submit` **never reaches the server** (the server-side handler is
-fine; a `curl POST …/submit` works and flips state correctly).
-
-Reproduced only when the run has open questions AND `questions.json` is shaped as an
-**object** (`{"questions": [...]}`) rather than the **bare array** the UI expects. A run
-with no `questions.json` (server serves `[]`) submits fine.
-
-### Root cause (proven)
-
-The UI's question contract is a **bare JSON array** of
-`{id, prompt, options:[{value, label, recommended}]}` — see the server's own test
-`questions_served_when_file_present` at `cli/src/review.rs:1819` and `renderQuestions` /
-`collectAnswers` in `cli/web/index.html`.
-
-The live `questions.json` for this run is instead an **object**:
-`{"questions": [{"id": "...", "question": "...", "options": ["str", ...]}]}` — wrong at
-three levels (object vs array, `question` vs `prompt`, string options vs objects).
-
-The failure chain (`cli/web/index.html`):
-
-1. `refresh()` fetches `questions` (line 1402) and calls `renderQuestions(questionsData)`
-   (line 1454).
-2. `renderQuestions` (line 1350) assigns `currentQuestions = questions || []` (line 1351)
-   — so `currentQuestions` becomes the **object**. It then hits
-   `if (!currentQuestions.length) { ...; return; }` (line 1353): an object has no
-   `.length` (`undefined`), so it **returns early without throwing**, leaving
-   `currentQuestions` set to the object. (This is why the form still renders and the
-   button looks normal — the throw is deferred to submit time.)
-3. On Submit, `submitDecision()` (line 1514) disables the button (line 1533), then builds
-   the payload (line 1536). `answers: collectAnswers()` (line 1539) runs **before** the
-   `try` block (line 1543). `collectAnswers()` (line 1375) calls
-   `currentQuestions.forEach(...)` (line 1377), which throws
-   `TypeError: currentQuestions.forEach is not a function`.
-4. Because that throw is **outside** the `try/catch`, it is uncaught: the
-   `fetch(api('submit'))` never fires, and the `catch` that would call `showError(...)`
-   and re-enable the button never runs. The button is left disabled with no message →
-   "Submit doesn't work."
-
-Verified live: `curl -X POST …/submit` with a well-formed body **does** flip state
-(the server side is correct — `handle_post_submit`, `cli/src/review.rs:808`), and
-replaying the exact live `questions.json` payload through `collectAnswers()` reproduces
-the uncaught `TypeError` before any fetch.
-
-### Reproduction
-
-1. Start `drovr serve` for a run whose `questions.json` is an object
-   (`{"questions":[...]}`) instead of a bare array.
-2. Open the review page, provide feedback, click **Submit**.
-3. Observe: button greys out, no decision recorded, `GET /api/runs/<run>/state`
-   unchanged, and a `TypeError: currentQuestions.forEach is not a function` in the
-   browser console.
-
-### Workaround
-
-- Unblock a stuck reviewer by submitting via `curl` directly (server side works):
-  ```
-  # request changes (safe, reversible; increments turn, flips state -> waiting)
-  curl -s -X POST http://<addr>/api/runs/<run>/submit -H 'Content-Type: application/json' \
-    -d '{"decision":"request-changes","feedback":"<msg>","answers":{},"annotations":[]}'
-  # approve
-  curl -s -X POST http://<addr>/api/runs/<run>/submit -H 'Content-Type: application/json' \
-    -d '{"decision":"approve","feedback":"","answers":{},"annotations":[]}'
-  ```
-- Or rewrite `questions.json` in the run dir into the UI's bare-array shape.
-
-### Fix ideas (for a future drovr change)
-
-1. **Harden the UI against the wrong shape** (defense-in-depth): in `renderQuestions`,
-   normalize the payload — accept both a bare array and `{questions:[...]}`, and coerce
-   to an array (`Array.isArray(x) ? x : (x && x.questions) || []`) before assigning
-   `currentQuestions`. This alone prevents the `collectAnswers` throw.
-2. **Move the payload build inside the `try`** in `submitDecision()` (or guard
-   `collectAnswers`/`collectAnnotations`) so any exception surfaces via `showError(...)`
-   and re-enables the button instead of silently killing Submit.
-3. **Fix the producer contract**: make whatever writes `questions.json` emit the exact
-   schema the UI/tests expect (bare array of `{id, prompt, options:[{value,label,
-   recommended}]}`), or normalize where `questions` is served
-   (`cli/src/review.rs:487-490` — today it streams the file through verbatim) so the wire
-   format is authoritative regardless of the writer.
-4. Add a UI/integration test that feeds a malformed `questions.json` and asserts Submit
-   still posts (or shows an error), locking in the fault tolerance.
-
 ## `approve` discards the reviewer's question answers — FIXED 2026-07-25
 
 **Status:** fixed on `feat/questions-ui`. `handle_post_submit`'s approve branch now
@@ -598,6 +504,12 @@ driver can tell this turn's answers from a stale previous turn's. Regression tes
 **Re-verified against source 2026-07-25:** still live at that point; fixed later the same day (see Status above).
 
 The Symptom and Root cause below describe the behaviour **before** the fix, kept for history.
+
+**`answers` is now always `{}`.** The interview channel replaced `questions.json`, so the review
+page no longer populates that field; questions are asked with `drovr ask` and answered into
+`interview.jsonl`, never here. The field and the regression test above stay for wire
+compatibility — the fix this entry records is still in the code, which is why the entry is kept
+rather than retired.
 
 ### Symptom
 
@@ -621,8 +533,12 @@ survived a "request changes" but were dropped on "approve".
 
 Mirrored the request-changes persistence: on approve, write `feedback.json` carrying
 `{turn, decision:"approve", feedback, answers, annotations}`. The consuming half was wired
-too — `drovr review wait` names `feedback.json` in its approval message, and the brainstorm
-phase prompt tells the agent to fold the answers into `spec.md` rather than re-ask.
+too — at the time, `drovr review wait` named `feedback.json` in its approval message and the
+brainstorm phase prompt told the agent to fold the answers into `spec.md` rather than re-ask.
+**Neither is true any more**, and this paragraph is history: the ask channel took the question
+half over, so the approval message no longer points at `feedback.json` and the brainstorm
+prompt no longer mentions folding answers. Only the `feedback`/`annotations` half of this
+persistence is live behaviour today.
 
 ## Serving a spec doesn't start a watcher — the reviewer's decision gets missed
 

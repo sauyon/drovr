@@ -123,6 +123,12 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    longer populates — questions are asked with `drovr ask` and answered into `interview.jsonl`,
    never here. An empty `feedback` does not mean an empty turn — the reviewer may have said
    everything in `annotations` (per-line comments on the spec).
+
+   **You stay out of the interview.** A pending `drovr ask` is answered by the human in the
+   web UI and read back by the phase agent that posted it. Never forward one into your own
+   context and never answer one yourself: the Q&A is exactly what this channel exists to keep
+   out of the driver, and an ask you answer is a design decision the human never saw.
+
    Forward it to the agent:
    ```
    drovr phase send <run> brainstorm "Reviewer requested changes (see feedback.json). Revise spec.md, then run: drovr review summary <run> \"<what changed>\""

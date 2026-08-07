@@ -63,10 +63,13 @@ panel is not a gate · `L1971` `code-review brief` names a tool the reviewer doe
 `L2736` has a written fix shape (`.lock().unwrap_or_else(|e| e.into_inner())` across 5 files) —
 cheap, and it stops one failure becoming ~90.
 
-## Two are already being resolved by the brainstorm work
+## Two the brainstorm work reaches — one now retired, one only half-covered
 
-- **`L424`** (high) — Submit dies when `questions.json` is not a bare array. The approved-design
-  direction **deletes `questions.json`**, so this goes away rather than getting fixed.
+- **Submit dies when `questions.json` is not a bare array** (high) — **retired**. The
+  interactive-brainstorm work deleted `questions.json`, the `GET questions` route and the
+  questions panel outright, so the entry is **gone from `known-issues.md` by deletion, not by a
+  fix**: there is no longer a shape the payload can be wrong in. Do not look for a patch that
+  closed it.
 - **`L3830`** — `feedback.json` overwritten every turn. `interview.jsonl` is append-only, which
   covers the interview channel; the gate's own `feedback.json` still has the defect.
 

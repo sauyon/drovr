@@ -1,12 +1,15 @@
 # Interactive brainstorm: the ask channel, and shorter specs
 
-**Status:** approved design (spec gate turn 3, 2026-08-06). T1–T3 implemented.
+**Status:** approved design (spec gate turn 3, 2026-08-06). **T1–T9 implemented** — the whole
+ask channel ships. The spec-length A/B is deliberately still outstanding; see
+*"What was not built"* at the end.
 
 Reconstructed into the repo after the original `spec.md` was destroyed with the run directory —
 see `known-issues.md`, *"`cargo test` deleted the real `~/.local/share/drovr`, twice"*. The
 approved text lived only in the run dir and is gone; this is the design as approved, rewritten
-from the driver's context. `plan.md`'s 10 tasks are lost with it, but T1–T3 are committed and
-their handoffs describe what they built.
+from the driver's context. The original plan's 10 tasks went with it and were **not**
+reconstructed: the work was re-decomposed into **T1–T9** under a replacement plan, so the task
+numbers here do not correspond to the lost T4/T5/T6/T7/T10.
 
 ## Problem
 
@@ -45,7 +48,7 @@ parking it there is the only way to put it in front of a human.
 ## The ask channel
 
 ```
-drovr ask <run> --question <text|@file> [--context <text>] [--context-file <path>]
+drovr ask <run> --question <text|@file> [--context <text> | --context-file <path>]
                 [--option <value>=<label>]... [--recommend <value>]
 drovr ask wait <run> [--timeout-ms N]
 ```
@@ -108,13 +111,50 @@ section decision 6 forbids.
 
 ## Implemented so far
 
+All nine tasks are done. Each row's detail is in its `implement-task-<n>-HANDOFF.md` and
+`task<n>-report.md` in the run dir.
+
 | task | state |
 | --- | --- |
 | T1 — freeze the A/B | done; 7 commits; 3 guards green |
 | T2 — `cli/src/interview.rs` | done; append-only log + fold; 26 tests |
-| T3 — `drovr ask` / `ask wait` | done; see `implement-task-3-HANDOFF.md` |
+| T3 — `drovr ask` / `ask wait` | done; post and wait split, never blocking |
+| T4 — server routes | done; `GET interview` + `POST answer` live, `GET questions` returns 404 |
+| T5 — UI: the interview panel | done; one pending ask on screen behind a `1 of N` counter |
+| T6 — UI: retire the questions panel | done; panel and `renderQuestions()` deleted, keyboard cursor retargeted onto the answer rows |
+| T7 — the ask directive in the phase prompts | done; every writer phase prompt carries it, `review-angle.md` excluded per decision 7, both halves test-pinned |
+| T8 — rewrite `brainstorm.md` | done; investigate → interview → decision-record spec → gate; no `questions.json`, no "open questions" |
+| T9 — docs | done; this document, `README.md`, `known-issues.md` (+ triage), `skills/pipeline` and `skills/handoff` |
 
-Two interfaces drifted from the plan during T3 and bind for everything downstream:
-`--context <text>` + `--context-file <path>` (matching every other drovr command, rather than
-the plan's `--context <path>`), and `ask wait` with nothing pending printing the folded
-interview rather than a bare `[]`.
+### Interfaces that drifted from the plan
+
+These bind, and the plan's text does not:
+
+1. **`--context <text>` and `--context-file <path>`**, mutually exclusive — matching every other
+   drovr command, rather than the plan's single `--context <path>`. (T3.)
+2. **`ask wait` with nothing pending prints the folded interview**, not a bare `[]`. (T3.) This
+   closes a re-arm race: a `[]` would pair exit `0` ("answered") with no answer when the human
+   answers in the seconds between a timeout and the caller re-arming.
+
+## What was not built
+
+Two things a reader will reasonably expect to find and will not:
+
+1. **The spec-length A/B was deliberately out of scope for this run** — no arm was written, no
+   fixture scored, no outcome applied. The frozen ledger under `docs/skill-evidence/spec-length/`
+   is untouched and still awaits it: 3 fixtures, 233 ledger rows, control arm `S0`. Everything
+   the A/B needs exists; nobody has run it. The ordering guarantee still holds, so it can be run
+   whenever someone picks it up.
+2. **The review page cannot show an *answered* interview.** The panel renders only the pending
+   ask and empties itself once nothing is pending; `interview.jsonl` is on disk and served at
+   `GET /api/runs/<run>/interview`, but a human reviewing the spec never sees the Q&A that
+   produced it. This is why `brainstorm.md` requires the spec to stand on its own for a reviewer
+   who was not in the interview, rather than deferring to the log. Rendering the folded log for
+   the reviewer is a real, unowned follow-up.
+
+**One cost, stated plainly.** The run's goal was shorter *specs*, and `brainstorm.md` itself got
+longer: **103 lines on `main` → 160 here.** Only 25 of those 57 lines are this run's (the base it
+branched from already carried 135, from the unlanded ask-directive work underneath); T8 added the
+interview loop and the decision-record framing. A longer prompt costs context in **every**
+brainstorm phase, forever, and that is a real price paid up front against a spec-length saving
+that has not yet been measured. Only the A/B in (1) can say whether the trade pays.
