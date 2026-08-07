@@ -299,21 +299,28 @@ escalation    = true   # the phases / handoff escalation contract
 ### Review UI keyboard navigation
 
 The review server's pages are drivable without a mouse, vim- or emacs-style. A
-cursor moves over the session list on the landing page, and over the run's open
-questions on a run page. Press <kbd>?</kbd> in the UI for the same table.
+cursor moves over the session list on the landing page, and on a run page over
+the **answer rows of the one interview question currently on screen** — every
+option, then the free-text row, then submit. The interview panel shows exactly
+one pending question at a time, behind a `1 of N` counter; answer it and the
+next one takes its place. Press <kbd>?</kbd> in the UI for the same table.
 
 | Keys | Action |
 |---|---|
-| `j` `↓` `C-n`* · `k` `↑` `C-p` | next / previous row or question |
+| `j` `↓` `C-n`* · `k` `↑` `C-p` | next / previous row |
 | `g` `M-<` · `G` `M->` | first / last |
 | `C-v` `M-v` | page down / up |
-| `Enter` `o` `l` `→` | open the session under the cursor |
-| `1`–`9` | pick that option on the question under the cursor |
-| `i` | type a custom answer on that question |
+| `Enter` `o` `l` `→` | open the session, or activate the answer row under the cursor |
+| `1`–`9` | pick that option of the agent's question |
+| `i` | type a custom answer |
+| `a` | archive / restore the session under the cursor |
 | `/` `C-s` | filter the session list |
 | `h` `←` | back to the session list |
 | `Esc` `C-g` | close the filter or help, or leave a text box |
 | `?` | key help |
+
+`1`–`9` count **options only**: the free-text and submit rows are not in that
+index space, so a digit can never land on a row with no option to pick.
 
 Keys never fire while you are typing in a text box — `Esc`/`C-g` steps out
 first. \* `C-n` only reaches the page on macOS, where the browser's own modifier
@@ -335,6 +342,8 @@ is hidden on macOS where it does not apply.
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
+| `drovr ask <run> --question <text\|@file> [--context <text> \| --context-file <path>] [--option <value>=<label>]... [--recommend <value>]` | Post one question for the human and **return immediately** — it never blocks. Appends a pending record to `interview.jsonl` and prints three lines: the ask id, then the run's page URL (starting the review server if it is not already up — only if it could not be *started* does it instead note that the question is on disk and will appear as soon as the server is), then the `drovr ask wait` command to background. `--context` and `--context-file` are mutually exclusive; `@<path>` on `--question` reads the text from a file (`@@` escapes a leading `@`). Exit 0 = posted, 5 = the run was cancelled (terminal — stop work), 1 = error. Run by phase agents, not by the driver. |
+| `drovr ask wait <run> [--timeout-ms N]` | Block until every question **that was outstanding when it started** has an answer, then print those asks — each with its latest answer — as JSON. Not the whole log: earlier answered asks are not included, except in the nothing-was-pending case, which prints the entire folded interview rather than a bare `[]`. A file poller, so it needs no server. Exit 0 = answered, 2 = timeout (re-run to resume; the question is still on disk and still on screen), 5 = run cancelled, 1 = error, including a run dir that is not there. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
 | `drovr reflex --gate` | Render the per-turn gate card JSON (`UserPromptSubmit`). Run by the `user-prompt` hook; reads the hook payload on **stdin** to find `transcript_path`. Prints nothing when `enabled` or `per_turn` is false, or when the previous turn already invoked a `drovr:*` skill **successfully** (a failed call still gets a card). Exactly one of `--skill` / `--gate` is required. |
 
@@ -476,7 +485,7 @@ The server reads and writes these files in each run dir:
 | `review.state.json` | server on state change | Durable `{state, turn}` — makes the server restart-safe. |
 | `feedback.json` | server on submit | Human feedback JSON for the current turn. |
 | `summary.txt` | server on POST summary | Agent summary text. |
-| `questions.json` | agent | MC questions for the reviewer (optional). |
+| `interview.jsonl` | agent (`drovr ask`) **and** server (`POST answer`) | The agent↔human interview log: append-only, one JSON object per line. The agent appends a pending question, the reviewer's answer is appended against it. |
 | `approved` | server on approve | Marker file written when the spec is approved. |
 
 ### Other per-run files
@@ -512,8 +521,18 @@ supervised across logins/reboots, install the `systemd --user` unit at
 `packaging/drovr.service` (`systemctl --user enable --now drovr`).
 
 1. In a run's detail view, state starts as `idle`.
-2. Read the spec, leave annotations, answer questions, and choose
-   **Request changes** or **Approve**.
+2. Read the spec, leave annotations, and choose **Request changes** or
+   **Approve**. Separately from this loop, the run page carries the **interview
+   panel**: whenever an agent has posted a question with `drovr ask`, it appears
+   there and you answer it in place. That is a different channel from the gate —
+   answering appends to `interview.jsonl` and does not touch the run's review
+   state, so it works at any point in the run's life, including before a spec
+   exists and after one is approved. The one run *state* that refuses is a
+   cancelled run (409). Otherwise: **400** for a malformed body, an over-long
+   answer, or an append that would push the log past its cap; **404** for an
+   unknown ask id — or an unknown run; **500** if the log itself is unusable
+   (already over-cap, a symlink, not a regular file) or the append fails; and
+   **403** if the host/origin write guard refuses the POST.
 3. The driver posts a summary, then **waits** for the reviewer instead of
    busy-polling state:
    ```

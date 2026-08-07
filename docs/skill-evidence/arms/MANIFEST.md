@@ -105,3 +105,4 @@ Further rules follow from the parser being strict for the whole file at once:
 | voice | V1 | `docs/skill-evidence/arms/voice/V1.md` | `84f693b90a7f79dd2a968e2279258210c5cf8284` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
 | voice | V2 | `docs/skill-evidence/arms/voice/V2.md` | `a8a3cb0292919aef53a3204a81b112991228e690` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
 | voice | V3 | `docs/skill-evidence/arms/voice/V3.md` | `24e204266831e89ccd8494ed0bb78aa50e304431` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
+| spec-length | S0 | `docs/skill-evidence/arms/spec-length/S0.md` | `db89be9ee06913386afcb6f1053597fdb9728a3a` | `9accca813ba5f1ca42714c0bfb146788645d0aee` | 2026-08-06 |

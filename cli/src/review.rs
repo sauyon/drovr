@@ -3,7 +3,9 @@
 //! A single long-lived HTTP server serves *every* run under the drovr data
 //! dir. It presents a session-list landing view (`GET /api/runs`) and, per run,
 //! the interactive spec-review surface: read the spec, diff it against the
-//! prior version, answer MC questions, leave per-line annotations, and submit a
+//! prior version, answer the agent's pending interview question (`GET interview`
+//! / `POST answer` — this replaced an MC-questions panel fed by a
+//! `questions.json` the agent wrote), leave per-line annotations, and submit a
 //! decision (approve / request-changes / cancel). The same run-scoped surface also
 //! serves the code-review panel (`/api/runs/<run>/review/{findings,diff}`).
 //!
@@ -54,7 +56,11 @@ use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
 
 /// How often [`review_wait`] polls the live server for a reviewer decision.
 /// Mirrors `phase::POLL_INTERVAL` — a filesystem/state poll, not a hot loop.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+///
+/// `pub(crate)` because `drovr ask wait` polls the interview log at the same cadence.
+/// Both are a human-in-the-loop wait; one number keeps them from drifting into two
+/// different ideas of how responsive a wait should feel.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Default port for the always-on server. (The default *host* lives in config
 /// as `serve_host`, resolved by `main::cmd_serve`.)
@@ -191,9 +197,6 @@ impl RunPaths {
     }
     fn cancelled(&self) -> PathBuf {
         self.dir.join("cancelled")
-    }
-    fn questions(&self) -> PathBuf {
-        self.dir.join("questions.json")
     }
     fn review_state(&self) -> PathBuf {
         self.dir.join("review.state.json")
@@ -739,11 +742,11 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
             respond_str(req, 200, "text/plain; charset=utf-8", text);
         }
 
-        // GET questions — questions.json (or empty array)
-        (Method::Get, "questions") => {
-            let body = fs::read_to_string(p.questions()).unwrap_or_else(|_| "[]".into());
-            respond_str(req, 200, "application/json", body);
-        }
+        // GET interview — the folded interview.jsonl (see [`handle_get_interview`]).
+        (Method::Get, "interview") => handle_get_interview(req, &p),
+
+        // POST answer — the human answers one interview question.
+        (Method::Post, "answer") => handle_post_answer(req, &p),
 
         // GET review/findings?task=<task> — merged <task>-review.json (or {}).
         (Method::Get, "review/findings") => {
@@ -784,6 +787,148 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 
         _ => respond_404(req),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The interview channel (`<run_dir>/interview.jsonl`)
+// ---------------------------------------------------------------------------
+
+/// A `{"ok":false,"error":"…"}` body. `error` is always a fixed string chosen by
+/// the handler — never `err.to_string()` and never a request field — for the
+/// reason spelled out on [`handle_post_answer`].
+fn respond_json_err(req: Request, status: u16, error: &str) {
+    respond_str(
+        req,
+        status,
+        "application/json",
+        serde_json::json!({"ok": false, "error": error}).to_string(),
+    );
+}
+
+/// `GET /api/runs/<run>/interview` — the folded interview, as
+/// [`interview::to_json`]'s array. A missing log is `[]`; that is
+/// [`interview::read`]'s own answer, not a special case here.
+///
+/// An unreadable-but-present log is **500, never `[]`**. Reporting a broken
+/// interview as an empty one is exactly the failure `cmd_ask_wait` refuses (exit
+/// 1, never exit 0), and here it would render "no questions" over a live one.
+fn handle_get_interview(req: Request, p: &RunPaths) {
+    match crate::interview::read(&p.dir) {
+        Ok(asks) => respond_str(
+            req,
+            200,
+            "application/json",
+            crate::interview::to_json(&asks),
+        ),
+        Err(e) => {
+            eprintln!("drovr interview: reading {}: {e}", p.dir.display());
+            respond_json_err(req, 500, "interview log unreadable");
+        }
+    }
+}
+
+/// `POST /api/runs/<run>/answer` — record the human's answer to one interview
+/// question. Body `{"id":"<ask id>","answer":"<text>"}`.
+///
+/// **It never touches `review.state.json`.** No state cell, no [`ReviewState`],
+/// no terminal-state refusal: taking the cell is the natural mistake here and it
+/// is what would couple the interview to the gate. It is likewise **not gated on
+/// gate state** — the channel is open at any point in a run's life, including
+/// after the spec is approved, because the plan and implement phases ask too.
+///
+/// The one refusal that is about the run rather than the request is
+/// **cancellation, checked first**, off the same `cancelled` marker
+/// [`crate::run_is_cancelled`] gives `drovr ask wait` for its exit 5. Without it
+/// the browser is all that stands between a human and an answer written into a
+/// run whose agent is already gone: the page recomputes its own mute only inside
+/// `refresh()`, which re-arms a state poll on `waiting` alone, so a tab sitting
+/// on an `idle`/`ready` run never learns of an out-of-band cancel. On the server
+/// the marker is authoritative and the UI's mute is purely cosmetic.
+///
+/// **No error body echoes the `id`.** [`interview::append_answer`]'s own
+/// `NotFound` text embeds it — written for an operator reading stderr, not for
+/// an HTTP client — so forwarding it would make a response mirror an unbounded
+/// request field back at whoever sent it, the same defect
+/// `interview::check_id`/`check_options` refuse one layer down. The real error
+/// goes to `eprintln!` and the client gets fixed text, as every other handler
+/// in this file does.
+///
+/// No per-run lock: answers allocate no `seq`, an append is `O_APPEND` plus one
+/// `write_all`, and the fold takes the last answer per id, so two concurrent
+/// answers are well-defined without one.
+///
+/// **Unthrottled, deliberately.** Nothing here rate-limits appends or refuses a
+/// second answer to an id, so a local caller can spend a run's whole
+/// [`interview::MAX_LOG`] budget on ~16 max-size answers and jam that run's
+/// channel. That is accepted rather than overlooked. `MAX_LOG` is the one
+/// authoritative bound, and a rate limiter beside it would be a second,
+/// heuristic one; the trust boundary is the server's existing one, where a local
+/// caller already reaches `POST submit` (which can *cancel* the run outright) and
+/// `POST send` (which types into the agent's terminal) — both strictly stronger
+/// than filling a log. Re-answering, in particular, is not a defect to close: it
+/// is the documented "last answer wins" contract, and a human correcting a
+/// mis-click depends on it.
+fn handle_post_answer(mut req: Request, p: &RunPaths) {
+    if crate::run_is_cancelled(&p.dir) {
+        respond_json_err(req, 409, "this run was cancelled");
+        return;
+    }
+    let body = read_body(&mut req);
+    let (id, answer) = match parse_answer(&body) {
+        Ok(pair) => pair,
+        Err(why) => {
+            respond_json_err(req, 400, why);
+            return;
+        }
+    };
+    match crate::interview::append_answer(&p.dir, &id, &answer) {
+        Ok(()) => respond_str(
+            req,
+            200,
+            "application/json",
+            serde_json::json!({"ok": true, "id": id}).to_string(),
+        ),
+        Err(e) => {
+            eprintln!("drovr answer: appending to {}: {e}", p.dir.display());
+            let (code, msg): (u16, &str) = match e.kind() {
+                io::ErrorKind::NotFound => (404, "no question with that id"),
+                io::ErrorKind::InvalidInput => {
+                    (400, "the answer is too long, or the interview log is full")
+                }
+                _ => (500, "could not append the answer"),
+            };
+            respond_json_err(req, code, msg);
+        }
+    }
+}
+
+/// Parse a `POST /answer` body into `(id, answer)`, or the fixed reason it is
+/// unusable. Every reason is a constant: see [`handle_post_answer`] on why an
+/// error body never quotes the caller's own fields.
+///
+/// An **empty** `answer` is legal and reaches [`interview::append_answer`] as
+/// one — "I have nothing to add" is a decision the human is entitled to make.
+/// Only a *missing* or non-string `answer` is a 400. The `id` is length-checked
+/// here as well as inside `append_answer`, so an oversized one is refused before
+/// it is carried into a fold of the whole log.
+fn parse_answer(body: &str) -> Result<(String, String), &'static str> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid JSON")?;
+    let obj = v.as_object().ok_or("body must be a JSON object")?;
+    let id = obj
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or("id must be a string")?;
+    if id.is_empty() {
+        return Err("id must not be empty");
+    }
+    if id.len() > crate::interview::MAX_ID {
+        return Err("id is too long");
+    }
+    let answer = obj
+        .get("answer")
+        .and_then(|a| a.as_str())
+        .ok_or("answer must be a string")?;
+    Ok((id.to_string(), answer.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -924,8 +1069,8 @@ fn handle_get_pane(req: Request, p: &RunPaths, url: &str) {
 /// re-provisions one on the next `phase_start` (in the run's `project_dir`) and
 /// records the new ids. What it cannot restore is the *agents* — every pane died
 /// with the workspace, so a phase that was `Running` when it was archived comes
-/// back `Failed` and has to be restarted. See docs/known-issues.md, "Restoring an
-/// archived run does not make it runnable again — FIXED 2026-08-02".
+/// back `Failed` and has to be restarted. See docs/known-issues.md, "Losing a run's
+/// herdr workspace — what the repair does, and what it still does not".
 /// Close `state`'s herdr workspace when archiving; report whether it closed.
 ///
 /// Split out of [`handle_archive`] and generic over [`Herdr`] so the destructive
@@ -1611,13 +1756,17 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
     }
 
     if decision == "approve" {
-        // Approve is terminal, but not answer-free: the reviewer may have
-        // answered the spec's open questions on the way to approving. Persist
-        // the same feedback.json the request-changes path writes, so the driver
-        // can read the selections instead of re-asking the human. The turn
+        // Persist the same feedback.json the request-changes path writes, so an
+        // approve and a request-changes have one shape between them. The turn
         // advances for the same reason it does there — a driver reading
-        // feedback.json must be able to tell this turn's answers from a stale
-        // previous turn's.
+        // feedback.json must be able to tell this turn from a stale previous one.
+        //
+        // `answers` is VESTIGIAL and the page now always posts `{}`: the reviewer
+        // cannot answer questions at the gate any more, and a spec carries no open
+        // questions to answer (`docs/interactive-brainstorm.md`, locked decision 6).
+        // Questions go out through `drovr ask` and are answered into
+        // `interview.jsonl`, never here. The field and its write stay so the wire
+        // shape is guaranteed rather than conditional; nothing should read them.
         rs.turn += 1;
         let fb_json = serde_json::json!({
             "turn": rs.turn,
@@ -4007,28 +4156,296 @@ mod tests {
         assert_eq!(body, "v2", "post-submit revision must diff against v2");
     }
 
+    // ---- the interview channel: GET interview / POST answer ----------------
+
     #[test]
-    fn questions_empty_when_no_file() {
-        let tmp = make_root("questions");
-        make_run(tmp.path(), "r", b"# Spec");
+    fn the_retired_questions_route_is_gone_not_quietly_empty() {
+        // `GET questions` and the panel that read it were deleted together. The
+        // page's `refresh()` used to `.catch(() => [])` this route, so a 200
+        // serving `[]` from a route nobody reads and a 404 are indistinguishable
+        // from the browser — but they are not the same to whatever else might
+        // still be pointed at it, and a live route is a reader waiting to happen.
+        let tmp = make_root("questions-retired");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("questions.json"), r#"[{"id":"q1","prompt":"Which?"}]"#).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
 
         let (status, body) = http_get(&addr, "/api/runs/r/questions");
+        assert_eq!(status, 404, "body={body}");
+        // Anchored against a LIVE sibling on the same prefix. On its own the 404
+        // above is also what a broken router, a renamed prefix or a mangled path
+        // split would produce, so it would keep passing while every run route on
+        // the server had stopped answering. This says the 404 is about THIS route.
+        let (live, live_body) = http_get(&addr, "/api/runs/r/interview");
+        assert_eq!(live, 200, "sibling run routes must still answer: {live_body}");
+    }
+
+    #[test]
+    fn interview_is_empty_array_when_no_log() {
+        let tmp = make_root("interview-empty");
+        make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_get(&addr, "/api/runs/r/interview");
         assert_eq!(status, 200);
         assert_eq!(body.trim(), "[]");
     }
 
     #[test]
-    fn questions_served_when_file_present() {
-        let tmp = make_root("questions-present");
+    fn interview_serves_the_folded_log() {
+        let tmp = make_root("interview-folded");
         let dir = make_run(tmp.path(), "r", b"# Spec");
-        let q_json = r#"[{"id":"q1","prompt":"Which?","options":[{"value":"a","label":"A"}]}]"#;
-        fs::write(dir.join("questions.json"), q_json).unwrap();
+        let opts = [crate::interview::AskOption {
+            value: "redis".into(),
+            label: "Redis".into(),
+        }];
+        let a0 =
+            crate::interview::append_ask(&dir, "Which cache?", Some("three regions"), &opts, Some("redis"))
+                .unwrap();
+        let a1 = crate::interview::append_ask(&dir, "Retry policy?", None, &[], None).unwrap();
+        crate::interview::append_answer(&dir, &a0.id, "redis").unwrap();
         let addr = start_server(tmp.path().to_path_buf());
 
-        let (status, body) = http_get(&addr, "/api/runs/r/questions");
+        let (status, body) = http_get(&addr, "/api/runs/r/interview");
         assert_eq!(status, 200);
-        assert!(body.contains("q1"), "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON array: {body}");
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2, "both asks, in seq order: {body}");
+        assert_eq!(arr[0]["id"], a0.id.as_str());
+        assert_eq!(arr[0]["answer"], "redis");
+        assert!(arr[0]["answered_at"].is_string(), "{body}");
+        assert_eq!(arr[0]["question"], "Which cache?");
+        assert_eq!(arr[0]["context"], "three regions");
+        assert_eq!(arr[0]["recommend"], "redis");
+        assert_eq!(arr[1]["id"], a1.id.as_str());
+        assert!(arr[1]["answer"].is_null(), "the unanswered one: {body}");
+    }
+
+    #[test]
+    fn interview_unreadable_log_is_500_not_empty() {
+        // Reporting a broken interview as an empty one is exactly what
+        // `cmd_ask_wait` refuses (exit 1, never 0): the UI would render "no
+        // questions" over a live one.
+        let tmp = make_root("interview-unreadable");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::create_dir(dir.join(crate::interview::LOG_FILE)).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_get(&addr, "/api/runs/r/interview");
+        assert_eq!(status, 500, "body={body}");
+        assert_ne!(body.trim(), "[]", "must not degrade to an empty interview");
+        assert!(body.contains(r#""ok":false"#), "body={body}");
+    }
+
+    #[test]
+    fn answer_appends_and_leaves_review_state_untouched() {
+        // The interview is not the gate. Answering must not take the run's
+        // state cell, and must not create or edit `review.state.json`.
+        let tmp = make_root("answer-append");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        let state_file = dir.join("review.state.json");
+        assert!(!state_file.exists(), "no state file to begin with");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &format!(r#"{{"id":"{}","answer":"redis"}}"#, ask.id),
+        );
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains(r#""ok":true"#), "body={body}");
+        assert!(body.contains(&ask.id), "the id is echoed on success: {body}");
+
+        let folded = crate::interview::read(&dir).unwrap();
+        assert_eq!(folded[0].answer.as_deref(), Some("redis"));
+        assert!(
+            !state_file.exists(),
+            "answering must not create review.state.json"
+        );
+    }
+
+    #[test]
+    fn answer_for_an_unknown_id_is_404() {
+        let tmp = make_root("answer-unknown");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            r#"{"id":"ask-nope","answer":"x"}"#,
+        );
+        assert_eq!(status, 404, "body={body}");
+        // `append_answer`'s own NotFound text embeds the id; forwarding it would
+        // mirror an unbounded request field back at its sender.
+        assert!(
+            !body.contains("ask-nope"),
+            "the error body must not echo the id: {body}"
+        );
+        assert!(body.contains("no question with that id"), "body={body}");
+    }
+
+    #[test]
+    fn answer_with_a_malformed_body_is_400() {
+        let tmp = make_root("answer-malformed");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let long_id = format!(
+            r#"{{"id":"{}","answer":"x"}}"#,
+            "a".repeat(crate::interview::MAX_ID + 1)
+        );
+        for body in [
+            "not json",
+            "[]",
+            "{}",
+            r#"{"id":123,"answer":"x"}"#,
+            r#"{"id":"","answer":"x"}"#,
+            r#"{"id":"ask-0"}"#,
+            r#"{"id":"ask-0","answer":7}"#,
+            long_id.as_str(),
+        ] {
+            let (status, resp) = http_post(&addr, "/api/runs/r/answer", "application/json", body);
+            assert_eq!(status, 400, "req={body} resp={resp}");
+            assert!(resp.contains(r#""ok":false"#), "req={body} resp={resp}");
+        }
+        assert!(
+            crate::interview::read(&dir).unwrap()[0].answer.is_none(),
+            "no malformed request appended anything"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_refuses_an_answer_before_it_parses_one() {
+        // The ordering the handler's doc claims, pinned. Cancellation is a fact
+        // about the RUN and outranks any complaint about the request: moving the
+        // marker check below `parse_answer` would answer 400 here and still pass
+        // every other test in this file, silently retiring the contract.
+        let tmp = make_root("answer-cancel-first");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        fs::write(dir.join("cancelled"), b"").unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        for body in ["not json", "{}", r#"{"id":"","answer":"x"}"#] {
+            let (status, resp) = http_post(&addr, "/api/runs/r/answer", "application/json", body);
+            assert_eq!(status, 409, "cancellation outranks a bad body: {body} -> {resp}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_answer_is_400_and_appends_nothing() {
+        // The `InvalidInput` arm of the handler's error mapping. Without this,
+        // deleting that arm — so an over-cap answer fell through to a generic
+        // 500 — would not fail a single test.
+        let tmp = make_root("answer-oversized");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let huge = "x".repeat(crate::interview::MAX_FIELD as usize + 1);
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &serde_json::json!({"id": ask.id, "answer": huge}).to_string(),
+        );
+        assert_eq!(status, 400, "an over-cap answer is a bad request, not a 500");
+        assert!(body.contains(r#""ok":false"#), "body={body}");
+        assert!(
+            !body.contains("xxxx"),
+            "the refusal must not echo the answer: {body}"
+        );
+        assert!(
+            crate::interview::read(&dir).unwrap()[0].answer.is_none(),
+            "the log is append-only, so a refused answer must append nothing"
+        );
+    }
+
+    #[test]
+    fn answer_accepts_an_empty_string() {
+        // "I have nothing to add" is a decision the human is entitled to make,
+        // and `append_answer` documents it as legal.
+        let tmp = make_root("answer-empty");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Anything else?", None, &[], None).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &format!(r#"{{"id":"{}","answer":""}}"#, ask.id),
+        );
+        assert_eq!(status, 200, "body={body}");
+        let folded = crate::interview::read(&dir).unwrap();
+        assert_eq!(folded[0].answer.as_deref(), Some(""), "answered, blankly");
+        assert!(
+            crate::interview::pending(&folded).is_empty(),
+            "an empty answer still clears the ask"
+        );
+    }
+
+    #[test]
+    fn answer_works_on_an_approved_run() {
+        // The channel is available at any time: the plan and implement phases
+        // ask too, long after the spec was approved.
+        let tmp = make_root("answer-approved");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        fs::write(dir.join("approved"), b"").unwrap();
+        let state_file = dir.join("review.state.json");
+        fs::write(&state_file, br#"{"state":"approved","turn":2}"#).unwrap();
+        let before = fs::read(&state_file).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &format!(r#"{{"id":"{}","answer":"redis"}}"#, ask.id),
+        );
+        assert_eq!(status, 200, "approval must not close the channel: {body}");
+        assert_eq!(
+            crate::interview::read(&dir).unwrap()[0].answer.as_deref(),
+            Some("redis")
+        );
+        assert_eq!(
+            fs::read(&state_file).unwrap(),
+            before,
+            "review.state.json is byte-identical"
+        );
+    }
+
+    #[test]
+    fn answer_is_refused_on_a_cancelled_run() {
+        // The pair with `answer_works_on_an_approved_run` is the point:
+        // approved must not block, cancelled must. `drovr ask wait` exits 5 on
+        // this marker, so the agent is already gone — an answer written here
+        // would go into the void with nothing surfaced to the human.
+        let tmp = make_root("answer-cancelled");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let ask = crate::interview::append_ask(&dir, "Which cache?", None, &[], None).unwrap();
+        fs::write(dir.join("cancelled"), b"").unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_post(
+            &addr,
+            "/api/runs/r/answer",
+            "application/json",
+            &format!(r#"{{"id":"{}","answer":"redis"}}"#, ask.id),
+        );
+        assert_eq!(status, 409, "body={body}");
+        assert!(body.contains("cancelled"), "body={body}");
+        assert!(
+            crate::interview::read(&dir).unwrap()[0].answer.is_none(),
+            "the ask is still unanswered"
+        );
     }
 
     #[test]
@@ -4076,10 +4493,15 @@ mod tests {
 
     #[test]
     fn submit_approve_persists_question_answers() {
-        // Approving is the common path for a spec whose open questions the
-        // reviewer just answered. If the answers only survive `request-changes`,
-        // every approved run silently drops them and the next phase has to
-        // re-ask the human.
+        // A WIRE-SHAPE test, not a workflow one. The reviewer cannot answer
+        // questions at the gate any more (that moved to `drovr ask` /
+        // `interview.jsonl`) and the page always posts `answers: {}`, so nothing
+        // real is riding on this map today. What it pins is that approve and
+        // request-changes write the SAME feedback.json shape: the approve branch
+        // once wrote only the marker, and a field that survives one decision but
+        // not the other is the asymmetry that caused that. It posts a non-empty
+        // map precisely because `{}` would pass whether or not the field is
+        // carried through.
         let tmp = make_root("approve-answers");
         let dir = make_run(tmp.path(), "r", b"# Done");
         let addr = start_server(tmp.path().to_path_buf());
