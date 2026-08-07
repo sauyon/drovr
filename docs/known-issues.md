@@ -2902,8 +2902,9 @@ running.
 ## Lessons kept from retired issues
 
 The second exception named in the policy at the top of this file: retired issues whose value was
-never the defect. **Keep these short.** If a lesson grows a reproduction and a fix list, it has
-become an issue again and belongs above.
+never the defect. Carry **the rule and the evidence that confirms it** — including what was ruled
+out, which is often the expensive part — and nothing else. The test is structural, not length: if
+a lesson grows a reproduction and a fix list, it has become an issue again and belongs above.
 
 - **Headless Chromium on Linux: always pass `--password-store=basic`** (retired 2026-08-01;
   the flag is in `cli/tests/web_nav.rs`). Without it, Chromium's cookie store loads its
