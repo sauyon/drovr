@@ -69,9 +69,12 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    spec.** Do not conflate them:
 
    - **A pending ask.** The brainstorm agent interviews the human *before* it writes the spec,
-     so the page carries a question long before `spec.md` exists. `drovr ask` prints the URL
-     itself and the agent hands it over — **you do not gate that on state**, and you stay out of
-     the interview (see step 5). A page with a pending ask is not empty and not broken.
+     so the page carries a question long before `spec.md` exists. `drovr ask` prints the URL, but
+     it prints it into a pane nobody is required to be watching, and **nothing notifies anyone** —
+     so **you** hand the link to the human as soon as you see the agent has asked. **Do not gate
+     that on state.** Announce it as *a question waiting*, not as a review, and then stay out of
+     the interview itself (step 5): you pass the link, never the Q&A. A page with a pending ask is
+     not empty and not broken.
    - **The review gate.** Here the old caution still holds: with no spec and no ask, the page has
      nothing on it, and an empty page reads as "the tool is broken." The brainstorm agent writes
      `spec.md` then runs `drovr review summary`, flipping state `idle → ready`. Only once

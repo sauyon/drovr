@@ -137,7 +137,8 @@ another's, and every other element on the page corroborates the wrong run).
 
 Navigate to a run whose gate has never been opened (no `spec.md`) after viewing a run that
 has one, and the previous run's rendered spec stays on screen under the new run's name. The
-turn badge, summary banner and questions panel all correctly update to the new run, so the
+turn badge, summary banner and (the then-current) questions panel all correctly updated to the
+new run, so the
 page reads as a coherent review of it — only the document body is wrong.
 
 Verified on the live server (`100.71.58.39:8795`):
@@ -904,7 +905,7 @@ correlating red runs with a spawn, which still has not been done.
 
 **If you hit it:** paste that message here rather than re-investigating from scratch.
 
-## `drovr code-review run` panel never completes (reviewer panes don't attach)
+## The code-review panel's stalls — what is fixed, and the unsubmitted seed that is not
 
 **Severity:** medium (the automated review-until-clean panel is unusable; the driver must fall
 back to spawning its own read-only reviewer).
@@ -1007,8 +1008,9 @@ panel reads the pane the emitted JSON has left the recent window.
 said *"Emit the fenced JSON, then exit"*, so reviewers wrote **no** `<task>-review-<angle>.json`
 and the lossy transcript was the only channel. Fix idea 1 below shipped: reviewers now submit
 through the MCP `submit_findings` tool, which performs the write for them, `obtain_findings_json`
-prefers that file, and `code_review::delivered_review` treats it as the completion signal. The
-seed now asserts the opposite of what it used to — reviewers are told *not* to print JSON.
+reads **only** that file — there is no transcript path left in it at all — and
+`code_review::delivered_review` treats it as the completion signal. The seed now asserts the
+opposite of what it used to: reviewers are told *not* to print JSON.
 
 **Correction to an easy misdiagnosis:** cursor reviewers *do* reach `done`. In pass 1 they merely
 appeared `idle` because they were still parked at the composer with the seed unsubmitted. Do not
@@ -1048,12 +1050,15 @@ missed, including a test that passed while allocating ~300 MB of grammar.
 
 ### Fix ideas (from the 2026-07-25 dogfood)
 
-1. **Make the findings channel durable, not a viewport.** — **SHIPPED**, in the form of fix idea 2
-   rather than as written here: reviewers run read-only and so cannot write the file themselves, so
-   `drovr mcp-findings` exposes a single `submit_findings` tool and drovr performs the write. The
-   file is now the primary channel and the completion signal, not a fallback.
-2. If the transcript must stay the channel, read full scrollback rather than
-   `source:"recent"`, and fail with the captured transcript attached so the driver can hand-merge.
+1. **Make the findings channel durable, not a viewport.** — **SHIPPED**, though not as written
+   here: reviewers run read-only and so cannot write the file themselves, so `drovr mcp-findings`
+   exposes a single `submit_findings` tool and drovr performs the write for them.
+   `obtain_findings_json` reads **only** that file — it is the sole channel findings enter drovr
+   through, and it is the completion signal (`code_review::delivered_review`).
+2. ~~If the transcript must stay the channel, read full scrollback rather than
+   `source:"recent"`.~~ **Dead advice.** The transcript is not the channel and cannot become one:
+   `herdr agent read` truncates long lines mid-word (see "Lessons kept from retired issues"), so
+   scraping cannot be made correct and drovr does not attempt it.
 3. Submit the seed reliably (see the entry below) — one fix removes failure mode 1 for the panel,
    `phase send`, and the review gate at once.
 
@@ -1149,7 +1154,11 @@ code is a contract the pipeline skill reads, and changing it belongs in its own 
 driver's behaviour changed alongside. Re-running `drovr code-review run` is the workaround and
 it costs one reviewer, not a panel.
 
-## `drovr phase send` returns success with the prompt left unsubmitted
+## `drovr phase send`: the false success is fixed; `until` is still a LEVEL, not an edge
+
+**Kept, half-fixed.** Fixed entries are deleted from this file; this one stays because only the
+first half closed — a send that does not take now exits 2 naming which failure it was, instead of
+exiting 0 (see `### Status` below). What is live is the `until` semantics in `### Still open`.
 
 **Severity:** high — an unattended pipeline stalls silently at every phase injection. (Filed as
 `low` originally on the grounds that it is recoverable; that undersold it. Recovery requires a
@@ -2243,7 +2252,10 @@ our copy; the general fix is the compare-and-swap or lockfile already proposed a
 
 Two consequences worth knowing:
 
-1. **The `|=` merge could undo a Restore — FIXED 2026-08-02, it is now `=`.** This paragraph
+1. **The `|=` merge could undo a Restore; it is now `=`, and `state.json` is the authority.**
+   The rule is recorded where it binds — `cli/src/run.rs`'s `archived` field doc — and pinned by
+   `archiving_mid_run_survives_every_save_the_review_makes`. The narrative below is kept only
+   because it explains *why* the rule is a rule; the defect itself is gone. This paragraph
    used to say the merge was unreachable "because `code_review_run` refuses archived runs up
    front"; that is only true of runs archived *before* the panel starts.
    `archiving_mid_run_survives_every_save_the_review_makes` (`cli/src/code_review.rs`) pins the
@@ -2265,25 +2277,6 @@ Two consequences worth knowing:
    eventual save recreates a `state.json` for a run the human explicitly deleted. This
    predates the change — plain `save` always did this — but it is now reachable from two more
    writers.
-
-## The Archive button used to destroy the human's own panes
-
-Found and fixed 2026-07-27, reviewing the merge with main. Recorded because the shape recurs.
-
-Two teardown paths existed for the same workspace. `drovr cleanup` was hardened on main to list
-the workspace's panes and refuse `workspace_close` unless every pane present is one drovr
-created — sparing the shell or editor a human keeps in the run's workspace. The Archive button's
-`close_for_archive` still called `workspace_close` outright, so one click destroyed exactly what
-cleanup had been taught to protect.
-
-Neither side was wrong on its own, which is why ten rounds of reviewing the branch never saw it:
-the branch's teardown predated the hardening, and `review.rs` did not conflict during the merge,
-so it carried through untouched. It took reviewing the MERGE — asking what the two features do
-to each other — to surface it. Both paths now share `close_run_panes`.
-
-`workspace_closed: false` consequently has two meanings now, and the page says both: the close
-failed, or it was withheld because the human's panes are in there. Both warrant the warning —
-in either case something may still be live under an archived run.
 
 ## The review gate writes nothing when the run directory is gone — and still reports approved
 
@@ -2951,6 +2944,15 @@ become an issue again and belongs above.
   it: `submit_findings` solved the problem a different way. Recorded because it is the obvious
   channel to reach for if a read-only agent ever needs to return more than a tool call can carry,
   and because it is not discoverable without knowing it exists.
+- **Two teardown paths for one resource drift apart** (retired 2026-07-27). `drovr cleanup` was
+  hardened on main to refuse `workspace_close` unless every pane in the workspace is one drovr
+  created — sparing the shell or editor a human keeps there. The Archive button's
+  `close_for_archive` still closed outright, so one click destroyed exactly what cleanup had been
+  taught to protect. **Neither side was wrong alone**, `review.rs` did not conflict during the
+  merge, and ten rounds of reviewing the branch never saw it: it took reviewing the **merge** —
+  asking what two features do to each other — to surface it. Both now share `close_run_panes`.
+  A consequence that is still live: `workspace_closed: false` has two meanings, and the page says
+  both — the close failed, or it was withheld because the human's panes are in there.
 - **A skill's `description:` is a trigger, not a summary** (retired 2026-08-04; pinned by
   `cli/tests/skills_valid.rs::no_phase_scoped_description_literals`). It is the line that
   decides whether the skill is read at all, so a precondition written into it is a precondition

@@ -480,9 +480,10 @@
   }
 
   /* ---- The interview (the agent's live ask channel) ---- */
-  /* The accent edge is what separates this from every other panel on the page: it
-     is the only one a run can be waiting on OUTSIDE the review gate — it is live at
-     any state, and the gate is not. */
+  /* The accent edge is what separates this from the read-only panels around it: it
+     carries a question the run ITSELF posted and cannot settle without. The gate and
+     the live-session panel are the other two blocking surfaces; unlike the gate, this
+     one is live at any run state. */
   .interview-panel {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1001,9 +1002,10 @@
 
   <!-- The interview: the agent's live ask channel (`drovr ask`), populated
        dynamically and polled on its own 2s timer. Above everything else on the
-       page because it is the one thing here a run may be waiting on outside the
-       review gate below: until it is answered the agent cannot settle the decision
-       it asked about, whatever state the gate is in. It renders
+       page because it carries a question the run itself posted: until it is
+       answered the agent cannot settle the decision it asked about, whatever state
+       the gate below is in. (The gate and the live-session panel can also want a
+       human; this is the only one the run asked for explicitly.) It renders
        independently of the review gate: a question can arrive at any point in a
        run's life, including on a run whose spec is already approved and whose
        gate will never move again. -->

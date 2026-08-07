@@ -158,8 +158,9 @@ Two things a reader will reasonably expect to find and will not:
    the reviewer is a real, unowned follow-up.
 
 **One cost, stated plainly.** The run's goal was shorter *specs*, and `brainstorm.md` itself got
-longer: **103 lines on `main` → 160 here.** Ten of those 57 came with the unlanded branch this
-run sits on (which carried 113); the other **47 are this run's own** — T7 added the ask directive
+longer: **103 lines on `main` → 160 here.** Ten of those 57 came with the unlanded stack this run
+sits on (`drovr/skill-stickiness` → `drovr/brainstorm-rework`, which carried 113); the other
+**47 are this run's own** — T7 added the ask directive
 (113 → 135) and T8 the interview loop and decision-record framing (135 → 160). A longer prompt
 costs context in **every** brainstorm phase, forever, and that is a real price paid up front
 against a spec-length saving that has not yet been measured. Only the A/B in (1) can say whether

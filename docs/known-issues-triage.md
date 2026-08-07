@@ -3,7 +3,9 @@
 **This is a dated SNAPSHOT, and `known-issues.md` has moved since. Every number and every
 `L<n>` below describes the file as it stood on 2026-08-06 — do not read them as current.**
 Snapshot state: `docs/known-issues.md` on `drovr/brainstorm-rework` (base:
-`drovr/skill-stickiness`, current with main), **4107 lines, 87 `##` sections**.
+`drovr/skill-stickiness`, current with main), **4107 lines, 85 `##` sections**. (The header
+originally said 87; at 4107 lines the file had 85. Two more sections and ~160 lines were added
+between this snapshot and the run that edited it.)
 
 Method: every section's heading, `**Status:**` and `**Severity:**` line read; the 12 sections
 carrying neither were read in full. Sections were **not** read end-to-end — classification is
@@ -12,25 +14,27 @@ from stated severity and self-description, so a few calls may move on closer rea
 ## How to use the `L<n>` references
 
 They are **line numbers into the 2026-08-06 snapshot**, not into the file you have. They were
-already drifting when this was written, and the 2026-08-07 change below moved everything after
-the old `L494` up by ~300 lines. Resolve an `L<n>` by its quoted description against the
+already drifting when this was written, and the 2026-08-07 change below deleted entries from
+across the whole file, so the shift is progressive — anything from a few lines to a few hundred,
+depending where it sat. Resolve an `L<n>` by its quoted description against the
 current **headings** — which is the repo rule for citing `known-issues.md` anyway. Treat an
 `L<n>` as an id, never as a location.
 
 ## What changed since the snapshot
 
 **2026-08-07 — fixed entries are now deleted, not annotated.** The policy is stated at the top of
-`known-issues.md` itself. **Nine** entries whose defect was fixed were removed outright — the
-eight marked FIXED, plus the `questions.json` Submit entry this run retired by deletion. **Four**
-more that read as fixed were kept, because each still carries live open content: three were
-retitled so the heading says which half is live (the cross-run-state bug *class* with open
-follow-ups, the panel's still-open *partial*-commit hazard, and the workspace-repair contract
-with its unguarded double-provision race), and one was corrected in place under its own heading
-(panel-never-completes, whose diagnostics are still good). **Five** lessons were lifted out of
-deleted entries into a new **`## Lessons kept from retired issues`** section, which replaced
-`## Resolved` and also carries that section's one surviving bullet. Measured against the file as
-this run found it (`eb3b917`): **87 → 78 sections**, and roughly 330 lines shorter. Trust the
-section count; re-derive the line count if you need one, since ordinary edits move it.
+`known-issues.md` itself. **Ten** entries whose defect was fixed were removed outright: the seven
+`— FIXED`-marked ones that were not kept, plus three that carried no FIXED marker at all — the
+findings-channel entry, the Archive-button entry, and the `questions.json` Submit entry this run
+retired by deletion. **Five** more that read as fixed were kept, because each still carries live
+open content, and each was **retitled so the heading says which half is live**: the cross-run-state
+bug *class* with open follow-ups, the panel's still-open *partial*-commit hazard, the
+workspace-repair contract with its unguarded double-provision race, the code-review panel's
+unsubmitted seed, and `phase send`'s `until`-is-a-level. **Six** lessons were lifted out of deleted
+entries into a new **`## Lessons kept from retired issues`** section, which replaced `## Resolved`
+and also carries that section's one surviving bullet. Measured against the file as this run found
+it (`eb3b917`): **87 → 77 sections**. Trust the section count; re-derive the line count if you
+need one, since ordinary edits move it.
 
 Consequences for the counts below, which have **not** been recomputed: class **B — already
 fixed** is by construction now near-empty and is no longer a category this file's policy allows
@@ -49,6 +53,9 @@ one honestly labelled.
 | **D — test flake / dev infra** | 6 | real, but not product bugs |
 | **E — upstream, not drovr** | 1 | context-% computed against 200k |
 | meta | 2 | `Resolved`, `Follow-ups` |
+
+These sum to **88** against a stated 87 and an actual 85, so at least one entry was
+double-counted. Recorded, not patched — see "What changed since the snapshot" above.
 
 **Of the 56 open: 13 high, 18 medium, 25 low.**
 
