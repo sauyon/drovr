@@ -2457,8 +2457,8 @@ mod tests {
     ///
     /// ⚠ **CURRENTLY FAILING for the same reason as
     /// [`a_finished_panel_reaps_its_reviewers`]** — a spurious `WouldBlock` out of
-    /// `acquire_run_lock`, not anything about the sweep. See that test's note and
-    /// `docs/known-issues.md`.
+    /// `acquire_run_lock`, not anything about the sweep. See that test's note,
+    /// forge.ko.ag/drovr/drovr#80 and `docs/known-issues.md`.
     #[test]
     fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
         let env = TestEnv::new();
@@ -2781,8 +2781,9 @@ mod tests {
     /// `pane_close` calls, so it is one of only two tests in the suite that turn a
     /// *best-effort* reap refusal into a failure rather than a warning. The
     /// refusal is a spurious `WouldBlock` out of `acquire_run_lock`, whose cause
-    /// is a live production fault — see `docs/known-issues.md`, "`acquire_run_lock`
-    /// WouldBlock on a fixed `/tmp/drovr-*-test-*` root". Deliberately **not**
+    /// is a live production fault — forge.ko.ag/drovr/drovr#80, written up in
+    /// `docs/known-issues.md` under "`acquire_run_lock` WouldBlock on a fixed
+    /// `/tmp/drovr-*-test-*` root". Deliberately **not**
     /// `#[ignore]`d and deliberately not weakened: the assertion is right, the
     /// lock is wrong, and hiding it would retire the only executable evidence
     /// that the fault is real.

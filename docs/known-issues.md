@@ -69,10 +69,10 @@ instrumentation did not catch.
 ### The part that did not fit is now EXPLAINED — a concurrent fork inherits the locked fd (2026-08-07)
 
 **Found:** run `enforce-env-lock`, task 8, the moment `code_review.rs`'s 65 tests stopped being
-serialized by `ENV_LOCK`. **This is a live PRODUCTION fault, not a test artifact.** It is being
-tracked separately; task 8 deliberately did **not** fix it, because changing `acquire_run_lock`'s
-refuse-fast semantics deserves its own design and review rather than a decision taken inside a
-test-isolation sweep.
+serialized by `ENV_LOCK`. **This is a live PRODUCTION fault, not a test artifact.** Tracked as
+**forge.ko.ag/drovr/drovr#80**; task 8 deliberately did **not** fix it, because changing
+`acquire_run_lock`'s refuse-fast semantics deserves its own design and review rather than a
+decision taken inside a test-isolation sweep.
 
 `acquire_run_lock` is `flock`-shaped, and an `flock` belongs to the **open file description**, not
 to the file descriptor. `fork()` copies the fd table, so a child created while the lock is held
