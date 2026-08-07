@@ -4708,21 +4708,19 @@ mod tests {
     use crate::config::AgentLaunch;
     use crate::herdr::FakeHerdr;
     use crate::run::{Phase, PhaseStatus, RunState};
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
 
-    fn make_run(name: &str) -> RunState {
-        // Caller must hold ENV_LOCK before calling.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", format!("/tmp/drovr-phase-test-{name}"));
-        }
-        // Start each test from a clean run dir so a stale `.done` marker or
-        // state.json from a prior run can't leak across test invocations.
-        let _ = std::fs::remove_dir_all(run_dir(name));
+    /// The `&TestEnv` parameter IS the contract: the run this returns resolves
+    /// under that environment's data root and nowhere else. The old fixture
+    /// redirected `XDG_DATA_HOME` process-globally and needed a `remove_dir_all`
+    /// to scrub the deterministic `/tmp/drovr-phase-test-{name}` root it shared
+    /// with every other run of the suite; a `TestEnv`'s root is per-test and
+    /// already empty.
+    fn make_run(env: &TestEnv, name: &str) -> RunState {
         // `phase_done` stamps the pass token into the marker; a value left behind
-        // by another test would silently change what `phase_wait` accepts.
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        // by an earlier call under the same environment would silently change
+        // what `phase_wait` accepts.
+        env.unset(PASS_ENV);
         RunState {
             name: name.to_owned(),
             task: "test task".into(),
@@ -4744,8 +4742,8 @@ mod tests {
         }
     }
 
-    fn make_run_with_workspace(name: &str, ws_id: &str) -> RunState {
-        let mut run = make_run(name);
+    fn make_run_with_workspace(env: &TestEnv, name: &str, ws_id: &str) -> RunState {
+        let mut run = make_run(env, name);
         run.workspace = Some(ws_id.to_owned());
         run.root_pane = Some(format!("{ws_id}:root"));
         run
@@ -4760,9 +4758,9 @@ mod tests {
     /// phases, handoffs and commits are not.
     #[test]
     fn phase_start_reprovisions_a_workspace_that_vanished() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("ws-gone-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "ws-gone-test", "wAG");
         run.phases.push({
                 let mut p = Phase::new("plan");
                 p.status = PhaseStatus::Done;
@@ -4827,9 +4825,9 @@ mod tests {
     /// nobody is doing.
     #[test]
     fn reprovisioning_fails_the_phases_whose_agents_died_with_the_workspace() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("ws-orphan-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "ws-orphan-test", "wAG");
         run.phases.push({
                 let mut p = Phase::new("plan");
                 p.status = PhaseStatus::Done;
@@ -4892,9 +4890,9 @@ mod tests {
     /// run as archived. Repair does not get to overrule the human.
     #[test]
     fn an_archived_run_is_not_quietly_brought_back_to_life() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("archived-ws-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "archived-ws-test", "wAG");
         run.archived = true;
         run.save().unwrap();
         h.kill_workspace("wAG", ["wAG:root".to_string()]);
@@ -4933,11 +4931,11 @@ mod tests {
     /// mode, compared field by field through serde.
     #[test]
     fn a_failed_repair_leaves_the_callers_run_state_untouched() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
 
         // 1. Refused because the run is archived.
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("untouched-archived-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "untouched-archived-test", "wAG");
         run.phases.push({
                 let mut p = Phase::new("plan");
                 p.status = PhaseStatus::Running;
@@ -4957,7 +4955,7 @@ mod tests {
 
         // 2. Refused because there is no cwd to open a workspace in.
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("untouched-nocwd-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "untouched-nocwd-test", "wAG");
         run.project_dir = String::new();
         run.save().unwrap();
         h.kill_workspace("wAG", ["wAG:root".to_string()]);
@@ -4967,7 +4965,7 @@ mod tests {
 
         // 3. herdr refused to make the workspace.
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("untouched-create-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "untouched-create-test", "wAG");
         run.phases.push({
                 let mut p = Phase::new("plan");
                 p.status = PhaseStatus::Running;
@@ -4994,7 +4992,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let h = FakeHerdr::new();
-            let mut run = make_run_with_workspace("untouched-save-test", "wAG");
+            let mut run = make_run_with_workspace(&env, "untouched-save-test", "wAG");
             run.phases.push({
                     let mut p = Phase::new("plan");
                     p.status = PhaseStatus::Running;
@@ -5041,9 +5039,9 @@ mod tests {
     fn a_workspace_that_cannot_be_recorded_is_given_back() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("ws-save-fails-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "ws-save-fails-test", "wAG");
         run.save().unwrap();
         h.kill_workspace("wAG", ["wAG:root".to_string()]);
 
@@ -5112,9 +5110,9 @@ mod tests {
     /// the end of `ensure_workspace`, and it writes what the copy holds.
     #[test]
     fn repairing_a_restored_run_leaves_it_restored_on_disk() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("archived-writeback-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "archived-writeback-test", "wAG");
         run.archived = false;
         run.save().unwrap();
         // This caller's copy is latched `true` from an Archive it observed before
@@ -5141,9 +5139,9 @@ mod tests {
     /// away — the guard skipped by an error nobody sees.
     #[test]
     fn an_unreadable_state_json_refuses_the_repair_rather_than_guessing() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("archived-unreadable-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "archived-unreadable-test", "wAG");
         run.save().unwrap();
         std::fs::write(
             run_dir("archived-unreadable-test").join("state.json"),
@@ -5180,9 +5178,9 @@ mod tests {
     /// the read side, which would still be wrong on its own.)
     #[test]
     fn a_restore_on_disk_beats_a_stale_archive_held_in_memory() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("archived-stale-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "archived-stale-test", "wAG");
         // The human's current decision, as recorded by the Restore button.
         run.archived = false;
         run.save().unwrap();
@@ -5205,9 +5203,9 @@ mod tests {
     /// exists to stop repair overruling the human, not to add a new refusal.
     #[test]
     fn an_archived_run_whose_workspace_survived_still_starts() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("archived-zombie-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "archived-zombie-test", "wAG");
         run.archived = true;
         run.save().unwrap();
         // workspace_close failed, so wAG is still there.
@@ -5226,9 +5224,9 @@ mod tests {
     /// "please recreate the run" — for a run that may hold 23 tasks of work.
     #[test]
     fn phase_start_provisions_a_workspace_the_run_never_got() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("ws-null-test");
+        let mut run = make_run(&env, "ws-null-test");
         run.workspace = None;
         run.root_pane = None;
 
@@ -5247,9 +5245,9 @@ mod tests {
     /// orphan the run's own agents, which is worse than the bug being fixed.
     #[test]
     fn a_live_workspace_is_never_reprovisioned() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("ws-live-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "ws-live-test", "wAG");
 
         phase_start(&h, &mut run, "implement", None).unwrap();
 
@@ -5266,9 +5264,9 @@ mod tests {
     /// that still dies on a vanished one.
     #[test]
     fn spawn_reviewer_reprovisions_a_vanished_workspace() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-ws-gone-test", "wAG");
+        let mut run = make_run_with_workspace(&env, "rev-ws-gone-test", "wAG");
         h.kill_workspace("wAG", ["wAG:root".to_string()]);
 
         spawn_reviewer(
@@ -5295,9 +5293,9 @@ mod tests {
 
     #[test]
     fn start_records_pane_id_and_status_running() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("start-test");
+        let mut run = make_run(&env, "start-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
@@ -5334,9 +5332,9 @@ mod tests {
 
     #[test]
     fn reviewer_launch_includes_workspace_root_guard() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-guard-test", "ws-g");
+        let mut run = make_run_with_workspace(&env, "rev-guard-test", "ws-g");
 
         spawn_reviewer(
             &h,
@@ -5370,9 +5368,9 @@ mod tests {
     /// for the run's lifetime and every phase tab is independently closeable.
     #[test]
     fn first_phase_creates_its_own_tab_and_leaves_the_root_pane_alone() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("ws-isolation-test", "ws-42");
+        let mut run = make_run_with_workspace(&env, "ws-isolation-test", "ws-42");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
@@ -5409,9 +5407,9 @@ mod tests {
 
     #[test]
     fn later_phase_creates_its_own_tab() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("later-tab-test", "ws-7");
+        let mut run = make_run_with_workspace(&env, "later-tab-test", "ws-7");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         phase_start(&h, &mut run, "plan", None).unwrap();
@@ -5451,9 +5449,9 @@ mod tests {
         // be rebuilt — a cwd to open the workspace in. Even then the run is not
         // sent back to `drovr new`: it names the missing field and where to put
         // it, because everything else about the run is still good.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("no-cwd-test");
+        let mut run = make_run(&env, "no-cwd-test");
         run.workspace = None;
         run.root_pane = None;
         run.project_dir = String::new();
@@ -5479,9 +5477,9 @@ mod tests {
 
     #[test]
     fn phase_start_preserves_focus() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("focus-test");
+        let mut run = make_run(&env, "focus-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
@@ -5507,16 +5505,16 @@ mod tests {
 
     #[test]
     fn wait_sees_marker_and_marks_phase_done() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("wait-done-test");
+        let mut run = make_run(&env, "wait-done-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // The phase agent authors its handoff, then signals completion — from
         // inside its pane, so the marker carries this pass's token.
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         let marker = done_marker(&run.name, "plan");
         assert!(
             marker.exists(),
@@ -5551,9 +5549,9 @@ mod tests {
 
     #[test]
     fn phase_start_does_not_un_archive_a_run_archived_while_it_worked() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("phase-start-archived");
+        let mut run = make_run(&env, "phase-start-archived");
         run.save().unwrap();
         archive_on_disk("phase-start-archived");
 
@@ -5567,14 +5565,14 @@ mod tests {
 
     #[test]
     fn phase_send_does_not_un_archive_a_run_archived_while_it_reopened() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("phase-send-archived");
+        let mut run = make_run(&env, "phase-send-archived");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
@@ -5598,9 +5596,9 @@ mod tests {
 
     #[test]
     fn phase_wait_does_not_un_archive_a_run_archived_while_it_blocked() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("phase-wait-archived");
+        let mut run = make_run(&env, "phase-wait-archived");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // The phase agent authors its handoff and signals completion from inside
@@ -5608,7 +5606,7 @@ mod tests {
         // is now ignored, which would time out instead of completing.
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         // ...but the reviewer archived the run while the wait was blocked.
         archive_on_disk("phase-wait-archived");
 
@@ -5623,9 +5621,9 @@ mod tests {
 
     #[test]
     fn wait_timeout_leaves_running() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("wait-timeout-test");
+        let mut run = make_run(&env, "wait-timeout-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // No marker dropped and no blocked status → wait times out quickly and
@@ -5639,9 +5637,9 @@ mod tests {
 
     #[test]
     fn wait_blocked_short_circuits_before_timeout() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("wait-blocked-fast-test");
+        let mut run = make_run(&env, "wait-blocked-fast-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         h.push_status(Some("blocked"));
@@ -5660,9 +5658,9 @@ mod tests {
 
     #[test]
     fn wait_idle_status_keeps_waiting_not_blocked_or_done() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("wait-idle-test");
+        let mut run = make_run(&env, "wait-idle-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // idle is NOT a completion or block signal (a parked agent awaiting a
@@ -5677,16 +5675,16 @@ mod tests {
 
     #[test]
     fn wait_marker_wins_over_status_check() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("wait-marker-wins-test");
+        let mut run = make_run(&env, "wait-marker-wins-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // Marker present AND a blocked status queued: the marker WINS, so the
         // phase is Done rather than Blocked.
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         h.push_status(Some("blocked"));
 
         let outcome = phase_wait(&h, &mut run, "plan", 5000).unwrap();
@@ -5769,9 +5767,9 @@ mod tests {
 
     #[test]
     fn triage_destructive_escalates_and_never_auto_answers() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("triage-destructive-test");
+        let mut run = make_run(&env, "triage-destructive-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_read("Dangerous rm operation detected.\n❯ 1. Yes\n  2. No");
@@ -5813,9 +5811,9 @@ mod tests {
 
     #[test]
     fn triage_routine_auto_answers_and_continues() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("triage-routine-test");
+        let mut run = make_run(&env, "triage-routine-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_read("Do you want to make this edit to src/lib.rs?\n❯ 1. Yes\n  2. No");
@@ -5844,9 +5842,9 @@ mod tests {
 
     #[test]
     fn triage_unknown_escalates_without_answering() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("triage-unknown-test");
+        let mut run = make_run(&env, "triage-unknown-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_read("Allow the WebFetch tool to run?\n❯ 1. Yes\n  2. No");
@@ -5871,9 +5869,9 @@ mod tests {
 
     #[test]
     fn triage_no_pane_id_escalates() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("triage-no-pane-test");
+        let mut run = make_run(&env, "triage-no-pane-test");
         // A phase with no pane_id yet.
         run.phases.push({
             let mut p = Phase::new("code");
@@ -5893,8 +5891,8 @@ mod tests {
 
     #[test]
     fn done_on_unknown_phase_errors() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("done-unknown-test");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "done-unknown-test");
         // No phases registered → phase_done must reject rather than write a
         // stray marker.
         assert!(phase_done(&run, "nonexistent").is_err());
@@ -5909,8 +5907,8 @@ mod tests {
 
     #[test]
     fn done_succeeds_for_review_phase() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("done-review-test");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "done-review-test");
         // A reviewer phase lives only in `review_phases`, yet must be able to drop
         // its completion marker via `drovr phase done` (which calls phase_done).
         run.review_phases.push(
@@ -5933,8 +5931,8 @@ mod tests {
 
     #[test]
     fn done_requires_handoff_for_pipeline_phase() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("done-requires-handoff");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "done-requires-handoff");
         run.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -5973,8 +5971,8 @@ mod tests {
 
     #[test]
     fn done_rejects_empty_handoff_for_pipeline_phase() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("done-empty-handoff");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "done-empty-handoff");
         run.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -6000,9 +5998,9 @@ mod tests {
 
     #[test]
     fn send_routes_to_review_phase_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-review-test");
+        let mut run = make_run(&env, "send-review-test");
         // A reviewer pane registered only in `review_phases` must still be
         // reachable by `phase_send` (require_pane_id falls back to review_phases).
         run.review_phases.push(
@@ -6030,9 +6028,9 @@ mod tests {
 
     #[test]
     fn send_routes_to_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-test");
+        let mut run = make_run(&env, "send-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         // Report the pane ready so the readiness gate returns on the first poll.
@@ -6138,9 +6136,9 @@ mod tests {
     // first try, so no keystroke is sent and no second wait is needed.
     #[test]
     fn send_does_not_nudge_when_prompt_takes_first_try() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-healthy-test");
+        let mut run = make_run(&env, "send-healthy-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6174,9 +6172,9 @@ mod tests {
     // — and once nudged, the send is a success, not an error.
     #[test]
     fn send_nudges_enter_when_payload_lands_unsubmitted() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-unsubmitted-test");
+        let mut run = make_run(&env, "send-unsubmitted-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6221,9 +6219,9 @@ mod tests {
     // Assert the ABSENCE of the keystroke, not merely the error.
     #[test]
     fn send_raises_without_keystroke_when_payload_is_swallowed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-swallowed-test");
+        let mut run = make_run(&env, "send-swallowed-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         // A pane parked on an unclassified modal still reports `idle`, so the
@@ -6269,9 +6267,9 @@ mod tests {
     // stop.
     #[test]
     fn send_does_not_nudge_on_evidence_that_predates_the_prompt() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-stale-evidence-test");
+        let mut run = make_run(&env, "send-stale-evidence-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6322,9 +6320,9 @@ mod tests {
     // blind into an unknown screen.
     #[test]
     fn send_raises_without_keystroke_when_pane_is_unreadable() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-unreadable-test");
+        let mut run = make_run(&env, "send-unreadable-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6371,9 +6369,9 @@ mod tests {
     // one a three-state refactor can drop by writing `before != Present`.
     #[test]
     fn send_does_not_nudge_when_the_before_look_failed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-blind-before-test");
+        let mut run = make_run(&env, "send-blind-before-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6418,9 +6416,9 @@ mod tests {
     // A nudge that does not help must not be reported as a delivered seed.
     #[test]
     fn send_raises_when_nudge_does_not_submit() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-stuck-composer-test");
+        let mut run = make_run(&env, "send-stuck-composer-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("idle"));
@@ -6454,14 +6452,14 @@ mod tests {
     // phase nobody knows to clean up.
     #[test]
     fn an_undelivered_seed_also_reports_the_re_open_it_left_behind() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-undelivered-reopen-test");
+        let mut run = make_run(&env, "send-undelivered-reopen-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         run.phases[0].status = PhaseStatus::Done;
         run.save().unwrap();
 
@@ -6519,9 +6517,9 @@ mod tests {
     // -- phase_send waits for the agent to attach before sending --------------
     #[test]
     fn send_waits_for_agent_ready_before_sending() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-ready-test");
+        let mut run = make_run(&env, "send-ready-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         // The agent boots: unreadable, then `unknown` (pane seen, no agent yet),
@@ -6575,9 +6573,9 @@ mod tests {
     // for the "gate on idle only → 30s stall on busy agents" bug).
     #[test]
     fn send_to_working_agent_does_not_block() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-working-test");
+        let mut run = make_run(&env, "send-working-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         h.push_status(Some("working"));
@@ -6602,9 +6600,9 @@ mod tests {
     // into a never-ready pane would be silently swallowed.
     #[test]
     fn send_raises_and_does_not_send_when_agent_never_ready() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-never-ready-test");
+        let mut run = make_run(&env, "send-never-ready-test");
 
         phase_start(&h, &mut run, "code", None).unwrap();
         // The pane keeps reporting an un-started state — it never attaches. (Enough
@@ -6647,9 +6645,9 @@ mod tests {
 
     #[test]
     fn start_with_seed_records_handoff_doc() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("seed-test");
+        let mut run = make_run(&env, "seed-test");
         let seed = Path::new("/tmp/seed.md");
 
         phase_start(&h, &mut run, "brainstorm", Some(seed)).unwrap();
@@ -6678,9 +6676,9 @@ mod tests {
     // never the one it is launching into.
     #[test]
     fn phase_start_never_closes_a_pane_that_is_still_in_play() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("no-mid-run-close-test");
+        let mut run = make_run(&env, "no-mid-run-close-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         phase_start(&h, &mut run, "plan", None).unwrap();
@@ -6698,9 +6696,9 @@ mod tests {
 
     #[test]
     fn start_reuses_existing_phase_entry() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("reuse-test");
+        let mut run = make_run(&env, "reuse-test");
 
         // Pre-populate a Pending phase
         run.phases.push(Phase::new("plan"));
@@ -6713,15 +6711,15 @@ mod tests {
 
     #[test]
     fn phase_start_clears_stale_done_marker() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("stale-marker-test");
+        let mut run = make_run(&env, "stale-marker-test");
 
         // Pass 1: the phase runs and signals done, leaving `<phase>.done` behind.
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_1 = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass_1);
+        agent_signals_done(&env, &run, "plan", &pass_1);
         let marker = done_marker(&run.name, "plan");
         assert!(marker.exists());
 
@@ -6738,7 +6736,7 @@ mod tests {
 
         // Drive the phase to a genuine `Done` in state, so the pass-3 assertions
         // below actually exercise the reset (nothing else writes `Done`).
-        agent_signals_done(&run, "plan", &run.phases[0].pass.clone().unwrap());
+        agent_signals_done(&env, &run, "plan", &run.phases[0].pass.clone().unwrap());
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
@@ -6789,20 +6787,16 @@ mod tests {
     /// Simulate the agent launched by pass `token` running `drovr phase done`:
     /// the pane's environment carries `DROVR_PASS`, so the marker it writes is
     /// stamped with that pass's token.
-    fn agent_signals_done(run: &RunState, phase: &str, token: &PassToken) {
-        unsafe {
-            std::env::set_var(PASS_ENV, token.as_str());
-        }
+    fn agent_signals_done(env: &TestEnv, run: &RunState, phase: &str, token: &PassToken) {
+        env.set(PASS_ENV, token.as_str());
         phase_done(run, phase).unwrap();
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        env.unset(PASS_ENV);
     }
 
     /// A saved run with `plan` registered as a pipeline phase — the shape `phase_done`'s
     /// handoff gate applies to.
-    fn registered_phase_run(name: &str) -> RunState {
-        let mut run = make_run(name);
+    fn registered_phase_run(env: &TestEnv, name: &str) -> RunState {
+        let mut run = make_run(env, name);
         run.phases.push({
                 let mut p = Phase::new("plan");
                 p.status = PhaseStatus::Running;
@@ -6827,15 +6821,15 @@ mod tests {
 
     #[test]
     fn phase_wait_rejects_a_marker_recreated_by_the_previous_pass() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("stale-pass-test");
+        let mut run = make_run(&env, "stale-pass-test");
 
         // Pass 1 runs to completion.
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_a = run.phases[0].pass.clone().expect("pass 1 must mint a token");
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass_a);
+        agent_signals_done(&env, &run, "plan", &pass_a);
 
         // Pass 2 re-enters the phase: fresh token, stale marker swept.
         phase_start(&h, &mut run, "plan", None).unwrap();
@@ -6850,13 +6844,9 @@ mod tests {
         // First line of defence: `phase_done` refuses outright, so the agent is
         // told it did NOT complete the phase rather than exiting 0 on a marker
         // that could never be honoured.
-        unsafe {
-            std::env::set_var(PASS_ENV, pass_a.as_str());
-        }
+        env.set(PASS_ENV, pass_a.as_str());
         let err = phase_done(&run, "plan").unwrap_err();
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        env.unset(PASS_ENV);
         assert!(
             err.to_string().contains("could never be matched to the running pass"),
             "the stale agent must be refused at the source: {err}"
@@ -6892,14 +6882,14 @@ mod tests {
         // repeated wait idempotent WITHOUT a `status == Done` short-circuit. That
         // short-circuit is what made every "state persisted but marker destroyed"
         // ordering hazard reportable as a false completion.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("current-pass-test");
+        let mut run = make_run(&env, "current-pass-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
 
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
@@ -6930,14 +6920,14 @@ mod tests {
         // DIRECTORY. `save`'s final rename onto it fails, while `remove_file` on
         // the marker would still succeed — so the marker's survival is a direct
         // observation of which step ran first.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("start-order-test");
+        let mut run = make_run(&env, "start-order-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         let marker = done_marker(&run.name, "plan");
         assert!(marker.exists());
 
@@ -6962,14 +6952,14 @@ mod tests {
         // load failure SKIPPED the check and the waiter completed anyway. A
         // completion that cannot be verified must never be reported: reaping tears
         // panes down on this verdict, so an unverifiable Done closes a live pane.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("guard-fail-closed-test");
+        let mut run = make_run(&env, "guard-fail-closed-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
 
         // Make the re-read fail while leaving the (matching) marker in place.
         std::fs::remove_file(run_dir(&run.name).join("state.json")).unwrap();
@@ -6988,9 +6978,9 @@ mod tests {
         // `status` into the caller's entry-time snapshot, a caller that saves after
         // waiting — reaping records the reap exactly that way — would write the
         // stale snapshot back and undo everything else that happened meanwhile.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("caller-state-test");
+        let mut run = make_run(&env, "caller-state-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
@@ -7003,7 +6993,7 @@ mod tests {
         other.save().unwrap();
         assert_eq!(run.cursor, 0, "the waiter's snapshot is stale by construction");
 
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
@@ -7025,9 +7015,9 @@ mod tests {
         // Flattening them (`and_then`) makes a vanished LEGACY phase compare
         // None == None, pass the supersession guard, write nothing, and still
         // return Done — a false completion with no persisted trace.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("vanished-phase-test");
+        let mut run = make_run(&env, "vanished-phase-test");
         run.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -7059,9 +7049,9 @@ mod tests {
     fn phase_wait_refuses_a_superseded_passs_completion() {
         // A wait can run for an hour. If a `phase start` re-entered the phase
         // meanwhile, the marker this waiter matches belongs to a dead pass.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("superseded-test");
+        let mut run = make_run(&env, "superseded-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_a = run.phases[0].pass.clone().unwrap();
@@ -7074,7 +7064,7 @@ mod tests {
         assert_ne!(pass_a, pass_b);
 
         // Pass A's still-live agent now signals done with ITS token.
-        agent_signals_done(&run, "plan", &pass_a);
+        agent_signals_done(&env, &run, "plan", &pass_a);
 
         // `run` is this waiter's hour-old snapshot, still expecting pass A.
         // Supersession is its OWN outcome, never `TimedOut`: "another pass took
@@ -7100,9 +7090,9 @@ mod tests {
         // worse payload: the waiter's snapshot still carries the superseded pass
         // token and its `Running`/`Done` status, so saving it would restore the
         // dead pass and undo the very re-entry that superseded this wait.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("superseded-no-clobber-test");
+        let mut run = make_run(&env, "superseded-no-clobber-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_a = run.phases[0].pass.clone().unwrap();
@@ -7113,7 +7103,7 @@ mod tests {
         let pass_b = other.phases[0].pass.clone().unwrap();
         assert_ne!(pass_a, pass_b);
 
-        agent_signals_done(&run, "plan", &pass_a);
+        agent_signals_done(&env, &run, "plan", &pass_a);
 
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
@@ -7145,9 +7135,9 @@ mod tests {
         // `TimedOut` — "the agent is stuck" — for a phase that is perfectly
         // healthy under a newer pass. The whole point of the distinct outcome is
         // that a caller never has to guess which of the two it is got.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("superseded-no-marker-test");
+        let mut run = make_run(&env, "superseded-no-marker-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_a = run.phases[0].pass.clone().unwrap();
@@ -7198,9 +7188,9 @@ mod tests {
         // Supersession means a NEWER pass exists. `phase_start` always mints
         // `Some`, so a token that VANISHED is corruption, not a re-entry, and it
         // must stay a timeout — the loud, diagnosable outcome — never "all is well".
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("dropped-token-test");
+        let mut run = make_run(&env, "dropped-token-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass_a = run.phases[0].pass.clone().unwrap();
@@ -7223,7 +7213,7 @@ mod tests {
         // Same on the marker path: the live agent's own marker lands, matching the
         // token this waiter holds, while the phase on disk has lost it. Not Done
         // (the fresh state cannot account for the token), and not Superseded.
-        agent_signals_done(&run, "plan", &pass_a);
+        agent_signals_done(&env, &run, "plan", &pass_a);
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::TimedOut,
@@ -7239,9 +7229,9 @@ mod tests {
         // `TimedOut`. If someone later "aligns" this with the fail-closed guard,
         // an unreadable state file turns an honest timeout into exit 1 — which the
         // handoff skill documents as STOP — and breaks the re-arm loop.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("timeout-unreadable-state-test");
+        let mut run = make_run(&env, "timeout-unreadable-state-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         std::fs::write(run_dir(&run.name).join("state.json"), b"{ not json").unwrap();
@@ -7259,9 +7249,9 @@ mod tests {
         // _fresh_state`, with the opposite (open) failure mode for the same reason:
         // a vanished phase is not evidence of a re-entry, and nothing is being
         // reported complete here.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("timeout-vanished-phase-test");
+        let mut run = make_run(&env, "timeout-vanished-phase-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let mut clobbered = RunState::load("timeout-vanished-phase-test").unwrap();
@@ -7280,9 +7270,9 @@ mod tests {
         // catch-all for "the wait ended without a marker". A phase still running
         // the pass this waiter expects has to keep reporting `TimedOut`, or the
         // driver stops triaging genuinely stuck agents.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("timeout-still-timeout-test");
+        let mut run = make_run(&env, "timeout-still-timeout-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         assert_eq!(
@@ -7297,9 +7287,9 @@ mod tests {
         // `phase_send` has the same shape: the marker gets destroyed and the
         // status write does not land (or vice versa), leaving `Done` on disk with
         // no agent running. A status short-circuit would report success there.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("stale-done-status-test");
+        let mut run = make_run(&env, "stale-done-status-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         // Hand-craft exactly the wreckage those failure paths leave behind.
@@ -7323,14 +7313,14 @@ mod tests {
         // survive and that wait returns Done in microseconds while the agent has
         // not even read the prompt. The driver then advances (and, once reaping
         // lands, tears down the pane it just messaged).
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-reentry-test");
+        let mut run = make_run(&env, "send-reentry-test");
 
         phase_start(&h, &mut run, "implement-task-1", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "implement-task-1");
-        agent_signals_done(&run, "implement-task-1", &pass);
+        agent_signals_done(&env, &run, "implement-task-1", &pass);
         assert_eq!(
             phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
             PhaseWaitOutcome::Done
@@ -7340,7 +7330,7 @@ mod tests {
         // simply finished again) after the earlier one was accepted. Without this
         // the sweep assertion below would hold vacuously — `phase_wait` retains the
         // marker it accepts.
-        agent_signals_done(&run, "implement-task-1", &pass);
+        agent_signals_done(&env, &run, "implement-task-1", &pass);
         assert!(done_marker(&run.name, "implement-task-1").exists());
 
         // Exit 3: forward the findings to the SAME live agent.
@@ -7364,7 +7354,7 @@ mod tests {
         );
 
         // The same agent (same pane, same token) finishing the fix completes it.
-        agent_signals_done(&run, "implement-task-1", &pass);
+        agent_signals_done(&env, &run, "implement-task-1", &pass);
         assert_eq!(
             phase_wait(&h, &mut run, "implement-task-1", 50).unwrap(),
             PhaseWaitOutcome::Done
@@ -7379,15 +7369,15 @@ mod tests {
         // interval is unbounded, with the status still `Running`. A send that
         // skipped the sweep in that state would be followed by a wait that
         // completes instantly off work finished before the send was even issued.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-running-sweep-test");
+        let mut run = make_run(&env, "send-running-sweep-test");
 
         phase_start(&h, &mut run, "implement-task-1", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "implement-task-1");
         // The agent finishes, but NOBODY waits — status stays Running.
-        agent_signals_done(&run, "implement-task-1", &pass);
+        agent_signals_done(&env, &run, "implement-task-1", &pass);
         assert_eq!(run.phases[0].status, PhaseStatus::Running);
         assert!(done_marker(&run.name, "implement-task-1").exists());
 
@@ -7410,19 +7400,19 @@ mod tests {
         // deliverable. An agent parked on a permission prompt never becomes ready;
         // sweeping before that gate would discard a genuine completion (marker AND
         // Done status) without any new work having been requested.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("failed-send-test");
+        let mut run = make_run(&env, "failed-send-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         let pass = run.phases[0].pass.clone().unwrap();
         write_handoff(&run, "plan");
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         assert_eq!(
             phase_wait(&h, &mut run, "plan", 50).unwrap(),
             PhaseWaitOutcome::Done
         );
-        agent_signals_done(&run, "plan", &pass); // agent re-signals; nobody consumes
+        agent_signals_done(&env, &run, "plan", &pass); // agent re-signals; nobody consumes
 
         // The pane never attaches → the send fails. (Same idiom as
         // `send_raises_and_does_not_send_when_agent_never_ready`: enough queued
@@ -7461,9 +7451,9 @@ mod tests {
         // all), whose marker would otherwise complete a pass it knows nothing
         // about. The documented flow has the agent run `phase done` from inside
         // its own pane, where the token is always present.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("untokenized-test");
+        let mut run = make_run(&env, "untokenized-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         assert!(run.phases[0].pass.is_some());
@@ -7505,9 +7495,9 @@ mod tests {
         // against a phase that has none is an inconsistency — it means some pass
         // wrote state that was subsequently lost — and trusting it would make the
         // legacy path a general fail-open hole rather than a bounded one.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("legacy-pass-test");
+        let mut run = make_run(&env, "legacy-pass-test");
         run.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -7547,8 +7537,8 @@ mod tests {
     /// not be refused by a gate about scaffold sections.
     #[test]
     fn a_sectionless_hand_written_handoff_still_completes() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-hand-written");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-hand-written");
         write_raw_handoff(
             &run,
             "plan",
@@ -7572,8 +7562,8 @@ mod tests {
     /// The accident the gate exists for: run `handoff-scaffold`, forget, signal done.
     #[test]
     fn an_untouched_scaffold_is_refused() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-untouched");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-untouched");
         write_raw_handoff(&run, "plan", &crate::brief::handoff_scaffold());
 
         let err = phase_done(&run, "plan").unwrap_err().to_string();
@@ -7587,8 +7577,8 @@ mod tests {
     /// still drovr's.
     #[test]
     fn a_scaffold_with_the_placeholders_deleted_is_refused() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-placeholders-deleted");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-placeholders-deleted");
         let stripped: String = crate::brief::handoff_scaffold()
             .lines()
             .filter(|l| l.trim() != crate::brief::SCAFFOLD_PLACEHOLDER)
@@ -7604,8 +7594,8 @@ mod tests {
     /// writing either.
     #[test]
     fn rearranged_scaffold_text_is_not_writing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-rearranged");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-rearranged");
         let scaffold = crate::brief::handoff_scaffold();
         let lines: Vec<&str> = scaffold
             .lines()
@@ -7623,8 +7613,8 @@ mod tests {
     /// still hold the placeholder.
     #[test]
     fn a_partly_written_handoff_names_the_sections_still_holding_todo() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-partly-written");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-partly-written");
         let filled = crate::brief::handoff_scaffold().replacen(
             &format!("\n{}\n", crate::brief::SCAFFOLD_PLACEHOLDER),
             "\nPorted the parser to the new lexer; interfaces unchanged.\n",
@@ -7643,8 +7633,8 @@ mod tests {
     /// A fully written handoff completes.
     #[test]
     fn a_written_handoff_completes() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-written");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-written");
         let written = crate::brief::handoff_scaffold().replace(
             crate::brief::SCAFFOLD_PLACEHOLDER,
             "Real content for this section.",
@@ -7657,8 +7647,8 @@ mod tests {
     /// A hand-written handoff that never went through the scaffold is untouched by the gate.
     #[test]
     fn a_hand_written_handoff_still_completes() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-hand-written");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-hand-written");
         write_raw_handoff(
             &run,
             "plan",
@@ -7675,8 +7665,8 @@ mod tests {
     /// over the silent bypasses that chasing this case produced across five review rounds.
     #[test]
     fn a_quoted_bare_todo_is_refused_and_that_is_the_trade() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-quoted-todo");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-quoted-todo");
         write_raw_handoff(
             &run,
             "plan",
@@ -7698,8 +7688,8 @@ mod tests {
     /// sending the agent to rewrite a file that is already there.
     #[test]
     fn an_unreadable_handoff_is_not_reported_as_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = registered_phase_run("handoff-unreadable");
+        let env = TestEnv::new();
+        let run = registered_phase_run(&env, "handoff-unreadable");
         // A directory at the handoff path: present, but not readable as a file.
         let hp = run_dir(&run.name).join("plan-HANDOFF.md");
         std::fs::create_dir_all(&hp).unwrap();
@@ -7724,8 +7714,8 @@ mod tests {
         // mints no tokens (every phase records `pass: None`) while a rebuilt binary
         // in the same shell exports $DROVR_PASS — so an agent can hold a token its
         // phase does not have.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("untokened-write-test");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "untokened-write-test");
         run.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -7738,13 +7728,9 @@ mod tests {
         run.save().unwrap();
         write_handoff(&run, "plan");
 
-        unsafe {
-            std::env::set_var(PASS_ENV, "token-from-a-newer-binary");
-        }
+        env.set(PASS_ENV, "token-from-a-newer-binary");
         let err = phase_done(&run, "plan").unwrap_err();
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        env.unset(PASS_ENV);
         assert!(
             err.to_string().contains("env -u DROVR_PASS"),
             "the refusal must name the way out — dropping the token, not supplying one: {err}"
@@ -7766,11 +7752,11 @@ mod tests {
         // silent `let _ =` would launch the agent into a phase whose next
         // `phase wait` still short-circuits on the old marker.
         use std::os::unix::fs::PermissionsExt;
-        /// Restore the directory's permissions even if the test panics. Without
-        /// this a panic leaves the run dir at 0o555 with a marker inside, which
-        /// `make_run`'s `remove_dir_all` cannot clear — so EVERY later run of this
-        /// test fails, and its panic (under the held ENV_LOCK) poisons the mutex
-        /// and reds the whole suite.
+        /// Restore the directory's permissions even if the test panics. The run
+        /// dir now lives inside this test's own scratch root, so a leftover
+        /// 0o555 directory can no longer red every later run of this test — but
+        /// `TempDir`'s cleanup is best-effort and silent, so without this the
+        /// unwritable tree is simply leaked into the system temp root instead.
         struct RestorePerms(PathBuf, std::fs::Permissions);
         impl Drop for RestorePerms {
             fn drop(&mut self) {
@@ -7778,9 +7764,9 @@ mod tests {
             }
         }
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("unremovable-marker-test");
+        let mut run = make_run(&env, "unremovable-marker-test");
 
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -7814,9 +7800,9 @@ mod tests {
         // `Phase::default()` is representable with `name: ""`; the only site that
         // appends a phase must refuse to create one, so an unnamed phase is never
         // addressable via find_phase.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("empty-name-test");
+        let mut run = make_run(&env, "empty-name-test");
         assert!(phase_start(&h, &mut run, "", None).is_err());
         assert!(phase_start(&h, &mut run, "   ", None).is_err());
         for bad in ["../../etc/x", "a/b", "a\\b", ".hidden", "a\0b", ".."] {
@@ -7865,9 +7851,9 @@ mod tests {
         // The token has to reach the agent's ENVIRONMENT (not just state.json):
         // that is what makes it immutable for the life of that agent, and so what
         // makes a marker attributable to the pass that wrote it.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("pass-env-test");
+        let mut run = make_run(&env, "pass-env-test");
         phase_start(&h, &mut run, "plan", None).unwrap();
 
         let pass = run.phases[0].pass.clone().unwrap();
@@ -7881,8 +7867,8 @@ mod tests {
 
     #[test]
     fn collect_reads_handoff_file() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut run = make_run("collect-reads-test");
+        let env = TestEnv::new();
+        let mut run = make_run(&env, "collect-reads-test");
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("brainstorm-HANDOFF.md"), "## handoff content").unwrap();
@@ -7896,8 +7882,8 @@ mod tests {
     fn collect_rejects_a_path_escaping_phase_name() {
         // `collect` interpolates the name into `<run_dir>/<phase>-HANDOFF.md`, so
         // it needs the same guard as every other name-to-path entry point.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = make_run("collect-traversal-test");
+        let env = TestEnv::new();
+        let run = make_run(&env, "collect-traversal-test");
         for bad in ["../../../../etc/passwd", "a/b", ".hidden", ""] {
             let err = collect(&run, bad).unwrap_err();
             // Must be the NAME guard, not an incidental "file not found" — the
@@ -7914,17 +7900,17 @@ mod tests {
 
     #[test]
     fn collect_missing_file_returns_err() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = make_run("collect-missing-test");
+        let env = TestEnv::new();
+        let run = make_run(&env, "collect-missing-test");
         let result = collect(&run, "nonexistent");
         assert!(result.is_err());
     }
 
     #[test]
     fn phase_start_uses_project_dir_as_cwd() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("proj-cwd-test");
+        let mut run = make_run(&env, "proj-cwd-test");
         run.project_dir = "/home/user/my-project".into();
 
         // EVERY phase's tab must carry project_dir as its cwd — the first one
@@ -7947,16 +7933,15 @@ mod tests {
     // -- A1: phase_start tags the launch with DROVR_PHASE=<run>/<phase> --------
     #[test]
     fn phase_start_sets_drovr_phase() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        // Hermetic: clear the config-dir/secret env so the command shape is
+        let env = TestEnv::new();
+        // Hermetic: the overlay seeds neither of these, so the command shape is
         // deterministic regardless of the ambient environment this test runs in.
+        // The explicit unsets keep that dependency visible rather than implicit.
         // (CLAUDE_CONFIG_DIR, when set, IS inlined — see the dedicated test below.)
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-        }
+        env.unset("CLAUDE_CONFIG_DIR");
+        env.unset("ANTHROPIC_API_KEY");
         let h = FakeHerdr::new();
-        let mut run = make_run("start-test");
+        let mut run = make_run(&env, "start-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
 
@@ -7984,20 +7969,18 @@ mod tests {
     //    drovr_phase environment-sensitive before it was made hermetic.
     #[test]
     fn phase_start_inlines_claude_config_dir_when_set() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-        }
+        let env = TestEnv::new();
+        env.set("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
+        env.unset("ANTHROPIC_API_KEY");
         let h = FakeHerdr::new();
-        let mut run = make_run("cfg-dir-test");
+        let mut run = make_run(&env, "cfg-dir-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
-        // Restore the env immediately (before any fallible assertion) so no code
-        // path out of this test leaks the var to the next ENV_LOCK holder.
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
+        // The restore stays where it was, before any fallible assertion, but it
+        // is no longer load-bearing: the overlay is thread-scoped and dies with
+        // `env`, so a panicking assertion can no longer leak this var to another
+        // test the way a process-global write under the old mutex could.
+        env.unset("CLAUDE_CONFIG_DIR");
 
         let calls = h.calls();
         let run_call = calls.iter().find(|c| c.contains("pane_run")).unwrap();
@@ -8030,10 +8013,10 @@ mod tests {
     //    phase's own tab and the anchor is still recorded.
     #[test]
     fn a_failed_launch_leaves_the_root_pane_untouched() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
         h.fail_pane_run();
-        let mut run = make_run_with_workspace("launch-fail-test", "ws-9");
+        let mut run = make_run_with_workspace(&env, "launch-fail-test", "ws-9");
 
         let res = phase_start(&h, &mut run, "brainstorm", None);
         assert!(
@@ -8095,10 +8078,10 @@ mod tests {
     /// class and leaving the other is how the class survives.
     #[test]
     fn a_reviewer_whose_launch_fails_does_not_strand_its_tab() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
         h.fail_pane_run();
-        let mut run = make_run_with_workspace("rev-orphan", "ws-ro");
+        let mut run = make_run_with_workspace(&env, "rev-orphan", "ws-ro");
 
         let res = spawn_reviewer(
             &h,
@@ -8137,11 +8120,11 @@ mod tests {
     /// reason the record comes first.
     #[test]
     fn an_orphan_tab_stays_recorded_when_it_cannot_be_closed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
         h.fail_pane_run();
         h.fail_pane_close();
-        let mut run = make_run_with_workspace("launch-fail-noclose", "ws-nc");
+        let mut run = make_run_with_workspace(&env, "launch-fail-noclose", "ws-nc");
 
         assert!(phase_start(&h, &mut run, "brainstorm", None).is_err());
 
@@ -8191,9 +8174,9 @@ mod tests {
 
     #[test]
     fn diagnose_stuck_phase_surfaces_actionable_diagnostic() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("stuck-test");
+        let mut run = make_run(&env, "stuck-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         // The pane read on the next timeout returns a parked prompt.
@@ -8222,9 +8205,9 @@ mod tests {
 
     #[test]
     fn diagnose_stuck_phase_none_when_working() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("working-test");
+        let mut run = make_run(&env, "working-test");
 
         phase_start(&h, &mut run, "brainstorm", None).unwrap();
         // The pane shows ordinary working output — not a stuck prompt.
@@ -8238,9 +8221,9 @@ mod tests {
 
     #[test]
     fn diagnose_stuck_phase_none_without_pane_id() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let run = make_run("no-pane-test"); // no phase started → no pane_id
+        let run = make_run(&env, "no-pane-test"); // no phase started → no pane_id
         // No phase registered at all: nothing to diagnose, no pane read.
         assert!(diagnose_stuck_phase(&h, &run, "brainstorm").is_none());
         assert!(
@@ -8253,9 +8236,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_registers_in_review_phases() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("spawn-rev-test", "ws-rv");
+        let mut run = make_run_with_workspace(&env, "spawn-rev-test", "ws-rv");
 
         spawn_reviewer(
             &h,
@@ -8303,9 +8286,9 @@ mod tests {
     /// with "phase has no pane_id" and no next move.
     #[test]
     fn sending_to_a_reaped_phase_says_it_was_reaped_and_how_to_get_it_back() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-to-reaped");
+        let mut run = make_run(&env, "send-to-reaped");
         let mut p = Phase::new("brainstorm");
         p.status = PhaseStatus::Done;
         p.set_pane("ws-mk:p1");
@@ -8331,9 +8314,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_clears_a_marker_left_by_the_reviewer_it_replaces() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-sweep-test", "ws-rs");
+        let mut run = make_run_with_workspace(&env, "rev-sweep-test", "ws-rs");
         let phase = "review:task-1:1:correctness";
         let marker = done_marker(&run.name, phase);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -8367,9 +8350,9 @@ mod tests {
             }
         }
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-sweep-fail-test", "ws-rsf");
+        let mut run = make_run_with_workspace(&env, "rev-sweep-fail-test", "ws-rsf");
         let phase = "review:task-1:1:correctness";
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -8408,8 +8391,8 @@ mod tests {
     /// reviewer that was replaced must not finish its replacement.
     #[test]
     fn a_marker_completes_only_the_pass_whose_token_it_carries() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let run = make_run("marker-pass-test");
+        let env = TestEnv::new();
+        let run = make_run(&env, "marker-pass-test");
         std::fs::create_dir_all(run_dir(&run.name)).unwrap();
         let marker = done_marker(&run.name, "plan");
 
@@ -8439,9 +8422,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_always_creates_tab_never_root_pane() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-tab-test", "ws-rt");
+        let mut run = make_run_with_workspace(&env, "rev-tab-test", "ws-rt");
         // root_pane is Some. Nothing may run there — not a pipeline phase
         // (see `first_phase_creates_its_own_tab_…`) and not a reviewer.
         assert!(run.root_pane.is_some());
@@ -8485,9 +8468,9 @@ mod tests {
         // quoting half of the pair moved onto the run name — which is checked
         // for path safety only and so still reaches the command with
         // metacharacters intact.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-inject-test; id", "ws-ri");
+        let mut run = make_run_with_workspace(&env, "rev-inject-test; id", "ws-ri");
 
         spawn_reviewer(
             &h,
@@ -8511,9 +8494,9 @@ mod tests {
         // Was `spawn_reviewer_errors_without_workspace`. A reviewer needs a tab,
         // a tab needs a workspace, and a workspace is now something drovr makes
         // rather than something it refuses over.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("rev-no-ws-test");
+        let mut run = make_run(&env, "rev-no-ws-test");
         run.workspace = None;
 
         spawn_reviewer(
@@ -8537,9 +8520,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_records_seed_and_phase_send_routes_to_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-seed-test", "ws-rs");
+        let mut run = make_run_with_workspace(&env, "rev-seed-test", "ws-rs");
         let seed = Path::new("/tmp/review-seed.md");
 
         spawn_reviewer(
@@ -8586,9 +8569,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_preserves_focus() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-focus-test", "ws-rf");
+        let mut run = make_run_with_workspace(&env, "rev-focus-test", "ws-rf");
 
         spawn_reviewer(
             &h,
@@ -8621,9 +8604,9 @@ mod tests {
 
     #[test]
     fn phase_start_empty_project_dir_returns_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("empty-proj-dir-test");
+        let mut run = make_run(&env, "empty-proj-dir-test");
         run.project_dir = String::new();
 
         let result = phase_start(&h, &mut run, "brainstorm", None);
@@ -8649,9 +8632,9 @@ mod tests {
     /// it — which is exactly what the first pass of this change did.
     #[test]
     fn every_missing_project_dir_refusal_names_the_field_instead_of_starting_over() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("proj-dir-wording-test");
+        let mut run = make_run(&env, "proj-dir-wording-test");
         run.project_dir = String::new();
 
         let from_start = phase_start(&h, &mut run, "brainstorm", None).unwrap_err();
@@ -8685,9 +8668,9 @@ mod tests {
 
     #[test]
     fn spawn_reviewer_empty_project_dir_returns_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("rev-empty-proj-test", "ws-e");
+        let mut run = make_run_with_workspace(&env, "rev-empty-proj-test", "ws-e");
         run.project_dir = String::new();
 
         let result = spawn_reviewer(
@@ -8785,9 +8768,9 @@ mod tests {
 
     #[test]
     fn phase_start_rejects_a_shell_metacharacter_phase_name() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("inject-reject-test");
+        let mut run = make_run(&env, "inject-reject-test");
 
         let err = phase_start(&h, &mut run, "p; rm -rf ~", None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -8802,9 +8785,9 @@ mod tests {
     fn spawn_reviewer_rejects_a_shell_metacharacter_phase_name() {
         // The HTTP-reachable half: `review:<task>:<iter>:<angle>` is built from a
         // task string the review server only checks for path safety.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("inject-reviewer-test", "ws-i");
+        let mut run = make_run_with_workspace(&env, "inject-reviewer-test", "ws-i");
 
         let err = spawn_reviewer(
             &h,
@@ -8827,10 +8810,8 @@ mod tests {
         // Defence in depth behind `require_phase_name`: run names and pass tokens
         // are NOT restricted the way phase names are, and this is the one command
         // string drovr hands to a shell rather than to a human.
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
+        let env = TestEnv::new();
+        env.unset("CLAUDE_CONFIG_DIR");
         let h = FakeHerdr::new();
 
         launch_in_pane(
@@ -8868,9 +8849,9 @@ mod tests {
     fn phase_done_remediation_commands_are_quoted() {
         // The refusal prints a command the agent's human is meant to paste. A run
         // name is validated for path safety only, so it can carry metacharacters.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("done-quote-test; id");
+        let mut run = make_run(&env, "done-quote-test; id");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         write_handoff(&run, "plan");
@@ -8886,7 +8867,7 @@ mod tests {
         );
 
         // Case 2: an untokened phase holding a token — remedy DROPS it.
-        let mut legacy = make_run("done-quote-legacy; id");
+        let mut legacy = make_run(&env, "done-quote-legacy; id");
         legacy.phases.push(
             {
                 let mut p = Phase::new("plan");
@@ -8897,13 +8878,9 @@ mod tests {
         );
         legacy.save().unwrap();
         write_handoff(&legacy, "plan");
-        unsafe {
-            std::env::set_var(PASS_ENV, "t-from-elsewhere");
-        }
+        env.set(PASS_ENV, "t-from-elsewhere");
         let err = phase_done(&legacy, "plan").unwrap_err().to_string();
-        unsafe {
-            std::env::remove_var(PASS_ENV);
-        }
+        env.unset(PASS_ENV);
         assert!(
             err.contains("env -u DROVR_PASS drovr phase done 'done-quote-legacy; id' 'plan'"),
             "the drop-the-token remedy must be quoted too: {err}"
@@ -8917,14 +8894,14 @@ mod tests {
         // exactly the state that later reads as a phantom incomplete phase. The
         // bare transport error says nothing about it, and the caller is left
         // believing nothing happened.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-fail-test");
+        let mut run = make_run(&env, "send-fail-test");
 
         phase_start(&h, &mut run, "plan", None).unwrap();
         write_handoff(&run, "plan");
         let pass = run.phases[0].pass.clone().unwrap();
-        agent_signals_done(&run, "plan", &pass);
+        agent_signals_done(&env, &run, "plan", &pass);
         run.phases[0].status = PhaseStatus::Done;
         run.save().unwrap();
 
@@ -8955,9 +8932,9 @@ mod tests {
         // its `.done` marker is intact. Claiming "your marker is deleted and the
         // status is back to Running" there is a false diagnostic about a phase
         // that is genuinely, correctly complete.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("send-fail-reviewer-test");
+        let mut run = make_run(&env, "send-fail-reviewer-test");
         run.review_phases.push(
             {
                 let mut p = Phase::new("review:t:1:correctness");
@@ -9023,9 +9000,9 @@ mod tests {
         // So the strict alphabet gates CREATION only. The resolve path keeps the
         // path-safety rule, and the emitted commands are quoted (they always must
         // be: run names are unrestricted too).
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("old-name-test");
+        let mut run = make_run(&env, "old-name-test");
         let legacy = "review:t:1:api & contracts";
         run.review_phases.push(
             {
@@ -9067,9 +9044,9 @@ mod tests {
         // destroying the reviewer's genuine completion marker.
         //
         // A phase name must identify ONE phase.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("name-collision-test", "ws-nc");
+        let mut run = make_run_with_workspace(&env, "name-collision-test", "ws-nc");
         let name = "review:t:1:correctness";
         spawn_reviewer(
             &h,
@@ -9100,9 +9077,9 @@ mod tests {
 
     #[test]
     fn a_name_a_pipeline_phase_already_holds_cannot_become_a_reviewer() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("name-collision-rev-test", "ws-ncr");
+        let mut run = make_run_with_workspace(&env, "name-collision-rev-test", "ws-ncr");
         phase_start(&h, &mut run, "plan", None).unwrap();
 
         let err = spawn_reviewer(
@@ -9131,9 +9108,9 @@ mod tests {
         // `spawn_reviewer` refuses it. Merging main is safe because main already
         // retains-then-spawns; a future respawn that forgets to will fail loudly
         // here instead of silently rerouting the reviewer's pane.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run_with_workspace("reviewer-respawn-test", "ws-rr");
+        let mut run = make_run_with_workspace(&env, "reviewer-respawn-test", "ws-rr");
         let name = "review:t:1:correctness";
 
         spawn_reviewer(
@@ -9178,9 +9155,9 @@ mod tests {
         // legacy-named phases the create/resolve split exists to keep working.
         // The strict rule applies to a name being INTRODUCED, not to one already
         // in state.json.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let mut run = make_run("old-name-reentry-test");
+        let mut run = make_run(&env, "old-name-reentry-test");
         let legacy = "my task 1";
         run.phases.push(
             {

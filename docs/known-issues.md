@@ -1,5 +1,63 @@
 # Known issues
 
+## Two test binaries on one machine fight over the fixed `/tmp/drovr-*-test-*` scratch roots (2026-08-06)
+
+**Severity:** high while several worktrees are live — it reds an arbitrary ~30 to ~210 tests in a
+run that has nothing wrong with it, and the first-reported failure is never the cause.
+**Found:** run `enforce-env-lock`, task 6, while measuring `cargo test` stability.
+
+### Symptom
+
+`cargo test` intermittently reports tens of failures, almost all
+`called Result::unwrap() on an Err value: PoisonError { .. }`. The one non-poison panic is a
+`WouldBlock` out of `acquire_run_lock`:
+
+```
+called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error:
+"another drovr command is moving run 'rh-profile's panes around ..." }
+```
+
+Only one test in the binary uses the run name `rh-profile`, and it holds `ENV_LOCK`, so the
+contending `flock` holder cannot be another test in the same process.
+
+### Root cause
+
+The test fixtures that predate `TestEnv` point `XDG_DATA_HOME` at a *fixed, machine-global* path
+derived from the run name — `phase::rehydrate_tests::rehydrate_run` uses
+`/tmp/drovr-rehydrate-test-{name}`, and `capture_tests`, `reap_tests` and the old
+`phase::tests::make_run` had the same shape. Every checkout of drovr on the machine therefore
+resolves the *same* `run.lock`. `acquire_run_lock` is `flock`-shaped, so a second test binary —
+another worktree's `cargo test`, a `nix build` checkPhase, a rerun that overlapped — takes the lock
+and the first gets `WouldBlock`. The panic happens under `ENV_LOCK`, which poisons it, and the
+cascade documented under *"A panicking test can poison `ENV_LOCK` for the whole suite"* turns one
+failure into every subsequent lock-taking test.
+
+Reproduce deterministically by running two copies of the same test binary at once:
+
+```sh
+B=cli/target/debug/deps/drovr-<hash>
+$B > a.txt 2>&1 & $B > b.txt 2>&1 & wait
+```
+
+One side comes back with ~200 failures and ~200 `PoisonError`s. Confirmed at `25fab8f` (before any
+task-6 edit) and at task 6's head — it is not caused by either.
+
+### Consequence for measurement
+
+**Do not conclude a change made the suite flaky by comparing run counts across time.** With eight
+sibling worktrees built, the flake rate tracks what the *other* agents are doing, not the diff
+under test. An unpaired batch of runs at `25fab8f` came back 0/9 clean while task 6's head came back
+6/14 cascaded, purely because the windows differed; the two-binary experiment above shows both
+commits fail identically.
+
+### Fix
+
+Give every test its own scratch root. `cli/src/test_env.rs`'s `TestEnv` does exactly this (a
+`tempfile::TempDir` per test), so a module is immune once its fixtures take `&TestEnv` —
+`phase::tests` is, as of task 6. The remaining exposed fixtures are `phase::capture_tests`,
+`phase::rehydrate_tests`, `phase::reap_tests` (task 7), `code_review.rs` (task 8) and
+`run.rs`/`brief.rs`/`main.rs` (task 9).
+
 ## Reviewers judge an intermediate task against the WHOLE run's goal
 
 **Severity:** medium (every intermediate task of every multi-task run draws a spurious CRITICAL, and
