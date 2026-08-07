@@ -730,7 +730,7 @@ impl SystemHerdr {
         params: Value,
         read_timeout: Duration,
     ) -> io::Result<CallResult> {
-        let path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| {
+        let path = crate::env::var("HERDR_SOCKET_PATH").map_err(|_| {
             io::Error::other("HERDR_SOCKET_PATH is not set; cannot reach herdr socket")
         })?;
         let id = SystemTime::now()
@@ -796,7 +796,7 @@ impl SystemHerdr {
     fn agent_env(&self) -> Value {
         let mut map = serde_json::Map::new();
         for var in AGENT_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
+            if let Ok(val) = crate::env::var(var) {
                 map.insert((*var).to_string(), Value::String(val));
             }
         }

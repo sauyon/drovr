@@ -2855,7 +2855,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-reap-off");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         std::fs::write(&cfg, "reap_finished_panes = false\n").unwrap();
@@ -2882,7 +2882,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-readonly-done");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -3247,7 +3247,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-aborted-pass");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3321,7 +3321,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-fast-reviewer");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3382,7 +3382,7 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-late-session");
         // One angle, so the poll queue below maps to one reviewer deterministically.
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3445,7 +3445,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-backend");
         // Pin reviews to cursor while the RUN stays on claude — the divergence
         // this test exists for. `make_run` wrote `review_agent = "claude"`.
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(&cfg, "review_agent = \"cursor\"\n").unwrap();
         assert_eq!(run.agent.as_deref(), Some("claude"), "the run is claude");
@@ -3581,7 +3581,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-mcp-project-file");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -3699,7 +3699,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-opencode-dir");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3759,7 +3759,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-opencode-toctou");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3844,7 +3844,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-cfg-decoy");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3888,7 +3888,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-opencode-decoy");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3936,7 +3936,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-opencode-dir-2");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3986,7 +3986,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-mcp-opencode");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -4039,7 +4039,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-mcp-foreign");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -4110,7 +4110,7 @@ mod tests {
         let (mut run, _repo) = make_run("cr-mcp-rewrite");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -4281,7 +4281,7 @@ mod tests {
         let h = FakeHerdr::new();
         let (mut run, _repo) = make_run("cr-mcp-none");
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"codex\"\n",
         )

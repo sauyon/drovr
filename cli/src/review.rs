@@ -2013,7 +2013,7 @@ pub fn ensure_server() -> io::Result<String> {
     }
     // Test seam: with DROVR_NO_SPAWN set, don't fork a daemon (spawning the test
     // binary with a `serve` arg would re-enter the harness). Just report down.
-    if std::env::var_os("DROVR_NO_SPAWN").is_some() {
+    if crate::env::var_os("DROVR_NO_SPAWN").is_some() {
         return Err(io::Error::other("drovr review server is not running"));
     }
     spawn_daemon()?;

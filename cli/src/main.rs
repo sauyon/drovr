@@ -2,6 +2,7 @@ mod blocked;
 mod brief;
 mod code_review;
 mod config;
+mod env;
 mod findings;
 mod herdr;
 mod mcp_findings;

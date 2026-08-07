@@ -873,9 +873,9 @@ fn legacy_agent() -> Option<String> {
 /// unchanged: the real CLI resolves the real data root, which is the point of
 /// it.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
+    let base = crate::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
+        .unwrap_or_else(|_| PathBuf::from(crate::env::var("HOME").unwrap()).join(".local/share"));
     #[cfg(test)]
     refuse_home_data_root(&base);
     base.join("drovr")
@@ -914,6 +914,9 @@ pub fn data_dir() -> PathBuf {
 /// * `$HOME` unset leaves nothing to protect and the check passes.
 #[cfg(test)]
 fn refuse_home_data_root(base: &std::path::Path) {
+    // Raw std::env on purpose: this guard must see the REAL $HOME, and the cfg(test)
+    // shim answers only from the overlay, which never seeds HOME. Dies with this
+    // function at T13.
     let home = match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
         _ => return,
@@ -930,7 +933,7 @@ fn refuse_home_data_root(base: &std::path::Path) {
              variant.",
             real_base.display(),
             real_home.display(),
-            std::env::var("XDG_DATA_HOME").ok(),
+            crate::env::var("XDG_DATA_HOME").ok(),
         );
     }
 }
@@ -1970,8 +1973,8 @@ mod tests {
     #[test]
     fn data_dir_refuses_to_resolve_inside_the_real_home() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
-        let prev = std::env::var("XDG_DATA_HOME").ok();
+        let home = PathBuf::from(crate::env::var("HOME").expect("HOME must be set"));
+        let prev = crate::env::var("XDG_DATA_HOME").ok();
 
         // (1) Unset: the `$HOME/.local/share` fallback.
         unsafe {
@@ -2091,7 +2094,7 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(dirs.len()));
 
         let lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("XDG_DATA_HOME").ok();
+        let prev = crate::env::var("XDG_DATA_HOME").ok();
 
         let handles: Vec<_> = dirs
             .iter()

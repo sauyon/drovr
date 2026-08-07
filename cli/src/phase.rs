@@ -2547,7 +2547,7 @@ fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
 /// profile the agent authenticated under, and "exactly" is not something two
 /// `std::env::var` calls in different files stay agreed on.
 fn agent_profile_env() -> Option<String> {
-    std::env::var("CLAUDE_CONFIG_DIR").ok()
+    crate::env::var("CLAUDE_CONFIG_DIR").ok()
 }
 
 /// What one `pane_info` poll has to say about a phase's persisted record.
@@ -3812,7 +3812,7 @@ pub fn phase_done(run: &RunState, phase: &str) -> io::Result<PathBuf> {
     // the agent through `herdr pane run`'s command string, and if herdr ever
     // hands the argument to a shell that does NOT strip them, the value would
     // arrive as `'abc-1'`. Our tokens never contain a quote, so this is free.
-    let token = std::env::var(PASS_ENV).unwrap_or_default();
+    let token = crate::env::var(PASS_ENV).unwrap_or_default();
     let token = token.trim().trim_matches('\'');
     // A marker this process cannot have matched to the running pass must not be
     // written with an exit 0: that tells the AGENT it finished while the driver

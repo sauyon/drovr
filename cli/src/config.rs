@@ -617,21 +617,21 @@ fn default_agents() -> BTreeMap<String, AgentSpec> {
 /// environment marker. Otherwise use markers exported by the major CLIs and
 /// fall back to the configured default when drovr is run from an ordinary shell.
 pub fn invoking_agent(config: &Config) -> String {
-    if let Ok(agent) = std::env::var("DROVR_AGENT")
+    if let Ok(agent) = crate::env::var("DROVR_AGENT")
         && !agent.trim().is_empty()
     {
         return agent;
     }
-    if std::env::var_os("CURSOR_AGENT").is_some() {
+    if crate::env::var_os("CURSOR_AGENT").is_some() {
         return "cursor".into();
     }
-    if std::env::var_os("CLAUDECODE").is_some() {
+    if crate::env::var_os("CLAUDECODE").is_some() {
         return "claude".into();
     }
-    if std::env::var_os("CODEX_THREAD_ID").is_some() {
+    if crate::env::var_os("CODEX_THREAD_ID").is_some() {
         return "codex".into();
     }
-    if std::env::var_os("OPENCODE").is_some() {
+    if crate::env::var_os("OPENCODE").is_some() {
         return "opencode".into();
     }
     config.default_agent.clone()
@@ -654,12 +654,12 @@ impl Default for Config {
 
 /// `${XDG_CONFIG_HOME:-$HOME/.config}/drovr/config.toml`
 pub fn config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
+    let base = crate::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             // `HOME` unset (CI/containers) must not panic: fall back to a relative
             // `.config`, which `load_config` will simply see as NotFound → defaults.
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = crate::env::var("HOME").unwrap_or_default();
             PathBuf::from(home).join(".config")
         });
     base.join("drovr").join("config.toml")
@@ -1119,7 +1119,7 @@ fn command_available(command: &str) -> bool {
         return executable_file(path);
     }
 
-    std::env::var_os("PATH")
+    crate::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).any(|dir| executable_file(&dir.join(command))))
         .unwrap_or(false)
 }
