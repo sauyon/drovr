@@ -5,9 +5,11 @@
 **Severity:** high while several worktrees are live — it reds an arbitrary ~30 to ~210 tests in a
 run that has nothing wrong with it, and the first-reported failure is never the cause.
 **Found:** run `enforce-env-lock`, task 6, while measuring `cargo test` stability.
-**Status:** one contributing cause confirmed and reproducible on demand (below). It is **not the
-whole story** — see *"The part that does not fit"*. Do not close this on the two-binary explanation
-alone.
+**Status:** **both causes now identified.** One is the shared `/tmp` scratch root (below), fixed by
+`TestEnv`. The other — the "apparently no holder" case — is a concurrent `fork` inheriting the
+locked fd; see *"The part that did not fit is now EXPLAINED"*. That second one is a **live
+production fault and is NOT fixed**; it is tracked separately. Do not close this entry on the
+two-binary explanation alone.
 
 ### Symptom
 
@@ -62,7 +64,69 @@ above explanation out for that occurrence:
 So something can make `File::try_lock` return `WouldBlock` with, apparently, no holder. Candidates
 not yet ruled out: a `drovr` child process left alive by an earlier phase; `flock` semantics under
 the sandbox's overlay/tmpfs mount; or a genuine second in-process acquisition on a path this
-instrumentation did not catch. **Unresolved.**
+instrumentation did not catch.
+
+### The part that did not fit is now EXPLAINED — a concurrent fork inherits the locked fd (2026-08-07)
+
+**Found:** run `enforce-env-lock`, task 8, the moment `code_review.rs`'s 65 tests stopped being
+serialized by `ENV_LOCK`. **This is a live PRODUCTION fault, not a test artifact.** It is being
+tracked separately; task 8 deliberately did **not** fix it, because changing `acquire_run_lock`'s
+refuse-fast semantics deserves its own design and review rather than a decision taken inside a
+test-isolation sweep.
+
+`acquire_run_lock` is `flock`-shaped, and an `flock` belongs to the **open file description**, not
+to the file descriptor. `fork()` copies the fd table, so a child created while the lock is held
+shares that description. Rust opens with `O_CLOEXEC`, so the child's copy goes away at `exec` — but
+between `fork` and `exec` the child holds the lock, and **the parent closing its own fd does not
+release it**. Any `try_lock` on that inode in that window returns `WouldBlock` with:
+
+- no fd on the inode anywhere in `/proc/self/fd` — the parent already closed its own, and
+- no entry for the inode in `/proc/locks` by the time you look, because the child has since `exec`ed.
+
+Which is exactly the "apparently no holder" signature above, and why it survives the nix sandbox:
+the forking process is drovr's own test binary, not another worktree's.
+
+Reproduce it standalone — 8 threads locking their **own private** files, plus N threads doing
+nothing but `Command::new("/bin/true").output()`:
+
+```rust
+// N forker threads spinning on Command::new("/bin/true").output(), plus:
+for t in 0..8 {                                  // each with its own private dir
+    for _ in 0..3000 {
+        let f = OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(dir.join("run.lock")).unwrap();
+        if f.try_lock().is_err() { fails += 1; }  // no other thread wants THIS file
+        drop(f);
+    }
+}
+```
+
+| forker threads | failures / 24000 attempts |
+| --- | --- |
+| 0 | **0** |
+| 4 | **3949** (~16%) |
+
+`ENV_LOCK` was masking it in the suite: while every lock-taking test was serialized, no test forked
+`git` concurrently with another test's `acquire_run_lock`. `code_review.rs`'s fixture runs `git` six
+times per test across 63 tests, so the moment those tests run in parallel the window is hit
+constantly.
+
+**Two tests turn it into a failure** rather than a warning, because a refused reap is best-effort
+everywhere else and only warns: `code_review::tests::a_finished_panel_reaps_its_reviewers` and
+`code_review::tests::a_finished_panel_sweeps_the_pane_its_respawn_orphaned`, both of which count
+`pane_close` calls. Both are left **failing and un-`#[ignore]`d** on purpose — they are the only
+executable evidence the fault is real. **Every task after task 8 in this run inherits those two
+failures and must not attribute them to its own work.**
+
+In production the same window makes `drovr phase reap`/`rehydrate` refuse with "another drovr
+command is moving run 'X's panes around" when nothing of the sort is happening — any concurrent
+subprocess spawn in the same process suffices.
+
+**Not fixed here.** Candidate fixes, for whoever takes the tracked issue: a short bounded retry on
+`WouldBlock` (the fork/exec window is microseconds, so this preserves "refuse fast" against a real
+holder); or serializing lock acquisition against process spawning; or an fd-inheritance-free locking
+primitive. Each changes documented semantics — see `acquire_run_lock`'s "**Why it fails rather than
+waits**".
 
 Frequency, measured with forced rebuilds (`nix build --no-link --rebuild`, interleaved to control
 for machine load): **0 failures in 5 rebuilds at task 6's head and 0 in 5 at `25fab8f`.** One
