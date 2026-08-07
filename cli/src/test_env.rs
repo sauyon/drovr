@@ -279,8 +279,9 @@ impl TestEnv {
     ///
     /// # Panics
     ///
-    /// If `key` is `XDG_DATA_HOME` or `XDG_CONFIG_HOME` and `val` resolves
-    /// inside the real `$HOME` but outside the system temp root — see
+    /// If `key` is one of [`GUARDED_KEYS`] — `XDG_DATA_HOME`,
+    /// `XDG_CONFIG_HOME` or `HOME` — and `val` is either not absolute, or
+    /// resolves inside the real `$HOME` but outside the system temp root. See
     /// [`refuse_home_root`]. The check runs *before* the lock is taken, so a
     /// rejected write cannot poison the overlay.
     pub fn set(&self, key: &str, val: impl AsRef<OsStr>) {
@@ -297,7 +298,24 @@ impl TestEnv {
     ///
     /// Masks rather than falls through: the key reads as absent afterwards even
     /// if the process environment still has it.
+    ///
+    /// # Panics
+    ///
+    /// If `key` is one of [`GUARDED_KEYS`]. Taking a root away is a way through
+    /// the check on naming one: with `XDG_CONFIG_HOME` absent and `HOME` never
+    /// seeded, `config::config_path()`'s `unwrap_or_default()` yields a
+    /// *relative* `.config/drovr/config.toml`, which resolves against the
+    /// working directory and therefore inside the real `$HOME` for any checkout
+    /// under it — silently. A root can be pointed somewhere else; it cannot be
+    /// removed.
     pub fn unset(&self, key: &str) {
+        if GUARDED_KEYS.contains(&key) {
+            panic!(
+                "drovr test guard: {key} cannot be unset — it names a root, and code that \
+                 resolves one falls back to $HOME (or, worse, to a relative path) when it \
+                 is absent. Point it at another temp dir with TestEnv::set instead.",
+            );
+        }
         self.cur
             .vars
             .write()
@@ -822,6 +840,32 @@ mod tests {
             .expect_err("a relative root must be refused");
             let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
             assert!(msg.contains("must be an absolute path"), "{key}: {msg}");
+        }
+    }
+
+    /// A root cannot be taken away either, only pointed somewhere safe.
+    ///
+    /// `unset` would otherwise be a hole straight through the write guard, and
+    /// the two guarded XDG keys fail differently when absent — which is what
+    /// makes it worth closing rather than reasoning about:
+    ///
+    /// * `unset(XDG_DATA_HOME)` → `data_dir()`'s `$HOME` fallback reads absent
+    ///   (the overlay never seeds `HOME`) and `.unwrap()` panics. Loud, safe.
+    /// * `unset(XDG_CONFIG_HOME)` → `config_path()`'s fallback is
+    ///   `unwrap_or_default()`, so an absent `HOME` yields a *relative*
+    ///   `.config/drovr/config.toml`, which resolves against the working
+    ///   directory — inside the real `$HOME` for any checkout under it. Silent,
+    ///   and exactly the class of thing this module exists to stop.
+    #[test]
+    fn a_guarded_key_cannot_be_unset() {
+        for key in GUARDED_KEYS {
+            let env = TestEnv::new();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.unset(key);
+            }))
+            .expect_err("unsetting a root must be refused");
+            let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("cannot be unset"), "{key}: {msg}");
         }
     }
 
