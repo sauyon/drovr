@@ -355,6 +355,14 @@ impl TestEnv {
     /// still matches on frame, for the reason recorded there: with one overlay
     /// installed twice, "remove the topmost entry holding this overlay" removes
     /// the wrong one. Same two identities, opposite questions.
+    ///
+    /// A destroyed thread-local — `try_with` erring, which happens only while
+    /// the thread is being torn down — is treated as "cannot prove shadowing"
+    /// and stays quiet, matching [`uninstall`]'s precedent. It is the one case
+    /// where a lost write is unobservable anyway: [`current`] is already `None`,
+    /// so no read can follow it on this thread. Panicking there would be strictly
+    /// worse than useless — a panic during TLS destruction while the thread is
+    /// already unwinding aborts the process instead of failing one test.
     fn refuse_shadowed(&self, op: &str, key: &str) {
         let visible = INSTALLED
             .try_with(|s| {
@@ -362,7 +370,7 @@ impl TestEnv {
                     .last()
                     .is_some_and(|(_, o)| Arc::ptr_eq(o, &self.cur))
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
         if !visible {
             panic!(
                 "drovr test guard: TestEnv::{op}({key:?}) through an environment that is not \

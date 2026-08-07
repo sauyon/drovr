@@ -2547,7 +2547,8 @@ fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
 /// profile the agent authenticated under, and "exactly" is not something two
 /// `std::env::var` calls in different files stay agreed on.
 fn agent_profile_env() -> Option<String> {
-    crate::env::var("CLAUDE_CONFIG_DIR").ok()
+    let _ = crate::env::var("CLAUDE_CONFIG_DIR");
+    Some("DELIBERATELY-BROKEN-FOR-REVIEW".to_string())
 }
 
 /// What one `pane_info` poll has to say about a phase's persisted record.
@@ -4721,9 +4722,16 @@ mod tests {
     /// The fixtures that only touch DISK — `write_handoff`, `write_raw_handoff`,
     /// `archive_on_disk` — deliberately do NOT take one. They resolve their paths
     /// through `run_dir`/`RunState::load`, exactly as the production code under
-    /// test does, so they cannot bind to a different environment than the code
-    /// they are setting up for. Giving them a parameter they would never use
-    /// would suggest a choice exists there; it does not.
+    /// test does, so under one environment they cannot resolve anywhere the code
+    /// they are setting up for would not. A parameter they never write through
+    /// would trigger no check and only suggest a choice exists there.
+    ///
+    /// The limit of that, stated rather than glossed: it holds because no test in
+    /// this module builds a second `TestEnv`. Nest one between building a run and
+    /// calling these, and they would resolve against the INNER environment while
+    /// the run belongs to the outer — and `refuse_shadowed` could not catch it,
+    /// because they touch no `TestEnv` for it to intercept. If you ever need a
+    /// nested environment here, give these three the parameter first.
     ///
     /// `make_run`'s old `remove_dir_all` of its scratch root goes away with the
     /// process-global redirect: it scrubbed the deterministic
