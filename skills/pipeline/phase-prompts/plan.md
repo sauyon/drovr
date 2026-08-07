@@ -55,7 +55,8 @@ implementation plan broken into independently-executable tasks. You are NOT impl
    - its verification (which test(s) prove it), and
    - dependencies on earlier tasks.
    Order tasks so each depends only on interfaces defined by earlier ones.
-4. **Self-review before finishing — REQUIRED.** There is no human gate here, so do not sign
+4. **Self-review before finishing — REQUIRED.** There is no human *approval* gate here (step 1's
+   ask channel is open the whole phase; what this phase lacks is a sign-off), so do not sign
    off on your own judgment alone. Launch one or more **read-only** review subagents (Claude
    Code Agent tool, `subagent_type: general-purpose`, model `sonnet`) to adversarially review
    the plan: are the tasks independent, correctly ordered, each small enough for one

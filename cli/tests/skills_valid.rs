@@ -6378,25 +6378,10 @@ fn task_binding_directive_present() {
     // (path, must it carry the directive, how to describe the expectation)
     let mut corpus: Vec<(PathBuf, bool, String)> = Vec::new();
 
-    let prompts_dir = skills_dir().join(PHASE_PROMPTS_DIR);
-    let entries = fs::read_dir(&prompts_dir).unwrap_or_else(|e| {
-        panic!(
-            "cannot read phase-prompts dir {}: {e}",
-            prompts_dir.display()
-        )
-    });
-    let mut prompts: Vec<PathBuf> = entries
-        .map(|entry| entry.expect("read_dir entry").path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    prompts.sort();
-    assert!(
-        !prompts.is_empty(),
-        "no `.md` files under {} — the derived part of the corpus is empty, so \
-         every assertion over it would pass having read nothing",
-        prompts_dir.display()
-    );
-    for path in prompts {
+    // The same reader `ask_channel_directive_present` uses — one corpus, so a
+    // change to the extension filter or the sort cannot reach one check and miss
+    // the other.
+    for path in phase_prompt_files() {
         corpus.push((
             path,
             true,
@@ -6601,11 +6586,22 @@ fn canonical_ask_directive() -> Quote {
 
 /// Every `.md` under `skills/pipeline/phase-prompts`, sorted, asserted non-empty.
 ///
-/// Shared by both ask-channel checks so neither can end up reading a different
-/// corpus from the other, and **derived** for the same reason
-/// [`task_binding_directive_present`]'s is: a phase-prompt added later must be
-/// required to carry the directive the day it lands, not the day someone
-/// remembers to extend a const.
+/// One reader, called by [`task_binding_directive_present`] and
+/// [`ask_channel_directive_present`] alike, so the two cannot end up asserting
+/// over different corpora — a change to the extension filter or the sort that
+/// reached only one of two inlined copies would silently stop applying to the
+/// other. (The rewording companions do not call it: they read no files at all,
+/// only the const and synthetic strings.)
+///
+/// **Derived**, for the reason [`task_binding_directive_present`] spells out: a
+/// phase-prompt added later must be required to carry the directive the day it
+/// lands, not the day someone remembers to extend a const.
+///
+/// Known gap, shared with the check this pattern comes from: the filter is
+/// `.md` only, so a `newphase.markdown` would not be seen. Left as is rather
+/// than widened, because the repo's convention is uniformly `.md` and inventing
+/// a second accepted extension here would make this file the only place that
+/// says otherwise.
 fn phase_prompt_files() -> Vec<PathBuf> {
     let dir = skills_dir().join(PHASE_PROMPTS_DIR);
     let entries = fs::read_dir(&dir)
@@ -6659,17 +6655,42 @@ fn ask_channel_directive_present() {
         .map(|(name, _)| (*name).to_string())
         .collect();
 
+    // Everything that disagrees is COLLECTED, phantom entries included, rather
+    // than panicking on the first kind found. Renaming an excluded file is two
+    // independent failures at once — the entry now names nothing, and the renamed
+    // file is now an unexcluded prompt with no directive — and a check that
+    // panicked on the first would send a maintainer round the loop twice to learn
+    // the second.
+    let mut wrong = Vec::new();
+
     let mut phantom: Vec<&String> = excluded.difference(&present).collect();
     phantom.sort();
-    assert!(
-        phantom.is_empty(),
-        "ASK_DIRECTIVE_EXCLUSIONS entries naming no phase-prompt: {phantom:?}\n\
-         The table is asserting absence about files that are not there. If a \
-         prompt was renamed, rename its entry; if it was deleted, delete its \
-         entry — do not leave an exclusion standing for nothing.",
-    );
+    if !phantom.is_empty() {
+        wrong.push(format!(
+            "ASK_DIRECTIVE_EXCLUSIONS entries naming no phase-prompt: {phantom:?}\n\
+             The table is asserting absence about files that are not there. If a \
+             prompt was renamed, rename its entry; if it was deleted, delete its \
+             entry — do not leave an exclusion standing for nothing."
+        ));
+    }
 
-    let mut wrong = Vec::new();
+    // **At least one prompt must actually carry the directive.** Without this the
+    // check is satisfiable by exclusion: add every phase-prompt to the table,
+    // delete the text from all of them, and every remaining assertion below is
+    // about absence and passes clean. That is a real hole and not a theoretical
+    // one — the exclusion table is the one part of this check a future task is
+    // expected to edit. `task_binding_directive_present` is not exposed to it
+    // because its corpus carries unconditional must-carry members; this one's is
+    // table-driven end to end, so the floor has to be stated.
+    assert!(
+        excluded.len() < prompts.len(),
+        "every phase-prompt ({}) is in ASK_DIRECTIVE_EXCLUSIONS, so this check \
+         asserts nothing but absence and would pass with the directive deleted \
+         everywhere. An exclusion is for a prompt that briefs a non-writer; if \
+         every prompt is one, the directive has no site left and this check \
+         should be deleted rather than left standing empty.",
+        prompts.len(),
+    );
     for path in &prompts {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let excuse = ASK_DIRECTIVE_EXCLUSIONS
@@ -6685,22 +6706,34 @@ fn ask_channel_directive_present() {
             (None, 1) | (Some(_), 0) => continue,
             (None, 0) => {
                 // The likely failure is a rewording, not an omission, so show the
-                // drifting block rather than only the count.
-                let near = quotes
+                // drifting block rather than only the count. **Every** candidate,
+                // not the first: `drovr ask` is the name of the feature this
+                // directive is about, so prose elsewhere in the file may quote it
+                // too, and showing only the first match points a maintainer at an
+                // unrelated note while the actual drift stays invisible.
+                let near: Vec<&Quote> = quotes
                     .iter()
-                    .find(|quote| quote.as_str().contains("drovr ask"));
-                wrong.push(match near {
-                    Some(drifted) => format!(
-                        "{}: briefs a writer, so it must carry the ask directive, but it \
-                         quotes a DIFFERENT one:\n    {}",
-                        path.display(),
-                        drifted.as_str()
-                    ),
-                    None => format!(
+                    .filter(|quote| quote.as_str().contains("drovr ask"))
+                    .collect();
+                wrong.push(if near.is_empty() {
+                    format!(
                         "{}: briefs a writer, so it must carry the ask directive, and it \
                          does not quote it at all",
                         path.display()
-                    ),
+                    )
+                } else {
+                    let blocks: Vec<String> = near
+                        .iter()
+                        .map(|quote| format!("    {}", quote.as_str()))
+                        .collect();
+                    format!(
+                        "{}: briefs a writer, so it must carry the ask directive. It has \
+                         {} block quote(s) mentioning `drovr ask`, none of them the \
+                         directive — one of these has drifted:\n{}",
+                        path.display(),
+                        near.len(),
+                        blocks.join("\n")
+                    )
                 });
             }
             (None, n) => wrong.push(format!(

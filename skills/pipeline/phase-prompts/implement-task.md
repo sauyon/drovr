@@ -43,6 +43,13 @@ tasks; later tasks run as their own fresh phases.
    > a wait re-armed just after the human answered still hands you the answer. A timeout costs
    > nothing; a guess costs the run.
 
+   **`ask wait` is the ONE wait you may end your turn on — and step 6 is not it.** The rule there
+   is the same rule, not a different one: never park on something nothing will come to wake you
+   from. A backgrounded review panel or subagent is exactly that, which is why step 6 forbids it.
+   An ask is the opposite — it puts a question in front of a human, and their answer is what
+   un-parks you. So: post the ask, do whatever does not depend on the answer, and only then
+   background the wait and end the turn.
+
 2. **Read** the task brief and the accumulated interfaces in the `## Context from the driver`
    section, then read the real code you
    will touch (read-only explorers for anything you only need to understand, not change).
