@@ -4710,12 +4710,28 @@ mod tests {
     use crate::run::{Phase, PhaseStatus, RunState};
     use crate::test_env::TestEnv;
 
-    /// The `&TestEnv` parameter IS the contract: the run this returns resolves
-    /// under that environment's data root and nowhere else. The old fixture
-    /// redirected `XDG_DATA_HOME` process-globally and needed a `remove_dir_all`
-    /// to scrub the deterministic `/tmp/drovr-phase-test-{name}` root it shared
-    /// with every other run of the suite; a `TestEnv`'s root is per-test and
-    /// already empty.
+    /// Only the fixtures that WRITE the environment take `&TestEnv`.
+    ///
+    /// The parameter is not decorative and it is not merely the old "Caller must
+    /// hold ENV_LOCK" comment in parameter form: every write below goes through
+    /// [`TestEnv::set`]/[`TestEnv::unset`], which refuse a `TestEnv` that is not
+    /// the innermost one installed on the thread. Hand a fixture the wrong
+    /// environment and it panics rather than writing where nothing will read.
+    ///
+    /// The fixtures that only touch DISK — `write_handoff`, `write_raw_handoff`,
+    /// `archive_on_disk` — deliberately do NOT take one. They resolve their paths
+    /// through `run_dir`/`RunState::load`, exactly as the production code under
+    /// test does, so they cannot bind to a different environment than the code
+    /// they are setting up for. Giving them a parameter they would never use
+    /// would suggest a choice exists there; it does not.
+    ///
+    /// `make_run`'s old `remove_dir_all` of its scratch root goes away with the
+    /// process-global redirect: it scrubbed the deterministic
+    /// `/tmp/drovr-phase-test-{name}` root this fixture shared with every other
+    /// run of the suite — and with every other checkout of drovr on the machine
+    /// (`docs/known-issues.md`, "Two test binaries on one machine fight over the
+    /// fixed `/tmp/drovr-*-test-*` scratch roots"). A `TestEnv`'s root is
+    /// per-test and already empty.
     fn make_run(env: &TestEnv, name: &str) -> RunState {
         // `phase_done` stamps the pass token into the marker; a value left behind
         // by an earlier call under the same environment would silently change

@@ -287,6 +287,7 @@ impl TestEnv {
     pub fn set(&self, key: &str, val: impl AsRef<OsStr>) {
         let val = val.as_ref();
         refuse_home_root(key, Path::new(val));
+        self.refuse_shadowed("set", key);
         self.cur
             .vars
             .write()
@@ -316,11 +317,61 @@ impl TestEnv {
                  is absent. Point it at another temp dir with TestEnv::set instead.",
             );
         }
+        self.refuse_shadowed("unset", key);
         self.cur
             .vars
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key);
+    }
+
+    /// Refuse a write through a `TestEnv` that is not the innermost frame on
+    /// this thread.
+    ///
+    /// [`current`] answers the shim from `INSTALLED.last()`, so a write into a
+    /// shadowed overlay's map lands somewhere no `crate::env::var` will ever
+    /// look: the call returns normally, the variable never changes, and the
+    /// test asserts against the value it thinks it just set. That is the exact
+    /// shape of silent failure this module exists to remove — the process-global
+    /// `set_var` it replaces failed the same way, just for a different reason.
+    ///
+    /// The situation is reachable two ways. A test can hold two live `TestEnv`s
+    /// and write through the outer one; or a fixture taking `&TestEnv` can be
+    /// handed an environment other than the one its caller installed, which is
+    /// why the sweep's fixtures take the environment as a parameter rather than
+    /// building their own (`plan.md`, the T6–T12 shared rule). Neither is
+    /// expressible in the type system — `TestEnv` is `!Send`, so the frame is
+    /// known to be on *this* thread, but not that it is on top.
+    ///
+    /// A hard `panic!`, not a `debug_assert!`: the suite's own release-profile
+    /// runs (`nix build`'s `checkPhase`) are exactly where a silent write would
+    /// be hardest to notice.
+    ///
+    /// The predicate is OVERLAY identity, not [`FrameId`] identity, and the two
+    /// genuinely differ here. `env.handle().enter()` on the installing thread
+    /// pushes a *second frame over the same overlay* — a legitimate, tested
+    /// shape — and a write through `env` while that guard is alive lands in the
+    /// very map the reads come from. Comparing frames would refuse it. `Drop`
+    /// still matches on frame, for the reason recorded there: with one overlay
+    /// installed twice, "remove the topmost entry holding this overlay" removes
+    /// the wrong one. Same two identities, opposite questions.
+    fn refuse_shadowed(&self, op: &str, key: &str) {
+        let visible = INSTALLED
+            .try_with(|s| {
+                s.borrow()
+                    .last()
+                    .is_some_and(|(_, o)| Arc::ptr_eq(o, &self.cur))
+            })
+            .unwrap_or(false);
+        if !visible {
+            panic!(
+                "drovr test guard: TestEnv::{op}({key:?}) through an environment that is not \
+                 installed on this thread. Reads answer from the innermost TestEnv, so this \
+                 write would be invisible — the variable would keep its old value and the \
+                 assertion after it would test nothing. Write through the innermost TestEnv, \
+                 or drop it first."
+            );
+        }
     }
 
     /// The scratch root — the parent of both seeded roots.
@@ -776,6 +827,58 @@ mod tests {
         assert_eq!(crate::run::data_dir(), other.path().join("drovr"));
         env.set(CONFIG_KEY, other.path().join("cfg"));
         assert_eq!(env.config_root(), other.path().join("cfg"));
+    }
+
+    /// A write through a shadowed `TestEnv` is refused rather than lost.
+    ///
+    /// Found by task 6's review panel. Reads answer from `INSTALLED.last()`, so
+    /// writing through the OUTER of two live environments used to return
+    /// normally while changing nothing a `crate::env::var` would ever see — the
+    /// variable kept its old value and the assertion after it tested nothing.
+    /// That is the same silent-success failure the process-global `set_var` had,
+    /// which is the whole reason this module exists, so it has to be loud.
+    ///
+    /// `catch_unwind` for the reasons given on
+    /// `setting_the_data_root_inside_the_real_home_panics`; the panic takes no
+    /// lock and cannot poison anything.
+    #[test]
+    fn writing_through_a_shadowed_env_is_refused_not_silently_lost() {
+        let outer = TestEnv::new();
+        outer.set("SHADOW_PROBE", "from-outer");
+        let inner = TestEnv::new();
+
+        for op in ["set", "unset"] {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match op {
+                "set" => outer.set("SHADOW_PROBE", "from-outer-while-shadowed"),
+                _ => outer.unset("SHADOW_PROBE"),
+            }))
+            .expect_err("a write through the shadowed env must panic");
+            let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("not installed on this thread"), "{op}: {msg}");
+        }
+
+        // The refused writes changed neither overlay: the inner one never held
+        // the key, and the outer one still holds its original value.
+        assert_eq!(crate::env::var_os("SHADOW_PROBE"), None);
+        drop(inner);
+        assert_eq!(
+            crate::env::var("SHADOW_PROBE").as_deref(),
+            Ok("from-outer"),
+            "a refused write must not have modified the shadowed overlay either"
+        );
+
+        // ...and the guard does NOT fire on the shape that only *looks* like
+        // shadowing: `enter()` on the installing thread pushes a second frame
+        // over the SAME overlay, so a write through `outer` is still the write
+        // the reads see. A frame-identity check would wrongly refuse this.
+        let entered = outer.handle().enter();
+        outer.set("SHADOW_PROBE", "still-visible");
+        assert_eq!(
+            crate::env::var("SHADOW_PROBE").as_deref(),
+            Ok("still-visible"),
+            "a second frame over the same overlay is not shadowing"
+        );
+        drop(entered);
     }
 
     /// Every quadrant of the rule, including the one this machine cannot
