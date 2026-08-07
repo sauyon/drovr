@@ -119,7 +119,9 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
-   `{turn, decision, feedback, answers, annotations}`. An empty `feedback` does not mean an empty
+   `{turn, decision, feedback, annotations}`, plus a vestigial `answers` the review page no
+   longer populates — questions are asked with `drovr ask` and answered into `interview.jsonl`,
+   never here. An empty `feedback` does not mean an empty
    turn — the reviewer may have said everything in `annotations` (per-line comments on the spec).
    Forward it to the agent:
    ```

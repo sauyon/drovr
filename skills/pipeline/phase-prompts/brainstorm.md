@@ -68,8 +68,8 @@ reviewer. You are NOT implementing anything.
      no memory of what you just read. Put what is needed to decide into `--context <text>` or
      `--context-file <path>`: what the code actually does today, the alternatives you weighed,
      what each one costs.
-   - **Stop when the design is decided, not when you run out of questions — and not before
-     that.** Under-interviewing is the failure to expect: it feels like progress, and it is
+   - **Stop when the design is decided — not when you run out of questions, and not one ask
+     earlier.** Under-interviewing is the failure to expect: it feels like progress, and it is
      where the guesses come from. The test is concrete — if you could not write down the
      spec's interfaces without guessing at one of them, you are still interviewing. This
      interview is more economical than a chat-based grilling only because step 2 comes first,

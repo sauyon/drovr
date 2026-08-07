@@ -660,6 +660,15 @@ mod tests {
     /// has to survive — which is the point, since this file has no business
     /// failing over the prompt's copy-editing.
     ///
+    /// **Counted, not merely present.** Several tokens repeat (`<value>` four
+    /// times, `<text>`/`<path>`/`<label>` twice each), so a presence check would
+    /// accept a rule that ate three of four `<value>`s and left one standing —
+    /// green, while asserting something weaker than the sentence above. Not
+    /// reachable through today's two literal `str::replace` calls, which are
+    /// all-or-nothing per pattern; asserted anyway, because the whole point of
+    /// deriving the corpus is that the rule outlives the implementation that
+    /// happens to satisfy it.
+    ///
     /// Both halves, because half of an allowlist is not one. `<run>` must be
     /// **gone** from the composed brief — the ask directive tells the agent to run
     /// `drovr ask <run> …` verbatim, and an unsubstituted one there is a command
@@ -678,12 +687,12 @@ mod tests {
         // The editorial comment is stripped before substitution, so tokens inside
         // it are absent from the brief for an unrelated reason and would report a
         // failure this test is not about.
-        let mut prose: Vec<&str> = angle_tokens(strip_editorial_comment(BRAINSTORM))
-            .into_iter()
-            .filter(|token| *token != "<run>" && *token != "<N>")
-            .collect();
-        prose.sort_unstable();
-        prose.dedup();
+        let mut prose: std::collections::BTreeMap<&str, usize> = Default::default();
+        for token in angle_tokens(strip_editorial_comment(BRAINSTORM)) {
+            if token != "<run>" && token != "<N>" {
+                *prose.entry(token).or_default() += 1;
+            }
+        }
         assert!(
             !prose.is_empty(),
             "brainstorm.md carries no angle-bracket prose outside the substituted \
@@ -691,11 +700,13 @@ mod tests {
              nothing"
         );
 
-        for token in &prose {
+        for (token, wanted) in &prose {
+            let seen = brief.matches(token).count();
             assert!(
-                brief.contains(token),
-                "`{token}` is prose, not a placeholder, and composition ate it — \
-                 substitution must stay an allowlist: {brief}"
+                seen >= *wanted,
+                "`{token}` is prose, not a placeholder, and composition ate {} of its \
+                 {wanted} occurrence(s) — substitution must stay an allowlist: {brief}",
+                wanted - seen
             );
         }
         assert!(
