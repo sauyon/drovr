@@ -1559,6 +1559,84 @@ check('a recovering poll does not wipe an unread submit error', await evaluate(`
     stillShown: 'could not append the answer',
   });
 
+// The failures the poll can hit that are NOT an HTTP status: the request never
+// completing, and the render throwing on what came back. Both used to be swallowed
+// whole, leaving a question on screen that the page could no longer refresh and an
+// answer channel that could no longer deliver, with nothing said.
+check('the poll says so when it cannot reach the server, and recovers', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var duringOutage = document.getElementById('interview-error');
+    var said = !!duringOutage && duringOutage.style.display !== 'none' && duringOutage.textContent;
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var back = document.getElementById('interview-error');
+    var got = { said: said,
+                clearedOnRecovery: !back || back.style.display === 'none',
+                askBack: !!document.querySelector('#interview-area .interview-question') };
+    await pollInterview(routeGen);      // re-arm the chain for the checks below
+    return got;
+  })();`), { said: 'The interview could not be reached. Retrying…', clearedOnRecovery: true, askBack: true });
+
+check('a render that throws does not take the message with it', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, savedRender = renderInterview;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+    await pollInterview(routeGen);      // arm a poll message
+    clearTimeout(interviewTimer);
+    window.fetch = saved;
+    // A successful read whose render blows up. Clearing the message BEFORE the
+    // render means this path ends with a stale panel and nothing on it.
+    window.renderInterview = function() { throw new Error('forced render failure'); };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    window.renderInterview = savedRender;
+    var el = document.getElementById('interview-error');
+    var got = !!el && el.style.display !== 'none' && el.textContent;
+    interviewMsg = null; paintInterviewMsg();
+    await pollInterview(routeGen);
+    return got;
+  })();`), 'The interview could not be reached. Retrying…');
+
+// The answer landed and only the read-back did not, so the question is still on
+// screen looking exactly as unanswered as before. Saying nothing reads as "the
+// button did nothing" and invites a resubmit of an answer already in the log.
+check('an answer whose read-back fails still says it was recorded', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ ok: true, id: currentAsk.id }); } });
+      }
+      return Promise.reject(new Error('forced read-back failure'));
+    };
+    document.getElementById('interview-text').value = 'recorded but not read back';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var el = document.getElementById('interview-error');
+    var btn = document.getElementById('interview-answer-btn');
+    var got = { said: !!el && el.style.display !== 'none' && el.textContent,
+                buttonUsable: !!btn && !btn.disabled };
+    window.fetch = saved;
+    interviewMsg = null; paintInterviewMsg();
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    clearTimeout(interviewTimer);
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    said: 'Your answer was recorded. The question could not be reloaded; retrying…',
+    buttonUsable: true,
+  });
+
 // The POST is addressed to the run that was on screen when the button was
 // clicked, and its response belongs to that run too. A 409 says THAT run was
 // cancelled — applying it to whatever is on screen now mutes a live run's panel,

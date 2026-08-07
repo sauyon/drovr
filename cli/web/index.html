@@ -2327,6 +2327,13 @@ function setInterviewMsg(kind, text) {
   paintInterviewMsg();
 }
 
+// A read failure is the least urgent thing this panel can say — it recovers by
+// itself — so it never speaks over an answer that did not land or a run that was
+// cancelled. Neither of those recovers on its own.
+function sayPollFailed(text) {
+  if (!interviewMsg || interviewMsg.kind === 'poll') setInterviewMsg('poll', text);
+}
+
 async function pollInterview(gen) {
   if (gen !== routeGen) return;
   try {
@@ -2347,23 +2354,31 @@ async function pollInterview(gen) {
         var errBody = await r.json();
         if (errBody && errBody.error) msg = errBody.error;
       } catch (e) { /* not JSON; keep the generic message */ }
-      // A read failure is the least urgent thing this panel can say — it recovers
-      // by itself — so it never speaks over an answer that did not land or a run
-      // that was cancelled. Those two do not recover on their own.
-      if (gen === routeGen && (!interviewMsg || interviewMsg.kind === 'poll')) {
-        setInterviewMsg('poll', msg);
-      }
+      if (gen === routeGen) sayPollFailed(msg);
     } else {
       var data = await r.json();
       if (gen === routeGen) {
-        // A recovery clears ONLY what a read failure put there. Clearing more is
-        // how "your answer was not recorded" used to vanish inside 2s, leaving an
-        // unanswered question on a panel that looked perfectly normal.
-        if (interviewMsg && interviewMsg.kind === 'poll') interviewMsg = null;
         renderInterview(data);
+        // Cleared AFTER the render, not before it: a recovery that then throws
+        // would otherwise have taken the only message on screen with it, leaving
+        // stale questions and nothing said. A recovery also clears ONLY what a
+        // read failure put there — clearing more is how "your answer was not
+        // recorded" used to vanish inside 2s, leaving an unanswered question on a
+        // panel that looked perfectly normal.
+        if (interviewMsg && interviewMsg.kind === 'poll') {
+          interviewMsg = null;
+          paintInterviewMsg();
+        }
       }
     }
-  } catch (e) { /* transient; the next tick recovers */ }
+  } catch (e) {
+    // Not silent, unlike its sibling pollers: they mirror state the human only
+    // reads, while this panel is where an answer an agent is BLOCKED on gets
+    // typed. A page quietly showing a question it can no longer refresh, on a
+    // channel that can no longer deliver, is the failure this panel exists to
+    // retire. Self-clearing, so a single blip costs one tick's message.
+    if (gen === routeGen) sayPollFailed('The interview could not be reached. Retrying…');
+  }
   if (gen === routeGen) interviewTimer = setTimeout(function(){ pollInterview(gen); }, 2000);
 }
 
@@ -2445,10 +2460,13 @@ async function submitAnswer() {
     } catch (e) { /* handled below, same as a non-ok answer */ }
     if (gen !== routeGen) return;
     if (asks) { renderInterview(asks); return; }
-    // The answer landed; only the read-back did not. Re-enable rather than leave a
-    // dead button over a question that has already been answered — the scheduled
-    // tick repaints within 2s, and until it does the control still works.
+    // The answer landed; only the read-back did not. Say so — the question is
+    // still on screen and looks unanswered, which reads as "nothing happened" and
+    // invites a resubmit. Re-enable too, rather than leave a dead button over it.
+    // A 'poll' message, because the next successful tick is exactly what resolves
+    // this, and clears it on the way.
     if (btn) btn.disabled = false;
+    sayPollFailed('Your answer was recorded. The question could not be reloaded; retrying…');
     return;
   }
 
