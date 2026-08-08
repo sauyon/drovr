@@ -438,29 +438,6 @@ impl EnvHandle {
             _not_send: PhantomData,
         }
     }
-
-    /// A handle to whatever overlay the calling thread currently reads through.
-    ///
-    /// For a fixture that spawns workers on the caller's behalf and wants them
-    /// to resolve the environment the way their parent does — the review
-    /// server's request threads are the case this exists for. Threading a
-    /// `&TestEnv` parameter through such a fixture instead would force every
-    /// one of its callers to construct an environment, including the great
-    /// majority that pass an explicit root and read no variable at all.
-    ///
-    /// Capturing "whatever this thread reads through" cannot be handed the
-    /// wrong environment the way an explicit parameter can — that is what
-    /// [`TestEnv::refuse_shadowed`] exists to catch — because it is by
-    /// definition the innermost frame, the same one [`current`] answers the shim
-    /// from.
-    ///
-    /// `None` when nothing is installed. A worker spawned from a bare thread
-    /// then reads nothing and refuses loudly on its first access, which is the
-    /// intended outcome rather than a case to paper over: it means the test
-    /// wanted an environment and never said so.
-    pub fn of_current_thread() -> Option<EnvHandle> {
-        current().map(EnvHandle)
-    }
 }
 
 impl Drop for EnteredEnv {

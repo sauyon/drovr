@@ -2445,34 +2445,67 @@ mod tests {
     /// Start an always-on server on 127.0.0.1:0 in a background thread, rooted
     /// at `runs_root`. Returns the bound address string.
     ///
-    /// The workers adopt the calling thread's overlay, if it has one. Most
-    /// handlers resolve nothing from the environment — `runs_root` is passed in
-    /// explicitly, which is why the great majority of this fixture's callers
-    /// install no `TestEnv` at all — but some do: `handle_get_agents` calls
-    /// `config::load_config()`. Overlays are thread-scoped by design, so a
-    /// worker that did not enter one would read nothing and refuse on its first
-    /// access, surfacing as a 500 some distance from the cause.
-    ///
-    /// `None` is left as `None` deliberately rather than substituted for. A test
-    /// with no environment whose handler reaches for one is a test that failed
-    /// to say what it needed, and the refusal names the thread and the key.
+    /// The workers read no environment. That suits almost every test here:
+    /// `runs_root` is passed in explicitly, so nothing a handler needs comes
+    /// from a variable. A test whose handler DOES resolve one — today that is
+    /// only `handle_get_agents`, via `config::load_config()` — must use
+    /// [`start_server_with_env`] and say which environment it means.
     fn start_server(runs_root: PathBuf) -> String {
+        start_server_inner(None, runs_root)
+    }
+
+    /// [`start_server`], with the workers reading `env`.
+    ///
+    /// Takes the environment as a parameter rather than capturing whatever the
+    /// calling thread happens to have installed. An implicit capture reads
+    /// tidier and is worse: the handle it takes is the innermost frame only at
+    /// the instant of the call, so a test that later dropped or nested its
+    /// `TestEnv` would leave these workers — which outlive the test, since
+    /// nothing joins them — answering from an overlay the test itself has
+    /// stopped reading through. Nothing would catch that: `refuse_shadowed`
+    /// guards writes through a shadowed `TestEnv`, not a handle captured
+    /// earlier and entered later. The invariant would live in this doc comment,
+    /// which is the shape this whole run exists to delete.
+    ///
+    /// Named here, it is the caller's own `env` and the borrow says so.
+    ///
+    /// Cost, accepted: the workers are never joined, so the `EnvHandle` they
+    /// hold keeps `env`'s scratch `TempDir` alive for the rest of the test
+    /// binary's life rather than releasing it when `env` drops. That is the
+    /// same lifetime rule `Overlay` already applies deliberately — the
+    /// `TempDir` lives in the overlay precisely so a spawned thread cannot see
+    /// its root deleted out from under it — and it costs one small empty
+    /// directory, from the single call site that uses this.
+    fn start_server_with_env(env: &crate::test_env::TestEnv, runs_root: PathBuf) -> String {
+        start_server_inner(Some(env.handle()), runs_root)
+    }
+
+    fn start_server_inner(env: Option<crate::test_env::EnvHandle>, runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
         let bound_port = server.server_addr().to_ip().expect("ip addr").port();
         let ctx = Arc::new(Ctx::new(runs_root, allowed_hosts_for("127.0.0.1", bound_port)));
         let server = Arc::new(server);
-        let env = crate::test_env::EnvHandle::of_current_thread();
         for _ in 0..2 {
             let server = Arc::clone(&server);
             let ctx = Arc::clone(&ctx);
             let env = env.clone();
             thread::spawn(move || {
                 // Held for the worker's whole life: every request this thread
-                // serves must resolve the environment the test installed.
+                // serves resolves the environment the caller named.
                 let _entered = env.as_ref().map(|e| e.enter());
                 while let Ok(req) = server.recv() {
-                    handle(req, &ctx);
+                    // Isolate a panicking request, exactly as production
+                    // `serve` does. Without this a handler that refuses for
+                    // want of an overlay would kill the worker mid-request and
+                    // the test would fail with a connection reset — the
+                    // confusing, distant failure the refusal exists to replace.
+                    // With it the request 500s and the panic is printed by
+                    // name.
+                    let ctx = &ctx;
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle(req, ctx);
+                    }));
                 }
             });
         }
@@ -5203,14 +5236,15 @@ mod tests {
     #[test]
     fn the_agent_tree_says_when_its_sweep_reached_nothing() {
         // `handle_get_agents` is the one handler here that resolves a variable:
-        // it calls `config::load_config()`, which reads `XDG_CONFIG_HOME`. The
-        // request threads adopt this overlay (see `start_server`); without it
-        // they would have nothing to read and the endpoint would 500.
-        let _env = TestEnv::new();
+        // it calls `config::load_config()`, which reads `XDG_CONFIG_HOME`. Hence
+        // `start_server_with_env` below — the request threads read THIS
+        // environment, named rather than inferred; without one they would have
+        // nothing to read and the endpoint would 500.
+        let env = TestEnv::new();
         let tmp = std::env::temp_dir().join(format!("drovr-blk-10-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         make_running_run(&tmp, "blip", "w:p0");
-        let addr = start_server(tmp.clone());
+        let addr = start_server_with_env(&env, tmp.clone());
 
         // No herdr in the test environment, so the real `SystemHerdr` this
         // handler uses reaches nothing — which is precisely the state under
