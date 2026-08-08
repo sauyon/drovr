@@ -872,7 +872,7 @@ fn legacy_agent() -> Option<String> {
 /// two reads below go through [`crate::env`], which answers only from the
 /// calling thread's overlay and panics when there is none, so the only way a
 /// test reaches a data root is by naming one through
-/// [`crate::test_env::TestEnv`] — which refuses any root inside the real
+/// `TestEnv` (`cli/src/test_env.rs`) — which refuses any root inside the real
 /// `$HOME`. That single door is the guard; there is no second, weaker one
 /// beside it checking the value after the fact.
 ///

@@ -18,7 +18,7 @@
 //! failure rather than a silent one.
 //!
 //! There is likewise no fallthrough for the *absent overlay*. A read on a thread
-//! with no [`crate::test_env::TestEnv`] installed panics rather than answering
+//! with no `TestEnv` (`cli/src/test_env.rs`) installed panics rather than answering
 //! from the process. That is what makes the isolation authoritative instead of
 //! conventional: a test cannot opt out of declaring its environment, because
 //! there is no longer anything to opt out *to*.
@@ -27,7 +27,7 @@
 //! read. Process-global writes were the mechanism this removed, so there is no
 //! forwarding wrapper for them — that would be the same capability re-exported
 //! behind a nicer name. A test names its variables through
-//! [`crate::test_env::TestEnv`], which writes only its own thread's overlay.
+//! `TestEnv`, which writes only its own thread's overlay.
 
 use std::env::VarError;
 use std::ffi::OsString;
