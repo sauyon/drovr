@@ -1273,34 +1273,112 @@ claude -p --permission-mode plan --mcp-config <f> --strict-mcp-config \
   --allowedTools=mcp__drovr-findings__submit_findings "call submit_findings …"
 ```
 
-## One silent reviewer fails the whole `code-review run` (exit 1) instead of one angle
+## `--mode plan` refuses the edit TOOL, not a shell redirect — cursor is still open
 
-**Severity:** low-medium (recoverable — a plain re-run respawns the angle — but the exit code
-tells the pipeline driver to STOP and diagnose, for something self-healing).
-**Found:** 2026-07-26, reviewing the findings-channel wiring (`fix-review-json`). Not a
-regression; the behaviour predates the MCP findings channel.
+**Severity:** high for cursor (the invariant the review panel is built on is false for it);
+fixed for opencode.
+**Found:** 2026-08-08, panel `review:task-22:8`, gating Task 22.
 
 ### Symptom
 
-A reviewer that finishes without delivering anything — it never called `submit_findings`, so
-`<task>-review-<iter>-<angle>.json` does not exist — makes `code_review_run` return `Err`, which the
-CLI maps to **exit 1** ("setup failure: STOP and diagnose"). The other three angles' findings
-are already banked on disk and no merged `<task>-review.json` is written.
+A reviewer (`review:task-22:8:correctness`, backend `opencode`, `--agent plan`) ran
 
-### Why it is arguably wrong
+```
+git diff <base>..<head> > /tmp/full_diff.txt
+```
 
-The pass already knows how to recover from exactly this: the angle is marked
-`PhaseStatus::Failed`, and the next `drovr code-review run` replaces that reviewer in place
-(`cli/src/code_review.rs`, the respawn branch). So the state left behind is a *resumable* one,
-while the exit code says *unrecoverable*. Exit 2 (timeout — "resumable, re-run me") would
-describe it accurately, or the angle could simply be reported `Failed` and the pass continue.
+and **the write succeeded** — a 324 KB file landed in `/tmp`. Only the subsequent *read* raised
+opencode's `external_directory` prompt, which then stalled the panel: two of four reviewers
+blocked there and the gate could not close.
 
-### Status: open, deliberately not changed
+### The actual defect
 
-Raised as an open question in the `fix-review-json` design and left alone on purpose — the exit
-code is a contract the pipeline skill reads, and changing it belongs in its own task with the
-driver's behaviour changed alongside. Re-running `drovr code-review run` is the workaround and
-it costs one reviewer, not a panel.
+Not "drovr fails to sandbox reviewers". drovr **launched reviewers under a permission profile
+that permits arbitrary writes via bash**. Every backend's read-only mode draws its line at the
+*editing tools*; a shell redirect is not an edit. drovr's own `opencode.json` said
+`{"edit": "deny", "bash": "allow"}` — the `bash: allow` was deliberate, because the seed sent
+reviewers to `git diff`.
+
+### What was measured (opencode 1.18.3, 2026-08-08)
+
+Reproducible with `opencode run --agent plan` in a throwaway repo:
+
+* A bash permission pattern is matched against the **entire command string** as a glob — not
+  `argv[0]`, not a parsed command.
+* Therefore, with `{"*": "deny", "git diff*": "allow"}`, the command
+  `git diff --stat > /tmp/probe/out1.txt` **is allowed** and the file appears. That is the
+  incident's exact shape. **An allow-list of read-only commands does not work**: every useful
+  entry needs a trailing `*`, and a trailing `*` swallows ` > /anywhere`.
+* A more specific pattern beats `*` (that is how `git diff*` beat the `*` deny above).
+* With no matching allow, denial is a clean tool error the agent sees — not a hang.
+* `POST /session/{id}/shell` on `opencode serve` bypasses the bash permission rules entirely.
+  Not drovr's path, but do not use that endpoint to test permissions — it will report everything
+  as permitted.
+
+### Denying `bash` is not enough: the reviewer can delegate to a subagent that has it
+
+Found by the live test *after* `bash: {"*": "deny"}` was in place — the reviewer wrote `/tmp`
+anyway. **opencode permissions are per-agent.** `--agent plan`'s stock rules deny `task general`
+and nothing else, so the reviewer could still call the `task` tool against opencode's `explore`
+subagent, whose own resolved rules are `bash: allow *` (`opencode agent list`, 1.18.3):
+
+```
+== explore (subagent)
+  *      allow  *
+  *      deny   *
+  bash   allow  *
+```
+
+So a rule denying the reviewer a shell says nothing about the agent it spawns. `task` has to be
+denied too. Every config-reading test in the suite passed while this was open — which is the
+whole argument for the live test.
+
+### The fix, for opencode
+
+`cli/src/code_review.rs`, `opencode_plan_permission`: `bash` and `task` are both `{"*": "deny"}`
+— no allow-list for bash, for the reason above. `external_directory` is decided rather than left at `ask` (`ask` is a hang
+for an unattended reviewer, and it is what stalled the panel): `deny` everywhere except the run
+directory. `edit` stays denied.
+
+Reviewers therefore have **no shell**. What they lose is `git diff`, `git log`, `git show` and
+running a build; opencode's `read`, `grep`, `glob` and `list` cover the rest. The diff is handed
+to them instead — `write_review_diff` runs git in drovr and writes `<task>-review-<iter>.diff`
+into the run dir, and the seed names that file. That also removes the reason the incident
+happened: the reviewer wrote to `/tmp` because it wanted the diff on disk to work through.
+
+Pinned by `live_opencode_reviewer_cannot_write_through_a_shell_redirect` in `code_review.rs` —
+`#[ignore]`d because it needs the opencode binary and a live model, and run by hand with
+`cargo test --release live_opencode -- --ignored --nocapture`. It runs a real reviewer under
+drovr's real document, plus a control with the permission block removed, because "the file is
+absent" only means something if the control shows it would otherwise be present.
+
+### Still open: cursor has the same hole and drovr has no lever
+
+Measured the same day: `agent --mode plan --trust -p "…save it… git diff --stat > /tmp/…"`
+**wrote the file**. So cursor's plan mode refuses the edit tool and permits shell redirects,
+exactly as opencode's did.
+
+`--sandbox enabled` does **not** close it — with that flag set, the same run wrote both the
+project-relative target and `/tmp/CURS2.txt`.
+
+cursor's permission list (`permissions.allow` / `permissions.deny`, entries like `Shell(ls)`)
+lives in the user's global `~/.cursor/cli-config.json`, which drovr must not rewrite. A
+project-level `.cursor/cli.json` was tried and the probe was inconclusive — the model declined
+on its own reasoning rather than the rule firing, which is itself the point: cursor's refusal is
+model discretion, not enforcement.
+
+Left open deliberately (driver's call, 2026-08-08) rather than failing closed and disabling
+cursor reviewers. **A cursor reviewer can write anywhere its user can.** Anyone relying on the
+read-only property should pin `review_agent = "opencode"`.
+
+### Note on model-driven probes
+
+Both halves of this were hard to measure because the agent, not the rule, often decides. Weak
+models print the command instead of calling the tool; capable models refuse on their own
+("plan mode forbids modifications") without ever exercising the permission. Any future probe
+needs a framing the model wants to carry out — "the diff is large, save it for later analysis"
+worked where "run this exact command" did not — and a control run to distinguish *refused* from
+*never attempted*.
 
 ## `drovr phase send`: the false success is fixed; `until` is still a LEVEL, not an edge
 

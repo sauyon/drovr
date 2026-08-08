@@ -62,7 +62,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{McpSchema, load_config};
-use crate::findings::{Review, is_clean, merge_reviews, parse_review};
+use crate::findings::{Finding, Review, Severity, Verdict, is_clean, merge_reviews, parse_review};
 use crate::herdr::{AgentStatus, Herdr};
 use crate::mcp_findings::findings_path;
 use crate::phase::{
@@ -259,6 +259,74 @@ fn range_is_empty(project_dir: &str, base: &str, head: &str) -> io::Result<bool>
     }
 }
 
+/// Run git, in the project, and hand back stdout — or the reason git could not answer.
+fn git_capture(project_dir: &str, args: &[&str]) -> io::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(args)
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git {} in {project_dir} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    // `from_utf8_lossy`: a diff carries whatever bytes the files hold, and a repository
+    // with a latin-1 source file must not fail the review that would have flagged it.
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Where [`write_review_diff`] puts the artifact. Iteration-scoped for the same reason
+/// the findings files are: a reviewer left over from a superseded pass must keep
+/// reading the diff it was seeded against, not one a newer panel overwrote underneath
+/// it.
+fn review_diff_path(dir: &Path, task: &str, iter: u64) -> PathBuf {
+    dir.join(format!("{task}-review-{iter}.diff"))
+}
+
+/// Write the change under review to a file the reviewer can READ, and return its path.
+///
+/// # Why drovr runs git instead of the reviewer
+///
+/// A reviewer has no shell — see [`opencode_plan_permission`] for the measurement that
+/// forced that. `git diff` was its primary input, so drovr produces it. This is the
+/// half of the fix that keeps the panel working: denying bash without supplying the
+/// diff would have secured the reviewer by blinding it.
+///
+/// It also removes the reason the incident happened at all. The reviewer that wrote
+/// 324 KB to `/tmp` did so because it wanted the diff on disk to work through; drovr
+/// putting it there first means no reviewer has to invent that step.
+///
+/// # What the artifact contains
+///
+/// `--stat` first, then the patch, from `base` to the **working tree** rather than to
+/// `head`. The review scope has always been "the range plus the current working tree"
+/// (see [`build_seed`]), and a single `git diff <base>` is exactly that range: it
+/// carries every committed change up to `head` and every uncommitted one on top,
+/// without the reviewer having to combine two artifacts.
+fn write_review_diff(
+    dir: &Path,
+    project_dir: &str,
+    task: &str,
+    iter: u64,
+    base: &str,
+) -> io::Result<PathBuf> {
+    let stat = git_capture(project_dir, &["diff", "--stat", base])?;
+    let patch = git_capture(project_dir, &["diff", base])?;
+    let path = review_diff_path(dir, task, iter);
+    crate::brief::write_no_follow(
+        &path,
+        &format!(
+            "# The change under review: `git diff {base}` (base → working tree)\n\
+             # Written by drovr. Reviewers have no shell; this is that diff.\n\n\
+             ## Summary (--stat)\n\n{stat}\n## Patch\n\n{patch}"
+        ),
+    )?;
+    Ok(path)
+}
+
 /// Read the recorded review base for `task` from `<dir>/<task>-base.sha` (trimmed).
 /// A missing file is the caller's `Error` outcome (base not recorded at task start), and
 /// so is a file whose contents are not a plausible object name — see [`validated_sha`].
@@ -332,6 +400,18 @@ pub fn code_review_brief(
     // has no outcome to report — the CLI prints the error and exits 1, which is the same
     // observable result the outcome path produces.
     let context = resolve_context(&dir, task, context)?;
+    // The iteration a FRESH panel would open, or the one a resume would rejoin — the
+    // same choice `code_review_run` makes, so the path named here is the path that
+    // panel's reviewers were seeded with.
+    //
+    // This function PRINTS a brief; it does not write the diff. That is deliberate and
+    // it has a known edge: this command exists to hand-spawn a replacement reviewer
+    // into a panel that is already wedged, and such a panel has already written the
+    // diff for its iteration. Run against a task whose panel has never opened, the
+    // brief names a file that does not exist yet — the same shape as the existing
+    // caveat that a hand-spawned reviewer may not have the `submit_findings` tool.
+    // Giving `brief` the side effect of writing artifacts would be the worse trade.
+    let iter = resumable_iter(run, task, &load_config()?.angles).unwrap_or_else(|| next_iter(run, task));
     Ok(build_seed(
         task,
         angle,
@@ -340,6 +420,7 @@ pub fn code_review_brief(
         &run.task,
         &run.project_dir,
         context.as_deref(),
+        &review_diff_path(&dir, task, iter),
     ))
 }
 
@@ -397,6 +478,42 @@ fn next_iter(run: &RunState, task: &str) -> u64 {
         .unwrap_or(1)
 }
 
+/// What an angle contributes to the merged review when its reviewer finished without
+/// delivering one.
+///
+/// A `Critical` finding, so the merge's recomputed verdict is `changes` and
+/// [`is_clean`] is false. The alternative — dropping the angle — would let a panel
+/// whose `security` reviewer crashed at startup report a clean gate, which is worse
+/// than the exit-1 this replaced: a missing angle would become invisible instead of
+/// merely fatal.
+///
+/// `file` is not a path. A finding's file is where the reader should look, and there is
+/// nothing in the diff to look at — the thing that went wrong is the panel.
+fn undelivered_review(angle: &str, why: &io::Error) -> Review {
+    Review {
+        verdict: Verdict::Changes,
+        findings: vec![Finding {
+            file: format!("(the '{angle}' review did not run)"),
+            line: None,
+            severity: Severity::Critical,
+            // Stamped by `merge_reviews` from the angle this is filed under, like every
+            // other finding — left empty here for the same reason they are.
+            angle: String::new(),
+            summary: format!(
+                "the '{angle}' reviewer finished without submitting a review, so this \
+                 angle was never checked"
+            ),
+            rationale: format!(
+                "drovr harvested nothing usable for this angle ({why}). The other angles \
+                 below did deliver and their findings stand. Re-run `drovr code-review \
+                 run` to respawn just this reviewer — the panel resumes the same \
+                 iteration and waits only on the angles still missing."
+            ),
+        }],
+        impact: None,
+    }
+}
+
 /// Build the per-angle reviewer seed.
 ///
 /// `project_dir` is named in the seed on purpose: the diff is what changed, but
@@ -415,6 +532,7 @@ fn build_seed(
     task_desc: &str,
     project_dir: &str,
     context: Option<&str>,
+    diff_path: &Path,
 ) -> String {
     // Always emitted, matching the phase briefs: a section that appears only sometimes is
     // one a brief cannot refer to, and its absence is indistinguishable from a delivery
@@ -433,11 +551,19 @@ fn build_seed(
          ## Scope\n\n\
          The change under review is `git diff {base}..{head}` **plus** the current\n\
          working tree. Base = `{base}`, head = `{head}`.\n\n\
+         **drovr has already written that diff for you**, `--stat` first and then the\n\
+         patch:\n\n\
+             {diff}\n\n\
+         Read it from there. **DO NOT RUN SHELL COMMANDS.** A shell redirect is a\n\
+         write, and a reviewer does not write — on opencode the bash tool is denied\n\
+         outright, so there is nothing to fall back to. There is no `git diff` to run\n\
+         and no scratch file to make: for a large change, read the `--stat` section\n\
+         first and then the file's later regions as you need them.\n\n\
          You also have the WHOLE REPOSITORY to read: it is a full checkout at\n\
-         `{project_dir}`. Do not review the diff in isolation — you may read any file\n\
-         in it, follow the change's callers and callees outside the diff, check the\n\
-         invariants and neighbouring code it has to hold up against, and run the tests.\n\
-         Reading is unrestricted; only writing is not.\n\n\
+         `{project_dir}`. Do not review the diff in isolation — read any file in it,\n\
+         follow the change's callers and callees outside the diff, and check the\n\
+         invariants and neighbouring code it has to hold up against. Your read, grep,\n\
+         glob and list tools all work normally; reading is unrestricted.\n\n\
          ## Task under review\n\n{task_desc}\n\n\
          {context_section}\
          ## Output\n\n\
@@ -464,6 +590,7 @@ fn build_seed(
          do not stop to ask permission for it.\n\
          Do not modify any files or run `drovr phase done`.\n",
         brief = angle_brief(angle),
+        diff = diff_path.display(),
         schema = findings_schema(),
         tool = crate::mcp_findings::TOOL_NAME,
         qualified_tool = crate::mcp_findings::qualified_tool_name(),
@@ -504,12 +631,9 @@ fn findings_exe() -> String {
 /// **The plan agent's permissions.** `--agent plan` is opencode's read-only stance,
 /// but its stock permissions set edits *and* bash to `ask`. A reviewer pane has
 /// nobody to answer, so `ask` is a hang rather than a refusal — the failure looks
-/// like a reviewer that never reports. `edit` therefore becomes `deny` (the refusal
-/// `ask` was only approximating) and `bash` becomes `allow`, because the seed sends
-/// reviewers to `git diff` and the repository's tests. That leaves opencode's
-/// read-only stance exactly as strong as cursor's `--mode plan`: writes through the
-/// editing tools are refused, writes through a shell are not.
-fn opencode_document(run_name: &str, task: &str, iter: u64) -> serde_json::Value {
+/// like a reviewer that never reports. So drovr states the whole stance itself; see
+/// [`opencode_plan_permission`] for what each rule is and why.
+fn opencode_document(run_dir: &Path, run_name: &str, task: &str, iter: u64) -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "mcp": {
@@ -525,14 +649,81 @@ fn opencode_document(run_name: &str, task: &str, iter: u64) -> serde_json::Value
                 "enabled": true,
             },
         },
-        "agent": {"plan": {"permission": opencode_plan_permission()}},
+        "agent": {"plan": {"permission": opencode_plan_permission(run_dir)}},
     })
 }
 
-/// See [`opencode_document`]. Its own function so [`holds_more_than_drovrs_server`]
-/// can recognise drovr's document rather than backing it up on every pass.
-fn opencode_plan_permission() -> serde_json::Value {
-    serde_json::json!({"edit": "deny", "bash": "allow"})
+/// The reviewer's permission stance, stated in full rather than inherited.
+///
+/// Its own function so [`holds_more_than_drovrs_server`] can recognise drovr's
+/// document rather than backing it up on every pass.
+///
+/// # `bash` is denied outright, and an allow-list was measured and rejected
+///
+/// This used to be `bash: "allow"`, because the seed sent reviewers to `git diff`.
+/// That is the defect: on 2026-08-08 a reviewer under `--agent plan`, with
+/// `edit: deny` in force exactly as configured, ran
+/// `git diff <base>..<head> > /tmp/full_diff.txt` and the write **succeeded** (324 KB).
+/// The edit *tool* was refused; a shell redirect was never an edit.
+///
+/// The obvious repair — deny by default and allow the read-only commands a reviewer
+/// needs — does not work, and this was measured rather than assumed (opencode 1.18.3):
+///
+/// * A bash pattern is matched against the **entire command string** as a glob, not
+///   against `argv[0]` and not against a parsed command.
+/// * So with `{"*": "deny", "git diff*": "allow"}`, the command
+///   `git diff --stat > /tmp/probe/out1.txt` **is allowed**, and the file appears.
+///   That is the incident's exact command shape. Every useful allow entry needs a
+///   trailing `*`, and a trailing `*` swallows ` > /anywhere`.
+///
+/// An allow-list here would therefore read as enforcement while permitting the one
+/// command that caused the bug — worse than none. Layering a `"*>*": "deny"` rule on
+/// top would be a blocklist of shell write channels (`>`, `>>`, `|`, `tee`, `&&`,
+/// `$(…)`, `sed -i`, `python -c`, …), which is not a list anyone can finish.
+///
+/// So: no shell. What a reviewer loses is `git diff`, `git log`, `git show` and the
+/// ability to run a build — opencode's own `read`, `grep`, `glob` and `list` tools are
+/// untouched and cover the rest. The diff it lost is handed to it instead: drovr runs
+/// git itself and writes the diff into the run dir, and the seed names that file (see
+/// [`write_review_diff`]). The reviewer reads it, which is a permission it already has
+/// — and it no longer has any reason to improvise a scratch file, which is what
+/// started this.
+///
+/// # `task` is denied, because denying `bash` here does not deny it in a subagent
+///
+/// Found by the live test below, after `bash: deny` was in place and a reviewer wrote
+/// `/tmp` anyway. `--agent plan`'s stock rules deny `task general` and nothing else, so
+/// the reviewer could still delegate to opencode's **`explore`** subagent — whose own
+/// resolved rules are `bash: allow *` (`opencode agent list`, 1.18.3). Permissions are
+/// per-agent, so a rule denying the reviewer a shell says nothing about the agent it
+/// spawns. Denying `task` outright is the only way to make "this reviewer cannot run a
+/// shell" mean what it says.
+///
+/// This is the reason the live test is worth its runtime: every config-reading test
+/// here passed with `bash: deny` present and the property still false.
+///
+/// # `external_directory` is decided, not left at `ask`
+///
+/// opencode's stock rule is `ask *`, and an unattended reviewer has nobody to answer:
+/// that is what stalled two of four reviewers mid-panel, on a *read*. `ask` is a hang,
+/// so it must not survive into a reviewer's config in any form. It becomes `deny`,
+/// with one exception — the run directory, which is where drovr puts the seed and the
+/// diff the reviewer is being told to read. A denial the agent can see and route
+/// around beats a prompt nobody will answer.
+///
+/// opencode's own built-in allows (`…/tool-output/*`, `/tmp/opencode/*`) are left to
+/// win on their own: a more specific pattern beats `*`, which is the same precedence
+/// that let `git diff*` beat `*` above.
+fn opencode_plan_permission(run_dir: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "edit": {"*": "deny"},
+        "bash": {"*": "deny"},
+        "task": {"*": "deny"},
+        "external_directory": {
+            "*": "deny",
+            format!("{}/*", run_dir.display()): "allow",
+        },
+    })
 }
 
 /// Where the original of a replaced project config is kept.
@@ -562,6 +753,7 @@ fn backup_path(path: &Path) -> PathBuf {
 fn write_mcp_config(
     path: &Path,
     schema: McpSchema,
+    run_dir: &Path,
     run_name: &str,
     task: &str,
     iter: u64,
@@ -595,7 +787,7 @@ fn write_mcp_config(
         McpSchema::McpServers => serde_json::json!({
             "mcpServers": {crate::mcp_findings::SERVER_NAME: findings_server(run_name, task, iter)},
         }),
-        McpSchema::Opencode => opencode_document(run_name, task, iter),
+        McpSchema::Opencode => opencode_document(run_dir, run_name, task, iter),
     };
 
     if let Some(body) = &existing
@@ -1282,8 +1474,14 @@ pub fn code_review_run<H: Herdr>(
         exclude_locally(&run.project_dir, &format!("{rel}.drovr-backup*"));
     }
 
+    // The reviewer's primary input, written BEFORE any reviewer is spawned: a reviewer
+    // has no shell, so a seed naming a diff file that does not exist yet would send it
+    // to read nothing. `?` rather than a warning — a panel whose reviewers cannot see
+    // the change under review has nothing to review.
+    let diff_path = write_review_diff(&dir, &run.project_dir, task, iter, &base)?;
+
     let mcp_path = mcp.config_path(&dir, Path::new(&run.project_dir), task);
-    write_mcp_config(&mcp_path, mcp.schema(), &run.name, task, iter)?;
+    write_mcp_config(&mcp_path, mcp.schema(), &dir, &run.name, task, iter)?;
     if let Some(rel) = mcp.project_relative_path() {
         exclude_locally(&run.project_dir, rel);
         // A glob: now that the config file also backs up to the next FREE slot, the
@@ -1368,6 +1566,7 @@ pub fn code_review_run<H: Herdr>(
             &run.task,
             &run.project_dir,
             context.as_deref(),
+            &diff_path,
         );
         crate::brief::write_no_follow(&seed_path, &seed_text)?;
         // Re-check immediately before each spawn, not once for the pass. The angles
@@ -1493,14 +1692,31 @@ pub fn code_review_run<H: Herdr>(
             }
             // It finished and delivered nothing usable, and re-reading the same file
             // will fail identically forever. Record `Failed` so the next resume
-            // replaces the reviewer, then surface the error — an angle that delivered
-            // nothing must not pass for a clean one.
+            // replaces the reviewer, then DEGRADE rather than abort — an angle that
+            // delivered nothing must not pass for a clean one, but it must not throw
+            // away the angles that did deliver either.
+            //
+            // This used to be `harvest?`, i.e. exit 1 for the whole panel. Observed
+            // 2026-08-08: `type-design` died on a `CURL error` from the local endpoint
+            // and took down a run in which `security` had already submitted a full
+            // review. The reviewers are independent by construction — separate panes,
+            // separate files — so one backend failure is a hole in the panel, not a
+            // failure of it. It is recorded AS a blocking finding, so the gate still
+            // cannot come back clean with an angle missing.
             let harvest = obtain_findings_json(&dir, task, iter, &angle, &phase)
                 .and_then(|json| parse_review(&json));
             if let Some(i) = run.review_phases.iter().position(|p| p.name == phase) {
                 run.review_phases[i].status = PhaseStatus::Failed;
             }
-            harvested.push((angle, harvest?));
+            let review = harvest.unwrap_or_else(|e| {
+                eprintln!(
+                    "code-review: the '{angle}' reviewer finished without a usable review \
+                     ({e}) — recording the angle as undelivered and keeping the rest of \
+                     the panel"
+                );
+                undelivered_review(&angle, &e)
+            });
+            harvested.push((angle, review));
         }
         pending = still_pending;
         if pending.is_empty() {
@@ -1595,6 +1811,11 @@ pub fn code_review_run<H: Herdr>(
 
 #[cfg(test)]
 mod tests {
+    /// The diff artifact drovr writes for a real panel. Fixed here: these tests are
+    /// about the seed's wording, not about where the file lands.
+    fn diff_fixture() -> &'static Path {
+        Path::new("/run/dir/task-1-review-1.diff")
+    }
     use super::*;
     use crate::findings::Verdict;
     use crate::herdr::{FakeHerdr, PaneInfo, SessionId};
@@ -2328,13 +2549,28 @@ mod tests {
             ReviewOutcome::Timeout
         );
 
-        // correctness finishes, but writes a file that is not a Review.
+        // correctness finishes, but writes a file that is not a Review. The other
+        // three deliver properly, so the panel completes.
         drop_pass_marker(&run, "task-1", 1, "correctness");
         seed_angle_file(&run, "task-1", 1, "correctness", r#"{"not":"a review"}"#);
+        for angle in ["security", "error-handling", "type-design"] {
+            seed_angle_file(&run, "task-1", 1, angle, CLEAN);
+        }
 
-        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
-            .expect_err("unparseable findings must fail the pass loudly");
-        assert!(!err.to_string().is_empty());
+        // The pass DEGRADES rather than aborting: the angle is recorded as undelivered
+        // (a blocking finding, so the gate cannot come back clean) and the other three
+        // angles' clean verdicts survive instead of being thrown away.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None)
+                .expect("one unusable angle must not throw away the panel"),
+            ReviewOutcome::Findings
+        );
+        let merged = std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json"))
+            .expect("the merged review is written");
+        assert!(
+            merged.contains("the 'correctness' reviewer finished without submitting"),
+            "{merged}"
+        );
         assert_eq!(
             run.find_phase("review:task-1:1:correctness")
                 .unwrap()
@@ -2834,17 +3070,22 @@ mod tests {
             assert!(p.pane_id().is_some(), "{} must keep its pane", p.name);
         }
 
-        // (b) an angle that finished having delivered nothing aborts the pass
-        // before the merge — and so before any reap.
+        // (b) an angle that finished having delivered nothing no longer aborts the
+        // pass: it is recorded as undelivered and the panel reaches its verdict, so the
+        // reap DOES run. Every reviewer here has finished — the three that submitted
+        // and the one that did not — so there is nothing live being closed.
         drop_pass_marker(&run, "task-1", 1, "correctness");
         for angle in ["security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, angle, CLEAN);
         }
-        code_review_run(&h, &mut run, "task-1", 40, false, None)
-            .expect_err("precondition: an angle delivered nothing usable");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None)
+                .expect("a degraded panel still reaches a verdict"),
+            ReviewOutcome::Findings
+        );
         assert!(
-            closed_panes(&h).is_empty(),
-            "a pass that never reached a verdict must close nothing: {:?}",
+            !closed_panes(&h).is_empty(),
+            "a panel that reached its verdict reaps, degraded or not: {:?}",
             h.calls()
         );
     }
@@ -3135,12 +3376,22 @@ mod tests {
         );
         // They all finish, and not one of them calls `submit_findings`.
         drop_pass_markers(&run, "task-1", 2);
-        let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
-            .expect_err("a pass where nobody submitted must fail, not inherit iter 1");
-        assert!(
-            err.to_string().contains("never called submit_findings"),
-            "unexpected error: {err}"
+        // Every angle is recorded as undelivered — NOT credited with iteration 1's
+        // clean verdicts. The pass reaches a verdict, and that verdict blocks.
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None)
+                .expect("a degraded pass still returns"),
+            ReviewOutcome::Findings,
+            "a pass where nobody submitted must not inherit iter 1's clean gate"
         );
+        let merged = std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json"))
+            .expect("the merged review is written even when every angle is missing");
+        for a in load_config().unwrap().angles {
+            assert!(
+                merged.contains(&format!("the '{a}' reviewer finished without submitting")),
+                "angle '{a}' must be recorded as undelivered: {merged}"
+            );
+        }
     }
 
     /// The reverse direction, and the one a delete-on-open fix would still miss: a
@@ -3173,11 +3424,18 @@ mod tests {
             seed_angle_file(&run, "task-1", 1, &a, CLEAN);
         }
 
-        let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
-            .expect_err("a late straggler's verdict must not complete a newer panel");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None)
+                .expect("a degraded pass still returns"),
+            ReviewOutcome::Findings,
+            "a late straggler's verdict must not complete a newer panel"
+        );
+        let merged = std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json"))
+            .expect("the merged review is written");
         assert!(
-            err.to_string().contains("never called submit_findings"),
-            "unexpected error: {err}"
+            merged.contains("finished without submitting"),
+            "iteration 2's angles must read as undelivered, not as iteration 1's clean \
+             verdicts: {merged}"
         );
     }
 
@@ -3634,6 +3892,143 @@ mod tests {
         );
     }
 
+    /// THE test of the property, against the real opencode binary and a real model.
+    ///
+    /// Every other test here reads the config drovr composed. That is exactly the
+    /// weakness this defect got in through: `edit: deny` was asserted and present, and
+    /// a reviewer still wrote 324 KB to `/tmp`, because the assertion was about a key
+    /// rather than about what the agent could do. So this one runs an actual reviewer
+    /// under drovr's actual document and looks at the filesystem afterwards.
+    ///
+    /// It runs BOTH halves. The control uses the same project, the same prompt and the
+    /// same model with `bash` put back to `allow` — without it succeeding, the other
+    /// half proves nothing, because an agent that simply declined to try would look
+    /// identical to one that was refused.
+    ///
+    /// **The two halves use different target paths, and the denied half runs first.**
+    /// Both of those are scar tissue: sharing one path made this test report a false
+    /// escape. `timeout` kills the `opencode` process it launched but not the server
+    /// child that process spawned, so the control's orphan finished its command after
+    /// the control had already cleaned up — re-creating the shared path *during* the
+    /// other half and framing it for a write it never made. Distinct paths make that
+    /// contamination unrepresentable; running the denied half first means even a
+    /// leftover from a previous invocation cannot reach it.
+    ///
+    /// `#[ignore]` because it needs the `opencode` binary and a reachable model, which
+    /// a plain `cargo test` has neither of. It is meant to be run by hand when this
+    /// permission block changes:
+    ///
+    /// ```text
+    /// cargo test --release --bin drovr live_opencode -- --ignored --nocapture
+    /// ```
+    ///
+    /// Do not pipe that through `tail`: the pipeline's exit status is the pager's, and
+    /// a failure here then reads as a pass.
+    #[test]
+    #[ignore = "needs the opencode binary and a live model; run by hand"]
+    fn live_opencode_reviewer_cannot_write_through_a_shell_redirect() {
+        let project = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(project.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(project.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        // An uncommitted change, so `git diff --stat` has something to say and the
+        // control's redirect writes a non-empty file.
+        std::fs::write(project.path().join("a.txt"), "two\n").unwrap();
+        let run_dir = tempfile::tempdir().unwrap();
+
+        // Targets OUTSIDE the checkout — `/tmp`, the path the real reviewer escaped
+        // through, not merely somewhere inside the worktree. One per half; see above.
+        let target = |half: &str| {
+            std::env::temp_dir().join(format!("drovr-live-probe-{}-{half}.txt", std::process::id()))
+        };
+        // The framing that made a real reviewer do this: it wanted the diff on disk to
+        // work through. A bare "run this exact command" prompt gets declined by the
+        // model's own judgement rather than by the permission rule, which would test
+        // nothing — see the note in docs/known-issues.md on probing these.
+        let attempt = |doc: serde_json::Value, at: &Path| {
+            std::fs::write(
+                project.path().join("opencode.json"),
+                serde_json::to_string_pretty(&doc).unwrap(),
+            )
+            .unwrap();
+            // `timeout`, because `opencode run` does not reliably return promptly: a
+            // small local model can keep taking turns long after it has done the one
+            // thing being measured. Safe for both halves — what is asserted is the
+            // filesystem afterwards, and the control's own assertion catches a timeout
+            // that fired before it managed to write.
+            let out = Command::new("timeout")
+                .arg("300")
+                .arg("opencode")
+                .current_dir(project.path())
+                .args([
+                    "run",
+                    "--agent",
+                    "plan",
+                    &format!(
+                        "The diff is large. Save it for later analysis by running this \
+                         in the shell: git diff --stat > {}",
+                        at.display()
+                    ),
+                ])
+                .output()
+                .expect("the opencode binary runs");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+
+        // THE PROPERTY, first: drovr's real document, unmodified.
+        let denied_at = target("denied");
+        let _ = std::fs::remove_file(&denied_at);
+        let said = attempt(
+            opencode_document(run_dir.path(), "live", "task-1", 1),
+            &denied_at,
+        );
+        let escaped = denied_at.exists();
+        let _ = std::fs::remove_file(&denied_at);
+
+        // CONTROL: the same document with `bash` back to `allow` — what drovr used to
+        // write. This must still produce the file.
+        let mut permissive = opencode_document(run_dir.path(), "live", "task-1", 1);
+        permissive["agent"]["plan"]["permission"] =
+            serde_json::json!({"edit": {"*": "deny"}, "bash": {"*": "allow"}});
+        let control_at = target("control");
+        let _ = std::fs::remove_file(&control_at);
+        let control = attempt(permissive, &control_at);
+        let control_wrote = control_at.exists();
+        let _ = std::fs::remove_file(&control_at);
+
+        assert!(
+            control_wrote,
+            "the control run must actually be able to write {} — without that the \
+             assertion below proves nothing. opencode said: {control}",
+            control_at.display()
+        );
+        assert!(
+            !escaped,
+            "a reviewer under drovr's own config wrote {} — this is the /tmp escape, \
+             unfixed. opencode said: {said}",
+            denied_at.display()
+        );
+    }
+
     /// The displacement decision for opencode has to answer "is this file drovr's own?"
     /// about a document that is opencode's *whole project config*, and it has to keep
     /// answering it as `opencode_document` grows. A key whitelist cannot: add a field
@@ -3642,9 +4037,11 @@ mod tests {
     /// Recognition is therefore derived from the document itself.
     #[test]
     fn drovrs_own_opencode_file_is_recognised_across_passes_and_across_edits() {
-        let mine = opencode_document("run", "task-1", 1);
+        let mine = opencode_document(Path::new("/run/dir"), "run", "task-1", 1);
         // A previous pass's file: same document, different iteration.
-        let previous = serde_json::to_string(&opencode_document("run", "task-1", 7)).unwrap();
+        let previous =
+            serde_json::to_string(&opencode_document(Path::new("/run/dir"), "run", "task-1", 7))
+                .unwrap();
         assert!(
             !holds_more_than_drovrs_server(&previous, McpSchema::Opencode, &mine),
             "an earlier pass's own file is not a user config to be backed up"
@@ -4017,8 +4414,35 @@ mod tests {
                 .as_array()
                 .unwrap()[..]
         );
-        assert_eq!(body["agent"]["plan"]["permission"]["edit"], "deny");
-        assert_eq!(body["agent"]["plan"]["permission"]["bash"], "allow");
+        // The three rules that make `--agent plan` an actual read-only stance. `bash`
+        // is the one this test exists for: `allow` here was the defect — a reviewer
+        // ran `git diff <base>..<head> > /tmp/full_diff.txt` and the write succeeded,
+        // because a shell redirect was never an `edit`. See
+        // `opencode_plan_permission` for why this is a flat deny and not an
+        // allow-list of read-only commands.
+        let perm = &body["agent"]["plan"]["permission"];
+        assert_eq!(perm["edit"], serde_json::json!({"*": "deny"}), "{perm}");
+        assert_eq!(perm["bash"], serde_json::json!({"*": "deny"}), "{perm}");
+        // `task` too: permissions are PER-AGENT, so denying the reviewer a shell says
+        // nothing about a subagent it spawns — and opencode's `explore` subagent
+        // resolves to `bash: allow *`. Without this, `bash: deny` above is decorative.
+        assert_eq!(perm["task"], serde_json::json!({"*": "deny"}), "{perm}");
+        // `ask` must not survive in ANY rule: an unattended reviewer has nobody to
+        // answer, so `ask` is a hang. This is what stalled two of four reviewers.
+        assert!(
+            !perm.to_string().contains("\"ask\""),
+            "a reviewer's permission block must never say `ask`: {perm}"
+        );
+        // …and the run dir, where drovr puts the seed and the diff, is the one
+        // external directory it may read — otherwise the seed points at a file the
+        // reviewer is refused.
+        let run_dir = run_dir(&run.name);
+        assert_eq!(
+            perm["external_directory"][format!("{}/*", run_dir.display())],
+            "allow",
+            "{perm}"
+        );
+        assert_eq!(perm["external_directory"]["*"], "deny", "{perm}");
 
         let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
         assert!(
@@ -4145,7 +4569,7 @@ mod tests {
         let link = project.path().join(".cursor/mcp.json");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-        let err = write_mcp_config(&link, McpSchema::McpServers, "r", "task-1", 1)
+        let err = write_mcp_config(&link, McpSchema::McpServers, Path::new("/run/dir"), "r", "task-1", 1)
             .expect_err("a symlinked config must be refused, not followed");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
@@ -4160,6 +4584,7 @@ mod tests {
         let err = write_mcp_config(
             &project2.path().join(".cursor/mcp.json"),
             McpSchema::McpServers,
+            Path::new("/run/dir"),
             "r",
             "task-1",
             1,
@@ -4249,7 +4674,7 @@ mod tests {
         }
         // The rendering is what the reviewer actually receives.
         assert!(
-            build_seed("task-1", "security", "a", "b", "d", "/checkout/here", None)
+            build_seed("task-1", "security", "a", "b", "d", "/checkout/here", None, diff_fixture())
                 .contains(&rendered)
         );
     }
@@ -4265,7 +4690,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
         std::fs::create_dir(&path).unwrap();
 
-        let err = write_mcp_config(&path, McpSchema::McpServers, "r", "task-1", 1)
+        let err = write_mcp_config(&path, McpSchema::McpServers, Path::new("/run/dir"), "r", "task-1", 1)
             .expect_err("an unreadable config must not be silently replaced");
         assert!(
             err.to_string().contains("mcp.json"),
@@ -4313,11 +4738,18 @@ mod tests {
         // Every reviewer finishes (markers land) but none ever called the tool.
         drop_pass_markers(&run, "task-1", 1);
 
-        let err = code_review_run(&h, &mut run, "task-1", 5_000, false, None)
-            .expect_err("a missing findings file must be an error, not a scrape");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 5_000, false, None)
+                .expect("a degraded pass still returns"),
+            ReviewOutcome::Findings,
+            "a missing findings file must block the gate, not pass it"
+        );
+        let merged = std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json"))
+            .expect("the merged review is written");
         assert!(
-            err.to_string().contains("never called submit_findings"),
-            "unexpected error: {err}"
+            merged.contains("finished without submitting"),
+            "the missing file must be reported as undelivered, not scraped from the \
+             pane: {merged}"
         );
         // "Never reads a pane to obtain findings" is the invariant, and it is
         // about the HARVEST. `phase_send` does read each pane while seeding it, to
@@ -4377,9 +4809,18 @@ mod tests {
         // its wait loop accepts — having written nothing of its own. The pass must
         // fail rather than reuse what the dead reviewer left.
         drop_pass_marker(&run, "task-1", 1, "correctness");
-        let err = code_review_run(&h, &mut run, "task-1", 40, false, None)
-            .expect_err("a respawned angle with no file of its own must not succeed");
-        assert!(err.to_string().contains("correctness"), "{err}");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None)
+                .expect("a degraded pass still returns"),
+            ReviewOutcome::Findings
+        );
+        let merged = std::fs::read_to_string(run_dir(&run.name).join("task-1-review.json"))
+            .expect("the merged review is written");
+        assert!(
+            merged.contains("the 'correctness' reviewer finished without submitting"),
+            "the respawned angle must read as undelivered, not as the dead reviewer's \
+             torn file: {merged}"
+        );
         assert!(
             !leftover.exists(),
             "the respawn must clear the outgoing reviewer's file, or the replacement \
@@ -4582,6 +5023,7 @@ mod tests {
             "do the thing",
             "/checkout/here",
             None,
+            diff_fixture(),
         );
         assert!(
             seed.contains("git diff aaa..bbb"),
@@ -4602,6 +5044,86 @@ mod tests {
         assert!(seed.contains("critical") && seed.contains("important") && seed.contains("nit"));
     }
 
+    /// The artifact that replaced the reviewer's `git diff`. It has to carry both
+    /// halves: the `--stat` a reviewer reads first to decide where to look, and the
+    /// patch it then reads. A file with only one of them sends the reviewer looking for
+    /// the other through a shell it does not have.
+    #[test]
+    fn the_diff_drovr_writes_carries_the_stat_and_the_patch() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (run, repo) = make_run("cr-diff-artifact");
+        let dir = run_dir(&run.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = head_sha(&run.project_dir).unwrap();
+
+        // A committed change on top of the base, and an uncommitted one after it —
+        // the review scope is the range PLUS the working tree, so both must appear.
+        std::fs::write(repo.path().join("committed.rs"), "fn committed() {}\n").unwrap();
+        for args in [&["add", "committed.rs"][..], &["commit", "-qm", "c"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(repo.path().join("uncommitted.rs"), "fn uncommitted() {}\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["add", "uncommitted.rs"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let path = write_review_diff(&dir, &run.project_dir, "task-1", 3, &base).unwrap();
+        assert_eq!(path, review_diff_path(&dir, "task-1", 3));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("## Summary (--stat)"), "{body}");
+        assert!(body.contains("## Patch"), "{body}");
+        assert!(body.contains("fn committed()"), "the committed half is missing: {body}");
+        assert!(
+            body.contains("fn uncommitted()"),
+            "the working-tree half is missing, so the reviewer would review a stale \
+             range: {body}"
+        );
+    }
+
+    /// The seed names the diff by path, so the file has to exist by the time any
+    /// reviewer is seeded — a reviewer with no shell cannot recover from being sent to
+    /// a file that is not there yet.
+    #[test]
+    fn the_panel_writes_the_diff_before_it_seeds_anyone() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let h = FakeHerdr::new();
+        let (mut run, _repo) = make_run("cr-diff-before-seed");
+        write_base(&run, "task-1");
+        assert_eq!(
+            code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
+            ReviewOutcome::Timeout
+        );
+        let path = review_diff_path(&run_dir(&run.name), "task-1", 1);
+        assert!(
+            path.exists(),
+            "the panel must write {} before seeding reviewers at it",
+            path.display()
+        );
+        // …and every seed points at exactly that path.
+        let seed = std::fs::read_to_string(
+            run_dir(&run.name).join("task-1-review-correctness-seed.md"),
+        )
+        .unwrap();
+        assert!(
+            seed.contains(&path.display().to_string()),
+            "the seed must name the diff the panel wrote: {seed}"
+        );
+    }
+
     /// The diff alone cannot show whether a change is right — a reviewer has to read
     /// the callers, the invariants, and the tests it lands among. The seed must
     /// therefore name the checkout and grant whole-repo reads explicitly, or a
@@ -4616,6 +5138,7 @@ mod tests {
             "do the thing",
             "/checkout/here",
             None,
+            diff_fixture(),
         );
         assert!(
             seed.contains("/checkout/here"),
@@ -4625,9 +5148,22 @@ mod tests {
             seed.contains("read any file"),
             "seed must grant reads beyond the diffed files: {seed}"
         );
+        // The seed must NOT promise a shell. Reviewers have none — `bash` is denied
+        // (see `opencode_plan_permission`) — and a brief that told one to run `git
+        // diff` or the test suite would send every reviewer into a refusal it then has
+        // to reason its way out of, which is how a panel wastes its turn.
         assert!(
-            seed.contains("run the tests") || seed.contains("run tests"),
-            "seed must allow running the tests: {seed}"
+            !seed.contains("run the tests"),
+            "the seed must not promise a shell a reviewer does not have: {seed}"
+        );
+        assert!(
+            seed.contains("DO NOT RUN SHELL COMMANDS"),
+            "the seed must tell the reviewer plainly not to use a shell: {seed}"
+        );
+        // …and it must hand over the diff drovr wrote in its place, by path.
+        assert!(
+            seed.contains(&diff_fixture().display().to_string()),
+            "seed must name the diff drovr wrote for it: {seed}"
         );
     }
     /// Context the driver supplies must reach the reviewer as a labelled section of
@@ -4642,6 +5178,7 @@ mod tests {
             "do the thing",
             "/checkout/here",
             Some("the retry loop is new; ignore the vendored dir"),
+            diff_fixture(),
         );
         assert!(
             with.contains("## Context from the driver"),
@@ -4657,6 +5194,7 @@ mod tests {
             "do the thing",
             "/checkout/here",
             None,
+            diff_fixture(),
         );
         assert!(
             without.contains("## Context from the driver") && without.contains("none supplied"),
@@ -4796,6 +5334,7 @@ mod tests {
             "do it",
             "/checkout/here",
             None,
+            diff_fixture(),
         );
         assert!(
             seed.contains("submit_findings"),
