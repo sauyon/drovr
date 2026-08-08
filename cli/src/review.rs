@@ -2444,16 +2444,33 @@ mod tests {
 
     /// Start an always-on server on 127.0.0.1:0 in a background thread, rooted
     /// at `runs_root`. Returns the bound address string.
+    ///
+    /// The workers adopt the calling thread's overlay, if it has one. Most
+    /// handlers resolve nothing from the environment — `runs_root` is passed in
+    /// explicitly, which is why the great majority of this fixture's callers
+    /// install no `TestEnv` at all — but some do: `handle_get_agents` calls
+    /// `config::load_config()`. Overlays are thread-scoped by design, so a
+    /// worker that did not enter one would read nothing and refuse on its first
+    /// access, surfacing as a 500 some distance from the cause.
+    ///
+    /// `None` is left as `None` deliberately rather than substituted for. A test
+    /// with no environment whose handler reaches for one is a test that failed
+    /// to say what it needed, and the refusal names the thread and the key.
     fn start_server(runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
         let bound_port = server.server_addr().to_ip().expect("ip addr").port();
         let ctx = Arc::new(Ctx::new(runs_root, allowed_hosts_for("127.0.0.1", bound_port)));
         let server = Arc::new(server);
+        let env = crate::test_env::EnvHandle::of_current_thread();
         for _ in 0..2 {
             let server = Arc::clone(&server);
             let ctx = Arc::clone(&ctx);
+            let env = env.clone();
             thread::spawn(move || {
+                // Held for the worker's whole life: every request this thread
+                // serves must resolve the environment the test installed.
+                let _entered = env.as_ref().map(|e| e.enter());
                 while let Ok(req) = server.recv() {
                     handle(req, &ctx);
                 }
@@ -4630,11 +4647,12 @@ mod tests {
 
         // `enter()` must be the FIRST statement in the closure: `review_wait`
         // opens with `ensure_server()`, which reads `server.addr` under
-        // `data_dir()`. Without the overlay this thread falls through to the
-        // process environment and resolves the LIVE `~/.local/share/drovr` —
-        // `refuse_home_data_root` turns that into a panic rather than a silent
-        // wait on the developer's own review server, but the guard is the
-        // backstop, not the mechanism.
+        // `data_dir()`. Overlays are thread-scoped, so without this the spawned
+        // thread has no environment to read and refuses on its first access.
+        // That refusal replaced a far worse outcome: while `crate::env` still
+        // fell through to the process, this thread resolved the LIVE
+        // `~/.local/share/drovr` and waited on the developer's own review
+        // server.
         let env_handle = env.handle();
         let run_t = run.clone();
         let handle = thread::spawn(move || {
@@ -5184,6 +5202,11 @@ mod tests {
     /// node clean and clear an alarm already raised.
     #[test]
     fn the_agent_tree_says_when_its_sweep_reached_nothing() {
+        // `handle_get_agents` is the one handler here that resolves a variable:
+        // it calls `config::load_config()`, which reads `XDG_CONFIG_HOME`. The
+        // request threads adopt this overlay (see `start_server`); without it
+        // they would have nothing to read and the endpoint would 500.
+        let _env = TestEnv::new();
         let tmp = std::env::temp_dir().join(format!("drovr-blk-10-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         make_running_run(&tmp, "blip", "w:p0");

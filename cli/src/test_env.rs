@@ -7,7 +7,7 @@
 //! longer resolve each other's `XDG_DATA_HOME`.
 //!
 //! This replaces a convention with a capability. The old shape was a
-//! process-global `set_var` under `ENV_LOCK` whose contract lived in a doc
+//! process-global write under a shared mutex whose contract lived in a doc
 //! comment: a test that read the variable outside the lock, or ran before any
 //! test had set it, resolved whatever the process happened to say and
 //! *silently succeeded*. There is no such window here, because there is no
@@ -42,17 +42,13 @@
 //! state the guard *wants* unoverlaid — it has to compare against the paths the
 //! OS will actually use — but note that neither is caught by the chokepoint
 //! test in [`crate::env`], which scans for `std::env::var` only. That is a
-//! standing gap in the scan, not a licence: `std::env::temp_dir()` also appears
-//! in `main.rs::cleanup_scratch`, which task 9 migrates.
+//! standing gap in the scan rather than a licence: a future `current_dir` or
+//! `temp_dir` call added elsewhere in `src/` would not be reported.
 //!
-//! Neither bootstrap read takes `ENV_LOCK`, deliberately. No test in the suite
-//! writes `HOME` or `PATH`, so there is no same-key race to lose; the residual
-//! — that any concurrent `set_var` anywhere can in principle disturb the
-//! environ table — is the crate-wide condition this run is removing, shared
-//! with every existing environment read in every test, and it reaches zero when
-//! the last `set_var` goes. Taking `ENV_LOCK` here would instead be a new
-//! hazard: [`TestEnv::new`] is called from tests that may still hold it during
-//! tasks 6–12, and `std::sync::Mutex` is not reentrant.
+//! Neither bootstrap read is synchronised against anything, and no longer needs
+//! to be. Reading the environ table concurrently with a write to it is undefined
+//! behaviour, but there is no writer left in `src/`: nothing in the crate mutates
+//! the process environment any more, so these two reads race nothing.
 //!
 //! The temp-root exemption reads the *real* `TMPDIR`, so a test that changed
 //! `TMPDIR` process-globally would move it. That is correct rather than a hole:
@@ -275,7 +271,7 @@ impl TestEnv {
     /// Overlay a variable for this thread.
     ///
     /// Takes `impl AsRef<OsStr>` so call sites can pass `&Path`, `PathBuf` or
-    /// `&str` interchangeably, as they do today with `set_var`.
+    /// `&str` interchangeably, as the process-global writes it replaced did.
     ///
     /// # Panics
     ///
@@ -333,7 +329,7 @@ impl TestEnv {
     /// look: the call returns normally, the variable never changes, and the
     /// test asserts against the value it thinks it just set. That is the exact
     /// shape of silent failure this module exists to remove — the process-global
-    /// `set_var` it replaces failed the same way, just for a different reason.
+    /// write it replaces failed the same way, just for a different reason.
     ///
     /// The situation is reachable two ways. A test can hold two live `TestEnv`s
     /// and write through the outer one; or a fixture taking `&TestEnv` can be
@@ -441,6 +437,29 @@ impl EnvHandle {
             frame: install(&self.0),
             _not_send: PhantomData,
         }
+    }
+
+    /// A handle to whatever overlay the calling thread currently reads through.
+    ///
+    /// For a fixture that spawns workers on the caller's behalf and wants them
+    /// to resolve the environment the way their parent does — the review
+    /// server's request threads are the case this exists for. Threading a
+    /// `&TestEnv` parameter through such a fixture instead would force every
+    /// one of its callers to construct an environment, including the great
+    /// majority that pass an explicit root and read no variable at all.
+    ///
+    /// Capturing "whatever this thread reads through" cannot be handed the
+    /// wrong environment the way an explicit parameter can — that is what
+    /// [`TestEnv::refuse_shadowed`] exists to catch — because it is by
+    /// definition the innermost frame, the same one [`current`] answers the shim
+    /// from.
+    ///
+    /// `None` when nothing is installed. A worker spawned from a bare thread
+    /// then reads nothing and refuses loudly on its first access, which is the
+    /// intended outcome rather than a case to paper over: it means the test
+    /// wanted an environment and never said so.
+    pub fn of_current_thread() -> Option<EnvHandle> {
+        current().map(EnvHandle)
     }
 }
 
@@ -570,10 +589,11 @@ fn is_forbidden_root(value: &Path, home: &Path, temp_root: &Path) -> bool {
 /// The overlay removes the race, but not this: [`TestEnv::set`] is an
 /// unrestricted setter, and a thread-scoped write into the real data root is
 /// still a write into the real data root. So the property is *relocated*, from
-/// the read path — where `run::refuse_home_data_root` still holds it, until it
-/// is deleted — to the write path, which is now the single door through which a
+/// the read path — where `run::data_dir` used to re-check the value it had just
+/// resolved — to the write path, which is now the single door through which a
 /// root can be named. A precondition *on* the capability is the capability;
-/// a guard sitting beside one would be a second, weaker mechanism.
+/// a guard sitting beside one would be a second, weaker mechanism, which is why
+/// the read-path check was deleted rather than kept as a backstop.
 ///
 /// `$HOME` unset ⇒ nothing to protect ⇒ no check.
 fn refuse_home_root(key: &str, value: &Path) {
@@ -632,7 +652,7 @@ mod tests {
     ///
     /// The barrier is the point: both overlays are installed and written before
     /// either is read, so the assertions run in the window where a
-    /// process-global `set_var` would have had them clobbering each other.
+    /// process-global write would have had them clobbering each other.
     #[test]
     fn overlay_is_per_thread() {
         let gate = Arc::new(Barrier::new(2));
@@ -659,6 +679,13 @@ mod tests {
     /// Under `--test-threads=1` every test runs on the main thread, so the
     /// thread-local is *shared* across them and `Drop` is the whole isolation
     /// story. This asserts it.
+    ///
+    /// The post-drop half used to assert only that the dropped root was no
+    /// longer *the* answer — all it could assert while `crate::env` still fell
+    /// through to the process environment, and a weak property: it would also
+    /// have held if the read had leaked some third value. Now that the
+    /// fallthrough is gone the stronger statement is available and is the one
+    /// worth pinning: after the drop there is no answer at all.
     #[test]
     fn overlay_does_not_leak_between_sequential_tests() {
         let root = {
@@ -671,11 +698,35 @@ mod tests {
             root
         };
         assert!(current().is_none(), "dropping a TestEnv uninstalls it");
-        assert_ne!(
-            crate::env::var(DATA_KEY).map(PathBuf::from).ok(),
-            Some(root),
-            "the dropped overlay's data root is still visible",
+
+        // Caught rather than `#[should_panic]`, so that the pre-drop half above
+        // stays in the same test as the property it is the setup for.
+        let after = std::panic::catch_unwind(|| crate::env::var(DATA_KEY).ok());
+        let msg = after.expect_err(&format!(
+            "reading {DATA_KEY} after the overlay was dropped must refuse, not \
+             answer — the dropped root was {}",
+            root.display(),
+        ));
+        let msg = panic_message(&msg);
+        assert!(
+            msg.contains("no TestEnv installed on this thread"),
+            "expected the no-overlay refusal, got: {msg}",
         );
+    }
+
+    /// The payload of a `catch_unwind` error, as a string.
+    ///
+    /// `panic!` with a formatted message boxes a `String`; a literal one boxes a
+    /// `&'static str`. Both shapes occur in this crate, and a test that checked
+    /// only one would silently accept any panic of the other shape.
+    fn panic_message(e: &Box<dyn std::any::Any + Send>) -> &str {
+        if let Some(s) = e.downcast_ref::<String>() {
+            s
+        } else if let Some(s) = e.downcast_ref::<&str>() {
+            s
+        } else {
+            "<panic payload was neither String nor &str>"
+        }
     }
 
     #[test]
@@ -790,15 +841,16 @@ mod tests {
     /// `catch_unwind` rather than `#[should_panic]` for two reasons: the panic
     /// message is asserted, and the whole assertion can be skipped when `$HOME`
     /// is unset, which `#[should_panic]` cannot express. The panic is contained
-    /// here and takes no lock, so it cannot poison anything — see
-    /// `docs/known-issues.md` → "A panicking test can poison `ENV_LOCK` for the
-    /// whole suite". libtest still prints the caught panic; that is noise, not
-    /// a failure.
+    /// here and takes no lock — nor does anything else in this module, which is
+    /// why the poison cascade `docs/known-issues.md` records (under two headings
+    /// naming the mutex, unquoted here because the name is the token this run
+    /// removed from `src/`) can no longer happen. libtest still prints the
+    /// caught panic; that is noise, not a failure.
     ///
     /// On a machine whose system temp root *contains* `$HOME` the exemption
-    /// swallows this case and the assertion fails. That machine already fails
-    /// the whole suite through `run::refuse_home_data_root`, which has no
-    /// exemption at all; it is not a case this task can make green.
+    /// swallows this case and the assertion fails. Such a machine is not one
+    /// this check can be made green on: the exemption is what lets the suite's
+    /// own scratch dirs be named at all.
     #[test]
     fn setting_the_data_root_inside_the_real_home_panics() {
         let Some(home) = real_home() else {
@@ -843,7 +895,7 @@ mod tests {
     /// writing through the OUTER of two live environments used to return
     /// normally while changing nothing a `crate::env::var` would ever see — the
     /// variable kept its old value and the assertion after it tested nothing.
-    /// That is the same silent-success failure the process-global `set_var` had,
+    /// That is the same silent-success failure the process-global write had,
     /// which is the whole reason this module exists, so it has to be loud.
     ///
     /// `catch_unwind` for the reasons given on

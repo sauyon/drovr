@@ -1,0 +1,169 @@
+================================================================================
+race-green.txt — the XDG_DATA_HOME race, watched NOT failing (run enforce-env-lock, T13)
+================================================================================
+
+WHAT THIS IS
+  The other half of `race-red.txt`. That file recorded
+  `cli/src/run.rs::run::tests::data_root_is_not_shared_between_threads` failing,
+  on the record, before the fix existed. This file records the same test, the
+  same assertion, passing after it.
+
+  Read the two together or neither is worth much: a green test nobody watched
+  fail proves nothing, and a red one nobody watched go green proves only that a
+  defect was once real.
+
+WHAT IT PROVES — AND WHAT IT DOES NOT
+  Proves: two threads can now each redirect the data root, concurrently and in
+  a tight loop, without either observing the other's. The redirection is
+  thread-scoped by construction rather than by convention.
+
+  Does NOT prove: that this fixed any observed flake. T2's baseline recorded
+  8/8 green parallel runs — the documented flake did not reproduce, and that
+  ruling stands unchanged. This run removed a MECHANISM. It did not fix a flake
+  that was never watched failing.
+
+  Also does NOT prove the parallel suite is deterministic. It is not, for an
+  unrelated and still-open reason: forge.ko.ag/drovr/drovr#80, a fork/flock
+  race in `acquire_run_lock` that this run deliberately did not touch. See §3.
+
+WHEN / WHERE
+  recorded:    2026-08-08
+  worktree:    /home/sauyon/devel/drovr/.drovr/wt/enforce-env-lock
+  branch:      drovr/enforce-env-lock
+  review base: ad506cd11046b4e474c5c83a7670661be9955f2f (task-13-base.sha)
+  toolchain:   export PATH=/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin:\
+/nix/store/l3gishxdaxhnaxczyw0jw7dcy9p4rhcs-rustc-1.97.0/bin:$PATH
+               (cargo 1.97.0 / rustc 1.97.0)
+  machine:     Linux 7.1.5-arch1-2, glibc; local worktree, not the nix sandbox.
+               Same machine as race-red.txt.
+
+HOW TO REPRODUCE
+  cd cli
+  cargo test --bin drovr data_root_is_not_shared_between_threads
+
+  NOTE the changed command. `race-red.txt` said
+
+      cargo test --bin drovr -- --ignored data_root_is_not_shared_between_threads
+
+  and that command now selects NOTHING — which is itself the evidence that the
+  `#[ignore]` came off:
+
+      running 0 tests
+      test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 731 filtered out
+
+
+--------------------------------------------------------------------------------
+§1  VERBATIM GREEN OUTPUT
+--------------------------------------------------------------------------------
+
+$ cd cli
+$ cargo test --bin drovr data_root_is_not_shared_between_threads
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/main.rs (target/debug/deps/drovr-b62291024005c9ca)
+
+running 1 test
+test run::tests::data_root_is_not_shared_between_threads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 730 filtered out; finished in 0.06s
+$ echo $?
+0
+
+  Ten consecutive invocations, matching race-red.txt §1's ten:
+
+    run  1: ok    run  2: ok    run  3: ok    run  4: ok    run  5: ok
+    run  6: ok    run  7: ok    run  8: ok    run  9: ok    run 10: ok
+
+  Against 10/10 FAILED at 4460-5985 stolen reads per run in race-red.txt §1.
+  The stolen-read count is now structurally zero: the assertion is
+  `observed.iter().sum() == 0` and it holds, so neither thread saw the other's
+  root in any of the 20_000 reads it performed.
+
+
+--------------------------------------------------------------------------------
+§2  THE SUITE COUNT race-red.txt §5 ASKED FOR
+--------------------------------------------------------------------------------
+
+  race-red.txt §5 item 3 predicted: "The suite must then report 731 passed /
+  0 failed / 0 ignored: the same 730 as the baseline, plus this test now
+  passing. 730 with 1 ignored means the `#[ignore]` was not removed."
+
+$ cargo test --bin drovr -- --test-threads=1
+test result: ok. 731 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.61s
+
+  731 / 0 / 0, exactly as predicted. The arithmetic behind it is not quite the
+  prediction's, and the difference is worth stating rather than glossing:
+
+    730  baseline (T12's inventory, of which 1 was this ignored test)
+     -1  data_dir_refuses_to_resolve_inside_the_real_home  — DELETED (T13 item 3)
+     +1  data_dir_without_a_test_env_panics                — its successor (item 4)
+     -1  without_an_overlay_the_shim_is_std_env            — asserted the fallthrough
+     +1  without_an_overlay_the_shim_refuses_to_read       — its successor
+     +1  without_an_overlay_var_os_refuses_too             — the second door
+    ---
+    731
+
+  The full `--list` inventory was diffed line by line before and after: three
+  changed lines, all of them the above, nothing else moved.
+
+
+--------------------------------------------------------------------------------
+§3  WHAT IS STILL RED, AND WHY IT IS NOT THIS
+--------------------------------------------------------------------------------
+
+  The PARALLEL suite still fails. Ten consecutive runs at this commit:
+
+    728/3, 728/3, 729/2, 729/2, 729/2, 728/3, 729/2, 727/4, 729/2, 729/2
+
+  All 25 failures across those runs are the fork-window family described in
+  `docs/known-issues.md`'s first entry (forge.ko.ag/drovr/drovr#80): an `flock`
+  belongs to the open file description, so a concurrent `fork()` in the
+  fork→exec window leaves a child holding the lock. 19 were the two
+  `code_review::tests` panel-reaping tests; the other 6 were the same mechanism
+  surfacing elsewhere (`WouldBlock` from `acquire_run_lock`, and ETXTBSY on the
+  `with_stub` helper at `herdr.rs:2131`, which writes a stub script and then
+  execs it).
+
+  NONE came from this task's new refusal. The decisive check, which anyone can
+  repeat: no failure output in any of the ten runs contains the string
+  "no TestEnv installed". A test that had lost its environment would say so by
+  name; none did.
+
+  `--test-threads=1` is the gate and is clean and repeatable at 731/0/0.
+
+
+--------------------------------------------------------------------------------
+§4  MUTATION CHECKS — IS THE GREEN LOAD-BEARING?
+--------------------------------------------------------------------------------
+
+  A rewritten test that passes is worth exactly as much as its ability to still
+  fail. Two checks.
+
+  (a) THE OBSERVATION IS LIVE. Redirect each thread to a root other than the one
+      its expectation was derived from — `env.set(DATA_KEY, root.join("elsewhere"))`
+      — and every single read is counted as stolen:
+
+        panicked at src/run.rs:2030:9:
+          left: 40000
+         right: 0
+
+      40000 = 2 threads x 20_000 iterations. So the loop really does compare
+      `data_dir()` against this thread's root on every iteration; nothing is
+      being skipped, short-circuited or optimised away.
+
+  (b) THE SHARED-SLOT SHAPE IS NOT MERELY ABSENT, IT IS UNEXPRESSIBLE. The
+      intended mutation was to put both threads back on ONE overlay — the exact
+      analogue of the process-global slot that failed in race-red.txt. It does
+      not compile:
+
+        error[E0277]: `*const ()` cannot be sent between threads safely
+
+      `TestEnv` is `!Send` by construction (`cli/src/test_env.rs`, the
+      `const _: () = { ... }` Send/Sync probe block), and the `EnteredEnv` a
+      spawned thread CAN obtain has no setter at all. So a worker thread cannot
+      write another thread's overlay, and two threads cannot share one writable
+      one.
+
+      This is a stronger result than a red test and is recorded as such: the
+      defect race-red.txt demonstrates cannot be reintroduced by editing this
+      test, only by removing the `!Send` bound — which is itself guarded by the
+      compile-time probe.

@@ -17,12 +17,17 @@
 //! is what turns a test that still writes the process environment into a loud
 //! failure rather than a silent one.
 //!
-//! The overlay type does not exist yet, so today the `cfg(test)` bodies are the
-//! one transitional line marked below.
+//! There is likewise no fallthrough for the *absent overlay*. A read on a thread
+//! with no [`crate::test_env::TestEnv`] installed panics rather than answering
+//! from the process. That is what makes the isolation authoritative instead of
+//! conventional: a test cannot opt out of declaring its environment, because
+//! there is no longer anything to opt out *to*.
 //!
-//! The shim is READ-ONLY by design. `set_var`/`remove_var` are not forwarded:
-//! process-global writes are the mechanism being removed, not a capability to
-//! be re-exported behind a nicer name.
+//! The shim is READ-ONLY by design: there are two doors here and both of them
+//! read. Process-global writes were the mechanism this removed, so there is no
+//! forwarding wrapper for them — that would be the same capability re-exported
+//! behind a nicer name. A test names its variables through
+//! [`crate::test_env::TestEnv`], which writes only its own thread's overlay.
 
 use std::env::VarError;
 use std::ffi::OsString;
@@ -41,32 +46,61 @@ pub fn var_os(key: &str) -> Option<OsString> {
 }
 
 /// Read an environment variable as UTF-8, with `std::env::var`'s exact error
-/// semantics.
+/// semantics — but only from this thread's overlay.
+///
+/// # Panics
+///
+/// If no overlay is installed on the calling thread. See [`no_overlay`].
 #[cfg(test)]
 pub fn var(key: &str) -> Result<String, VarError> {
-    if let Some(overlay) = crate::test_env::current() {
-        // Converted here rather than in the overlay, so that `std::env::var`'s
-        // error semantics stay in one place: absent is NotPresent, non-UTF-8 is
-        // NotUnicode carrying the original bytes.
-        return match overlay.get_os(key) {
-            None => Err(VarError::NotPresent),
-            Some(v) => v.into_string().map_err(VarError::NotUnicode),
-        };
+    let Some(overlay) = crate::test_env::current() else {
+        no_overlay(key)
+    };
+    // Converted here rather than in the overlay, so that `std::env::var`'s
+    // error semantics stay in one place: absent is NotPresent, non-UTF-8 is
+    // NotUnicode carrying the original bytes.
+    match overlay.get_os(key) {
+        None => Err(VarError::NotPresent),
+        Some(v) => v.into_string().map_err(VarError::NotUnicode),
     }
-    // TRANSITIONAL — deleted at T13, which is what makes the capability authoritative.
-    // Until then an unmigrated test still reads the process env under ENV_LOCK.
-    std::env::var(key)
 }
 
-/// Read an environment variable as raw OS bytes.
+/// Read an environment variable as raw OS bytes, from this thread's overlay.
+///
+/// # Panics
+///
+/// If no overlay is installed on the calling thread. See [`no_overlay`].
 #[cfg(test)]
 pub fn var_os(key: &str) -> Option<OsString> {
-    if let Some(overlay) = crate::test_env::current() {
-        return overlay.get_os(key);
-    }
-    // TRANSITIONAL — deleted at T13, which is what makes the capability authoritative.
-    // Until then an unmigrated test still reads the process env under ENV_LOCK.
-    std::env::var_os(key)
+    let Some(overlay) = crate::test_env::current() else {
+        no_overlay(key)
+    };
+    overlay.get_os(key)
+}
+
+/// The refusal both `cfg(test)` readers share.
+///
+/// Panicking is the whole point, and the alternatives are each a way of being
+/// silently wrong. Falling through to the process environment is what this run
+/// removed — it is how a test resolved another test's `XDG_DATA_HOME`, and how
+/// `cargo test` twice deleted the live `~/.local/share/drovr`. Returning
+/// `NotPresent` instead would be quieter and worse: `data_dir()` would take its
+/// `$HOME/.local/share` fallback with `HOME` also absent, `unwrap()` on it, and
+/// every caller would report a confusing failure some distance from the test
+/// that forgot to declare an environment.
+///
+/// So the refusal names the thread as well as the key. The two ways to reach
+/// here are a test that installed nothing, and — much more easily missed — a
+/// thread the test *spawned*, which does not inherit the parent's overlay
+/// because the overlay is thread-scoped by design.
+#[cfg(test)]
+fn no_overlay(key: &str) -> ! {
+    panic!(
+        "drovr test guard: read of {key} with no TestEnv installed on this thread. Under \
+         cfg(test) drovr does not read the process environment at all — construct a \
+         `TestEnv` (cli/src/test_env.rs) at the top of the test, or `EnvHandle::enter()` \
+         if this is a thread the test spawned."
+    )
 }
 
 #[cfg(test)]
@@ -91,15 +125,6 @@ mod tests {
     /// failing test — a raw read is invisible to the overlay and therefore
     /// still races.
     const RAW_EXCEPTIONS: &[RawException] = &[
-        RawException {
-            file: "run.rs",
-            tag: "refuse-home-data-root",
-            why: "refuse_home_data_root must see the REAL $HOME. The cfg(test) shim answers \
-                  only from the overlay, which never seeds HOME, so a shimmed read would \
-                  return NotPresent and the guard would pass unconditionally for every \
-                  migrated test — silently inert for exactly the sweep it backstops. This \
-                  exception dies with the function it belongs to.",
-        },
         RawException {
             file: "test_env.rs",
             tag: "bootstrap-home",
@@ -262,29 +287,38 @@ mod tests {
         }
     }
 
-    /// With no overlay installed the shim is `std::env`, exactly.
+    /// With no overlay installed the shim refuses, rather than answering from
+    /// the process.
     ///
-    /// This is the transitional behaviour every not-yet-migrated test still
-    /// depends on. It is also the contract the overlay has to break on purpose:
-    /// when `TestEnv` lands, this equality holds only while no overlay is
-    /// installed on the calling thread.
-    ///
-    /// `PATH` is chosen because no test in the suite writes it, so the two
-    /// reads cannot be separated by a concurrent `set_var`. A key that is
-    /// absent covers the other branch.
+    /// This replaces the transitional `without_an_overlay_the_shim_is_std_env`,
+    /// which asserted the opposite equality — and it is the single assertion
+    /// that makes the isolation authoritative rather than conventional. While
+    /// the fallthrough existed, "every test declares its environment" was a
+    /// convention: a test that declared nothing still got an answer, just not a
+    /// reproducible one. `PATH` is deliberately the key, because it is the one
+    /// the process certainly *does* hold — a refusal on an absent key would
+    /// prove nothing about fallthrough.
     #[test]
-    fn without_an_overlay_the_shim_is_std_env() {
+    #[should_panic(expected = "no TestEnv installed on this thread")]
+    fn without_an_overlay_the_shim_refuses_to_read() {
         assert!(
             crate::test_env::current().is_none(),
             "this test asserts the NO-overlay branch; an overlay installed on \
-             this thread would make the equality below false by design",
+             this thread would answer the read below instead of refusing it",
         );
-        assert_eq!(super::var("PATH"), std::env::var("PATH"));
-        assert_eq!(super::var_os("PATH"), std::env::var_os("PATH"));
+        let _ = super::var("PATH");
+    }
 
-        const ABSENT: &str = "DROVR_ENV_SHIM_KEY_THAT_IS_NEVER_SET";
-        assert_eq!(super::var(ABSENT), Err(std::env::VarError::NotPresent));
-        assert_eq!(super::var_os(ABSENT), None);
+    /// `var_os` refuses on the same terms as [`var`](super::var).
+    ///
+    /// Separate test rather than a second line in the one above: `should_panic`
+    /// stops at the first panic, so a single test would assert only whichever
+    /// door it reached first and the other could quietly regain a fallthrough.
+    #[test]
+    #[should_panic(expected = "no TestEnv installed on this thread")]
+    fn without_an_overlay_var_os_refuses_too() {
+        assert!(crate::test_env::current().is_none());
+        let _ = super::var_os("PATH");
     }
 
     /// With an overlay installed the shim answers from it, and ONLY from it.
