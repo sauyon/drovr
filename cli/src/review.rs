@@ -2373,6 +2373,7 @@ pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
     use std::net::TcpStream;
 
     /// Start an always-on server on 127.0.0.1:0 in a background thread, rooted
@@ -4326,32 +4327,40 @@ mod tests {
 
     // -- review_summary / review_wait over the global server -----------------
 
-    /// Spin a server rooted at `<XDG_DATA_HOME>/drovr/runs`, write the global
-    /// `server.addr`, and return (addr, run, tempdir). Caller holds ENV_LOCK.
-    fn global_fixture(suffix: &str) -> (String, String, tempfile::TempDir) {
-        let tmp = make_root(suffix);
-        let base = tmp.path().to_path_buf();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", base.to_str().unwrap());
-        }
-        let runs_root = base.join("drovr/runs");
+    /// Spin a server rooted at `env`'s `<XDG_DATA_HOME>/drovr/runs`, write the
+    /// global `server.addr`, and return (addr, run).
+    ///
+    /// Takes the environment rather than building one: the caller needs the
+    /// same `TestEnv` for `data_root()` and, in the `review_wait` tests, for the
+    /// [`EnvHandle`](crate::test_env::EnvHandle) its waiting thread enters. The
+    /// scratch root it used to return is now owned by that `TestEnv`.
+    ///
+    /// `data_dir()` is `<XDG_DATA_HOME>/drovr`, which `make_run`'s
+    /// `create_dir_all` of `…/drovr/runs/<run>` has already created by the time
+    /// `server.addr` is written.
+    fn global_fixture(env: &TestEnv, suffix: &str) -> (String, String) {
+        let runs_root = env.data_root().join("drovr/runs");
         let run = format!("run-{suffix}");
         make_run(&runs_root, &run, b"# Spec");
         let addr = start_server(runs_root);
         fs::write(data_dir().join("server.addr"), addr.as_bytes()).unwrap();
-        (addr, run, tmp)
+        (addr, run)
     }
 
     #[test]
     fn review_summary_posts_to_server() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (_addr, run, tmp) = global_fixture("rev-summary");
+        let env = TestEnv::new();
+        let (_addr, run) = global_fixture(&env, "rev-summary");
 
         review_summary(&run, "Agent summary text.").expect("review_summary");
 
-        let summary =
-            fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("summary.txt"))
-                .expect("summary.txt");
+        let summary = fs::read_to_string(
+            env.data_root()
+                .join("drovr/runs")
+                .join(&run)
+                .join("summary.txt"),
+        )
+        .expect("summary.txt");
         assert_eq!(summary, "Agent summary text.");
     }
 
@@ -4361,8 +4370,8 @@ mod tests {
     /// watch. Regression guard for "serving a spec doesn't start a watcher".
     #[test]
     fn review_summary_returns_server_addr_for_the_watch_hint() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("rev-summary-addr");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "rev-summary-addr");
 
         let returned = review_summary(&run, "Agent summary text.").expect("review_summary");
 
@@ -4392,36 +4401,39 @@ mod tests {
 
     #[test]
     fn wait_missing_server_errors() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let tmp = make_root("wait-no-server");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-            // Don't fork the test binary as a daemon; just prove "down" errors.
-            std::env::set_var("DROVR_NO_SPAWN", "1");
-        }
+        let env = TestEnv::new();
+        // Don't fork the test binary as a daemon; just prove "down" errors. This
+        // has to go through the same overlay `ensure_server`'s shimmed read
+        // (`crate::env::var_os`) answers from — a raw process-global write would
+        // read back as absent and the test would really spawn `drovr serve`.
+        env.set("DROVR_NO_SPAWN", "1");
         let res = review_wait("nope", 100);
-        unsafe {
-            std::env::remove_var("DROVR_NO_SPAWN");
-        }
         assert!(res.is_err(), "missing server must error");
     }
 
     #[test]
     fn wait_times_out_while_idle() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (_addr, run, _tmp) = global_fixture("idle-timeout");
+        let env = TestEnv::new();
+        let (_addr, run) = global_fixture(&env, "idle-timeout");
         let outcome = review_wait(&run, 60).expect("wait");
         assert_eq!(outcome, WaitOutcome::Timeout);
     }
 
     #[test]
     fn wait_returns_approved() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("approve");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "approve");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        // `review_wait` resolves `server.addr` under `data_dir()` on its OWN
+        // thread, so the overlay has to be entered there and it has to be the
+        // first thing that happens — see the comment in `wait_returns_cancelled`.
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4436,12 +4448,16 @@ mod tests {
 
     #[test]
     fn wait_returns_changes_requested() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, tmp) = global_fixture("changes");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "changes");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4456,8 +4472,13 @@ mod tests {
             WaitOutcome::ChangesRequested
         );
 
-        let fb = fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("feedback.json"))
-            .expect("feedback.json");
+        let fb = fs::read_to_string(
+            env.data_root()
+                .join("drovr/runs")
+                .join(&run)
+                .join("feedback.json"),
+        )
+        .expect("feedback.json");
         assert!(fb.contains("needs work"), "feedback.json: {fb}");
     }
 
@@ -4465,8 +4486,8 @@ mod tests {
     fn summary_on_a_cancelled_run_errors_clearly() {
         // The agent's own exit path: it posts a summary, the run is already
         // cancelled, and the message must name that — not "unexpected response".
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("summary-cancelled");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "summary-cancelled");
         http_post(
             &addr,
             &format!("/api/runs/{run}/submit"),
@@ -4481,12 +4502,23 @@ mod tests {
 
     #[test]
     fn wait_returns_cancelled() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, tmp) = global_fixture("cancel");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "cancel");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        // `enter()` must be the FIRST statement in the closure: `review_wait`
+        // opens with `ensure_server()`, which reads `server.addr` under
+        // `data_dir()`. Without the overlay this thread falls through to the
+        // process environment and resolves the LIVE `~/.local/share/drovr` —
+        // `refuse_home_data_root` turns that into a panic rather than a silent
+        // wait on the developer's own review server, but the guard is the
+        // backstop, not the mechanism.
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4502,7 +4534,7 @@ mod tests {
         );
 
         assert!(
-            tmp.path()
+            env.data_root()
                 .join("drovr/runs")
                 .join(&run)
                 .join("cancelled")
