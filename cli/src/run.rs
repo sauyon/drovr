@@ -1435,6 +1435,7 @@ impl RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
     use crate::test_util::ENV_LOCK;
 
     // A RunState with the given phases; other fields inert. `archived` defaults
@@ -1756,11 +1757,7 @@ mod tests {
 
     #[test]
     fn a_stale_save_never_resurrects_an_archived_run() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
 
         // A long-running command (`code-review run` blocks for up to its timeout)
         // loads the run while it is still active...
@@ -1794,11 +1791,7 @@ mod tests {
     /// re-reading it, and what is on disk is what the run is.
     #[test]
     fn refresh_archived_adopts_disk_in_both_directions() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![running("implement")]);
         s.save().unwrap();
 
@@ -1823,11 +1816,7 @@ mod tests {
         // state.json. Folding a read error into "trust my own copy" would let a
         // torn read or a permissions problem silently decide which authority is
         // in force — the caller cannot even tell it happened.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![running("implement")]);
         s.save().unwrap();
         fs::write(run_dir("r").join("state.json"), b"{ this is not json").unwrap();
@@ -1856,11 +1845,7 @@ mod tests {
         // half that a one-way `|=` merge got wrong: a long-running command whose
         // copy latched `archived: true` (from an Archive it observed) must not
         // write that back over a Restore that has since landed.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut stale = completion_run(vec![running("implement")]);
         stale.archived = true;
         stale.save().unwrap();
@@ -1892,11 +1877,7 @@ mod tests {
 
     #[test]
     fn restore_can_still_clear_the_archived_flag() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![done("implement")]);
         s.archived = true;
         s.save().unwrap();
@@ -1941,17 +1922,20 @@ mod tests {
         assert_eq!(round.retired_panes, vec!["w:p7"]);
     }
 
+    /// The claim is about COMPOSITION — `run_dir` is `<XDG_DATA_HOME>/drovr/runs/<name>`
+    /// and nothing else — so the root is one this test names explicitly rather than the
+    /// one `TestEnv` seeds. Reading back a value the test never set would be a weaker
+    /// assertion: it could not tell "run_dir uses XDG_DATA_HOME" from "run_dir happens
+    /// to agree with TestEnv's default". The root is built from `env.path()` rather
+    /// than the `/tmp/drovr-xdg-test` literal it used to hard-code, which is the same
+    /// shape without pinning a fixed path two concurrent tests could both claim.
     #[test]
     fn run_dir_uses_xdg() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test");
-        }
-        assert_eq!(
-            run_dir("demo"),
-            PathBuf::from("/tmp/drovr-xdg-test/drovr/runs/demo")
-        );
-        assert_eq!(data_dir(), PathBuf::from("/tmp/drovr-xdg-test/drovr"));
+        let env = TestEnv::new();
+        let root = env.path().join("xdg");
+        env.set("XDG_DATA_HOME", &root);
+        assert_eq!(run_dir("demo"), root.join("drovr/runs/demo"));
+        assert_eq!(data_dir(), root.join("drovr"));
     }
 
     /// `data_dir()` must never resolve inside the real home directory while the
@@ -2166,11 +2150,7 @@ mod tests {
 
     #[test]
     fn list_runs_finds_dirs_with_state_json() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         // Missing runs/ dir → empty, not an error.
         assert!(list_runs_in(&runs_dir()).is_empty());
 
@@ -2289,10 +2269,7 @@ mod tests {
 
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test2");
-        }
+        let _env = TestEnv::new();
         let s = RunState {
             name: "demo".into(),
             task: "t".into(),
@@ -2392,11 +2369,7 @@ mod tests {
 
     #[test]
     fn save_leaves_no_temp_file_behind() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = fat_run("tmpclean", 3);
         s.save().unwrap();
         s.cursor = 1;
@@ -2436,23 +2409,32 @@ mod tests {
         //  * each writer builds its `RunState` ONCE, outside the loop, so its
         //    time goes into `fs::write` rather than into `format!`.
         //
-        // Structured so NOTHING panics inside a spawned thread: a panic there
-        // would surface at a join on the main thread, which is holding ENV_LOCK,
-        // poisoning it and cascade-failing every other test in the binary. Threads
-        // return Results; the main thread asserts. `thread::scope` guarantees all
-        // threads are joined even if the body unwinds, so no thread can outlive
-        // the lock guard or the TempDir and race the next test's `set_var`.
+        // Structured so NOTHING panics inside a spawned thread. That used to be
+        // about `ENV_LOCK`: a panic at a join on the main thread, which held the
+        // mutex, poisoned it and cascade-failed the whole binary. There is no
+        // shared lock here any more, and the reason it stays is the smaller one
+        // it always also had — a thread that panics reports as a bare
+        // `Any { .. }` at the join, while a returned `Err` carries the torn-read
+        // message that says what actually went wrong. Threads return Results;
+        // the main thread asserts. `thread::scope` guarantees all threads are
+        // joined even if the body unwinds, so none can outlive the `TestEnv`
+        // whose overlay — and whose TempDir — they are resolving against.
         const PHASES: usize = 200;
         const WRITERS: usize = 4;
         const SAVES: usize = 400;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let env = TestEnv::new();
         // Seed the file so the reader always has something to open.
         fat_run("race", PHASES).save().unwrap();
+
+        // The overlay is THREAD-LOCAL, so every thread below must enter it or its
+        // `save`/`load` resolves `data_dir()` outside this test's root entirely —
+        // in a checkout under $HOME that is `refuse_home_data_root`'s panic, and
+        // anywhere else it is five threads silently writing to five directories
+        // and a test that proves nothing. Shared by reference, not moved: the
+        // scoped closures each need their own guard, and `EnvHandle: Sync`.
+        let handle = env.handle();
+        let handle = &handle;
 
         let finished = std::sync::atomic::AtomicUsize::new(0);
         let finished = &finished;
@@ -2467,6 +2449,7 @@ mod tests {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|w| {
                     s.spawn(move || {
+                        let _guard = handle.enter();
                         let mut st = fat_run("race", PHASES);
                         while !reading.load(std::sync::atomic::Ordering::SeqCst) {
                             std::thread::yield_now();
@@ -2484,6 +2467,7 @@ mod tests {
                 })
                 .collect();
             let reader = s.spawn(move || {
+                let _guard = handle.enter();
                 // Deadline backstop: if a writer dies without incrementing
                 // `finished`, this must fail the test rather than spin forever
                 // (`cargo test` has no per-test timeout, so a hang is worse than
@@ -2831,11 +2815,7 @@ mod tests {
         // the point — `set_pane` clears `reaped`, so the public API cannot build
         // it), which is exactly why the write-side check is defence in depth
         // rather than dead code.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![done("plan")]);
         s.name = "asym".into();
         s.save().expect("a consistent state saves");
@@ -2886,11 +2866,7 @@ mod tests {
         assert_eq!(p.mark_reaped(), None, "idempotent; nothing left to retire");
 
         // The third door: a hand-written state.json.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let dir = run_dir("illegal");
         fs::create_dir_all(&dir).unwrap();
         fs::write(

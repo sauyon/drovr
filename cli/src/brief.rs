@@ -469,7 +469,7 @@ pub fn handoff_scaffold() -> String {
 mod tests {
     use super::*;
     use crate::run::RunState;
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
 
     /// Byte offset of the LINE that is exactly `heading`. The templates now mention
     /// headings in prose (e.g. "the task brief in the `## Context from the driver`
@@ -485,16 +485,12 @@ mod tests {
         None
     }
 
-    /// Composition now records/reads `<phase>-context.md`, so every test that composes
-    /// needs its own data home. Caller holds ENV_LOCK.
-    fn isolate(name: &str) -> std::path::PathBuf {
-        let data = std::path::PathBuf::from(format!("/tmp/drovr-brief-test-{name}"));
-        let _ = std::fs::remove_dir_all(&data);
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data);
-        }
-        data
-    }
+    // Composition records/reads `<phase>-context.md`, so every test that composes needs
+    // its own data home. `TestEnv::new()` IS that isolation — it seeds `XDG_DATA_HOME`
+    // into a per-test `TempDir` that no other thread can see — so the `isolate(name)`
+    // fixture that used to build `/tmp/drovr-brief-test-{name}` by hand has no work
+    // left to do and is gone. Its return value was discarded at all 18 call sites, and
+    // its per-name uniquifying is what the `TempDir` now provides by construction.
 
     fn make_run() -> RunState {
         RunState {
@@ -538,8 +534,7 @@ mod tests {
 
     #[test]
     fn composed_brief_substitutes_run_and_task_number() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("composed_brief_substitutes_run_and_task_number");
+        let _env = TestEnv::new();
         let run = make_run();
         let brief = compose_phase_brief(&run, "implement-task-3", None).unwrap();
         assert!(
@@ -566,8 +561,7 @@ mod tests {
     /// assemble one itself.
     #[test]
     fn composed_brief_drops_the_editorial_comment() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("composed_brief_drops_the_editorial_comment");
+        let _env = TestEnv::new();
         let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
         assert!(
             !brief.contains("<!--"),
@@ -585,8 +579,7 @@ mod tests {
     /// brackets".
     #[test]
     fn composition_leaves_non_placeholder_angle_brackets_alone() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("composition_leaves_non_placeholder_angle_brackets_alone");
+        let _env = TestEnv::new();
         let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
         assert!(
             brief.contains("answers[<id>]"),
@@ -596,8 +589,7 @@ mod tests {
 
     #[test]
     fn composed_brief_carries_the_task_and_the_driver_context() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("carries-context");
+        let _env = TestEnv::new();
         let run = make_run();
         let with =
             compose_phase_brief(&run, "plan", Some("the vendored dir is off limits")).unwrap();
@@ -632,8 +624,7 @@ mod tests {
     /// record must fail the composition, not warn and ship a thinner brief.
     #[test]
     fn an_unreadable_context_record_fails_the_composition() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("unreadable-record");
+        let _env = TestEnv::new();
         let run = make_run();
         // A DIRECTORY where the record belongs: readable path, unreadable as a file, and
         // deterministic across platforms and privilege levels (unlike chmod 000).
@@ -655,8 +646,7 @@ mod tests {
     /// replaces the link itself.
     #[test]
     fn recording_context_replaces_a_symlink_instead_of_following_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("symlink-record");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -686,8 +676,7 @@ mod tests {
     /// worse than not fixing it, because it reads as solved.
     #[test]
     fn recording_context_does_not_follow_a_symlink_at_the_temp_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("symlink-tmp");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -711,8 +700,7 @@ mod tests {
     /// work in the state that produces the error — including a directory at the path.
     #[test]
     fn clearing_context_works_when_the_record_is_a_directory() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("clear-a-directory");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(context_record(&dir, "plan")).unwrap();
@@ -738,8 +726,7 @@ mod tests {
     /// inject it into a brief.
     #[test]
     fn reading_a_symlinked_context_record_is_refused() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("symlink-read");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -760,8 +747,7 @@ mod tests {
     /// recording forever with an opaque `AlreadyExists`.
     #[test]
     fn a_stale_temp_file_does_not_block_recording() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("stale-temp");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -779,8 +765,7 @@ mod tests {
     /// `--context-file` and stdin is bypassable by writing the record directly.
     #[test]
     fn an_oversized_context_record_is_refused() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("oversized-record");
+        let _env = TestEnv::new();
         let run = make_run();
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -799,8 +784,7 @@ mod tests {
     /// account for it. An at-limit context must survive the round trip.
     #[test]
     fn an_at_limit_context_survives_being_recorded_and_reused() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("at-limit-roundtrip");
+        let _env = TestEnv::new();
         let run = make_run();
         let at_limit = "y".repeat(MAX_CONTEXT as usize);
 
@@ -822,8 +806,7 @@ mod tests {
     /// there: with no context, its scope is the task's entry in `plan.md`.
     #[test]
     fn the_implement_task_scope_pointer_matches_what_the_brief_contains() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("scope-pointer");
+        let _env = TestEnv::new();
         let run = make_run();
 
         // Assert on the pointer DROVR emits, not on the template's own prose (which
@@ -853,8 +836,7 @@ mod tests {
     /// every composed brief, with or without context.
     #[test]
     fn no_composed_brief_ends_with_a_stale_paste_footer() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("no-stale-footer");
+        let _env = TestEnv::new();
         let run = make_run();
         for phase in ["brainstorm", "plan", "review", "implement-task-1"] {
             for context in [None, Some("some context")] {
@@ -884,8 +866,7 @@ mod tests {
     /// at nothing. The section is therefore unconditional.
     #[test]
     fn every_composed_brief_has_a_context_section() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("always-context-section");
+        let _env = TestEnv::new();
         let run = make_run();
         for phase in ["brainstorm", "plan", "review", "implement-task-1"] {
             for context in [None, Some("real context")] {
@@ -908,8 +889,7 @@ mod tests {
     /// Context is per phase, never shared between them.
     #[test]
     fn recorded_context_does_not_leak_across_phases() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("context-per-phase");
+        let _env = TestEnv::new();
         let run = make_run();
         compose_phase_brief(&run, "plan", Some("plan-only context")).unwrap();
         let other = compose_phase_brief(&run, "review", None).unwrap();
@@ -927,8 +907,7 @@ mod tests {
     /// the task and context after it orphaned those criteria mid-brief.
     #[test]
     fn task_and_context_land_before_the_completion_criteria() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("section-order");
+        let _env = TestEnv::new();
         let run = make_run();
         let brief = compose_phase_brief(&run, "plan", Some("ctx here")).unwrap();
         let task = heading_pos(&brief, "## The run's task").expect("task section");
@@ -945,8 +924,7 @@ mod tests {
     /// the reviewer kept (decision A: `phase send` survives for free-form injection).
     #[test]
     fn an_unknown_phase_is_an_error_that_names_the_escape_hatch() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        isolate("an_unknown_phase_is_an_error_that_names_the_escape_hatch");
+        let _env = TestEnv::new();
         let err = compose_phase_brief(&make_run(), "verify-land", None)
             .expect_err("no template must not mean an improvised brief");
         let msg = err.to_string();
