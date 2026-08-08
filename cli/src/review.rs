@@ -1160,6 +1160,11 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
 /// scheme for a server whose front door is already open by design — and a
 /// half-measure here would read as protection this endpoint does not have.
 /// `serve_host` defaults to `127.0.0.1`, which is the actual boundary.
+///
+/// Under `cfg(test)` the shell-out is refused outright — see
+/// [`NO_DAEMON_UNDER_TEST`]. The `allow` is scoped to test builds, where that
+/// early return makes the rest of the body unreachable.
+#[cfg_attr(test, allow(unreachable_code))]
 fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
     let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
         respond_str(req, 400, "text/plain", "missing phase".into());
@@ -1207,6 +1212,21 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         };
         let code = if why == Why::NoSuchPhase { 404 } else { 409 };
         respond_str(req, code, "text/plain", msg);
+        return;
+    }
+
+    // Same wall as `ensure_server`'s, for the same reason and through this
+    // handler's existing 500 shape — see `NO_DAEMON_UNDER_TEST`. Spec §3.4 names
+    // only the daemon, but this handler forks a real `drovr` too, and today only
+    // test coverage (every case above short-circuits) keeps it unreached.
+    #[cfg(test)]
+    {
+        respond_str(
+            req,
+            500,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": NO_DAEMON_UNDER_TEST }).to_string(),
+        );
         return;
     }
 
@@ -2001,16 +2021,40 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// Why a `cfg(test)` build refuses, at every site that would fork a real
+/// `drovr`.
+///
+/// One string for all three ([`ensure_server`], [`handle_post_rehydrate`],
+/// [`handle_post_new_run`]) so a reader who hits it once does not have to work
+/// out whether the other two mean the same thing: they do, and the reason is
+/// structural rather than per-site. A forked child gets the process
+/// environment, and under `cfg(test)` the process environment is precisely what
+/// the test is NOT using — its roots live in a thread-local
+/// [`crate::test_env::TestEnv`] overlay, which no child can inherit. So the
+/// child resolves the real `~/.local/share/drovr` and writes into it.
+pub(crate) const NO_DAEMON_UNDER_TEST: &str =
+    "drovr review server is not running (a test may not fork a daemon: the child would \
+     inherit the REAL environment, not this thread's TestEnv, and resolve the live data root)";
+
 /// Ensure the always-on server is running and return its `host:port`.
 ///
 /// Reuses a live server (from `server.addr`) if one is reachable; otherwise
 /// spawns `drovr serve` as a detached background daemon and waits (bounded) for
 /// it to come up. This is what lets [`review_summary`] / [`review_wait`] work
 /// without the human starting a server by hand.
+///
+/// Under `cfg(test)` it never spawns — see [`NO_DAEMON_UNDER_TEST`]. The
+/// `allow` is scoped to test builds, where the early return really does make
+/// the rest of the body unreachable; the shipped build lints normally.
+#[cfg_attr(test, allow(unreachable_code))]
 pub fn ensure_server() -> io::Result<String> {
     if let Some(addr) = live_server_addr() {
         return Ok(addr);
     }
+    // Under `cfg(test)` this is not a seam, it is a wall: no test may fork a
+    // daemon, whatever it has set. See `NO_DAEMON_UNDER_TEST`.
+    #[cfg(test)]
+    return Err(io::Error::other(NO_DAEMON_UNDER_TEST));
     // Test seam: with DROVR_NO_SPAWN set, don't fork a daemon (spawning the test
     // binary with a `serve` arg would re-enter the harness). Just report down.
     if crate::env::var_os("DROVR_NO_SPAWN").is_some() {
@@ -2145,6 +2189,14 @@ fn live_server_addr() -> Option<String> {
 /// Body: `{ "name": "<run>", "task"?: "<text>", "dir"?: "<project dir>" }`.
 /// Runs `drovr new` then `drovr phase start <run> brainstorm` via this same
 /// binary, synchronously (both return quickly — `phase start` only spawns).
+///
+/// Under `cfg(test)` the shell-out is refused outright — see
+/// [`NO_DAEMON_UNDER_TEST`]. The refusal is placed as LATE as it can be, so
+/// every real refusal above it (400 on bad JSON, 400 on a bad run name) still
+/// runs and stays covered; the cost is that `task`/`dir` are then parsed and
+/// never used in a test build. Both `allow`s are scoped to `cfg(test)` — the
+/// shipped build lints normally.
+#[cfg_attr(test, allow(unreachable_code, unused_variables))]
 fn handle_post_new_run(mut req: Request) {
     let body = read_body(&mut req);
     let incoming: serde_json::Value = match serde_json::from_str(&body) {
@@ -2161,6 +2213,15 @@ fn handle_post_new_run(mut req: Request) {
     }
     let task = incoming["task"].as_str().unwrap_or("").to_string();
     let dir = incoming["dir"].as_str().unwrap_or("").to_string();
+
+    // Same wall as `ensure_server`'s, through this handler's existing 500 shape
+    // — see `NO_DAEMON_UNDER_TEST`. This one would fork `drovr new`, which
+    // creates a run directory: in a test that means one in the LIVE data root.
+    #[cfg(test)]
+    {
+        respond_str(req, 500, "text/plain", NO_DAEMON_UNDER_TEST.to_string());
+        return;
+    }
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -3565,7 +3626,9 @@ mod tests {
         // Every refusal short-circuits before `current_exe()`, so they are safe
         // to exercise in-process. The happy path shells out to the CLI — which
         // is the point: the CLI stays the sole writer of state.json — and is
-        // covered by `phase::rehydrate_tests` plus manual verification.
+        // covered by `phase::rehydrate_tests` plus manual verification. Under
+        // `cfg(test)` it no longer shells out at all, which the last case below
+        // asserts directly rather than leaving to the comment.
         let tmp = make_root("rehydrate-http");
         let dir = make_run(tmp.path(), "r", b"# Spec");
         let mut run: RunState = serde_json::from_str(
@@ -3595,6 +3658,13 @@ mod tests {
             crate::run::Phase::new("placeholder"),
             launch_failed,
         ];
+        // `brainstorm` (reaped, so its pane is gone and its agent record is
+        // waived) is fully rehydratable once the run has somewhere to launch —
+        // which is what makes the last case below reach the shell-out site. It
+        // also sharpens the refusals above: each now fails for its own reason
+        // rather than incidentally on `NoProjectDir`.
+        run.project_dir = tmp.path().to_string_lossy().into_owned();
+        run.workspace = Some("w".to_string());
         fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
         let before = fs::read_to_string(dir.join("state.json")).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
@@ -3660,6 +3730,20 @@ mod tests {
         );
         assert_eq!(s, 409, "{body}");
         assert!(body.contains("review-panel agent"), "{body}");
+
+        // The one case that passes every refusal and reaches the fork site. In
+        // a `cfg(test)` build it must be refused there too: the child would get
+        // the process environment, not this thread's overlay, and write into the
+        // live data root. Through the handler's existing JSON 500, so the HTTP
+        // contract is the one a failed `current_exe()` already produced.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=brainstorm",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 500, "{body}");
+        assert!(body.contains("a test may not fork a daemon"), "{body}");
 
         assert_eq!(
             fs::read_to_string(dir.join("state.json")).unwrap(),
@@ -3845,8 +3929,9 @@ mod tests {
     #[test]
     fn post_new_run_rejects_bad_input() {
         // The reject paths short-circuit before spawning `drovr new`, so they are
-        // safe to exercise in-process (the happy path shells out and is covered
-        // by manual/e2e testing).
+        // safe to exercise in-process. The happy path used to be untestable here
+        // for exactly that reason; under `cfg(test)` it is now refused at the
+        // fork site, which the last case asserts.
         let tmp = make_root("newrun");
         let addr = start_server(tmp.path().to_path_buf());
         // Missing name.
@@ -3858,6 +3943,22 @@ mod tests {
         // Malformed JSON.
         let (s, _) = http_post(&addr, "/api/runs", "application/json", "not json");
         assert_eq!(s, 400);
+        // A well-formed request, which reaches the fork site — and is refused
+        // there under `cfg(test)`. Without that wall this line would really run
+        // `drovr new`, creating a run directory in the LIVE data root, since the
+        // child cannot inherit a thread-local overlay.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs",
+            "application/json",
+            r#"{"name":"would-fork"}"#,
+        );
+        assert_eq!(s, 500, "{body}");
+        assert!(body.contains("a test may not fork a daemon"), "{body}");
+        assert!(
+            !tmp.path().join("would-fork").exists(),
+            "the refused request must not have created a run dir"
+        );
     }
 
     #[test]
@@ -4400,13 +4501,29 @@ mod tests {
     }
 
     #[test]
+    fn ensure_server_refuses_to_fork_a_daemon_under_cfg_test() {
+        // Deliberately does NOT set `DROVR_NO_SPAWN`. That is the assertion: the
+        // refusal has to sit ABOVE the seam, or this test forks the test binary
+        // with a `serve` arg — pointed at the real data root, since a child
+        // cannot inherit a thread-local overlay. `live_server_addr()` reads
+        // `server.addr` out of the (empty) TestEnv data root, so it answers
+        // `None` and control really does reach the refusal.
+        let _env = TestEnv::new();
+        let err = ensure_server().expect_err("no server is up in a fresh data root");
+        assert!(
+            err.to_string().contains("a test may not fork a daemon"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn wait_missing_server_errors() {
-        let env = TestEnv::new();
-        // Don't fork the test binary as a daemon; just prove "down" errors. This
-        // has to go through the same overlay `ensure_server`'s shimmed read
-        // (`crate::env::var_os`) answers from — a raw process-global write would
-        // read back as absent and the test would really spawn `drovr serve`.
-        env.set("DROVR_NO_SPAWN", "1");
+        // No `DROVR_NO_SPAWN` seam any more: under `cfg(test)` `ensure_server`
+        // refuses unconditionally, so "don't fork the test binary as a daemon"
+        // is a property of the build rather than something each test has to
+        // remember to arrange. Still asserts what it always did — that a missing
+        // server surfaces as an error, not a hang.
+        let _env = TestEnv::new();
         let res = review_wait("nope", 100);
         assert!(res.is_err(), "missing server must error");
     }

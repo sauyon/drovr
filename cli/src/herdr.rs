@@ -2087,6 +2087,7 @@ impl Herdr for FakeHerdr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
 
     /// Run `f` against a real [`SystemHerdr`] wired to a stub `herdr` that prints
     /// `stdout` and exits `code`.
@@ -3382,19 +3383,15 @@ mod tests {
     // it would otherwise park on, hanging the phase until `phase wait` times out).
     #[test]
     fn agent_env_includes_set_auth_vars_and_flicker() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-            std::env::remove_var("ANTHROPIC_BASE_URL");
-        }
+        // `test_env`, not `env`: the local `env` below is the JSON object under
+        // test. A fresh `TestEnv` seeds only the two roots and `PATH`, so every
+        // `AGENT_ENV_VARS` key starts absent — the removals this test used to
+        // open with were undoing process pollution the overlay no longer admits,
+        // and the trailing cleanup was undoing its own writes, which now drop
+        // with `test_env` at end of test.
+        let test_env = TestEnv::new();
+        test_env.set("CLAUDE_CONFIG_DIR", "/home/user/.config/claude-work");
         let env = SystemHerdr::new().agent_env();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-        }
         let map = env.as_object().expect("agent_env must be a JSON object");
         assert_eq!(
             map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str),
@@ -3425,15 +3422,12 @@ mod tests {
 
     #[test]
     fn agent_env_flicker_only_when_auth_unset() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-            std::env::remove_var("ANTHROPIC_BASE_URL");
-        }
+        // Nothing to set: "auth unset" is the state a fresh `TestEnv` is already
+        // in, so the overlay IS the precondition this test used to arrange by
+        // hand. Bound as `_test_env` because it is never written through — but
+        // it must stay bound, or the overlay uninstalls before `agent_env()`
+        // reads through it and the real process env answers instead.
+        let _test_env = TestEnv::new();
         let env = SystemHerdr::new().agent_env();
         let map = env.as_object().expect("agent_env must be a JSON object");
         assert_eq!(
@@ -3456,24 +3450,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_env_includes_all_set_vars() {
-        use crate::test_util::ENV_LOCK;
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/cfg");
-            std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
-            std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-5");
-            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-test");
-            std::env::set_var("ANTHROPIC_BASE_URL", "https://example.test");
-        }
+    fn agent_env_includes_every_auth_var_that_is_set() {
+        let test_env = TestEnv::new();
+        test_env.set("CLAUDE_CONFIG_DIR", "/cfg");
+        test_env.set("ANTHROPIC_API_KEY", "sk-test");
+        test_env.set("ANTHROPIC_MODEL", "claude-opus-4-5");
+        test_env.set("ANTHROPIC_AUTH_TOKEN", "tok-test");
+        test_env.set("ANTHROPIC_BASE_URL", "https://example.test");
         let env = SystemHerdr::new().agent_env();
-        unsafe {
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_MODEL");
-            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-            std::env::remove_var("ANTHROPIC_BASE_URL");
-        }
         let map = env.as_object().expect("agent_env must be a JSON object");
         assert_eq!(
             map.get("CLAUDE_CONFIG_DIR").and_then(Value::as_str),
