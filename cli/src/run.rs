@@ -2411,14 +2411,15 @@ mod tests {
         //
         // Structured so NOTHING panics inside a spawned thread. That used to be
         // about `ENV_LOCK`: a panic at a join on the main thread, which held the
-        // mutex, poisoned it and cascade-failed the whole binary. There is no
-        // shared lock here any more, and the reason it stays is the smaller one
-        // it always also had — a thread that panics reports as a bare
-        // `Any { .. }` at the join, while a returned `Err` carries the torn-read
-        // message that says what actually went wrong. Threads return Results;
-        // the main thread asserts. `thread::scope` guarantees all threads are
-        // joined even if the body unwinds, so none can outlive the `TestEnv`
-        // whose overlay — and whose TempDir — they are resolving against.
+        // mutex, poisoned it and cascade-failed the whole binary. THIS test no
+        // longer takes that lock (though the module still does, twice, until
+        // T13), so what keeps the structure is the smaller reason it always also
+        // had — a thread that panics reports as a bare `Any { .. }` at the join,
+        // while a returned `Err` carries the torn-read message that says what
+        // actually went wrong. Threads return Results; the main thread asserts.
+        // `thread::scope` guarantees all threads are joined even if the body
+        // unwinds, so none can outlive the `TestEnv` whose overlay — and whose
+        // TempDir — they are resolving against.
         const PHASES: usize = 200;
         const WRITERS: usize = 4;
         const SAVES: usize = 400;

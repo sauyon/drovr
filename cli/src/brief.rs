@@ -486,11 +486,9 @@ mod tests {
     }
 
     // Composition records/reads `<phase>-context.md`, so every test that composes needs
-    // its own data home. `TestEnv::new()` IS that isolation — it seeds `XDG_DATA_HOME`
-    // into a per-test `TempDir` that no other thread can see — so the `isolate(name)`
-    // fixture that used to build `/tmp/drovr-brief-test-{name}` by hand has no work
-    // left to do and is gone. Its return value was discarded at all 18 call sites, and
-    // its per-name uniquifying is what the `TempDir` now provides by construction.
+    // its own data home. `TestEnv::new()` is that isolation, which is why there is no
+    // fixture here: it seeds `XDG_DATA_HOME` into a per-test `TempDir` no other thread
+    // can see, so the root is both unique and empty by construction.
 
     fn make_run() -> RunState {
         RunState {
@@ -682,8 +680,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, "precious\n").unwrap();
-        // Plant a link at the temp path this process will use.
-        let tmp = dir.join(format!(".plan-context.{}.tmp", std::process::id()));
+        // Plant a link at the temp path this process will use. The name must track
+        // `write_no_follow`'s exactly — `.{file_name}.{pid}.tmp`, where `file_name` is
+        // the record's, so `plan-context.md` and not `plan-context`. It did not: the
+        // `.md` was missing, the link sat at a path drovr never opens, and the
+        // assertion below could not fail for any behaviour of the code under test.
+        // Verified by mutation — make `write_no_follow` follow a link at its temp path
+        // and this must go red.
+        let tmp = dir.join(format!(".plan-context.md.{}.tmp", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
 
         // Either outcome is acceptable — refuse, or write elsewhere — but the victim must
