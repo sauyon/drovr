@@ -184,15 +184,42 @@ mod tests {
 
     /// What this line does that only [`super::var`]/[`super::var_os`] should.
     ///
-    /// Two shapes, because catching only the first leaves the second as an
-    /// escape hatch: `use std::env::var;` followed by a bare `var("HOME")` is a
+    /// Three shapes, because catching only the first leaves the others as
+    /// escape hatches.
+    ///
+    /// `use std::env::var;` followed by a bare `var("HOME")` is a
     /// process-global read that no substring search for `std::env::var` would
     /// ever see. No file but `env.rs` needs to name `std::env` in a `use` at
     /// all, so the rule is simply that none may.
     ///
+    /// A process-global **write** is the third, and it is not a read at all:
+    /// `std::env::set_var` does not contain the substring `std::env::var`, so
+    /// the read rule never saw it. That was survivable while the writes were
+    /// the mechanism being removed and a human was greping for them each task.
+    /// It is not survivable now that they are all gone, because the write path
+    /// is where the *only* remaining home-directory guard lives
+    /// (`test_env::refuse_home_root`), and that guard's ground truth is
+    /// `test_env::real_home`, which reads the live process `HOME` on every call.
+    /// One raw `set_var("HOME", …)` anywhere in `src/` would therefore let a
+    /// test tell the guard that the real home is somewhere else and then name
+    /// the actual live data root unopposed. Nothing else in the crate would
+    /// notice: the reads cannot be affected — under `cfg(test)` they no longer
+    /// consult the process at all — so the damage would be silent, which is the
+    /// exact failure shape this module exists to end.
+    ///
+    /// Found by this task's own security review, which observed that the
+    /// "authoritative by construction" claim rested on a scan that could not
+    /// see the one operation capable of defeating it.
+    ///
     /// `std::env::vars`/`vars_os` are caught by the same substring as `var`.
     fn violation(line: &str) -> Option<&'static str> {
-        if line.contains("std::env::var") {
+        if is_write(line) {
+            Some(
+                "raw environment WRITE — the mechanism this crate removed. It is invisible \
+                 to every overlay, and it can move what test_env::real_home believes the \
+                 real home to be, which is the write-path guard's ground truth",
+            )
+        } else if line.contains("std::env::var") {
             Some("raw environment read")
         } else if line.contains("use std::env") {
             Some("import of std::env, which hides raw reads from this scan")
@@ -201,13 +228,30 @@ mod tests {
         }
     }
 
-    /// Every environment read in `src/` goes through this module.
+    /// A process-global write, which no [`RawException`] may ever excuse.
+    ///
+    /// Split out from [`violation`] because the two callers ask different
+    /// questions of the same predicate: one is naming the offence, the other is
+    /// refusing to let a marker comment wave it through.
+    fn is_write(line: &str) -> bool {
+        line.contains("std::env::set_var") || line.contains("std::env::remove_var")
+    }
+
+    /// Every environment read in `src/` goes through this module, and nothing
+    /// in `src/` writes the process environment at all.
     ///
     /// The chokepoint is the whole point of the module: a read that bypasses it
     /// cannot be redirected by a test's overlay, so it keeps resolving whatever
     /// the process-global environment happens to say at that instant. Grepping
     /// for that by hand once, at the moment the sweep lands, protects nothing
     /// from the tasks that come after it.
+    ///
+    /// The write half is what makes it a standing guarantee rather than a
+    /// snapshot. Thirteen tasks removed every `set_var`/`remove_var` from
+    /// `src/`; this is what keeps them removed, and it matters more than the
+    /// count suggests — see [`violation`] for why a single reintroduced write
+    /// would silently defeat the home-directory guard rather than merely
+    /// reintroduce a race.
     ///
     /// Scope is `cli/src/`. The integration tests under `cli/tests/` drive the
     /// *built binary*, compiled without `cfg(test)`, so there is no overlay for
@@ -252,7 +296,13 @@ mod tests {
                 let Some(what) = violation(line) else {
                     continue;
                 };
-                match tag.and_then(|t| {
+                // A marker comment can excuse a READ. It can never excuse a
+                // write: `RAW_EXCEPTIONS` exists for reads that cannot go
+                // through the overlay they are themselves installing, and no
+                // write has an equivalent — `TestEnv::set` is always available
+                // and is the only door. Consulting the tag here would leave the
+                // guard defeatable by the same edit that defeats it.
+                match tag.filter(|_| !is_write(line)).and_then(|t| {
                     RAW_EXCEPTIONS
                         .iter()
                         .position(|x| x.file == name && x.tag == t)
@@ -267,8 +317,11 @@ mod tests {
             offenders.is_empty(),
             "{} site(s) reach the process environment around crate::env. A raw read \
              cannot be redirected by a test's overlay, so it still resolves the \
-             process-global environment and still races. Route each through \
-             crate::env::var / crate::env::var_os, or — if it genuinely must stay raw — \
+             process-global environment and still races; a raw WRITE is worse — there \
+             is no supported way to perform one, and it can move the ground truth the \
+             test_env home guard compares against. Route each read through \
+             crate::env::var / crate::env::var_os and each write through \
+             crate::test_env::TestEnv::set, or — if a READ genuinely must stay raw — \
              mark it with a `// {MARKER} <tag>` comment on the line above and declare \
              that tag in RAW_EXCEPTIONS in cli/src/env.rs with the reason:\n  {}",
             offenders.len(),

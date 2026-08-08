@@ -879,6 +879,30 @@ fn legacy_agent() -> Option<String> {
 /// The shipped binary is unaffected. Outside `cfg(test)` `crate::env::var` is a
 /// verbatim `std::env::var` forward and the resolution below is byte-for-byte
 /// what it has always been.
+///
+/// # The `$HOME/.local/share` fallback has no test coverage, by construction
+///
+/// Stated here rather than left to be rediscovered, because this is the branch
+/// that resolved the LIVE data root in both incidents. Under `cfg(test)` it is
+/// now **unreachable**, and every route to it is closed on purpose:
+///
+/// * with no overlay installed, `crate::env::var("XDG_DATA_HOME")` panics
+///   before this line is reached;
+/// * with one installed, `TestEnv::new` always seeds `XDG_DATA_HOME`, and
+///   `TestEnv::unset` refuses to remove it — it is a `GUARDED_KEY` precisely
+///   because taking a root away is a way around the check on naming one.
+///
+/// So there is no way to ask a test what this expression does, and the old
+/// `data_dir_refuses_to_resolve_inside_the_real_home` — which covered it by
+/// mutating the process environment — is gone with the mechanism it used. The
+/// integration tests under `cli/tests/` do not cover it either: they pin
+/// `XDG_DATA_HOME` on every child, which is exactly what they must keep doing.
+///
+/// That is the correct trade and not a hole to be plugged — restoring coverage
+/// would mean restoring a way to run drovr's resolver with no declared data
+/// root, which is the capability this whole module removed. But it does mean
+/// the expression below is verified by reading rather than by running: **change
+/// it and nothing will tell you.** Raised by task 13's test review.
 pub fn data_dir() -> PathBuf {
     let base = crate::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)

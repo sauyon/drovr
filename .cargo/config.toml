@@ -12,19 +12,24 @@
 # the per-test tempdirs, this root is durable and shared across runs — a stale server.addr /
 # server.pid can outlive the run that wrote it.
 #
-# This does NOT subsume per-test pinning, and tests must keep doing it:
+# Who this still protects, now that the guard has moved to the write path:
 #   - cargo discovers this file by CWD ANCESTRY, so `cargo test --manifest-path <repo>/cli`
 #     from elsewhere, or running a target/debug/deps binary directly, never sees it;
-#   - a test that set_var's XDG_DATA_HOME at runtime overrides it for itself and its children;
 #   - panes created by an already-running herdr daemon inherit that daemon's environment,
 #     not cargo's — which is why the tests pin HERDR_SOCKET_PATH at a dead socket.
 #
-# Interaction with run.rs's cfg(test) refuse_home_data_root guard, which panics when the data
-# root resolves inside $HOME: in a checkout under $HOME (the normal case) this forced value is
-# itself inside $HOME, so an unpinned unit test aborts rather than using this root — the root
-# is a tripwire for cfg(test) code, not a working scratch dir. Where the checkout is NOT under
-# $HOME (the nix sandbox: HOME=/homeless-shelter, src=/build/source) the guard cannot fire and
-# an unpinned test would silently share this root instead. Both arms are reasons the per-test
-# pinning above stays load-bearing until the guard moves to the write path.
+# It NO LONGER protects the unit tests, and no longer needs to. This file used to interact
+# with run.rs's cfg(test) `refuse_home_data_root` guard, which re-checked the data root after
+# resolving it; that function is deleted. Under cfg(test) `crate::env::var`/`var_os` now
+# answer ONLY from the calling thread's TestEnv overlay and panic when there is none, so a
+# unit test cannot read this value at all — not even when cargo does force it. `cargo test
+# --bin drovr` is therefore safe whether or not this file is picked up: unpinned code gets a
+# refusal naming the key and the thread, where it used to get a silent resolve. That includes
+# the nix sandbox (HOME=/homeless-shelter, src=/build/source), which the old guard could not
+# cover because nothing there is under $HOME.
+#
+# The per-child pinning in cli/tests/* stays load-bearing and must NOT be removed: those
+# tests exec the BUILT binary, compiled without cfg(test), so none of the above reaches them.
+# `cli/tests/data_root_is_forced.rs` is the signal that this file itself is still in effect.
 [env]
 XDG_DATA_HOME = { value = "target/cargo-xdg-data", relative = true, force = true }
