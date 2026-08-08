@@ -400,9 +400,13 @@ pub fn code_review_brief(
     // has no outcome to report — the CLI prints the error and exits 1, which is the same
     // observable result the outcome path produces.
     let context = resolve_context(&dir, task, context)?;
-    // The iteration a FRESH panel would open, or the one a resume would rejoin — the
-    // same choice `code_review_run` makes, so the path named here is the path that
-    // panel's reviewers were seeded with.
+    // The iteration a FRESH panel would open, or the one a resume would rejoin. NOT
+    // quite the choice `code_review_run` makes: that one re-validates a resumable
+    // iteration against the recorded head SHA and starts fresh if HEAD has moved. This
+    // does not, so if the implementer committed while a panel sat wedged, the brief
+    // names the wedged iteration's diff while a re-run would open a new one. That is
+    // the right bias for what this command is for — handing a replacement reviewer the
+    // brief the WEDGED panel is working from — but it is not the same predicate.
     //
     // This function PRINTS a brief; it does not write the diff. That is deliberate and
     // it has a known edge: this command exists to hand-spawn a replacement reviewer
@@ -505,9 +509,12 @@ fn undelivered_review(angle: &str, why: &io::Error) -> Review {
             ),
             rationale: format!(
                 "drovr harvested nothing usable for this angle ({why}). The other angles \
-                 below did deliver and their findings stand. Re-run `drovr code-review \
-                 run` to respawn just this reviewer — the panel resumes the same \
-                 iteration and waits only on the angles still missing."
+                 below did deliver and their findings stand. Re-running `drovr \
+                 code-review run` opens a FRESH iteration and respawns every angle, not \
+                 just this one: a panel only resumes in place while some angle is still \
+                 `Running`, and by the time this message exists the panel has drained. \
+                 So the cost of recovering this angle is another full pass — which is \
+                 also why the angles below are worth reading first."
             ),
         }],
         impact: None,
@@ -1768,9 +1775,12 @@ pub fn code_review_run<H: Herdr>(
     // delivered — leaves reviewers this pass may need again, and reaches none of
     // this. Only a completed merge proves the panel is finished with.
     //
-    // Every angle is `Done` by here, structurally: the loop exits only when
-    // nothing is pending, an angle that delivered is `Done`, and one that did
-    // not takes `harvest?` out of the function.
+    // Every angle is RESOLVED by here, structurally: the loop exits only when
+    // nothing is pending, an angle that delivered is `Done`, and one that finished
+    // without delivering is `Failed` with an `undelivered_review` standing in for its
+    // verdict. It used to be "every angle is `Done`", because a non-delivering angle
+    // took `harvest?` out of the function before this point — it no longer does, and a
+    // degraded panel reaps exactly like a clean one.
     //
     // Best-effort, per angle, and it never touches the verdict: this function
     // has already produced its answer, so a pane that will not close is a
