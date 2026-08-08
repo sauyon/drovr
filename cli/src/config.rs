@@ -1144,14 +1144,7 @@ fn executable_file(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::ENV_LOCK;
-
-    // Sets XDG_CONFIG_HOME to `dir`. Caller must hold ENV_LOCK.
-    fn set_config_home(dir: &std::path::Path) {
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir);
-        }
-    }
+    use crate::test_env::TestEnv;
 
     /// The bare-`#[serde(default)]`-on-bool trap, for the opt-OUT switch: a
     /// config file that says nothing about reaping must still reap, and one that
@@ -1161,10 +1154,8 @@ mod tests {
     /// `false` closes panes for the one user who asked drovr not to.
     #[test]
     fn reaping_is_on_unless_a_config_file_turns_it_off() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        set_config_home(tmp.path());
-        let path = tmp.path().join("drovr/config.toml");
+        let env = TestEnv::new();
+        let path = env.config_root().join("drovr/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         assert!(
@@ -1186,9 +1177,7 @@ mod tests {
 
     #[test]
     fn absent_file_yields_defaults() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        set_config_home(tmp.path());
+        let _env = TestEnv::new();
 
         let cfg = load_config().unwrap();
         assert_eq!(cfg, Config::default());
@@ -1277,12 +1266,11 @@ mod tests {
     /// the field exists to close.
     #[test]
     fn a_user_env_unset_list_adds_to_the_built_in_one_rather_than_replacing_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        set_config_home(dir.path());
-        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("drovr/config.toml"),
+            dir.join("config.toml"),
             "[agents.opencode]\ncommand = \"opencode\"\n\
              readonly_env_unset = [\"HTTP_PROXY\"]\n",
         )
@@ -1311,12 +1299,11 @@ mod tests {
     /// without error and reads no servers from. It has to be stated.
     #[test]
     fn an_mcp_override_must_state_its_schema_rather_than_inherit_a_default() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        set_config_home(dir.path());
-        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("drovr/config.toml"),
+            dir.join("config.toml"),
             "[agents.opencode]\ncommand = \"opencode\"\n\
              [agents.opencode.mcp]\nmechanism = \"project-file\"\npath = \"custom.json\"\n",
         )
@@ -1357,13 +1344,15 @@ mod tests {
     /// root: drovr would move the entire repository aside before spawning a reviewer.
     #[test]
     fn a_displace_entry_that_resolves_to_the_project_root_is_rejected() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
+        // One config root for the whole loop, not one per iteration: each pass
+        // rewrites `config.toml` wholesale and creates nothing else, so there is
+        // nothing an earlier `bad` could leave behind for a later one to read.
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         for bad in [".", "./.", "./"] {
-            let dir = tempfile::tempdir().unwrap();
-            set_config_home(dir.path());
-            std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
             std::fs::write(
-                dir.path().join("drovr/config.toml"),
+                dir.join("config.toml"),
                 format!("[agents.tool]\ncommand = \"tool\"\nreadonly_displace = [{bad:?}]\n"),
             )
             .unwrap();
@@ -1380,12 +1369,11 @@ mod tests {
     /// became a mechanism — and the doc is only worth as much as this test.
     #[test]
     fn both_workspace_mechanisms_round_trip_through_the_config_file() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        set_config_home(dir.path());
-        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("drovr/config.toml"),
+            dir.join("config.toml"),
             "[agents.flagtool]\ncommand = \"flagtool\"\n\
              [agents.flagtool.workspace]\nmechanism = \"flag\"\nflag = \"--root\"\n\
              [agents.postool]\ncommand = \"postool\"\n\
@@ -1414,12 +1402,11 @@ mod tests {
     /// one is a config error, not a comment.
     #[test]
     fn a_stale_agent_key_fails_the_load_instead_of_being_ignored() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        set_config_home(dir.path());
-        std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("drovr/config.toml"),
+            dir.join("config.toml"),
             "[agents.claude]\ncommand = \"claude\"\nworkspace_flag = \"--add-dir\"\n",
         )
         .unwrap();
@@ -1437,7 +1424,11 @@ mod tests {
     /// reviewer is handed a config it cannot read.
     #[test]
     fn a_stale_key_inside_a_mechanism_table_fails_the_load_too() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
+        // One config root for both passes; see
+        // `a_displace_entry_that_resolves_to_the_project_root_is_rejected`.
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         for (table, body) in [
             (
                 "mcp",
@@ -1448,11 +1439,8 @@ mod tests {
                 "[agents.tool.workspace]\nmechanism = \"flag\"\nflagg = \"--root\"\n",
             ),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            set_config_home(dir.path());
-            std::fs::create_dir_all(dir.path().join("drovr")).unwrap();
             std::fs::write(
-                dir.path().join("drovr/config.toml"),
+                dir.join("config.toml"),
                 format!("[agents.tool]\ncommand = \"tool\"\n{body}"),
             )
             .unwrap();
@@ -1636,16 +1624,14 @@ mod tests {
     fn an_explicit_agent_block_keeps_the_builtin_resume_flag() {
         // The documented merge trap: a user config with an explicit
         // `[agents.claude]` block must not silently drop fields it omits.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
             "[agents.claude]\ncommand = \"claude\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert_eq!(
@@ -1660,16 +1646,14 @@ mod tests {
         // independently would graft the built-in `--resume` onto an agent the
         // user deliberately gave a subcommand, producing a spec with both —
         // i.e. an ambiguous, unusable resume.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
             "[agents.claude]\ncommand = \"claude\"\nresume_subcommand = \"resume\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert_eq!(
@@ -1684,16 +1668,14 @@ mod tests {
         // lost its `#[serde(default)]` in that move would make every real
         // user config fail to load — `load_config` returning Err is a hard
         // stop, not a degradation. Pin the minimal entry.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
             "[agents.minimal]\ncommand = \"minimal\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().expect("an entry with only `command` must load");
         let spec = &cfg.agents["minimal"];
@@ -1718,9 +1700,8 @@ mod tests {
 
     #[test]
     fn an_agent_claiming_both_resume_shapes_is_rejected() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -1728,7 +1709,6 @@ mod tests {
              resume_subcommand = \"resume\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let err = load_config().expect_err("both resume shapes must be rejected");
         let msg = err.to_string();
@@ -1764,27 +1744,21 @@ mod tests {
 
     #[test]
     fn detects_cursor_and_honors_explicit_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("DROVR_AGENT");
-            std::env::set_var("CURSOR_AGENT", "1");
-        }
+        // A fresh `TestEnv` seeds only the two XDG roots and `PATH`, so every
+        // marker `invoking_agent` consults starts absent. The clearing this test
+        // used to open with — and the `CLAUDECODE` removal in the middle, which
+        // existed because drovr's own suite is often run *from* claude — were
+        // undoing pollution the overlay no longer admits.
+        let env = TestEnv::new();
+        env.set("CURSOR_AGENT", "1");
         assert_eq!(invoking_agent(&Config::default()), "cursor");
-        unsafe {
-            std::env::set_var("DROVR_AGENT", "custom");
-        }
+        env.set("DROVR_AGENT", "custom");
         assert_eq!(invoking_agent(&Config::default()), "custom");
-        unsafe {
-            std::env::remove_var("DROVR_AGENT");
-            std::env::remove_var("CURSOR_AGENT");
-            std::env::remove_var("CLAUDECODE");
-            std::env::set_var("CODEX_THREAD_ID", "thread");
-        }
+        env.unset("DROVR_AGENT");
+        env.unset("CURSOR_AGENT");
+        env.set("CODEX_THREAD_ID", "thread");
         assert_eq!(invoking_agent(&Config::default()), "codex");
         assert!(Config::default().agents.contains_key("codex"));
-        unsafe {
-            std::env::remove_var("CODEX_THREAD_ID");
-        }
     }
 
     /// claude carries the server config on its command line, so the path drovr
@@ -1904,9 +1878,8 @@ mod tests {
 
     #[test]
     fn mcp_mechanisms_parse_from_config_and_are_merged_per_agent() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -1926,7 +1899,6 @@ command = "agent"
 "#,
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         let cmd = cfg
@@ -1955,11 +1927,12 @@ command = "agent"
     /// or traversing value would write outside the project. Reject it at load.
     #[test]
     fn a_project_file_path_that_escapes_the_project_is_rejected() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
+        // One config root for both passes; see
+        // `a_displace_entry_that_resolves_to_the_project_root_is_rejected`.
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
         for bad in ["/etc/mcp.json", "../../.cursor/mcp.json"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let dir = tmp.path().join("drovr");
-            std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("config.toml"),
                 format!(
@@ -1969,7 +1942,6 @@ command = "agent"
                 ),
             )
             .unwrap();
-            set_config_home(tmp.path());
             let err = load_config().expect_err("path '{bad}' must be rejected");
             assert!(err.to_string().contains("mine"), "{err}");
         }
@@ -1997,9 +1969,8 @@ command = "agent"
 
     #[test]
     fn load_config_rejects_relative_command() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -2011,7 +1982,6 @@ command = "./git"
 "#,
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let err = load_config().expect_err("relative-path command must be rejected");
         let msg = err.to_string();
@@ -2024,9 +1994,8 @@ command = "./git"
 
     #[test]
     fn parses_spec_example_toml() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -2046,7 +2015,6 @@ readonly_flag = "--sandbox read-only"
 "#,
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert_eq!(cfg.review_agent.as_deref(), Some("codex"));
@@ -2066,12 +2034,10 @@ readonly_flag = "--sandbox read-only"
 
     #[test]
     fn file_omitting_agents_keeps_builtin_claude() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "default_agent = \"claude\"\n").unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert_eq!(
@@ -2086,12 +2052,10 @@ readonly_flag = "--sandbox read-only"
         // config file that omits the key (serde default).
         assert!(Config::default().worktree, "Config::default should isolate");
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "default_agent = \"claude\"\n").unwrap();
-        set_config_home(tmp.path());
         assert!(
             load_config().unwrap().worktree,
             "a config omitting `worktree` should still isolate"
@@ -2107,16 +2071,14 @@ readonly_flag = "--sandbox read-only"
 
     #[test]
     fn user_agent_map_keeps_missing_builtins_and_fields() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
             "[agents.codex]\ncommand = \"codex\"\nreadonly_flag = \"--sandbox read-only\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert!(cfg.reviewer_launch(Some("codex")).is_ok());
@@ -2236,9 +2198,8 @@ readonly_flag = "--sandbox read-only"
 
     #[test]
     fn reflex_config_parses_full_table() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
@@ -2253,7 +2214,6 @@ escalation = true
 "#,
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert!(!cfg.reflex.enabled);
@@ -2268,16 +2228,14 @@ escalation = true
     fn reflex_table_present_but_enabled_omitted_defaults_true() {
         // The bare-`#[serde(default)]`-on-bool trap: an absent `enabled` under a
         // present `[reflex]` table must fall back to `true`, not `bool::default()`.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
             "[reflex]\npreamble = \"only a preamble here\"\n",
         )
         .unwrap();
-        set_config_home(tmp.path());
 
         let cfg = load_config().unwrap();
         assert!(cfg.reflex.enabled);
@@ -2286,25 +2244,21 @@ escalation = true
 
     #[test]
     fn malformed_toml_errors() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "this is = = not valid toml [[[").unwrap();
-        set_config_home(tmp.path());
 
         assert!(load_config().is_err());
     }
 
     #[test]
     fn empty_serve_host_errors() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("drovr");
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
         std::fs::create_dir_all(&dir).unwrap();
         // Explicit empty string is a mistake, not a request for the default.
         std::fs::write(dir.join("config.toml"), "serve_host = \"\"\n").unwrap();
-        set_config_home(tmp.path());
 
         assert!(load_config().is_err());
     }
