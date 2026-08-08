@@ -2032,6 +2032,11 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
 /// the test is NOT using — its roots live in a thread-local
 /// [`crate::test_env::TestEnv`] overlay, which no child can inherit. So the
 /// child resolves the real `~/.local/share/drovr` and writes into it.
+///
+/// Every reference to it is `#[cfg(test)]`, so a non-test build sees it as
+/// dead. Silenced with `allow` rather than `#[cfg(test)]` so the doc links
+/// above stay resolvable in both configurations.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const NO_DAEMON_UNDER_TEST: &str =
     "drovr review server is not running (a test may not fork a daemon: the child would \
      inherit the REAL environment, not this thread's TestEnv, and resolve the live data root)";
