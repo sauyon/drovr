@@ -1160,6 +1160,11 @@ fn handle_post_keys(mut req: Request, p: &RunPaths, url: &str) {
 /// scheme for a server whose front door is already open by design — and a
 /// half-measure here would read as protection this endpoint does not have.
 /// `serve_host` defaults to `127.0.0.1`, which is the actual boundary.
+///
+/// Under `cfg(test)` the shell-out is refused outright — see
+/// [`NO_DAEMON_UNDER_TEST`]. The `allow` is scoped to test builds, where that
+/// early return makes the rest of the body unreachable.
+#[cfg_attr(test, allow(unreachable_code))]
 fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) {
     let Some(phase) = query_param(url, "phase").filter(|q| !q.is_empty()) else {
         respond_str(req, 400, "text/plain", "missing phase".into());
@@ -1207,6 +1212,21 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
         };
         let code = if why == Why::NoSuchPhase { 404 } else { 409 };
         respond_str(req, code, "text/plain", msg);
+        return;
+    }
+
+    // Same wall as `ensure_server`'s, for the same reason and through this
+    // handler's existing 500 shape — see `NO_DAEMON_UNDER_TEST`. Spec §3.4 names
+    // only the daemon, but this handler forks a real `drovr` too, and today only
+    // test coverage (every case above short-circuits) keeps it unreached.
+    #[cfg(test)]
+    {
+        respond_str(
+            req,
+            500,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": NO_DAEMON_UNDER_TEST }).to_string(),
+        );
         return;
     }
 
@@ -2001,19 +2021,48 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// Why a `cfg(test)` build refuses, at every site that would fork a real
+/// `drovr`.
+///
+/// One string for all three ([`ensure_server`], [`handle_post_rehydrate`],
+/// [`handle_post_new_run`]) so a reader who hits it once does not have to work
+/// out whether the other two mean the same thing: they do, and the reason is
+/// structural rather than per-site. A forked child gets the process
+/// environment, and under `cfg(test)` the process environment is precisely what
+/// the test is NOT using — its roots live in a thread-local
+/// [`crate::test_env::TestEnv`] overlay, which no child can inherit. So the
+/// child resolves the real `~/.local/share/drovr` and writes into it.
+///
+/// Every reference to it is `#[cfg(test)]`, so a non-test build sees it as
+/// dead. Silenced with `allow` rather than `#[cfg(test)]` so the doc links
+/// above stay resolvable in both configurations.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NO_DAEMON_UNDER_TEST: &str =
+    "drovr review server is not running (a test may not fork a daemon: the child would \
+     inherit the REAL environment, not this thread's TestEnv, and resolve the live data root)";
+
 /// Ensure the always-on server is running and return its `host:port`.
 ///
 /// Reuses a live server (from `server.addr`) if one is reachable; otherwise
 /// spawns `drovr serve` as a detached background daemon and waits (bounded) for
 /// it to come up. This is what lets [`review_summary`] / [`review_wait`] work
 /// without the human starting a server by hand.
+///
+/// Under `cfg(test)` it never spawns — see [`NO_DAEMON_UNDER_TEST`]. The
+/// `allow` is scoped to test builds, where the early return really does make
+/// the rest of the body unreachable; the shipped build lints normally.
+#[cfg_attr(test, allow(unreachable_code))]
 pub fn ensure_server() -> io::Result<String> {
     if let Some(addr) = live_server_addr() {
         return Ok(addr);
     }
+    // Under `cfg(test)` this is not a seam, it is a wall: no test may fork a
+    // daemon, whatever it has set. See `NO_DAEMON_UNDER_TEST`.
+    #[cfg(test)]
+    return Err(io::Error::other(NO_DAEMON_UNDER_TEST));
     // Test seam: with DROVR_NO_SPAWN set, don't fork a daemon (spawning the test
     // binary with a `serve` arg would re-enter the harness). Just report down.
-    if std::env::var_os("DROVR_NO_SPAWN").is_some() {
+    if crate::env::var_os("DROVR_NO_SPAWN").is_some() {
         return Err(io::Error::other("drovr review server is not running"));
     }
     spawn_daemon()?;
@@ -2145,6 +2194,14 @@ fn live_server_addr() -> Option<String> {
 /// Body: `{ "name": "<run>", "task"?: "<text>", "dir"?: "<project dir>" }`.
 /// Runs `drovr new` then `drovr phase start <run> brainstorm` via this same
 /// binary, synchronously (both return quickly — `phase start` only spawns).
+///
+/// Under `cfg(test)` the shell-out is refused outright — see
+/// [`NO_DAEMON_UNDER_TEST`]. The refusal is placed as LATE as it can be, so
+/// every real refusal above it (400 on bad JSON, 400 on a bad run name) still
+/// runs and stays covered; the cost is that `task`/`dir` are then parsed and
+/// never used in a test build. Both `allow`s are scoped to `cfg(test)` — the
+/// shipped build lints normally.
+#[cfg_attr(test, allow(unreachable_code, unused_variables))]
 fn handle_post_new_run(mut req: Request) {
     let body = read_body(&mut req);
     let incoming: serde_json::Value = match serde_json::from_str(&body) {
@@ -2161,6 +2218,15 @@ fn handle_post_new_run(mut req: Request) {
     }
     let task = incoming["task"].as_str().unwrap_or("").to_string();
     let dir = incoming["dir"].as_str().unwrap_or("").to_string();
+
+    // Same wall as `ensure_server`'s, through this handler's existing 500 shape
+    // — see `NO_DAEMON_UNDER_TEST`. This one would fork `drovr new`, which
+    // creates a run directory: in a test that means one in the LIVE data root.
+    #[cfg(test)]
+    {
+        respond_str(req, 500, "text/plain", NO_DAEMON_UNDER_TEST.to_string());
+        return;
+    }
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -2373,11 +2439,48 @@ pub fn review_wait(run: &str, timeout_ms: u64) -> io::Result<WaitOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
     use std::net::TcpStream;
 
     /// Start an always-on server on 127.0.0.1:0 in a background thread, rooted
     /// at `runs_root`. Returns the bound address string.
+    ///
+    /// The workers read no environment. That suits almost every test here:
+    /// `runs_root` is passed in explicitly, so nothing a handler needs comes
+    /// from a variable. A test whose handler DOES resolve one — today that is
+    /// only `handle_get_agents`, via `config::load_config()` — must use
+    /// [`start_server_with_env`] and say which environment it means.
     fn start_server(runs_root: PathBuf) -> String {
+        start_server_inner(None, runs_root)
+    }
+
+    /// [`start_server`], with the workers reading `env`.
+    ///
+    /// Takes the environment as a parameter rather than capturing whatever the
+    /// calling thread happens to have installed. An implicit capture reads
+    /// tidier and is worse: the handle it takes is the innermost frame only at
+    /// the instant of the call, so a test that later dropped or nested its
+    /// `TestEnv` would leave these workers — which outlive the test, since
+    /// nothing joins them — answering from an overlay the test itself has
+    /// stopped reading through. Nothing would catch that: `refuse_shadowed`
+    /// guards writes through a shadowed `TestEnv`, not a handle captured
+    /// earlier and entered later. The invariant would live in this doc comment,
+    /// which is the shape this whole run exists to delete.
+    ///
+    /// Named here, it is the caller's own `env` and the borrow says so.
+    ///
+    /// Cost, accepted: the workers are never joined, so the `EnvHandle` they
+    /// hold keeps `env`'s scratch `TempDir` alive for the rest of the test
+    /// binary's life rather than releasing it when `env` drops. That is the
+    /// same lifetime rule `Overlay` already applies deliberately — the
+    /// `TempDir` lives in the overlay precisely so a spawned thread cannot see
+    /// its root deleted out from under it — and it costs one small empty
+    /// directory, from the single call site that uses this.
+    fn start_server_with_env(env: &crate::test_env::TestEnv, runs_root: PathBuf) -> String {
+        start_server_inner(Some(env.handle()), runs_root)
+    }
+
+    fn start_server_inner(env: Option<crate::test_env::EnvHandle>, runs_root: PathBuf) -> String {
         let server = Server::http("127.0.0.1:0").expect("bind");
         let bound = server.server_addr().to_ip().expect("ip addr").to_string();
         let bound_port = server.server_addr().to_ip().expect("ip addr").port();
@@ -2386,9 +2489,23 @@ mod tests {
         for _ in 0..2 {
             let server = Arc::clone(&server);
             let ctx = Arc::clone(&ctx);
+            let env = env.clone();
             thread::spawn(move || {
+                // Held for the worker's whole life: every request this thread
+                // serves resolves the environment the caller named.
+                let _entered = env.as_ref().map(|e| e.enter());
                 while let Ok(req) = server.recv() {
-                    handle(req, &ctx);
+                    // Isolate a panicking request, exactly as production
+                    // `serve` does. Without this a handler that refuses for
+                    // want of an overlay would kill the worker mid-request and
+                    // the test would fail with a connection reset — the
+                    // confusing, distant failure the refusal exists to replace.
+                    // With it the request 500s and the panic is printed by
+                    // name.
+                    let ctx = &ctx;
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle(req, ctx);
+                    }));
                 }
             });
         }
@@ -3564,7 +3681,9 @@ mod tests {
         // Every refusal short-circuits before `current_exe()`, so they are safe
         // to exercise in-process. The happy path shells out to the CLI — which
         // is the point: the CLI stays the sole writer of state.json — and is
-        // covered by `phase::rehydrate_tests` plus manual verification.
+        // covered by `phase::rehydrate_tests` plus manual verification. Under
+        // `cfg(test)` it no longer shells out at all, which the last case below
+        // asserts directly rather than leaving to the comment.
         let tmp = make_root("rehydrate-http");
         let dir = make_run(tmp.path(), "r", b"# Spec");
         let mut run: RunState = serde_json::from_str(
@@ -3594,6 +3713,13 @@ mod tests {
             crate::run::Phase::new("placeholder"),
             launch_failed,
         ];
+        // `brainstorm` (reaped, so its pane is gone and its agent record is
+        // waived) is fully rehydratable once the run has somewhere to launch —
+        // which is what makes the last case below reach the shell-out site. It
+        // also sharpens the refusals above: each now fails for its own reason
+        // rather than incidentally on `NoProjectDir`.
+        run.project_dir = tmp.path().to_string_lossy().into_owned();
+        run.workspace = Some("w".to_string());
         fs::write(dir.join("state.json"), serde_json::to_string(&run).unwrap()).unwrap();
         let before = fs::read_to_string(dir.join("state.json")).unwrap();
         let addr = start_server(tmp.path().to_path_buf());
@@ -3659,6 +3785,20 @@ mod tests {
         );
         assert_eq!(s, 409, "{body}");
         assert!(body.contains("review-panel agent"), "{body}");
+
+        // The one case that passes every refusal and reaches the fork site. In
+        // a `cfg(test)` build it must be refused there too: the child would get
+        // the process environment, not this thread's overlay, and write into the
+        // live data root. Through the handler's existing JSON 500, so the HTTP
+        // contract is the one a failed `current_exe()` already produced.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs/r/rehydrate?phase=brainstorm",
+            "text/plain",
+            "",
+        );
+        assert_eq!(s, 500, "{body}");
+        assert!(body.contains("a test may not fork a daemon"), "{body}");
 
         assert_eq!(
             fs::read_to_string(dir.join("state.json")).unwrap(),
@@ -3844,8 +3984,9 @@ mod tests {
     #[test]
     fn post_new_run_rejects_bad_input() {
         // The reject paths short-circuit before spawning `drovr new`, so they are
-        // safe to exercise in-process (the happy path shells out and is covered
-        // by manual/e2e testing).
+        // safe to exercise in-process. The happy path used to be untestable here
+        // for exactly that reason; under `cfg(test)` it is now refused at the
+        // fork site, which the last case asserts.
         let tmp = make_root("newrun");
         let addr = start_server(tmp.path().to_path_buf());
         // Missing name.
@@ -3857,6 +3998,22 @@ mod tests {
         // Malformed JSON.
         let (s, _) = http_post(&addr, "/api/runs", "application/json", "not json");
         assert_eq!(s, 400);
+        // A well-formed request, which reaches the fork site — and is refused
+        // there under `cfg(test)`. Without that wall this line would really run
+        // `drovr new`, creating a run directory in the LIVE data root, since the
+        // child cannot inherit a thread-local overlay.
+        let (s, body) = http_post(
+            &addr,
+            "/api/runs",
+            "application/json",
+            r#"{"name":"would-fork"}"#,
+        );
+        assert_eq!(s, 500, "{body}");
+        assert!(body.contains("a test may not fork a daemon"), "{body}");
+        assert!(
+            !tmp.path().join("would-fork").exists(),
+            "the refused request must not have created a run dir"
+        );
     }
 
     #[test]
@@ -4326,32 +4483,40 @@ mod tests {
 
     // -- review_summary / review_wait over the global server -----------------
 
-    /// Spin a server rooted at `<XDG_DATA_HOME>/drovr/runs`, write the global
-    /// `server.addr`, and return (addr, run, tempdir). Caller holds ENV_LOCK.
-    fn global_fixture(suffix: &str) -> (String, String, tempfile::TempDir) {
-        let tmp = make_root(suffix);
-        let base = tmp.path().to_path_buf();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", base.to_str().unwrap());
-        }
-        let runs_root = base.join("drovr/runs");
+    /// Spin a server rooted at `env`'s `<XDG_DATA_HOME>/drovr/runs`, write the
+    /// global `server.addr`, and return (addr, run).
+    ///
+    /// Takes the environment rather than building one: the caller needs the
+    /// same `TestEnv` for `data_root()` and, in the `review_wait` tests, for the
+    /// [`EnvHandle`](crate::test_env::EnvHandle) its waiting thread enters. The
+    /// scratch root it used to return is now owned by that `TestEnv`.
+    ///
+    /// `data_dir()` is `<XDG_DATA_HOME>/drovr`, which `make_run`'s
+    /// `create_dir_all` of `…/drovr/runs/<run>` has already created by the time
+    /// `server.addr` is written.
+    fn global_fixture(env: &TestEnv, suffix: &str) -> (String, String) {
+        let runs_root = env.data_root().join("drovr/runs");
         let run = format!("run-{suffix}");
         make_run(&runs_root, &run, b"# Spec");
         let addr = start_server(runs_root);
         fs::write(data_dir().join("server.addr"), addr.as_bytes()).unwrap();
-        (addr, run, tmp)
+        (addr, run)
     }
 
     #[test]
     fn review_summary_posts_to_server() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (_addr, run, tmp) = global_fixture("rev-summary");
+        let env = TestEnv::new();
+        let (_addr, run) = global_fixture(&env, "rev-summary");
 
         review_summary(&run, "Agent summary text.").expect("review_summary");
 
-        let summary =
-            fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("summary.txt"))
-                .expect("summary.txt");
+        let summary = fs::read_to_string(
+            env.data_root()
+                .join("drovr/runs")
+                .join(&run)
+                .join("summary.txt"),
+        )
+        .expect("summary.txt");
         assert_eq!(summary, "Agent summary text.");
     }
 
@@ -4361,8 +4526,8 @@ mod tests {
     /// watch. Regression guard for "serving a spec doesn't start a watcher".
     #[test]
     fn review_summary_returns_server_addr_for_the_watch_hint() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("rev-summary-addr");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "rev-summary-addr");
 
         let returned = review_summary(&run, "Agent summary text.").expect("review_summary");
 
@@ -4391,37 +4556,56 @@ mod tests {
     }
 
     #[test]
+    fn ensure_server_refuses_to_fork_a_daemon_under_cfg_test() {
+        // Deliberately does NOT set `DROVR_NO_SPAWN`. That is the assertion: the
+        // refusal has to sit ABOVE the seam, or this test forks the test binary
+        // with a `serve` arg — pointed at the real data root, since a child
+        // cannot inherit a thread-local overlay. `live_server_addr()` reads
+        // `server.addr` out of the (empty) TestEnv data root, so it answers
+        // `None` and control really does reach the refusal.
+        let _env = TestEnv::new();
+        let err = ensure_server().expect_err("no server is up in a fresh data root");
+        assert!(
+            err.to_string().contains("a test may not fork a daemon"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn wait_missing_server_errors() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let tmp = make_root("wait-no-server");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-            // Don't fork the test binary as a daemon; just prove "down" errors.
-            std::env::set_var("DROVR_NO_SPAWN", "1");
-        }
+        // No `DROVR_NO_SPAWN` seam any more: under `cfg(test)` `ensure_server`
+        // refuses unconditionally, so "don't fork the test binary as a daemon"
+        // is a property of the build rather than something each test has to
+        // remember to arrange. Still asserts what it always did — that a missing
+        // server surfaces as an error, not a hang.
+        let _env = TestEnv::new();
         let res = review_wait("nope", 100);
-        unsafe {
-            std::env::remove_var("DROVR_NO_SPAWN");
-        }
         assert!(res.is_err(), "missing server must error");
     }
 
     #[test]
     fn wait_times_out_while_idle() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (_addr, run, _tmp) = global_fixture("idle-timeout");
+        let env = TestEnv::new();
+        let (_addr, run) = global_fixture(&env, "idle-timeout");
         let outcome = review_wait(&run, 60).expect("wait");
         assert_eq!(outcome, WaitOutcome::Timeout);
     }
 
     #[test]
     fn wait_returns_approved() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("approve");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "approve");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        // `review_wait` resolves `server.addr` under `data_dir()` on its OWN
+        // thread, so the overlay has to be entered there and it has to be the
+        // first thing that happens — see the comment in `wait_returns_cancelled`.
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4436,12 +4620,16 @@ mod tests {
 
     #[test]
     fn wait_returns_changes_requested() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, tmp) = global_fixture("changes");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "changes");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4456,8 +4644,13 @@ mod tests {
             WaitOutcome::ChangesRequested
         );
 
-        let fb = fs::read_to_string(tmp.path().join("drovr/runs").join(&run).join("feedback.json"))
-            .expect("feedback.json");
+        let fb = fs::read_to_string(
+            env.data_root()
+                .join("drovr/runs")
+                .join(&run)
+                .join("feedback.json"),
+        )
+        .expect("feedback.json");
         assert!(fb.contains("needs work"), "feedback.json: {fb}");
     }
 
@@ -4465,8 +4658,8 @@ mod tests {
     fn summary_on_a_cancelled_run_errors_clearly() {
         // The agent's own exit path: it posts a summary, the run is already
         // cancelled, and the message must name that — not "unexpected response".
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, _tmp) = global_fixture("summary-cancelled");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "summary-cancelled");
         http_post(
             &addr,
             &format!("/api/runs/{run}/submit"),
@@ -4481,12 +4674,24 @@ mod tests {
 
     #[test]
     fn wait_returns_cancelled() {
-        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
-        let (addr, run, tmp) = global_fixture("cancel");
+        let env = TestEnv::new();
+        let (addr, run) = global_fixture(&env, "cancel");
         http_post(&addr, &format!("/api/runs/{run}/summary"), "text/plain", "go");
 
+        // `enter()` must be the FIRST statement in the closure: `review_wait`
+        // opens with `ensure_server()`, which reads `server.addr` under
+        // `data_dir()`. Overlays are thread-scoped, so without this the spawned
+        // thread has no environment to read and refuses on its first access.
+        // That refusal replaced a far worse outcome: while `crate::env` still
+        // fell through to the process, this thread resolved the LIVE
+        // `~/.local/share/drovr` and waited on the developer's own review
+        // server.
+        let env_handle = env.handle();
         let run_t = run.clone();
-        let handle = thread::spawn(move || review_wait(&run_t, 10_000));
+        let handle = thread::spawn(move || {
+            let _entered = env_handle.enter();
+            review_wait(&run_t, 10_000)
+        });
         thread::sleep(Duration::from_millis(200));
         assert!(!handle.is_finished(), "wait must block while `ready`");
 
@@ -4502,7 +4707,7 @@ mod tests {
         );
 
         assert!(
-            tmp.path()
+            env.data_root()
                 .join("drovr/runs")
                 .join(&run)
                 .join("cancelled")
@@ -5030,10 +5235,16 @@ mod tests {
     /// node clean and clear an alarm already raised.
     #[test]
     fn the_agent_tree_says_when_its_sweep_reached_nothing() {
+        // `handle_get_agents` is the one handler here that resolves a variable:
+        // it calls `config::load_config()`, which reads `XDG_CONFIG_HOME`. Hence
+        // `start_server_with_env` below — the request threads read THIS
+        // environment, named rather than inferred; without one they would have
+        // nothing to read and the endpoint would 500.
+        let env = TestEnv::new();
         let tmp = std::env::temp_dir().join(format!("drovr-blk-10-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         make_running_run(&tmp, "blip", "w:p0");
-        let addr = start_server(tmp.clone());
+        let addr = start_server_with_env(&env, tmp.clone());
 
         // No herdr in the test environment, so the real `SystemHerdr` this
         // handler uses reaches nothing — which is precisely the state under

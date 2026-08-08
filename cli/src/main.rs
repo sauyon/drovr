@@ -2,6 +2,7 @@ mod blocked;
 mod brief;
 mod code_review;
 mod config;
+mod env;
 mod findings;
 mod herdr;
 mod mcp_findings;
@@ -13,6 +14,10 @@ mod run;
 /// embedded third-party assets to known-good digests.
 #[cfg(test)]
 mod sha256;
+/// The only door to a test's environment: a thread-scoped overlay that
+/// `crate::env` reads instead of the process environment.
+#[cfg(test)]
+mod test_env;
 mod shell;
 mod worktree;
 
@@ -2268,16 +2273,6 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared env-var lock for tests that mutate `XDG_DATA_HOME`.
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub(crate) mod test_util {
-    use std::sync::Mutex;
-    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2291,18 +2286,6 @@ mod tests {
     }
 
     // -- cleanup ----------------------------------------------------------------
-
-    /// Point `XDG_DATA_HOME` at a scratch dir unique to this test, and return it
-    /// so the caller can remove it. Callers must hold `ENV_LOCK`.
-    #[cfg(test)]
-    fn cleanup_scratch(tag: &str) -> std::path::PathBuf {
-        let tmp = std::env::temp_dir().join(format!("drovr-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &tmp);
-        }
-        tmp
-    }
 
     #[test]
     fn the_panel_merge_carries_retired_panes_not_just_review_phases() {
@@ -2437,10 +2420,9 @@ mod tests {
     #[test]
     fn resurrect_restores_the_workspace_it_advertises_a_resume_into() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("resurrect-restores");
+        let _env = TestEnv::new();
         let mut run = seed_workspaceless_run("lost-ws");
         let fake = FakeHerdr::new();
         fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
@@ -2465,18 +2447,15 @@ mod tests {
             report.contains("implement"),
             "the phase whose agent died is where you resume: {report}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The other half of "restore what you advertise, or refuse and say why".
     #[test]
     fn resurrect_that_cannot_restore_refuses_instead_of_advertising_a_resume() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("resurrect-refuses");
+        let _env = TestEnv::new();
         let mut run = seed_workspaceless_run("unfixable-ws");
         let fake = FakeHerdr::new();
         fake.kill_workspace("wAG", ["wAG:p1".to_string()]);
@@ -2488,8 +2467,6 @@ mod tests {
             !err.to_string().contains("To resume"),
             "it must not smuggle the resume instruction into the failure: {err}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A finished run needs no workspace, and resurrect must not create one just
@@ -2497,10 +2474,9 @@ mod tests {
     #[test]
     fn resurrect_of_a_finished_run_provisions_nothing() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("resurrect-complete");
+        let _env = TestEnv::new();
         let mut run = seed_workspaceless_run("done-ws");
         for p in run.phases.iter_mut() {
             p.status = PhaseStatus::Done;
@@ -2517,8 +2493,6 @@ mod tests {
             "no workspace is needed to say a run is finished: {:?}",
             fake.calls()
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The workspace drovr created for a run is still the human's to use — they
@@ -2528,10 +2502,9 @@ mod tests {
     #[test]
     fn cleanup_keeps_a_workspace_holding_panes_drovr_did_not_create() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-foreign");
+        let _env = TestEnv::new();
         seed_paned_run("keep-ws");
 
         let fake = FakeHerdr::new();
@@ -2560,8 +2533,6 @@ mod tests {
             RunState::load("keep-ws").expect("run kept").archived,
             "the run is still archived when only its panes were reaped"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// When the workspace holds nothing but drovr's own panes, one
@@ -2569,10 +2540,9 @@ mod tests {
     #[test]
     fn cleanup_closes_the_workspace_when_only_drovr_panes_remain() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-owned");
+        let _env = TestEnv::new();
         seed_paned_run("close-ws");
 
         let fake = FakeHerdr::new();
@@ -2588,8 +2558,6 @@ mod tests {
             !calls.iter().any(|c| c.contains("pane_close")),
             "no per-pane close is needed once the workspace goes: {calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A failed pane listing means "cannot tell what is in there", never "it is
@@ -2599,10 +2567,9 @@ mod tests {
     #[test]
     fn cleanup_closes_only_drovr_panes_when_the_listing_fails() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-blind");
+        let _env = TestEnv::new();
         seed_paned_run("blind-ws");
 
         let fake = FakeHerdr::new();
@@ -2622,8 +2589,6 @@ mod tests {
             calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
             "the reviewer pane must still be closed: {calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The blind fallback must still skip a pane herdr can prove is gone: closing
@@ -2631,10 +2596,9 @@ mod tests {
     #[test]
     fn cleanup_blind_fallback_skips_panes_proven_gone() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-blind-dead");
+        let _env = TestEnv::new();
         seed_paned_run("blind-dead-ws");
 
         let fake = FakeHerdr::new();
@@ -2651,8 +2615,6 @@ mod tests {
             calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
             "the surviving pane must still be closed: {calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A pane drovr recorded but that is already gone (the human closed the tab)
@@ -2661,10 +2623,9 @@ mod tests {
     #[test]
     fn cleanup_skips_drovr_panes_that_are_already_gone() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-gone");
+        let _env = TestEnv::new();
         seed_paned_run("gone-ws");
 
         let fake = FakeHerdr::new();
@@ -2681,8 +2642,6 @@ mod tests {
             calls.iter().any(|c| c == "pane_close pane=wAC:p2"),
             "the pane that is still there must be closed: {calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The set of panes drovr owns: `root_pane` (which no phase ever claims, so
@@ -3127,10 +3086,9 @@ mod tests {
     #[test]
     fn cleanup_marks_the_run_archived() {
         use crate::herdr::FakeHerdr;
-        use crate::test_util::ENV_LOCK;
+        use crate::test_env::TestEnv;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = cleanup_scratch("cleanup-archived");
+        let _env = TestEnv::new();
 
         // Cleaned up mid-brainstorm: the shape that used to strand a run on a
         // live-looking status. No worktree, so the prune path is a no-op and the
@@ -3159,8 +3117,6 @@ mod tests {
         // that carries the meaning, and rewriting phase history would lose the
         // record of how far the run actually got.
         assert_eq!(after.phases[0].status, PhaseStatus::Running);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -- clap parse tests -------------------------------------------------------

@@ -868,71 +868,46 @@ fn legacy_agent() -> Option<String> {
 ///
 /// # Fail-closed under `cfg(test)`
 ///
-/// Under test this refuses to resolve anywhere inside `$HOME` and panics
-/// instead — see [`refuse_home_data_root`]. Behaviour outside `cfg(test)` is
-/// unchanged: the real CLI resolves the real data root, which is the point of
-/// it.
+/// This function carries no test-only guard of its own. Under `cfg(test)` the
+/// two reads below go through [`crate::env`], which answers only from the
+/// calling thread's overlay and panics when there is none, so the only way a
+/// test reaches a data root is by naming one through
+/// `TestEnv` (`cli/src/test_env.rs`) — which refuses any root inside the real
+/// `$HOME`. That single door is the guard; there is no second, weaker one
+/// beside it checking the value after the fact.
+///
+/// The shipped binary is unaffected. Outside `cfg(test)` `crate::env::var` is a
+/// verbatim `std::env::var` forward and the resolution below is byte-for-byte
+/// what it has always been.
+///
+/// # The `$HOME/.local/share` fallback has no test coverage, by construction
+///
+/// Stated here rather than left to be rediscovered, because this is the branch
+/// that resolved the LIVE data root in both incidents. Under `cfg(test)` it is
+/// now **unreachable**, and every route to it is closed on purpose:
+///
+/// * with no overlay installed, `crate::env::var("XDG_DATA_HOME")` panics
+///   before this line is reached;
+/// * with one installed, `TestEnv::new` always seeds `XDG_DATA_HOME`, and
+///   `TestEnv::unset` refuses to remove it — it is a `GUARDED_KEY` precisely
+///   because taking a root away is a way around the check on naming one.
+///
+/// So there is no way to ask a test what this expression does, and the old
+/// `data_dir_refuses_to_resolve_inside_the_real_home` — which covered it by
+/// mutating the process environment — is gone with the mechanism it used. The
+/// integration tests under `cli/tests/` do not cover it either: they pin
+/// `XDG_DATA_HOME` on every child, which is exactly what they must keep doing.
+///
+/// That is the correct trade and not a hole to be plugged — restoring coverage
+/// would mean restoring a way to run drovr's resolver with no declared data
+/// root, which is the capability this whole module removed. But it does mean
+/// the expression below is verified by reading rather than by running: **change
+/// it and nothing will tell you.** Raised by task 13's test review.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
+    let base = crate::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share"));
-    #[cfg(test)]
-    refuse_home_data_root(&base);
+        .unwrap_or_else(|_| PathBuf::from(crate::env::var("HOME").unwrap()).join(".local/share"));
     base.join("drovr")
-}
-
-/// Panic if a test just resolved the data root inside the user's home
-/// directory.
-///
-/// `cargo test` destroyed the real `~/.local/share/drovr` twice, taking ~65
-/// runs across four agents with it. The mechanism was not one bad test: tests
-/// redirect `XDG_DATA_HOME` by mutating it PROCESS-GLOBALLY under `ENV_LOCK`,
-/// and the only thing tying a test to that lock was a doc comment. A test that
-/// read the variable outside the lock — or simply ran before any test had set
-/// it, with the developer's own `XDG_DATA_HOME=$HOME/.local/share` still in the
-/// environment — resolved the LIVE root and *silently succeeded*. The silent
-/// success is the bug. This makes that case stop.
-///
-/// The rule is one comparison, deliberately: **the resolved base must not lie
-/// inside `$HOME`**. Not "does this look like a real path" — there is no
-/// guessing here, and there is no second heuristic backstop next to it. A test
-/// data root belongs in a temp dir; anything under the user's home is a test
-/// that got it wrong, whether it arrived via the `$HOME/.local/share` fallback
-/// or an `XDG_DATA_HOME` aimed straight at the live root.
-///
-/// Both sides are canonicalised where they exist, so a symlinked `$HOME` (or a
-/// `..`-laden `XDG_DATA_HOME`) does not walk around the check.
-///
-/// # Where this guard is weaker than it looks
-///
-/// * It is `cfg(test)` only, so it covers the unit tests compiled into the
-///   `drovr` bin. The integration tests under `cli/tests/` drive the *built
-///   binary*, which is compiled WITHOUT `cfg(test)` and therefore unguarded;
-///   they must keep pinning `XDG_DATA_HOME` on the child themselves.
-/// * A path that reaches `$HOME` only through a symlink whose own parent does
-///   not exist yet cannot be canonicalised, so it is compared literally.
-/// * `$HOME` unset leaves nothing to protect and the check passes.
-#[cfg(test)]
-fn refuse_home_data_root(base: &std::path::Path) {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => PathBuf::from(h),
-        _ => return,
-    };
-    let real_home = fs::canonicalize(&home).unwrap_or(home);
-    let real_base = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    if real_base.starts_with(&real_home) {
-        panic!(
-            "drovr test guard: data_dir() resolved to {}/drovr, inside the real home \
-             directory {} — this is the LIVE drovr data root, and a test writing there \
-             is how ~/.local/share/drovr got destroyed. XDG_DATA_HOME was {:?}. Set it \
-             to a temp dir (holding ENV_LOCK) before anything that calls \
-             data_dir()/run_dir()/runs_dir(), or pass an explicit root to the *_in() \
-             variant.",
-            real_base.display(),
-            real_home.display(),
-            std::env::var("XDG_DATA_HOME").ok(),
-        );
-    }
 }
 
 pub fn run_dir(name: &str) -> PathBuf {
@@ -1431,7 +1406,7 @@ impl RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
 
     // A RunState with the given phases; other fields inert. `archived` defaults
     // off so each test opts in explicitly.
@@ -1752,11 +1727,7 @@ mod tests {
 
     #[test]
     fn a_stale_save_never_resurrects_an_archived_run() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
 
         // A long-running command (`code-review run` blocks for up to its timeout)
         // loads the run while it is still active...
@@ -1790,11 +1761,7 @@ mod tests {
     /// re-reading it, and what is on disk is what the run is.
     #[test]
     fn refresh_archived_adopts_disk_in_both_directions() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![running("implement")]);
         s.save().unwrap();
 
@@ -1819,11 +1786,7 @@ mod tests {
         // state.json. Folding a read error into "trust my own copy" would let a
         // torn read or a permissions problem silently decide which authority is
         // in force — the caller cannot even tell it happened.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![running("implement")]);
         s.save().unwrap();
         fs::write(run_dir("r").join("state.json"), b"{ this is not json").unwrap();
@@ -1852,11 +1815,7 @@ mod tests {
         // half that a one-way `|=` merge got wrong: a long-running command whose
         // copy latched `archived: true` (from an Archive it observed) must not
         // write that back over a Restore that has since landed.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut stale = completion_run(vec![running("implement")]);
         stale.archived = true;
         stale.save().unwrap();
@@ -1888,11 +1847,7 @@ mod tests {
 
     #[test]
     fn restore_can_still_clear_the_archived_flag() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![done("implement")]);
         s.archived = true;
         s.save().unwrap();
@@ -1937,93 +1892,178 @@ mod tests {
         assert_eq!(round.retired_panes, vec!["w:p7"]);
     }
 
+    /// The claim is about COMPOSITION — `run_dir` is `<XDG_DATA_HOME>/drovr/runs/<name>`
+    /// and nothing else — so the root is one this test names explicitly rather than the
+    /// one `TestEnv` seeds. Reading back a value the test never set would be a weaker
+    /// assertion: it could not tell "run_dir uses XDG_DATA_HOME" from "run_dir happens
+    /// to agree with TestEnv's default". The root is built from `env.path()` rather
+    /// than the `/tmp/drovr-xdg-test` literal it used to hard-code, which is the same
+    /// shape without pinning a fixed path two concurrent tests could both claim.
     #[test]
     fn run_dir_uses_xdg() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test");
-        }
-        assert_eq!(
-            run_dir("demo"),
-            PathBuf::from("/tmp/drovr-xdg-test/drovr/runs/demo")
-        );
-        assert_eq!(data_dir(), PathBuf::from("/tmp/drovr-xdg-test/drovr"));
+        let env = TestEnv::new();
+        let root = env.path().join("xdg");
+        env.set("XDG_DATA_HOME", &root);
+        assert_eq!(run_dir("demo"), root.join("drovr/runs/demo"));
+        assert_eq!(data_dir(), root.join("drovr"));
     }
 
-    /// `data_dir()` must never resolve inside the real home directory while the
-    /// test suite is running.
+    /// With no `TestEnv` installed, `data_dir()` does not resolve at all.
     ///
-    /// It did, twice, and took the run directories of ~65 runs with it. The
-    /// failure mode was SILENT SUCCESS: a test that lost the process-global
-    /// `XDG_DATA_HOME` race resolved the LIVE data root and carried on writing
-    /// — and deleting — there, passing all the while. Nothing about the old
-    /// code could tell the two apart, so the guard has to be the thing that
-    /// stops, not a convention.
+    /// This is the successor to `data_dir_refuses_to_resolve_inside_the_real_home`,
+    /// and it is a strictly stronger property. That test asked "did this
+    /// resolution land somewhere catastrophic?" — a question about the *value*,
+    /// answerable only by comparing against the real `$HOME`, and therefore
+    /// silent about a test that resolved some other test's scratch root. This
+    /// one asks whether the test declared an environment at all. Under
+    /// `cfg(test)` the shim reads only from the overlay, so a `data_dir()` with
+    /// nothing installed has no answer to give and says so.
     ///
-    /// Both ways in are covered, because only one of them is the documented
-    /// one:
-    ///   1. `XDG_DATA_HOME` unset → the `$HOME/.local/share` fallback.
-    ///   2. `XDG_DATA_HOME` SET to the live root — which is exactly what a
-    ///      developer's shell exports, so this is the case that actually fired.
-    /// A scratch root outside `$HOME` must still resolve normally; a guard that
-    /// refused everything would just be a broken suite.
+    /// The panic comes from `crate::env::var` — the door — not from `data_dir`,
+    /// which is why the expected substring names the guard rather than the
+    /// caller. Every other resolver in the crate reads through the same door and
+    /// therefore inherits the same refusal; `data_dir` is the one asserted on
+    /// because it is the resolution that destroyed the live data root.
     #[test]
-    fn data_dir_refuses_to_resolve_inside_the_real_home() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
-        let prev = std::env::var("XDG_DATA_HOME").ok();
+    #[should_panic(expected = "no TestEnv installed")]
+    fn data_dir_without_a_test_env_panics() {
+        let _ = data_dir();
+    }
 
-        // (1) Unset: the `$HOME/.local/share` fallback.
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        let fallback = std::panic::catch_unwind(data_dir);
+    /// Two threads, each pointing `XDG_DATA_HOME` at its own root, each
+    /// re-reading `data_dir()` N times. Neither may ever observe the other's.
+    ///
+    /// This is the race itself, in miniature and on purpose — and it is this
+    /// branch's only executable proof that the race existed and is gone. The
+    /// two threads stand in for two tests running concurrently under
+    /// `cargo test`: both redirect the data root, both do it the only way the
+    /// code allows, and they do it at the same time on purpose.
+    ///
+    /// # What changed under it, and why the test did not have to be weakened
+    ///
+    /// The shape is unchanged from the form that failed: two threads, a
+    /// `Barrier`, `ITERATIONS = 20_000`, a redirect *inside* the loop before
+    /// every read, and the same exact-equality observation. Only the
+    /// redirection mechanism moved. It used to be an `unsafe` process-global
+    /// write of `XDG_DATA_HOME` — one slot that both threads wrote, serialised
+    /// by nothing stronger than a doc comment asking callers to take a shared
+    /// mutex. It is now [`TestEnv::set`] on a per-thread overlay, and there is
+    /// no shared slot left to lose a race for.
+    ///
+    /// Keeping the write inside the loop is the load-bearing part of the
+    /// translation. Hoisting it out would leave a test that reads a value
+    /// nobody is concurrently writing, which is true of almost any test and
+    /// proves nothing here. The write has to stay in the hot path, interleaved
+    /// with the other thread's, for the passing result to mean that the write
+    /// itself is thread-scoped.
+    ///
+    /// Its recorded red output — the same assertion, against the process-global
+    /// implementation, at 4460-5985 stolen reads per run over ten consecutive
+    /// runs — is `docs/test-isolation/race-red.txt`. That file is spec §7's
+    /// first artifact and this test is the other half of it: red there, green
+    /// here, same assertion.
+    ///
+    /// # The observation
+    ///
+    /// Deliberately one-way: a thread counts only the iterations where
+    /// `data_dir()` was NOT exactly `<its own root>/drovr`. Equality, not a
+    /// prefix — `data_dir()` is defined as precisely that join, and a prefix
+    /// test would also accept a root nested *under* this thread's own. Zero
+    /// means no thread ever saw another's root; any non-zero count is the race,
+    /// caught in the act. Both threads' counts are reported, because "which
+    /// side lost" varies run to run and neither is the interesting fact.
+    ///
+    /// # There is no longer a critical section to order panics around
+    ///
+    /// The previous form went to some length to keep every panic on its own
+    /// failure path outside the shared env mutex, because a panic while holding
+    /// it poisoned it for the whole process and turned one honest failure into a
+    /// cascade of `PoisonError`s — `forge.ko.ag/drovr/drovr/issues` has two entries on
+    /// that cascade, both headed with the mutex's name, which is why neither is
+    /// quoted here: the name is exactly the token this task removed from `src/`.
+    /// None of that applies now:
+    /// no lock is taken, nothing is restored afterwards, and each thread's
+    /// overlay is a value uninstalled by `Drop` on unwind. That deletion is
+    /// itself part of what the test demonstrates.
+    ///
+    /// The threads are still joined into `Result`s rather than unwrapped in
+    /// place, for the one reason that survives: a worker that panics — say by
+    /// reading with no overlay installed — must not stop the *other* thread's
+    /// count from being reported, and `?`-style short-circuiting on the first
+    /// `join` would do exactly that.
+    #[test]
+    fn data_root_is_not_shared_between_threads() {
+        /// Reads per thread. Tuned upward until the race lost reliably; see
+        /// `docs/test-isolation/race-red.txt` for the observed failure ratio.
+        const ITERATIONS: usize = 20_000;
 
-        // (2) Set, but aimed straight at the live root.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        }
-        let live = std::panic::catch_unwind(data_dir);
+        // One scratch root per thread, created here so that both exist before
+        // either thread starts and neither can be blamed on setup timing. Held
+        // to the end of the test — dropping a `TempDir` deletes it, and a
+        // thread still resolving under a deleted root proves nothing.
+        //
+        // Each thread's own `TestEnv` brings a scratch dir of its own too; the
+        // roots are named explicitly anyway so that the redirect stays visible
+        // in the loop below, where the whole point of the test is.
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| tempfile::tempdir().expect("scratch data root"))
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(dirs.len()));
 
-        // (3) A scratch root outside `$HOME` still resolves.
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
-        let scratch = std::panic::catch_unwind(data_dir);
+        let handles: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                let root = dir.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Constructed ON this thread, not moved onto it: the
+                    // overlay installs into a thread-local, and `TestEnv` is
+                    // `!Send` precisely so that this cannot be got wrong.
+                    let env = TestEnv::new();
+                    // Line the threads up so the writes actually interleave;
+                    // staggered, each could finish before the other starts.
+                    barrier.wait();
+                    // `data_dir()` is `<XDG_DATA_HOME>/drovr` exactly, so the
+                    // expected value is exact too. A prefix test would also
+                    // accept a root that merely nests under ours.
+                    let mine = root.join("drovr");
+                    let mut stolen = 0usize;
+                    for _ in 0..ITERATIONS {
+                        env.set("XDG_DATA_HOME", &root);
+                        if data_dir() != mine {
+                            stolen += 1;
+                        }
+                    }
+                    stolen
+                })
+            })
+            .collect();
 
-        // Restore before asserting: a failed assertion must not leak a
-        // home-pointing `XDG_DATA_HOME` into whatever runs next.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
+        // Collected, not unwrapped: one thread's panic must not suppress the
+        // other's count. See the doc comment.
+        let joined: Vec<std::thread::Result<usize>> =
+            handles.into_iter().map(|h| h.join()).collect();
 
-        assert!(
-            fallback.is_err(),
-            "data_dir() silently resolved the LIVE data root through the \
-             $HOME/.local/share fallback: {fallback:?}"
-        );
-        assert!(
-            live.is_err(),
-            "data_dir() silently resolved the LIVE data root from an \
-             XDG_DATA_HOME pointing at it: {live:?}"
-        );
+        let observed: Vec<usize> = joined
+            .into_iter()
+            .map(|r| r.expect("neither thread may panic"))
+            .collect();
+
         assert_eq!(
-            scratch.expect("a scratch root outside $HOME must still resolve"),
-            tmp.path().join("drovr")
+            observed.iter().sum::<usize>(),
+            0,
+            "data_dir() resolved another thread's data root: {observed:?} of \
+             {ITERATIONS} reads per thread saw a root the reading thread had \
+             not set. Each thread redirects through its OWN TestEnv overlay, so \
+             a non-zero count means the redirection is process-global again — \
+             the shape that let one test write into another's directory, \
+             silently, until it deleted the live data root."
         );
     }
 
     #[test]
     fn list_runs_finds_dirs_with_state_json() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         // Missing runs/ dir → empty, not an error.
         assert!(list_runs_in(&runs_dir()).is_empty());
 
@@ -2142,10 +2182,7 @@ mod tests {
 
     #[test]
     fn state_roundtrips_and_finds_first_incomplete() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/drovr-xdg-test2");
-        }
+        let _env = TestEnv::new();
         let s = RunState {
             name: "demo".into(),
             task: "t".into(),
@@ -2245,11 +2282,7 @@ mod tests {
 
     #[test]
     fn save_leaves_no_temp_file_behind() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = fat_run("tmpclean", 3);
         s.save().unwrap();
         s.cursor = 1;
@@ -2289,23 +2322,34 @@ mod tests {
         //  * each writer builds its `RunState` ONCE, outside the loop, so its
         //    time goes into `fs::write` rather than into `format!`.
         //
-        // Structured so NOTHING panics inside a spawned thread: a panic there
-        // would surface at a join on the main thread, which is holding ENV_LOCK,
-        // poisoning it and cascade-failing every other test in the binary. Threads
-        // return Results; the main thread asserts. `thread::scope` guarantees all
-        // threads are joined even if the body unwinds, so no thread can outlive
-        // the lock guard or the TempDir and race the next test's `set_var`.
+        // Structured so NOTHING panics inside a spawned thread. That used to be
+        // about the shared env mutex: a panic at a join on the main thread,
+        // which held it, poisoned it and cascade-failed the whole binary. No
+        // such lock exists any more, so what keeps the structure is the smaller
+        // reason it always also had — a thread that panics reports as a bare
+        // `Any { .. }` at the join,
+        // while a returned `Err` carries the torn-read message that says what
+        // actually went wrong. Threads return Results; the main thread asserts.
+        // `thread::scope` guarantees all threads are joined even if the body
+        // unwinds, so none can outlive the `TestEnv` whose overlay — and whose
+        // TempDir — they are resolving against.
         const PHASES: usize = 200;
         const WRITERS: usize = 4;
         const SAVES: usize = 400;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let env = TestEnv::new();
         // Seed the file so the reader always has something to open.
         fat_run("race", PHASES).save().unwrap();
+
+        // The overlay is THREAD-LOCAL, so every thread below must enter it or its
+        // `save`/`load` has no overlay to resolve `data_dir()` through at all and
+        // refuses outright. That refusal is the point: before it existed, a
+        // thread that skipped `enter()` fell through to the process environment,
+        // and this was five threads silently writing to five directories and a
+        // test that proved nothing. Shared by reference, not moved: the
+        // scoped closures each need their own guard, and `EnvHandle: Sync`.
+        let handle = env.handle();
+        let handle = &handle;
 
         let finished = std::sync::atomic::AtomicUsize::new(0);
         let finished = &finished;
@@ -2320,6 +2364,7 @@ mod tests {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|w| {
                     s.spawn(move || {
+                        let _guard = handle.enter();
                         let mut st = fat_run("race", PHASES);
                         while !reading.load(std::sync::atomic::Ordering::SeqCst) {
                             std::thread::yield_now();
@@ -2337,6 +2382,7 @@ mod tests {
                 })
                 .collect();
             let reader = s.spawn(move || {
+                let _guard = handle.enter();
                 // Deadline backstop: if a writer dies without incrementing
                 // `finished`, this must fail the test rather than spin forever
                 // (`cargo test` has no per-test timeout, so a hang is worse than
@@ -2684,11 +2730,7 @@ mod tests {
         // the point — `set_pane` clears `reaped`, so the public API cannot build
         // it), which is exactly why the write-side check is defence in depth
         // rather than dead code.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let mut s = completion_run(vec![done("plan")]);
         s.name = "asym".into();
         s.save().expect("a consistent state saves");
@@ -2739,11 +2781,7 @@ mod tests {
         assert_eq!(p.mark_reaped(), None, "idempotent; nothing left to retire");
 
         // The third door: a hand-written state.json.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path().to_str().unwrap());
-        }
+        let _env = TestEnv::new();
         let dir = run_dir("illegal");
         fs::create_dir_all(&dir).unwrap();
         fs::write(

@@ -1600,30 +1600,46 @@ mod tests {
     use crate::herdr::{FakeHerdr, PaneInfo, SessionId};
     use crate::phase::done_marker;
     use crate::run::{Phase, PhaseStatus};
-    use crate::test_util::ENV_LOCK;
+    use crate::test_env::TestEnv;
     use std::process::Command;
 
     /// A run whose `project_dir` is a fresh git repo with one commit (so `head_sha`
-    /// resolves), and whose run dir is a clean, unique `XDG_DATA_HOME`. Caller holds
-    /// ENV_LOCK. Also writes a config that pins reviews to Claude so tests do not
-    /// depend on whether Cursor's `agent` executable is installed on the host.
-    fn make_run(name: &str) -> (RunState, tempfile::TempDir) {
-        let data = std::path::PathBuf::from(format!("/tmp/drovr-cr-test-{name}"));
-        let _ = std::fs::remove_dir_all(&data);
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data);
-        }
-        // Pin the review backend; all other fields use built-in defaults.
-        let cfg_home = data.join("config-home");
+    /// resolves), and whose run dir is inside `env`'s scratch `XDG_DATA_HOME`. Also
+    /// writes a config that pins reviews to Claude so tests do not depend on whether
+    /// Cursor's `agent` executable is installed on the host.
+    ///
+    /// Takes the caller's `&TestEnv` rather than building its own: the test needs
+    /// the handle for its own reads, and an environment installed by a fixture would
+    /// be uninstalled again the moment the fixture returned.
+    ///
+    /// The old `remove_dir_all` of `/tmp/drovr-cr-test-{name}` is gone with the
+    /// process-global redirect it scrubbed: that root was shared with every other
+    /// run of the suite and every other checkout on the machine
+    /// (`forge.ko.ag/drovr/drovr/issues`, "Two test binaries on one machine fight over the
+    /// fixed `/tmp/drovr-*-test-*` scratch roots"). A `TestEnv` root is per-test and
+    /// already empty.
+    ///
+    /// What that trades away, stated so the next author does not have to find it:
+    /// two calls in ONE test now share a root, where the old per-call redirect gave
+    /// each its own. Calling this twice with the SAME `name` therefore inherits the
+    /// first run's whole directory instead of a scrubbed one — its `state.json`, its
+    /// `task-N-base.sha`, its findings files, its run lock. Every caller here passes
+    /// a distinct name; give a second call a distinct name too, rather than
+    /// reintroducing a scrub.
+    ///
+    /// The returned `TempDir` is the git REPO, not the data root: it owns
+    /// `project_dir`, and dropping it early deletes the commits `head_sha` resolves.
+    fn make_run(env: &TestEnv, name: &str) -> (RunState, tempfile::TempDir) {
+        // Pin the review backend; all other fields use built-in defaults. No
+        // environment write: `TestEnv::new` already points `XDG_CONFIG_HOME` here,
+        // so this is an ordinary file write under the scratch root.
+        let cfg_home = env.config_root();
         std::fs::create_dir_all(cfg_home.join("drovr")).unwrap();
         std::fs::write(
             cfg_home.join("drovr/config.toml"),
             "review_agent = \"claude\"\n",
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &cfg_home);
-        }
 
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -1767,9 +1783,9 @@ mod tests {
 
     #[test]
     fn an_archived_run_is_refused_before_any_reviewer_is_spawned() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-archived");
+        let (mut run, _repo) = make_run(&env, "cr-archived");
         write_base(&run, "task-1");
         // The human filed this run away: `workspace_close` already destroyed its
         // workspace, and nothing recreates a closed one.
@@ -1809,9 +1825,9 @@ mod tests {
     /// empty range must not be spellable as one.
     #[test]
     fn an_empty_review_range_is_refused_before_any_reviewer_is_spawned() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-empty-range");
+        let (mut run, _repo) = make_run(&env, "cr-empty-range");
         write_base_at_head(&run, "task-1");
 
         let outcome = code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap();
@@ -1843,9 +1859,9 @@ mod tests {
     /// does not exist": proof the value never got as far as git.
     #[test]
     fn a_crafted_base_is_rejected_before_it_reaches_git() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, repo) = make_run("cr-crafted-base");
+        let (mut run, repo) = make_run(&env, "cr-crafted-base");
         let pwned = repo.path().join("pwned");
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1878,9 +1894,9 @@ mod tests {
     /// one" — and the reason both halves of the fix are needed.
     #[test]
     fn an_unresolvable_base_is_refused_rather_than_reviewed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-unresolvable-base");
+        let (mut run, _repo) = make_run(&env, "cr-unresolvable-base");
         let dir = run_dir(&run.name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("task-1-base.sha"), "a".repeat(40)).unwrap();
@@ -1923,9 +1939,9 @@ mod tests {
     /// more than the equal-SHA case it generalises.
     #[test]
     fn an_empty_commit_is_refused_even_though_the_shas_differ() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-empty-commit");
+        let (mut run, _repo) = make_run(&env, "cr-empty-commit");
         write_base_at_head(&run, "task-1");
         commit_empty(&run);
 
@@ -1955,9 +1971,9 @@ mod tests {
     /// is the test that goes red if the emptiness check is inverted or widened.
     #[test]
     fn a_non_empty_range_still_reaches_the_reviewers() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-nonempty-range");
+        let (mut run, _repo) = make_run(&env, "cr-nonempty-range");
         write_base_at_head(&run, "task-1");
         // One commit is the entire difference between the refused case above and this
         // one; nothing else about the fixture changes.
@@ -1980,12 +1996,9 @@ mod tests {
 
     #[test]
     fn archiving_mid_run_survives_every_save_the_review_makes() {
-        // `into_inner` on poison: this test's assert is the whole point, and a
-        // real failure here must not cascade PoisonError into every other test
-        // sharing the lock — that turns one honest failure into ~11 misleading ones.
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-archive-mid-run");
+        let (mut run, _repo) = make_run(&env, "cr-archive-mid-run");
         write_base(&run, "task-1");
         run.save().unwrap();
 
@@ -2005,9 +2018,9 @@ mod tests {
 
     #[test]
     fn archiving_during_a_resumed_poll_survives_the_deadline_save() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-archive-resumed-poll");
+        let (mut run, _repo) = make_run(&env, "cr-archive-resumed-poll");
         write_base(&run, "task-1");
         run.save().unwrap();
 
@@ -2045,9 +2058,9 @@ mod tests {
 
     #[test]
     fn archiving_during_a_resumed_pass_survives_the_final_save_too() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-archive-resumed-final");
+        let (mut run, _repo) = make_run(&env, "cr-archive-resumed-final");
         write_base(&run, "task-1");
         run.save().unwrap();
 
@@ -2085,9 +2098,9 @@ mod tests {
 
     #[test]
     fn rerun_after_timeout_resumes_the_same_iter_without_respawning() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-same-iter");
+        let (mut run, _repo) = make_run(&env, "cr-resume-same-iter");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2140,9 +2153,9 @@ mod tests {
 
     #[test]
     fn resume_harvests_angles_that_already_finished() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-harvest");
+        let (mut run, _repo) = make_run(&env, "cr-resume-harvest");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2203,9 +2216,9 @@ mod tests {
 
     #[test]
     fn resume_completing_the_last_stragglers_merges_every_angle() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-completes");
+        let (mut run, _repo) = make_run(&env, "cr-resume-completes");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2248,9 +2261,9 @@ mod tests {
 
     #[test]
     fn resume_respawns_a_reviewer_whose_pane_died() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-respawn");
+        let (mut run, _repo) = make_run(&env, "cr-resume-respawn");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2293,9 +2306,9 @@ mod tests {
     /// so it would wait on an agent that was never asked anything — forever.
     #[test]
     fn a_reviewer_that_could_not_be_seeded_is_marked_failed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-send-fails");
+        let (mut run, _repo) = make_run(&env, "cr-send-fails");
         write_base(&run, "task-1");
         h.fail_agent_send();
 
@@ -2319,9 +2332,9 @@ mod tests {
     /// marked `Failed` so a resume replaces the reviewer instead of retrying forever.
     #[test]
     fn an_unparseable_reviewer_result_marks_the_angle_failed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-bad-json");
+        let (mut run, _repo) = make_run(&env, "cr-bad-json");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2357,9 +2370,9 @@ mod tests {
     /// then replaces it.
     #[test]
     fn a_marker_that_carries_no_pass_token_does_not_finish_a_reviewer() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-untokened-marker");
+        let (mut run, _repo) = make_run(&env, "cr-untokened-marker");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2390,9 +2403,9 @@ mod tests {
 
     #[test]
     fn resume_respawns_an_angle_whose_reviewer_failed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-failed");
+        let (mut run, _repo) = make_run(&env, "cr-resume-failed");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2441,11 +2454,16 @@ mod tests {
     /// one. Before the sweep it survived every trigger and waited for
     /// `drovr cleanup`, which is exactly the accumulation reaping exists to
     /// stop.
+    ///
+    /// ⚠ **CURRENTLY FAILING for the same reason as
+    /// [`a_finished_panel_reaps_its_reviewers`]** — a spurious `WouldBlock` out of
+    /// `acquire_run_lock`, not anything about the sweep. See that test's note,
+    /// forge.ko.ag/drovr/drovr#80 and `forge.ko.ag/drovr/drovr/issues`.
     #[test]
     fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-sweep-orphan");
+        let (mut run, _repo) = make_run(&env, "cr-sweep-orphan");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2506,9 +2524,9 @@ mod tests {
     /// a finished iteration look resumable forever.
     #[test]
     fn a_leftover_for_an_unconfigured_angle_does_not_make_an_iter_resumable() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-unconfigured-leftover");
+        let (mut run, _repo) = make_run(&env, "cr-unconfigured-leftover");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -2550,9 +2568,9 @@ mod tests {
     /// again rather than trusted or hard-failed.
     #[test]
     fn resume_rewaits_an_angle_whose_banked_findings_are_unreadable() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-banked-corrupt");
+        let (mut run, _repo) = make_run(&env, "cr-banked-corrupt");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2586,9 +2604,9 @@ mod tests {
     /// current diff, so the safe move is a fresh panel.
     #[test]
     fn a_missing_iter_head_record_starts_a_fresh_panel() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-no-head-record");
+        let (mut run, _repo) = make_run(&env, "cr-no-head-record");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2611,9 +2629,9 @@ mod tests {
 
     #[test]
     fn fresh_flag_starts_a_new_iteration() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-fresh-flag");
+        let (mut run, _repo) = make_run(&env, "cr-fresh-flag");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2645,9 +2663,9 @@ mod tests {
 
     #[test]
     fn head_moving_forces_a_fresh_iteration_instead_of_resuming() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-head-moved");
+        let (mut run, _repo) = make_run(&env, "cr-resume-head-moved");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -2678,9 +2696,9 @@ mod tests {
 
     #[test]
     fn a_completed_iter_is_never_resumed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-resume-after-complete");
+        let (mut run, _repo) = make_run(&env, "cr-resume-after-complete");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -2710,9 +2728,9 @@ mod tests {
 
     #[test]
     fn clean_pass_writes_merged_and_returns_clean() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-clean");
+        let (mut run, _repo) = make_run(&env, "cr-clean");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -2758,11 +2776,22 @@ mod tests {
     /// A panel that reached a verdict is finished with its reviewers, and their
     /// panes are the largest thing a run accumulates — four per iteration, and a
     /// task can take several iterations.
+    ///
+    /// ⚠ **CURRENTLY FAILING, and not because of what it asserts.** It counts
+    /// `pane_close` calls, so it is one of only two tests in the suite that turn a
+    /// *best-effort* reap refusal into a failure rather than a warning. The
+    /// refusal is a spurious `WouldBlock` out of `acquire_run_lock`, whose cause
+    /// is a live production fault — forge.ko.ag/drovr/drovr#80, written up in
+    /// `forge.ko.ag/drovr/drovr/issues` under "`acquire_run_lock` WouldBlock on a fixed
+    /// `/tmp/drovr-*-test-*` root". Deliberately **not**
+    /// `#[ignore]`d and deliberately not weakened: the assertion is right, the
+    /// lock is wrong, and hiding it would retire the only executable evidence
+    /// that the fault is real.
     #[test]
     fn a_finished_panel_reaps_its_reviewers() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-reap-panel");
+        let (mut run, _repo) = make_run(&env, "cr-reap-panel");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -2815,9 +2844,9 @@ mod tests {
     /// for the whole review twice, having thrown away the one in progress.
     #[test]
     fn a_panel_that_does_not_reach_a_verdict_reaps_nothing() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-reap-timeout");
+        let (mut run, _repo) = make_run(&env, "cr-reap-timeout");
         write_base(&run, "task-1");
 
         // (a) timeout: nobody delivered, so every reviewer is still working.
@@ -2852,10 +2881,10 @@ mod tests {
     /// The opt-out reaches the panel too.
     #[test]
     fn a_panel_keeps_its_panes_when_reaping_is_turned_off() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-reap-off");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let (mut run, _repo) = make_run(&env, "cr-reap-off");
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         std::fs::write(&cfg, "reap_finished_panes = false\n").unwrap();
@@ -2877,12 +2906,12 @@ mod tests {
 
     #[test]
     fn readonly_reviewers_complete_from_herdr_status_and_findings_file() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-readonly-done");
+        let (mut run, _repo) = make_run(&env, "cr-readonly-done");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -2919,9 +2948,9 @@ mod tests {
 
     #[test]
     fn important_finding_returns_findings_and_changes_verdict() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-findings");
+        let (mut run, _repo) = make_run(&env, "cr-findings");
         write_base(&run, "task-1");
         seed_angle_file(
             &run,
@@ -2950,9 +2979,9 @@ mod tests {
     /// whoever is debugging a story that never happened.
     #[test]
     fn an_unreadable_iter_head_record_is_surfaced_not_reported_as_a_moved_head() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-head-unreadable");
+        let (mut run, _repo) = make_run(&env, "cr-head-unreadable");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -2993,9 +3022,9 @@ mod tests {
     /// status is `idle`, which is exactly that pane.
     #[test]
     fn a_delivered_findings_file_completes_an_angle_with_no_pane_signal_at_all() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-artifact-only");
+        let (mut run, _repo) = make_run(&env, "cr-artifact-only");
         write_base(&run, "task-1");
         // Every reviewer delivered. Nobody dropped a done-marker (the seed forbids
         // `drovr phase done`) and no pane will ever report `done`.
@@ -3022,9 +3051,9 @@ mod tests {
     /// was stuck in — `Running` forever, with a complete review beside it.
     #[test]
     fn a_resume_banks_a_delivered_angle_still_recorded_running() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-artifact-resume");
+        let (mut run, _repo) = make_run(&env, "cr-artifact-resume");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -3067,9 +3096,9 @@ mod tests {
     /// than either completing the angle or failing the pass outright.
     #[test]
     fn a_half_written_findings_file_is_not_mistaken_for_completion() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-half-written");
+        let (mut run, _repo) = make_run(&env, "cr-half-written");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -3112,9 +3141,9 @@ mod tests {
     /// nobody reviewed.
     #[test]
     fn a_fresh_iteration_cannot_harvest_the_previous_iterations_verdicts() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-iter-staleness");
+        let (mut run, _repo) = make_run(&env, "cr-iter-staleness");
         write_base(&run, "task-1");
 
         // Iteration 1: every angle delivers clean, so the pass completes.
@@ -3150,9 +3179,9 @@ mod tests {
     /// stop a straggler that writes afterwards.
     #[test]
     fn a_straggler_from_a_superseded_iteration_cannot_pollute_the_new_one() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-iter-straggler");
+        let (mut run, _repo) = make_run(&env, "cr-iter-straggler");
         write_base(&run, "task-1");
 
         // Iteration 1 spawns and times out, leaving its reviewers running.
@@ -3183,9 +3212,9 @@ mod tests {
 
     #[test]
     fn later_clean_pass_replaces_stale_finding_files() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-stale-findings");
+        let (mut run, _repo) = make_run(&env, "cr-stale-findings");
         write_base(&run, "task-1");
         seed_angle_file(
             &run,
@@ -3222,9 +3251,9 @@ mod tests {
 
     #[test]
     fn missing_base_sha_is_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-nobase");
+        let (mut run, _repo) = make_run(&env, "cr-nobase");
         // No base.sha written.
         let outcome = code_review_run(&h, &mut run, "task-1", 5_000, false, None).unwrap();
         assert_eq!(outcome, ReviewOutcome::Error);
@@ -3244,10 +3273,10 @@ mod tests {
         // invocation; their only poll was the readiness gate, which routinely
         // returns before herdr publishes the session. They exit, herdr drops it,
         // and a later resume finds a reviewer it cannot rehydrate.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-aborted-pass");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let (mut run, _repo) = make_run(&env, "cr-aborted-pass");
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3318,10 +3347,10 @@ mod tests {
         // the exact losing sequence — the angle already delivered and its marker
         // already on disk at the first visit, session published only on that
         // visit's poll.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-fast-reviewer");
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let (mut run, _repo) = make_run(&env, "cr-fast-reviewer");
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3378,11 +3407,11 @@ mod tests {
         // point herdr drops the session for good, and reaping closes the pane.
         //
         // So: first poll started-but-session-less, later polls carrying one.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-late-session");
+        let (mut run, _repo) = make_run(&env, "cr-late-session");
         // One angle, so the poll queue below maps to one reviewer deterministically.
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(
             &cfg,
@@ -3440,12 +3469,12 @@ mod tests {
         // the wrong question and silently never record a cross-backend
         // reviewer's session. That is unrecoverable: herdr drops the session when
         // the reviewer exits, and reviewers are told to exit.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-backend");
+        let (mut run, _repo) = make_run(&env, "cr-backend");
         // Pin reviews to cursor while the RUN stays on claude — the divergence
         // this test exists for. `make_run` wrote `review_agent = "claude"`.
-        let cfg = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+        let cfg = std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
             .join("drovr/config.toml");
         std::fs::write(&cfg, "review_agent = \"cursor\"\n").unwrap();
         assert_eq!(run.agent.as_deref(), Some("claude"), "the run is claude");
@@ -3466,9 +3495,9 @@ mod tests {
 
     #[test]
     fn timeout_leaves_reviewers_running_for_a_resume() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-timeout");
+        let (mut run, _repo) = make_run(&env, "cr-timeout");
         write_base(&run, "task-1");
 
         // No markers dropped → tiny timeout → Timeout.
@@ -3504,9 +3533,9 @@ mod tests {
 
     #[test]
     fn reviewers_spawned_with_configured_readonly_launch() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-launch");
+        let (mut run, _repo) = make_run(&env, "cr-launch");
         write_base(&run, "task-1");
         for a in ["correctness", "security", "error-handling", "type-design"] {
             seed_angle_file(&run, "task-1", 1, a, CLEAN);
@@ -3530,9 +3559,9 @@ mod tests {
     /// launch at it.
     #[test]
     fn the_panel_writes_the_findings_server_config_and_launches_against_it() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-flag");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-flag");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -3576,12 +3605,12 @@ mod tests {
     /// drovr's plumbing and not a change the user asked for.
     #[test]
     fn a_project_file_backend_gets_its_config_written_into_the_project_and_excluded() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-project-file");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-project-file");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -3694,12 +3723,12 @@ mod tests {
     /// that `holds_more_than_drovrs_server` had to stop keeping.
     #[test]
     fn a_repo_opencode_directory_cannot_redefine_the_agent_drovr_launches_read_only() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-opencode-dir");
+        let (mut run, _repo) = make_run(&env, "cr-opencode-dir");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3754,12 +3783,12 @@ mod tests {
     /// displacement.
     #[test]
     fn the_displacement_is_re_checked_before_every_reviewer_not_once_per_pass() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-opencode-toctou");
+        let (mut run, _repo) = make_run(&env, "cr-opencode-toctou");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3839,12 +3868,12 @@ mod tests {
     /// backup slot is evidence of nothing, here too.
     #[test]
     fn a_committed_config_backup_decoy_cannot_make_drovr_discard_the_users_config() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-cfg-decoy");
+        let (mut run, _repo) = make_run(&env, "cr-cfg-decoy");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3883,12 +3912,12 @@ mod tests {
     /// another. The occupant of a backup slot is not evidence of anything.
     #[test]
     fn a_committed_backup_decoy_cannot_make_drovr_delete_the_users_directory() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-opencode-decoy");
+        let (mut run, _repo) = make_run(&env, "cr-opencode-decoy");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3931,12 +3960,12 @@ mod tests {
     /// must survive untouched.
     #[test]
     fn a_second_pass_clears_a_recreated_opencode_dir_without_touching_the_first_backup() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-opencode-dir-2");
+        let (mut run, _repo) = make_run(&env, "cr-opencode-dir-2");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -3981,12 +4010,12 @@ mod tests {
     /// `git diff` and the tests, so bash cannot simply be denied.
     #[test]
     fn an_opencode_reviewer_gets_opencodes_schema_and_a_non_stalling_plan_agent() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-opencode");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-opencode");
         run.agent = Some("opencode".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"opencode\"\n",
         )
@@ -4034,12 +4063,12 @@ mod tests {
     /// else; the displaced config is preserved, not destroyed.
     #[test]
     fn a_foreign_server_in_the_project_config_is_never_handed_to_a_reviewer() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-foreign");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-foreign");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -4105,12 +4134,12 @@ mod tests {
     /// pass after the first) is rewritten in place — no backup, no noise.
     #[test]
     fn rewriting_drovrs_own_config_does_not_accumulate_backups() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-rewrite");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-rewrite");
         run.agent = Some("cursor".into());
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"cursor\"\n",
         )
@@ -4135,7 +4164,7 @@ mod tests {
     /// wherever it points — outside the project entirely.
     #[test]
     fn a_symlinked_project_config_is_refused_rather_than_followed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = TestEnv::new();
         let tmp = tempfile::tempdir().unwrap();
         let elsewhere = tmp.path().join("outside.json");
         std::fs::write(&elsewhere, "{}").unwrap();
@@ -4258,7 +4287,7 @@ mod tests {
     /// fail to back up — a config it never managed to read.
     #[test]
     fn an_unreadable_existing_config_is_an_error_not_a_silent_replacement() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = TestEnv::new();
         let dir = tempfile::tempdir().unwrap();
         // A directory where the config should be: reading it fails with something
         // other than NotFound, exactly like a permissions or IO failure would.
@@ -4277,11 +4306,11 @@ mod tests {
     /// the pass fails at spawn time with a readable reason rather than timing out.
     #[test]
     fn a_review_backend_with_no_findings_channel_is_refused_before_spawning() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-mcp-none");
+        let (mut run, _repo) = make_run(&env, "cr-mcp-none");
         std::fs::write(
-            std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            std::path::Path::new(&crate::env::var("XDG_CONFIG_HOME").unwrap())
                 .join("drovr/config.toml"),
             "review_agent = \"codex\"\n",
         )
@@ -4301,9 +4330,9 @@ mod tests {
     /// reviewer produced nothing — and never falls back to reading its pane.
     #[test]
     fn a_reviewer_that_never_submitted_produced_nothing_and_no_pane_is_read() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-file-only");
+        let (mut run, _repo) = make_run(&env, "cr-file-only");
         write_base(&run, "task-1");
         // Spawn the panel — and mint the pass tokens its markers must carry.
         assert_eq!(
@@ -4340,9 +4369,9 @@ mod tests {
     /// A replacement reviewer must not inherit the dead one's findings file.
     #[test]
     fn a_respawned_reviewer_does_not_inherit_the_dead_ones_findings() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-respawn-inherit");
+        let (mut run, _repo) = make_run(&env, "cr-respawn-inherit");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -4394,9 +4423,9 @@ mod tests {
     /// pane's fate is not evidence about a review that was already delivered.
     #[test]
     fn a_delivered_verdict_still_counts_after_its_reviewer_s_pane_dies() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-delivered-then-died");
+        let (mut run, _repo) = make_run(&env, "cr-delivered-then-died");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
@@ -4424,8 +4453,8 @@ mod tests {
 
     #[test]
     fn head_sha_reads_temp_repo() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (run, _repo) = make_run("cr-headsha");
+        let env = TestEnv::new();
+        let (run, _repo) = make_run(&env, "cr-headsha");
         let sha = head_sha(&run.project_dir).unwrap();
         assert_eq!(sha.len(), 40, "a full HEAD sha: {sha}");
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
@@ -4670,9 +4699,9 @@ mod tests {
     /// passes none reuses the record rather than silently dropping it.
     #[test]
     fn context_is_recorded_and_reused_by_a_later_pass() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-context-persist");
+        let (mut run, _repo) = make_run(&env, "cr-context-persist");
         write_base(&run, "task-1");
 
         assert_eq!(
@@ -4713,9 +4742,9 @@ mod tests {
     /// (shared resolver, so this pins the delegation as much as the behavior).
     #[test]
     fn an_empty_context_clears_the_recorded_one() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (mut run, _repo) = make_run("cr-context-clear");
+        let (mut run, _repo) = make_run(&env, "cr-context-clear");
         write_base(&run, "task-1");
         assert_eq!(
             code_review_run(&h, &mut run, "task-1", 40, false, Some("stale context")).unwrap(),
@@ -4743,9 +4772,9 @@ mod tests {
     /// spawning anything — otherwise its prompt goes back to being agent-authored.
     #[test]
     fn brief_composes_the_same_frame_without_spawning() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let env = TestEnv::new();
         let h = FakeHerdr::new();
-        let (run, _repo) = make_run("cr-brief");
+        let (run, _repo) = make_run(&env, "cr-brief");
         write_base(&run, "task-1");
 
         let brief = code_review_brief(&run, "task-1", "security", Some("only the parser changed"))
@@ -4771,8 +4800,8 @@ mod tests {
     /// rather than print a frame with an empty diff range.
     #[test]
     fn brief_without_a_recorded_base_is_an_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let (run, _repo) = make_run("cr-brief-no-base");
+        let env = TestEnv::new();
+        let (run, _repo) = make_run(&env, "cr-brief-no-base");
         let err = code_review_brief(&run, "task-1", "security", None)
             .expect_err("no base recorded must be an error");
         assert!(
@@ -4788,6 +4817,13 @@ mod tests {
     /// JSON string literals and loses a complete, valid verdict.
     #[test]
     fn seed_routes_findings_through_the_submit_tool() {
+        // For the `run_dir("myrun")` below, and only for that: this test asserts on a
+        // string, but it computes the path it must NOT find by calling the production
+        // resolver. Without an overlay that resolver reads the process environment —
+        // which, before this module moved onto `TestEnv`, happened to hold whatever
+        // scratch root a sibling test had set process-globally. That leftover is the
+        // race this run exists to remove, so the test now brings its own root.
+        let _env = TestEnv::new();
         let seed = build_seed(
             "task-1",
             "security",

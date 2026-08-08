@@ -1,0 +1,427 @@
+================================================================================
+baseline-before.txt — the "before" state for run enforce-env-lock (plan.md Task 2)
+================================================================================
+
+WHAT THIS IS
+  Two of spec.md §7's three artifacts are before/after comparisons. This file is
+  the recorded "before". Later tasks (T13 in particular) compare against the
+  numbers and outcomes below, not against memory or the known-issues text.
+
+WHEN / WHERE
+  recorded:    2026-08-06T20:44-07:00
+  worktree:    /home/sauyon/devel/drovr/.drovr/wt/enforce-env-lock
+  branch:      drovr/enforce-env-lock
+  HEAD:        a4d568c509d3b4ce4ab45006b6a2cde336570431  (refactor(test-isolation): derive the interlock test from the config file)
+  run base:    1731440 (the branch point); T1 landed at HEAD
+  tree:        clean at recording time
+  toolchain:   export PATH=/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin:\
+/nix/store/l3gishxdaxhnaxczyw0jw7dcy9p4rhcs-rustc-1.97.0/bin:$PATH
+               (cargo 1.97.0 / rustc 1.97.0; plain `cargo` fails with
+               "rustup could not choose a version")
+
+HOW THE SUITE WAS RUN
+  From cli/, as plain `cargo test` with NO `XDG_DATA_HOME=$(mktemp -d)` prefix.
+  T1's repo-root .cargo/config.toml now forces XDG_DATA_HOME for every process
+  cargo launches, so the prefix protocol is retired — this is what "before"
+  means for every later comparison.
+
+WHAT IS AND IS NOT INCLUDED IN "BEFORE"
+  T1 (repo-root .cargo/config.toml + cli/tests/data_root_is_forced.rs) IS in
+  this baseline; it landed before this recording, and the plan sequences T2
+  after T1 deliberately. T1 did NOT touch ENV_LOCK, any `set_var`/`remove_var`
+  site, or any of the 340 `ENV_LOCK.lock()` call sites — the surface this run
+  actually changes is byte-identical to the branch point. So the numbers below
+  are a trustworthy "before the lock/env-write sites were modified" record.
+  One count moved because of T1 and is stated explicitly: the integration test
+  count is 22, not 21 (T1 added cli/tests/data_root_is_forced.rs), for a total
+  of 730 = 708 unit + 22 integration.
+
+================================================================================
+1. `cargo test` — full parallel run, 3×  (plan.md Task 2, item 1)
+================================================================================
+
+The known issue "Test suite flakes under parallel `cargo test`; needs
+`--test-threads=1`" (docs/known-issues.md, cited by heading) claims this run is
+flaky. Its stated symptom is precise, so the comparison can be precise:
+"~50+ tests across `config`, `herdr`, `run`, `phase` fail with unrelated
+assertion errors; the same tests pass in isolation and under --test-threads=1".
+
+OBSERVED TODAY: it did not reproduce. 3/3 mandated runs green, 730 passed,
+0 failed. Five further parallel runs were done as a bonus (section 1b) — 8/8
+green in total. The honest before-state is "did not reproduce in 3 runs
+(nor in 8)". T13's after-state must be >= that: 730 passing, 0 failing.
+
+The failure set is therefore not "stable" or "unstable" — it is empty in this
+sample. That is a statement about 8 runs on one machine, NOT a claim that the
+race does not exist: the race is real by construction (process-global
+`set_var` under a by-convention mutex), it is simply not being lost here today.
+Do not read this section as evidence that the run's premise is wrong.
+
+--------------------------------------------------------------------------------
+1.1  $ cargo test 2>&1 | tail -40      (exit 0)
+--------------------------------------------------------------------------------
+  aggregate: 730 passed, 0 failed, 0 ignored, across 8 test binaries
+
+test injects_reflex_when_drovr_phase_unset ... ok
+test section_toggle_omits_disabled_section ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/rehydrate_http.rs (target/debug/deps/rehydrate_http-dd9aac27fa9ca1f4)
+
+running 2 tests
+test a_rehydrate_that_cannot_finish_does_not_exit_zero ... ok
+test rehydrate_over_http_really_runs_the_cli_and_reports_its_failure ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/serve_single.rs (target/debug/deps/serve_single-15e258d2cb688e69)
+
+running 6 tests
+test concurrent_starts_leave_exactly_one_server ... ok
+test stale_discovery_files_do_not_block_startup ... ok
+test a_foreign_process_on_the_requested_port_fails_to_bind ... ok
+test second_serve_on_same_port_is_refused ... ok
+test killing_a_server_frees_the_lock_immediately ... ok
+test second_serve_on_another_port_is_refused ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/skills_valid.rs (target/debug/deps/skills_valid-f5135a60acb6fcf7)
+
+running 2 tests
+test methodology_skills_within_body_budget ... ok
+test all_skills_have_valid_frontmatter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/web_nav.rs (target/debug/deps/web_nav-786fcf3ab8dd49dc)
+
+running 1 test
+test web_keyboard_navigation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.11s
+
+
+--------------------------------------------------------------------------------
+1.2  $ cargo test 2>&1 | tail -40      (exit 0)
+--------------------------------------------------------------------------------
+  aggregate: 730 passed, 0 failed, 0 ignored, across 8 test binaries
+
+test custom_preamble_replaces_default_framing ... ok
+test reflex_disabled_emits_nothing ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/rehydrate_http.rs (target/debug/deps/rehydrate_http-dd9aac27fa9ca1f4)
+
+running 2 tests
+test a_rehydrate_that_cannot_finish_does_not_exit_zero ... ok
+test rehydrate_over_http_really_runs_the_cli_and_reports_its_failure ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/serve_single.rs (target/debug/deps/serve_single-15e258d2cb688e69)
+
+running 6 tests
+test concurrent_starts_leave_exactly_one_server ... ok
+test stale_discovery_files_do_not_block_startup ... ok
+test a_foreign_process_on_the_requested_port_fails_to_bind ... ok
+test second_serve_on_same_port_is_refused ... ok
+test killing_a_server_frees_the_lock_immediately ... ok
+test second_serve_on_another_port_is_refused ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/skills_valid.rs (target/debug/deps/skills_valid-f5135a60acb6fcf7)
+
+running 2 tests
+test methodology_skills_within_body_budget ... ok
+test all_skills_have_valid_frontmatter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/web_nav.rs (target/debug/deps/web_nav-786fcf3ab8dd49dc)
+
+running 1 test
+test web_keyboard_navigation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.11s
+
+
+--------------------------------------------------------------------------------
+1.3  $ cargo test 2>&1 | tail -40      (exit 0)
+--------------------------------------------------------------------------------
+  aggregate: 730 passed, 0 failed, 0 ignored, across 8 test binaries
+
+test section_toggle_omits_disabled_section ... ok
+test custom_preamble_replaces_default_framing ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/rehydrate_http.rs (target/debug/deps/rehydrate_http-dd9aac27fa9ca1f4)
+
+running 2 tests
+test a_rehydrate_that_cannot_finish_does_not_exit_zero ... ok
+test rehydrate_over_http_really_runs_the_cli_and_reports_its_failure ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/serve_single.rs (target/debug/deps/serve_single-15e258d2cb688e69)
+
+running 6 tests
+test concurrent_starts_leave_exactly_one_server ... ok
+test stale_discovery_files_do_not_block_startup ... ok
+test a_foreign_process_on_the_requested_port_fails_to_bind ... ok
+test second_serve_on_same_port_is_refused ... ok
+test killing_a_server_frees_the_lock_immediately ... ok
+test second_serve_on_another_port_is_refused ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/skills_valid.rs (target/debug/deps/skills_valid-f5135a60acb6fcf7)
+
+running 2 tests
+test methodology_skills_within_body_budget ... ok
+test all_skills_have_valid_frontmatter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/web_nav.rs (target/debug/deps/web_nav-786fcf3ab8dd49dc)
+
+running 1 test
+test web_keyboard_navigation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.22s
+
+
+--------------------------------------------------------------------------------
+1b. Five additional parallel `cargo test` runs (bonus — flake characterisation)
+--------------------------------------------------------------------------------
+
+The driver flagged `herdr::tests::only_an_explicit_pane_not_found_proves_a_pane_is_gone`
+as having failed once during T1's verification, then passing repeatedly. Five
+extra full parallel runs were done to try to characterise it. It did not
+reproduce; no test failed in any of them.
+
+run 4: exit 0 — 730 passed, 0 failed
+run 5: exit 0 — 730 passed, 0 failed
+run 6: exit 0 — 730 passed, 0 failed
+run 7: exit 0 — 730 passed, 0 failed
+run 8: exit 0 — 730 passed, 0 failed
+
+  Total parallel-run sample: 8 runs, 8 green, 5840 test executions, 0 failures.
+  `only_an_explicit_pane_not_found_proves_a_pane_is_gone` passed in all 8.
+
+  Three separately-recorded flake claims, and what this sample says about each
+  (all cited by heading, docs/known-issues.md):
+
+    * "Test suite flakes under parallel `cargo test`; needs `--test-threads=1`"
+      — did NOT reproduce in 8 parallel runs.
+    * "`lock_records_our_pid_and_releases_on_drop` flakes at ~5-8%, independent
+      of test threads" — did NOT reproduce in 8 parallel runs, 1 serial run, or
+      2 sandbox runs (11 executions; at 5-8% the expected count is ~1, so this
+      is weak evidence, not a refutation).
+    * `herdr::tests::only_an_explicit_pane_not_found_proves_a_pane_is_gone`,
+      which the driver saw fail once during T1 — did NOT reproduce.
+
+  None of these is a claim the flakes are gone. 8 runs on one idle machine is a
+  small sample, and a race that depends on machine load will not show itself on
+  demand. Recorded so T13 does not have to guess what "before" looked like.
+
+================================================================================
+2. `cargo test -- --test-threads=1` — serial run  (plan.md Task 2, item 2)
+================================================================================
+
+The known issue's prescribed workaround. Green, as expected, and ~29s wall
+clock vs ~35-40s for the parallel run (the suite is dominated by one 16s
+integration test, so serialisation costs less here than it usually would).
+
+--------------------------------------------------------------------------------
+2.1  $ cargo test -- --test-threads=1 2>&1 | tail -40      (exit 0)
+--------------------------------------------------------------------------------
+  aggregate: 730 passed, 0 failed, 0 ignored, across 8 test binaries
+
+test section_toggle_omits_disabled_section ... ok
+test suppressed_when_drovr_phase_set ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/rehydrate_http.rs (target/debug/deps/rehydrate_http-dd9aac27fa9ca1f4)
+
+running 2 tests
+test a_rehydrate_that_cannot_finish_does_not_exit_zero ... ok
+test rehydrate_over_http_really_runs_the_cli_and_reports_its_failure ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/serve_single.rs (target/debug/deps/serve_single-15e258d2cb688e69)
+
+running 6 tests
+test a_foreign_process_on_the_requested_port_fails_to_bind ... ok
+test concurrent_starts_leave_exactly_one_server ... ok
+test killing_a_server_frees_the_lock_immediately ... ok
+test second_serve_on_another_port_is_refused ... ok
+test second_serve_on_same_port_is_refused ... ok
+test stale_discovery_files_do_not_block_startup ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/skills_valid.rs (target/debug/deps/skills_valid-f5135a60acb6fcf7)
+
+running 2 tests
+test all_skills_have_valid_frontmatter ... ok
+test methodology_skills_within_body_budget ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/web_nav.rs (target/debug/deps/web_nav-786fcf3ab8dd49dc)
+
+running 1 test
+test web_keyboard_navigation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.17s
+
+
+
+  Per-binary breakdown (serial run), showing the 708/22 split:
+    test result: ok. 708 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.69s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+    test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.17s
+
+================================================================================
+3. `nix build .` from the repo root  (plan.md Task 2, item 3 — spec open Q1)
+================================================================================
+
+RESULT: PASSES. Both halves of spec open question 1 are resolved YES. No
+escalation needed; T1's second arm holds.
+
+  Q1a — does T1's repo-root .cargo/config.toml apply inside the nix sandbox?
+        YES, proved by the sandbox itself. `buildAndTestSubdir = "cli"` puts
+        the unpacked source root on cargo's cwd-ancestor chain, and T1's
+        interlock test — which parses .cargo/config.toml and asserts the live
+        XDG_DATA_HOME resolves to <repo>/target/cargo-xdg-data — PASSED in the
+        sandbox (see the checkPhase excerpt below). A test that fails when the
+        config is absent, passing in the sandbox, is the proof.
+
+  Q1b — is <src>/target/cargo-xdg-data WRITABLE in the sandbox?
+        YES. `buildRustPackage` unpacks the source writable and cargo already
+        builds into <src>/target/ there. Proved directly (section 3.3) by a
+        throwaway overrideAttrs build whose preCheck created and wrote a file
+        under that exact path.
+
+  Note for the record: HOME=/homeless-shelter in the sandbox, so the scratch
+  root is OUTSIDE $HOME there. This is exactly the case T1's handoff flagged
+  as Dead end 2 — cfg(test)'s `refuse_home_data_root` guard cannot fire in the
+  sandbox. Nothing is unpinned today so nothing is currently harmed, and the
+  full suite is green in the sandbox; T13 owns closing it.
+
+--------------------------------------------------------------------------------
+3.1  $ nix build .        (from the repo root; exit 0; ~42s)
+--------------------------------------------------------------------------------
+
+  Verbatim stdout+stderr. Note that nix's own output stops at "building ...":
+  the exit status is NOT in the text. It was 0, observed by the invoking shell,
+  and independently corroborated two ways — the derivation's output exists in
+  the store (`nix-store --query --outputs` on the .drv resolves), and the log in
+  section 3.2 shows installPhase/fixupPhase completing after checkPhase.
+
+warning: updating lock file "/home/sauyon/devel/drovr/.drovr/wt/enforce-env-lock/flake.lock":
+• Added input 'flake-utils':
+    'github:numtide/flake-utils/11707dc2f618dd54ca8739b309ec4fc024de578b?narHash=sha256-l0KFg5HjrsfsO/JpG%2Br7fRrqm12kzFHyUHqHCVpMMbI%3D' (2024-11-13)
+• Added input 'flake-utils/systems':
+    'github:nix-systems/default/da67096a3b9bf56a91d16901293e51ba5b49a27e?narHash=sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768%3D' (2023-04-09)
+• Added input 'nixpkgs':
+    'github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17?narHash=sha256-4IHyyLgLBdKefkljdKod4IMn023pQiDXAWJA187cmdY%3D' (2026-07-23)
+this derivation will be built:
+  /nix/store/w8q63i497ghv0bqchk9sipw0z8nng55h-drovr-0.2.0.drv
+building '/nix/store/w8q63i497ghv0bqchk9sipw0z8nng55h-drovr-0.2.0.drv'...
+
+  (The flake.lock warning is not a diff: flake.lock is untracked here because
+  the user's global gitignore at ~/.config/git/ignore:16 ignores it. `nix build`
+  regenerated it from the revs pinned in flake.nix; `git status` stayed clean.)
+
+--------------------------------------------------------------------------------
+3.2  checkPhase inside the sandbox — `nix log` excerpt
+     (drv: /nix/store/w8q63i497ghv0bqchk9sipw0z8nng55h-drovr-0.2.0.drv)
+--------------------------------------------------------------------------------
+
+  The full suite runs inside the sandbox (doCheck defaults on). All 8 test
+  binaries green, 730 passed, 0 failed — the same totals as the local runs:
+
+    running 708 tests
+    test result: ok. 708 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.80s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    running 3 tests
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    running 7 tests
+    test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    running 2 tests
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+    running 6 tests
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+    running 2 tests
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  And the interlock test, which is Q1a's proof, in the sandbox:
+
+         Running tests/data_root_is_forced.rs (/build/64paiyl4hy2c9fiixr3w01g0s5n865dr-source/target/x86_64-unknown-linux-gnu/release/deps/data_root_is_forced-7c06c371c1e14435)
+    
+    running 1 test
+    test cargo_forces_the_data_root_at_the_repo_scratch_path ... ok
+    
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    
+
+--------------------------------------------------------------------------------
+3.3  Writability probe (Q1b) — throwaway overrideAttrs build, repo untouched
+--------------------------------------------------------------------------------
+
+  $ nix build --impure --no-link -f <scratch>/probe.nix -L     (exit 0)
+
+  probe.nix = the flake's default package with a preCheck appended that mkdir's
+  and writes under "$NIX_BUILD_TOP/$sourceRoot/target/cargo-xdg-data". Nothing
+  in the repo was modified to run it.
+
+    drovr-xdg-writability-probe> PROBE pwd=/build/pbhpbzfmv1z4sjjgyys1kkyjrqn2068r-source
+    drovr-xdg-writability-probe> PROBE NIX_BUILD_TOP=/build sourceRoot=pbhpbzfmv1z4sjjgyys1kkyjrqn2068r-source HOME=/homeless-shelter
+    drovr-xdg-writability-probe> PROBE target=/build/pbhpbzfmv1z4sjjgyys1kkyjrqn2068r-source/target/cargo-xdg-data
+    drovr-xdg-writability-probe> PROBE RESULT: XDG_DATA_HOME scratch path IS writable in the nix sandbox
+
+  The probe build also ran the whole suite with that directory pre-created and
+  non-empty: 730 passed, 0 failed. A populated scratch root does not upset the
+  suite.
+
+================================================================================
+4. WHAT LATER TASKS MUST COMPARE AGAINST
+================================================================================
+
+  * `cargo test` (parallel, no prefix, no --test-threads=1): 730 passed,
+    0 failed, 0 ignored — 708 unit (bin drovr) + 22 integration, across 8 test
+    binaries. Green in 8/8 runs.
+  * `cargo test -- --test-threads=1`: same 730/0/0.
+  * `nix build .`: exit 0, sandbox checkPhase green at the same 730/0/0.
+  * Zero *compiler* warnings in all of the above. (The only "warning:" lines in
+    any log are nix-level and unrelated to the code: the flake.lock update
+    notice in 3.1, and an HTTP 401 from a substituter cache. Neither is rustc.)
+  * The known issue's flakiness claim did NOT reproduce in 8 parallel runs.
+    T13 cannot claim "fixed the flake" against this baseline — there is no
+    observed flake to fix here. What it CAN claim is the property: the race is
+    removed by construction. Any wording that leans on "the suite used to flake"
+    must cite an observation, and this file is not one.
+  * T3 (the deliberate race demonstration) is the artifact that supplies the
+    watched-failing evidence this baseline could not.
+
+  Canary: ~/.local/share/drovr/canary.txt present and untouched (mtime
+  2026-08-06 20:33) after every one of the 8 parallel runs, the serial run, and
+  both nix builds. No suite run touched the live data root.
+
+================================================================================
+end of baseline-before.txt
+================================================================================
