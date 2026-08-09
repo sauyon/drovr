@@ -19,30 +19,44 @@ and the difference is recorded in `RESULTS.md`. This clause exists because a lit
 the plan's T10 branch could otherwise paste a winning candidate and report an unqualified *"shorter
 without loss"* in exactly the case `R4a` was written to qualify.
 
+**What is protected, and it is not only item 12.** The rules that decide the outcome are **items 8,
+8a, 9, 10, 11, 12, 13, 14 and 14a** — call them the **governed items**. Item 12 is not special: R1
+and R2 are *defined in terms of* item 9's `present` test, item 8's schema, item 8a's sample and item
+10's instrument, so loosening any of those moves the gate exactly as surely as rewriting R2 would.
+Items 1–7 are the framing, the design and the id pool; they are governed too, but the reason to name
+the list explicitly is that an earlier draft of this clause protected item 12 alone, which would have
+left the definitions it depends on editable after a result was visible.
+
 **What may change, and when.** Three windows, and there is no fourth:
 
 1. **Before T3's first commit** — while no arm text and no generated spec exist. Corrections are
-   legitimate and need no log entry beyond the commit itself. This is the only window in which a
-   rule may be *added*.
+   legitimate and need no log entry beyond the revision table below. **This is the only window in
+   which a rule may be added, and the only one in which a governed item may be weakened.**
 2. **From T3's first commit until T4 dispatches its first probe** — arm text exists but no result
-   does. Corrections are still legitimate, because nothing has been measured, but **every one is
-   logged in `docs/skill-evidence/spec-length/RESULTS.md` with its reason and its commit**, and no
-   rule in item 12 may be *weakened* — only clarified.
-3. **After T4 dispatches its first probe** — **no rule in item 12 may be revised at all**, and any
+   does. Corrections are still legitimate, because nothing has been measured, but **no governed item
+   may be weakened — only clarified**, and every edit is logged in
+   `docs/skill-evidence/spec-length/RESULTS.md` with its reason and its commit.
+3. **After T4 dispatches its first probe** — **no governed item may be revised at all**, and any
    edit to this file whatsoever is a protocol deviation, logged in `RESULTS.md` with its reason and
    its commit.
 
 A rule chosen once a result is visible is not a rule; it is the result wearing a rule's clothes.
 
-**This file was revised twice after its first commit, both times inside window 1**, and says so
-here rather than leaving `git log -p` as the only witness:
+**Every edit in every window appends a row to the revision table below**, in the same commit that
+makes the edit. Windows 2 and 3 log to `RESULTS.md` **as well**, not instead: `RESULTS.md` does not
+exist until T7, so a reader before then would otherwise have no record at all, and a reader after it
+should not have to open a second file to learn that this one moved.
+
+**This file was revised three times after its first commit, all inside window 1**, and says so here
+rather than leaving `git log -p` as the only witness:
 
 | commit | what changed |
 |---|---|
-| `7cfd07a` | first commit — items 1–14 plus 8a, rules `R1`–`R7`. |
+| `7cfd07a` | first commit — items 1–14 plus 8a; rules `R1`, `R1a`, `R2`, `R3`, `R3a`, `R4`, `R5`, `R6`, `R6a`, `R7`. |
 | `bdd6622` | `R4`'s row-judgement count corrected from 1380 to **460** per arm (1380 is the figure across all three arms). |
 | `3dd0dcc` | **`R4a` and `R5a` added** — neither was in the first commit. `R1`'s primary sentence reworded (the original, read literally, required generations that never judged a row to retain it). Item 8a's sample offset pinned. |
-| the commit that added this table | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows above split from two to three. No rule added or weakened. |
+| `6e33620` | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows split from two to three; this table added. No rule added or weakened. |
+| the commit that added this row | **`14a` added** — T9's gap-finder and pairing-adjudicator prompts and the `gaps/` schema, which `R7` makes fatal but which no file pinned. **`R3a` gained its post-T8/T9 fallback**, which was undefined. The protected set widened from item 12 alone to the nine governed items. This table made append-only and forward-looking. |
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE.md` is the hash
 record and `docs/skill-evidence/arms/MANIFEST.md` is the provenance record; both are authoritative
@@ -525,6 +539,16 @@ applies. **Do not describe this scoring as fully blind anywhere.**
   human complained about. Ties break on mean bytes, then on the arm file's own line count. A shorter
   *instruction* that produces *longer* specs has not won anything. And if the arm with the lowest
   mean is `S1`, **no candidate beat the control**: ship nothing and record it.
+
+  **The comparison T7 records is provisional; the winner is decided only after T8 and T9.** T7
+  applies R3a over the arms that cleared R2, but T8 and T9 run *after* T7 and either can be fatal
+  (R7). So the ordering, pre-registered here because otherwise it is settled once the results are
+  in: **the winner is the lowest-mean arm among the CANDIDATES that cleared R2 *and* T8 *and* T9.**
+  If the provisional leader is then eliminated by T8 or T9, **the next-lowest surviving candidate
+  takes its place** — it is not discarded along with the leader, and the run does not fall to a null
+  merely because the shortest survivor was not the shortest clearer. If no candidate survives all
+  three, the outcome is the null under R7. T7 labels its own table **"provisional — T8 and T9 have
+  not run"** whenever any candidate cleared R2, so no reader mistakes it for the verdict.
 - **R4 — the control is not exempt, and a universal null is the likely outcome.** `S1`'s retention
   is the **instrument reading**: it says whether the gate is clearable at all under D2. R1 requires
   **460** row-judgements — 2 samples × 230 rows — to come back clean for **one** arm to pass, and
@@ -662,3 +686,87 @@ Verdicts land in `docs/skill-evidence/spec-length/transmission/<id>.json`:
 ```
 
 `answers` covers exactly the 20 sampled ids for that fixture, in order.
+
+---
+
+## 14a. T9's instruments
+
+Numbered out of sequence for the same reason 8a is: it was added during T2's own review, and items
+1–14 are cited by number elsewhere. **It exists because `R7` makes a T9 gap fatal, and T9 was the
+only fatal instrument in this run whose prompts were pinned nowhere** — not here, and only as prose
+in the plan. T9 runs after T7 has unblinded, so whoever writes its prompts then knows which arm is
+which and authored two of the three. An instrument authored after the results are visible is the
+thing this file exists to prevent, and R7's fatality is what made it worth fixing rather than noting.
+
+**Scope, mirroring T8 exactly:** per surviving candidate arm, 3 fixtures × **sample 1 only** = 3
+gap-finder runs + 3 pairing-adjudicator runs. Output is
+`docs/skill-evidence/spec-length/gaps/<id>.md`, `<id>` being the **candidate's** generation id.
+
+**The gap-finder** (foreground, blind) is handed the generated spec and the fixture's task line —
+**never the fixture spec, never the ledger, never the control's generated spec**, since with the
+control in hand it would be answering by comparison instead of by reading:
+
+```
+You are about to implement this task:
+
+    <TASK LINE for the fixture, from item 4>
+
+The only thing you have been given is the spec below. Read it as the implementer: assume it is
+all you get, and that nobody is available to answer follow-up questions.
+
+--- BEGIN SPEC ---
+<the contents of generated/<id>.md>
+--- END SPEC ---
+
+List every question you would still have to ask before you could build this. A question counts
+only if the spec does not answer it and you could not proceed without the answer; do not list
+things you would simply decide yourself, and do not list questions about how to implement a
+decision the spec already made.
+
+Return exactly one line and nothing else, a JSON array of question strings in the order you
+would need them answered:
+["<question>", "<question>"]
+```
+
+**The pairing adjudicator** (foreground, blind to which spec is which) is handed that question list
+and **both** generated specs relabelled `A` and `B`, with the arm identities withheld:
+
+```
+Below are two specs, A and B, written for the same task, and a list of questions an implementer
+had after reading one of them. You are not told which spec the questions came from, and you are
+not being asked which spec is better.
+
+For each question, answer twice, independently: does spec A answer it, and does spec B answer
+it? "Answers it" means an implementer reading that spec would not need to ask — a topic
+mentioned without the operative detail does not count.
+
+--- BEGIN SPEC A ---
+<contents>
+--- END SPEC A ---
+--- BEGIN SPEC B ---
+<contents>
+--- END SPEC B ---
+
+--- BEGIN QUESTIONS ---
+<n>. <question>
+--- END QUESTIONS ---
+
+Return exactly one line and nothing else, a JSON array of one object per question in order:
+[{"n":1,"a_answers":true,"b_answers":false}]
+```
+
+**Which spec is `A` is fixed by the ids, not chosen**, so position cannot carry a hint and nobody
+picks it once the answers are visible: the two ids are compared as lowercase hex strings, and **the
+lexicographically smaller id is `A`**. The control generation paired against is `S1`'s generation
+for the **same fixture and same sample** — which exists whether or not `S1` itself cleared R2,
+because the pairing reads the spec, not the verdict.
+
+**The join is the phase agent's, and only afterwards.** A question the **control answers and the
+candidate does not** is a **gap**, and a gap is fatal to that arm under R7. A question neither
+answers is not a gap; a question the candidate answers and the control does not is recorded as a
+point in the candidate's favour and changes no verdict.
+
+`gaps/<id>.md` carries, in this order: the arm, fixture and sample; the gap-finder's questions
+verbatim; the adjudicator's per-question `a_answers`/`b_answers` with the `A`/`B` labels resolved to
+arm names **after** the join; the resulting gap list; and any disagreement recorded under R6a. As
+everywhere else in this run, a disagreement with an adjudication is **recorded, never overwritten**.
