@@ -2,7 +2,9 @@
 
 **Run:** `spec-length-ab` · **Branch:** `drovr/spec-length-ab`
 
-**This file was opened by T4, not T7, and holds only what T4 owns: the raw measurements.**
+**This file was opened by T4, not T7, and holds only what T4 owns: the raw measurements, the
+window-2 revision log, the freeze re-verification, the feasibility reading, and T4's own
+deviations.**
 `PROTOCOL.md`'s preamble anticipated T7 creating it, and the plan lists it as a T7 interface — but
 the plan's own T4 procedure directs the generated specs' `wc` numbers and the feasibility reading
 here, and `PROTOCOL.md`'s window-2 revisions were owed a log in a file that did not yet exist. T4
@@ -12,14 +14,17 @@ instrument reading under `R4`, and the re-run log under `R6`.
 
 **No arm is printed against any generation id in this file — but the arm is derivable from it, and
 saying only the first half would be a comfortable lie.** (Arm *names* do appear, in §1, §2 and §5,
-describing the arms as arms; what never appears is an id paired with its arm.) The per-generation
-table in §3 carries `id`, `fixture`, `sample`, lines, bytes and the fixture percentage, and
-deliberately **not** the arm:
+describing the arms as arms; what never appears is an id printed beside its arm — and even that
+understates it, because until round 8 §5's deviation 5 carried an 18-digit by-arm sequence that
+paired all eighteen positionally. It has been removed and recorded under deviation 4.) The
+per-generation table in §3 carries `id`, `fixture`, `sample`, lines, bytes and the fixture
+percentage, and deliberately **not** the arm:
 when T7 unblinds it records the arm in **a table of its own, per §6 — never by widening §3**, whose
-whole value is that it was written before any scoring. However, §5's deviation 4 records the draw's
-salt and ordering rule, which means **this file alone determines the whole assignment** for anyone
-willing to run one `sha256` loop. That is a further consequence of deviation 4 and it is recorded
-there, not glossed here.
+whole value is that it was written before any scoring. However, **this file alone determines the
+whole assignment**, by two independent routes: §5's deviation 4 records the draw's salt, direction
+and ordering rule, which yields it after one `sha256` loop; and deviation 5's now-removed by-arm
+digit string yielded it with no computation at all, and survives in a commit message. Both are
+recorded under deviation 4, not glossed here.
 
 **This file is never shown to a scorer or an adjudicator, on the same footing as
 `blind-map.json`.** Withholding the arm column is not sufficient on its own: §3 tabulates all 18
@@ -264,7 +269,10 @@ run knows was exposed.**
    - **The message does not state the sort direction**, and that bears on the **arm** half. Reading
      the hash order descending instead of ascending swaps `S1` and `S3` across 12 of the 18 ids;
      only the middle block is direction-independent. Nor does the message's own item-14a sentence
-     break the tie — the 1–2 balance it reports holds under both readings.
+     break the tie: what it reports is the criterion — *"neither `S1` nor either candidate holds the
+     lexicographically smaller id in all three fixtures"* — and that is satisfied either way
+     (ascending gives 1–2 and 1–2; descending gives 2–1 and 1–2). The message states no numbers; the
+     1–2 figures appear only in this entry's own draw record below.
    - **It does not fix the within-arm fixture order or the within-fixture sample order**, and those
      bear on the `(fixture, sample)` half. They are `skill-stickiness`, `tiered-review`,
      `tui-dc-picker`, then sample 1 before sample 2 — also stated in this entry's own draw record
@@ -275,6 +283,16 @@ run knows was exposed.**
    matched `blind-map.json` arm-for-arm. **The severity is unchanged**: the arm is the secret, the
    partition is the arm, and the message gives the partition up. A reader who has to try two
    readings has been slowed down, not stopped.
+
+   **There is a second, cheaper disclosure of the same assignment, and it is part of this same
+   deviation.** While closing the filesystem ordering channel (deviation 5), T4 published an
+   18-digit by-arm sequence — `<digit per file, in id-lexicographic order>` — in this file and in
+   the round-2 commit message. Read against the id order it was presented with, that string pairs
+   every id with its arm **in the clear**: no salt, no hash, no `git log`. It has been removed from
+   this file and replaced by a property that carries the same argument without the map; the commit
+   message keeps it, and history may not be rewritten. **Two independent routes therefore exist, and
+   the run's blinding is weaker than the deviation-4-only account implies** — that is stated here
+   rather than left for T10 to notice.
 
    **Why it was written.** To make the draw *auditable* — so a reader could confirm the assignment
    was not steered toward an arm, rather than take T4's word. The reasoning was right and the
@@ -349,15 +367,15 @@ run knows was exposed.**
      phase agent putting the shard where item 10 says it goes before anything reads it. **Whichever
      task does this records both substitutions here**, so a later reader can disagree with the
      lenient reading explicitly rather than discover it by inference.
-     **T4's own feasibility dispatch is the first entry under this rule, and it is recorded in
-     deviation 1 above** — it ran with a working directory inside this worktree, after this very
-     commit had put the salt in the history. T10 reading this bullet must follow that pointer: it is
-     the only dispatch in the run so far that is known to have been exposed.
-
      **If a task cannot arrange that, the channel is open for that dispatch and it must be recorded
      here as a deviation, not assumed away.** Do not treat "the scorer was told only to read the
      spec" as a control; it is an instruction, and this deviation exists because instructions are
      not what kept the assignment secret.
+
+     **T4's own feasibility dispatch is the first entry under that duty, and it is written up in
+     deviation 1 above** — it ran with a working directory inside this worktree, after this very
+     commit had put the salt in the history. T10 reading this bullet must follow that pointer: it is
+     the only dispatch in the run so far that is known to have been exposed.
 
      **Inlining the spec text into the prompt is a different question and is NOT pre-authorised:**
      item 10's template has no slot for the document's text, item 10 is governed, and window 3 is
@@ -385,7 +403,17 @@ run knows was exposed.**
    order, nor readdir order — and all three still reproduced the partition exactly. The fix was
    therefore to **recreate the directory, writing all 18 files in id-lexicographic order** (which is
    arm-independent, by the draw) and then set every mtime to `2026-08-08T00:00:00Z`. Readdir and
-   inode order now run `232113121332233211` by arm — mixed, not blocked.
+   inode order are now mixed rather than blocked: **the longest run of consecutive files sharing an
+   arm is two, against six before**, and each arm's six files are spread across the listing.
+
+   **An earlier draft substantiated that by printing the by-arm sequence as an 18-digit string. That
+   string is a complete arm map in the clear** — read against the id-lexicographic order this
+   paragraph names, it pairs every id with its arm, with no salt, no hashing and no commit log
+   needed. It was a cheaper disclosure than deviation 4's and it was published while fixing a leak.
+   It is removed from this file, but it is **not** repairable: it is also in the round-2 commit
+   message, and history may not be rewritten. **Recorded as part of deviation 4**, which is the same
+   breach of item 6 by the same root cause; the property above is what the claim needed, and it
+   discloses nothing.
 
    **Content is untouched.** The `git hash-object --no-filters` digest over all 18 files is
    identical before and after, `git status` reports no change to `generated/`, and every `wc` number
