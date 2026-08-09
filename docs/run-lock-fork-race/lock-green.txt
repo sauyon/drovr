@@ -34,7 +34,8 @@ WHAT IT PROVES — AND WHAT IT DOES NOT
 
   Does NOT prove: that the parallel suite is deterministic in general. It was
   fully green in all ten runs here, but the stub-exec/`ETXTBSY` defect on
-  `with_stub_herdr` (`cli/src/herdr.rs:2108`, panicking at `:2131`) is a
+  `with_stub_herdr` (`cli/src/herdr.rs:2108`, panicking at `:2133` — `lock-red.txt`
+  says `:2131`, drifted; see §6b) is a
   SEPARATE defect in the same fork-window family and is untouched by this work.
   It is intermittent: zero occurrences in `lock-red.txt`'s final ten and zero in
   these ten, but two in the earlier set (`lock-red.txt` WHEN / WHERE). No lock is
@@ -91,8 +92,9 @@ HOW TO REPRODUCE
   grep -o "moving run '[^']*'" run-N.log | sort -u | wc -l           # run names
 
   `--nocapture` is not optional and criterion (b) is worthless without it. A
-  refused reap does not fail a test — it warns and carries on
-  (`cli/src/code_review.rs:1577-1578`, `cli/src/phase.rs:2530-2531`), and
+  refused reap does not fail a test — it `eprintln!`s a warning and carries on
+  (`cli/src/code_review.rs:1577-1578`, `cli/src/phase.rs:2560-2561` — the latter
+  is `lock-red.txt`'s `:2530-2531`, drifted; see §6b), and
   `cargo test` captures a PASSING test's stdout and stderr. Without it the
   refusal cannot appear whether or not the bug is firing, and a zero would mean
   nothing. Every count below is over the merged `2>&1` stream.
@@ -383,14 +385,44 @@ HOW TO REPRODUCE
       excludes by name. A reader following the §3 pointer may hit `:35` first;
       §3 is the correct side.
 
-  (b) TWO LINE CITATIONS IN §3 HAVE DRIFTED, unavoidably — T6 edited doc comments
-      above both tests, and a frozen baseline legitimately freezes line numbers.
-      Corrected against this file's head sha:
+  (b) ITS LINE CITATIONS HAVE DRIFTED — more of them than the two first noticed,
+      and unavoidably: T3-T6 edited code and doc comments above these sites, and
+      a frozen baseline legitimately freezes line numbers. Audited against this
+      file's head sha. The distinction that matters is not how far a number
+      moved but WHERE IT LANDS NOW, so both columns are given:
 
-        §3(a) cites cli/src/code_review.rs:2515  →  now :2522
-        §3(b) cites cli/src/code_review.rs:2807  →  now :2829
+        §3   cited        real site now      what the CITED line points at today
+        ---  -----------  -----------------  ---------------------------------
+        (a)  cr.rs:2515   :2522              still inside the sweep test
+        (b)  cr.rs:2807   :2829              the `closed_panes` helper (:2776)
+        (c)  ph.rs:11907  :11937             still inside its own test
+        (d)  ph.rs:12368  :12393 / :12398    a DIFFERENT test — `a_reap_banks_
+                                             the_session_before_it_closes_the_
+                                             pane` (:12351)
+        (e)  ph.rs:11660  :11690             still inside its own test
+        (e)  ph.rs:10472  :10481             still inside its own test
 
-      `:2807` is the sharper trap: it now lands INSIDE the very doc comment that
-      cites §3(b), a loop that reads as a contradiction. The test functions
-      themselves are at `:2470` (sweep) and `:2813` (reap). Re-grep rather than
-      trust any of these — they have moved once already.
+        (cr.rs = cli/src/code_review.rs, ph.rs = cli/src/phase.rs)
+
+      ⚠ ROWS (b) AND (d) ARE THE DANGEROUS ONES, and only they. The other four
+      still land inside the test §3 attributes them to, so a reader arrives in
+      the right place and merely off the exact assertion. (b) and (d) now point
+      at a different item altogether — `:2807` at the `closed_panes` helper the
+      reap test calls, `:12368` at an unrelated reap test — and a reader who
+      trusts either will conclude §3 misattributed its failure. It did not; the
+      code moved under it.
+
+      …and outside §3, `phase.rs:2530-2531` (the refused-reap warning, quoted in
+      §2's `--nocapture` argument) is now `:2560-2561`, and `herdr.rs:2131` is
+      now `:2133`. Still accurate: `code_review.rs:1577-1578`, `herdr.rs:2108`,
+      `run.rs:906-915`, `test_env.rs:246-263`.
+
+      The test functions themselves are at `:2470` (sweep) and `:2813` (reap).
+
+      ⭐ THE DURABLE FIX IS NOT A NUMBER. This list will itself go stale — it
+      already describes a tree one commit behind anything that edits these files.
+      Locate these sites by NAME (`grep -n 'fn <test_name>'`, `grep -n 'could not
+      reap'`) and treat every line number in both files as a hint. That is the
+      general lesson, and it was learned the hard way twice: an earlier draft of
+      THIS file copied `:2530-2531` and `:2131` straight out of `lock-red.txt`
+      without re-grepping, and both were wrong.
