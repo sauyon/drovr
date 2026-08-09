@@ -1366,6 +1366,27 @@ impl Unfinished {
 /// process dies, so a crashed holder never leaves a claim anyone has to judge
 /// stale.
 ///
+/// **Why release is EXPLICIT.** That last sentence is about process DEATH, and
+/// it stays true — it is exactly *not* what covers an ordinary drop. `close(2)`
+/// releases an `flock` only when it closes the LAST fd on the open file
+/// description, and `fork(2)` hands a child a second fd on that very
+/// description; `O_CLOEXEC` takes the child's copy away at `exec`, but not
+/// before. Inside that window a holder that "releases" by dropping its `File`
+/// has released nothing: the next `try_lock` on the inode refuses with
+/// `WouldBlock` while no one anywhere holds a claim. drovr shells out to `git`
+/// and `herdr` routinely, so the window is not hypothetical — this is
+/// forge.ko.ag/drovr/drovr#80. So this lock comes back as a
+/// [`crate::flock::FileLock`] — as does `server.pid`'s, which has the same
+/// shape — whose `Drop` unlocks the description outright and whose `File` is
+/// private, leaving a close-based release unspellable. What that changed is the
+/// release mechanism, not the refusal policy: nothing below waits that did not
+/// wait before. One residue remains: a holder killed without unwinding
+/// (`SIGKILL`, `abort`) between a `fork` and that child's `exec` leaves the lock
+/// held for that window — microseconds. `Drop` runs on every ordinary exit and
+/// on panic-unwind, so that is the only gap left, it is not reachable from a
+/// path drovr controls, and closing it would need the bounded retry this design
+/// rejects.
+///
 /// **Why it fails rather than waits.** The holder may be inside a 30-second
 /// readiness wait, and a queued second rehydrate would then either duplicate
 /// the first (if it did not re-read) or refuse anyway (if it did). Refusing now
@@ -1373,8 +1394,12 @@ impl Unfinished {
 /// refused this way is best-effort at every automatic trigger, so it warns and
 /// the phase is untouched.
 ///
-/// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped: a second
-/// `open` + lock in the SAME process blocks on itself. So no holder may call
+/// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped, so the claim
+/// belongs to the open file description and not to the process: a second `open`
+/// + lock in the SAME process is a SECOND description, and it conflicts with the
+/// first exactly as a stranger's would. `try_lock` refuses it with `WouldBlock`:
+/// it does not block, and it does not quietly succeed the way a process-owned
+/// POSIX record lock would. So no holder may call
 /// another — `phase_start`'s reap loop calls `phase_reap` per phase, each
 /// taking and dropping the lock, and never wraps the loop in one.
 ///
