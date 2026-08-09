@@ -2455,11 +2455,18 @@ mod tests {
     /// `drovr cleanup`, which is exactly the accumulation reaping exists to
     /// stop.
     ///
-    /// It counts `pane_close` calls, which makes it one of only two tests in the
-    /// suite — `a_finished_panel_reaps_its_reviewers` is the other — that turn a
-    /// *best-effort* reap refusal into a failure rather than a warning. See that
-    /// test's note for why the pair, and nothing else, went red under a parallel
-    /// suite while forge.ko.ag/drovr/drovr#80 was live.
+    /// ⚠️ Do not `#[ignore]` it and do not weaken its counts on a flake. A flake
+    /// here is evidence about the lock, not about the assertion.
+    ///
+    /// With [`a_finished_panel_reaps_its_reviewers`] it is one of only two tests
+    /// in this module that assert the panel's reap actually HAPPENED — this one
+    /// through both the orphan's close and the retirement count. Every other
+    /// `closed_panes` caller here asserts emptiness, which a refused reap
+    /// satisfies vacuously. That is why the pair, and nothing else here, went red
+    /// under a parallel suite while drovr#80 was live; the assertion that fired
+    /// in this test was the retirement count, not the close
+    /// (`docs/run-lock-fork-race/lock-red.txt` §3a). drovr#80 is fixed — see that
+    /// test's note for the mechanism and for the measurements.
     #[test]
     fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
         let env = TestEnv::new();
@@ -2778,23 +2785,31 @@ mod tests {
     /// panes are the largest thing a run accumulates — four per iteration, and a
     /// task can take several iterations.
     ///
-    /// It counts `pane_close` calls, which makes it one of only two tests in the
-    /// suite — `a_finished_panel_sweeps_the_pane_its_respawn_orphaned` is the
-    /// other — that turn a *best-effort* reap refusal into a failure rather than
-    /// a warning. Everywhere else a refused reap prints a warning and the command
-    /// still reports success, so while forge.ko.ag/drovr/drovr#80 was live these
-    /// two, and nothing else, went red under a parallel suite: the spurious
-    /// `WouldBlock` out of `acquire_run_lock` cost real `pane_close` calls, and
-    /// only a test that counts them can notice.
+    /// ⚠️ Do not `#[ignore]` it and do not weaken its counts on a flake. A flake
+    /// here is evidence about the lock, not about the assertion: the counts in the
+    /// body have always been right, and the fix described below did not touch
+    /// them.
     ///
-    /// drovr#80 is fixed at the mechanism: releasing one of drovr's file locks is
-    /// now an explicit unlock rather than a `File` drop (`crate::flock`), so an fd
-    /// inherited across a `fork` can no longer hold a lock its owner has dropped.
-    /// `docs/run-lock-fork-race/lock-red.txt` is the measurement that made the
-    /// fault visible; `docs/run-lock-fork-race/lock-green.txt` is the same
-    /// measurement re-run against the fix. Nothing below changed for it — the
-    /// assertion was always right, and weakening it would retire the pair's only
-    /// executable claim on this behaviour.
+    /// It and [`a_finished_panel_sweeps_the_pane_its_respawn_orphaned`] are the
+    /// only two tests in this module that assert the panel's reap actually
+    /// HAPPENED. Every other `closed_panes` caller here asserts emptiness, which
+    /// a refused reap satisfies vacuously — and a refused reap is *best-effort*
+    /// at every automatic trigger, so it warns and the run carries on reporting
+    /// success. (`drovr phase reap`, which an operator asked for, does surface
+    /// it.) So this pair is the only thing here that can notice a close that
+    /// never happened.
+    ///
+    /// That is why the pair failed hardest under a parallel suite while
+    /// forge.ko.ag/drovr/drovr#80 was live: this test in 7 of 10 runs and the
+    /// sweep test in 9, out of 18 failures across four tests
+    /// (`docs/run-lock-fork-race/lock-red.txt` §3 — the red baseline, taken
+    /// deliberately before the fix existed). drovr#80 is fixed at the mechanism:
+    /// every lock drovr takes is now released by an explicit `flock(LOCK_UN)`
+    /// rather than by dropping its `File` — see `crate::flock`, which owns that
+    /// invariant for both `run.lock` and `server.pid` — so an fd inherited across
+    /// a `fork` can no longer hold a lock its owner has dropped. The same
+    /// measurement re-run against the fix belongs beside the baseline, as
+    /// `docs/run-lock-fork-race/lock-green.txt`.
     #[test]
     fn a_finished_panel_reaps_its_reviewers() {
         let env = TestEnv::new();
