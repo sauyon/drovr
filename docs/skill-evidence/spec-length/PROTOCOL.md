@@ -474,7 +474,8 @@ applies. **Do not describe this scoring as fully blind anywhere.**
   mean is `S1`, **no candidate beat the control**: ship nothing and record it.
 - **R4 — the control is not exempt, and a universal null is the likely outcome.** `S1`'s retention
   is the **instrument reading**: it says whether the gate is clearable at all under D2. R1 requires
-  roughly 1380 row-judgements to come back clean for one arm to pass; at any realistic per-row
+  **460** row-judgements — 2 samples × 230 rows — to come back clean for **one** arm to pass, and
+  **1380** across all three; at any realistic per-row
   fidelity the probable result is that **no arm clears, control included**. That is anticipated, not
   a failure of execution. The gate still binds at 230/230 for everyone, and T10 must state plainly
   when the null is attributable to the instrument rather than to the candidates.
