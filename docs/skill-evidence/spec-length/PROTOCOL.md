@@ -9,11 +9,40 @@ preceding the commits that introduce `docs/skill-evidence/arms/spec-length/S2.md
 preceding the generation commit. No test parses this file. Its force is the ordering, plus the fact
 that T10's write-up has to be checkable against it line by line.
 
-**What may change, and when.** Corrections to this file are legitimate only while no arm text and
-no generated spec exist — that is, before T3's first commit. **After T4 dispatches its first probe,
-no rule in item 12 may be revised**, and any edit to this file at all is a protocol deviation that
-must be logged in `docs/skill-evidence/spec-length/RESULTS.md` with its reason and its commit. A
-rule chosen once a result is visible is not a rule; it is the result wearing a rule's clothes.
+**This file is authoritative over the plan on every rule it states.** The plan
+(`~/.local/share/drovr/runs/spec-length-ab/plan.md`) decomposed the work and named most of these
+rules first, but it is a working document that is not itself pre-registered, and its T7 and T10
+sections enumerate the rules **by name in prose** — a list that does not include `R4a` or `R5a`,
+both added here during T2's own review. **T7 and T10 apply the complete rule set in item 12, not
+the subset the plan's prose happens to name.** Where the two differ on a rule, this file governs
+and the difference is recorded in `RESULTS.md`. This clause exists because a literal executor of
+the plan's T10 branch could otherwise paste a winning candidate and report an unqualified *"shorter
+without loss"* in exactly the case `R4a` was written to qualify.
+
+**What may change, and when.** Three windows, and there is no fourth:
+
+1. **Before T3's first commit** — while no arm text and no generated spec exist. Corrections are
+   legitimate and need no log entry beyond the commit itself. This is the only window in which a
+   rule may be *added*.
+2. **From T3's first commit until T4 dispatches its first probe** — arm text exists but no result
+   does. Corrections are still legitimate, because nothing has been measured, but **every one is
+   logged in `docs/skill-evidence/spec-length/RESULTS.md` with its reason and its commit**, and no
+   rule in item 12 may be *weakened* — only clarified.
+3. **After T4 dispatches its first probe** — **no rule in item 12 may be revised at all**, and any
+   edit to this file whatsoever is a protocol deviation, logged in `RESULTS.md` with its reason and
+   its commit.
+
+A rule chosen once a result is visible is not a rule; it is the result wearing a rule's clothes.
+
+**This file was revised twice after its first commit, both times inside window 1**, and says so
+here rather than leaving `git log -p` as the only witness:
+
+| commit | what changed |
+|---|---|
+| `7cfd07a` | first commit — items 1–14 plus 8a, rules `R1`–`R7`. |
+| `bdd6622` | `R4`'s row-judgement count corrected from 1380 to **460** per arm (1380 is the figure across all three arms). |
+| `3dd0dcc` | **`R4a` and `R5a` added** — neither was in the first commit. `R1`'s primary sentence reworded (the original, read literally, required generations that never judged a row to retain it). Item 8a's sample offset pinned. |
+| the commit that added this table | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows above split from two to three. No rule added or weakened. |
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE.md` is the hash
 record and `docs/skill-evidence/arms/MANIFEST.md` is the provenance record; both are authoritative
@@ -179,8 +208,14 @@ cannot be corrected in place. T10 repeats all three in the write-up.
 
 **230 ledger rows in total (91 / 84 / 55).** These are the ledgers' own `**Closed list: N rows.**`
 declarations, which `spec_length_ledgers_are_the_closed_lists_they_claim` checks against the tables
-beneath them, and they are authoritative. **Counting `^|` lines gives 233 because it picks up each
-file's header row** — 233 is a miscount and no task may "fix" a ledger to reach it.
+beneath them, and they are authoritative.
+
+**233 is a miscount, and here is exactly which command produces it.** `grep -c '^| '` returns
+92 / 85 / 56 = **233**: it counts each table's header row (`| id | kind | item |`, which has a space
+after the leading pipe) on top of the data rows, while excluding the separator row (`|---|---|---|`,
+which has none). Counting `grep -c '^|'` instead returns 93 / 86 / 57 = **236**, picking up both.
+Only the `**Closed list: N rows.**` declarations are authoritative, and no task may "fix" a ledger
+to reach 233 or 236.
 
 Every generation is scored against **its own fixture's** ledger only. An arm's retention is the
 union rule in item 12's R1 over its six generations.
@@ -327,7 +362,12 @@ spec, it cannot be swayed by how good the spec looks.
 **The sample is fully determined, offset included, so two dispatches cannot select different rows.**
 Take the file's `present: true` rows in ledger order and number them 1, 2, 3, … *among themselves*
 (this index is over `present: true` rows only, not over ledger rows). The sample is **every row whose
-index is divisible by 5** — the 5th, 10th, 15th, and so on. That is `floor(n/5)` rows out of `n`. If
+index is divisible by 5** — the 5th, 10th, 15th, and so on. That is `floor(n/5)` rows out of `n`.
+
+**"20%" is the nominal figure, and `floor(n/5)/n` is the real one** — they coincide only when `n` is
+a multiple of 5, and otherwise the sample is slightly *under* a fifth (`n = 9` gives 1 row, 11%).
+The mechanics above are what binds; the round number is shorthand, including where limitation 7 of
+item 1 uses it. Do not adjust the stride or the offset to hit a true 20%. If
 a verdict has fewer than five `present: true` rows the sample is **empty**: record that in
 `RESULTS.md` against the verdict id and do **not** substitute a different sample, a different offset
 or a smaller stride to manufacture one.
@@ -501,8 +541,10 @@ applies. **Do not describe this scoring as fully blind anywhere.**
     control that drops a row may simply have dropped it. T8 and T9 still run on the candidate under
     R7, unchanged; they are the independent fatal checks and neither is weakened here.
   - **But R3's length comparison then contains no control.** *"Shorter than what ships"* is not
-    established by this run, because `S1`'s generations are outside the cleared set. T10 reports the
-    candidate's mean against `S1`'s mean labelled **"descriptive, not a pass"** under R5.
+    established by this run, because `S1`'s generations are outside the cleared set. T10 may still
+    report the candidate's mean against `S1`'s mean, and when it does it carries the same
+    **"descriptive, not a pass"** label R5 puts on a retention count below 230 — this bullet is what
+    licenses that label for a *length* comparison, since R5's own text is scoped to retention.
   - **T10 must name every row `S1` dropped and every generation that dropped it**, beside the
     statement that the candidate retained it. That list is the only thing that lets the next reader
     tell a genuinely better candidate from a noisy instrument, and **T10 must say which it believes
