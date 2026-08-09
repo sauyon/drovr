@@ -32,11 +32,6 @@ use std::path::Path;
 /// The `File` is private on purpose — see the module doc. Handing it out (by
 /// value, or by `&mut`) would let a caller drop it, and a drop is not a
 /// release.
-///
-/// Nothing outside the tests constructs one yet; `crate::phase::acquire_run_lock`
-/// and `crate::review::try_take_lock` are moved onto it in the tasks after this
-/// one, and the `allow` goes when the first of them lands.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FileLock {
     file: File,
 }
@@ -45,11 +40,6 @@ pub(crate) struct FileLock {
 /// advisory lock on it. `Ok(None)` means someone else holds it right now;
 /// `Err` is a real IO failure — a missing parent directory, say, which this
 /// does not create.
-///
-/// (`allow(dead_code)` for the same reason as [`FileLock`]'s, and on the same
-/// terms: no production caller until `acquire_run_lock` **or** `try_take_lock`
-/// moves onto it, whichever lands first.)
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_take(path: &Path) -> io::Result<Option<FileLock>> {
     let file = OpenOptions::new()
         .read(true)
@@ -74,8 +64,10 @@ impl FileLock {
     /// offset, so a second call would write past the bytes it just cut and
     /// leave a NUL-padded prefix behind — hence the rewind.
     ///
-    /// (`allow(dead_code)` for the same reason as [`FileLock`]'s: no production
-    /// caller until `review.rs`'s `server.pid` lock moves onto it.)
+    /// (The `allow(dead_code)` is the last one left in this module: only the
+    /// tests call this until `review.rs`'s `server.pid` lock moves onto it, and
+    /// it goes when that lands. The rest of the surface has production callers
+    /// now — `crate::phase::acquire_run_lock` — so their `allow`s are gone.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn overwrite(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.file.set_len(0)?;

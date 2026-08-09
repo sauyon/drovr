@@ -1,10 +1,10 @@
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{AgentLaunch, load_config};
+use crate::flock::FileLock;
 use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, PromptOutcome, SessionId};
 use crate::run::{
     NotReapable, NotRehydratable, PassToken, Phase, PhaseStatus, REVIEWER_PREFIX, RunState,
@@ -1381,17 +1381,11 @@ impl Unfinished {
 /// The lock alone does not close the race — see `phase_rehydrate` and
 /// `phase_reap`, which both re-read `state.json` under it. Serializing two
 /// launches without that just makes them consecutive rather than simultaneous.
-fn acquire_run_lock(run_name: &str) -> io::Result<File> {
+fn acquire_run_lock(run_name: &str) -> io::Result<FileLock> {
     let path = run_dir(run_name).join("run.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    match lock.try_lock() {
-        Ok(()) => Ok(lock),
-        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+    match crate::flock::try_take(&path)? {
+        Some(lock) => Ok(lock),
+        None => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
                 "another drovr command is moving run '{run_name}'s panes around (a \
@@ -1401,7 +1395,6 @@ fn acquire_run_lock(run_name: &str) -> io::Result<File> {
                  rehydrate is bringing back would close the pane it just opened."
             ),
         )),
-        Err(TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -11688,7 +11681,6 @@ mod rehydrate_tests {
     // No fork, no sleep, no external binary, so the fault is staged
     // deterministically rather than raced for, and this holds inside `nix
     // build`'s sandbox as well as on a developer's machine.
-    #[ignore = "drovr#80: fails until FileLock::drop unlocks explicitly — see docs/run-lock-fork-race/lock-red.txt"]
     #[test]
     fn a_dropped_run_lock_releases_even_when_its_description_is_shared() {
         let env = TestEnv::new();
