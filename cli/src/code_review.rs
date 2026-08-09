@@ -278,15 +278,66 @@ fn git_capture(project_dir: &str, args: &[&str]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Where [`write_review_diff`] puts the artifact. Iteration-scoped for the same reason
-/// the findings files are: a reviewer left over from a superseded pass must keep
-/// reading the diff it was seeded against, not one a newer panel overwrote underneath
-/// it.
-fn review_diff_path(dir: &Path, task: &str, iter: u64) -> PathBuf {
-    dir.join(format!("{task}-review-{iter}.diff"))
+/// The directory holding one iteration's split diff, **inside the project**.
+///
+/// Iteration-scoped for the same reason the findings files are: a reviewer left over
+/// from a superseded pass must keep reading the diff it was seeded against, not one a
+/// newer panel overwrote underneath it.
+///
+/// # Why inside the project and not the run dir
+///
+/// It used to be the run dir, and every reviewer stalled on it. opencode gates a read
+/// outside the working directory behind an `external_directory` decision whose stock
+/// value is `ask` — a prompt nobody in a reviewer pane can answer. Measured on
+/// 2026-08-08 (opencode 1.18.3): a project-level `external_directory` allow for the run
+/// dir does **not** override the global `ask`; the read still hung until timeout. See
+/// `docs/known-issues.md`.
+///
+/// So the artifact goes where the reviewer's read permission already reaches
+/// unconditionally: the checkout it is reviewing. `.drovr/` is drovr's own directory
+/// there and is gitignored in this repository; for a project that does not ignore it,
+/// [`code_review_run`] adds a local exclude, so the artifacts never read as untracked
+/// work.
+fn review_diff_dir(project_dir: &str, task: &str, iter: u64) -> PathBuf {
+    Path::new(project_dir)
+        .join(REVIEW_ARTIFACT_DIR)
+        .join(format!("{task}-review-{iter}"))
 }
 
-/// Write the change under review to a file the reviewer can READ, and return its path.
+/// The one file the seed names: the index [`write_review_diff`] writes, which carries
+/// `--stat` and points at the per-file patches beside it.
+fn review_diff_path(project_dir: &str, task: &str, iter: u64) -> PathBuf {
+    review_diff_dir(project_dir, task, iter).join("index.md")
+}
+
+/// The project-relative directory drovr writes review artifacts into. Also what
+/// [`code_review_run`] excludes locally, so the two cannot name different paths.
+const REVIEW_ARTIFACT_DIR: &str = ".drovr/review";
+
+/// A patch file name for `path`, ordinal-prefixed: `007-cli__src__main.rs.diff`.
+///
+/// The ordinal, not the slug, is what makes the name unique — two different paths can
+/// sanitise to the same slug (`a/b.rs` and `a_b.rs`), and a truncated slug collides far
+/// more easily than that. Truncation is real: a path can exceed the 255-byte filename
+/// limit on its own, and a diff drovr cannot write is a file the reviewer is sent to and
+/// does not find.
+fn patch_file_name(ordinal: usize, path: &str) -> String {
+    let slug: String = path
+        .chars()
+        .map(|c| match c {
+            '/' => '_',
+            c if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' => c,
+            _ => '_',
+        })
+        .collect();
+    // 120 chars leaves room for the ordinal, the separator and `.diff` inside 255 bytes
+    // even if every retained char is multi-byte — it cannot be, since the map above
+    // emits only ASCII, so this is slack rather than arithmetic.
+    let slug = if slug.len() > 120 { &slug[..120] } else { &slug[..] };
+    format!("{ordinal:03}-{slug}.diff")
+}
+
+/// Write the change under review as files the reviewer can READ, and return the index.
 ///
 /// # Why drovr runs git instead of the reviewer
 ///
@@ -299,32 +350,90 @@ fn review_diff_path(dir: &Path, task: &str, iter: u64) -> PathBuf {
 /// 324 KB to `/tmp` did so because it wanted the diff on disk to work through; drovr
 /// putting it there first means no reviewer has to invent that step.
 ///
-/// # What the artifact contains
+/// # Why it is split per file rather than one blob
 ///
-/// `--stat` first, then the patch, from `base` to the **working tree** rather than to
-/// `head`. The review scope has always been "the range plus the current working tree"
-/// (see [`build_seed`]), and a single `git diff <base>` is exactly that range: it
-/// carries every committed change up to `head` and every uncommitted one on top,
-/// without the reviewer having to combine two artifacts.
-fn write_review_diff(
-    dir: &Path,
-    project_dir: &str,
-    task: &str,
-    iter: u64,
-    base: &str,
-) -> io::Result<PathBuf> {
+/// A single artifact was measured unreviewable. Task 22's diff is 382 KB, and the
+/// review endpoint's time-to-first-token is superlinear in context — 4 KB/32 s,
+/// 32 KB/71 s, 64 KB/183 s, 128 KB/294 s, i.e. ~4x the context for ~9x the time. At
+/// 382 KB opencode's client gave up with `CURL error: Server returned nothing`. A diff
+/// the reviewer cannot finish loading is not a diff it can review.
+///
+/// One file per patch makes the reviewer's context ITS choice: it reads a small index,
+/// then only the patches its angle needs. That is also better review practice —
+/// findings come back localised to a file instead of smeared across one blob.
+///
+/// Always split, with no size threshold. A threshold would be a second code path,
+/// exercised only above some number nobody can defend, and the cost it would save below
+/// that number is one extra read of a short index. The granularity floor is one file:
+/// a single file whose patch is itself enormous still lands in one read (the largest
+/// here is 47 KB, comfortably inside the measured range), and if that ever stops being
+/// true it is a real limit to report, not one to paper over with a second mechanism.
+///
+/// # What the artifacts contain
+///
+/// The range is `base` to the **working tree**, not to `head`. The review scope has
+/// always been "the range plus the current working tree" (see [`build_seed`]), and a
+/// single `git diff <base>` is exactly that: every committed change up to `head` and
+/// every uncommitted one on top, without the reviewer having to combine two artifacts.
+fn write_review_diff(project_dir: &str, task: &str, iter: u64, base: &str) -> io::Result<PathBuf> {
+    let dir = review_diff_dir(project_dir, task, iter);
+    std::fs::create_dir_all(&dir)?;
+
     let stat = git_capture(project_dir, &["diff", "--stat", base])?;
-    let patch = git_capture(project_dir, &["diff", base])?;
-    let path = review_diff_path(dir, task, iter);
+    // `-z`: git quotes an unusual path in its default output, and a quoted name handed
+    // back to `git diff --` is a path that does not exist. NUL-separated names need no
+    // quoting, so what comes out is what goes back in.
+    let names = git_capture(project_dir, &["diff", "--name-only", "-z", base])?;
+
+    let mut listing = String::new();
+    let mut total = 0usize;
+    for (i, name) in names.split('\0').filter(|n| !n.is_empty()).enumerate() {
+        let patch = git_capture(project_dir, &["diff", base, "--", name])?;
+        let file = patch_file_name(i + 1, name);
+        crate::brief::write_no_follow(&dir.join(&file), &patch)?;
+        total += patch.len();
+        // An empty patch is reported rather than hidden. git named the file, so
+        // something changed in it; if the per-file diff came back empty the reviewer
+        // needs to know that this file's change is NOT in front of it — a silently
+        // short listing reads as "nothing to see here".
+        let note = if patch.is_empty() {
+            "  **empty — drovr could not extract this file's patch; ask for it**"
+        } else {
+            ""
+        };
+        listing.push_str(&format!(
+            "- `{name}` — {} bytes — read `{}`{note}\n",
+            patch.len(),
+            dir.join(&file).display(),
+        ));
+    }
+    if listing.is_empty() {
+        listing.push_str("*(git reported no changed files in this range.)*\n");
+    }
+
+    let index = review_diff_path(project_dir, task, iter);
     crate::brief::write_no_follow(
-        &path,
+        &index,
         &format!(
-            "# The change under review: `git diff {base}` (base → working tree)\n\
-             # Written by drovr. Reviewers have no shell; this is that diff.\n\n\
-             ## Summary (--stat)\n\n{stat}\n## Patch\n\n{patch}"
+            "# The change under review: `git diff {base}` (base → working tree)\n\n\
+             Written by drovr. Reviewers have no shell; this is that diff, split one\n\
+             file per patch so you can choose what to load. Total patch size: {total}\n\
+             bytes across {count} files.\n\n\
+             ## How to read this\n\n\
+             Read the summary below first. Then read ONLY the per-file patches your\n\
+             angle actually needs — the review model slows down sharply as its context\n\
+             grows, and loading every patch at once is how a reviewer runs out of time\n\
+             before it reports.\n\n\
+             The list under `## Per-file patches` is COMPLETE and every path in it is\n\
+             absolute. Read those paths directly. Do not glob for them: there is no\n\
+             subdirectory and no other extension, and a turn spent guessing at the\n\
+             layout is a turn not spent reviewing.\n\n\
+             ## Summary (--stat)\n\n{stat}\n\
+             ## Per-file patches\n\n{listing}",
+            count = names.split('\0').filter(|n| !n.is_empty()).count(),
         ),
     )?;
-    Ok(path)
+    Ok(index)
 }
 
 /// Read the recorded review base for `task` from `<dir>/<task>-base.sha` (trimmed).
@@ -424,7 +533,7 @@ pub fn code_review_brief(
         &run.task,
         &run.project_dir,
         context.as_deref(),
-        &review_diff_path(&dir, task, iter),
+        &review_diff_path(&run.project_dir, task, iter),
     ))
 }
 
@@ -558,14 +667,17 @@ fn build_seed(
          ## Scope\n\n\
          The change under review is `git diff {base}..{head}` **plus** the current\n\
          working tree. Base = `{base}`, head = `{head}`.\n\n\
-         **drovr has already written that diff for you**, `--stat` first and then the\n\
-         patch:\n\n\
+         **drovr has already written that diff for you**, split one file per patch.\n\
+         Start here:\n\n\
              {diff}\n\n\
-         Read it from there. **DO NOT RUN SHELL COMMANDS.** A shell redirect is a\n\
-         write, and a reviewer does not write — on opencode the bash tool is denied\n\
-         outright, so there is nothing to fall back to. There is no `git diff` to run\n\
-         and no scratch file to make: for a large change, read the `--stat` section\n\
-         first and then the file's later regions as you need them.\n\n\
+         That index carries the `--stat` summary and names the per-file patch beside\n\
+         it for every changed file. Read the index first, then read ONLY the patches\n\
+         your angle needs — loading all of them at once is how a reviewer runs out of\n\
+         time before it reports.\n\n\
+         **DO NOT RUN SHELL COMMANDS.** A shell redirect is a write, and a reviewer\n\
+         does not write — on opencode the bash tool is denied outright, so there is\n\
+         nothing to fall back to. There is no `git diff` to run and no scratch file to\n\
+         make; the patches are already on disk.\n\n\
          You also have the WHOLE REPOSITORY to read: it is a full checkout at\n\
          `{project_dir}`. Do not review the diff in isolation — read any file in it,\n\
          follow the change's callers and callees outside the diff, and check the\n\
@@ -640,7 +752,7 @@ fn findings_exe() -> String {
 /// nobody to answer, so `ask` is a hang rather than a refusal — the failure looks
 /// like a reviewer that never reports. So drovr states the whole stance itself; see
 /// [`opencode_plan_permission`] for what each rule is and why.
-fn opencode_document(run_dir: &Path, run_name: &str, task: &str, iter: u64) -> serde_json::Value {
+fn opencode_document(run_name: &str, task: &str, iter: u64) -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "mcp": {
@@ -656,7 +768,7 @@ fn opencode_document(run_dir: &Path, run_name: &str, task: &str, iter: u64) -> s
                 "enabled": true,
             },
         },
-        "agent": {"plan": {"permission": opencode_plan_permission(run_dir)}},
+        "agent": {"plan": {"permission": opencode_plan_permission()}},
     })
 }
 
@@ -691,9 +803,9 @@ fn opencode_document(run_dir: &Path, run_name: &str, task: &str, iter: u64) -> s
 /// So: no shell. What a reviewer loses is `git diff`, `git log`, `git show` and the
 /// ability to run a build — opencode's own `read`, `grep`, `glob` and `list` tools are
 /// untouched and cover the rest. The diff it lost is handed to it instead: drovr runs
-/// git itself and writes the diff into the run dir, and the seed names that file (see
-/// [`write_review_diff`]). The reviewer reads it, which is a permission it already has
-/// — and it no longer has any reason to improvise a scratch file, which is what
+/// git itself and writes the diff INSIDE THE CHECKOUT, and the seed names that file
+/// (see [`write_review_diff`]). The reviewer reads it, which is a permission it already
+/// has — and it no longer has any reason to improvise a scratch file, which is what
 /// started this.
 ///
 /// # `task` is denied, because denying `bash` here does not deny it in a subagent
@@ -709,27 +821,55 @@ fn opencode_document(run_dir: &Path, run_name: &str, task: &str, iter: u64) -> s
 /// This is the reason the live test is worth its runtime: every config-reading test
 /// here passed with `bash: deny` present and the property still false.
 ///
-/// # `external_directory` is decided, not left at `ask`
+/// # `external_directory` is a flat deny, and an allow was measured not to work
 ///
 /// opencode's stock rule is `ask *`, and an unattended reviewer has nobody to answer:
 /// that is what stalled two of four reviewers mid-panel, on a *read*. `ask` is a hang,
-/// so it must not survive into a reviewer's config in any form. It becomes `deny`,
-/// with one exception — the run directory, which is where drovr puts the seed and the
-/// diff the reviewer is being told to read. A denial the agent can see and route
-/// around beats a prompt nobody will answer.
+/// so it must not survive into a reviewer's config in any form.
+///
+/// This carried an exception for the run directory, because that is where drovr used to
+/// write the diff. The exception did not work. Measured 2026-08-08 on opencode 1.18.3,
+/// with exactly that allow in the project `opencode.json`: a `read` of a file under the
+/// run dir issued the call and then hung to timeout — a **project-level**
+/// `external_directory` allow does not override the global `ask`. All four reviewers of
+/// one panel sat on `△ Permission required — Access external directory`.
+///
+/// So there is nothing left for the allow to permit: the diff moved inside the checkout
+/// ([`review_diff_dir`]), where no `external_directory` decision is involved at all, and
+/// the seed is injected as text rather than read from a path. Nothing else drovr hands a
+/// reviewer lives outside the project — its findings channel is an MCP server, a
+/// separate process these rules do not govern. A rule whose justification is gone is
+/// worse than no rule: it reads as enforcement of something.
 ///
 /// opencode's own built-in allows (`…/tool-output/*`, `/tmp/opencode/*`) are left to
 /// win on their own: a more specific pattern beats `*`, which is the same precedence
 /// that let `git diff*` beat `*` above.
-fn opencode_plan_permission(run_dir: &Path) -> serde_json::Value {
+///
+/// # `question` is denied — the third way a reviewer stalls on a prompt
+///
+/// Found live on 2026-08-08, in the panel that proved the diff path fixed. The
+/// correctness reviewer read the index, followed it to the patches, read the
+/// working-tree files around them, verified all five of the driver's gate points — and
+/// then called opencode's `question` tool to ask *"Submit a clean correctness review?
+/// 1. Submit clean 2. Hold for more detail"*. Nobody was there. A complete review sat
+/// undelivered behind a menu.
+///
+/// `--agent plan` resolves `question` to `allow` on its own (`opencode agent list`,
+/// 1.18.3). A reviewer has no interlocutor by construction — the seed already tells it
+/// not to stop and ask — so the capability is only ever a way to hang. Denying it turns
+/// "ask the human" into a refusal the model can see and route around, which for this
+/// one means submitting the review it had already finished.
+///
+/// Note the shape: `question` takes a bare action, NOT a `{pattern: action}` map like
+/// `bash` and `edit`. `{"*": "deny"}` is a schema error, and opencode refuses to start
+/// on an invalid config — the reviewer would not stall, it would never run.
+fn opencode_plan_permission() -> serde_json::Value {
     serde_json::json!({
         "edit": {"*": "deny"},
         "bash": {"*": "deny"},
         "task": {"*": "deny"},
-        "external_directory": {
-            "*": "deny",
-            format!("{}/*", run_dir.display()): "allow",
-        },
+        "external_directory": {"*": "deny"},
+        "question": "deny",
     })
 }
 
@@ -760,7 +900,6 @@ fn backup_path(path: &Path) -> PathBuf {
 fn write_mcp_config(
     path: &Path,
     schema: McpSchema,
-    run_dir: &Path,
     run_name: &str,
     task: &str,
     iter: u64,
@@ -794,7 +933,7 @@ fn write_mcp_config(
         McpSchema::McpServers => serde_json::json!({
             "mcpServers": {crate::mcp_findings::SERVER_NAME: findings_server(run_name, task, iter)},
         }),
-        McpSchema::Opencode => opencode_document(run_dir, run_name, task, iter),
+        McpSchema::Opencode => opencode_document(run_name, task, iter),
     };
 
     if let Some(body) = &existing
@@ -1485,10 +1624,14 @@ pub fn code_review_run<H: Herdr>(
     // has no shell, so a seed naming a diff file that does not exist yet would send it
     // to read nothing. `?` rather than a warning — a panel whose reviewers cannot see
     // the change under review has nothing to review.
-    let diff_path = write_review_diff(&dir, &run.project_dir, task, iter, &base)?;
+    // `.drovr/` is gitignored in drovr's own repository, but a project drovr reviews
+    // need not ignore it — and review artifacts showing up as untracked files would be
+    // drovr's plumbing masquerading as the implementer's work.
+    exclude_locally(&run.project_dir, REVIEW_ARTIFACT_DIR);
+    let diff_path = write_review_diff(&run.project_dir, task, iter, &base)?;
 
     let mcp_path = mcp.config_path(&dir, Path::new(&run.project_dir), task);
-    write_mcp_config(&mcp_path, mcp.schema(), &dir, &run.name, task, iter)?;
+    write_mcp_config(&mcp_path, mcp.schema(), &run.name, task, iter)?;
     if let Some(rel) = mcp.project_relative_path() {
         exclude_locally(&run.project_dir, rel);
         // A glob: now that the config file also backs up to the next FREE slot, the
@@ -3959,7 +4102,6 @@ mod tests {
         // An uncommitted change, so `git diff --stat` has something to say and the
         // control's redirect writes a non-empty file.
         std::fs::write(project.path().join("a.txt"), "two\n").unwrap();
-        let run_dir = tempfile::tempdir().unwrap();
 
         // Targets OUTSIDE the checkout — `/tmp`, the path the real reviewer escaped
         // through, not merely somewhere inside the worktree. One per half; see above.
@@ -4008,7 +4150,7 @@ mod tests {
         let denied_at = target("denied");
         let _ = std::fs::remove_file(&denied_at);
         let said = attempt(
-            opencode_document(run_dir.path(), "live", "task-1", 1),
+            opencode_document("live", "task-1", 1),
             &denied_at,
         );
         let escaped = denied_at.exists();
@@ -4016,7 +4158,7 @@ mod tests {
 
         // CONTROL: the same document with `bash` back to `allow` — what drovr used to
         // write. This must still produce the file.
-        let mut permissive = opencode_document(run_dir.path(), "live", "task-1", 1);
+        let mut permissive = opencode_document("live", "task-1", 1);
         permissive["agent"]["plan"]["permission"] =
             serde_json::json!({"edit": {"*": "deny"}, "bash": {"*": "allow"}});
         let control_at = target("control");
@@ -4039,6 +4181,142 @@ mod tests {
         );
     }
 
+    /// The other half of the same bargain, and the one the panel actually depends on:
+    /// a reviewer that cannot write must still be able to READ the diff drovr wrote for
+    /// it, unattended, with nobody there to answer a prompt.
+    ///
+    /// This is the test the previous fix did not have, and its absence cost a whole
+    /// panel. The diff went to the run dir, a project-level `external_directory` allow
+    /// was written for that dir, and every config-reading assertion passed — while all
+    /// four live reviewers sat on `△ Permission required — Access external directory`
+    /// until they timed out. A test asserting the path string is not a test of the
+    /// property; only an agent actually reading the file is.
+    ///
+    /// The property half reads drovr's real artifacts through drovr's real document,
+    /// and must come back with a marker that appears **only in a per-file patch** — not
+    /// in the index and not in the prompt. So a pass means the reviewer read the index,
+    /// followed it to a patch, and read that too: the exact two hops the seed asks for.
+    ///
+    /// The CONTROL is the old arrangement: the same artifacts, byte for byte, placed
+    /// OUTSIDE the checkout. It must *not* produce the marker. Without it a green
+    /// property half proves only that the model can read some file, not that putting
+    /// the file inside the project is what made it possible — and moving the artifacts
+    /// back out would go unnoticed. Expect the control to burn its whole timeout: it is
+    /// hanging on a permission prompt, which is the defect being guarded against.
+    ///
+    /// `#[ignore]` for the same reason as the test above; same invocation:
+    ///
+    /// ```text
+    /// cargo test --release --bin drovr live_opencode -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the opencode binary and a live model; run by hand"]
+    fn live_opencode_reviewer_can_read_the_diff_drovr_wrote() {
+        let project = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(project.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(project.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        let base = head_sha(project.path().to_str().unwrap()).unwrap();
+
+        // The marker rides in on the CHANGE, so it lands in a per-file patch and
+        // nowhere else. Pid-derived: a model cannot produce this token by guessing at
+        // the prompt, which is what makes echoing it evidence of an actual read.
+        let marker = format!("DROVR-MARKER-{}", std::process::id());
+        std::fs::write(project.path().join("a.txt"), format!("one\n{marker}\n")).unwrap();
+
+        let project_dir = project.path().to_str().unwrap();
+        let index = write_review_diff(project_dir, "task-1", 1, &base).unwrap();
+        let index_body = std::fs::read_to_string(&index).unwrap();
+        assert!(
+            !index_body.contains(&marker),
+            "the marker must live only in a per-file patch, or the control half can \
+             pass by reading the index alone: {index_body}"
+        );
+
+        // drovr's real document, in the real place — this is the config the reviewer
+        // runs under.
+        std::fs::write(
+            project.path().join("opencode.json"),
+            serde_json::to_string_pretty(&opencode_document("live", "task-1", 1)).unwrap(),
+        )
+        .unwrap();
+
+        // Same shape of prompt as the seed's: start at the index, follow it to the
+        // patch. The marker's prefix is named so a cooperative model knows what to
+        // reply with; the pid half never appears here.
+        let ask = |at: &Path| {
+            let out = Command::new("timeout")
+                .arg("180")
+                .arg("opencode")
+                .current_dir(project.path())
+                .args([
+                    "run",
+                    "--agent",
+                    "plan",
+                    &format!(
+                        "Read the file {}. It indexes a code change and names a \
+                         per-file patch file for every changed file. Read the patch it \
+                         names for `a.txt`, and reply with ONLY the marker token on the \
+                         added line — it starts with DROVR-MARKER-.",
+                        at.display()
+                    ),
+                ])
+                .output()
+                .expect("the opencode binary runs");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+
+        // THE PROPERTY: the artifacts where drovr now puts them, inside the checkout.
+        let inside = ask(&index);
+
+        // CONTROL: the same artifacts outside it, which is where they used to go. The
+        // copied index has to point at the copied patches, or this would measure a
+        // reader that fell back to the in-project ones.
+        let outside = tempfile::tempdir().unwrap();
+        let src = review_diff_dir(project_dir, "task-1", 1);
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            let body = std::fs::read_to_string(entry.path())
+                .unwrap()
+                .replace(&src.display().to_string(), &outside.path().display().to_string());
+            std::fs::write(outside.path().join(entry.file_name()), body).unwrap();
+        }
+        let external = ask(&outside.path().join("index.md"));
+
+        assert!(
+            inside.contains(&marker),
+            "a reviewer could not read the diff drovr wrote at {} — the panel is blind \
+             again. opencode said: {inside}",
+            index.display()
+        );
+        assert!(
+            !external.contains(&marker),
+            "the same artifacts read fine from OUTSIDE the checkout, so this test no \
+             longer distinguishes the fix from the bug it replaced — re-measure \
+             opencode's `external_directory` behaviour before trusting either half. \
+             opencode said: {external}"
+        );
+    }
+
     /// The displacement decision for opencode has to answer "is this file drovr's own?"
     /// about a document that is opencode's *whole project config*, and it has to keep
     /// answering it as `opencode_document` grows. A key whitelist cannot: add a field
@@ -4047,10 +4325,10 @@ mod tests {
     /// Recognition is therefore derived from the document itself.
     #[test]
     fn drovrs_own_opencode_file_is_recognised_across_passes_and_across_edits() {
-        let mine = opencode_document(Path::new("/run/dir"), "run", "task-1", 1);
+        let mine = opencode_document("run", "task-1", 1);
         // A previous pass's file: same document, different iteration.
         let previous =
-            serde_json::to_string(&opencode_document(Path::new("/run/dir"), "run", "task-1", 7))
+            serde_json::to_string(&opencode_document("run", "task-1", 7))
                 .unwrap();
         assert!(
             !holds_more_than_drovrs_server(&previous, McpSchema::Opencode, &mine),
@@ -4443,16 +4721,20 @@ mod tests {
             !perm.to_string().contains("\"ask\""),
             "a reviewer's permission block must never say `ask`: {perm}"
         );
-        // …and the run dir, where drovr puts the seed and the diff, is the one
-        // external directory it may read — otherwise the seed points at a file the
-        // reviewer is refused.
-        let run_dir = run_dir(&run.name);
+        // …and `external_directory` is a FLAT deny, with no allow beside it. An allow
+        // was tried, for the run dir, and measured not to work — a project-level allow
+        // does not override the global `ask`, so it bought nothing while reading as
+        // enforcement. Everything drovr hands a reviewer is inside the checkout now.
         assert_eq!(
-            perm["external_directory"][format!("{}/*", run_dir.display())],
-            "allow",
+            perm["external_directory"],
+            serde_json::json!({"*": "deny"}),
             "{perm}"
         );
-        assert_eq!(perm["external_directory"]["*"], "deny", "{perm}");
+        // `question` too, and as a BARE action — the map form is a schema error and
+        // opencode refuses to start on an invalid config. A reviewer that can ask a
+        // question will eventually ask one, and there is nobody in a reviewer pane to
+        // answer it: one already parked a finished review behind a menu.
+        assert_eq!(perm["question"], "deny", "{perm}");
 
         let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
         assert!(
@@ -4579,7 +4861,7 @@ mod tests {
         let link = project.path().join(".cursor/mcp.json");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-        let err = write_mcp_config(&link, McpSchema::McpServers, Path::new("/run/dir"), "r", "task-1", 1)
+        let err = write_mcp_config(&link, McpSchema::McpServers, "r", "task-1", 1)
             .expect_err("a symlinked config must be refused, not followed");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
@@ -4594,7 +4876,6 @@ mod tests {
         let err = write_mcp_config(
             &project2.path().join(".cursor/mcp.json"),
             McpSchema::McpServers,
-            Path::new("/run/dir"),
             "r",
             "task-1",
             1,
@@ -4700,7 +4981,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
         std::fs::create_dir(&path).unwrap();
 
-        let err = write_mcp_config(&path, McpSchema::McpServers, Path::new("/run/dir"), "r", "task-1", 1)
+        let err = write_mcp_config(&path, McpSchema::McpServers, "r", "task-1", 1)
             .expect_err("an unreadable config must not be silently replaced");
         assert!(
             err.to_string().contains("mcp.json"),
@@ -5054,16 +5335,14 @@ mod tests {
         assert!(seed.contains("critical") && seed.contains("important") && seed.contains("nit"));
     }
 
-    /// The artifact that replaced the reviewer's `git diff`. It has to carry both
+    /// The artifacts that replaced the reviewer's `git diff`. They have to carry both
     /// halves: the `--stat` a reviewer reads first to decide where to look, and the
-    /// patch it then reads. A file with only one of them sends the reviewer looking for
-    /// the other through a shell it does not have.
+    /// patches it then reads. An index with only one of them sends the reviewer looking
+    /// for the other through a shell it does not have.
     #[test]
-    fn the_diff_drovr_writes_carries_the_stat_and_the_patch() {
+    fn the_diff_drovr_writes_carries_the_stat_and_a_patch_per_file() {
         let _lock = ENV_LOCK.lock().unwrap();
         let (run, repo) = make_run("cr-diff-artifact");
-        let dir = run_dir(&run.name);
-        std::fs::create_dir_all(&dir).unwrap();
         let base = head_sha(&run.project_dir).unwrap();
 
         // A committed change on top of the base, and an uncommitted one after it —
@@ -5091,16 +5370,76 @@ mod tests {
                 .success()
         );
 
-        let path = write_review_diff(&dir, &run.project_dir, "task-1", 3, &base).unwrap();
-        assert_eq!(path, review_diff_path(&dir, "task-1", 3));
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("## Summary (--stat)"), "{body}");
-        assert!(body.contains("## Patch"), "{body}");
-        assert!(body.contains("fn committed()"), "the committed half is missing: {body}");
+        let path = write_review_diff(&run.project_dir, "task-1", 3, &base).unwrap();
+        assert_eq!(path, review_diff_path(&run.project_dir, "task-1", 3));
+        // Inside the checkout, which is the whole point: a reviewer's read permission
+        // reaches here without any `external_directory` decision.
         assert!(
-            body.contains("fn uncommitted()"),
+            path.starts_with(&run.project_dir),
+            "the diff must live inside the project, not at {}",
+            path.display()
+        );
+
+        let index = std::fs::read_to_string(&path).unwrap();
+        assert!(index.contains("## Summary (--stat)"), "{index}");
+        assert!(index.contains("## Per-file patches"), "{index}");
+        // The index carries the map, not the patches: the reviewer must be able to pick
+        // what it loads, which is the property that makes a large change reviewable.
+        assert!(
+            !index.contains("fn committed()"),
+            "the index must not inline the patches — that is the blob this replaced: \
+             {index}"
+        );
+
+        // Every changed file has its own patch, and the index names each one by a path
+        // that resolves. Both halves of the scope appear: the range PLUS the working
+        // tree.
+        let dir = review_diff_dir(&run.project_dir, "task-1", 3);
+        let mut bodies = String::new();
+        for (i, name) in ["committed.rs", "uncommitted.rs"].iter().enumerate() {
+            let patch = dir.join(patch_file_name(i + 1, name));
+            assert!(
+                index.contains(&patch.display().to_string()),
+                "the index must name {}: {index}",
+                patch.display()
+            );
+            bodies.push_str(&std::fs::read_to_string(&patch).unwrap());
+        }
+        assert!(
+            bodies.contains("fn committed()"),
+            "the committed half is missing: {bodies}"
+        );
+        assert!(
+            bodies.contains("fn uncommitted()"),
             "the working-tree half is missing, so the reviewer would review a stale \
-             range: {body}"
+             range: {bodies}"
+        );
+    }
+
+    /// Two different paths can sanitise to the same slug (`a/b.rs` and `a_b.rs` both
+    /// become `a_b.rs`), and a path long enough to be truncated collides far more
+    /// easily than that. The ordinal is what actually keeps the names apart — without
+    /// it one file's patch silently overwrites another's and the reviewer reviews the
+    /// wrong change with no sign anything went missing.
+    #[test]
+    fn per_file_patch_names_are_unique_even_when_the_paths_collide() {
+        assert_ne!(
+            patch_file_name(1, "a/b.rs"),
+            patch_file_name(2, "a_b.rs"),
+            "the slug alone is not unique; the ordinal must carry it"
+        );
+        let long = format!("src/{}/x.rs", "d".repeat(400));
+        assert_ne!(patch_file_name(3, &long), patch_file_name(4, &long));
+        assert!(
+            patch_file_name(3, &long).len() < 200,
+            "a long path must be truncated to a writable filename: {}",
+            patch_file_name(3, &long)
+        );
+        // Nothing that would leave the artifact directory or need quoting.
+        let hostile = patch_file_name(5, "../../etc/passwd; rm -rf");
+        assert!(
+            !hostile.contains('/') && !hostile.contains(' ') && !hostile.contains(';'),
+            "{hostile}"
         );
     }
 
@@ -5117,7 +5456,7 @@ mod tests {
             code_review_run(&h, &mut run, "task-1", 40, false, None).unwrap(),
             ReviewOutcome::Timeout
         );
-        let path = review_diff_path(&run_dir(&run.name), "task-1", 1);
+        let path = review_diff_path(&run.project_dir, "task-1", 1);
         assert!(
             path.exists(),
             "the panel must write {} before seeding reviewers at it",

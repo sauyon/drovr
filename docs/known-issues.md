@@ -11,10 +11,12 @@ marker, delete instead. If the fix is worth recording, it is worth recording in 
 
 ## An `opencode` reviewer takes its seed and then dies mid-review on the local endpoint — OPEN
 
-**Severity:** high — the seed now arrives (that half is fixed and pinned by tests; see
-`wait_for_started_pane` in `cli/src/phase.rs`), but `drovr code-review run` still cannot finish
-with `review_agent = "opencode"` on this host, so the gate is still unreachable.
+**Severity:** medium, down from high. The seed arrives, the diff is readable and split, and
+reviewers now deliver real findings — but some fraction of a panel still dies on a connection
+drop, so `drovr code-review run` with `review_agent = "opencode"` needs a resume (sometimes more
+than one) to fill in every angle on this host.
 **Found:** 2026-08-07, `drovr code-review run skill-stickiness task-22`, iterations 4 and 6.
+**Narrowed:** 2026-08-08, iteration 11 — see "Two causes separated out" below.
 
 ### Symptom
 
@@ -45,16 +47,61 @@ Reading the pane shows the reviewer read the diff and then hit its provider:
   (`opencode run --agent plan "$(drovr code-review brief … --angle correctness)"`) ran for ten
   minutes and submitted nothing.
 
-So the failure is the review WORKLOAD against the local `Qwen3.6 35B A3B (abliterated)` at
-`ko.ag`: ~16K of context per reviewer, and the server drops the connection mid-turn.
+### Two causes separated out and fixed (2026-08-08); the connection drop is what is left
+
+Three separate things were producing the same "finished without submitting" symptom, and the
+first two were drovr's:
+
+1. **The reviewer could not READ the diff.** It was written to the run dir, outside the checkout,
+   behind an `external_directory` prompt nobody could answer. Fixed: the diff goes to
+   `<project>/.drovr/review/` (`code_review::review_diff_dir`). See the lesson at the bottom of
+   this file for the part that is not obvious.
+2. **The reviewer stopped to ask a question.** `--agent plan` resolves opencode's `question`
+   permission to `allow`; a correctness reviewer finished a full review and then parked on
+   *"Submit a clean correctness review? 1. Submit clean 2. Hold for more detail"*. Fixed:
+   `question: "deny"` in `opencode_plan_permission` (a BARE action, not a `{pattern: action}`
+   map — the map form is a schema error and opencode then refuses to start at all).
+
+**Context size was measured and is real, but it is not the whole story.** Time-to-first-token on
+this endpoint is superlinear in context: 4 KB/32 s, 16 KB/38 s, 32 KB/71 s, 64 KB/183 s,
+128 KB/294 s — ~4x the context for ~9x the time. Task 22's diff is 382 KB, so a single-blob diff
+was hours away from a first token and the client gave up. That is why drovr now splits the diff
+one file per patch and the seed tells the reviewer to read the index and then only what its angle
+needs (`code_review::write_review_diff`). Reviewers that survive now run at 20–93 K of context and
+deliver.
+
+**What remains is CONCURRENCY, and the ceiling has been measured: this endpoint serves 2
+reviewers, and drovr's panel spawns 4.** Reviewers die with `CURL error: Server returned nothing`
+**on their very first turn** — before reading anything, at ~5 KB of seed context, with nothing
+accumulated. Four identical runs of the real seed against `ko.ag`, varying only how many ran at
+once:
+
+| concurrent reviewers | outcome |
+|---|---|
+| 1 | 0 drops. Read 10 per-file patches over 7 min and was still working when the probe's own cap fired. |
+| 2 | 0 drops. Both read 5 patches each. |
+| 3 | **2 of 3 dropped on the first turn**; the survivor read 6 patches. |
+| 4 (a real panel) | 2 of 4 dropped on iteration 11, 3 of 4 on iteration 12. |
+
+Control, to separate load from a sick server: a single trivial request (`reply HEALTHOK`) answers
+in seconds throughout, including immediately after a panel has just lost three reviewers. And
+4 concurrent *seed-sized* requests that ask only for a one-word reply lost just 1 of 4 — so it is
+not input size and not connection count on its own. What exceeds the endpoint is several
+concurrent LONG generations.
 
 ### What to try next
 
-1. Watch the endpoint while one reviewer runs — the `CURL error` is the server closing the
-   connection, and whether that is memory, a request timeout, or concurrency is a question for
-   the server, not for drovr.
-2. If it is capacity, the panel's four concurrent reviewers are the load: try one angle at a time
-   before concluding anything about the model.
+1. **Cap the panel's concurrency.** This is the fix, and it is the one thing not yet built:
+   seed reviewers in waves of N rather than all four at once. N=2 is what the table supports for
+   this endpoint. It needs a decision that is not a phase agent's to make — the default costs
+   every user wall-clock on every panel, whether it is a config knob or derived from the backend,
+   and the panel's "every reviewer exits before the implementer writes" invariant has to survive
+   being split into waves.
+2. Until then, the resume is the workaround, with a caveat that limits it: `code-review run`
+   merges as soon as every angle is *resolved*, and a degraded angle counts as resolved. So a pass
+   where all four die merges into four criticals and closes the iteration — a resume only
+   accumulates while at least one reviewer is still `Running` (`resumable_iter`). Resume EARLY,
+   with a short `--timeout-ms`, while a survivor is still working.
 3. **Do not silently rewrite `~/.config/drovr/config.toml`.** It is the user's global config, the
    setting is deliberate (the `cross-model-arm` stage ran qwen through opencode), and swapping the
    reviewer changes what reviewed the work. Say what you changed if you change it.
@@ -3131,6 +3178,24 @@ never the defect. Carry **the rule and the evidence that confirms it** — inclu
 out, which is often the expensive part — and nothing else. The test is structural, not length: if
 a lesson grows a reproduction and a fix list, it has become an issue again and belongs above.
 
+- **An `external_directory` allow in a PROJECT `opencode.json` does not override the global
+  `ask`** (recorded 2026-08-08, opencode 1.18.3; the fix was to stop needing one). opencode's
+  stock rule for reading outside the working directory is `ask *`, and a reviewer pane has nobody
+  to answer, so it is a hang rather than a refusal. The obvious repair — write
+  `"external_directory": {"*": "deny", "<the dir>/*": "allow"}` into the project config drovr
+  already writes — **looks** right, matches the precedence that makes `bash: {"*": "deny", "git
+  diff*": "allow"}` work in the same file, and does not work. Measured directly: with exactly
+  that allow in place, `opencode run --agent plan "Read the file <run_dir>/perm-test.txt and reply
+  with ONLY its contents"` issued the read and hung to timeout; live, all four reviewers of one
+  panel sat on `△ Permission required — Access external directory ~/.local/share/drovr/runs/…`
+  and the panel came back with four `critical` findings saying the angle was never checked. The
+  rule that came out of it: **do not try to buy a reviewer access to a path outside its working
+  directory — put the file inside the checkout instead.** That is why drovr writes the review diff
+  to `<project>/.drovr/review/` (`code_review::review_diff_dir`) and not to the run dir. Note the
+  asymmetry, since it is what makes this non-obvious: per-*tool* allow patterns in a project config
+  do compose with the global config; `external_directory` did not. Not re-tested against a global
+  or user-level allow — that would grant every opencode agent on the host the same access, which
+  is not a trade drovr gets to make on the user's behalf.
 - **Headless Chromium on Linux: always pass `--password-store=basic`** (retired 2026-08-01;
   the flag is in `cli/tests/web_nav.rs`). Without it, Chromium's cookie store loads its
   encryption key through OSCrypt, which asks the Secret Service over D-Bus; on a machine with
