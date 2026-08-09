@@ -2461,7 +2461,8 @@ mod tests {
     ///
     /// With [`a_finished_panel_reaps_its_reviewers`] it is one of only two tests
     /// in this module that assert the panel's reap actually HAPPENED — this one
-    /// through both the orphan's close and the retirement count. In the ten runs
+    /// through both the orphan's close and the panel's retirement count. Both go
+    /// through `acquire_run_lock`, so either fires on a refusal. In the ten runs
     /// of `docs/run-lock-fork-race/lock-red.txt` §3a it was the retirement count
     /// that fired here, not the close. drovr#80 is fixed at the mechanism; see
     /// that test's note for what changed and for the red-baseline numbers.
@@ -2805,9 +2806,9 @@ mod tests {
     /// every lock drovr takes is now released on drop by an explicit
     /// `flock(LOCK_UN)` rather than by the drop itself — see `crate::flock`,
     /// which owns that invariant for both `run.lock` and `server.pid` — so an fd
-    /// inherited across a `fork` can no longer hold a lock its owner has dropped. The same
-    /// measurement re-run against the fix belongs beside the baseline, as
-    /// `docs/run-lock-fork-race/lock-green.txt`.
+    /// inherited across a `fork` can no longer hold a lock its owner has dropped.
+    /// The same measurement re-run against the fix belongs beside the baseline,
+    /// as `docs/run-lock-fork-race/lock-green.txt`.
     #[test]
     fn a_finished_panel_reaps_its_reviewers() {
         let env = TestEnv::new();
