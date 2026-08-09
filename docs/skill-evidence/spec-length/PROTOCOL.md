@@ -19,13 +19,15 @@ and the difference is recorded in `RESULTS.md`. This clause exists because a lit
 the plan's T10 branch could otherwise paste a winning candidate and report an unqualified *"shorter
 without loss"* in exactly the case `R4a` was written to qualify.
 
-**What is protected, and it is not only item 12.** The rules that decide the outcome are **items 8,
-8a, 9, 10, 11, 12, 13, 14 and 14a** — call them the **governed items**. Item 12 is not special: R1
-and R2 are *defined in terms of* item 9's `present` test, item 8's schema, item 8a's sample and item
-10's instrument, so loosening any of those moves the gate exactly as surely as rewriting R2 would.
-Items 1–7 are the framing, the design and the id pool; they are governed too, but the reason to name
-the list explicitly is that an earlier draft of this clause protected item 12 alone, which would have
-left the definitions it depends on editable after a result was visible.
+**What is protected: every item in this file.** The **governed items** are **items 1 through 14a,
+all sixteen, without exception**. Item 12 is not special and is not the boundary: R1 and R2 are
+*defined in terms of* item 9's `present` test, item 8's schema, item 8a's sample and item 10's
+instrument; the id pool (item 6) and the probe template (item 5) determine what is measured at all;
+and item 11 governs what may be claimed about the result. Loosening any of them moves the outcome as
+surely as rewriting R2 would. This is stated as "everything" rather than as a list because an
+earlier draft of this clause protected item 12 alone, and the next draft protected a nine-item
+subset that still left the probe template and the id pool outside it — each time, the carve-out was
+the bug.
 
 **What may change, and when.** Three windows, and there is no fourth:
 
@@ -47,8 +49,10 @@ makes the edit. Windows 2 and 3 log to `RESULTS.md` **as well**, not instead: `R
 exist until T7, so a reader before then would otherwise have no record at all, and a reader after it
 should not have to open a second file to learn that this one moved.
 
-**This file was revised three times after its first commit, all inside window 1**, and says so here
-rather than leaving `git log -p` as the only witness:
+**This file was revised four times after its first commit, all inside window 1**, and says so here
+rather than leaving `git log -p` as the only witness. Count the rows below `7cfd07a`: that number
+and this sentence must always agree, and both must agree with
+`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL.md`.
 
 | commit | what changed |
 |---|---|
@@ -56,7 +60,8 @@ rather than leaving `git log -p` as the only witness:
 | `bdd6622` | `R4`'s row-judgement count corrected from 1380 to **460** per arm (1380 is the figure across all three arms). |
 | `3dd0dcc` | **`R4a` and `R5a` added** — neither was in the first commit. `R1`'s primary sentence reworded (the original, read literally, required generations that never judged a row to retain it). Item 8a's sample offset pinned. |
 | `6e33620` | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows split from two to three; this table added. No rule added or weakened. |
-| the commit that added this row | **`14a` added** — T9's gap-finder and pairing-adjudicator prompts and the `gaps/` schema, which `R7` makes fatal but which no file pinned. **`R3a` gained its post-T8/T9 fallback**, which was undefined. The protected set widened from item 12 alone to the nine governed items. This table made append-only and forward-looking. |
+| `5043dbf` | **`14a` added** — T9's gap-finder and pairing-adjudicator prompts and the `gaps/` schema, which `R7` makes fatal but which no file pinned. **`R3a` gained its post-T8/T9 fallback**, which was undefined. The protected set widened from item 12 alone to a nine-item list. This table made append-only and forward-looking. |
+| the commit that added this row | **Item 14 gained a definition of `recovered` and literal probe and adjudicator prompts** — T8's fatal criterion was named but never defined, and its prompts were the only instrument prompts still unwritten, which made `5043dbf`'s claim that T9 was "the only" unpinned instrument false. **`R3a`'s fallback gained step 2**, the check against `S1`'s mean, without which it could crown a candidate the control had beaten. The protected set widened again, from nine items to **all sixteen**. Revision count corrected from three to four. |
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE.md` is the hash
 record and `docs/skill-evidence/arms/MANIFEST.md` is the provenance record; both are authoritative
@@ -543,12 +548,22 @@ applies. **Do not describe this scoring as fully blind anywhere.**
   **The comparison T7 records is provisional; the winner is decided only after T8 and T9.** T7
   applies R3a over the arms that cleared R2, but T8 and T9 run *after* T7 and either can be fatal
   (R7). So the ordering, pre-registered here because otherwise it is settled once the results are
-  in: **the winner is the lowest-mean arm among the CANDIDATES that cleared R2 *and* T8 *and* T9.**
-  If the provisional leader is then eliminated by T8 or T9, **the next-lowest surviving candidate
-  takes its place** — it is not discarded along with the leader, and the run does not fall to a null
-  merely because the shortest survivor was not the shortest clearer. If no candidate survives all
-  three, the outcome is the null under R7. T7 labels its own table **"provisional — T8 and T9 have
-  not run"** whenever any candidate cleared R2, so no reader mistakes it for the verdict.
+  in — apply these three steps in order:
+
+  1. **The survivors** are the CANDIDATES (`S2`, `S3`) that cleared R2 *and* T8 *and* T9. If there
+     are none, the outcome is the null under R7 and nothing ships.
+  2. **The control still has to be beaten.** If `S1` cleared R2 and its mean is **lower than or
+     equal to** the lowest surviving candidate's, then **no candidate beat the control**: ship
+     nothing and record it, exactly as the sentence above says. The survivors clearing every gate
+     does not by itself make one of them shorter than what already ships. (If `S1` did **not** clear
+     R2, it is not in R3's compared set at all and R4a governs the comparison instead.)
+  3. **Otherwise the lowest-mean survivor wins.** If the provisional leader was eliminated by T8 or
+     T9, **the next-lowest surviving candidate takes its place** — it is not discarded along with
+     the leader, and the run does not fall to a null merely because the shortest survivor was not
+     the shortest R2-clearer.
+
+  T7 labels its own table **"provisional — T8 and T9 have not run"** whenever any candidate cleared
+  R2, so no reader mistakes it for the verdict.
 - **R4 — the control is not exempt, and a universal null is the likely outcome.** `S1`'s retention
   is the **instrument reading**: it says whether the gate is clearable at all under D2. R1 requires
   **460** row-judgements — 2 samples × 230 rows — to come back clean for **one** arm to pass, and
@@ -670,11 +685,68 @@ the row's subject **with the row's answer removed**:
     What does this spec say about <the row's subject, with the row's answer removed>?
 ```
 
-The probe is handed **only** `generated/<id>.md` and the 20 questions so phrased. It never sees the
-ledger — being handed the answer is the whole failure this test exists to catch. `recovered` is then
-decided by an **independent blind adjudicator** handed the 20 `(ledger row, probe answer)` pairs and
-nothing else: no spec, no arm label. The phase agent records both and never overwrites an
-adjudication it disagrees with — a disagreement is recorded under R6a.
+**`recovered` is defined here, because it is a fatal criterion and an undefined fatal criterion is
+one invented at the moment it is least neutral** — T8 runs after T7 has unblinded:
+
+> `recovered` is `true` when the probe's answer states the row's content **with its operative
+> detail** — the exact name, the exact bound, the exact exclusion — so that an implementer holding
+> only that answer would build what the row states, without stopping to ask. An answer on the right
+> topic that drops the operative detail is `false`, and so is an answer that says the spec does not
+> address it.
+
+This is the same standard as item 9's `present` and item 8a's *establish*, applied to a probe's
+answer instead of to a quoted span, and it is worded to match them deliberately.
+
+**The probe prompt**, fixed here and identical across arms — it is handed **only**
+`generated/<id>.md` and the 20 questions, never the ledger, because being handed the answer is the
+whole failure this test exists to catch:
+
+```
+Below is a spec. Read it, then answer the questions that follow using ONLY what it says.
+
+--- BEGIN SPEC ---
+<the contents of generated/<id>.md>
+--- END SPEC ---
+
+--- BEGIN QUESTIONS ---
+<n>. What does this spec say about <the row's subject, with the row's answer removed>?
+--- END QUESTIONS ---
+
+Answer each question in your own words, from the spec alone. Do not guess, do not fill gaps
+from what you know about software, and do not consult any other file. If the spec does not
+address a question, say exactly: "the spec does not address this".
+
+Return exactly one line and nothing else, a JSON array of one object per question in order:
+[{"n":1,"answer":"<your answer>"}]
+```
+
+**The adjudicator prompt**, likewise fixed — it is handed the 20 `(ledger row, probe answer)` pairs
+and **nothing else: no spec, no arm label, no other row**:
+
+```
+For each numbered pair below you are given a key-point row from a frozen ledger, and an answer
+someone gave after reading a document you have not seen. Decide, for each pair independently:
+
+    does the answer state this row, with its operative detail?
+
+"Operative detail" is the exact name, the exact bound, the exact exclusion. An answer on the
+right topic that drops it is a no, and so is an answer that says the document does not address
+the point.
+
+You are not judging the document, which you have not seen, and not judging whether the row is
+a good row. Only whether this answer states this row.
+
+--- BEGIN PAIRS ---
+<n>. ROW: <ledger row item text>
+    ANSWER: <the probe's answer>
+--- END PAIRS ---
+
+Return exactly one line and nothing else, a JSON array of one object per pair in order:
+[{"n":1,"recovered":true},{"n":2,"recovered":false}]
+```
+
+The phase agent records both and never overwrites an adjudication it disagrees with — a disagreement
+is recorded under R6a.
 
 Verdicts land in `docs/skill-evidence/spec-length/transmission/<id>.json`:
 
@@ -692,9 +764,10 @@ Verdicts land in `docs/skill-evidence/spec-length/transmission/<id>.json`:
 ## 14a. T9's instruments
 
 Numbered out of sequence for the same reason 8a is: it was added during T2's own review, and items
-1–14 are cited by number elsewhere. **It exists because `R7` makes a T9 gap fatal, and T9 was the
-only fatal instrument in this run whose prompts were pinned nowhere** — not here, and only as prose
-in the plan. T9 runs after T7 has unblinded, so whoever writes its prompts then knows which arm is
+1–14 are cited by number elsewhere. **It exists because `R7` makes a T9 gap fatal, and T9's prompts
+were pinned nowhere** — not here, and only as prose in the plan. (T8's were incomplete for the same
+reason and in the same review round; item 14 now carries them, so **every fatal instrument in this
+run is pinned in this file**.) T9 runs after T7 has unblinded, so whoever writes its prompts then knows which arm is
 which and authored two of the three. An instrument authored after the results are visible is the
 thing this file exists to prevent, and R7's fatality is what made it worth fixing rather than noting.
 
@@ -757,7 +830,12 @@ Return exactly one line and nothing else, a JSON array of one object per questio
 
 **Which spec is `A` is fixed by the ids, not chosen**, so position cannot carry a hint and nobody
 picks it once the answers are visible: the two ids are compared as lowercase hex strings, and **the
-lexicographically smaller id is `A`**. The control generation paired against is `S1`'s generation
+lexicographically smaller id is `A`**. That guarantee rests on T4's assignment being independent of
+the ids' values, so it is pinned here as a constraint on item 6: **T4 may not use any property of an
+id — its value, its lexicographic rank, or its position in the pool listing — as a function of the
+arm it is assigned to.** An assignment that gave one arm the smaller id in all three fixtures would
+put that arm in position `A` every time and hand the adjudicator back the correlation this rule
+removes. The control generation paired against is `S1`'s generation
 for the **same fixture and same sample** — which exists whether or not `S1` itself cleared R2,
 because the pairing reads the spec, not the verdict.
 
