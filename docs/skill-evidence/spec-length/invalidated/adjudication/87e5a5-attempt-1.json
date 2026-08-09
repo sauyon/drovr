@@ -1,0 +1,93 @@
+{
+  "spec_id": "87e5a5",
+  "attempt": "attempt-1",
+  "ledger": "skill-stickiness",
+  "sample_rule": "PROTOCOL.md item 8a: present:true rows in ledger order, indexed among themselves, every index divisible by 5",
+  "pairs": [
+    {
+      "n": 1,
+      "row": "skill-stickiness-06",
+      "establishes": true
+    },
+    {
+      "n": 2,
+      "row": "skill-stickiness-13",
+      "establishes": false
+    },
+    {
+      "n": 3,
+      "row": "skill-stickiness-19",
+      "establishes": true
+    },
+    {
+      "n": 4,
+      "row": "skill-stickiness-24",
+      "establishes": false
+    },
+    {
+      "n": 5,
+      "row": "skill-stickiness-29",
+      "establishes": false
+    },
+    {
+      "n": 6,
+      "row": "skill-stickiness-34",
+      "establishes": true
+    },
+    {
+      "n": 7,
+      "row": "skill-stickiness-39",
+      "establishes": true
+    },
+    {
+      "n": 8,
+      "row": "skill-stickiness-44",
+      "establishes": true
+    },
+    {
+      "n": 9,
+      "row": "skill-stickiness-49",
+      "establishes": true
+    },
+    {
+      "n": 10,
+      "row": "skill-stickiness-54",
+      "establishes": true
+    },
+    {
+      "n": 11,
+      "row": "skill-stickiness-59",
+      "establishes": true
+    },
+    {
+      "n": 12,
+      "row": "skill-stickiness-64",
+      "establishes": true
+    },
+    {
+      "n": 13,
+      "row": "skill-stickiness-69",
+      "establishes": false
+    },
+    {
+      "n": 14,
+      "row": "skill-stickiness-74",
+      "establishes": true
+    },
+    {
+      "n": 15,
+      "row": "skill-stickiness-79",
+      "establishes": false
+    },
+    {
+      "n": 16,
+      "row": "skill-stickiness-84",
+      "establishes": true
+    },
+    {
+      "n": 17,
+      "row": "skill-stickiness-89",
+      "establishes": true
+    }
+  ]
+}

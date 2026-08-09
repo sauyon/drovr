@@ -474,6 +474,10 @@ plan's T5 procedure says *"log every re-run and its reason per `R6`; log any res
 `R6a`"*. Both are satisfied by T5 recording its own re-run here and T7 aggregating across tasks;
 neither file is edited above this line, and **§3 is untouched**.
 
+**Every count in this section was recomputed from `invalidated/adjudication/*.json` after review
+found three of them wrong.** See §7.8 — the corrections are recorded rather than quietly applied,
+because an escalation whose arithmetic drifted once should be checkable by whoever reads it next.
+
 ### 7.1 The outcome, stated first
 
 **All six `skill-stickiness` verdicts failed `PROTOCOL.md` item 8a and are invalidated in whole. No
@@ -483,15 +487,23 @@ verdict was filed. `retention/` does not exist.** The scoring output is preserve
 **This is a finding about the instrument, not about the arms**, and it is an **escalation**, not a
 closed item. It is not `R6`-remediable: the prescribed remedy was applied and failed identically.
 
+**The concrete downstream consequence, spelled out so T7 does not have to re-derive it.** `R2` gates
+on an arm reaching **230/230**, and `R1`'s union is over all six of an arm's generations across all
+three ledgers. With no admissible `skill-stickiness` verdict, **no arm has a defined retention count
+at all** — not a low one, an undefined one — so `R2` cannot be applied to any arm, `R3`'s length
+comparison has no cleared set to range over, and `R7` cannot decide whether T8 runs. Clearing this
+requires changing item 8a's whole-file rule, its stride, or item 8's 3-span cap. **All three are
+governed items in window 3, where any edit is a deviation**, and none of it is T5's to decide.
+
 ### 7.2 What was run
 
-13 scorer dispatches and 7 adjudications, all foreground, all `subagent_type: general-purpose`,
-`model: sonnet`. Item 10's template was handed over byte-for-byte (see deviation 7 for the two
-substituted paths); item 8a's prompt likewise.
+**14 scorer dispatches and 7 adjudications — 21 in total**, all foreground, all
+`subagent_type: general-purpose`, `model: sonnet`. Item 10's template was handed over byte-for-byte
+(see deviation 7 for the two substituted paths); item 8a's prompt likewise.
 
 | id | present / 91 | rows absent | 8a sample | `establishes: false` | verdict |
 |---|---|---|---|---|---|
-| `4a73ef` (attempt 1) | 91 | — | 18 | 6 | invalidated |
+| `4a73ef` (attempt 1) | 91 | — | 18 | 6 | invalidated, superseded |
 | `4a73ef` (attempt 2, `R6` re-run) | 91 | — | 18 | 4 | invalidated |
 | `aa3199` | 91 | — | 18 | 5 | invalidated |
 | `d25798` | 89 | `-08`, `-11` | 17 | 3 | invalidated |
@@ -502,9 +514,19 @@ substituted paths); item 8a's prompt likewise.
 Sample sizes are `floor(n/5)` over `present: true` rows in ledger order, stride 5, offset as item 8a
 fixes it. No sample was empty, so item 8a's fewer-than-five carve-out never applied.
 
+**The operative six** are attempt 2 for `4a73ef` and attempt 1 for the other five; attempt 1 of
+`4a73ef` is superseded by its re-run and is excluded from every figure below unless named.
+
 **Retention counts above are `R5` descriptive, never a pass — and here they are weaker than that:
 they come from verdicts item 8a has invalidated, so they are not evidence of retention at all.**
 They are printed only because they are what the escalation is about.
+
+**The raw per-row adjudications are committed at `invalidated/adjudication/<id>-<attempt>.json`**,
+one record per dispatch, each pairing the sampled row id with the adjudicator's own
+`establishes` call. Item 8a pins no output path — unlike items 8, 10 and 14 — so nothing required
+this; it is here because review pointed out that without it, every figure in §7.3 rests on T5's
+transcription and a later auditor could only re-check it by re-dispatching a non-deterministic
+subagent. **Anyone may now recompute this section from the files.**
 
 ### 7.3 Why it failed — items 8a and 9 apply different standards
 
@@ -513,39 +535,51 @@ whether **1–3 spans, with the spec withheld**, establish the row. The second i
 row genuinely present and actionable across a 585-line spec can still be un-establishable from three
 quoted fragments, particularly a multi-clause row carrying several exact names.
 
-**26 of 106 adjudicated rows (25%) came back `establishes: false`**, and the failures are a property
-of the **ledger row**, not of the generation:
+**24 of 106 rows adjudicated across the operative six (22.6%) came back `establishes: false`**;
+across all seven adjudications it is 30 of 124 (24.2%). The failures are a property of the **ledger
+row**, not of the generation:
 
-| row | failed / files that sampled it |
+| row | failed / operative files that sampled it |
 |---|---|
 | `skill-stickiness-55` | 4 / 4 |
 | `skill-stickiness-65` | 4 / 4 |
-| `skill-stickiness-10` | 3 / 4 |
-| `skill-stickiness-05` | 2 / 4 |
-| `skill-stickiness-80` | 2 / 4 |
+| `skill-stickiness-05` | 2 / 5 |
+| `skill-stickiness-10` | 2 / 4 |
+| `skill-stickiness-50`, `-80`, `-85`, `-90` | 1 / 4 each |
+| `-13`, `-17`, `-24`, `-29`, `-42`, `-69`, `-79`, `-87` | 1 / 1 each |
+
+The last row of that table is not noise: those eight are sampled by exactly one file each, because
+`d25798` and `87e5a5` drop rows and their stride-5 sample therefore lands elsewhere. **Every row that
+was sampled more than once and failed, failed on multiple generations.**
 
 Because item 8a's stride and offset are **fixed**, every verdict with all 91 rows present samples the
 same eighteen rows — so the same hard rows are adjudicated every time. `-65` requires three arm
 descriptions (`A`, `A′`, `B`) inside three spans; `-55` cites a `§7.3` section number that does not
-exist in any generation. Neither is reachable within item 8's 3-span cap however good the spec is.
+exist in any generation, the specs having renumbered under compression. Neither is reachable within
+item 8's 3-span cap however good the spec is.
 
 **The arithmetic closes the argument.** Whole-file invalidation over ~18 sampled rows means a file
-passes only if every sampled row passes. At the observed 25% per-row failure rate that is
-`0.75^18` ≈ **0.6%**; even at a 5% per-row rate it is only ≈ 40%. **Item 8a as pre-registered cannot
+passes only if every sampled row passes. At the observed 22.6% per-row failure rate that is
+`0.774^18` ≈ **1.0%**; even at a 5% per-row rate it is only ≈ 40%. **Item 8a as pre-registered cannot
 be cleared by this ledger at this sample size**, and no amount of re-running changes that.
 
-**Three things this is not.** It is not the multi-line-span hazard T5 checked for first: pairs whose
-spans contained a newline passed at a *higher* rate (8/10) than single-line pairs (72/96), so the
-prompt's one-line `SPANS:` layout is not the cause. It is not one scorer's slip: the `R6` re-run
-changed 16 of 18 sampled rows' spans and still failed. And it is not a T5 judgement call substituted
-for the adjudicator's — every `establishes: false` above is an adjudicator's, unedited.
+**Two things this is not, and one thing it partly is.** It is not the multi-line-span hazard T5
+checked for first: pairs whose spans contained a newline passed at a *higher* rate (8/10) than
+single-line pairs (72/96), so the prompt's one-line `SPANS:` layout is not the cause. It is not a T5
+judgement substituted for the adjudicator's — every `establishes: false` above is an adjudicator's,
+unedited. But **"not one scorer's slip" is too strong as originally written**: the `R6` re-run
+changed 16 of 18 sampled rows' spans and still failed, which does show the failure survives a fresh
+scoring pass — and that same re-run also introduced a genuine scorer defect of its own (§7.8,
+finding 1). Both are true. The structural claim rests on the row-level concentration and the
+arithmetic above, not on the scorers having been faultless.
 
 ### 7.4 `R6` — the re-run log
 
 **One re-run, of `4a73ef`, whole.** Reason: *"a verdict fails item 8a's relevance adjudication"* —
 item 8a's closed list, entry 4. Both shards were re-dispatched with the identical frozen template;
-the verdict was re-assembled, not patched. **Attempt 2 also failed 8a (4 of 18).** Attempt 1 is
-preserved at `invalidated/4a73ef.attempt-1.json` beside it.
+the verdict was re-assembled, not patched. **Attempt 2 also failed 8a (4 of 18), and separately
+fails item 8's no-shared-span rule (§7.8).** Attempt 1 is preserved at
+`invalidated/4a73ef.attempt-1.json` beside it.
 
 **No other re-run was performed, deliberately.** `R6` forbids re-running to chase a result, and once
 the re-run had failed on a fresh set of spans there was no protocol-failure remedy left to apply —
@@ -556,12 +590,12 @@ the one thing here a reader might reasonably want reversed; it is recorded so it
 ### 7.5 `R6a` — doubts recorded, not resolved
 
 1. **The retention numbers are implausibly high, and T5 does not believe them.** Four of six
-   generations scored **91/91**, and 13 of 13 scorer shards reported near-total retention. `R4`
+   generations scored **91/91**, and 14 of 14 scorer shards reported near-total retention. `R4`
    pre-registers a universal null as the *likely* outcome and warns that the residual risk runs
    toward a **false pass**; limitation 7 says the same. A 91/91 on a 91-row ledger compressed into a
-   455–706 line spec is exactly the shape a lenient scorer produces. The 25% 8a failure rate is
-   independent evidence for that reading: a quarter of the spans the scorer thought sufficient did
-   not establish their row to a second reader.
+   455–706 line spec is exactly the shape a lenient scorer produces. The 22.6% 8a failure rate is
+   independent evidence for that reading: nearly a quarter of the spans the scorer thought sufficient
+   did not establish their row to a second reader.
 2. **T4's two `R6a` doubts are confirmed, not merely inherited.** T4 predicted that span
    self-containment would fail item 8a and that T5 should *enforce* rule 2 rather than tolerate it.
    T5 enforced it — via the 8a pass, which is the governed instrument for exactly this — and every
@@ -599,7 +633,38 @@ must use `sonnet` for all 30 of its dispatches or the 18 verdicts are not compar
 ### 7.7 What T5 did land
 
 `cli/tests/skills_valid.rs::spec_length_retention_verdicts_are_complete_and_quoted` and its four
-companion unit tests, green. The six invalidated verdicts **all passed** that mechanical check over
-546 rows before 8a rejected them — which is the check working exactly as item 8 says it should:
-*"it asserts well-formedness, never judgement."* A green there was never a claim that a verdict was
-right, and this run is the demonstration.
+companion unit tests, green. **Five of the seven scoring passes satisfy that mechanical check over
+all 91 rows; `4a73ef` attempt 2 does not** (§7.8). The five that do are the check working exactly as
+item 8 says it should: *"it asserts well-formedness, never judgement."* A green there was never a
+claim that a verdict was right, and this run is the demonstration — in both directions, since the one
+file that fails the mechanical check would have been caught by it had it ever been in `retention/`.
+
+### 7.8 Corrections review found in this section
+
+Recorded rather than silently applied, because §7 is the record behind an escalation.
+
+1. **`4a73ef` attempt 2 violates item 8's no-shared-span rule, and §7.7 originally claimed all six
+   verdicts passed the mechanical check.** The span *"returns all 8 files — none of those literals
+   survives anywhere."* is cited under both `skill-stickiness-16` and `-89`. **The claim was
+   asserted, not machine-verified**: the walk test ran against the six *attempt-1* verdicts while
+   they were in `retention/`, and the `R6` re-run replaced `4a73ef` afterwards without the test being
+   re-run. Then everything moved to `invalidated/`, where no test reads it. That is the
+   green-having-verified-nothing failure mode this corpus keeps rediscovering, committed by the task
+   that landed the check. The defect straddles the shard boundary (row 16 is in shard 1, row 89 in
+   shard 2), so **no single scorer dispatch could have caught it** — only an assembled-file check,
+   which is precisely what item 8's completeness rule is for. It changes no disposition: the file was
+   already invalidated by 8a, and now fails item 8 as well.
+2. **"13 scorer dispatches" was wrong; it is 14**, and it contradicted deviation 9's own arithmetic
+   in the same section. Corrected in §7.2 and §7.5.
+3. **"26 of 106 adjudicated rows (25%)" was wrong; it is 24 of 106 (22.6%).** The 26 substituted
+   attempt 1's superseded count for attempt 2's while keeping a denominator that presumes attempt 2 —
+   a figure computed from data `R6` had explicitly superseded. The probability argument moves from
+   0.6% to 1.0% and is unaffected in substance.
+4. **The row-failure table was computed over attempt 1 and had three wrong denominators.**
+   `-05` is 2/5 not 2/4 (`d25798` samples it too, its dropped rows falling after ledger position 5),
+   `-10` is 2/4 not 3/4, and `-80` is 1/4 not 2/4 — the last two because attempt 2 establishes rows
+   attempt 1 did not. The `-55` and `-65` figures of 4/4, which carry the structural argument, are
+   unchanged.
+5. **The raw 8a output was not preserved.** Now committed under `invalidated/adjudication/`; see
+   §7.2. Every figure in §7.3 is recomputable from it, which is what makes corrections 3 and 4
+   checkable rather than another assertion.

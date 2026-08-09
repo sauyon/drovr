@@ -21,10 +21,16 @@ immediate `*.json` children of `retention/` and will not see any of this. Neithe
 
 | file | what it is |
 |---|---|
-| `<id>.json` | an assembled verdict, item-8 well-formed, item-8a **failed** |
+| `<id>.json` | an assembled verdict, item-8a **failed** |
 | `parts/<id>-<k>.json` | the two scorer shards it was concatenated from (item 10) |
+| `adjudication/<id>-<attempt>.json` | the raw item-8a calls: each sampled row id beside the adjudicator's own `establishes` |
 | `4a73ef.attempt-1.json` | the first scoring pass of `4a73ef`, replaced by the `R6` whole re-run |
 | `parts/4a73ef-<k>.attempt-1.json` | that first pass's shards |
+
+**Five of the seven passes are item-8 well-formed. `4a73ef.json` — attempt 2 — is not**: it cites one
+span under two rows (`skill-stickiness-16` and `-89`), which item 8 forbids outright. It was found by
+review, not by the check that exists for it, because the check reads `retention/` and this file never
+entered it. `../RESULTS.md` §7.8 records that honestly, including whose fault it is.
 
 `4a73ef.json` is **attempt 2** — the `R6` re-run. It failed item 8a as well, on four of eighteen
 sampled rows against attempt 1's six, with sixteen of the eighteen sampled rows carrying different
