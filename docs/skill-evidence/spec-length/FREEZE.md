@@ -139,7 +139,7 @@ candidate arm is `S1`, the mandated rewrite — beating `S0` is not an achieveme
 | `docs/skill-evidence/arms/spec-length/S0.md` | `db89be9ee06913386afcb6f1053597fdb9728a3a` | `370e211174fcb23cfc48a9732fc528754e9b02c6` | 2026-08-06 |
 | `docs/skill-evidence/arms/spec-length/S1.md` | `bb0d5cdcf2903e9d47e705820911a2464c73ab22` | `a9eef3a3de9303213cce4a689dee3133f75c2ac8` | 2026-08-08 |
 | `docs/skill-evidence/arms/spec-length/S2.md` | `8126b24fabadf3aff9391afd132f79676a288459` | `6352ea1b65be6fc0c3039577234844b98db575c9` | 2026-08-08 |
-| `docs/skill-evidence/arms/spec-length/S3.md` | `21a3467ab41fe978a27e662f0b095127534da831` | `6352ea1b65be6fc0c3039577234844b98db575c9` | 2026-08-08 |
+| `docs/skill-evidence/arms/spec-length/S3.md` | `978f4c46c545e7d0df09158ad9cbfeca550c3eca` | `6a56a21f676c33f58a3936adaa25ca1d97129fee` | 2026-08-08 |
 
 ## Who appends what, and when
 
