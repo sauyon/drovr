@@ -679,13 +679,14 @@ Recorded rather than silently applied, because §7 is the record behind an escal
    item-8 rule set over all seven files rather than by counting. **Recorded because it is the third
    time in this section that a figure was written before it was checked** — the first two are
    corrections 3 and 4 — and the pattern is more useful to a later reader than the digit is.
-7a. **A fourth figure was computed from attempt 1 and survived three correction rounds.** §7.3's
-   multi-line-span check cited 8/10 and 72/96 — attempt 1's numbers, whose 80 passes and 26 failures
-   are the superseded headline in disguise. Over the operative six it is 7/7 and 75/99. Correction 3
-   fixed the headline and did not sweep the paragraph four sentences below it, and rounds 2 and 3
-   both certified §7.3 before round 3 caught this. **Every figure in §7.3 has now been recomputed
-   from `adjudication/` once more, together rather than one at a time**, which is what should have
-   happened at correction 3.
 7. **`invalidated/README.md` kept the superseded figures** after §7.3 was corrected: 26 of 106, 25%,
    and `0.75^18` ≈ 0.6%. A correction applied to one file and not its sibling leaves the tree
    asserting both. Now aligned to 24 of 106, 22.6% and ≈ 1.0%.
+8. **A fourth figure was computed from attempt 1 and survived two correction rounds.** §7.3's
+   multi-line-span check cited 8/10 and 72/96 — attempt 1's numbers, whose 80 passes and 26 failures
+   are the superseded headline in disguise. Over the operative six it is 7/7 and 75/99, and the text
+   now also says that seven pairs is too small a sample to lean on. Correction 3 fixed the headline
+   and did not sweep the paragraph four sentences below it; **review round 2 then recomputed §7.3
+   and certified it, missing this line too**, and round 3 caught it. **Every figure in §7.3 has now
+   been recomputed from `adjudication/` in one pass rather than one at a time**, which is what
+   should have happened at correction 3.
