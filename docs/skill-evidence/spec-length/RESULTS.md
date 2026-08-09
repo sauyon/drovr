@@ -3,8 +3,8 @@
 **Run:** `spec-length-ab` · **Branch:** `drovr/spec-length-ab`
 
 **This file was opened by T4, not T7, and holds only what T4 owns: the raw measurements, the
-window-2 revision log, the freeze re-verification, the feasibility reading, and T4's own
-deviations.**
+window-2 revision log, the freeze re-verification, the feasibility reading, T4's own deviations,
+and a closing note of what T7 still owes.**
 `PROTOCOL.md`'s preamble anticipated T7 creating it, and the plan lists it as a T7 interface — but
 the plan's own T4 procedure directs the generated specs' `wc` numbers and the feasibility reading
 here, and `PROTOCOL.md`'s window-2 revisions were owed a log in a file that did not yet exist. T4
