@@ -1,0 +1,396 @@
+================================================================================
+lock-green.txt — drovr#80 watched NOT failing (run run-lock-fork-race, T7)
+================================================================================
+
+WHAT THIS IS
+  The other half of `lock-red.txt`. That file recorded drovr#80 failing, on the
+  record, before the fix existed: a deterministic mechanism test that failed
+  10/10, and ten parallel suite runs that emitted `acquire_run_lock`'s refusal
+  307 times and failed 18 tests. This file records the same two measurements,
+  same commands, same machine, after it.
+
+  Read the two together or neither is worth much: a green test nobody watched
+  fail proves nothing, and a red one nobody watched go green proves only that a
+  defect was once real.
+
+  The fix is one line — release is an explicit `flock(LOCK_UN)` in
+  `crate::flock::FileLock`'s `Drop`, never a bare drop of the `File`. §5 removes
+  that line again and watches the red come back, so the green below is shown to
+  be load-bearing rather than merely present.
+
+WHAT IT PROVES — AND WHAT IT DOES NOT
+  Proves (§1): a drovr advisory file lock is released when its guard drops, even
+  while a second fd shares the open file description. `LOCK_UN` names the
+  description itself, so it does not care how many fds still point at it. The
+  test that failed 10/10 in `lock-red.txt` §1 now passes 10/10, with its body
+  unchanged and its `#[ignore]` removed.
+
+  Proves (§2): in ten parallel runs of the whole suite, the two `pane_close`-
+  counting tests pass in 10/10, and `acquire_run_lock`'s refusal message appears
+  ZERO times. Red side: 22-41 occurrences per run, 307 total, mean 31. That is
+  the criterion with real statistical power — ~310 expected occurrences going to
+  0 — and it is the one that cannot pass by luck, which is why it counts the
+  MESSAGE and not the failures (`lock-red.txt` §2's ⭐).
+
+  Does NOT prove: that the parallel suite is deterministic in general. It was
+  fully green in all ten runs here, but the stub-exec/`ETXTBSY` defect on
+  `with_stub_herdr` (`cli/src/herdr.rs:2108`, panicking at `:2131`) is a
+  SEPARATE defect in the same fork-window family and is untouched by this work.
+  It is intermittent: zero occurrences in `lock-red.txt`'s final ten and zero in
+  these ten, but two in the earlier set (`lock-red.txt` WHEN / WHERE). No lock is
+  involved and `File::unlock()` does nothing for it — exactly as
+  `docs/test-isolation/race-green.txt:113-124` said for drovr#80 itself, from the
+  other side. Ten green runs are not a claim that it is gone.
+
+  Does NOT prove: anything about the SIGKILL residual. A holder killed without
+  unwinding between a `fork` and that child's `exec` still leaves the lock held
+  until the child execs. `Drop` runs on every ordinary exit and on panic-unwind,
+  so that is the only gap left; it is documented in `cli/src/phase.rs`'s
+  `acquire_run_lock` doc comment and deliberately NOT closed here — closing it
+  would need the bounded retry this design rejects (plan.md q4=no).
+
+  Does NOT prove: any production frequency, and this run re-measured none. The
+  standalone fork-based reproducer's 3949 / 24000 (~16%) is the TRACKER's number
+  (forge.ko.ag/drovr/drovr#80); the brainstorm phase's re-run, 4582 / 24000
+  (~19%), is `spec.md:25-37`'s. Neither belongs to this repo and neither was
+  taken here. Attribute them accordingly; never to this run.
+
+  Does NOT prove: that the lock still EXCLUDES — not on its own. §1's test only
+  asserts that a re-claim succeeds, so it would pass against a lock that had
+  stopped locking altogether. Exclusion is asserted by
+  `flock::tests::a_live_holder_is_reported_as_none` and
+  `phase::rehydrate_tests::two_rehydrates_of_one_run_cannot_both_launch`, both
+  green in all ten runs (§2). Read them as a pair; neither is sufficient alone.
+  §5's mutation check is what makes the pair meaningful.
+
+WHEN / WHERE
+  recorded:    2026-08-08
+  worktree:    /home/sauyon/devel/drovr/.drovr/wt/run-lock-fork-race
+  branch:      drovr/run-lock-fork-race
+  head sha:    49a9eba932d684ca6a8fadf1dcfd47e39ed57309 (= T6's head, = T7's
+               review base `task-7-base.sha`). Every measurement below was taken
+               at that commit with a clean tree. T7 changes no code — this file
+               and `lock-red.txt`'s closing cross-link are its whole diff — so
+               the code these numbers describe is the code that ships.
+  toolchain:   export PATH=/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin:\
+/nix/store/l3gishxdaxhnaxczyw0jw7dcy9p4rhcs-rustc-1.97.0/bin:$PATH
+               (cargo 1.97.0 / rustc 1.97.0)
+  machine:     Linux 7.1.5-arch1-2, glibc; local worktree, NOT the nix sandbox.
+               Same machine as `lock-red.txt`. Other drovr worktrees had live
+               agents on this box throughout, as they did for the red set — the
+               load that produced 22-41 refusals per run there is still present
+               here, and produced 0.
+
+HOW TO REPRODUCE
+  cd cli
+  # §1 — the mechanism, deterministic, exits 0. NOTE: no `--ignored` now.
+  cargo test --offline --bin drovr a_dropped_run_lock_releases_even_when_its_description_is_shared
+  # §2 — the population; `--nocapture` is MANDATORY (see below)
+  cargo test --offline --no-fail-fast -- --nocapture 2>&1 | tee run-N.log
+  grep -c 'another drovr command is moving run' run-N.log            # refusals
+  grep -o "moving run '[^']*'" run-N.log | sort -u | wc -l           # run names
+
+  `--nocapture` is not optional and criterion (b) is worthless without it. A
+  refused reap does not fail a test — it warns and carries on
+  (`cli/src/code_review.rs:1577-1578`, `cli/src/phase.rs:2530-2531`), and
+  `cargo test` captures a PASSING test's stdout and stderr. Without it the
+  refusal cannot appear whether or not the bug is firing, and a zero would mean
+  nothing. Every count below is over the merged `2>&1` stream.
+
+
+--------------------------------------------------------------------------------
+§1  THE MECHANISM — VERBATIM GREEN
+--------------------------------------------------------------------------------
+
+  $ cargo test --offline --bin drovr a_dropped_run_lock_releases_even_when_its_description_is_shared
+
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 1.93s
+       Running unittests src/main.rs (target/debug/deps/drovr-b62291024005c9ca)
+
+  running 1 test
+  test phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 734 filtered out; finished in 0.00s
+
+  $ echo $?
+  0
+
+  Ten consecutive invocations, matching `lock-red.txt` §1's ten:
+
+    run  1: ok    run  2: ok    run  3: ok    run  4: ok    run  5: ok
+    run  6: ok    run  7: ok    run  8: ok    run  9: ok    run 10: ok
+
+    RATIO: 10 / 10 passed. Against 10 / 10 FAILED, every one `WouldBlock`, in
+    `lock-red.txt` §1.
+
+  THE BODY IS UNCHANGED and the `#[ignore]` is gone — `lock-red.txt` §1's
+  closing requirement. The old command now selects nothing, which is itself the
+  evidence that the `#[ignore]` came off:
+
+  $ cargo test --offline --bin drovr -- --ignored a_dropped_run_lock_releases_even_when_its_description_is_shared
+  running 0 tests
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 735 filtered out; finished in 0.00s
+
+  There is no scheduling in that test: no fork, no sleep, no second thread, no
+  external binary — `try_clone` stages the second fd that `fork()` produces in
+  production. So this result is a property of the test's construction and cannot
+  be perturbed by machine load or by a sandbox's process restrictions. That is
+  what makes it the mechanism half; §2 is the population half.
+
+
+--------------------------------------------------------------------------------
+§2  THE POPULATION — TEN PARALLEL SUITE RUNS
+--------------------------------------------------------------------------------
+
+  $ for i in $(seq 1 10); do cargo test --offline --no-fail-fast -- --nocapture; done
+
+  Unit binary (`--bin drovr`) in the first four columns; the 8 integration
+  binaries were `ok` in all ten runs — verified per run, every `test result:`
+  line after the first, 9 of 9 `ok` each time.
+
+    run   passed  failed  ignored  refusals  run names   all 9 binaries
+      1      735      0       0        0         0            758
+      2      735      0       0        0         0            758
+      3      735      0       0        0         0            758
+      4      735      0       0        0         0            758
+      5      735      0       0        0         0            758
+      6      735      0       0        0         0            758
+      7      735      0       0        0         0            758
+      8      735      0       0        0         0            758
+      9      735      0       0        0         0            758
+     10      735      0       0        0         0            758
+    ------------------------------------------------------------------
+    total               0                0
+
+  RATIO: 0 / 10 runs emitted the refusal. 0 / 10 runs failed any test.
+  Ten runs green, against ZERO green runs in `lock-red.txt` §2.
+
+  Both counting methods agree, run for run, as they did in the red set: `grep -c`
+  (lines) and `grep -o | wc -l` (occurrences) are both 0 in all ten.
+
+  ⭐ THE REFUSAL COUNT IS THE RESULT. 307 → 0. The red side's failures were a
+  lossy ~6% sample (18 / 307) of the fault; the message count is the fault
+  itself, and it is gone. The 18 failures went with it.
+
+  ⚠ `FAILED` DOES appear in these logs and is NOT a test failure. It is drovr's
+  own phase-status text in a fixture's captured stdout ("…marked FAILED, restart
+  the one you want…"). Match `^test .* \.\.\. FAILED` or `test result: FAILED`,
+  not the bare word — both are 0 in all ten runs. A bare `grep -l FAILED` hits
+  all ten logs and means nothing.
+
+
+--------------------------------------------------------------------------------
+§3  THE PLAN'S BAR, CRITERION BY CRITERION
+--------------------------------------------------------------------------------
+
+  plan.md T7 item 3 set three criteria and said not to round the result up or
+  down. Taken one at a time, against `lock-red.txt` §5's red baselines:
+
+  (a) THE THREE NAMED TESTS PASS IN ALL TEN.  MET — 10/10 each.
+
+        test                                                     red      green
+        code_review::…::a_finished_panel_reaps_its_reviewers      7/10 F   10/10 ok
+        code_review::…::a_finished_panel_sweeps_…_respawn_orphaned 9/10 F  10/10 ok
+        phase::rehydrate_tests::rehydrate_refuses_a_phase_whose_
+          launch_never_completed                                  1/10 F   10/10 ok
+
+  (b) THE REFUSAL STRING APPEARS ZERO TIMES.  MET — 0 across all ten runs
+      (§2). Red: 307. Note the baseline to compare against is `lock-red.txt`
+      §2's 22-41/run, NOT plan.md:100-107's single lighter-load run of 21;
+      `lock-red.txt` §5 flags that, and the bar is zero either way.
+
+  (c) ONLY THE STUB-EXEC FAILURE PERMITTED.  MET VACUOUSLY, and this is the one
+      place the result is BETTER than the bar rather than equal to it: the
+      permitted failure did not occur either. `grep -c 'the stub herdr was never
+      executed'` is 0 in all ten runs. Nothing was absorbed under (c).
+
+      ⚠ `lock-red.txt` §5 raised a DEPARTURE for the driver on (c) — plan.md
+      names one test for the stub-exec mode but it was seen in two. It is moot
+      for this measurement, because neither test failed in any of the ten runs.
+      It is NOT resolved as a question: the defect is intermittent, so a future
+      run may still meet it in either test. Left open, deliberately.
+
+  THE TIGHTENING `lock-red.txt` §5 OFFERED, taken up. Three further tests failed
+  on a bare `WouldBlock` across the red twenty and are not on plan.md's (a) list.
+  This fix should close all three, so they were checked; all are 10/10 green:
+
+        phase::reap_tests::reaping_a_phase_twice_closes_one_pane          10/10 ok
+        phase::rehydrate_tests::two_rehydrates_of_one_run_cannot_both_launch
+                                                                          10/10 ok
+        phase::rehydrate_tests::rehydrate_uses_the_recorded_profile_not_
+          the_servers_environment                                         10/10 ok
+
+  THE HONEST SUMMARY, in the words plan.md asked for: criteria (a) and (b) hold,
+  and not even the `ETXTBSY` failure (c) permits remained. The parallel suite was
+  fully green in ten consecutive runs. That is stronger than the bar — and it is
+  still NOT the claim "the parallel suite is deterministic", because (c)'s defect
+  is intermittent and ten quiet runs do not retire it. See WHAT IT DOES NOT PROVE.
+
+
+--------------------------------------------------------------------------------
+§4  SERIAL, BUILD, DOC, LINT, AND THE SOLE-DOOR GREP
+--------------------------------------------------------------------------------
+
+  $ cargo test --offline -- --test-threads=1
+
+  test result: ok. 735 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.51s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.80s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.04s
+  test result: ok.   2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.07s
+  test result: ok.   6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.87s
+  test result: ok.   2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.06s
+
+  $ echo $?
+  0
+
+  758 passed, 0 failed, 0 ignored — plan.md T7 item 1's number exactly, and its
+  arithmetic reconciles:
+
+    754  baseline (`lock-red.txt` §4's serial total, which was 754 + 1 ignored)
+     +1  T1's mechanism test, `#[ignore]` removed at T3
+     +3  T2's `flock::tests`
+    ---
+    758
+
+  ⚠ TWO CORRECT TOTALS, DIFFERENT SCOPES — do not treat one as refuting the
+  other. 758 is the sum across all NINE test binaries. 735 is the unit binary
+  (`--bin drovr`) alone, which is what the first `test result:` line reports and
+  what §2's table columns are: 731 pre-existing + 1 + 3. Both appear in this
+  run's records and both are right.
+
+  $ cargo build --offline          # after `touch src/main.rs` — an incremental
+                                   # no-op proves nothing
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.04s
+  — 0 warnings, unchanged from the plan's baseline and from `lock-red.txt` §4.
+
+  $ rm -rf target/doc && cargo doc --offline --no-deps --document-private-items
+  warning: unresolved link to `tests::crate_reads_the_environment_only_through_the_shim`
+  warning: unresolved link to `crate::test_env::TestEnv`
+  warning: unclosed HTML tag `run`
+  warning: unclosed HTML tag `task`
+  warning: `drovr` (bin "drovr" doc) generated 4 warnings
+  — exactly the 4 pre-existing warnings, diffed line for line against
+  `lock-red.txt` §4 and plan.md:39-44. None new, none from `flock.rs`,
+  `phase.rs`, `review.rs` or `code_review.rs`. The bar is "still exactly these
+  4", not "zero".
+
+  ⭐ CLIPPY, WHICH T2-T6 COULD NOT RUN, RUNS. Every task from T2 on recorded
+  `cargo clippy` as blocked by a pre-existing `E0514` — `clap_derive` and
+  `serde_derive` in `cli/target` built by rustc 1.97.1 while the pinned
+  toolchain is 1.97.0 — and carried it forward as the run's largest unverified
+  surface. The cause is a toolchain SPLIT, not a code defect: the pinned
+  `rustc`/`cargo` are 1.97.0 (2d8144b78) but `clippy-driver` on `PATH` is 1.97.1
+  (8bab26f4f6). Running clippy with its OWN matched toolchain and a fresh target
+  dir sidesteps the mismatched artifacts entirely:
+
+  $ CARGO_TARGET_DIR=<fresh> cargo clippy --offline --all-targets   # no pinned PATH
+
+    0 errors, 7 warnings:
+      src/herdr.rs:1104     collapsible_if
+      src/review.rs:3164    manual_split_once
+      src/test_env.rs:526   collapsible_if
+      tests/e2e.rs:71,91,104  manual_split_once  (x3)
+      tests/web_nav.rs:83   ptr_arg
+
+  ALL SEVEN ARE PRE-EXISTING AND NONE IS IN THIS RUN'S DIFF. `herdr.rs`,
+  `test_env.rs`, `tests/e2e.rs` and `tests/web_nav.rs` are not touched by this
+  run at all (`git diff --name-only 180aa5ec..HEAD`). `review.rs` IS touched, but
+  its changed hunks are at 40-51, 1962, 2086-2127 and 4368-4457 — `:3164` (HTTP
+  response splitting) falls in none of them. Zero warnings in `flock.rs`,
+  `phase.rs` or `code_review.rs`. The run's lint gap is closed, and clean.
+
+  $ grep -rn "\.try_lock()" cli/ hooks/          # over TRACKED files
+  cli/src/flock.rs:56
+
+  One hit, the guard's own. Baseline was `phase.rs:1392` + `review.rs:2117`, so
+  this is the proof that `crate::flock` is the sole door. Match the CALL
+  `.try_lock()`, not the bare word: `phase.rs:1379,1404,1407` name
+  `File::try_lock` in prose, legitimately, and a bare-word grep reports those as
+  hits that are not defects. Restrict the grep to tracked files or use
+  `git ls-files` — `cli/target/doc/` contains generated HTML mirroring
+  `flock.rs:56`, and it is gitignored.
+
+
+--------------------------------------------------------------------------------
+§5  MUTATION CHECK — IS THE GREEN LOAD-BEARING?
+--------------------------------------------------------------------------------
+
+  A green test that passes is worth exactly as much as its ability to still
+  fail. The fix is one line, so the mutation is the sharpest one available:
+  comment out the explicit unlock in `FileLock::drop` — i.e. go back to
+  releasing by close, which is precisely drovr#80 — and re-measure.
+
+    // cli/src/flock.rs
+    fn drop(&mut self) {
+        // MUTATION: let _ = self.file.unlock();
+    }
+
+  (a) THE MECHANISM TEST GOES RED, with `lock-red.txt` §1's panic verbatim:
+
+        test phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared ... FAILED
+
+        panicked at src/phase.rs:11737:13:
+        the re-claim was refused with WouldBlock (another drovr command is moving
+        run 'lock-dup's panes around …) — dropping the `File` closed OUR fd, but a
+        close-based release does not release an open file description another fd
+        still shares, so the lock outlived its holder (drovr#80). Release has to
+        be an explicit unlock.
+
+      Same test, same body, same message as the red baseline. The only thing
+      that changed between 10/10 FAILED and 10/10 ok is that one line.
+
+  (b) THE POPULATION GOES RED TOO, back into the red set's measured band. One
+      parallel run under the mutation:
+
+        test result: FAILED. 731 passed; 4 failed; 0 ignored
+        refusals: 26        distinct run names: 12
+
+      26 refusals over 12 run names sits inside `lock-red.txt` §2's 22-41 over
+      9-14. The four failures name the fault from four directions:
+
+        code_review::tests::a_finished_panel_reaps_its_reviewers
+        flock::tests::a_shared_description_does_not_keep_the_lock_after_drop
+        phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared
+        review::tests::lock_records_our_pid_and_releases_on_drop
+
+      Note the last one: `server.pid`, not `run.lock`. T4 put `review.rs` on the
+      same guard, so ONE line governs BOTH locks — and removing it breaks both.
+      That is the module-level claim in `cli/src/flock.rs`'s doc, executed.
+
+  (c) THE MUTATION WAS REVERTED AND THE GREEN RE-CONFIRMED. `git checkout --
+      cli/src/flock.rs`; `git diff --exit-code` clean, tree clean, `Drop` back to
+      `let _ = self.file.unlock();`. An eleventh parallel run, after the revert:
+      735 passed, 0 failed, 0 refusals. This eleventh run is a post-mutation
+      control and is deliberately NOT counted among §2's ten.
+
+
+--------------------------------------------------------------------------------
+§6  TWO CORRECTIONS TO lock-red.txt, RECORDED HERE RATHER THAN THERE
+--------------------------------------------------------------------------------
+
+  `lock-red.txt` is T1's frozen evidence record. Two defects were found in it
+  after it was written; neither is repaired in place, because a baseline that is
+  edited after the fact is not a baseline. Both are recorded here instead.
+
+  (a) `lock-red.txt:35` SAYS "FIVE distinct tests failed on it across the ten
+      (§3 a-e)". It is FOUR. §3(e) says its two tests were seen in the EARLIER
+      ten-run set "not in this one", and §2's own table totals 18 failures =
+      9 (§3a) + 7 (§3b) + 1 (§3c) + 1 (§3d), reconstructing §2's per-run column
+      row for row. The "five" counts §3(e)'s tests, which that subsection
+      excludes by name. A reader following the §3 pointer may hit `:35` first;
+      §3 is the correct side.
+
+  (b) TWO LINE CITATIONS IN §3 HAVE DRIFTED, unavoidably — T6 edited doc comments
+      above both tests, and a frozen baseline legitimately freezes line numbers.
+      Corrected against this file's head sha:
+
+        §3(a) cites cli/src/code_review.rs:2515  →  now :2522
+        §3(b) cites cli/src/code_review.rs:2807  →  now :2829
+
+      `:2807` is the sharper trap: it now lands INSIDE the very doc comment that
+      cites §3(b), a loop that reads as a contradiction. The test functions
+      themselves are at `:2470` (sweep) and `:2813` (reap). Re-grep rather than
+      trust any of these — they have moved once already.
