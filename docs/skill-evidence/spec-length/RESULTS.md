@@ -16,6 +16,15 @@ and is not read by T5 or T6 at all. An arm column here would unblind the scoring
 opened this file before T7, which is exactly the leak the map exists to prevent. **T7 adds the arm
 column when it unblinds, and not before.**
 
+**This file is never shown to a scorer or an adjudicator, on the same footing as
+`blind-map.json`.** Withholding the arm column is not sufficient on its own: §3 tabulates all 18
+lengths grouped by fixture, and **length is precisely the leak channel `PROTOCOL.md` item 11 names
+as this experiment's real one**. A scorer holding this table can rank the six generations of its own
+fixture and form a prior on the arm under exactly the hypothesis being tested. Item 10 already lists
+what a scorer may be handed — the spec, its shard's ledger rows, the item-8 schema and the item-9
+definition — and this file is not on it. That list is the rule; this paragraph exists so nobody
+reaches for `RESULTS.md` thinking the arm column was the whole risk.
+
 ---
 
 ## 1. `PROTOCOL.md` revisions requiring a log here
@@ -104,6 +113,19 @@ it lives outside `retention/` precisely so nothing can mistake it for one, and n
 Under `R5` it is **descriptive, never a pass** — and note that under `R2` a 54/55 generation would
 **eliminate** its arm, since the gate is 230/230 with no partial credit.
 
+**T5's verdict for `f8729b` governs, and supersedes this reading.** `f8729b` is a `tui-dc-picker`
+generation, so T6 scores it again on the same instrument as part of the real measurement. When the
+two disagree — on `tui-dc-picker-01` or on any other row — **the T6 verdict is the one that counts,
+and this reading is superseded rather than reconciled with it.** The disagreement is recorded under
+`R6a` against `f8729b` and carried into the write-up; it is not grounds for a re-run under `R6`,
+which is a closed list this is not on. Pinned here because the reading was published *before* the
+scoring, and a rule written afterwards to settle a conflict is a rule chosen with the answer visible.
+
+**Note what a 54/55 would mean if it held.** Under `R1` the arm's dropped set is the union over its
+six generations, and under `R2` any drop eliminates — so a single absent row on one generation is
+enough to eliminate that arm at 229/230. This reading therefore already sketches an outcome for one
+arm. It decides nothing: it is n=1, unadjudicated, and superseded by T6 per the paragraph above.
+
 **The scorer was blind; the phase agent was not.** See deviation 1 below.
 
 **The arm is deliberately not named here.** It is in `blind-map.json` and T7 reads it there.
@@ -112,8 +134,9 @@ Under `R5` it is **descriptive, never a pass** — and note that under `R2` a 54
 
 ## 5. Deviations recorded by T4
 
-Three, none of them a `PROTOCOL.md` edit. **T10 repeats these alongside the four in `PROTOCOL.md`
-item 2.**
+Six, none of them a `PROTOCOL.md` edit. **T10 repeats these alongside the four in `PROTOCOL.md`
+item 2**, which makes ten in the write-up's complete list. Deviation 4 is the serious one and is an
+**escalation, not a closed item**.
 
 1. **The feasibility generation could not be chosen "without consulting `blind-map.json`", because
    the agent that chose it had just written that file.** The plan asks T4 to pick one
@@ -150,6 +173,75 @@ item 2.**
    directory is what stops a feasibility reading from being counted as a retention verdict.
    `spec_length_retention_verdicts_are_complete_and_quoted` (T5) reads the immediate `*.json`
    children of `retention/` and will not see it.
+
+4. **T4 published the id assignment a second time, in a commit message, and `PROTOCOL.md` item 6
+   says it may be recorded *only* in `blind-map.json`. This is the most serious thing on this page
+   and it cannot be undone.**
+
+   **What happened.** Commit `b03cba02183fb0eaf3e3a9d31e2fb18b75c861d4`'s message states the
+   derivation in full: the pool is ordered by `sha256("<id>|spec-length-ab/T4/draw-1")` ascending
+   and assigned in that order to the triples in canonical arm-major order (`S1`, `S2`, `S3`; within
+   an arm `skill-stickiness`, `tiered-review`, `tui-dc-picker`; within a fixture sample 1 then 2).
+   That is a complete re-encoding of the map. T4's own review reconstructed all 18 cells from the
+   commit message alone and got a byte-for-byte match.
+
+   **Why it was written.** To make the draw *auditable* — so a reader could confirm the assignment
+   was not steered toward an arm, rather than take T4's word. The reasoning was right and the
+   channel was wrong: an auditor needs the derivation, and a scorer must not have it, so it belonged
+   inside `blind-map.json` (or a sibling held to the same never-shown rule), not in `git log`.
+
+   **The draw, since this is now the place it is recorded.** One attempt, salt
+   `spec-length-ab/T4/draw-1`, no redraw. The declared acceptance criterion was item 14a's: at
+   sample 1, across the three fixtures, neither `S1` nor a candidate may hold the lexicographically
+   smaller id — position `A` in T9's pairing — in all three `S1`-vs-candidate pairings. Draw 1 came
+   out **1–2 against one candidate and 1–2 against the other**, mixed in both, so the criterion was
+   satisfied on the first attempt. **The redraw fallback was declared but never exercised, and that
+   matters:** re-drawing *until* the arms come out balanced would make the assignment conditional on
+   the arm–id correlation, which is itself a function of the arm and so the very thing item 14a
+   forbids. Had it fired, the redraw would have been a deviation to record here, not a reset.
+   `cli/tests/skills_valid.rs::spec_length_id_assignment_does_not_track_the_arm` pins the outcome.
+
+   **What it costs.** The draw itself remains item-14a compliant: the hash ordering is genuinely
+   independent of the arm, and no property of an id is a *function* of its arm. What is lost is the
+   operational guarantee. For anyone holding the commit log, the arm is now computable from the id —
+   so `blind-map.json` being withheld no longer withholds the assignment, and item 11's
+   *"label-blind, not arm-blind"* understates the exposure for this run.
+
+   **It is not repairable.** `FREEZE.md` forbids rewriting history on this branch, and T10 has to be
+   able to check the ordering. Re-drawing under a fresh salt does not help either: the old id↔spec
+   pairing is already in history under the old filenames, so a remap would leave two recoverable
+   mappings instead of one. `R6` does not license regeneration for this — it is not a probe failure,
+   and its re-run list is closed.
+
+   **What is asked of the tasks after this one.**
+
+   - **T5 and T6:** a scorer is handed the spec, its shard's ledger rows, and item 8/9's text —
+     nothing else, and no reason to read the repository. Do not hand a scorer anything that invites
+     it to consult `git log`, and do not paste the salt into a prompt or a commit message.
+   - **T10:** report this as a stated limitation on the blinding, next to item 11's channel, and say
+     plainly that a determined reader of this branch's history could have unblinded any generation.
+   - **The driver:** whether this is severe enough to void the run and restart under an unpublished
+     salt is **not T4's call**, and T4 has not made it. The run continues as specified; this entry
+     is the escalation.
+
+5. **The 18 generated files' mtimes were normalised to a single timestamp after they were written.**
+   They had been written in three contiguous blocks of six with multi-minute gaps between them, and
+   the blocks were the arms in order — `ls -l` recovered the exact three-way partition, which is
+   the entire structure a between-arm comparison needs. Git does not track mtimes, so a fresh clone
+   was never affected; but T5 and T6 score **in this worktree** and their scorer subagents can run
+   `ls`. All 18 were set to `2026-08-08T00:00:00Z` with `touch -d`. **Content is untouched**: the
+   `git hash-object` digest over all 18 files is identical before and after, and every `wc` number
+   in §3 was taken before the change and re-verified after. Recorded so that uniform mtimes are not
+   later misread as evidence that the specs were written in one batch.
+
+6. **Every generated spec opens with a `# ` title, and item 5 says the file holds "only the spec
+   body — no header".** All 18 begin with a markdown title naming the fixture's subject. Read
+   literally that is non-compliant. It is **not** an arm channel: the title is byte-identical across
+   all six generations of each fixture, so it carries no arm signal, and the fixture's subject is
+   ordinary vocabulary throughout a spec about it. Nor is it the probes' fault — item 5's template
+   never tells a probe this; the sentence sits in the surrounding commentary. And T4 could not have
+   fixed it without editing the raw measurement, which is the one repair this run forbids. Recorded
+   as a drafting gap in item 5 rather than smoothed over.
 
 ---
 

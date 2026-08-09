@@ -2609,6 +2609,10 @@ fn spec_length_blind_map_path() -> PathBuf {
     spec_length_dir().join("blind-map.json")
 }
 
+/// The same file, spelled repo-relative for `git rev-parse <commit>:<path>`,
+/// which resolves against the repository root rather than the filesystem.
+const SPEC_LENGTH_BLIND_MAP_REPO_PATH: &str = "docs/skill-evidence/spec-length/blind-map.json";
+
 /// The per-generation retention verdicts (T5/T6). Absent until T5.
 fn spec_length_retention_dir() -> PathBuf {
     spec_length_dir().join("retention")
@@ -2706,11 +2710,22 @@ fn is_token_byte(b: u8) -> bool {
 ///
 /// **Whole-token, not substring, and that is the difference between a leak check
 /// and a check that forces curation.** The arms are named `S1`/`S2`/`S3`, and a
-/// plain substring search for `S3` would also fire on `S3 bucket`, `RFC-S3x` or
-/// any identifier that happens to contain it. A generated spec is *evidence*: the
+/// plain substring search for `S3` would fire on `RFC-S3x`, `TS3`, or any
+/// identifier that merely contains it. A generated spec is *evidence*: the
 /// protocol forbids retrying a generation because its output looks wrong, so a
 /// check that can fire on legitimate prose is a check whose only available fix is
 /// the one thing this run may not do. Token boundaries keep it aimed at labels.
+///
+/// **Two residual behaviours, stated because neither is obvious from the code.**
+/// A bare `S3` surrounded by spaces IS a token and does fire — `S3 bucket` in
+/// ordinary prose would be reported as a leak. That is accepted: the trade is
+/// deliberate and the false positive is discoverable, whereas a missed label is
+/// not. And because `-` counts as a token byte, `arm-S3` and `S3-style` do NOT
+/// fire — hyphenated compounds are common enough in technical prose that
+/// excluding them costs less than it buys, given that **no probe prompt in this
+/// run contains an arm label at all**. This check is a backstop against a channel
+/// that is already closed at the source, not the only thing standing in front of
+/// it.
 ///
 /// `needle` is assumed ASCII, which every token this file searches for is;
 /// `match_indices` then only ever reports char boundaries, so indexing the
@@ -2954,6 +2969,12 @@ fn spec_length_generations_are_unlabelled_and_cover_the_design() {
         // The id: item 5 says the file holds the spec body and nothing else, and
         // an id in the text would let a scorer join two shards of the same spec
         // — or read `blind-map.json` against it.
+        //
+        // Substring here, token above, and the asymmetry is deliberate: an arm
+        // label is a real English-adjacent string that legitimate prose can
+        // contain, while a 6-hex pool token is opaque and has no business
+        // appearing at all — including nested inside a longer hex run, which is
+        // what a pasted path or SHA would look like.
         if let Some(at) = text.find(id.as_str()) {
             leaks.push(format!(
                 "  {}:{} carries its own id `{id}`",
@@ -3013,8 +3034,23 @@ fn spec_length_generations_are_unlabelled_and_cover_the_design() {
 /// id's *value*, its *lexicographic rank* and its *position in the pool listing*
 /// from being a function of the arm; a test can only refuse the specific
 /// degenerate outcomes, not prove the assignment was drawn independently. What it
-/// pins is the one that would actually bite T9, on the one axis T9 reads. A green
-/// here does not certify the draw — `RESULTS.md` records how it was made.
+/// pins is the one that would actually bite T9, on the one axis T9 reads —
+/// **the third property, position in item 6's listing, is not checked here at
+/// all.** An assignment handing `S1` pool positions 1–6, `S2` 7–12 and `S3` 13–18
+/// would pass this test outright unless it happened to sweep lexicographically
+/// too. A green here does not certify the draw; `RESULTS.md` §5 records how it
+/// was made and is the thing to read.
+///
+/// **A sweep is not proof of a dependent draw, and re-drawing is not free.** With
+/// three fixtures and two outcomes each, an honestly independent assignment
+/// sweeps position `A` with probability 1/4 per candidate — so this test firing
+/// means "the outcome item 14a refuses has occurred", not "the draw was rigged".
+/// It still has to fail: T9's guarantee is about the outcome, not the intent.
+/// But note what the repair costs. Re-drawing *until* the arms come out balanced
+/// makes the assignment conditional on the arm–id correlation, which is itself a
+/// function of the arm — the thing item 14a forbids — so a redraw is a deviation
+/// `RESULTS.md` must record, not a reset. T4's draw was mixed on the first
+/// attempt and no redraw was made.
 ///
 /// Scope is **sample 1** across the three fixtures, because that is exactly what
 /// T8 and T9 run on (item 14, item 14a). Sample 2 is never paired.
@@ -3090,12 +3126,31 @@ fn spec_length_id_assignment_does_not_track_the_arm() {
 /// join last for the same reason, and T7 may only join once all 18 verdicts exist.
 /// Prose cannot enforce that; the commit graph can.
 ///
+/// **The ordering alone would not have been enough, so the map's BYTES are
+/// pinned too.** An earlier draft of this check resolved only the map's
+/// *introducing commit*. That leaves the whole attack open: editing
+/// `blind-map.json` after the verdicts land — permuting which arm each id belongs
+/// to, to fit the results — does not change which commit introduced the path, so
+/// the descent check stays green, and
+/// [`spec_length_generations_are_unlabelled_and_cover_the_design`] only asks
+/// whether the map is *a* valid 3x3x2 covering, which a permutation still is.
+/// Nothing else pins it: unlike the ledger and the arms, `blind-map.json` has no
+/// `FREEZE.md` row. So this check also re-hashes the working file against the
+/// blob its introducing commit recorded. The map is written once and never
+/// legitimately changes.
+///
 /// **An empty `retention/` is a pass, and it is the correct state until T5** —
 /// the same shape as [`freeze_precedes_every_candidate_arm`] tolerating zero arms.
 /// It is still never vacuous: the map must itself resolve to an introducing
-/// commit, which is a real fact about a real file from T4 onward, and an
-/// uncommitted map is precisely what would make every descent check below it
-/// unanswerable.
+/// commit and still hash to its original bytes, both real facts about a real file
+/// from T4 onward, and an uncommitted map is precisely what would make every
+/// descent check below it unanswerable.
+///
+/// **What it still cannot see.** The same three routes
+/// [`freeze_precedes_every_candidate_arm`] documents — a cherry-picked commit, a
+/// rename-plus-rewrite, retyped text — apply here unchanged, because this is the
+/// same reachability machinery. The content pin closes the after-the-fact edit;
+/// it does not turn a reachability check into a proof.
 #[test]
 fn spec_length_blind_map_precedes_every_retention_verdict() {
     assert!(
@@ -3129,6 +3184,40 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         ),
     };
 
+    // The map still holds the bytes it was committed with. See this test's doc
+    // comment: without this, a post-hoc permutation of the assignment passes
+    // every other check in the run.
+    let at_commit = format!("{}:{SPEC_LENGTH_BLIND_MAP_REPO_PATH}", map_commit.as_str());
+    let out = git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "rev-parse".to_string(),
+        at_commit.clone(),
+    ])
+    .unwrap_or_else(|how| panic!("cannot ask git for `{at_commit}`: {how}"));
+    assert!(
+        out.status.success(),
+        "`git rev-parse {at_commit}` failed: {}\n\n\
+         This is NOT a finding about the map — it is this check reporting that it could not \
+         read the blob its introducing commit recorded.",
+        git_stderr(&out),
+    );
+    let committed = GitObjectId::parse(String::from_utf8_lossy(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("`git rev-parse {at_commit}` printed {e}"));
+    let on_disk = git_hash_object(&map_path);
+    assert_eq!(
+        on_disk.as_str(),
+        committed.as_str(),
+        "{} no longer holds the bytes commit {} introduced.\n\n\
+         The arm<->id assignment is written once, before any probe, and never legitimately \
+         changes. A map edited after the verdicts exist is a map that could have been \
+         edited to fit them — and permuting arms across ids leaves the covering valid, the \
+         introducing commit untouched, and every other check in this run green. This is \
+         the only thing that catches it: `blind-map.json` has no `FREEZE.md` row.",
+        map_path.display(),
+        map_commit.as_str(),
+    );
+
     let retention = spec_length_retention_dir();
     let entries = match fs::read_dir(&retention) {
         Ok(entries) => entries,
@@ -3145,6 +3234,7 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
     let mut violations = Vec::new();
     let mut uncommitted = Vec::new();
     let mut unreadable = Vec::new();
+    let mut strays = Vec::new();
     for entry in entries {
         let entry = entry.unwrap_or_else(|e| {
             panic!(
@@ -3154,10 +3244,33 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
             )
         });
         let path = entry.path();
-        // Immediate `*.json` children only. `parts/` holds scorer shards, which
-        // `PROTOCOL.md` item 10 calls working material and deliberately leaves
-        // unchecked; the assembled file is the evidence.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // Immediate `*.json` children only — with everything else collected
+        // rather than skipped. `parts/` is the ONE documented exception:
+        // `PROTOCOL.md` item 10 calls the shards beneath it working material and
+        // deliberately leaves them unchecked, and the assembled file is the
+        // evidence.
+        //
+        // The bare `continue` this replaced skipped every unrecognised entry
+        // silently, which is the exact hole [`SpecLengthArms`] exists to close:
+        // `retention/4a73ef.JSON`, `retention/4a73ef.json.bak` or a verdict
+        // filed one directory down reaches none of the three outcome buckets
+        // below, and the check prints `ok` having ordered nothing.
+        if path.is_dir() {
+            if name != "parts" {
+                strays.push(format!("  {}: a directory that is not `parts/`", path.display()));
+            }
+            continue;
+        }
         if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            strays.push(format!(
+                "  {}: not an immediate `*.json` child",
+                path.display()
+            ));
             continue;
         }
         let at = format!("verdict `{}`", path.display());
@@ -3183,6 +3296,23 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
             Descent::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
         }
     }
+
+    // Before any ordering verdict, for the same reason
+    // `freeze_precedes_every_candidate_arm` refuses a stray arm first: a verdict
+    // this scan does not recognise reaches none of this check's outcomes, and
+    // invisibility is the one answer an ordering gate must never give.
+    strays.sort();
+    assert!(
+        strays.is_empty(),
+        "{} holds {} entry/entries this ordering check cannot classify:\n{}\n\n\
+         Every immediate child of this directory is a `<id>.json` verdict, and `parts/` is \
+         the only subdirectory item 10 sanctions. A misnamed or misplaced verdict is not a \
+         violation, not uncommitted and not unreadable — it is simply never checked. \
+         Rename it, move it, or teach this check about it deliberately.",
+        retention.display(),
+        strays.len(),
+        strays.join("\n"),
+    );
 
     assert!(
         unreadable.is_empty(),
