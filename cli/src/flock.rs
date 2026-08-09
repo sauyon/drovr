@@ -1,4 +1,8 @@
-//! The one advisory file lock drovr takes — and the only way it is released.
+//! Every advisory file lock drovr takes — and the only way one is released.
+//!
+//! Two sites use it: `run.lock` (`crate::phase::acquire_run_lock`) and
+//! `server.pid` (`crate::review::try_take_lock`). A third belongs here too —
+//! open-coding `File::try_lock` again is how drovr#80 comes back.
 //!
 //! An `flock` belongs to the **open file description**, not to the file
 //! descriptor that names it. `fork(2)` copies the fd table, so a child born
@@ -20,7 +24,8 @@
 //! [`try_take`] and no way to get the `File` back out, a close-based release is
 //! not spellable. See `crate::phase::acquire_run_lock`'s doc comment for the
 //! fuller account of what such a lock serializes and why it refuses rather than
-//! waits.
+//! waits — it is written about `run.lock`, but the argument is the module's, not
+//! that call site's, and it governs `server.pid` identically.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Seek, Write};

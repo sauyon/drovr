@@ -1959,7 +1959,10 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     // Single-writer for the discovery files: take the lock before touching the
     // socket or rewriting `server.addr`, so a live server keeps serving untouched.
     // Held until this function returns, which for a serving process means until it
-    // exits; the kernel drops it either way.
+    // exits. It must stay a NAMED binding: `let _ =` would drop the guard on this
+    // line and release the lock immediately. Release is the guard's `Drop`, an
+    // explicit unlock — the kernel closing the fds is only the fallback for a
+    // death that never unwinds (drovr#80; see `crate::flock`).
     let _lock = acquire_pid_lock()?;
 
     let addr = format!("{host}:{port}");
@@ -2090,6 +2093,14 @@ pub fn ensure_server() -> io::Result<String> {
 /// has to guess whether some pid is still a server. It is also the only check that
 /// catches a duplicate on an *arbitrary* port, where the OS bind would not
 /// serialize two starts at all.
+///
+/// "However the process dies" is the last fd on the open file description closing,
+/// which is all of them — so it covers a `SIGKILL` too, except in the microseconds
+/// between a `fork` and that child's `exec`, where the child still holds an
+/// inherited fd and `Drop` never got to run. That residue is drovr#80's, it is not
+/// reachable from a path drovr controls, and closing it would need the bounded
+/// retry this design rejects. Ordinary exits and panics go through `Drop`, which
+/// unlocks the description outright and does not care how many fds share it.
 ///
 /// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
 /// refusal message — never for the decision.
@@ -4354,8 +4365,19 @@ mod tests {
     /// Exclusivity *between processes* is what matters, and it is pinned by
     /// `tests/serve_single.rs` (a second `drovr serve` is refused, and six racing
     /// starts leave one server). Taking the same lock twice inside one process is
-    /// explicitly unspecified in std, so this covers the rest of the contract: the
-    /// pid lands in the file for humans, and dropping releases the claim.
+    /// explicitly unspecified in std, so this covers the rest of the contract:
+    /// the pid lands in the file for humans, dropping releases the claim, and —
+    /// since drovr#80 — dropping still releases it when a second fd shares the
+    /// open file description. That third property is the whole point of the
+    /// `try_clone` staging in the body; it is not scaffolding, and removing it
+    /// retires the only drovr#80 regression guard in this module.
+    ///
+    /// It also means the re-claim below leans on that unspecified same-process
+    /// double-take: it is what makes the test red without the fix. Should a
+    /// platform ever grant it instead of refusing, this passes vacuously — the
+    /// primitive-level `flock::tests::a_shared_description_does_not_keep_the_lock_after_drop`
+    /// is the copy to trust, and `tests/serve_single.rs` is the cross-process
+    /// one that needs no such assumption.
     ///
     /// Deliberately path-based rather than data-dir based: nothing here touches
     /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
@@ -4366,9 +4388,14 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        // This flaked three times (2026-07-26, 2026-08-01, and once more under
-        // this run's own review) and never on demand, and the cause is now
-        // known: drovr#80. `close(2)` releases an `flock` only when it closes
+        // This flaked three times (2026-07-26; 2026-08-01; and 2026-08-02, in
+        // run `phase-reap`, which is the sighting that captured the evidence —
+        // "after drop: …/server.pid contains \"1123224\"; this pid is 1123224",
+        // OUR OWN pid, so the step that failed was the re-claim after
+        // `drop(held)`), plus once more during this run's T3 review. It never
+        // reproduced on demand, and the cause is now known: drovr#80, which is
+        // exactly what that captured message says. `close(2)` releases an
+        // `flock` only when it closes
         // the LAST fd on the open file description, and any sibling test thread
         // spawning `git` or `herdr` forks a child that inherits one — so a
         // release-by-drop released nothing until that child exec'd, and this
@@ -4403,7 +4430,12 @@ mod tests {
         );
 
         // The fd a `fork()` hands a child: a second fd on the SAME open file
-        // description, still open across the drop below.
+        // description, still open across the drop below. That `try_clone` is a
+        // `dup(2)` and not a re-`open` is the property this staging rests on,
+        // and it is pinned — by the shared file offset — in
+        // `flock::tests::a_shared_description_does_not_keep_the_lock_after_drop`,
+        // not assumed here. Reimplement `try_clone` as a re-`open` and that test
+        // fails; this one would quietly stop testing drovr#80.
         let shared = held
             .try_clone()
             .expect("stage the fd a forked child inherits");
