@@ -46,8 +46,9 @@ pub(crate) struct FileLock {
 /// `Err` is a real IO failure — a missing parent directory, say, which this
 /// does not create.
 ///
-/// (`allow(dead_code)` for the same reason as [`FileLock`]'s: no production
-/// caller until `acquire_run_lock` moves onto it.)
+/// (`allow(dead_code)` for the same reason as [`FileLock`]'s, and on the same
+/// terms: no production caller until `acquire_run_lock` **or** `try_take_lock`
+/// moves onto it, whichever lands first.)
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_take(path: &Path) -> io::Result<Option<FileLock>> {
     let file = OpenOptions::new()
