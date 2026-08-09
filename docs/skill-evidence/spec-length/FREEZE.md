@@ -225,4 +225,6 @@ a row's value was swapped rather than appended, which is precisely why it is wri
 
 **The rule is not weakened.** It binds T4 onward unchanged: once the first probe runs, a wrong hash
 is a finding and STOP, never an edit. This entry is a record of one breach, not a precedent for a
-second. **T10 repeats it in the write-up alongside the three deviations in `PROTOCOL.md` item 2.**
+second. **T10 repeats it in the write-up alongside the other three deviations in `PROTOCOL.md` item 2**,
+where this breach is itself recorded as deviation 4 — so item 2's list is the complete one, and it
+says four, not three.
