@@ -2455,10 +2455,11 @@ mod tests {
     /// `drovr cleanup`, which is exactly the accumulation reaping exists to
     /// stop.
     ///
-    /// ⚠ **CURRENTLY FAILING for the same reason as
-    /// [`a_finished_panel_reaps_its_reviewers`]** — a spurious `WouldBlock` out of
-    /// `acquire_run_lock`, not anything about the sweep. See that test's note,
-    /// forge.ko.ag/drovr/drovr#80 and `forge.ko.ag/drovr/drovr/issues`.
+    /// It counts `pane_close` calls, which makes it one of only two tests in the
+    /// suite — `a_finished_panel_reaps_its_reviewers` is the other — that turn a
+    /// *best-effort* reap refusal into a failure rather than a warning. See that
+    /// test's note for why the pair, and nothing else, went red under a parallel
+    /// suite while forge.ko.ag/drovr/drovr#80 was live.
     #[test]
     fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
         let env = TestEnv::new();
@@ -2777,16 +2778,23 @@ mod tests {
     /// panes are the largest thing a run accumulates — four per iteration, and a
     /// task can take several iterations.
     ///
-    /// ⚠ **CURRENTLY FAILING, and not because of what it asserts.** It counts
-    /// `pane_close` calls, so it is one of only two tests in the suite that turn a
-    /// *best-effort* reap refusal into a failure rather than a warning. The
-    /// refusal is a spurious `WouldBlock` out of `acquire_run_lock`, whose cause
-    /// is a live production fault — forge.ko.ag/drovr/drovr#80, written up in
-    /// `forge.ko.ag/drovr/drovr/issues` under "`acquire_run_lock` WouldBlock on a fixed
-    /// `/tmp/drovr-*-test-*` root". Deliberately **not**
-    /// `#[ignore]`d and deliberately not weakened: the assertion is right, the
-    /// lock is wrong, and hiding it would retire the only executable evidence
-    /// that the fault is real.
+    /// It counts `pane_close` calls, which makes it one of only two tests in the
+    /// suite — `a_finished_panel_sweeps_the_pane_its_respawn_orphaned` is the
+    /// other — that turn a *best-effort* reap refusal into a failure rather than
+    /// a warning. Everywhere else a refused reap prints a warning and the command
+    /// still reports success, so while forge.ko.ag/drovr/drovr#80 was live these
+    /// two, and nothing else, went red under a parallel suite: the spurious
+    /// `WouldBlock` out of `acquire_run_lock` cost real `pane_close` calls, and
+    /// only a test that counts them can notice.
+    ///
+    /// drovr#80 is fixed at the mechanism: releasing one of drovr's file locks is
+    /// now an explicit unlock rather than a `File` drop (`crate::flock`), so an fd
+    /// inherited across a `fork` can no longer hold a lock its owner has dropped.
+    /// `docs/run-lock-fork-race/lock-red.txt` is the measurement that made the
+    /// fault visible; `docs/run-lock-fork-race/lock-green.txt` is the same
+    /// measurement re-run against the fix. Nothing below changed for it — the
+    /// assertion was always right, and weakening it would retire the pair's only
+    /// executable claim on this behaviour.
     #[test]
     fn a_finished_panel_reaps_its_reviewers() {
         let env = TestEnv::new();
