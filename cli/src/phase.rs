@@ -1378,19 +1378,21 @@ impl Unfinished {
 /// holder that "releases" by dropping its `File` has released nothing: the
 /// next `try_lock` on the inode refuses with `WouldBlock` while no one
 /// anywhere holds a claim. drovr shells out to `git` and `herdr` routinely, so
-/// the window is not hypothetical — this is forge.ko.ag/drovr/drovr#80, and
-/// [`crate::flock`] is where the invariant is stated once for both locks. So
-/// this lock comes back as a [`crate::flock::FileLock`] — as does
-/// `server.pid`'s, which has the same shape — whose `Drop` unlocks the
-/// description outright and whose `File` is private, leaving a close-based
-/// release unspellable. What that changed is the release mechanism, not the
-/// refusal policy: nothing below waits that did not wait before. That window
-/// is also the one exception to the crashed-holder argument: a holder killed
-/// without unwinding (`SIGKILL`, `abort`) between a `fork` and that child's
-/// `exec` leaves the lock held until the child execs — microseconds. `Drop`
-/// runs on every ordinary exit and on panic-unwind, so that is the only gap
-/// left, it is not reachable from a path drovr controls, and closing it would
-/// need the bounded retry this design rejects.
+/// the window is not hypothetical — this is forge.ko.ag/drovr/drovr#80.
+/// [`crate::flock`] states this invariant for both locks; it is restated here
+/// because the loose sentence it corrects is here. So this lock comes back as a
+/// [`crate::flock::FileLock`] — as does `server.pid`'s, which has the same
+/// shape — whose `Drop` unlocks the description outright and whose `File` is
+/// private, leaving a close-based release unspellable.
+///
+/// What that changed is the release **mechanism**, not the refusal policy:
+/// nothing below waits that did not wait before. And the fork window is the one
+/// exception to the crashed-holder argument above — a holder killed without
+/// unwinding (`SIGKILL`, `abort`) between a `fork` and that child's `exec`
+/// leaves the lock held until the child execs, microseconds later. `Drop` runs
+/// on every ordinary exit and on panic-unwind, so that is the only gap left, it
+/// is not reachable from a path drovr controls, and closing it would need the
+/// bounded retry this design rejects.
 ///
 /// **Why it fails rather than waits.** The holder may be inside a 30-second
 /// readiness wait, and a queued second rehydrate would then either duplicate
