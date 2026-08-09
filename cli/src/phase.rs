@@ -11666,6 +11666,52 @@ mod rehydrate_tests {
         );
     }
 
+    // drovr#80 — a lock "released" by dropping its `File` is not released at
+    // all while a second fd shares the open file description.
+    //
+    // `try_clone` is a faithful stand-in for `fork()`, and that is the whole
+    // design of this test: both produce a SECOND fd on ONE open file
+    // description. An `flock` belongs to the description, not to either fd, and
+    // `close(2)` releases it only when it closes the LAST fd on that
+    // description. So a holder that drops its `File` while any inherited copy
+    // is still open has released nothing, and the next `try_lock` on that inode
+    // refuses with `WouldBlock` while no other process claims it. In production
+    // the second fd is the one `fork()` hands a child drovr spawned (`git`,
+    // `herdr`); `O_CLOEXEC` drops it at `exec`, but not before, and the window
+    // is enough — see `acquire_run_lock`'s doc comment.
+    //
+    // No fork, no sleep, no external binary, so the fault is staged
+    // deterministically rather than raced for, and this holds inside `nix
+    // build`'s sandbox as well as on a developer's machine.
+    #[ignore = "drovr#80: fails until FileLock::drop unlocks explicitly — see docs/run-lock-fork-race/lock-red.txt"]
+    #[test]
+    fn a_dropped_run_lock_releases_even_when_its_description_is_shared() {
+        let env = TestEnv::new();
+        let run = rehydrate_run(&env, "lock-dup");
+        // `acquire_run_lock` opens with `create(true)` but creates no parents,
+        // so the run dir has to exist before the first claim.
+        run.save().unwrap();
+
+        let held = acquire_run_lock("lock-dup").expect("first claim");
+        let shared = held
+            .try_clone()
+            .expect("a second fd on the SAME description — what fork() hands a child");
+        drop(held);
+
+        if let Err(err) = acquire_run_lock("lock-dup") {
+            panic!(
+                "the re-claim was refused with {:?} ({err}) — dropping the `File` closed \
+                 OUR fd, but a close-based release does not release an open file \
+                 description another fd still shares, so the lock outlived its holder \
+                 (drovr#80). Release has to be an explicit unlock.",
+                err.kind()
+            );
+        }
+
+        // Last, so the staging fd outlives the re-claim it is meant to block.
+        drop(shared);
+    }
+
     #[test]
     fn a_rehydrate_that_cannot_record_its_pane_does_not_leave_it_live() {
         // ⚠️ THE IMMORTAL-PANE BUG, third sighting. `launch_in_pane` succeeded,
@@ -11848,7 +11894,12 @@ mod rehydrate_tests {
         // Saved: `phase_rehydrate` re-reads `state.json` under its lock, so an
         // in-memory-only change is not a change at all.
         run.save().unwrap();
-        assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
+        // Surfaced, not discarded: a bare `.is_ok()` here reports only "false",
+        // and this call hard-errors on a refused run lock (drovr#80's
+        // `WouldBlock`) as readily as on a real regression. The kind is what
+        // tells the two apart.
+        phase_rehydrate(&h, &mut run, "plan")
+            .unwrap_or_else(|err| panic!("rehydrate must succeed, got {:?}: {err}", err.kind()));
         let launch = pane_run_call(&h);
         assert!(
             launch.contains("agent --workspace"),

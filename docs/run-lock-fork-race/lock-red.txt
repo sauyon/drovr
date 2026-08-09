@@ -1,0 +1,293 @@
+================================================================================
+lock-red.txt — drovr#80 watched failing (run run-lock-fork-race, T1)
+================================================================================
+
+WHAT THIS IS
+  plan.md T1 item 5. A fix for a race nobody watched fail is not trustworthy,
+  so this is drovr#80 failing, on the record, before the fix exists. Two
+  measurements, and they answer different questions:
+
+    §1  a DETERMINISTIC test — the mechanism, staged rather than raced for:
+        `cli/src/phase.rs`,
+        `phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared`
+
+    §2  TEN parallel runs of the whole suite — the POPULATION, i.e. how often
+        the mechanism actually fires in this repo's own test suite today
+
+  The test in §1 is `#[ignore]`d for T1–T2 and is EXPECTED TO FAIL; the serial
+  suite stays green because it never runs (§4). At T3 the `#[ignore]` comes off
+  and its body is not touched — it must simply PASS. Until then this file is
+  the only evidence it ever ran.
+
+WHAT IT PROVES — AND WHAT IT DOES NOT
+  Proves (§1): an advisory lock released by DROPPING its `File` is not released
+  at all while a second fd shares the open file description. The lock belongs
+  to the description, not to either fd, and `close(2)` releases it only when it
+  closes the LAST fd. Dropping the holder therefore leaves the lock standing
+  and the next `try_lock` refuses with `WouldBlock` while no other process
+  claims it. `try_clone` stages the second fd; `fork()` is what produces it in
+  production, and `O_CLOEXEC` removes the child's copy at `exec`, not before.
+
+  Proves (§2): this is not a rare corner. `acquire_run_lock`'s refusal message
+  is emitted 26–40 times PER PARALLEL SUITE RUN (320 across ten runs, mean 32),
+  spread over 10–16 distinct run names, while only 1–3 tests fail. It is fatal
+  in exactly the places that COUNT `pane_close` calls; everywhere else a
+  best-effort reap swallows it into a warning. Two further failures (§3) are
+  the same `WouldBlock`, hitting `phase_rehydrate` directly.
+
+  Does NOT prove: anything about the SIGKILL residual — a holder killed with
+  SIGKILL still leaves the lock to the kernel, and nothing here exercises that.
+
+  Does NOT prove: any production frequency. The tracker's own standalone
+  reproducer measured 3949 failures in 24000 attempts (~16%) with 4 forker
+  threads. That figure lives in forge.ko.ag/drovr/drovr#80, NOT in this repo
+  (`grep -rn "3949" .` finds nothing here), and was NOT re-run by this task.
+  Attribute it to the tracker; it is not a measurement of this run.
+
+  Does NOT prove: that every parallel failure is drovr#80. Two of the 23 are a
+  DIFFERENT defect in the same fork-window family — stub-exec / `ETXTBSY` on
+  `with_stub_herdr` (`cli/src/herdr.rs:2108`, panicking at `:2131`). No lock is
+  involved and `File::unlock()` does nothing for it. It is out of scope for
+  this run, by the plan, deliberately. See §3.
+
+WHEN / WHERE
+  recorded:    2026-08-08
+  worktree:    /home/sauyon/devel/drovr/.drovr/wt/run-lock-fork-race
+  branch:      drovr/run-lock-fork-race
+  review base: 180aa5ec561cd05e7250256cc60f6909d3102967 (task-1-base.sha)
+  measured against the code as it stands after T1's two edits — the new
+  `#[ignore]`d test, and the strengthened assertion at the tail of
+  `rehydrate_refuses_a_phase_whose_launch_never_completed`. Neither changes any
+  behaviour under test; the strengthened assertion exists precisely so a
+  `WouldBlock` there can be told from a real regression.
+  toolchain:   export PATH=/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin:\
+/nix/store/l3gishxdaxhnaxczyw0jw7dcy9p4rhcs-rustc-1.97.0/bin:$PATH
+               (cargo 1.97.0 / rustc 1.97.0)
+  machine:     Linux 7.1.5-arch1-2, glibc; local worktree, not the nix sandbox.
+               NOTE: ten other drovr worktrees had live agents on this machine
+               throughout. That loads the box and is the likeliest reason the
+               refusal counts here (26–40) run above the 21 the plan phase
+               measured in a single run. It does not weaken the evidence — the
+               fix's bar is ZERO, and a larger red number only widens the gap.
+
+HOW TO REPRODUCE
+  cd cli
+  # §1 — the mechanism, deterministic, exits 101
+  cargo test --offline -- --ignored a_dropped_run_lock_releases_even_when_its_description_is_shared
+  # §2 — the population; `--nocapture` is MANDATORY (see §2)
+  cargo test --offline --no-fail-fast -- --nocapture
+
+
+--------------------------------------------------------------------------------
+§1  THE MECHANISM — VERBATIM RED
+--------------------------------------------------------------------------------
+
+  $ cargo test --offline -- --ignored a_dropped_run_lock_releases_even_when_its_description_is_shared
+
+     Compiling drovr v0.2.0 (/home/sauyon/devel/drovr/.drovr/wt/run-lock-fork-race/cli)
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 2.40s
+       Running unittests src/main.rs (target/debug/deps/drovr-b62291024005c9ca)
+
+  running 1 test
+  test phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared ... FAILED
+
+  failures:
+
+  ---- phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared stdout ----
+
+  thread 'phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared' (1950235) panicked at src/phase.rs:11702:13:
+  the re-claim was refused with WouldBlock (another drovr command is moving run 'lock-dup's panes around (a rehydrate may be waiting up to 30s for its agent to come up). Wait for it to finish and look at the phase again — two rehydrates of one phase would leave two live agents and record only one, and reaping a phase a rehydrate is bringing back would close the pane it just opened.) — dropping the `File` closed OUR fd, but a close-based release does not release an open file description another fd still shares, so the lock outlived its holder (drovr#80). Release has to be an explicit unlock.
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+  failures:
+      phase::rehydrate_tests::a_dropped_run_lock_releases_even_when_its_description_is_shared
+
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 731 filtered out; finished in 0.00s
+
+  error: test failed, to rerun pass `--bin drovr`
+  exit status 101
+
+  There is no scheduling in that test: no fork, no sleep, no second thread, no
+  external binary. It fails every time, and it holds inside `nix build`'s
+  sandbox as well as on a developer's machine — which the fork-based reproducer
+  in `docs/known-issues.md` does not reliably do.
+
+  ⚠ Its module path is `phase::rehydrate_tests::…`, NOT `phase::tests::…` as
+  the plan's "Interfaces introduced" line says. The plan's own placement
+  instruction (immediately after `two_rehydrates_of_one_run_cannot_both_launch`)
+  puts it in `rehydrate_tests`, and its body needs the `rehydrate_run` fixture
+  that only that module defines. Placement won; the path in the plan is wrong.
+
+
+--------------------------------------------------------------------------------
+§2  THE POPULATION — TEN PARALLEL SUITE RUNS
+--------------------------------------------------------------------------------
+
+  $ for i in $(seq 1 10); do cargo test --offline --no-fail-fast -- --nocapture; done
+
+  `--nocapture` is MANDATORY and the refusal column is worthless without it: a
+  refused reap only `println!`s a warning (`cli/src/code_review.rs:1578`,
+  `cli/src/phase.rs:2531`) and `cargo test` captures a PASSING test's stdout.
+  Almost every one of these 320 refusals happens inside a test that passes.
+
+  Unit binary (`--bin drovr`) only; the 8 integration binaries were green in
+  all ten runs. "refusals" counts the exact string
+  `another drovr command is moving run`; "runs" is how many DISTINCT drovr run
+  names appear in those messages.
+
+    run   passed  failed  ignored  refusals  runs
+      1      729      2       1        40     16
+      2      728      3       1        32     14
+      3      728      3       1        28     14
+      4      728      3       1        32     15
+      5      728      3       1        26     10
+      6      729      2       1        33     15
+      7      729      2       1        33     13
+      8      730      1       1        30     13
+      9      729      2       1        27     11
+     10      729      2       1        39     13
+    ----------------------------------------------
+    total              23              320
+
+  RATIO: 10 / 10 runs emitted the refusal. 10 / 10 runs failed at least one
+  test. Zero runs were green.
+
+  The refusals cluster in `code_review`'s fixtures, which reap a four-reviewer
+  panel and so take the run lock four times in quick succession while sibling
+  test threads fork `git` and `herdr`. Across all ten runs, by run name:
+
+     32  cr-sweep-orphan            20  cr-artifact-only
+     25  cr-stale-findings          18  cr-nonempty-range
+     25  cr-iter-staleness          18  cr-half-written
+     21  cr-reap-panel              17  cr-resume-after-complete
+     21  cr-clean                   15  cr-unconfigured-leftover
+     21  cr-artifact-resume         15  cr-readonly-done
+     21  cr-archive-resumed-final   15  cr-launch
+     20  cr-delivered-then-died     13  cr-findings
+      1  rh-profile                  1  rh-concurrent
+      1  cr-resume-completes
+
+  ⭐ THAT IS THE REAL SIZE OF drovr#80. It fires ~32 times per suite run and is
+  swallowed 30-odd of those times. The two `pane_close`-counting tests are not
+  the extent of the bug — they are merely the only places where it is fatal.
+  This is why T7's criterion (b) counts the MESSAGE and not the failures: the
+  failures are a lossy, ~7% sample of the fault.
+
+
+--------------------------------------------------------------------------------
+§3  ALL 23 FAILURES, ATTRIBUTED
+--------------------------------------------------------------------------------
+
+  Nothing here is unclassified. 21 of 23 are drovr#80; 2 are not, and are not
+  this run's to fix.
+
+  (a) code_review::tests::a_finished_panel_sweeps_the_pane_its_respawn_orphaned
+      10 / 10 runs.   `cli/src/code_review.rs:2515`
+
+        assertion `left == right` failed: one retirement per reviewer reaped by the panel: []
+          left: 0
+         right: 4
+
+  (b) code_review::tests::a_finished_panel_reaps_its_reviewers
+      9 / 10 runs (passed in run 8).   `cli/src/code_review.rs:2807`
+
+        assertion `left == right` failed: one close per reviewer: [ …FakeHerdr call log, trimmed… ]
+          left: 1
+         right: 4
+
+      Both are preceded in the captured stdout by the refusal, verbatim:
+
+        code-review: warning: could not reap the 'security' reviewer (another drovr command is moving run 'cr-reap-panel's panes around (a rehydrate may be waiting up to 30s for its agent to come up). Wait for it to finish and look at the phase again — two rehydrates of one phase would leave two live agents and record only one, and reaping a phase a rehydrate is bringing back would close the pane it just opened.); `drovr cleanup` will reclaim its pane
+
+      These two are the run's real-world red→green pair. Their bodies and
+      assertions are NOT edited by this run.
+
+  (c) phase::rehydrate_tests::two_rehydrates_of_one_run_cannot_both_launch
+      run 3.   `cli/src/phase.rs:11660`
+
+        assertion `left == right` failed: another drovr command is moving run 'rh-concurrent's panes around (…)
+          left: WouldBlock
+         right: AlreadyExists
+
+      The sharpest single data point in this file. That test takes the lock,
+      asserts the refusal, then `drop(held)`s it and expects the NEXT rehydrate
+      to get as far as `AlreadyExists`. It got `WouldBlock` — the test's own
+      `drop` did not release its own lock. drovr#80, inside the very test
+      written to prove the lock works.
+
+  (d) phase::rehydrate_tests::rehydrate_uses_the_recorded_profile_not_the_servers_environment
+      run 4.   `cli/src/phase.rs:10472`
+
+        called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "another drovr command is moving run 'rh-profile's panes around (…)" }
+
+      A plain `phase_rehydrate(...).unwrap()` on a run nothing else touches.
+      A hard error, not a warning: this is the production shape of the bug.
+
+  (e) NOT drovr#80 — stub-exec / `ETXTBSY`, 2 occurrences:
+        run 2: herdr::tests::an_unreachable_herdr_reports_unknown_liveness_and_assumes_panes_alive
+        run 5: herdr::tests::workspace_exists_trusts_only_a_listing_herdr_actually_answered
+      both at `cli/src/herdr.rs:2131`:
+
+        the stub herdr was never executed — this test is not testing what it claims
+
+      Same fork-window FAMILY (a forked child inherits the still-open write fd
+      on the stub script, and `exec`ing a file held open for writing fails with
+      `ETXTBSY`), different defect, no lock involved. `File::unlock()` cannot
+      touch it. The plan excludes it explicitly. Its appearance in T7's runs is
+      NOT a regression from this work, and fixing it there would make this
+      change's evidence ambiguous about which defect closed what.
+
+  Not observed, and worth stating: the third test the plan implicated,
+  `phase::rehydrate_tests::rehydrate_refuses_a_phase_whose_launch_never_completed`,
+  PASSED in all ten of these runs. It failed in the plan phase's measurement,
+  where the bare `assert!(… .is_ok())` discarded the error and it could not be
+  attributed. T1 replaced that assertion with one that names `err.kind()`, so
+  if it fails again — here or at T7 — the cause will be on the record rather
+  than inferred.
+
+
+--------------------------------------------------------------------------------
+§4  THE SERIAL SUITE IS STILL GREEN  (the `#[ignore]` is doing its job)
+--------------------------------------------------------------------------------
+
+  $ cargo test --offline -- --test-threads=1
+  exit status 0
+
+  test result: ok. 731 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.68s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.76s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.03s
+  test result: ok.   2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.06s
+  test result: ok.   6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.88s
+  test result: ok.   2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in  0.00s
+  test result: ok.   1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.05s
+
+  754 passed, 0 failed, 1 ignored — the plan's baseline of 754/0/0 plus this
+  task's one deliberate `#[ignore]`. A serial run forks nothing concurrently,
+  so drovr#80 does not fire in it at all; that is exactly why the parallel
+  measurement in §2 is the one that carries the weight.
+
+  $ cargo build --offline
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.10s
+  — 0 warnings, unchanged from the baseline.
+
+
+--------------------------------------------------------------------------------
+§5  WHAT T7 MUST DO WITH THIS
+--------------------------------------------------------------------------------
+
+  `lock-green.txt` is the same three measurements, re-run at the end of T6, and
+  it is compared against THIS file, not against a remembered number:
+
+    §1 → the test in §1 must PASS with the `#[ignore]` removed and its body
+         unchanged. A body edit invalidates the red above.
+    §2 → the refusal count must be 0, in all ten runs. The red column is
+         26–40 (mean 32) on this machine; the plan phase measured 21 on a
+         quieter one. Either way the bar is zero, not "fewer".
+    §3 → (a) through (d) must pass in all ten. (e) — the two `herdr.rs:2131`
+         stub-exec failures — is the ONLY failure T7 may still see, and it must
+         be named as such, not glossed as flake.
+    §4 → 758 passed, 0 failed, 0 ignored serially (754 + T1's 1 un-ignored +
+         T2's 3), and `cargo build --offline` still at 0 warnings.
