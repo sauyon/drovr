@@ -251,19 +251,30 @@ run knows was exposed.**
 
    **What happened.** Commit `b03cba02183fb0eaf3e3a9d31e2fb18b75c861d4`'s message gives the salt
    and the rule: *"the pool is ordered by `sha256("<id>|spec-length-ab/T4/draw-1")` and assigned in
-   that order to the triples in canonical arm-major order"*. That is enough to recover **every id's
-   arm** — three contiguous blocks of six — which is precisely what withholding `blind-map.json`
-   was protecting. T4's own review recovered the three-way arm partition from the message and
-   matched `blind-map.json` arm-for-arm.
+   that order to the triples in canonical arm-major order"*. That is enough to recover the
+   **three-way arm partition** — three contiguous blocks of six — which is precisely what
+   withholding `blind-map.json` was protecting, and it fixes the middle block as `S2`.
 
-   It is **not** the whole map, and an earlier draft of this entry overstated it three times
-   ("states the derivation in full", "a complete re-encoding", "reconstructed all 18 cells from the
-   commit message alone"). The message does not fix the sort direction, the within-arm fixture
-   order, or the within-fixture sample order, so it does not by itself yield the `(fixture, sample)`
-   half of a cell. Those are `S1`, `S2`, `S3`; within an arm `skill-stickiness`, `tiered-review`,
-   `tui-dc-picker`; within a fixture sample 1 then 2 — **spelled out here for the first time**, and
-   independently recoverable from `PROTOCOL.md` item 3 regardless. **The severity is unchanged**:
-   the arm is the secret, and the message gives it up.
+   **It is not the whole map, and this entry has now overstated that twice.** The first draft
+   claimed the message "states the derivation in full", was "a complete re-encoding of the map", and
+   that review had "reconstructed all 18 cells from the commit message alone". The second draft
+   corrected those but still said the message yields *every id's arm*, and filed the missing sort
+   direction under the wrong half. Precisely:
+
+   - **The message does not state the sort direction**, and that bears on the **arm** half. Reading
+     the hash order descending instead of ascending swaps `S1` and `S3` across 12 of the 18 ids;
+     only the middle block is direction-independent. Nor does the message's own item-14a sentence
+     break the tie — the 1–2 balance it reports holds under both readings.
+   - **It does not fix the within-arm fixture order or the within-fixture sample order**, and those
+     bear on the `(fixture, sample)` half. They are `skill-stickiness`, `tiered-review`,
+     `tui-dc-picker`, then sample 1 before sample 2 — also stated in this entry's own draw record
+     below, and the fixture order is independently recoverable from `PROTOCOL.md` item 3's table.
+     (Item 3 does not name the arms; item 2 does.)
+
+   T4's own review recovered the partition from the message, **took the ascending reading**, and
+   matched `blind-map.json` arm-for-arm. **The severity is unchanged**: the arm is the secret, the
+   partition is the arm, and the message gives the partition up. A reader who has to try two
+   readings has been slowed down, not stopped.
 
    **Why it was written.** To make the draw *auditable* — so a reader could confirm the assignment
    was not steered toward an arm, rather than take T4's word. The reasoning was right and the
@@ -271,7 +282,10 @@ run knows was exposed.**
    inside `blind-map.json` (or a sibling held to the same never-shown rule), not in `git log`.
 
    **The draw, since this is now the place it is recorded.** One attempt, salt
-   `spec-length-ab/T4/draw-1`, no redraw. The declared acceptance criterion was item 14a's: at
+   `spec-length-ab/T4/draw-1`, hash order **ascending**, no redraw. (The direction is stated because
+   without it the record does not reproduce the map — see the bullet above; leaving it out would
+   have made this audit trail unusable for the one thing it exists for.) The declared acceptance
+   criterion was item 14a's: at
    sample 1, across the three fixtures, neither `S1` nor a candidate may hold the lexicographically
    smaller id — position `A` in T9's pairing — in all three `S1`-vs-candidate pairings. Draw 1 came
    out **1–2 against one candidate and 1–2 against the other**, mixed in both, so the criterion was
@@ -282,10 +296,12 @@ run knows was exposed.**
    `cli/tests/skills_valid.rs::spec_length_id_assignment_does_not_track_the_arm` pins the outcome.
 
    **Recording it here makes this file a second in-repo copy of the assignment, and that is a
-   deliberate, argued choice rather than an oversight — with one honest caveat.** The caveat: the
-   paragraph above spells out the within-arm fixture order and the within-fixture sample order,
-   which `b03cba0`'s message did *not* — it said only "canonical arm-major order". So this is
-   marginally **more** disclosure than the commit message, not a pure restatement. It is still the
+   deliberate, argued choice rather than an oversight — with one honest caveat.** The caveat: this
+   entry states the sort direction, the within-arm fixture order and the within-fixture sample order
+   (the "What happened" bullets above, and the draw record immediately above), and `b03cba0`'s
+   message states **none** of the three — it said only "canonical arm-major order". So this is
+   materially **more** disclosure than the commit message, not a pure restatement, and it is what
+   takes the map from *recoverable-if-you-guess-the-direction* to *recoverable*. It is still the
    right call, because the map is already recoverable from the repository without this file:
    `PROTOCOL.md` item 6 supplies the pool, item 3 fixes the canonical fixture order, and the commit
    message supplies the salt. Withholding the derivation here would therefore buy no blinding back
@@ -333,6 +349,11 @@ run knows was exposed.**
      phase agent putting the shard where item 10 says it goes before anything reads it. **Whichever
      task does this records both substitutions here**, so a later reader can disagree with the
      lenient reading explicitly rather than discover it by inference.
+     **T4's own feasibility dispatch is the first entry under this rule, and it is recorded in
+     deviation 1 above** — it ran with a working directory inside this worktree, after this very
+     commit had put the salt in the history. T10 reading this bullet must follow that pointer: it is
+     the only dispatch in the run so far that is known to have been exposed.
+
      **If a task cannot arrange that, the channel is open for that dispatch and it must be recorded
      here as a deviation, not assumed away.** Do not treat "the scorer was told only to read the
      spec" as a control; it is an instruction, and this deviation exists because instructions are
