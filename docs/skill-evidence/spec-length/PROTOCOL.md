@@ -49,10 +49,12 @@ makes the edit. Windows 2 and 3 log to `RESULTS.md` **as well**, not instead: `R
 exist until T7, so a reader before then would otherwise have no record at all, and a reader after it
 should not have to open a second file to learn that this one moved.
 
-**This file was revised four times after its first commit, all inside window 1**, and says so here
+**This file was revised six times after its first commit, all inside window 1**, and says so here
 rather than leaving `git log -p` as the only witness. Count the rows below `7cfd07a`: that number
 and this sentence must always agree, and both must agree with
-`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL.md`.
+`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL.md`. **The count has been wrong twice,
+both times by one, because the commit doing the correcting adds a row of its own** — so when you
+update it, count the table *after* adding your row, not before.
 
 | commit | what changed |
 |---|---|
@@ -61,7 +63,8 @@ and this sentence must always agree, and both must agree with
 | `3dd0dcc` | **`R4a` and `R5a` added** — neither was in the first commit. `R1`'s primary sentence reworded (the original, read literally, required generations that never judged a row to retain it). Item 8a's sample offset pinned. |
 | `6e33620` | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows split from two to three; this table added. No rule added or weakened. |
 | `5043dbf` | **`14a` added** — T9's gap-finder and pairing-adjudicator prompts and the `gaps/` schema, which `R7` makes fatal but which no file pinned. **`R3a` gained its post-T8/T9 fallback**, which was undefined. The protected set widened from item 12 alone to a nine-item list. This table made append-only and forward-looking. |
-| the commit that added this row | **Item 14 gained a definition of `recovered` and literal probe and adjudicator prompts** — T8's fatal criterion was named but never defined, and its prompts were the only instrument prompts still unwritten, which made `5043dbf`'s claim that T9 was "the only" unpinned instrument false. **`R3a`'s fallback gained step 2**, the check against `S1`'s mean, without which it could crown a candidate the control had beaten. The protected set widened again, from nine items to **all sixteen**. Revision count corrected from three to four. |
+| `b3dde8f` | **Item 14 gained a definition of `recovered` and literal probe and adjudicator prompts** — T8's fatal criterion was named but never defined, and its prompts were the only instrument prompts still unwritten, which made `5043dbf`'s claim that T9 was "the only" unpinned instrument false. **`R3a`'s fallback gained step 2**, the check against `S1`'s mean, without which it could crown a candidate the control had beaten. The protected set widened again, from nine items to **all sixteen**. Revision count corrected from three to four. |
+| the commit that added this row | **Item 14 gained a blind question-writer** — the probe prompt was fixed but its one blank, the 60 per-row question texts, was still a judgement call left to T8, which runs after unblinding. The questions are now composed by a subagent that sees only ledger rows, committed before T8's first probe, and reused across arms. **`R3a` step 2 now applies the full three-key order** rather than `≤` on mean lines, which disagreed with R3a's own tie-break for an exact tie. **`R6`'s closed re-run list** now names item 14 and 14a verdicts, which have no automated check behind them. Revision count corrected from four to **six** — it had been wrong twice, both times by one. |
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE.md` is the hash
 record and `docs/skill-evidence/arms/MANIFEST.md` is the provenance record; both are authoritative
@@ -552,11 +555,15 @@ applies. **Do not describe this scoring as fully blind anywhere.**
 
   1. **The survivors** are the CANDIDATES (`S2`, `S3`) that cleared R2 *and* T8 *and* T9. If there
      are none, the outcome is the null under R7 and nothing ships.
-  2. **The control still has to be beaten.** If `S1` cleared R2 and its mean is **lower than or
-     equal to** the lowest surviving candidate's, then **no candidate beat the control**: ship
-     nothing and record it, exactly as the sentence above says. The survivors clearing every gate
-     does not by itself make one of them shorter than what already ships. (If `S1` did **not** clear
-     R2, it is not in R3's compared set at all and R4a governs the comparison instead.)
+  2. **The control still has to be beaten, under the full ordering and not just on lines.** If `S1`
+     cleared R2, rank it against the lowest surviving candidate by **the same three-key order this
+     rule already fixes: mean lines, then mean bytes, then the arm file's own line count.** If `S1`
+     ranks first under that order, **no candidate beat the control**: ship nothing and record it,
+     exactly as the sentence above says. The survivors clearing every gate does not by itself make
+     one of them shorter than what already ships. **An exact tie on mean lines is resolved by bytes
+     and then by the arm file, never by defaulting to the control** — the three-key order is the
+     rule, and step 2 does not get a shorter one of its own. (If `S1` did **not** clear R2, it is
+     not in R3's compared set at all and R4a governs the comparison instead.)
   3. **Otherwise the lowest-mean survivor wins.** If the provisional leader was eliminated by T8 or
      T9, **the next-lowest surviving candidate takes its place** — it is not discarded along with
      the leader, and the run does not fall to a null merely because the shortest survivor was not
@@ -601,9 +608,11 @@ applies. **Do not describe this scoring as fully blind anywhere.**
   outcome live.
 - **R6 — no re-runs to chase a result.** One generation round per arm. A re-run is permitted only
   for a **protocol** failure, and the list is closed: the probe wrote no file; a verdict is
-  malformed; a verdict fails the item-8 mechanical check; a verdict fails item 8a's relevance
-  adjudication. Never for an unwanted outcome, and **every re-run is logged in `RESULTS.md` with its
-  reason**.
+  malformed — **which covers a transmission verdict under item 14 and a gap file under item 14a
+  exactly as it covers a retention verdict, since those two have no automated check behind them and
+  a closed list that omitted them would leave a malformed one with nowhere to go**; a verdict fails
+  the item-8 mechanical check; a verdict fails item 8a's relevance adjudication. Never for an
+  unwanted outcome, and **every re-run is logged in `RESULTS.md` with its reason**.
 - **R6a — you may never silently accept a verdict you believe is wrong.** If a verdict is
   schema-valid, passes adjudication, and still looks wrong on inspection, that is not a licence to
   re-run and not a licence to accept: **record the specific doubt in `RESULTS.md` against that
@@ -683,6 +692,45 @@ the row's subject **with the row's answer removed**:
 
 ```
     What does this spec say about <the row's subject, with the row's answer removed>?
+```
+
+**Who fills that blank, and when — because the template alone does not pin the questions.** Turning
+a ledger row into a subject-without-its-answer is a judgement call, one per row, 60 in total, and
+T8 runs *after* T7 has unblinded. Leaving it to T8 would put the same non-blind hand on the
+questions that item 14a exists to keep off T9's prompts. So:
+
+- **An independent question-writer subagent composes all 60**, handed **only the sampled ledger
+  rows** — never a generated spec, never an arm, never `blind-map.json`, never a retention verdict.
+  It cannot favour an arm because it has never seen one.
+- Its output is committed to `docs/skill-evidence/spec-length/transmission/questions/<fixture>.json`
+  as `[{"id": "<ledger id>", "question": "<text>"}]`, covering that fixture's 20 sampled ids in
+  order. **The same 20 questions are then used for every arm**, which is what makes the comparison
+  between arms a comparison at all.
+- **It may run at any point once the ledger is frozen** — it is blind whenever it runs, so the
+  ordering that matters is only that the file is **committed before T8 dispatches its first probe**.
+  T8 reads it and does not edit it; a question that looks wrong to T8 is recorded as a doubt under
+  R6a, not rewritten.
+
+Its prompt, fixed here:
+
+```
+Below are rows from a frozen key-point ledger. Each states a decision, interface, constraint or
+scope boundary that a spec was supposed to carry.
+
+For each row, write ONE question that asks what a spec says about that row's SUBJECT, with the
+row's ANSWER removed. The question must be answerable only by someone who has the answer, and
+must not contain the answer itself — no exact name, bound or exclusion that the row supplies.
+
+Example shape, for a row reading "The picker has three levels: project -> config -> version":
+    What does this spec say about how the picker's browsing hierarchy is structured?
+Not: "What does this spec say about the picker's three levels?" -- that leaks the answer.
+
+--- BEGIN ROWS ---
+<id>: <row item text>
+--- END ROWS ---
+
+Return exactly one line and nothing else, a JSON array of one object per row in order:
+[{"id":"<id>","question":"<text>"}]
 ```
 
 **`recovered` is defined here, because it is a fatal criterion and an undefined fatal criterion is
