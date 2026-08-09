@@ -1349,7 +1349,7 @@ impl Unfinished {
 }
 
 /// Take the exclusive lock that serializes the commands which move a run's
-/// panes around, held for as long as the returned file lives.
+/// panes around, held for as long as the returned guard lives.
 ///
 /// **Two holders, one lock, on purpose.** `phase_rehydrate` brings a phase back
 /// on a new pane and `phase_reap` closes one and drops the registration — they

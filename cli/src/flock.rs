@@ -66,8 +66,9 @@ impl FileLock {
     ///
     /// (The `allow(dead_code)` is the last one left in this module: only the
     /// tests call this until `review.rs`'s `server.pid` lock moves onto it, and
-    /// it goes when that lands. The rest of the surface has production callers
-    /// now — `crate::phase::acquire_run_lock` — so their `allow`s are gone.)
+    /// it goes when that lands. [`FileLock`] and [`try_take`] carried one for
+    /// the same reason and no longer need it — `crate::phase::acquire_run_lock`
+    /// calls them. `try_clone` never carried one; it is `#[cfg(test)]`.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn overwrite(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.file.set_len(0)?;
