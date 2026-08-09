@@ -180,3 +180,36 @@ Re-verifying by hand is still what a task owes at a gate rather than at CI time 
 `git hash-object --no-filters <path>` for each row. T8's start gate does exactly this before its
 first probe, so the freeze is confirmed at the moment it is relied on and not merely at some point
 since.
+
+## Recorded breach of the append-only rule — `S3`'s row, T3, 2026-08-08
+
+**This section is appended, not an edit.** It records the one time the rule at the top of this file
+was broken, because the alternative was to leave the breach discoverable only by reading `git log -p`
+— and a freeze record whose violations are invisible in the record is no better than no record.
+
+**What happened.** T3 authored `S2` and `S3`, committed them (`6352ea1b`), and appended both rows
+(`06ff6702`). Its own review then found that `S3` violated `PROTOCOL.md` item 13: it dropped the
+exclusivity half of `S1`'s first ask — *"a decision record, **not a discussion**"* — entirely rather
+than stating it briefly, so it was not "the shortest text that still **states** the three things
+`S1` asks for". T3 corrected `S3` (`6a56a21f`, adding the three words *"and nothing else"*) and then
+**rewrote `S3`'s existing row in place** (`2845f11d`) instead of leaving it. That in-place rewrite is
+what this file forbids: *"a wrong hash is a finding, not an edit."*
+
+**Why it was not resolved the other way.** Appending a corrected row is impossible here —
+`freeze_rows_still_hash_to_their_files` re-hashes **every** row on every run, so a superseded row
+would sit permanently red, and history may not be rewritten on this branch. The choice was
+therefore between an undisclosed in-place edit and a disclosed one. `MANIFEST.md` faces the same
+situation and resolves it explicitly (*"re-snapshotting an arm means correcting its row, not
+appending another … a duplicate would leave two hashes claiming the same identity, which is worse
+than an edit with a reason"*); this file has no such carve-out, so the edit is a deviation and is
+labelled one rather than smoothed over.
+
+**What it does and does not cost.** It does **not** contaminate any measurement: no probe had run,
+`generated/`, `blind-map.json` and `retention/` did not exist, and the corrected arm is still
+committed strictly after `PROTOCOL.md` (`7cfd07a8`) and after this file (`9accca81`), so the
+freeze-before-probe guarantee is intact. What it does cost is auditability — no test can detect that
+a row's value was swapped rather than appended, which is precisely why it is written down here.
+
+**The rule is not weakened.** It binds T4 onward unchanged: once the first probe runs, a wrong hash
+is a finding and STOP, never an edit. This entry is a record of one breach, not a precedent for a
+second. **T10 repeats it in the write-up alongside the three deviations in `PROTOCOL.md` item 2.**
