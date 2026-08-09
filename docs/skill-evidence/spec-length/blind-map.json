@@ -1,0 +1,20 @@
+{
+  "14855d": { "arm": "S2", "fixture": "tiered-review", "sample": 1 },
+  "1c6368": { "arm": "S3", "fixture": "tiered-review", "sample": 1 },
+  "28529c": { "arm": "S2", "fixture": "tui-dc-picker", "sample": 2 },
+  "350ba8": { "arm": "S1", "fixture": "tiered-review", "sample": 1 },
+  "37e173": { "arm": "S1", "fixture": "tui-dc-picker", "sample": 2 },
+  "3cfbc8": { "arm": "S3", "fixture": "tui-dc-picker", "sample": 1 },
+  "4a73ef": { "arm": "S1", "fixture": "skill-stickiness", "sample": 1 },
+  "4fdca8": { "arm": "S2", "fixture": "tui-dc-picker", "sample": 1 },
+  "80d9a2": { "arm": "S1", "fixture": "skill-stickiness", "sample": 2 },
+  "87e5a5": { "arm": "S3", "fixture": "skill-stickiness", "sample": 2 },
+  "88fb62": { "arm": "S3", "fixture": "tiered-review", "sample": 2 },
+  "aa3199": { "arm": "S2", "fixture": "skill-stickiness", "sample": 1 },
+  "b0d2fc": { "arm": "S2", "fixture": "tiered-review", "sample": 2 },
+  "bbd141": { "arm": "S3", "fixture": "tui-dc-picker", "sample": 2 },
+  "d25798": { "arm": "S3", "fixture": "skill-stickiness", "sample": 1 },
+  "db3e2d": { "arm": "S2", "fixture": "skill-stickiness", "sample": 2 },
+  "f8729b": { "arm": "S1", "fixture": "tui-dc-picker", "sample": 1 },
+  "fe9c04": { "arm": "S1", "fixture": "tiered-review", "sample": 2 }
+}

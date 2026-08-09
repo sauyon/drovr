@@ -2591,6 +2591,626 @@ fn spec_length_ledgers_are_the_closed_lists_they_claim() {
     }
 }
 
+/// The spec-length A/B's working directory
+/// (`docs/skill-evidence/spec-length/`).
+fn spec_length_dir() -> PathBuf {
+    evidence_dir().join("spec-length")
+}
+
+/// The 18 generated specs, one `<id>.md` per (arm, fixture, sample) triple.
+fn spec_length_generated_dir() -> PathBuf {
+    spec_length_dir().join("generated")
+}
+
+/// The arm↔id assignment. Written by T4 before any scorer is dispatched, and
+/// **never shown to a scorer or an adjudicator** — that part is procedural and
+/// nothing here can check it.
+fn spec_length_blind_map_path() -> PathBuf {
+    spec_length_dir().join("blind-map.json")
+}
+
+/// The per-generation retention verdicts (T5/T6). Absent until T5.
+fn spec_length_retention_dir() -> PathBuf {
+    spec_length_dir().join("retention")
+}
+
+/// The eighteen opaque generation ids, transcribed from `PROTOCOL.md` item 6.
+///
+/// Pinned here so the checks below can say a generation carries a **pool** id
+/// rather than merely a plausible-looking one. Without the pool, an id invented
+/// at generation time — or a nineteenth file quietly added later — would satisfy
+/// every other assertion: it would be 6 hex characters, it would have a blind-map
+/// entry, and it would have a file. The pool is what makes the set closed.
+///
+/// **The listing order maps to nothing.** Item 6 says so explicitly, and item 14a
+/// makes it binding: T4 assigns these to triples in an order of its own, so
+/// reading position *k* here as "the *k*th triple" is reading a correlation that
+/// was deliberately not put there.
+const SPEC_LENGTH_ID_POOL: &[&str] = &[
+    "87e5a5", "88fb62", "4a73ef", "350ba8", "80d9a2", "b0d2fc", "3cfbc8", "37e173", "f8729b",
+    "4fdca8", "bbd141", "db3e2d", "14855d", "28529c", "d25798", "fe9c04", "1c6368", "aa3199",
+];
+
+/// The three arms that are generated from — `PROTOCOL.md` item 2.
+///
+/// `S0` is deliberately absent: it is the historical baseline, "never generated
+/// from, never scored, and never shipped". A design that produced `S0`
+/// generations would be measuring text nobody ships.
+const SPEC_LENGTH_GENERATED_ARMS: &[&str] = &["S1", "S2", "S3"];
+
+/// The candidate arms — the ones item 14a's `A`/`B` pairing puts opposite the
+/// control. `S1` is the control and is not among them.
+const SPEC_LENGTH_CANDIDATE_ARMS: &[&str] = &["S2", "S3"];
+
+/// The three fixtures — `PROTOCOL.md` item 3. These are the ledger/fixture file
+/// stems, so a blind-map cell naming one of them names a real ledger.
+const SPEC_LENGTH_FIXTURE_NAMES: &[&str] = &["skill-stickiness", "tiered-review", "tui-dc-picker"];
+
+/// Two samples per (arm, fixture) — `PROTOCOL.md` item 3's `3 x 3 x 2 = 18`.
+const SPEC_LENGTH_SAMPLES: &[u32] = &[1, 2];
+
+/// One `blind-map.json` cell — `PROTOCOL.md` item 7's schema.
+///
+/// Closed (`deny_unknown_fields`) for the same reason item 8's verdict struct is:
+/// an extra key is the shape a hand-edited map takes, and a map that carries a
+/// stray `"note": "S3 looked short"` is a leak channel wearing a comment's
+/// clothes.
+///
+/// Deliberately **not** [`VoiceCell`], whose third field is `scenario`. The two
+/// stages' vocabularies are disjoint; sharing a type would let a spec-length cell
+/// naming a voice scenario parse cleanly.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpecLengthCell {
+    arm: String,
+    fixture: String,
+    sample: u32,
+}
+
+/// Read and parse `blind-map.json`, or fail saying which.
+///
+/// A missing map is a hard failure rather than a skip. Unlike
+/// [`freeze_precedes_every_candidate_arm`], where zero arms is a legitimate state
+/// for a whole task, the map and the generations land **together** in T4 — so
+/// there is no state in this run where the map's absence is correct and the
+/// checks below should stay quiet. A skip here would print `ok` having compared
+/// nothing, on the one file that makes 18 anonymous specs attributable at all.
+fn read_spec_length_blind_map() -> HashMap<String, SpecLengthCell> {
+    let path = spec_length_blind_map_path();
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}\n\n\
+             This file is the arm<->id assignment for the 18 generated specs. Without it \
+             every generation is anonymous and no retention verdict can ever be attributed \
+             to an arm — the measurement is unrecoverable without regenerating.",
+            path.display()
+        )
+    });
+    serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}\n\n\
+             Expected `PROTOCOL.md` item 7's schema: an object of \
+             `\"<id>\": {{\"arm\": ..., \"fixture\": ..., \"sample\": ...}}` and no other keys.",
+            path.display()
+        )
+    })
+}
+
+/// Is `b` a character that would make an occurrence part of a longer word?
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Byte offset of the first occurrence of `needle` in `haystack` that stands as
+/// its own token — neither neighbour a letter, digit, `_` or `-`.
+///
+/// **Whole-token, not substring, and that is the difference between a leak check
+/// and a check that forces curation.** The arms are named `S1`/`S2`/`S3`, and a
+/// plain substring search for `S3` would also fire on `S3 bucket`, `RFC-S3x` or
+/// any identifier that happens to contain it. A generated spec is *evidence*: the
+/// protocol forbids retrying a generation because its output looks wrong, so a
+/// check that can fire on legitimate prose is a check whose only available fix is
+/// the one thing this run may not do. Token boundaries keep it aimed at labels.
+///
+/// `needle` is assumed ASCII, which every token this file searches for is;
+/// `match_indices` then only ever reports char boundaries, so indexing the
+/// neighbouring bytes is safe even though the specs contain multi-byte
+/// punctuation.
+fn token_position(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii() && !needle.is_empty());
+    let bytes = haystack.as_bytes();
+    haystack
+        .match_indices(needle)
+        .find(|(at, _)| {
+            let before_free = *at == 0 || !is_token_byte(bytes[at - 1]);
+            let end = at + needle.len();
+            let after_free = end == bytes.len() || !is_token_byte(bytes[end]);
+            before_free && after_free
+        })
+        .map(|(at, _)| at)
+}
+
+/// The 1-based line number containing byte offset `at`, for a legible failure.
+fn line_of_offset(text: &str, at: usize) -> usize {
+    text[..at].matches('\n').count() + 1
+}
+
+/// The 18 generated specs exist, are non-empty, carry no arm label, and
+/// `blind-map.json` attributes each of them to a distinct cell of the design.
+///
+/// **Blinding is what this test is really about.** T5 and T6 hand a generated
+/// spec to a scorer and ask which ledger rows survived. If the scorer can tell
+/// which arm wrote the spec it is scoring, the retention numbers stop being a
+/// measurement of the instruction and become a measurement of the scorer's
+/// expectations — and, because the arms are frozen and there is exactly one
+/// generation round (`R6`), there is no way to recover except by regenerating all
+/// 18. So the label channel is closed here, at the only moment it is cheap.
+///
+/// **What it checks, and what it cannot.** It checks the channels that live in
+/// the bytes: the arm name, the id, and the probe template's own scaffolding. It
+/// **cannot** check the channel `PROTOCOL.md` item 11 names as this experiment's
+/// real one — length, section shape and vocabulary still correlate with the arm,
+/// and no test closes that. Item 11 is the honest statement of the limit; this is
+/// the part a machine can enforce. Do not read a green here as "the scoring is
+/// blind".
+///
+/// **Absence is not a legal state and there is no skip.** See
+/// [`read_spec_length_blind_map`].
+#[test]
+fn spec_length_generations_are_unlabelled_and_cover_the_design() {
+    let map = read_spec_length_blind_map();
+    let map_path = spec_length_blind_map_path();
+
+    // The pool is a closed set of 18 distinct tokens. Asserted rather than
+    // assumed, because everything below measures the map against it — a pool
+    // transcribed with a duplicate would quietly shrink the design to 17.
+    let pool: HashSet<&str> = SPEC_LENGTH_ID_POOL.iter().copied().collect();
+    assert_eq!(
+        pool.len(),
+        18,
+        "the id pool transcribed from PROTOCOL.md item 6 holds {} distinct tokens, not 18",
+        pool.len()
+    );
+
+    // Every id is a pool id. A generation under an off-pool id would be a
+    // nineteenth arm-fixture cell that item 6 never authorised.
+    let mut off_pool: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !pool.contains(id))
+        .collect();
+    off_pool.sort_unstable();
+    assert!(
+        off_pool.is_empty(),
+        "{} uses {} id(s) that are not in PROTOCOL.md item 6's pool: {}\n\n\
+         The pool is what closes the set. An id invented at generation time satisfies \
+         every other check here — 6 hex characters, a map entry, a file — while sitting \
+         outside the pre-registered design.",
+        map_path.display(),
+        off_pool.len(),
+        off_pool.join(", "),
+    );
+
+    // Every cell names a real arm, a real fixture and a real sample, reported
+    // together so one run names every bad cell rather than the first.
+    let mut bad_cells = Vec::new();
+    for (id, cell) in &map {
+        if !SPEC_LENGTH_GENERATED_ARMS.contains(&cell.arm.as_str()) {
+            bad_cells.push(format!(
+                "  {id}: arm `{}` is not one of {SPEC_LENGTH_GENERATED_ARMS:?}",
+                cell.arm
+            ));
+        }
+        if !SPEC_LENGTH_FIXTURE_NAMES.contains(&cell.fixture.as_str()) {
+            bad_cells.push(format!(
+                "  {id}: fixture `{}` is not one of {SPEC_LENGTH_FIXTURE_NAMES:?}",
+                cell.fixture
+            ));
+        }
+        if !SPEC_LENGTH_SAMPLES.contains(&cell.sample) {
+            bad_cells.push(format!(
+                "  {id}: sample {} is not one of {SPEC_LENGTH_SAMPLES:?}",
+                cell.sample
+            ));
+        }
+    }
+    bad_cells.sort();
+    assert!(
+        bad_cells.is_empty(),
+        "{} holds {} cell value(s) outside the design:\n{}",
+        map_path.display(),
+        bad_cells.len(),
+        bad_cells.join("\n"),
+    );
+
+    // The design, triple by triple rather than as a total: 18 is also what a map
+    // with two `S2`/`tiered-review`/`1` cells and no `S3`/`tiered-review`/`2`
+    // cell adds up to, and that map would silently reweight every per-arm union
+    // R1 computes from it.
+    for arm in SPEC_LENGTH_GENERATED_ARMS {
+        for fixture in SPEC_LENGTH_FIXTURE_NAMES {
+            for sample in SPEC_LENGTH_SAMPLES {
+                let hits: Vec<&str> = map
+                    .iter()
+                    .filter(|(_, c)| c.arm == *arm && c.fixture == *fixture && c.sample == *sample)
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "{}: the triple ({arm}, {fixture}, sample {sample}) is covered {} time(s), \
+                     not exactly once{}",
+                    map_path.display(),
+                    hits.len(),
+                    if hits.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (by {})", hits.join(", "))
+                    },
+                );
+            }
+        }
+    }
+    // Redundant with the loop above only while the design is exactly 3x3x2; kept
+    // because it is the assertion that catches a 19th cell, which the loop cannot
+    // see.
+    assert_eq!(
+        map.len(),
+        18,
+        "{} holds {} entries; the design is 3 arms x 3 fixtures x 2 samples = 18",
+        map_path.display(),
+        map.len(),
+    );
+
+    // `generated/` holds exactly the mapped ids and nothing else. A stray file is
+    // refused rather than ignored: an unmapped `<id>.md` is a spec that will be
+    // scored and can never be attributed, and a `notes.md` sitting beside the
+    // specs is one more thing a scorer could be handed by accident.
+    let gen_dir = spec_length_generated_dir();
+    let entries = fs::read_dir(&gen_dir).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}\n\n\
+             `blind-map.json` names 18 generations; this is where their text lives.",
+            gen_dir.display()
+        )
+    });
+    let mut on_disk: HashSet<String> = HashSet::new();
+    let mut strays: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "cannot read an entry of {}: {e}. Refusing to report on only the \
+                 generations that happened to be readable.",
+                gen_dir.display()
+            )
+        });
+        let path = entry.path();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string);
+        let is_md = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
+        match stem {
+            Some(stem) if is_md && map.contains_key(&stem) => {
+                on_disk.insert(stem);
+            }
+            _ => strays.push(path.display().to_string()),
+        }
+    }
+    strays.sort();
+    assert!(
+        strays.is_empty(),
+        "{} holds {} file(s) that no blind-map entry names:\n  {}\n\n\
+         Every file in this directory is a generated spec and every generated spec has a \
+         cell. An unmapped one is text that can be scored and never attributed.",
+        gen_dir.display(),
+        strays.len(),
+        strays.join("\n  "),
+    );
+    let mut missing: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !on_disk.contains(*id))
+        .collect();
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "{} names {} generation(s) with no `<id>.md` in {}: {}",
+        map_path.display(),
+        missing.len(),
+        gen_dir.display(),
+        missing.join(", "),
+    );
+
+    // The leak set. Every token here is one the probe could only have learned
+    // from its own prompt — none of them occurs anywhere in the three fixtures,
+    // so an occurrence is a leak and not the fixture's own vocabulary showing
+    // through. The experiment's *real* leak channel (length, shape, vocabulary)
+    // is item 11's and is not checkable; see this test's doc comment.
+    let mut leaks: Vec<String> = Vec::new();
+    for id in map.keys() {
+        let path = gen_dir.join(format!("{id}.md"));
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            !text.trim().is_empty(),
+            "{} is empty. An empty generation is a probe that did not run, not a spec \
+             that says nothing — re-running it is the one re-run `R6` permits.",
+            path.display(),
+        );
+
+        // Arm labels, including `S0`: it is not an arm of this run, so its
+        // appearance would mean the probe was handed something no probe should
+        // ever see.
+        for label in ["S0", "S1", "S2", "S3"] {
+            if let Some(at) = token_position(&text, label) {
+                leaks.push(format!(
+                    "  {}:{} carries the arm label `{label}`",
+                    path.display(),
+                    line_of_offset(&text, at),
+                ));
+            }
+        }
+        // The id: item 5 says the file holds the spec body and nothing else, and
+        // an id in the text would let a scorer join two shards of the same spec
+        // — or read `blind-map.json` against it.
+        if let Some(at) = text.find(id.as_str()) {
+            leaks.push(format!(
+                "  {}:{} carries its own id `{id}`",
+                path.display(),
+                line_of_offset(&text, at),
+            ));
+        }
+        // The probe template's scaffolding. If these survived into the output the
+        // probe echoed its prompt, which means the arm's instruction text itself
+        // is sitting in the file the scorer reads.
+        for marker in ["BEGIN INSTRUCTION", "END INSTRUCTION"] {
+            if let Some(at) = text.find(marker) {
+                leaks.push(format!(
+                    "  {}:{} echoes the probe template's `{marker}` marker",
+                    path.display(),
+                    line_of_offset(&text, at),
+                ));
+            }
+        }
+        // The fixture name is deliberately NOT in the leak set. Item 5 excludes
+        // it as a *header*, but every one of these specs is about its fixture's
+        // topic and will name it in ordinary prose — `skill-stickiness` occurs 14
+        // times inside its own fixture. Refusing the word would fire on faithful
+        // compression, and the only fix available for that is editing the
+        // measurement.
+    }
+    leaks.sort();
+    assert!(
+        leaks.is_empty(),
+        "{} generated spec(s) carry a label a scorer must never see:\n{}\n\n\
+         `PROTOCOL.md` item 5: the generated file holds ONLY the spec body — no header, no \
+         arm name, no fixture name, no id. Anything else is a channel to the scorer, and a \
+         scorer that can identify the arm makes every retention number worthless.\n\n\
+         Fixing this by editing the generated text is NOT available: the specs are the raw \
+         measurement. A leak means the probe was mis-prompted, and the repair is to re-run \
+         that probe under `R6` and log it.",
+        leaks.len(),
+        leaks.join("\n"),
+    );
+}
+
+/// No property of a generation id is a function of the arm it was assigned to —
+/// the constraint `PROTOCOL.md` item 14a places on item 6.
+///
+/// **Why an id assignment needs a test at all.** T9 pairs each candidate
+/// generation against the control's generation for the same fixture and sample,
+/// relabels them `A` and `B`, and asks a blind adjudicator which spec answers
+/// each question. Which one is `A` is fixed by the ids — *"the lexicographically
+/// smaller id is `A`"* — precisely so that nobody chooses it once the answers are
+/// visible. That guarantee is only worth anything if the ids themselves do not
+/// track the arm: an assignment that handed `S1` the smaller id in all three
+/// fixtures would put the control in position `A` every time and give the
+/// adjudicator back, through position, exactly the correlation the relabelling
+/// removes.
+///
+/// **This is the necessary half, not the sufficient half.** Item 14a forbids the
+/// id's *value*, its *lexicographic rank* and its *position in the pool listing*
+/// from being a function of the arm; a test can only refuse the specific
+/// degenerate outcomes, not prove the assignment was drawn independently. What it
+/// pins is the one that would actually bite T9, on the one axis T9 reads. A green
+/// here does not certify the draw — `RESULTS.md` records how it was made.
+///
+/// Scope is **sample 1** across the three fixtures, because that is exactly what
+/// T8 and T9 run on (item 14, item 14a). Sample 2 is never paired.
+#[test]
+fn spec_length_id_assignment_does_not_track_the_arm() {
+    let map = read_spec_length_blind_map();
+    let map_path = spec_length_blind_map_path();
+
+    let id_for = |arm: &str, fixture: &str, sample: u32| -> String {
+        map.iter()
+            .find(|(_, c)| c.arm == arm && c.fixture == fixture && c.sample == sample)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no entry for ({arm}, {fixture}, sample {sample}) — \
+                     `spec_length_generations_are_unlabelled_and_cover_the_design` reports \
+                     the coverage failure in full",
+                    map_path.display()
+                )
+            })
+    };
+
+    for candidate in SPEC_LENGTH_CANDIDATE_ARMS {
+        let mut control_is_a: Vec<&str> = Vec::new();
+        let mut candidate_is_a: Vec<&str> = Vec::new();
+        for fixture in SPEC_LENGTH_FIXTURE_NAMES {
+            let control = id_for("S1", fixture, 1);
+            let other = id_for(candidate, fixture, 1);
+            assert_ne!(
+                control, other,
+                "{}: ({fixture}, sample 1) gives S1 and {candidate} the same id",
+                map_path.display()
+            );
+            if control < other {
+                control_is_a.push(fixture);
+            } else {
+                candidate_is_a.push(fixture);
+            }
+        }
+        assert!(
+            !control_is_a.is_empty() && !candidate_is_a.is_empty(),
+            "{}: across all three fixtures at sample 1, `{}` always holds position `A` in \
+             the S1-vs-{candidate} pairing (A on: {}).\n\n\
+             `PROTOCOL.md` item 14a fixes `A` as the lexicographically smaller id so that \
+             position cannot carry a hint, and makes that a constraint on T4's assignment: \
+             no property of an id may be a function of the arm. A clean sweep of position \
+             `A` by one arm hands T9's adjudicator the correlation the A/B relabelling \
+             exists to remove.\n\n\
+             This is a finding about the ASSIGNMENT, not about any spec. Before T5 scores \
+             anything the repair is to re-draw the assignment and regenerate; afterwards it \
+             is not repairable and T10 records it as a limitation on T9.",
+            map_path.display(),
+            if control_is_a.is_empty() {
+                candidate
+            } else {
+                "S1"
+            },
+            if control_is_a.is_empty() {
+                candidate_is_a.join(", ")
+            } else {
+                control_is_a.join(", ")
+            },
+        );
+    }
+}
+
+/// `blind-map.json` was committed before any retention verdict was.
+///
+/// **The ordering is the claim, exactly as it is for the freeze.** A map written
+/// after the verdicts is a map that could have been written to fit them: with 18
+/// anonymous specs and 18 finished retention counts in hand, assigning arms
+/// afterwards picks the result. `scoring-rubric.md`'s order of operations puts the
+/// join last for the same reason, and T7 may only join once all 18 verdicts exist.
+/// Prose cannot enforce that; the commit graph can.
+///
+/// **An empty `retention/` is a pass, and it is the correct state until T5** —
+/// the same shape as [`freeze_precedes_every_candidate_arm`] tolerating zero arms.
+/// It is still never vacuous: the map must itself resolve to an introducing
+/// commit, which is a real fact about a real file from T4 onward, and an
+/// uncommitted map is precisely what would make every descent check below it
+/// unanswerable.
+#[test]
+fn spec_length_blind_map_precedes_every_retention_verdict() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no verdict's position relative to the blind map can \
+         be verified"
+    );
+    let repo = repo_root();
+    let map_path = spec_length_blind_map_path();
+    assert!(
+        map_path.is_file(),
+        "{} does not exist. It is what every retention verdict is ordered against.",
+        map_path.display()
+    );
+
+    let map_commit = match introducing_commit_in(&repo, &map_path) {
+        Introduced::At(commit) => commit,
+        Introduced::NotCommitted => panic!(
+            "{} exists on disk but no commit introduces it.\n\n\
+             Every retention verdict is measured as a descendant of this file's introducing \
+             commit, so an uncommitted map makes the ordering guarantee silently inert. \
+             `PROTOCOL.md` item 7 requires it committed before the first scorer is \
+             dispatched — commit it now, before generating or scoring anything further.",
+            map_path.display()
+        ),
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when {} was introduced: {how}\n\n\
+             This is NOT a finding about the map — it is this check reporting that it could \
+             not run.",
+            map_path.display()
+        ),
+    };
+
+    let retention = spec_length_retention_dir();
+    let entries = match fs::read_dir(&retention) {
+        Ok(entries) => entries,
+        // T5 has not run. The map still had to resolve above, so this is not a
+        // vacuous pass.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!(
+            "cannot read {}: {e}. This is NOT the same as holding no verdicts — refusing \
+             to report an ordering verdict on a directory this check could not enumerate.",
+            retention.display()
+        ),
+    };
+
+    let mut violations = Vec::new();
+    let mut uncommitted = Vec::new();
+    let mut unreadable = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "cannot read an entry of {}: {e}. Refusing to order only the verdicts that \
+                 happened to be readable.",
+                retention.display()
+            )
+        });
+        let path = entry.path();
+        // Immediate `*.json` children only. `parts/` holds scorer shards, which
+        // `PROTOCOL.md` item 10 calls working material and deliberately leaves
+        // unchecked; the assembled file is the evidence.
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let at = format!("verdict `{}`", path.display());
+        let verdict_commit = match introducing_commit_in(&repo, &path) {
+            Introduced::At(commit) => commit,
+            Introduced::NotCommitted => {
+                uncommitted.push(format!("  {at}: not yet committed — not verifiable"));
+                continue;
+            }
+            Introduced::Undetermined { how } => {
+                unreadable.push(format!("  {at}: {how}"));
+                continue;
+            }
+        };
+        match descends_from_in(&repo, &map_commit, &verdict_commit) {
+            Descent::Yes => {}
+            Descent::No => violations.push(format!(
+                "  {at}: introduced by {}, which does NOT descend from the blind map's \
+                 commit {}",
+                verdict_commit.as_str(),
+                map_commit.as_str(),
+            )),
+            Descent::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
+        }
+    }
+
+    assert!(
+        unreadable.is_empty(),
+        "{} retention verdict(s) could not be checked at all:\n{}\n\n\
+         This is NOT a finding about the verdicts — it is this check reporting that it \
+         could not run.",
+        unreadable.len(),
+        unreadable.join("\n"),
+    );
+    assert!(
+        uncommitted.is_empty(),
+        "{} retention verdict(s) are on disk with no introducing commit:\n{}\n\n\
+         A verdict that is not in history cannot be shown to postdate the blind map, so \
+         this check can say nothing about it. Commit the verdict, then re-run.",
+        uncommitted.len(),
+        uncommitted.join("\n"),
+    );
+    assert!(
+        violations.is_empty(),
+        "{} retention verdict(s) predate the blind map {}:\n{}\n\n\
+         A map written after the verdicts is a map that could have been written to fit \
+         them. The assignment is committed first so that it cannot be.",
+        violations.len(),
+        map_path.display(),
+        violations.join("\n"),
+    );
+}
+
 /// Build a throwaway repository so the git helpers above can be exercised
 /// against history this file controls.
 ///
