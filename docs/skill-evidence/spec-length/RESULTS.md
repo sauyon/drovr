@@ -13,7 +13,8 @@ instrument reading under `R4`, and the re-run log under `R6`.
 **No arm is printed against any generation id in this file — but the arm is derivable from it, and
 saying only the first half would be a comfortable lie.** (Arm *names* do appear, in §1, §2 and §5,
 describing the arms as arms; what never appears is an id paired with its arm.) The per-generation
-table in §3 carries `id`, `fixture`, `sample`, lines and bytes, and deliberately **not** the arm:
+table in §3 carries `id`, `fixture`, `sample`, lines, bytes and the fixture percentage, and
+deliberately **not** the arm:
 when T7 unblinds it records the arm in **a table of its own, per §6 — never by widening §3**, whose
 whole value is that it was written before any scoring. However, §5's deviation 4 records the draw's
 salt and ordering rule, which means **this file alone determines the whole assignment** for anyone
@@ -120,26 +121,39 @@ not just this one.
    the exact name … does not"* count — `false` is defensible, and T4 does not overturn it. But the
    entire 54-vs-55 rests on a named-constant threshold, and **T6 should expect to land either side
    of it.**
-2. **The scorer's spans are clipped to source lines, and some do not stand alone.** The generated
-   specs are hard-wrapped, and the scorer copied whole lines, so many spans end mid-phrase. That is
-   fine against item 8, which only requires each span to be a verbatim substring — every span here
-   is — but item 8a shows the adjudicator **the spans with the spec withheld** and asks whether they
-   *establish* the row. A clipped span can fail that while the spec plainly contains the row. In
-   this verdict the clearest cases are `tui-dc-picker-41` (the span stops before the merge's
-   conflict rule, which is the row's whole content) and `tui-dc-picker-36` (the span never says what
-   `(shared)` is appended to) — **and both fall inside item 8a's every-fifth-row sample**, so on this
-   evidence an 8a pass is not the default outcome. **Nothing in item 10's template tells a scorer a
-   span must be self-contained**, so this is the instrument's default behaviour, not one scorer's
-   slip. Item 8a makes any `establishes: false` invalidate the **whole** verdict file, re-run whole
-   under `R6` — 91 rows for a `skill-stickiness` verdict. **T5 and T6: expect this, budget for it,
-   and log each re-run's reason.** T4 may not fix it: item 10's template is a governed item and
-   window 3 is closed.
+2. **The scorer's spans are clipped to source lines, and some do not establish their row — which
+   breaks a rule the scorer was given, rather than exposing a gap in the instrument.** The generated
+   specs are hard-wrapped, and the scorer copied whole lines, so many spans end mid-phrase. Every
+   span is a verbatim substring, so that half is satisfied. But **both item 8 and item 10's own hard
+   rule 2 require the spans to be ones "which together establish the row"** — and item 8a defines
+   *establish* as an implementer reading **only those spans** building what the row states. The
+   requirement is therefore already in the scorer's prompt, verbatim, and this verdict does not meet
+   it in at least two places: `tui-dc-picker-41`, whose spans stop at *"the overlay wins on"* and
+   never reach the conflict rule that is the row's whole content, and `tui-dc-picker-36`, whose
+   single span never says what `(shared)` is appended to. Both fail as **sets**, not as individual
+   spans, and **both fall inside item 8a's every-fifth-row sample** — so an 8a pass on this file is
+   not the default outcome.
+
+   **An earlier draft of this entry called it "the instrument's default behaviour, not one scorer's
+   slip" and said item 10's template was silent on self-containment. That was wrong on both counts**
+   — the template carries the rule — and it is corrected here rather than quietly amended, because
+   the disposition it implied was wrong too: there is no governed-item drafting gap to work around,
+   and nothing here needed T4 to change a frozen template.
+
+   **What T5 and T6 actually owe.** Not tolerance — **enforcement**. Rule 2 is hard; check each
+   `present: true` row's spans against it before accepting a shard, and treat a set that does not
+   stand alone as a malformed verdict, which `R6`'s closed list already covers. Budget for re-runs
+   anyway: an `establishes: false` at 8a invalidates the **whole** file, 91 rows for a
+   `skill-stickiness` verdict, and every re-run is logged here with its reason.
 
 **What it is for.** `R4` pre-registers a universal null as the *likely* outcome: `R1` needs 460
 row-judgements clean for one arm to pass, and at any realistic per-row fidelity the expected result
-is that no arm clears. This reading costs one scorer run and says, before T5 and T6 spend 36 more,
-whether 230/230 is reachable at all under D2. **It is recorded because it was taken, not because it
-was reassuring** — the instruction to write it down either way is what makes it evidence.
+is that no arm clears. This reading costs one scorer run and says, before T5 and T6 spend **48
+dispatches** between them — 30 scorer runs under item 10's sharding plus 18 item-8a adjudications
+(T5 is 18, T6 is 30) — whether 230/230 is reachable at all under D2. (The plan's T4 section says
+"36 more"; that figure matches neither the scorer runs nor the total, and the per-task budgets in
+the plan's own standing rules are the ones that add up.) **It is recorded because it was taken, not
+because it was reassuring** — the instruction to write it down either way is what makes it evidence.
 
 **What it is not.** It is **n = 1** of 18, one fixture of three, and the smallest ledger of the
 three. It is **not** a retention verdict: it has not been through item 8a's relevance adjudication,
@@ -266,14 +280,29 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
 
    - **T5 and T6:** a prompt-level control is not enough here, and saying "do not invite the scorer
      to read `git log`" would be pretending otherwise — a scorer subagent with a shell and a cwd
-     inside this worktree needs no invitation. **The control that actually holds is to put the spec
-     somewhere the history is not:** copy `generated/<id>.md` byte-for-byte to a scratch path
-     outside the repository and point the scorer at that. Item 10's template supplies
-     `<abs path to generated/<id>.md>` as a path, and a path to identical bytes satisfies it —
-     verify the copy's `git hash-object` matches before dispatching. **Inlining the spec text into
-     the prompt instead is NOT pre-authorised here:** item 10's template has no slot for the
-     document's text, item 10 is a governed item, and window 3 is closed — so a task that inlines is
-     deviating and must log it. Also: never paste the salt into a prompt or a commit message again.
+     inside this worktree needs no invitation. **And moving the spec file is not sufficient, which
+     an earlier draft of this entry got wrong.** Item 10's template hands the scorer its own `<id>`
+     three times over — in the output path, in the `spec_id` field, and in the return line — so a
+     scorer that can reach this repository's history can run the `sha256` loop on its own id and
+     unblind itself no matter where the spec bytes were copied to.
+
+     **What actually closes it is denying the scorer the history, not the file:** dispatch with a
+     working directory **outside this repository**, hand it the spec at a scratch path there (a
+     byte-for-byte copy — verify `git hash-object` matches first), and have it write its shard to a
+     scratch path too, with the phase agent moving the result into `retention/parts/` afterwards.
+     **If a task cannot arrange that, the channel is open for that dispatch and it must be recorded
+     here as a deviation, not assumed away.** Do not treat "the scorer was told only to read the
+     spec" as a control; it is an instruction, and this deviation exists because instructions are
+     not what kept the assignment secret.
+
+     **Inlining the spec text into the prompt is a different question and is NOT pre-authorised:**
+     item 10's template has no slot for the document's text, item 10 is governed, and window 3 is
+     closed — a task that inlines is deviating and must log it. Substituting a path is the lesser
+     reading, since the template's `<abs path to generated/<id>.md>` is a path placeholder and a
+     path to identical bytes fills it; that is the interpretation this run takes, and it is stated
+     so a later reader can disagree with it explicitly rather than discover it by inference.
+
+     Also: never paste the salt into a prompt or a commit message again.
    - **T10:** report this as a stated limitation on the blinding, next to item 11's channel, and say
      plainly that a determined reader of this branch's history could have unblinded any generation.
    - **The driver:** whether this is severe enough to void the run and restart under an unpublished

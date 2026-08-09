@@ -2801,9 +2801,19 @@ struct RetentionScan {
     ///
     /// The **stem is not checked**: `retention/notes.json` would be ordered as
     /// though it were a verdict, and `retention/4a73eg.json` (a typo'd id) is not
-    /// flagged. That is deliberate division of labour, not an oversight — item
-    /// 8's completeness test owns `spec_id` validity and rejects both, and
-    /// duplicating the id vocabulary here would be a second place to forget one.
+    /// flagged. That is a deliberate division of labour — this is an *ordering*
+    /// check and duplicating the id vocabulary here would be a second place to
+    /// forget one — but it is a division with nothing on the other side yet, and
+    /// saying otherwise would be delegating to a check that does not exist.
+    ///
+    /// **This is therefore a requirement on T5's
+    /// `spec_length_retention_verdicts_are_complete_and_quoted`, which
+    /// `PROTOCOL.md` item 8 says T5 lands and which is not in this file today:**
+    /// it must reject a stem that is not a pool id, and require the stem to equal
+    /// the file's own `spec_id`. **Item 8 does not state either rule** — it
+    /// constrains `spec_id`'s shape nowhere and never mentions the filename — so
+    /// without them `retention/4a73eg.json` carrying `"spec_id": "4a73ef"` and a
+    /// well-formed row set is rejected by nothing, here or there.
     verdicts: Vec<PathBuf>,
     /// Everything the naming rule does not recognise, described. Collected
     /// rather than skipped: see [`scan_retention_dir`].
@@ -2878,10 +2888,21 @@ fn scan_retention_dir(dir: &Path) -> Option<RetentionScan> {
 ///
 /// A predicate rather than an inline `||` so it can be exercised: against the
 /// real repository the map's introducing and finalising commits are the same and
-/// `retention/` is empty, so **every** combination that matters is unreachable
-/// there, and an inline condition would ship having never been false. See
-/// [`retention_scan_surfaces_every_misfiled_verdict`] for the same reasoning one
-/// function over.
+/// `retention/` does not exist at all (which the caller distinguishes from an
+/// empty one — see [`scan_retention_dir`]), so **every** combination that matters
+/// is unreachable there, and an inline condition would ship having never been
+/// false. See [`retention_scan_surfaces_every_misfiled_verdict`] for the same
+/// reasoning applied to the scan.
+///
+/// **Both commits must be resolved the same way, and today they are not quite.**
+/// `introduced_at` comes from [`introducing_commit_in`], which passes `--follow`;
+/// this one's counterpart comes from [`last_commit_touching`], which does not.
+/// The two agree for any path that was never renamed, which covers
+/// `blind-map.json` and every path this run creates — but a rename into place
+/// would make them disagree and fail spuriously. Unreachable, and recorded rather
+/// than patched, because adding `--follow` to a one-commit lookup has its own
+/// failure mode (`--follow` with no `-1` semantics is what
+/// [`introducing_commit_in`] documents at length).
 fn blind_map_is_immovable(
     verdict_count: usize,
     finalised_at: &GitObjectId,
