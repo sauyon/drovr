@@ -3633,6 +3633,799 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
     );
 }
 
+/// One row of a retention verdict — `PROTOCOL.md` item 8.
+///
+/// Closed, like every other verdict struct in this file, and for the reason item
+/// 8 gives: an extra key, a missing key, a wrong type or a `null` is a hard
+/// error. Nothing here is `Option`, so a `null` fails to deserialize rather than
+/// arriving as an absence the checks below would have to remember to reject.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionRow {
+    id: String,
+    present: bool,
+    quotes: Vec<String>,
+}
+
+/// One assembled retention verdict — `PROTOCOL.md` item 8.
+///
+/// **Deliberately not shared with the shard shape**, even though item 10 gives
+/// the shards the same three keys: a shard is working material covering its own
+/// slice of the ledger, an assembled verdict must carry the whole ledger, and the
+/// only thing that distinguishes them is the completeness rule below. Sharing a
+/// type would invite a caller to run the shard rules over a verdict.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionVerdict {
+    spec_id: String,
+    ledger: String,
+    rows: Vec<RetentionRow>,
+}
+
+/// A key-point ledger's declared count and its row ids, in ledger order.
+#[derive(Debug)]
+struct LedgerIndex {
+    declared: usize,
+    ids: Vec<String>,
+}
+
+/// Parse a key-point ledger into its declared count and its ordered row ids.
+///
+/// **This does not replace the walk inside
+/// [`spec_length_ledgers_are_the_closed_lists_they_claim`], and the duplication is
+/// deliberate.** That test asserts per-row properties (`kind` is one of four, the
+/// item cell is non-empty, the ids run `-01`, `-02`, … with no gaps) with its own
+/// failure messages, and it discovers its ledgers from `FREEZE.md`. This one
+/// answers a different question — *what ids, in what order, must a verdict
+/// carry* — for a caller that already knows which ledger it wants.
+///
+/// **What keeps the two from drifting apart is the count.** Both read the same
+/// `Closed list: N rows` declaration, and this parser refuses a table that
+/// disagrees with it. So a row this walk failed to recognise (or wrongly
+/// recognised) cannot silently shorten the id list a verdict is measured against
+/// — it fails here instead, saying so.
+fn parse_ledger_ids(text: &str) -> Result<LedgerIndex, String> {
+    let declared: usize = text
+        .lines()
+        .find_map(|l| {
+            l.split("Closed list:")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| "no `Closed list: N rows` declaration".to_string())?;
+
+    let mut ids = Vec::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        let Some(cells) = split_ledger_row(line) else {
+            continue;
+        };
+        if !in_table {
+            if cells.len() == 3 && cells[0] == "id" && cells[1] == "kind" && cells[2] == "item" {
+                in_table = true;
+            }
+            continue;
+        }
+        if is_separator_row(&cells) {
+            continue;
+        }
+        if cells.len() != 3 {
+            return Err(format!(
+                "row has {} cells, expected 3 (`| id | kind | item |`): {line}",
+                cells.len()
+            ));
+        }
+        ids.push(cells[0].clone());
+    }
+
+    if !in_table {
+        return Err("no `| id | kind | item |` header row".to_string());
+    }
+    if ids.len() != declared {
+        return Err(format!(
+            "declares {declared} rows but carries {}. The verdict completeness check \
+             measures a verdict against this list, so a list that has drifted from its \
+             own declared count would silently change what `complete` means.",
+            ids.len()
+        ));
+    }
+    Ok(LedgerIndex { declared, ids })
+}
+
+/// Resolve a verdict's `ledger` cell to the ledger file it names.
+///
+/// **A whitelist, not a path join, and that is the point.** `ledger` is a string
+/// read out of a JSON file a subagent wrote. Joining it onto `ledger/` would make
+/// `"../../../etc/passwd"` and `"../fixtures/tui-dc-picker.spec"` both resolvable,
+/// and the second is the realistic one: a verdict scored against a *fixture*
+/// instead of its ledger would be measured against the source document it is
+/// supposed to have compressed. Only the three fixture stems name a ledger.
+fn retention_ledger_path(name: &str) -> Result<PathBuf, String> {
+    if !SPEC_LENGTH_FIXTURE_NAMES.contains(&name) {
+        return Err(format!(
+            "`ledger` is `{name}`, which is not one of {SPEC_LENGTH_FIXTURE_NAMES:?}. \
+             The cell names a ledger stem under \
+             `docs/skill-evidence/spec-length/ledger/`, not a path."
+        ));
+    }
+    Ok(spec_length_dir().join("ledger").join(format!("{name}.md")))
+}
+
+/// Every rule `PROTOCOL.md` item 8 states about an assembled retention verdict,
+/// as a pure function over already-read bytes.
+///
+/// `stem` is the verdict file's own name without `.json`; `ledger_ids` are the
+/// ids of the ledger the verdict names, in ledger order; `spec` is the full text
+/// of `generated/<spec_id>.md`.
+///
+/// **This asserts well-formedness and never judgement.** Nothing here can say a
+/// verdict is *right* — a scorer that cites a real, on-topic, entirely irrelevant
+/// sentence satisfies every rule below. Item 8a's adjudication pass is what
+/// covers that, and the two are not substitutes.
+///
+/// **Two rules here are not in item 8's prose, and both are owed to T4.** Item 8
+/// names the file `retention/<id>.json` but nothing enforced the stem, so
+/// `retention/4a73eg.json` carrying `"spec_id": "4a73ef"` was rejected by nothing:
+/// it would be scanned as a verdict, checked against the right spec, and counted
+/// under an id that does not exist. So the stem must be a **pool** id, and it must
+/// equal `spec_id`. [`retention_scan_surfaces_every_misfiled_verdict`]'s scan
+/// deliberately does not do this — its job is to surface entries no check
+/// classifies, and a file named after a plausible id is classified fine.
+fn check_retention_verdict(
+    stem: &str,
+    verdict: &RetentionVerdict,
+    ledger_ids: &[String],
+    spec: &str,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+
+    if !SPEC_LENGTH_ID_POOL.contains(&stem) {
+        wrong.push(format!(
+            "the file is named `{stem}.json`, and `{stem}` is not one of the eighteen pool \
+             ids. A verdict filed under an invented id is scanned, checked and counted — \
+             against a generation that does not exist."
+        ));
+    }
+    if verdict.spec_id != stem {
+        wrong.push(format!(
+            "the file is named `{stem}.json` but scores `{}`. Both may be real ids, which \
+             is what makes this quiet: every other rule here passes while the score is \
+             attributed to the wrong generation, and T7 joins on the id.",
+            verdict.spec_id,
+        ));
+    }
+    if !SPEC_LENGTH_ID_POOL.contains(&verdict.spec_id.as_str()) {
+        wrong.push(format!(
+            "`spec_id` is `{}`, which is not one of the eighteen pool ids",
+            verdict.spec_id,
+        ));
+    }
+
+    // **Completeness, reported by cause rather than as one diff.** Which of the
+    // four went wrong says what to do about it: a gap or a duplicate is a shard
+    // assembly fault, an extra is a row the scorer invented, and a pure
+    // permutation is neither.
+    let got: Vec<&str> = verdict.rows.iter().map(|r| r.id.as_str()).collect();
+    if got != ledger_ids.iter().map(String::as_str).collect::<Vec<_>>() {
+        let expected: HashSet<&str> = ledger_ids.iter().map(String::as_str).collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut duplicated: Vec<&str> = Vec::new();
+        let mut extra: Vec<&str> = Vec::new();
+        for id in &got {
+            if !seen.insert(id) && !duplicated.contains(id) {
+                duplicated.push(id);
+            }
+            if !expected.contains(id) && !extra.contains(id) {
+                extra.push(id);
+            }
+        }
+        let missing: Vec<&str> = ledger_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !seen.contains(id))
+            .collect();
+
+        if !missing.is_empty() {
+            wrong.push(format!(
+                "{} ledger row(s) are not scored at all: {}. `rows` carries EVERY id of the \
+                 named ledger — an unscored row is not a `false`, it is a row nobody looked \
+                 at, and averaging over the rows that are present would silently change the \
+                 denominator.",
+                missing.len(),
+                missing.join(", "),
+            ));
+        }
+        if !duplicated.is_empty() {
+            wrong.push(format!(
+                "{} ledger row(s) are scored twice: {}. Two shards whose boundaries overlap \
+                 produce exactly this, and the second verdict silently wins or loses \
+                 depending on who reads it.",
+                duplicated.len(),
+                duplicated.join(", "),
+            ));
+        }
+        if !extra.is_empty() {
+            wrong.push(format!(
+                "{} scored id(s) are not in the ledger `{}`: {}",
+                extra.len(),
+                verdict.ledger,
+                extra.join(", "),
+            ));
+        }
+        if missing.is_empty() && duplicated.is_empty() && extra.is_empty() {
+            let at = got
+                .iter()
+                .zip(ledger_ids.iter())
+                .position(|(a, b)| *a != b.as_str())
+                .unwrap_or(0);
+            wrong.push(format!(
+                "the rows are the right set in the wrong ledger order — row {} is `{}` where \
+                 the ledger has `{}`. Order is what lets two verdicts be compared row by row \
+                 without a join, and item 8 fixes it.",
+                at + 1,
+                got[at],
+                ledger_ids[at],
+            ));
+        }
+    }
+
+    // **The quote rules, per row.** Run over every row including ones the
+    // completeness check already complained about: a verdict with one missing row
+    // still has 90 rows whose spans are worth reporting in the same pass.
+    for row in &verdict.rows {
+        if row.present {
+            if row.quotes.is_empty() || row.quotes.len() > 3 {
+                wrong.push(format!(
+                    "row `{}` is `present: true` with {} span(s); item 8 requires 1 to 3. \
+                     Zero is an unevidenced retention claim; more than three is a row \
+                     established by assembling the document rather than by citing it.",
+                    row.id,
+                    row.quotes.len(),
+                ));
+            }
+            for (i, quote) in row.quotes.iter().enumerate() {
+                if quote.is_empty() {
+                    wrong.push(format!(
+                        "row `{}` span {} is the empty string, which is a substring of every \
+                         document and evidences nothing",
+                        row.id,
+                        i + 1,
+                    ));
+                } else if !spec.contains(quote.as_str()) {
+                    wrong.push(format!(
+                        "row `{}` span {} is not a verbatim substring of the generated spec: \
+                         {:?}. Every span is copied from the document, never from the ledger \
+                         row and never reconstructed — a near-miss paraphrase is the shape a \
+                         span takes when the scorer wrote it from memory.",
+                        row.id,
+                        i + 1,
+                        quote,
+                    ));
+                }
+            }
+        } else if !row.quotes.is_empty() {
+            wrong.push(format!(
+                "row `{}` is `present: false` but carries {} span(s); item 8 requires `[]`",
+                row.id,
+                row.quotes.len(),
+            ));
+        }
+    }
+
+    // **No span may be cited for more than one row.** Exact string equality, and
+    // that is the honest bound: two spans that overlap heavily but differ by a
+    // word still pass, so this catches copy-paste reuse rather than reuse in
+    // general. Item 8a's adjudication is what stands behind the residue.
+    let mut cited: HashMap<&str, &str> = HashMap::new();
+    for row in &verdict.rows {
+        for quote in &row.quotes {
+            match cited.get(quote.as_str()) {
+                Some(first) if *first != row.id.as_str() => wrong.push(format!(
+                    "the span {:?} is cited for more than one row (`{first}` and `{}`). A \
+                     near-boilerplate sentence pressed into service for several rows is the \
+                     cheapest way to fake retention.",
+                    quote, row.id,
+                )),
+                Some(_) => {}
+                None => {
+                    cited.insert(quote.as_str(), row.id.as_str());
+                }
+            }
+        }
+    }
+
+    wrong
+}
+
+/// [`check_retention_verdict`] enforces every rule in `PROTOCOL.md` item 8, and
+/// the two stem rules T4's ordering test deliberately left to this one.
+///
+/// Driven by inline fixtures rather than by files dropped into `retention/`,
+/// which is the pattern `parse_manifest_rejects_schema_drift`,
+/// `blind_map_check_refuses_a_map_that_cannot_attribute_its_verdicts` and
+/// `ledger_check_refuses_a_table_that_does_not_add_up` all follow — and here it is
+/// load-bearing rather than merely tidy: a malformed `<id>.json` written into
+/// `retention/` to watch RED is a file nothing in the plan deletes, and a
+/// leftover one silently corrupts T7's "exactly 18 verdicts" accounting.
+#[test]
+fn retention_check_refuses_a_verdict_that_is_not_complete_and_quoted() {
+    // A three-row ledger and a spec whose text really does contain the spans
+    // quoted below. `4a73ef` is a real pool id; the ids are shaped like real
+    // ledger ids but the ledger they come from is this fixture, not disk.
+    let ids: Vec<String> = ["fx-01", "fx-02", "fx-03"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let spec = "The picker binds `j` and `k` to move.\nIt refuses an empty selection.\n";
+
+    let verdict = |json: &str| -> RetentionVerdict {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("fixture does not parse: {e}\n{json}"))
+    };
+
+    // The shape everything below deviates from: complete, in order, quoted from
+    // the spec, no span doing double duty.
+    let sound = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["binds `j` and `k`"]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":true,"quotes":["refuses an empty selection","The picker"]}
+           ]}"#,
+    );
+    assert!(
+        check_retention_verdict("4a73ef", &sound, &ids, spec).is_empty(),
+        "a well-formed verdict must pass: {:?}",
+        check_retention_verdict("4a73ef", &sound, &ids, spec)
+    );
+
+    let complains = |stem: &str, v: &RetentionVerdict, needle: &str, why: &str| {
+        let found = check_retention_verdict(stem, v, &ids, spec);
+        assert!(
+            found.iter().any(|c| c.contains(needle)),
+            "{why}: expected a complaint mentioning `{needle}`, got {found:?}"
+        );
+    };
+
+    // **The stem rules.** Both are cases the ordering test's scan passes happily.
+    complains(
+        "4a73eg",
+        &sound,
+        "4a73eg",
+        "a stem that is not a pool id is a verdict counted under an id that does not exist",
+    );
+    let renamed = verdict(
+        r#"{"spec_id":"80d9a2","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef",
+        &renamed,
+        "80d9a2",
+        "a verdict filed under one id but scoring another attributes a score to the wrong \
+         generation, and both ids are real so nothing else notices",
+    );
+
+    // **Completeness.** A gap, a duplicate, an extra, and a permutation — the
+    // four ways a concatenation of shards loses or gains a row.
+    let missing = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &missing, "fx-02",
+        "a dropped row is the shard-assembly failure this rule exists to catch",
+    );
+    let duplicated = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-02","present":true,"quotes":["The picker"]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &duplicated, "twice",
+        "a row scored twice — the shape two overlapping shards produce",
+    );
+    let extra = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]},
+             {"id":"fx-04","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &extra, "fx-04",
+        "an id that is not in the ledger is a row the scorer invented",
+    );
+    let reordered = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &reordered, "ledger order",
+        "ledger order is what makes two verdicts comparable row-by-row without a join",
+    );
+
+    // **The quote rules.**
+    let unquoted = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":[]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &unquoted, "1 to 3",
+        "`present: true` with no span is an unevidenced retention claim",
+    );
+    let four = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,
+              "quotes":["The picker","binds","to move","empty selection"]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &four, "1 to 3",
+        "four spans is past item 8's cap — the bound is what stops a row being established \
+         by assembling the whole document",
+    );
+    let invented = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["binds j and k to move"]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &invented, "not a verbatim substring",
+        "a near-miss paraphrase is exactly what a scorer produces when it is reconstructing \
+         the span from memory instead of copying it",
+    );
+    let empty_span = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":[""]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &empty_span, "empty",
+        "the empty string is a substring of every document, so it satisfies the verbatim \
+         rule while evidencing nothing",
+    );
+    let absent_but_quoted = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":["The picker"]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &absent_but_quoted, "`present: false`",
+        "spans under an absent row are the scorer arguing with its own verdict",
+    );
+    let reused = verdict(
+        r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["The picker"]},
+             {"id":"fx-02","present":true,"quotes":["The picker"]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    complains(
+        "4a73ef", &reused, "more than one row",
+        "a near-boilerplate sentence pressed into service for several rows is the cheapest \
+         way to fake retention (item 8)",
+    );
+}
+
+/// The verdict schema is closed at the serde layer, so the checks above never see
+/// a shape they would have to remember to reject.
+#[test]
+fn retention_verdict_schema_is_closed() {
+    let parses = |json: &str| serde_json::from_str::<RetentionVerdict>(json);
+
+    assert!(
+        parses(r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[]}"#).is_ok(),
+        "the three-key object is item 8's schema and must parse"
+    );
+    for (json, why) in [
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[],"note":"S3 looked short"}"#,
+            "an extra key on the object — the shape a hand-annotated verdict takes, and a \
+             leak channel wearing a comment's clothes",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","rows":[]}"#,
+            "a missing key: a verdict that does not name its ledger cannot be checked for \
+             completeness against one",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":null}"#,
+            "a `null` where rows belong",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","present":"yes","quotes":[]}]}"#,
+            "`present` as a string: `\"false\"` is truthy in enough languages that this must \
+             not be coerced",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","present":true,"quotes":"The picker"}]}"#,
+            "`quotes` as a bare string rather than an array — item 8's whole point is that a \
+             row may need up to three spans",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","present":true,"quotes":[],"confidence":0.8}]}"#,
+            "an extra key on a row",
+        ),
+        (
+            r#"{"spec_id":"4a73ef","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","quotes":[]}]}"#,
+            "a row with no verdict at all",
+        ),
+    ] {
+        assert!(parses(json).is_err(), "must be refused — {why}:\n{json}");
+    }
+}
+
+/// `ledger` names one of the three fixtures' ledgers, and nothing else.
+#[test]
+fn retention_ledger_cell_names_a_ledger_and_not_a_path() {
+    for name in SPEC_LENGTH_FIXTURE_NAMES {
+        let path = retention_ledger_path(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            path.ends_with(format!("{name}.md")),
+            "{name} must resolve to its own ledger, got {}",
+            path.display()
+        );
+        assert!(
+            path.is_file(),
+            "{} does not exist, so the whitelist names a ledger that is not there",
+            path.display()
+        );
+    }
+    for bad in [
+        "../fixtures/tui-dc-picker.spec",
+        "../../../etc/passwd",
+        "tui-dc-picker.md",
+        "skill_stickiness",
+        "",
+    ] {
+        assert!(
+            retention_ledger_path(bad).is_err(),
+            "`{bad}` must not resolve to a ledger"
+        );
+    }
+}
+
+/// [`parse_ledger_ids`] returns the real ledger's ids, and refuses a table that
+/// has drifted from its own declared count.
+#[test]
+fn parse_ledger_ids_refuses_a_table_that_disagrees_with_its_declared_count() {
+    let header = "**Closed list: 2 rows.**\n\n| id | kind | item |\n|---|---|---|\n";
+
+    let sound = format!("{header}| fx-01 | decision | a |\n| fx-02 | scope | b |\n\nProse.\n");
+    let index = parse_ledger_ids(&sound).expect("a table that adds up");
+    assert_eq!(index.ids, vec!["fx-01".to_string(), "fx-02".to_string()]);
+    assert_eq!(index.declared, 2);
+
+    let short = format!("{header}| fx-01 | decision | a |\n");
+    assert!(
+        parse_ledger_ids(&short)
+            .unwrap_err()
+            .contains("declares 2 rows but carries 1"),
+        "a table shorter than its declaration must fail: the id list is what `complete` \
+         means for every verdict scored against it"
+    );
+
+    let long = format!(
+        "{header}| fx-01 | decision | a |\n| fx-02 | scope | b |\n| fx-03 | scope | c |\n"
+    );
+    assert!(parse_ledger_ids(&long).is_err(), "a table longer than its declaration must fail");
+
+    assert!(
+        parse_ledger_ids("| id | kind | item |\n|---|---|---|\n| fx-01 | scope | a |\n")
+            .unwrap_err()
+            .contains("Closed list"),
+        "a ledger with no declared count has no closed list to check against"
+    );
+    assert!(
+        parse_ledger_ids("**Closed list: 1 rows.**\n\nno table here\n")
+            .unwrap_err()
+            .contains("header row"),
+        "a declaration with no table must fail rather than return zero ids"
+    );
+
+    // The real ledgers parse, and agree with the count
+    // `spec_length_ledgers_are_the_closed_lists_they_claim` independently checks.
+    for name in SPEC_LENGTH_FIXTURE_NAMES {
+        let path = retention_ledger_path(name).expect("fixture name");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let index =
+            parse_ledger_ids(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(
+            index.ids.len(),
+            index.declared,
+            "{}: parsed id count must equal the declared count",
+            path.display()
+        );
+    }
+}
+
+/// Every assembled retention verdict on disk is complete and quoted —
+/// `PROTOCOL.md` item 8, over the immediate `*.json` children of `retention/`.
+///
+/// **This is the check that proves the shard concatenation lost nothing.** Item 10
+/// splits a 91-row ledger into two scorer runs precisely because a 91-row JSON
+/// reply is where a scorer truncates; the phase agent then concatenates the
+/// shards' `rows`. A dropped shard, an overlapping boundary, or a truncated reply
+/// all produce an assembled file that looks fine and quietly changes the
+/// denominator of a retention count that a 230/230 gate reads. Shards under
+/// `parts/` are deliberately unchecked (item 10 calls them working material); the
+/// assembled file is the evidence, and this is what stands behind it.
+///
+/// **Well-formedness, never judgement.** Nothing here can say a verdict is
+/// *right*: a scorer citing a real, on-topic, irrelevant sentence passes every
+/// rule. Item 8a's blind adjudication pass covers relevance, and a green here is
+/// not a substitute for it.
+///
+/// **An empty directory is a pass, and a missing one too** — zero verdicts is the
+/// correct state before T5, exactly as zero arms is for
+/// [`freeze_precedes_every_candidate_arm`]. It tightens as each verdict lands.
+/// The rules themselves are exercised regardless by
+/// [`retention_check_refuses_a_verdict_that_is_not_complete_and_quoted`], so this
+/// walk being vacuous early does not mean the rules ship unrun.
+#[test]
+fn spec_length_retention_verdicts_are_complete_and_quoted() {
+    let retention = spec_length_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        // T5 has not run. Nothing to check, and nothing wrong.
+        return;
+    };
+
+    // Refused here as well as in `spec_length_blind_map_precedes_every_retention_verdict`,
+    // and the duplication is deliberate: a verdict this scan does not recognise
+    // is never opened by the loop below, so it would be unchecked by *this* rule
+    // whatever the ordering check said about it. Each check refuses what it cannot
+    // see rather than relying on a sibling to have refused it first.
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries this completeness check cannot classify:\n{}\n\n\
+         Every immediate child is an `<id>.json` verdict and `parts/` is item 10's only \
+         sanctioned subdirectory. An unrecognised entry is not checked — it is simply \
+         never opened.",
+        retention.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut rows_checked = 0usize;
+    let mut ledger_cache: HashMap<String, Vec<String>> = HashMap::new();
+
+    for path in &scan.verdicts {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| panic!("{}: no file stem", path.display()))
+            .to_string();
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+        let verdict: RetentionVerdict = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                wrong.push(format!(
+                    "  {}: does not match item 8's schema: {e}\n    Expected exactly \
+                     {{\"spec_id\", \"ledger\", \"rows\":[{{\"id\", \"present\", \
+                     \"quotes\"}}]}} — an extra key, a missing key, a wrong type or a \
+                     `null` is a hard error. A malformed verdict is re-run WHOLE under R6, \
+                     never patched.",
+                    path.display(),
+                ));
+                continue;
+            }
+        };
+
+        let ledger_path = match retention_ledger_path(&verdict.ledger) {
+            Ok(p) => p,
+            Err(e) => {
+                wrong.push(format!("  {}: {e}", path.display()));
+                continue;
+            }
+        };
+        let ids = ledger_cache
+            .entry(verdict.ledger.clone())
+            .or_insert_with(|| {
+                let text = fs::read_to_string(&ledger_path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+                parse_ledger_ids(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()))
+                    .ids
+            })
+            .clone();
+
+        // **Pool membership before path building, and that ordering is the
+        // point.** `spec_id` is a string out of a JSON file a subagent wrote;
+        // joining it onto `generated/` unchecked would let `"../arms/S3"` name the
+        // arm file — which is both a traversal and, in this run, the one file a
+        // scoring path must never read. [`check_retention_verdict`] states the
+        // same rule for its own callers; this is the guard that has to run first
+        // because reading the spec depends on it.
+        if !SPEC_LENGTH_ID_POOL.contains(&verdict.spec_id.as_str()) {
+            wrong.push(format!(
+                "  {}: `spec_id` is {:?}, which is not one of the eighteen pool ids — \
+                 refusing to resolve a generated-spec path from it",
+                path.display(),
+                verdict.spec_id,
+            ));
+            continue;
+        }
+        let spec_path = spec_length_generated_dir().join(format!("{}.md", verdict.spec_id));
+        let spec = match fs::read_to_string(&spec_path) {
+            Ok(s) => s,
+            Err(e) => {
+                wrong.push(format!(
+                    "  {}: scores `{}` but {} cannot be read: {e}",
+                    path.display(),
+                    verdict.spec_id,
+                    spec_path.display(),
+                ));
+                continue;
+            }
+        };
+
+        rows_checked += verdict.rows.len();
+        for complaint in check_retention_verdict(&stem, &verdict, &ids, &spec) {
+            wrong.push(format!("  {}: {complaint}", path.display()));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} problem(s) across {} retention verdict(s) in {}:\n{}\n\n\
+         Each of these is a protocol failure under R6, and the remedy is a WHOLE re-run of \
+         the offending verdict with the reason logged in `RESULTS.md` — never a patch. A \
+         verdict repaired by hand is a verdict whose provenance is the repairer's judgement \
+         rather than the scorer's.",
+        wrong.len(),
+        scan.verdicts.len(),
+        retention.display(),
+        wrong.join("\n"),
+    );
+
+    // A directory holding verdicts that contributed no rows would print `ok`
+    // having checked nothing — the failure mode this corpus keeps rediscovering.
+    // An empty directory is exempt because zero verdicts is a legitimate state.
+    assert!(
+        scan.verdicts.is_empty() || rows_checked > 0,
+        "{} holds {} verdict(s) but no rows were checked",
+        retention.display(),
+        scan.verdicts.len(),
+    );
+}
+
 /// Build a throwaway repository so the git helpers above can be exercised
 /// against history this file controls.
 ///
