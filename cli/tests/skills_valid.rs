@@ -2750,6 +2750,191 @@ fn line_of_offset(text: &str, at: usize) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
+/// The most recent commit that touched `repo_relative_path`.
+///
+/// [`introducing_commit_in`] answers *when did this path first appear*, which is
+/// the right question for an arm — an arm's text is frozen at birth. It is the
+/// wrong question for `blind-map.json`, which may legitimately be re-drawn before
+/// any scoring begins. What must be ordered against a retention verdict is the
+/// commit that **finalised** the map, so that is what this resolves.
+///
+/// `Err` is git refusing the question; `Ok(None)` is git answering that no commit
+/// touches the path. Kept apart for the reason the rest of this file keeps them
+/// apart: an absence of evidence is not evidence of absence.
+fn last_commit_touching(repo: &Path, repo_relative_path: &str) -> Result<GitObjectId, String> {
+    let shown = format!("git log -1 --format=%H -- {repo_relative_path}");
+    let out = git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "log".to_string(),
+        "-1".to_string(),
+        "--format=%H".to_string(),
+        "--".to_string(),
+        repo_relative_path.to_string(),
+    ])?;
+    if !out.status.success() {
+        return Err(format!("`{shown}` failed: {}", git_stderr(&out)));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = stdout.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return Err(format!(
+            "`{shown}` named no commit — the file exists on disk but nothing in history \
+             touches it. Every retention verdict is ordered against the commit that \
+             finalised the assignment, so an uncommitted map makes that guarantee inert."
+        ));
+    };
+    GitObjectId::parse(line).map_err(|e| format!("`{shown}` printed {e}"))
+}
+
+/// What an immediate scan of `retention/` found.
+#[derive(Default)]
+struct RetentionScan {
+    /// Immediate `<id>.json` children — the assembled verdicts, which are the
+    /// evidence and the things to order.
+    verdicts: Vec<PathBuf>,
+    /// Everything the naming rule does not recognise, described. Collected
+    /// rather than skipped: see [`scan_retention_dir`].
+    strays: Vec<String>,
+}
+
+/// Scan `retention/` into verdicts and strays. `None` if the directory does not
+/// exist — T5 has not run, which is a correct state.
+///
+/// **Everything unrecognised is collected, not skipped, and that is the whole
+/// point of the function.** The first draft of the caller used a bare `continue`
+/// for "not an immediate `*.json` child", which meant `retention/4a73ef.JSON`,
+/// `retention/4a73ef.json.bak`, or a verdict filed one directory down reached
+/// none of the caller's three outcome buckets — not a violation, not
+/// uncommitted, not unreadable — and the ordering check printed `ok` having
+/// ordered nothing. That is the same hole [`SpecLengthArms`] exists to close.
+///
+/// **`parts/` is the one sanctioned subdirectory**: `PROTOCOL.md` item 10 calls
+/// the scorer shards beneath it working material and deliberately leaves them
+/// unchecked, the assembled file being the evidence.
+///
+/// **The residual, named rather than implied:** a verdict misfiled *into*
+/// `parts/` is still invisible here, and that is the likeliest misfiling of all,
+/// since `parts/` is exactly where T5 writes its shards. Nothing in this scan can
+/// distinguish an assembled verdict that landed in `parts/` from the shards that
+/// belong there. Item 8's completeness test over `retention/*.json` is what would
+/// notice the verdict missing from where it should be.
+fn scan_retention_dir(dir: &Path) -> Option<RetentionScan> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!(
+            "cannot read {}: {e}. This is NOT the same as holding no verdicts — refusing \
+             to report an ordering verdict on a directory this check could not enumerate.",
+            dir.display()
+        ),
+    };
+
+    let mut scan = RetentionScan::default();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "cannot read an entry of {}: {e}. Refusing to order only the verdicts that \
+                 happened to be readable.",
+                dir.display()
+            )
+        });
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if path.is_dir() {
+            if name != "parts" {
+                scan.strays
+                    .push(format!("{}: a directory that is not `parts/`", path.display()));
+            }
+            continue;
+        }
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            scan.strays.push(format!(
+                "{}: not an immediate `*.json` child",
+                path.display()
+            ));
+            continue;
+        }
+        scan.verdicts.push(path);
+    }
+    scan.verdicts.sort();
+    scan.strays.sort();
+    Some(scan)
+}
+
+/// [`scan_retention_dir`] surfaces every shape of misfiled verdict, and lets
+/// `parts/` through.
+///
+/// This exists because the branch it exercises **cannot fire against the real
+/// repository yet** — `retention/` does not exist until T5 — and a fail-open fix
+/// that ships having never executed is the same "green having verified nothing"
+/// the bug was. Same reasoning as [`ScratchRepo`], one layer down: no history is
+/// needed here, only a directory.
+#[test]
+fn retention_scan_surfaces_every_misfiled_verdict() {
+    assert!(
+        scan_retention_dir(Path::new("/nonexistent/retention")).is_none(),
+        "a missing retention/ is T5-has-not-run, which the caller must be able to tell \
+         apart from an empty one"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::create_dir(root.join("parts")).expect("parts");
+    fs::create_dir(root.join("archive")).expect("archive");
+    fs::write(root.join("parts").join("4a73ef-1.json"), "{}").expect("shard");
+    fs::write(root.join("4a73ef.json"), "{}").expect("verdict");
+    fs::write(root.join("80d9a2.JSON"), "{}").expect("wrong case");
+    fs::write(root.join("350ba8.json.bak"), "{}").expect("backup");
+    fs::write(root.join("f8729b"), "{}").expect("no extension");
+    fs::write(root.join(".gitkeep"), "").expect("gitkeep");
+
+    let scan = scan_retention_dir(root).expect("directory exists");
+
+    let verdicts: Vec<String> = scan
+        .verdicts
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec!["4a73ef.json".to_string()],
+        "only the immediate `<id>.json` child is a verdict — `parts/` holds shards and is \
+         deliberately unchecked"
+    );
+
+    // Five strays: the four misnamed files — `.gitkeep` included — plus the
+    // `archive/` subdirectory. `80d9a2.JSON` is the case-only miss that a
+    // `to_lowercase()` comparison would have let through.
+    assert_eq!(
+        scan.strays.len(),
+        5,
+        "expected every unrecognised entry to be surfaced, got: {:?}",
+        scan.strays
+    );
+    for expected in ["80d9a2.JSON", "350ba8.json.bak", "f8729b", ".gitkeep"] {
+        assert!(
+            scan.strays.iter().any(|s| s.contains(expected)),
+            "`{expected}` reached none of the outcome buckets — it is exactly the silent \
+             skip this scan exists to prevent. Strays were: {:?}",
+            scan.strays
+        );
+    }
+    // Matched on the path, not on the word: the `archive/` stray's own
+    // description contains "parts/" (it says it is a directory that is not one).
+    assert!(
+        !scan.strays.iter().any(|s| s.starts_with(
+            &root.join("parts").display().to_string()
+        )),
+        "`parts/` is item 10's sanctioned subdirectory and must not be a stray: {:?}",
+        scan.strays
+    );
+    assert!(
+        scan.strays.iter().any(|s| s.contains("archive")),
+        "a subdirectory that is not `parts/` must be a stray: {:?}",
+        scan.strays
+    );
+}
+
 /// The 18 generated specs exist, are non-empty, carry no arm label, and
 /// `blind-map.json` attributes each of them to a distinct cell of the design.
 ///
@@ -3126,25 +3311,32 @@ fn spec_length_id_assignment_does_not_track_the_arm() {
 /// join last for the same reason, and T7 may only join once all 18 verdicts exist.
 /// Prose cannot enforce that; the commit graph can.
 ///
-/// **The ordering alone would not have been enough, so the map's BYTES are
-/// pinned too.** An earlier draft of this check resolved only the map's
-/// *introducing commit*. That leaves the whole attack open: editing
-/// `blind-map.json` after the verdicts land — permuting which arm each id belongs
-/// to, to fit the results — does not change which commit introduced the path, so
-/// the descent check stays green, and
+/// **What is ordered is the commit that FINALISED the map, not the one that
+/// introduced it.** An earlier draft used the introducing commit for both the
+/// descent check and a byte pin, and that was wrong in both directions. Too weak,
+/// because editing `blind-map.json` after the verdicts land — permuting which arm
+/// each id belongs to, to fit the results — does not change which commit
+/// introduced the path, so the descent check stayed green while the assignment
+/// moved underneath it; and
 /// [`spec_length_generations_are_unlabelled_and_cover_the_design`] only asks
 /// whether the map is *a* valid 3x3x2 covering, which a permutation still is.
-/// Nothing else pins it: unlike the ledger and the arms, `blind-map.json` has no
-/// `FREEZE.md` row. So this check also re-hashes the working file against the
-/// blob its introducing commit recorded. The map is written once and never
-/// legitimately changes.
+/// Too strong, because a re-draw **before any scoring** is legitimate — it is
+/// what [`spec_length_id_assignment_does_not_track_the_arm`] prescribes when the
+/// assignment sweeps position `A` — and pinning the first blob would have failed
+/// it permanently, accusing it of fitting verdicts that did not exist yet.
+///
+/// [`last_commit_touching`] resolves the finalising commit, every verdict must
+/// descend from **that**, and the working tree must match it. A pre-verdict
+/// re-draw moves the finalising commit and stays green; a post-verdict edit
+/// cannot, because the verdicts already in history do not descend from it.
+/// Nothing else pins this file: unlike the ledger and the arms, `blind-map.json`
+/// has no `FREEZE.md` row.
 ///
 /// **An empty `retention/` is a pass, and it is the correct state until T5** —
 /// the same shape as [`freeze_precedes_every_candidate_arm`] tolerating zero arms.
-/// It is still never vacuous: the map must itself resolve to an introducing
-/// commit and still hash to its original bytes, both real facts about a real file
-/// from T4 onward, and an uncommitted map is precisely what would make every
-/// descent check below it unanswerable.
+/// It is still never vacuous: the map must resolve to an introducing commit, must
+/// resolve to a finalising commit, and must hash to what that commit recorded —
+/// three real facts about a real file, checked from T4 onward.
 ///
 /// **What it still cannot see.** The same three routes
 /// [`freeze_precedes_every_candidate_arm`] documents — a cherry-picked commit, a
@@ -3166,7 +3358,10 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         map_path.display()
     );
 
-    let map_commit = match introducing_commit_in(&repo, &map_path) {
+    // Resolved for its own sake, not for the ordering below: this is the
+    // assertion that keeps the whole check non-vacuous while `retention/` is
+    // still empty, and `NotCommitted` is the state it exists to refuse.
+    let _introduced_at = match introducing_commit_in(&repo, &map_path) {
         Introduced::At(commit) => commit,
         Introduced::NotCommitted => panic!(
             "{} exists on disk but no commit introduces it.\n\n\
@@ -3184,10 +3379,19 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         ),
     };
 
-    // The map still holds the bytes it was committed with. See this test's doc
-    // comment: without this, a post-hoc permutation of the assignment passes
-    // every other check in the run.
-    let at_commit = format!("{}:{SPEC_LENGTH_BLIND_MAP_REPO_PATH}", map_commit.as_str());
+    // The map is FINALISED — the last commit that touched it, which is the one
+    // every verdict must postdate. Not the introducing commit: a re-draw before
+    // any scoring is legitimate (it is what
+    // `spec_length_id_assignment_does_not_track_the_arm` prescribes when the
+    // assignment sweeps position `A`), and pinning the *first* blob would fail
+    // such a re-draw permanently, accusing it of fitting verdicts that do not
+    // exist yet.
+    let map_final = last_commit_touching(&repo, SPEC_LENGTH_BLIND_MAP_REPO_PATH)
+        .unwrap_or_else(|how| panic!("cannot find the last commit touching {SPEC_LENGTH_BLIND_MAP_REPO_PATH}: {how}"));
+
+    // Working tree matches that commit — no uncommitted edit is sitting in front
+    // of the bytes every check below reasons about.
+    let at_commit = format!("{}:{SPEC_LENGTH_BLIND_MAP_REPO_PATH}", map_final.as_str());
     let out = git_output(&[
         "-C".to_string(),
         repo.display().to_string(),
@@ -3199,7 +3403,8 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         out.status.success(),
         "`git rev-parse {at_commit}` failed: {}\n\n\
          This is NOT a finding about the map — it is this check reporting that it could not \
-         read the blob its introducing commit recorded.",
+         read the blob that commit recorded. A rename of this path is the likely cause: the \
+         repo-relative constant is spelled out here and does not follow one.",
         git_stderr(&out),
     );
     let committed = GitObjectId::parse(String::from_utf8_lossy(&out.stdout).trim())
@@ -3208,71 +3413,48 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
     assert_eq!(
         on_disk.as_str(),
         committed.as_str(),
-        "{} no longer holds the bytes commit {} introduced.\n\n\
-         The arm<->id assignment is written once, before any probe, and never legitimately \
-         changes. A map edited after the verdicts exist is a map that could have been \
-         edited to fit them — and permuting arms across ids leaves the covering valid, the \
-         introducing commit untouched, and every other check in this run green. This is \
-         the only thing that catches it: `blind-map.json` has no `FREEZE.md` row.",
+        "{} has uncommitted changes: it does not hash to the blob its last commit ({}) \
+         recorded.\n\n\
+         Every ordering claim below is about the committed map, so an edited working copy \
+         makes them claims about a different file. Commit the change (which the ordering \
+         check will then hold to postdating nothing) or discard it.",
         map_path.display(),
-        map_commit.as_str(),
+        map_final.as_str(),
     );
 
     let retention = spec_length_retention_dir();
-    let entries = match fs::read_dir(&retention) {
-        Ok(entries) => entries,
-        // T5 has not run. The map still had to resolve above, so this is not a
-        // vacuous pass.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => panic!(
-            "cannot read {}: {e}. This is NOT the same as holding no verdicts — refusing \
-             to report an ordering verdict on a directory this check could not enumerate.",
-            retention.display()
-        ),
+    let scan = match scan_retention_dir(&retention) {
+        Some(scan) => scan,
+        // T5 has not run. The map still had to resolve, and still had to match
+        // its commit, so this is not a vacuous pass.
+        None => return,
     };
+
+    // Before any ordering verdict, for the same reason
+    // `freeze_precedes_every_candidate_arm` refuses a stray arm first: a verdict
+    // this scan does not recognise reaches none of this check's outcomes, and
+    // invisibility is the one answer an ordering gate must never give.
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries this ordering check cannot classify:\n{}\n\n\
+         Every immediate child of this directory is a `<id>.json` verdict, and `parts/` is \
+         the only subdirectory item 10 sanctions. A misnamed or misplaced verdict is not a \
+         violation, not uncommitted and not unreadable — it is simply never checked. \
+         Rename it, move it, or teach this check about it deliberately. (A `.gitkeep` is \
+         not needed here and is refused for the same reason: this directory is verdicts.)",
+        retention.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     let mut violations = Vec::new();
     let mut uncommitted = Vec::new();
     let mut unreadable = Vec::new();
-    let mut strays = Vec::new();
-    for entry in entries {
-        let entry = entry.unwrap_or_else(|e| {
-            panic!(
-                "cannot read an entry of {}: {e}. Refusing to order only the verdicts that \
-                 happened to be readable.",
-                retention.display()
-            )
-        });
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        // Immediate `*.json` children only — with everything else collected
-        // rather than skipped. `parts/` is the ONE documented exception:
-        // `PROTOCOL.md` item 10 calls the shards beneath it working material and
-        // deliberately leaves them unchecked, and the assembled file is the
-        // evidence.
-        //
-        // The bare `continue` this replaced skipped every unrecognised entry
-        // silently, which is the exact hole [`SpecLengthArms`] exists to close:
-        // `retention/4a73ef.JSON`, `retention/4a73ef.json.bak` or a verdict
-        // filed one directory down reaches none of the three outcome buckets
-        // below, and the check prints `ok` having ordered nothing.
-        if path.is_dir() {
-            if name != "parts" {
-                strays.push(format!("  {}: a directory that is not `parts/`", path.display()));
-            }
-            continue;
-        }
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
-            strays.push(format!(
-                "  {}: not an immediate `*.json` child",
-                path.display()
-            ));
-            continue;
-        }
+    for path in scan.verdicts {
         let at = format!("verdict `{}`", path.display());
         let verdict_commit = match introducing_commit_in(&repo, &path) {
             Introduced::At(commit) => commit,
@@ -3285,34 +3467,17 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
                 continue;
             }
         };
-        match descends_from_in(&repo, &map_commit, &verdict_commit) {
+        match descends_from_in(&repo, &map_final, &verdict_commit) {
             Descent::Yes => {}
             Descent::No => violations.push(format!(
                 "  {at}: introduced by {}, which does NOT descend from the blind map's \
-                 commit {}",
+                 last commit {}",
                 verdict_commit.as_str(),
-                map_commit.as_str(),
+                map_final.as_str(),
             )),
             Descent::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
         }
     }
-
-    // Before any ordering verdict, for the same reason
-    // `freeze_precedes_every_candidate_arm` refuses a stray arm first: a verdict
-    // this scan does not recognise reaches none of this check's outcomes, and
-    // invisibility is the one answer an ordering gate must never give.
-    strays.sort();
-    assert!(
-        strays.is_empty(),
-        "{} holds {} entry/entries this ordering check cannot classify:\n{}\n\n\
-         Every immediate child of this directory is a `<id>.json` verdict, and `parts/` is \
-         the only subdirectory item 10 sanctions. A misnamed or misplaced verdict is not a \
-         violation, not uncommitted and not unreadable — it is simply never checked. \
-         Rename it, move it, or teach this check about it deliberately.",
-        retention.display(),
-        strays.len(),
-        strays.join("\n"),
-    );
 
     assert!(
         unreadable.is_empty(),
