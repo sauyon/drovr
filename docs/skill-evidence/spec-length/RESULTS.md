@@ -149,8 +149,9 @@ not just this one.
 **What it is for.** `R4` pre-registers a universal null as the *likely* outcome: `R1` needs 460
 row-judgements clean for one arm to pass, and at any realistic per-row fidelity the expected result
 is that no arm clears. This reading costs one scorer run and says, before T5 and T6 spend **48
-dispatches** between them — 30 scorer runs under item 10's sharding plus 18 item-8a adjudications
-(T5 is 18, T6 is 30) — whether 230/230 is reachable at all under D2. (The plan's T4 section says
+dispatches** between them — 30 scorer runs under item 10's sharding, plus 18 item-8a adjudications,
+one per verdict file — whether 230/230 is reachable at all under D2. (Split by task: T5 owns 18 of
+those 48, T6 the other 30.) (The plan's T4 section says
 "36 more"; that figure matches neither the scorer runs nor the total, and the per-task budgets in
 the plan's own standing rules are the ones that add up.) **It is recorded because it was taken, not
 because it was reassuring** — the instruction to write it down either way is what makes it evidence.
@@ -175,7 +176,9 @@ six generations, and under `R2` any drop eliminates — so a single absent row o
 enough to eliminate that arm at 229/230. This reading therefore already sketches an outcome for one
 arm. It decides nothing: it is n=1, unadjudicated, and superseded by T6 per the paragraph above.
 
-**The scorer was blind; the phase agent was not.** See deviation 1 below.
+**The scorer was handed no arm; the phase agent held the whole map.** See deviation 1 below — and
+deviation 4 for why "the scorer was handed no arm" is not the same as "the scorer could not have
+found one".
 
 **The arm is deliberately not named here.** It is in `blind-map.json` and T7 reads it there.
 
@@ -205,9 +208,20 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
    done | sort | head -1
    ```
 
-   **The scorer itself was fully blind** — it received the generated spec and the ledger rows, and
-   nothing else. What is compromised is the *choice* of which generation to read, not the reading.
-   The residual risk is that a phase agent holding the map could have chosen a generation it
+   **The scorer was handed only the generated spec and the ledger rows** — no arm, no map, no other
+   spec. It is deliberately not called "fully blind": item 11 and item 1's limitation 2 both forbid
+   that phrase for this run's scoring, and it would be wrong here for a second reason given in
+   deviation 4 — **this dispatch ran with a working directory inside this worktree, after
+   `b03cba0` had already put the draw's salt in the history**, so the scorer *could* have recovered
+   its own arm from `git log` had it gone looking. Nothing suggests it did, and its output shows no
+   sign of it; but "was told only to read the spec" is an instruction, not a control, which is the
+   whole lesson of deviation 4. **That channel was open for T4's own dispatch on exactly the terms
+   T5 and T6 are held to, and it is recorded as open rather than assumed shut** — imposing the
+   recording duty on later tasks while exempting the one that wrote the duty would be the cheapest
+   possible dishonesty.
+
+   What is separately compromised is the *choice* of which generation to read, not the reading. The
+   residual risk there is that a phase agent holding the map could have chosen a generation it
    expected to score well; the fixed, pre-declared, single-shot rule is what bounds it, and this
    paragraph is the rest of the answer.
 
@@ -286,10 +300,22 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
      scorer that can reach this repository's history can run the `sha256` loop on its own id and
      unblind itself no matter where the spec bytes were copied to.
 
-     **What actually closes it is denying the scorer the history, not the file:** dispatch with a
+     **What narrows it furthest is denying the scorer the history, not the file:** dispatch with a
      working directory **outside this repository**, hand it the spec at a scratch path there (a
      byte-for-byte copy — verify `git hash-object` matches first), and have it write its shard to a
      scratch path too, with the phase agent moving the result into `retention/parts/` afterwards.
+     Under that arrangement the scorer is handed no path into the repository at all — item 10
+     inlines the ledger rows, the schema and the `present` definition — so reaching the history
+     means going looking for it. **That is narrowing, not closing**: a subagent with a shell can
+     still find a repository. Say "narrowed" in the write-up, not "closed".
+
+     Note this route substitutes **two** of item 10's paths, and only one of them is covered by the
+     argument below. The *input* path is a placeholder for a path to the document's bytes, and a
+     copy satisfies it. The *output* path is not: `retention/parts/<id>-<k>.json` names a specific
+     file in a specific place, and writing elsewhere is a real departure, mitigated only by the
+     phase agent putting the shard where item 10 says it goes before anything reads it. **Whichever
+     task does this records both substitutions here**, so a later reader can disagree with the
+     lenient reading explicitly rather than discover it by inference.
      **If a task cannot arrange that, the channel is open for that dispatch and it must be recorded
      here as a deviation, not assumed away.** Do not treat "the scorer was told only to read the
      spec" as a control; it is an instruction, and this deviation exists because instructions are

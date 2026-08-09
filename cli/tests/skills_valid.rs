@@ -2810,10 +2810,12 @@ struct RetentionScan {
     /// `spec_length_retention_verdicts_are_complete_and_quoted`, which
     /// `PROTOCOL.md` item 8 says T5 lands and which is not in this file today:**
     /// it must reject a stem that is not a pool id, and require the stem to equal
-    /// the file's own `spec_id`. **Item 8 does not state either rule** — it
-    /// constrains `spec_id`'s shape nowhere and never mentions the filename — so
-    /// without them `retention/4a73eg.json` carrying `"spec_id": "4a73ef"` and a
-    /// well-formed row set is rejected by nothing, here or there.
+    /// the file's own `spec_id`. Item 8's opening line **does** specify the name —
+    /// `retention/<id>.json`, the same `<id>` the body's `spec_id` carries — so
+    /// what is missing is enforcement, not the rule. (`spec_id`'s *shape* is
+    /// genuinely unconstrained there.) Until T5 lands it, `retention/4a73eg.json`
+    /// carrying `"spec_id": "4a73ef"` and a well-formed row set is rejected by
+    /// nothing, here or there.
     verdicts: Vec<PathBuf>,
     /// Everything the naming rule does not recognise, described. Collected
     /// rather than skipped: see [`scan_retention_dir`].
@@ -2899,10 +2901,13 @@ fn scan_retention_dir(dir: &Path) -> Option<RetentionScan> {
 /// this one's counterpart comes from [`last_commit_touching`], which does not.
 /// The two agree for any path that was never renamed, which covers
 /// `blind-map.json` and every path this run creates — but a rename into place
-/// would make them disagree and fail spuriously. Unreachable, and recorded rather
-/// than patched, because adding `--follow` to a one-commit lookup has its own
-/// failure mode (`--follow` with no `-1` semantics is what
-/// [`introducing_commit_in`] documents at length).
+/// would make them disagree and fail spuriously. Recorded rather than patched
+/// because it is unreachable here and the patch is not free: `--follow` requires
+/// a single pathspec and changes what git walks, so adding it to a lookup whose
+/// whole job is "the newest commit touching this path" is a behaviour change to
+/// buy coverage of a case this run cannot produce. (It is **not** the failure mode
+/// [`introducing_commit_in`] documents — that one is `--diff-filter=A` with `-1`
+/// returning the most recent *add*, and this lookup has no `--diff-filter`.)
 fn blind_map_is_immovable(
     verdict_count: usize,
     finalised_at: &GitObjectId,
