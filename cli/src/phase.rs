@@ -1366,26 +1366,31 @@ impl Unfinished {
 /// process dies, so a crashed holder never leaves a claim anyone has to judge
 /// stale.
 ///
-/// **Why release is EXPLICIT.** That last sentence is about process DEATH, and
-/// it stays true — it is exactly *not* what covers an ordinary drop. `close(2)`
-/// releases an `flock` only when it closes the LAST fd on the open file
-/// description, and `fork(2)` hands a child a second fd on that very
-/// description; `O_CLOEXEC` takes the child's copy away at `exec`, but not
-/// before. Inside that window a holder that "releases" by dropping its `File`
-/// has released nothing: the next `try_lock` on the inode refuses with
-/// `WouldBlock` while no one anywhere holds a claim. drovr shells out to `git`
-/// and `herdr` routinely, so the window is not hypothetical — this is
-/// forge.ko.ag/drovr/drovr#80. So this lock comes back as a
-/// [`crate::flock::FileLock`] — as does `server.pid`'s, which has the same
-/// shape — whose `Drop` unlocks the description outright and whose `File` is
-/// private, leaving a close-based release unspellable. What that changed is the
-/// release mechanism, not the refusal policy: nothing below waits that did not
-/// wait before. One residue remains: a holder killed without unwinding
-/// (`SIGKILL`, `abort`) between a `fork` and that child's `exec` leaves the lock
-/// held for that window — microseconds. `Drop` runs on every ordinary exit and
-/// on panic-unwind, so that is the only gap left, it is not reachable from a
-/// path drovr controls, and closing it would need the bounded retry this design
-/// rejects.
+/// **Why release is EXPLICIT.** Read that last sentence precisely, because its
+/// loose half is the whole bug. An `flock` is not held "for a process": it
+/// belongs to the open file description, and "drops it however that process
+/// dies" is really the LAST fd on that description closing. Ordinarily that is
+/// all of them at once, so the crashed-holder argument does hold — but it is
+/// an argument about process DEATH, and it is exactly *not* what covers an
+/// ordinary drop. `close(2)` releases the lock only in that same last-fd case,
+/// and `fork(2)` hands a child a second fd on that very description, which
+/// `O_CLOEXEC` takes away at `exec` but not before. Inside that window a
+/// holder that "releases" by dropping its `File` has released nothing: the
+/// next `try_lock` on the inode refuses with `WouldBlock` while no one
+/// anywhere holds a claim. drovr shells out to `git` and `herdr` routinely, so
+/// the window is not hypothetical — this is forge.ko.ag/drovr/drovr#80, and
+/// [`crate::flock`] is where the invariant is stated once for both locks. So
+/// this lock comes back as a [`crate::flock::FileLock`] — as does
+/// `server.pid`'s, which has the same shape — whose `Drop` unlocks the
+/// description outright and whose `File` is private, leaving a close-based
+/// release unspellable. What that changed is the release mechanism, not the
+/// refusal policy: nothing below waits that did not wait before. That window
+/// is also the one exception to the crashed-holder argument: a holder killed
+/// without unwinding (`SIGKILL`, `abort`) between a `fork` and that child's
+/// `exec` leaves the lock held until the child execs — microseconds. `Drop`
+/// runs on every ordinary exit and on panic-unwind, so that is the only gap
+/// left, it is not reachable from a path drovr controls, and closing it would
+/// need the bounded retry this design rejects.
 ///
 /// **Why it fails rather than waits.** The holder may be inside a 30-second
 /// readiness wait, and a queued second rehydrate would then either duplicate
@@ -1395,13 +1400,13 @@ impl Unfinished {
 /// the phase is untouched.
 ///
 /// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped, so the claim
-/// belongs to the open file description and not to the process: a second `open`
-/// + lock in the SAME process is a SECOND description, and it conflicts with the
-/// first exactly as a stranger's would. `try_lock` refuses it with `WouldBlock`:
-/// it does not block, and it does not quietly succeed the way a process-owned
-/// POSIX record lock would. So no holder may call
-/// another — `phase_start`'s reap loop calls `phase_reap` per phase, each
-/// taking and dropping the lock, and never wraps the loop in one.
+/// belongs to the open file description and not to the process: a second
+/// `open` + lock in the SAME process is a SECOND description, and it conflicts
+/// with the first exactly as a stranger's would. `try_lock` refuses it with
+/// `WouldBlock`: it does not block, and it does not quietly succeed the way a
+/// process-owned POSIX record lock would. So no holder may call another —
+/// `phase_start`'s reap loop calls `phase_reap` per phase, each taking and
+/// dropping the lock, and never wraps the loop in one.
 ///
 /// The lock alone does not close the race — see `phase_rehydrate` and
 /// `phase_reap`, which both re-read `state.json` under it. Serializing two
@@ -1641,8 +1646,9 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // no different from being simultaneous. Held for the whole function.
     let _lock = acquire_run_lock(&run.name)?;
     // The caller's copy may predate the lock by any amount — the driver holds
-    // one across a whole run, and the winner of the race above wrote while this
-    // process was blocked. `state.json` under the lock is the only authority.
+    // one across a whole run, and the winner of the race above wrote before
+    // this process took the lock (never *while* it waited: acquisition refuses
+    // rather than blocks). `state.json` under the lock is the only authority.
     *run = RunState::load(&run.name)?;
     // ONE precondition, shared with the HTTP handler and the agent tree — see
     // `RunState::rehydratable`. Written as separate checks it drifted twice:
@@ -11698,10 +11704,11 @@ mod rehydrate_tests {
     // `herdr`); `O_CLOEXEC` drops it at `exec`, but not before, and the window
     // is enough. `docs/run-lock-fork-race/lock-red.txt` is the measurement.
     //
-    // ⚠ `acquire_run_lock`'s doc comment does not yet describe any of this —
-    // it still says the kernel "drops [the lock] however that process dies",
-    // which is what this test refutes. Correcting it is a later task in this
-    // run; until then, do not read that comment as contradicting this one.
+    // `acquire_run_lock`'s doc comment now makes this argument itself, under
+    // "Why release is EXPLICIT", including why the kernel "drops [the lock]
+    // however that process dies" is about process death and is not what covers
+    // an ordinary drop. The two are meant to agree; if you change one, read the
+    // other.
     //
     // No fork, no sleep, no external binary, so the fault is staged
     // deterministically rather than raced for, and this holds inside `nix
