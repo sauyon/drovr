@@ -2758,9 +2758,16 @@ fn line_of_offset(text: &str, at: usize) -> usize {
 /// any scoring begins. What must be ordered against a retention verdict is the
 /// commit that **finalised** the map, so that is what this resolves.
 ///
-/// `Err` is git refusing the question; `Ok(None)` is git answering that no commit
-/// touches the path. Kept apart for the reason the rest of this file keeps them
-/// apart: an absence of evidence is not evidence of absence.
+/// **This one helper deliberately collapses "git refused" and "git says nothing
+/// touches this path" into a single `Err`**, which is the opposite of what
+/// [`Introduced`], [`Descent`] and [`Provenance`] do. `git log -1` exits 0 with
+/// empty output for an untracked path, so the two are distinguishable here and
+/// keeping them apart would be easy — the reason not to is that the only caller
+/// has *already* refused the uncommitted case through
+/// [`introducing_commit_in`]'s `NotCommitted` arm before it gets here, with a
+/// message about the map rather than about the check. A second three-way type
+/// would add a branch that cannot be reached. Do not copy this collapse to a new
+/// caller without restoring the distinction.
 fn last_commit_touching(repo: &Path, repo_relative_path: &str) -> Result<GitObjectId, String> {
     let shown = format!("git log -1 --format=%H -- {repo_relative_path}");
     let out = git_output(&[
@@ -2789,8 +2796,14 @@ fn last_commit_touching(repo: &Path, repo_relative_path: &str) -> Result<GitObje
 /// What an immediate scan of `retention/` found.
 #[derive(Default)]
 struct RetentionScan {
-    /// Immediate `<id>.json` children — the assembled verdicts, which are the
+    /// Immediate `*.json` children — the assembled verdicts, which are the
     /// evidence and the things to order.
+    ///
+    /// The **stem is not checked**: `retention/notes.json` would be ordered as
+    /// though it were a verdict, and `retention/4a73eg.json` (a typo'd id) is not
+    /// flagged. That is deliberate division of labour, not an oversight — item
+    /// 8's completeness test owns `spec_id` validity and rejects both, and
+    /// duplicating the id vocabulary here would be a second place to forget one.
     verdicts: Vec<PathBuf>,
     /// Everything the naming rule does not recognise, described. Collected
     /// rather than skipped: see [`scan_retention_dir`].
@@ -2859,6 +2872,52 @@ fn scan_retention_dir(dir: &Path) -> Option<RetentionScan> {
     scan.verdicts.sort();
     scan.strays.sort();
     Some(scan)
+}
+
+/// May the blind map have moved? Only while nothing has been scored.
+///
+/// A predicate rather than an inline `||` so it can be exercised: against the
+/// real repository the map's introducing and finalising commits are the same and
+/// `retention/` is empty, so **every** combination that matters is unreachable
+/// there, and an inline condition would ship having never been false. See
+/// [`retention_scan_surfaces_every_misfiled_verdict`] for the same reasoning one
+/// function over.
+fn blind_map_is_immovable(
+    verdict_count: usize,
+    finalised_at: &GitObjectId,
+    introduced_at: &GitObjectId,
+) -> bool {
+    verdict_count == 0 || finalised_at.as_str() == introduced_at.as_str()
+}
+
+/// [`blind_map_is_immovable`] permits a re-draw before scoring and refuses one
+/// after — the distinction the ordering and byte checks cannot draw by
+/// themselves.
+#[test]
+fn the_blind_map_may_move_only_before_the_first_verdict() {
+    let first = GitObjectId::parse("b03cba02183fb0eaf3e3a9d31e2fb18b75c861d4").expect("first");
+    let moved = GitObjectId::parse("a186a4800000000000000000000000000000beef").expect("moved");
+
+    assert!(
+        blind_map_is_immovable(0, &first, &first),
+        "the untouched map with no verdicts is the normal state and must pass"
+    );
+    assert!(
+        blind_map_is_immovable(0, &moved, &first),
+        "a re-draw before anything is scored is legitimate — it is what \
+         `spec_length_id_assignment_does_not_track_the_arm` prescribes for a sweep of \
+         position `A`, and refusing it would make that repair impossible"
+    );
+    assert!(
+        blind_map_is_immovable(18, &first, &first),
+        "verdicts against an unmoved map is the state the whole run is trying to reach"
+    );
+    assert!(
+        !blind_map_is_immovable(1, &moved, &first),
+        "a map that moved after even ONE verdict exists must fail: this is the case the \
+         descent check and the byte pin both miss, because writing verdicts to disk, \
+         committing a permuted map, and only then committing the verdicts leaves both green"
+    );
 }
 
 /// [`scan_retention_dir`] surfaces every shape of misfiled verdict, and lets
@@ -3325,12 +3384,15 @@ fn spec_length_id_assignment_does_not_track_the_arm() {
 /// assignment sweeps position `A` — and pinning the first blob would have failed
 /// it permanently, accusing it of fitting verdicts that did not exist yet.
 ///
-/// [`last_commit_touching`] resolves the finalising commit, every verdict must
-/// descend from **that**, and the working tree must match it. A pre-verdict
-/// re-draw moves the finalising commit and stays green; a post-verdict edit
-/// cannot, because the verdicts already in history do not descend from it.
-/// Nothing else pins this file: unlike the ledger and the arms, `blind-map.json`
-/// has no `FREEZE.md` row.
+/// So there are **three** assertions, not one. [`last_commit_touching`] resolves
+/// the finalising commit; the working tree must match it (no uncommitted edit);
+/// every verdict must descend from it (ordering); and — the one that carries the
+/// weight — **once any verdict exists the finalising commit must equal the
+/// introducing commit**, so the map may move only while nothing has been scored.
+/// The third is not redundant: without it, writing verdicts to disk, permuting
+/// the map, committing it, and only then committing the verdicts satisfies both
+/// of the others. Nothing else pins this file — unlike the ledger and the arms,
+/// `blind-map.json` has no `FREEZE.md` row.
 ///
 /// **An empty `retention/` is a pass, and it is the correct state until T5** —
 /// the same shape as [`freeze_precedes_every_candidate_arm`] tolerating zero arms.
@@ -3341,8 +3403,10 @@ fn spec_length_id_assignment_does_not_track_the_arm() {
 /// **What it still cannot see.** The same three routes
 /// [`freeze_precedes_every_candidate_arm`] documents — a cherry-picked commit, a
 /// rename-plus-rewrite, retyped text — apply here unchanged, because this is the
-/// same reachability machinery. The content pin closes the after-the-fact edit;
-/// it does not turn a reachability check into a proof.
+/// same reachability machinery. The immovability assertion closes the
+/// after-the-fact edit; none of the three turns a reachability check into a
+/// proof. And nothing here can see the assignment being *used* wrongly — that a
+/// scorer was never shown this file is procedural, and no test reaches it.
 #[test]
 fn spec_length_blind_map_precedes_every_retention_verdict() {
     assert!(
@@ -3358,10 +3422,11 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         map_path.display()
     );
 
-    // Resolved for its own sake, not for the ordering below: this is the
-    // assertion that keeps the whole check non-vacuous while `retention/` is
-    // still empty, and `NotCommitted` is the state it exists to refuse.
-    let _introduced_at = match introducing_commit_in(&repo, &map_path) {
+    // Resolved for two reasons: it keeps the whole check non-vacuous while
+    // `retention/` is still empty (`NotCommitted` is the state it exists to
+    // refuse), and once verdicts exist it is compared against the finalising
+    // commit — see the immovability assertion after the scan.
+    let introduced_at = match introducing_commit_in(&repo, &map_path) {
         Introduced::At(commit) => commit,
         Introduced::NotCommitted => panic!(
             "{} exists on disk but no commit introduces it.\n\n\
@@ -3416,8 +3481,9 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
         "{} has uncommitted changes: it does not hash to the blob its last commit ({}) \
          recorded.\n\n\
          Every ordering claim below is about the committed map, so an edited working copy \
-         makes them claims about a different file. Commit the change (which the ordering \
-         check will then hold to postdating nothing) or discard it.",
+         makes them claims about a different file. Commit the change — after which the \
+         immovability check requires that no retention verdict yet exists, and the ordering \
+         check requires every verdict to postdate it — or discard it.",
         map_path.display(),
         map_final.as_str(),
     );
@@ -3437,7 +3503,7 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
     assert!(
         scan.strays.is_empty(),
         "{} holds {} entry/entries this ordering check cannot classify:\n{}\n\n\
-         Every immediate child of this directory is a `<id>.json` verdict, and `parts/` is \
+         Every immediate child of this directory is a `*.json` verdict, and `parts/` is \
          the only subdirectory item 10 sanctions. A misnamed or misplaced verdict is not a \
          violation, not uncommitted and not unreadable — it is simply never checked. \
          Rename it, move it, or teach this check about it deliberately. (A `.gitkeep` is \
@@ -3449,6 +3515,41 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
             .map(|s| format!("  {s}"))
             .collect::<Vec<_>>()
             .join("\n"),
+    );
+
+    // **Once any verdict exists, the map is immovable — and the descent check
+    // alone does NOT give you this.** An earlier revision pinned the working file
+    // against its *introducing* commit, which closed the following sequence by
+    // accident; replacing that with a pin against the *finalising* commit made
+    // the pin a tautology for a clean tree and reopened it:
+    //
+    //   1. write `retention/*.json` to disk, do not commit;
+    //   2. permute `blind-map.json` to fit them, commit — the map's finalising
+    //      commit moves;
+    //   3. commit the verdicts as a child of that.
+    //
+    // Every verdict then descends from the finalising commit and the working tree
+    // matches it, so the descent check and the byte pin are both green on a map
+    // that was rewritten to fit results already on disk. The commit graph cannot
+    // see step 1. What closes it is refusing any movement at all once a verdict
+    // exists: the map may move only while `retention/` is empty, which is exactly
+    // the carve-out the re-draw needed and nothing more.
+    assert!(
+        blind_map_is_immovable(scan.verdicts.len(), &map_final, &introduced_at),
+        "{} was modified after it was introduced, and {} retention verdict(s) already \
+         exist.\n\n\
+         introduced by {}\n  last touched by {}\n\n\
+         The assignment may be re-drawn freely while nothing has been scored — that is what \
+         `spec_length_id_assignment_does_not_track_the_arm` prescribes for a sweep of \
+         position `A`. Once a single verdict exists it may not move again, because a map \
+         edited with results in hand is a map that could have been edited to fit them, and \
+         nothing in the commit graph can distinguish the two. Note the verdicts do not have \
+         to be *committed* for this to bite: writing them to disk, permuting the map, then \
+         committing both in order leaves every descent check green.",
+        map_path.display(),
+        scan.verdicts.len(),
+        introduced_at.as_str(),
+        map_final.as_str(),
     );
 
     let mut violations = Vec::new();

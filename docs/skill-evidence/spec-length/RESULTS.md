@@ -10,17 +10,21 @@ opening it resolves both. **T7 owns every analysis below the raw tables** — th
 `R1`, the gate verdict under `R2`, the length comparison under `R3`/`R3a`, the dropped-row lists, the
 instrument reading under `R4`, and the re-run log under `R6`.
 
-**No arm is *printed* anywhere in this file — but the arm is derivable from it, and saying only the
-first half would be a comfortable lie.** The per-generation table below carries `id`, `fixture`,
-`sample`, lines and bytes, and deliberately **not** the arm; T7 adds that column when it unblinds,
-and not before. However, §5's deviation 4 records the draw's salt and ordering rule, which means
-**this file alone determines the whole assignment** for anyone willing to run one `sha256` loop.
-That is a further consequence of deviation 4 and it is recorded there, not glossed here.
+**No arm is printed against any generation id in this file — but the arm is derivable from it, and
+saying only the first half would be a comfortable lie.** (Arm *names* do appear, in §1, §2 and §5,
+describing the arms as arms; what never appears is an id paired with its arm.) The per-generation
+table in §3 carries `id`, `fixture`, `sample`, lines and bytes, and deliberately **not** the arm:
+when T7 unblinds it records the arm in **a table of its own, per §6 — never by widening §3**, whose
+whole value is that it was written before any scoring. However, §5's deviation 4 records the draw's
+salt and ordering rule, which means **this file alone determines the whole assignment** for anyone
+willing to run one `sha256` loop. That is a further consequence of deviation 4 and it is recorded
+there, not glossed here.
 
 **This file is never shown to a scorer or an adjudicator, on the same footing as
 `blind-map.json`.** Withholding the arm column is not sufficient on its own: §3 tabulates all 18
-lengths grouped by fixture, and **length is precisely the leak channel `PROTOCOL.md` item 11 names
-as this experiment's real one**. A scorer holding this table can rank the six generations of its own
+lengths beside each generation's fixture, and **length is precisely the leak channel `PROTOCOL.md`
+item 11 names as this experiment's real one**. A scorer holding this table can group on the fixture
+column, rank the six generations of its own
 fixture and form a prior on the arm under exactly the hypothesis being tested. Item 10 already lists
 what a scorer may be handed — the spec, its shard's ledger rows, the item-8 schema and the item-9
 definition — and this file is not on it. That list is the rule; this paragraph exists so nobody
@@ -233,10 +237,15 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
    `cli/tests/skills_valid.rs::spec_length_id_assignment_does_not_track_the_arm` pins the outcome.
 
    **Recording it here makes this file a second in-repo copy of the assignment, and that is a
-   deliberate, argued choice rather than an oversight.** With the salt in `git log` the map is
-   already recoverable by anyone in this worktree, so withholding it here would buy no blinding
-   back — it would only mean the audit trail for *how the draw was made* lived nowhere, which is
-   the failure that makes "the draw was arm-independent" an assertion instead of a checkable claim.
+   deliberate, argued choice rather than an oversight — with one honest caveat.** The caveat: the
+   paragraph above spells out the within-arm fixture order and the within-fixture sample order,
+   which `b03cba0`'s message did *not* — it said only "canonical arm-major order". So this is
+   marginally **more** disclosure than the commit message, not a pure restatement. It is still the
+   right call, because the map is already recoverable from the repository without this file:
+   `PROTOCOL.md` item 6 supplies the pool, item 3 fixes the canonical fixture order, and the commit
+   message supplies the salt. Withholding the derivation here would therefore buy no blinding back
+   — it would only mean the audit trail for *how the draw was made* lived nowhere, which is the
+   failure that makes "the draw was arm-independent" an assertion instead of a checkable claim.
    The cost is that this file must be handled exactly like `blind-map.json`, which the preamble now
    says. **T10 reports this as part of deviation 4, not as a separate breach: it is the same rule
    (item 6's "only in `blind-map.json`") and the same root cause.**
@@ -258,10 +267,13 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
    - **T5 and T6:** a prompt-level control is not enough here, and saying "do not invite the scorer
      to read `git log`" would be pretending otherwise — a scorer subagent with a shell and a cwd
      inside this worktree needs no invitation. **The control that actually holds is to put the spec
-     somewhere the history is not:** copy `generated/<id>.md` to a scratch path outside the
-     repository and point the scorer there, or inline the spec text into the prompt. Item 10's
-     template names a path, and any path that resolves to the same bytes satisfies it. Also: never
-     paste the salt into a prompt or a commit message again.
+     somewhere the history is not:** copy `generated/<id>.md` byte-for-byte to a scratch path
+     outside the repository and point the scorer at that. Item 10's template supplies
+     `<abs path to generated/<id>.md>` as a path, and a path to identical bytes satisfies it —
+     verify the copy's `git hash-object` matches before dispatching. **Inlining the spec text into
+     the prompt instead is NOT pre-authorised here:** item 10's template has no slot for the
+     document's text, item 10 is a governed item, and window 3 is closed — so a task that inlines is
+     deviating and must log it. Also: never paste the salt into a prompt or a commit message again.
    - **T10:** report this as a stated limitation on the blinding, next to item 11's channel, and say
      plainly that a determined reader of this branch's history could have unblinded any generation.
    - **The driver:** whether this is severe enough to void the run and restart under an unpublished
@@ -288,14 +300,17 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
    are not later misread as evidence the specs were written in one batch, and so the next reader
    knows the ordering channels were closed deliberately rather than never having existed.
 
-6. **Item 5's "only the spec body — no header, … no fixture name" is breached on both counts, in
-   every generation, and it could not have been otherwise.** All 18 open with a `# ` title naming
-   the fixture's subject, and the fixture's own name appears in the body of several.
+6. **Item 5's "only the spec body — no header, … no fixture name" is breached on the header count
+   in every generation and on the fixture-name count in 11 of the 18, and neither could have been
+   otherwise.** All **18** open with a `# ` title naming the fixture's subject. The fixture's own
+   hyphenated name appears in **11**; the other seven — `4a73ef`, `80d9a2`, `87e5a5`, `aa3199`,
+   `bbd141`, `d25798`, `db3e2d` — contain none, which includes every `skill-stickiness` generation.
 
    **Neither is an arm channel.** The title is **byte-identical across all six generations of each
-   fixture** — three distinct titles, six files each — because item 4's task line for each fixture
-   *is* that title, and item 5's template hands that same line to every probe regardless of arm. So
-   the title is arm-invariant by construction, not by luck. The fixture name is likewise ordinary
+   fixture** — three distinct titles, six files each — because item 4 defines each fixture's task
+   line as *"the fixture's `# ` title plus a one-sentence restatement of its problem statement"*, so
+   the title is the task line's opening segment, and item 5's template hands that same line to every
+   probe regardless of arm. The title is therefore arm-invariant by construction, not by luck. The fixture name is likewise ordinary
    vocabulary in a spec about that subject, and the scorer is handed that fixture's ledger anyway.
 
    **It is the protocol's drafting gap, not the probes'.** Item 5's code-block template never tells
