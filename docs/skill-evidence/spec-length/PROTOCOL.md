@@ -177,7 +177,7 @@ cannot be corrected in place. T10 repeats all three in the write-up.
 | `tiered-review` | `fixtures/tiered-review.spec.md` | 463 | `ledger/tiered-review.md` | 84 |
 | `tui-dc-picker` | `fixtures/tui-dc-picker.spec.md` | 414 | `ledger/tui-dc-picker.md` | 55 |
 
-**230 ledger rows in total (91 / 84 / 55.)** These are the ledgers' own `**Closed list: N rows.**`
+**230 ledger rows in total (91 / 84 / 55).** These are the ledgers' own `**Closed list: N rows.**`
 declarations, which `spec_length_ledgers_are_the_closed_lists_they_claim` checks against the tables
 beneath them, and they are authoritative. **Counting `^|` lines gives 233 because it picks up each
 file's header row** — 233 is a miscount and no task may "fix" a ledger to reach it.
@@ -320,9 +320,17 @@ The answer to *"the schema in item 8 can be satisfied while being wrong."* It is
 sequence because it was added during plan review and later tasks cite item numbers.
 
 For each verdict file, an **independent blind adjudicator** subagent is given a pre-registered **20%
-sample of that file's `present: true` rows — every 5th such row, in order** — as
-`(ledger row text, the cited spans)` pairs, **and nothing else: not the generated spec, not the arm,
-not the other rows**. Because it never sees the spec, it cannot be swayed by how good the spec looks.
+sample of that file's `present: true` rows** as `(ledger row text, the cited spans)` pairs, **and
+nothing else: not the generated spec, not the arm, not the other rows**. Because it never sees the
+spec, it cannot be swayed by how good the spec looks.
+
+**The sample is fully determined, offset included, so two dispatches cannot select different rows.**
+Take the file's `present: true` rows in ledger order and number them 1, 2, 3, … *among themselves*
+(this index is over `present: true` rows only, not over ledger rows). The sample is **every row whose
+index is divisible by 5** — the 5th, 10th, 15th, and so on. That is `floor(n/5)` rows out of `n`. If
+a verdict has fewer than five `present: true` rows the sample is **empty**: record that in
+`RESULTS.md` against the verdict id and do **not** substitute a different sample, a different offset
+or a smaller stride to manufacture one.
 
 Its prompt, fixed here and identical for every verdict:
 
@@ -451,11 +459,16 @@ applies. **Do not describe this scoring as fully blind anywhere.**
 
 **These decide the outcome. None of them may be revised after T4 dispatches its first probe.**
 
-- **R1 — the all-generations rule.** An arm retains a row only if **all six** of its generations
-  retain it; equivalently, an arm's dropped set is the **union of the six per-generation dropped
-  sets**. Chosen deliberately over a majority-of-samples rule: a majority rule would let an arm lose
-  a decision in a real spec and still pass. *(This is an AND across generations. An earlier draft
-  called it "union across samples", which reads backwards; the sentence above is the operative one.)*
+- **R1 — the all-generations rule.** An arm retains a row only if **every generation that was scored
+  against that row retains it** — which is the two samples of that row's own fixture, since a
+  generation is only ever scored against its own fixture's ledger (item 3). Equivalently, and this
+  is the form to implement: **an arm's dropped set is the union of its six per-generation dropped
+  sets**, and its retention is `230 −` the size of that union. Chosen deliberately over a
+  majority-of-samples rule: a majority rule would let an arm lose a decision in a real spec and still
+  pass. *(This is an AND across generations. An earlier draft said "all six of its generations retain
+  it", which read literally would require the four generations of the other two fixtures to retain a
+  row they never judged — no row would ever be retained. The two sentences above are the operative
+  ones.)*
 - **R1a — per-generation retention is recorded alongside the union.** 18 per-generation counts, not
   just 3 union counts. Without them a null cannot be read: a row that 5 of 6 generations retain is
   sampling noise, and a row no generation retains is the instruction. Same data, and only R1a makes
@@ -479,8 +492,32 @@ applies. **Do not describe this scoring as fully blind anywhere.**
   fidelity the probable result is that **no arm clears, control included**. That is anticipated, not
   a failure of execution. The gate still binds at 230/230 for everyone, and T10 must state plainly
   when the null is attributable to the instrument rather than to the candidates.
+- **R4a — the asymmetric outcome: a candidate clears R2 and the control `S1` does not.** R4 covers
+  the symmetric null, and R7 covers *"`S1` clears, no candidate does"*. This rule covers the third
+  case, which the file's own limitation 7 makes reachable — the residual scoring risk runs toward a
+  **false pass**, so a candidate clearing a gate the shipped text failed is exactly the shape a
+  leaky instrument produces. It is pre-registered here rather than decided when it happens.
+  - **The candidate is not eliminated by the control's failure.** R2 is a per-arm gate, and a
+    control that drops a row may simply have dropped it. T8 and T9 still run on the candidate under
+    R7, unchanged; they are the independent fatal checks and neither is weakened here.
+  - **But R3's length comparison then contains no control.** *"Shorter than what ships"* is not
+    established by this run, because `S1`'s generations are outside the cleared set. T10 reports the
+    candidate's mean against `S1`'s mean labelled **"descriptive, not a pass"** under R5.
+  - **T10 must name every row `S1` dropped and every generation that dropped it**, beside the
+    statement that the candidate retained it. That list is the only thing that lets the next reader
+    tell a genuinely better candidate from a noisy instrument, and **T10 must say which it believes
+    and why.** It may report either, and it may not omit the question.
+  - The paste is permitted and is **not** automatic: it proceeds only if T8 and T9 are both clean.
 - **R5 — retention counts below 230 are descriptive, never a pass.** They are recorded so the null
   is informative, and they are labelled *"descriptive, not a pass"* wherever they appear.
+- **R5a — the copy check.** A generation whose length is **≥ 95% of its fixture's** (791 / 463 /
+  414) has substantially copied its input rather than compressed it. That is **not** a failure — it
+  is the correct null-ward behaviour under D2, and limitation 1 says a probe that copies its input
+  scores full retention at full length. But a high-retention verdict on such a generation says
+  nothing about the instruction, so `RESULTS.md` **flags every generation over that threshold**, and
+  the write-up may not read a flagged generation as a win. Stated here rather than left to T7
+  because it changes how a retention pass is read, and this file is where the rules that decide the
+  outcome live.
 - **R6 — no re-runs to chase a result.** One generation round per arm. A re-run is permitted only
   for a **protocol** failure, and the list is closed: the probe wrote no file; a verdict is
   malformed; a verdict fails the item-8 mechanical check; a verdict fails item 8a's relevance
