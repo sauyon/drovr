@@ -27,7 +27,8 @@ immediate `*.json` children of `retention/` and will not see any of this. Neithe
 | `4a73ef.attempt-1.json` | the first scoring pass of `4a73ef`, replaced by the `R6` whole re-run |
 | `parts/4a73ef-<k>.attempt-1.json` | that first pass's shards |
 
-**Five of the seven passes are item-8 well-formed. `4a73ef.json` — attempt 2 — is not**: it cites one
+**Six of the seven passes are item-8 well-formed. `4a73ef.json` — attempt 2 — is the only one that is
+not**: it cites one
 span under two rows (`skill-stickiness-16` and `-89`), which item 8 forbids outright. It was found by
 review, not by the check that exists for it, because the check reads `retention/` and this file never
 entered it. `../RESULTS.md` §7.8 records that honestly, including whose fault it is.
@@ -41,11 +42,16 @@ spans. That is what establishes the failure as structural rather than one scorer
 Item 9 defines `present` as *recoverable and actionable from the generated spec alone*. Item 8a asks
 a blind adjudicator whether **1–3 spans, with the spec withheld**, establish the row. Those are
 different standards, and the second is strictly harder: a row that is genuinely present and
-actionable in a 585-line spec can still be un-establishable from three quoted fragments. 26 of 106
-adjudicated rows (25%) came back `establishes: false`, and because item 8a's stride is fixed, the
+actionable in a 585-line spec can still be un-establishable from three quoted fragments. 24 of 106
+adjudicated rows (22.6%) came back `establishes: false`, and because item 8a's stride is fixed, the
 same hard rows are sampled in every file — `skill-stickiness-55` and `-65` each failed in **4 of the
-4** files that sampled them. With whole-file invalidation over ~18 sampled rows, a 25% per-row
-failure rate makes a passing file a `0.75^18` ≈ 0.6% event. The instrument cannot clear its own gate.
+4** files that sampled them. With whole-file invalidation over ~18 sampled rows, a 22.6% per-row
+failure rate makes a passing file a `0.774^18` ≈ 1.0% event. The instrument cannot clear its own gate.
+
+**Those figures are over the operative six** — attempt 2 for `4a73ef`, attempt 1 for the other five.
+Across all seven passes it is 30 of 124 (24.2%). `../RESULTS.md` §7.3 is the authority and this
+paragraph is a summary of it; if they ever disagree again, §7.3 and the records under
+`adjudication/` are what to recompute from.
 
 See `../RESULTS.md` §7 for the full record, the `R6` re-run log, the `R6a` doubts, and the
 escalation. **Nothing here may be promoted into `retention/` without that escalation being

@@ -633,9 +633,9 @@ must use `sonnet` for all 30 of its dispatches or the 18 verdicts are not compar
 ### 7.7 What T5 did land
 
 `cli/tests/skills_valid.rs::spec_length_retention_verdicts_are_complete_and_quoted` and its four
-companion unit tests, green. **Five of the seven scoring passes satisfy that mechanical check over
-all 91 rows; `4a73ef` attempt 2 does not** (§7.8). The five that do are the check working exactly as
-item 8 says it should: *"it asserts well-formedness, never judgement."* A green there was never a
+companion unit tests, green. **Six of the seven scoring passes satisfy that mechanical check over
+all 91 rows; `4a73ef` attempt 2 is the only one that does not** (§7.8). The six that do are the check
+working exactly as item 8 says it should: *"it asserts well-formedness, never judgement."* A green there was never a
 claim that a verdict was right, and this run is the demonstration — in both directions, since the one
 file that fails the mechanical check would have been caught by it had it ever been in `retention/`.
 
@@ -668,3 +668,13 @@ Recorded rather than silently applied, because §7 is the record behind an escal
 5. **The raw 8a output was not preserved.** Now committed under `invalidated/adjudication/`; see
    §7.2. Every figure in §7.3 is recomputable from it, which is what makes corrections 3 and 4
    checkable rather than another assertion.
+6. **The correction to §7.7 was itself wrong, and a second review round caught it.** Replacing
+   *"all six passed"* with *"five of the seven"* was another number nobody had run: seven assembled
+   passes exist, exactly one fails, so it is **six**. The sentence even contradicted itself, naming
+   one failing file while implying two. It is corrected above, and this time by running the full
+   item-8 rule set over all seven files rather than by counting. **Recorded because it is the third
+   time in this section that a figure was written before it was checked** — the first two are
+   corrections 3 and 4 — and the pattern is more useful to a later reader than the digit is.
+7. **`invalidated/README.md` kept the superseded figures** after §7.3 was corrected: 26 of 106, 25%,
+   and `0.75^18` ≈ 0.6%. A correction applied to one file and not its sibling leaves the tree
+   asserting both. Now aligned to 24 of 106, 22.6% and ≈ 1.0%.
