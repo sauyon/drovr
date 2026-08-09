@@ -475,8 +475,10 @@ plan's T5 procedure says *"log every re-run and its reason per `R6`; log any res
 neither file is edited above this line, and **§3 is untouched**.
 
 **Every count in this section was recomputed from `invalidated/adjudication/*.json` after review
-found three of them wrong.** See §7.8 — the corrections are recorded rather than quietly applied,
-because an escalation whose arithmetic drifted once should be checkable by whoever reads it next.
+found five of them wrong across three rounds.** See §7.8 — the corrections are recorded rather than
+quietly applied, because an escalation whose arithmetic drifted five times should be checkable by
+whoever reads it next, and because the drift is itself the most transferable thing here: **every one
+of the five was a figure written before it was run.**
 
 ### 7.1 The outcome, stated first
 
@@ -564,8 +566,10 @@ passes only if every sampled row passes. At the observed 22.6% per-row failure r
 be cleared by this ledger at this sample size**, and no amount of re-running changes that.
 
 **Two things this is not, and one thing it partly is.** It is not the multi-line-span hazard T5
-checked for first: pairs whose spans contained a newline passed at a *higher* rate (8/10) than
-single-line pairs (72/96), so the prompt's one-line `SPANS:` layout is not the cause. It is not a T5
+checked for first: across the operative six, **all 7** pairs whose spans contained a newline passed,
+against 75 of 99 single-line pairs. Seven is a small sample and proves little on its own — what it
+does do is point *away* from the prompt's one-line `SPANS:` layout rather than toward it, which is
+all this check was for. It is not a T5
 judgement substituted for the adjudicator's — every `establishes: false` above is an adjudicator's,
 unedited. But **"not one scorer's slip" is too strong as originally written**: the `R6` re-run
 changed 16 of 18 sampled rows' spans and still failed, which does show the failure survives a fresh
@@ -675,6 +679,13 @@ Recorded rather than silently applied, because §7 is the record behind an escal
    item-8 rule set over all seven files rather than by counting. **Recorded because it is the third
    time in this section that a figure was written before it was checked** — the first two are
    corrections 3 and 4 — and the pattern is more useful to a later reader than the digit is.
+7a. **A fourth figure was computed from attempt 1 and survived three correction rounds.** §7.3's
+   multi-line-span check cited 8/10 and 72/96 — attempt 1's numbers, whose 80 passes and 26 failures
+   are the superseded headline in disguise. Over the operative six it is 7/7 and 75/99. Correction 3
+   fixed the headline and did not sweep the paragraph four sentences below it, and rounds 2 and 3
+   both certified §7.3 before round 3 caught this. **Every figure in §7.3 has now been recomputed
+   from `adjudication/` once more, together rather than one at a time**, which is what should have
+   happened at correction 3.
 7. **`invalidated/README.md` kept the superseded figures** after §7.3 was corrected: 26 of 106, 25%,
    and `0.75^18` ≈ 0.6%. A correction applied to one file and not its sibling leaves the tree
    asserting both. Now aligned to 24 of 106, 22.6% and ≈ 1.0%.
