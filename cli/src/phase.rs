@@ -2525,7 +2525,11 @@ fn close_pane_preserving_focus<H: Herdr>(h: &H, pane: &str) -> io::Result<()> {
 ///
 /// The lock is taken and dropped per phase, inside [`phase_reap`]: the run lock
 /// is `flock`-shaped and not re-entrant, so wrapping this loop in one would
-/// deadlock against the first `phase_reap` it calls.
+/// break it — quietly, which is worse than the deadlock this once claimed.
+/// Nothing would hang: `try_lock` refuses rather than waits, so every
+/// [`phase_reap`] inside the wrapper would take its refused branch, warn, and
+/// leave the phase untouched. Reaping would simply stop happening while every
+/// command still reported success.
 fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
     for name in run.superseded_by(starting) {
         match phase_reap(h, run, &name) {
