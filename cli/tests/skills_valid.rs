@@ -2902,10 +2902,10 @@ fn scan_retention_dir(dir: &Path) -> Option<RetentionScan> {
 /// The two agree for any path that was never renamed, which covers
 /// `blind-map.json` and every path this run creates — but a rename into place
 /// would make them disagree and fail spuriously. Recorded rather than patched
-/// because it is unreachable here and the patch is not free: `--follow` requires
-/// a single pathspec and changes what git walks, so adding it to a lookup whose
-/// whole job is "the newest commit touching this path" is a behaviour change to
-/// buy coverage of a case this run cannot produce. (It is **not** the failure mode
+/// because it is unreachable here and the patch is not free: `--follow` changes
+/// what git walks, so adding it to a lookup whose whole job is "the newest commit
+/// touching this path" is a behaviour change bought to cover a case this run
+/// cannot produce. (It is **not** the failure mode
 /// [`introducing_commit_in`] documents — that one is `--diff-filter=A` with `-1`
 /// returning the most recent *add*, and this lookup has no `--diff-filter`.)
 fn blind_map_is_immovable(

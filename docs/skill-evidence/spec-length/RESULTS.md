@@ -190,6 +190,14 @@ Six, none of them a `PROTOCOL.md` edit. **T10 repeats these alongside the four i
 item 2**, which makes ten in the write-up's complete list. Deviation 4 is the serious one and is an
 **escalation, not a closed item**.
 
+**One record deliberately does not get a number of its own:** deviation 4 requires a dispatch whose
+`git log` channel was open to be recorded as a deviation, and T4's own feasibility scorer was such
+a dispatch. It is written up **inside deviation 1**, which is where that scorer is described, and
+cross-referenced from deviation 4 — not filed as a seventh entry, because it is the same breach as
+deviation 4 reaching one dispatch rather than a new one. The count stays six, and ten. **T10:
+carrying deviation 4 without deviation 1's last two paragraphs would drop the only dispatch this
+run knows was exposed.**
+
 1. **The feasibility generation could not be chosen "without consulting `blind-map.json`", because
    the agent that chose it had just written that file.** The plan asks T4 to pick one
    `tui-dc-picker` generation while staying blind to its arm, and then to record the reading as
@@ -241,12 +249,21 @@ item 2**, which makes ten in the write-up's complete list. Deviation 4 is the se
    says it may be recorded *only* in `blind-map.json`. This is the most serious thing on this page
    and it cannot be undone.**
 
-   **What happened.** Commit `b03cba02183fb0eaf3e3a9d31e2fb18b75c861d4`'s message states the
-   derivation in full: the pool is ordered by `sha256("<id>|spec-length-ab/T4/draw-1")` ascending
-   and assigned in that order to the triples in canonical arm-major order (`S1`, `S2`, `S3`; within
-   an arm `skill-stickiness`, `tiered-review`, `tui-dc-picker`; within a fixture sample 1 then 2).
-   That is a complete re-encoding of the map. T4's own review reconstructed all 18 cells from the
-   commit message alone and got a byte-for-byte match.
+   **What happened.** Commit `b03cba02183fb0eaf3e3a9d31e2fb18b75c861d4`'s message gives the salt
+   and the rule: *"the pool is ordered by `sha256("<id>|spec-length-ab/T4/draw-1")` and assigned in
+   that order to the triples in canonical arm-major order"*. That is enough to recover **every id's
+   arm** — three contiguous blocks of six — which is precisely what withholding `blind-map.json`
+   was protecting. T4's own review recovered the three-way arm partition from the message and
+   matched `blind-map.json` arm-for-arm.
+
+   It is **not** the whole map, and an earlier draft of this entry overstated it three times
+   ("states the derivation in full", "a complete re-encoding", "reconstructed all 18 cells from the
+   commit message alone"). The message does not fix the sort direction, the within-arm fixture
+   order, or the within-fixture sample order, so it does not by itself yield the `(fixture, sample)`
+   half of a cell. Those are `S1`, `S2`, `S3`; within an arm `skill-stickiness`, `tiered-review`,
+   `tui-dc-picker`; within a fixture sample 1 then 2 — **spelled out here for the first time**, and
+   independently recoverable from `PROTOCOL.md` item 3 regardless. **The severity is unchanged**:
+   the arm is the secret, and the message gives it up.
 
    **Why it was written.** To make the draw *auditable* — so a reader could confirm the assignment
    was not steered toward an arm, rather than take T4's word. The reasoning was right and the
