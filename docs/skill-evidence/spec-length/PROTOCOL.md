@@ -49,12 +49,16 @@ makes the edit. Windows 2 and 3 log to `RESULTS.md` **as well**, not instead: `R
 exist until T7, so a reader before then would otherwise have no record at all, and a reader after it
 should not have to open a second file to learn that this one moved.
 
-**This file was revised six times after its first commit, all inside window 1**, and says so here
-rather than leaving `git log -p` as the only witness. Count the rows below `7cfd07a`: that number
-and this sentence must always agree, and both must agree with
-`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL.md`. **The count has been wrong twice,
-both times by one, because the commit doing the correcting adds a row of its own** — so when you
-update it, count the table *after* adding your row, not before.
+**This file was revised seven times after its first commit — the first six inside window 1, the
+seventh inside window 2**, and says so here rather than leaving `git log -p` as the only witness.
+Count the rows below `7cfd07a`: that number and this sentence must always agree, and both must agree
+with `git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL.md`. **The count has been wrong
+twice, both times by one, because the commit doing the correcting adds a row of its own** — so when
+you update it, count the table *after* adding your row, not before.
+
+**The seventh revision is the first one that is not free.** Window 1 revisions needed no log beyond
+this table; window 2's must **also** be logged in `RESULTS.md` with their reason and commit, and
+`RESULTS.md` does not exist until T7. **That obligation now falls on T7** — see the last row below.
 
 | commit | what changed |
 |---|---|
@@ -64,7 +68,8 @@ update it, count the table *after* adding your row, not before.
 | `6e33620` | item 3's "233" miscount explanation corrected to name the exact command that produces it; `R4a`'s cross-reference to `R5` loosened; item 8a's "20%" qualified against `floor(n/5)`; the amendment windows split from two to three; this table added. No rule added or weakened. |
 | `5043dbf` | **`14a` added** — T9's gap-finder and pairing-adjudicator prompts and the `gaps/` schema, which `R7` makes fatal but which no file pinned. **`R3a` gained its post-T8/T9 fallback**, which was undefined. The protected set widened from item 12 alone to a nine-item list. This table made append-only and forward-looking. |
 | `b3dde8f` | **Item 14 gained a definition of `recovered` and literal probe and adjudicator prompts** — T8's fatal criterion was named but never defined, and its prompts were the only instrument prompts still unwritten, which made `5043dbf`'s claim that T9 was "the only" unpinned instrument false. **`R3a`'s fallback gained step 2**, the check against `S1`'s mean, without which it could crown a candidate the control had beaten. The protected set widened again, from nine items to **all sixteen**. Revision count corrected from three to four. |
-| the commit that added this row | **Item 14 gained a blind question-writer** — the probe prompt was fixed but its one blank, the 60 per-row question texts, was still a judgement call left to T8, which runs after unblinding. The questions are now composed by a subagent that sees only ledger rows, committed before T8's first probe, and reused across arms. **`R3a` step 2 now applies the full three-key order** rather than `≤` on mean lines, which disagreed with R3a's own tie-break for an exact tie. **`R6`'s closed re-run list** now names item 14 and 14a verdicts, which have no automated check behind them. Revision count corrected from four to **six** — it had been wrong twice, both times by one. |
+| `c041300` (T2's last, labelled "the commit that added this row" when written) | **Item 14 gained a blind question-writer** — the probe prompt was fixed but its one blank, the 60 per-row question texts, was still a judgement call left to T8, which runs after unblinding. The questions are now composed by a subagent that sees only ledger rows, committed before T8's first probe, and reused across arms. **`R3a` step 2 now applies the full three-key order** rather than `≤` on mean lines, which disagreed with R3a's own tie-break for an exact tie. **`R6`'s closed re-run list** now names item 14 and 14a verdicts, which have no automated check behind them. Revision count corrected from four to **six** — it had been wrong twice, both times by one. |
+| the commit that added this row (**T3, window 2** — the first revision outside window 1) | **Item 2's `S2`/`S3` size cells filled in.** They read "recorded by T3", and item 13 requires each arm's line and byte count to be reported, but neither `FREEZE.md` nor `MANIFEST.md` has a column that can hold one — so the placeholder had nowhere else to resolve to. **A fourth deviation added to item 2**, T3's in-place rewrite of `S3`'s `FREEZE.md` row: the section had said "Three, all recorded here", which would have told T10 its list was complete when it was not. The `c041300` row above was relabelled with its real SHA, because a second row reading "the commit that added this row" would have been ambiguous. Revision count corrected from six to **seven**. **No rule added, none weakened, no governed item touched** — the sizes are measurements and the deviation is a disclosure. **T7 must log this revision in `RESULTS.md`**: window 2 requires it, and no earlier revision did. |
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE.md` is the hash
 record and `docs/skill-evidence/arms/MANIFEST.md` is the provenance record; both are authoritative
@@ -145,8 +150,8 @@ immediately below rather than in a one-line disclaimer.
 | arm | role | path | `git hash-object --no-filters` | size |
 |---|---|---|---|---|
 | `S1` | **control**, frozen by T1 | `docs/skill-evidence/arms/spec-length/S1.md` | `bb0d5cdcf2903e9d47e705820911a2464c73ab22` | 15 lines / 191 words / 1151 bytes |
-| `S2` | candidate — a moderate trim of `S1` | `docs/skill-evidence/arms/spec-length/S2.md` | recorded by T3 in `FREEZE.md` | recorded by T3 |
-| `S3` | candidate — the aggressive minimum | `docs/skill-evidence/arms/spec-length/S3.md` | recorded by T3 in `FREEZE.md` | recorded by T3 |
+| `S2` | candidate — a moderate trim of `S1` | `docs/skill-evidence/arms/spec-length/S2.md` | recorded by T3 in `FREEZE.md` | 11 lines / 114 words / 705 bytes |
+| `S3` | candidate — the aggressive minimum | `docs/skill-evidence/arms/spec-length/S3.md` | recorded by T3 in `FREEZE.md` | 4 lines / 59 words / 354 bytes |
 
 `S1` was frozen at commit `a9eef3a3de9303213cce4a689dee3133f75c2ac8`, and that is the commit both
 its `FREEZE.md` and its `MANIFEST.md` rows name.
@@ -184,8 +189,10 @@ blank separator lines inside the item are truly empty, exactly one trailing newl
 
 ### Deviations from what the frozen artifacts say
 
-Three, all recorded here because the artifacts that state them are frozen or append-only and so
-cannot be corrected in place. T10 repeats all three in the write-up.
+Four, all recorded here because the artifacts that state them are frozen or append-only and so
+cannot be corrected in place. T10 repeats all four in the write-up. **Deviations 1–3 are things a
+frozen artifact says that this run does not do; deviation 4 is a rule this run broke.** They are
+listed together because T10 needs one complete list, not because they are the same kind of thing.
 
 1. **`FREEZE.md`'s *"Who appends what, and when"* table is stale.** It assigns `S1.md` to "T6" and
    `S2.md`/`S3.md` to "T8". Those are task numbers from a decomposition that was discarded and
@@ -215,6 +222,21 @@ cannot be corrected in place. T10 repeats all three in the write-up.
 
    This deviation is stated as a deviation, not smoothed over: it was written into a frozen artifact
    and this run does not follow it.
+
+4. **T3 rewrote `S3`'s `FREEZE.md` row in place, which `FREEZE.md` forbids.** Its own review found
+   `S3` violated item 13 — it dropped the exclusivity half of `S1`'s first ask rather than stating it
+   briefly — so T3 corrected the arm (`6a56a21f`) and updated its row (`2845f11d`). `FREEZE.md:14-16`
+   says *"none of them rewrites a row above … a wrong hash is a finding, not an edit."* Appending a
+   corrected row instead is impossible: `freeze_rows_still_hash_to_their_files` re-hashes **every**
+   row, so the superseded one would sit permanently red. The correction itself is legitimate — it is
+   squarely inside window 2, which permits it and requires only that it be logged — but the *manner*
+   of it broke `FREEZE.md`'s rule. **`FREEZE.md`'s own closing section records it in full**, and this
+   entry exists so that a T10 author reading this list is not told there are only three.
+
+   **Root cause, so it is not repeated: T3 froze before it had finished checking.** Had item 13's
+   review run to completion *before* the freeze commit, one commit would have carried the right bytes
+   and no row would ever have needed rewriting. **T4 onward: finish every check the protocol names,
+   then freeze.**
 
 ---
 

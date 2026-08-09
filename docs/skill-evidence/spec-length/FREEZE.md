@@ -195,6 +195,19 @@ than stating it briefly, so it was not "the shortest text that still **states** 
 **rewrote `S3`'s existing row in place** (`2845f11d`) instead of leaving it. That in-place rewrite is
 what this file forbids: *"a wrong hash is a finding, not an edit."*
 
+**The other resolution, and why it was rejected.** T3 could have reverted `S3` to its originally
+frozen bytes and filed the item-13 violation as a finding for a later task, leaving this file
+untouched. That was considered and rejected: it would have left an arm that fails item 13's own
+definition of what `S3` is — and the experiment would then measure a text the protocol says is not a
+valid arm. `PROTOCOL.md`'s window 2 (*"arm text exists but no result does … corrections are still
+legitimate, because nothing has been measured"*) makes the correction the sanctioned move, not the
+irregular one. **What broke the rule was the manner of recording it, not the correction itself.**
+
+**Root cause, stated plainly: the freeze happened before the checking finished.** Had T3 completed
+item 13's review *before* committing the rows, one commit would have carried the right bytes and no
+row would ever have needed rewriting. The lesson is sequencing, not a choice between two edit
+styles. **T4 onward: finish every check the protocol names, then freeze.**
+
 **Why it was not resolved the other way.** Appending a corrected row is impossible here —
 `freeze_rows_still_hash_to_their_files` re-hashes **every** row on every run, so a superseded row
 would sit permanently red, and history may not be rewritten on this branch. The choice was
