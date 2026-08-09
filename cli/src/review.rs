@@ -38,7 +38,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -49,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use crate::flock::FileLock;
 use crate::herdr::Herdr;
 use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
 
@@ -2080,7 +2080,9 @@ pub fn ensure_server() -> io::Result<String> {
     }
 }
 
-/// Take the single-server lock, held for as long as the returned file lives.
+/// Take the single-server lock, held for as long as the returned guard lives and
+/// released explicitly when it dies — see [`crate::flock`] for why a drop of the
+/// underlying `File` would not be a release (drovr#80).
 ///
 /// The lock is an advisory exclusive lock on `server.pid`, not the pid inside it:
 /// the kernel holds it for this process and drops it however the process dies, so
@@ -2091,7 +2093,7 @@ pub fn ensure_server() -> io::Result<String> {
 ///
 /// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
 /// refusal message — never for the decision.
-fn acquire_pid_lock() -> io::Result<File> {
+fn acquire_pid_lock() -> io::Result<FileLock> {
     match try_take_lock(&server_pid_file())? {
         Some(lock) => Ok(lock),
         // Someone holds it: they are serving (or about to), so stand down.
@@ -2106,23 +2108,11 @@ fn acquire_pid_lock() -> io::Result<File> {
 /// The pid is written *after* the lock is taken, so for the moment between the two
 /// the file still names the previous holder — which is why the pid only ever
 /// informs the message, never a decision.
-fn try_take_lock(path: &Path) -> io::Result<Option<File>> {
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Error(e)) => return Err(e),
-    }
-
-    lock.set_len(0)?;
-    lock.write_all(std::process::id().to_string().as_bytes())?;
-    lock.flush()?;
+fn try_take_lock(path: &Path) -> io::Result<Option<FileLock>> {
+    let Some(mut lock) = crate::flock::try_take(path)? else {
+        return Ok(None);
+    };
+    lock.overwrite(std::process::id().to_string().as_bytes())?;
     Ok(Some(lock))
 }
 
@@ -4376,12 +4366,16 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        // Every failure here reports the path and what the file held, because this test
-        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
-        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
-        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
-        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
-        // If it fails again, the message below is the evidence to file.
+        // This flaked three times (2026-07-26, 2026-08-01, and once more under
+        // this run's own review) and never on demand, and the cause is now
+        // known: drovr#80. `close(2)` releases an `flock` only when it closes
+        // the LAST fd on the open file description, and any sibling test thread
+        // spawning `git` or `herdr` forks a child that inherits one — so a
+        // release-by-drop released nothing until that child exec'd, and this
+        // test's re-claim was refused with nothing holding the lock. The
+        // `try_clone` below stages exactly that inherited fd, so the property is
+        // now asserted rather than waited on. `whats_there` stays: it costs
+        // nothing and still names the path and contents if this ever fails.
         let whats_there = |when: &str| -> String {
             format!(
                 "{when}: {} contains {:?}; this pid is {}",
@@ -4408,16 +4402,27 @@ mod tests {
             whats_there("after claim")
         );
 
+        // The fd a `fork()` hands a child: a second fd on the SAME open file
+        // description, still open across the drop below.
+        let shared = held
+            .try_clone()
+            .expect("stage the fd a forked child inherits");
+
         // Nothing has to prove the holder died for the lock to be free again.
         drop(held);
         let _held = try_take_lock(&path)
             .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
             .unwrap_or_else(|| {
                 panic!(
-                    "a lock released by dropping its File was still held. {}",
+                    "the lock was still held after its holder was dropped — closing our own \
+                     fd does not release an open file description another fd still shares, \
+                     so release has to be an explicit unlock (drovr#80). {}",
                     whats_there("after drop")
                 )
             });
+
+        // Last, so the staged fd outlives the re-claim it would otherwise block.
+        drop(shared);
     }
 
     /// A server that was killed leaves the file behind with its pid in it. The

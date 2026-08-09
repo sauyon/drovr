@@ -63,13 +63,6 @@ impl FileLock {
     /// through here. Truncating alone would not do it: `set_len` moves no file
     /// offset, so a second call would write past the bytes it just cut and
     /// leave a NUL-padded prefix behind — hence the rewind.
-    ///
-    /// (The `allow(dead_code)` is the last one left in this module: only the
-    /// tests call this until `review.rs`'s `server.pid` lock moves onto it, and
-    /// it goes when that lands. [`FileLock`] and [`try_take`] carried one for
-    /// the same reason and no longer need it — `crate::phase::acquire_run_lock`
-    /// calls them. `try_clone` never carried one; it is `#[cfg(test)]`.)
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn overwrite(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.rewind()?;
