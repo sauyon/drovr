@@ -11678,7 +11678,12 @@ mod rehydrate_tests {
     // refuses with `WouldBlock` while no other process claims it. In production
     // the second fd is the one `fork()` hands a child drovr spawned (`git`,
     // `herdr`); `O_CLOEXEC` drops it at `exec`, but not before, and the window
-    // is enough — see `acquire_run_lock`'s doc comment.
+    // is enough. `docs/run-lock-fork-race/lock-red.txt` is the measurement.
+    //
+    // ⚠ `acquire_run_lock`'s doc comment does not yet describe any of this —
+    // it still says the kernel "drops [the lock] however that process dies",
+    // which is what this test refutes. Correcting it is a later task in this
+    // run; until then, do not read that comment as contradicting this one.
     //
     // No fork, no sleep, no external binary, so the fault is staged
     // deterministically rather than raced for, and this holds inside `nix
