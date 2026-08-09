@@ -38,10 +38,19 @@ WHAT IT PROVES — AND WHAT IT DOES NOT
   says `:2131`, drifted; see §6b) is a
   SEPARATE defect in the same fork-window family and is untouched by this work.
   It is intermittent: zero occurrences in `lock-red.txt`'s final ten and zero in
-  these ten, but two in the earlier set (`lock-red.txt` WHEN / WHERE). No lock is
-  involved and `File::unlock()` does nothing for it — exactly as
-  `docs/test-isolation/race-green.txt:113-124` said for drovr#80 itself, from the
-  other side. Ten green runs are not a claim that it is gone.
+  these ten, but two in the earlier set (`lock-red.txt` WHEN / WHERE). NO LOCK IS
+  INVOLVED IN IT — that clause is about the stub-exec defect, not about drovr#80,
+  which is nothing but a lock — so `File::unlock()` does nothing for it and this
+  fix cannot have closed it.
+
+  `docs/test-isolation/race-green.txt:113-124` is the same disclaimer with the
+  roles swapped, and is worth reading beside this one: that file recorded ITS
+  green while naming the still-red parallel suite as someone else's defect —
+  drovr#80, this one. Now drovr#80 is fixed and the remaining doubt is the other
+  member of the fork-window family. Note the asymmetry, though, and do not
+  over-read the symmetry: race-green's ten runs were visibly red (25 failures),
+  whereas these ten are green and the residual risk is only that ETXTBSY did not
+  happen to fire. Ten quiet runs are not a claim that it is gone.
 
   Does NOT prove: anything about the SIGKILL residual. A holder killed without
   unwinding between a `fork` and that child's `exec` still leaves the lock held
@@ -198,7 +207,9 @@ HOW TO REPRODUCE
 
   (b) THE REFUSAL STRING APPEARS ZERO TIMES.  MET — 0 across all ten runs
       (§2). Red: 307. Note the baseline to compare against is `lock-red.txt`
-      §2's 22-41/run, NOT plan.md:100-107's single lighter-load run of 21;
+      §2's 22-41/run, NOT plan.md:89-90's single lighter-load run of 21
+      (`lock-red.txt:95` and `:403` both cite that figure as `plan.md:100-107`;
+      :100-107 is the adjacent three-failures table, and the count is at :89-90);
       `lock-red.txt` §5 flags that, and the bar is zero either way.
 
   (c) ONLY THE STUB-EXEC FAILURE PERMITTED.  MET VACUOUSLY, and this is the one
@@ -304,16 +315,39 @@ HOW TO REPRODUCE
   response splitting) falls in none of them. Zero warnings in `flock.rs`,
   `phase.rs` or `code_review.rs`. The run's lint gap is closed, and clean.
 
-  $ grep -rn "\.try_lock()" cli/ hooks/          # over TRACKED files
+  $ git ls-files cli hooks | xargs grep -n "\.try_lock()"
   cli/src/flock.rs:56
 
   One hit, the guard's own. Baseline was `phase.rs:1392` + `review.rs:2117`, so
-  this is the proof that `crate::flock` is the sole door. Match the CALL
-  `.try_lock()`, not the bare word: `phase.rs:1379,1404,1407` name
-  `File::try_lock` in prose, legitimately, and a bare-word grep reports those as
-  hits that are not defects. Restrict the grep to tracked files or use
-  `git ls-files` — `cli/target/doc/` contains generated HTML mirroring
-  `flock.rs:56`, and it is gitignored.
+  this is the proof that `crate::flock` is the sole door.
+
+  ⚠ TWO WAYS TO GET THE WRONG ANSWER HERE, and plan.md T7 item 6's literal
+  command falls into the second:
+
+  (i) MATCH THE CALL, NOT THE BARE WORD. A bare-word `grep -rn try_lock` reports
+      SEVEN prose hits that are not defects — the complete list over tracked
+      files, since a partial one invites the same mistake it warns about:
+
+        cli/src/flock.rs:5,13        the module doc's statement of the invariant
+        cli/src/phase.rs:1379,1404,1407   `acquire_run_lock`'s doc comment
+        cli/src/phase.rs:2529        `reap_superseded`'s "nothing would hang"
+        cli/src/phase.rs:11707       a comment inside T1's mechanism test
+
+      All are deliberate and T5 keeps them there. plan.md T7 item 6 makes this
+      point and is right about it; it just names only the first three.
+
+  (ii) ⭐ RESTRICT IT TO TRACKED FILES, WHICH THE PLAN'S COMMAND DOES NOT.
+      plan.md's `grep -rn "\.try_lock()" cli/ hooks/` returns TWO hits, not one:
+
+        cli/src/flock.rs:56
+        cli/target/doc/src/drovr/flock.rs.html:56
+
+      The second is generated rustdoc HTML mirroring the first, and `target/` is
+      gitignored (`.gitignore:1`). It is not a second door and not a defect — but
+      the plan's command does not exclude it, and the `cargo doc` step four lines
+      above this one RECREATES `cli/target/doc` every time, so anyone running §4
+      in order will meet it. Hence the `git ls-files` form above; it is the one
+      that actually yields the claimed single hit.
 
 
 --------------------------------------------------------------------------------
@@ -394,7 +428,10 @@ HOW TO REPRODUCE
         §3   cited        real site now      what the CITED line points at today
         ---  -----------  -----------------  ---------------------------------
         (a)  cr.rs:2515   :2522              still inside the sweep test
-        (b)  cr.rs:2807   :2829              the `closed_panes` helper (:2776)
+        (b)  cr.rs:2807   :2829              ⭐ the doc comment ABOVE the reap
+                                             test — and specifically the sentence
+                                             in it that cites §3(b). A citation
+                                             loop: §3(b) → :2807 → "see §3(b)".
         (c)  ph.rs:11907  :11937             still inside its own test
         (d)  ph.rs:12368  :12393 / :12398    a DIFFERENT test — `a_reap_banks_
                                              the_session_before_it_closes_the_
@@ -406,11 +443,20 @@ HOW TO REPRODUCE
 
       ⚠ ROWS (b) AND (d) ARE THE DANGEROUS ONES, and only they. The other four
       still land inside the test §3 attributes them to, so a reader arrives in
-      the right place and merely off the exact assertion. (b) and (d) now point
-      at a different item altogether — `:2807` at the `closed_panes` helper the
-      reap test calls, `:12368` at an unrelated reap test — and a reader who
-      trusts either will conclude §3 misattributed its failure. It did not; the
-      code moved under it.
+      the right place and merely off the exact assertion. (b) and (d) do not:
+      `:12368` now lands in an UNRELATED test, and `:2807` in the doc comment
+      above the right test — which is worse than it sounds, because that comment
+      cites §3(b), so following §3(b)'s line number returns you to a pointer back
+      to §3(b). A reader who trusts either will conclude §3 misattributed its
+      failure. It did not; the code moved under it.
+
+      ⚠ AND A WARNING ABOUT HOW THIS TABLE WAS BUILT, because getting it wrong is
+      easy in a specific way. "Which function encloses line N" was first computed
+      by scanning backwards for the nearest `fn` — which silently reports the
+      PRECEDING function for any line inside a doc comment, since a doc comment
+      is not a `fn`. That is exactly how row (b) was first recorded as the
+      `closed_panes` helper at `:2776` (real, but 31 lines earlier and ending at
+      `:2781`) instead of the doc comment it is actually in. Read the line.
 
       …and outside §3, `phase.rs:2530-2531` (the refused-reap warning, quoted in
       §2's `--nocapture` argument) is now `:2560-2561`, and `herdr.rs:2131` is

@@ -429,5 +429,7 @@ HOW TO REPRODUCE
   parallel runs fully green, and the refusal message 307 → 0. Its §5 removes the
   fix again and watches this file's red return, and its §6 records two defects
   found in THIS file after it was frozen — `:35`'s "FIVE distinct tests" should
-  read four, and §3's two line citations have drifted. Neither is repaired here,
-  on purpose: a baseline edited after the fact is not a baseline.
+  read four, and a number of line citations have drifted (§6b audits them and
+  says which now point at the WRONG item rather than merely the wrong line; do
+  not trust a count quoted from here). Neither is repaired here, on purpose: a
+  baseline edited after the fact is not a baseline.
