@@ -48,11 +48,11 @@ this one row, not a rule about the column.
 
 | path | `git hash-object --no-filters` | frozen at commit | date |
 |---|---|---|---|
-| `docs/skill-evidence/spec-length/PROTOCOL-2.md` | `b928dfcd5a0d80bda5ca2542dc074265e5c81c59` | `ea011be37c8279c5eae6adb743dd78f07e6dea52` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/PROTOCOL-2.md` | `7ef62e50ffcfdfebd0941d3f1d3a1c7e9bd939bb` | `128a5f2d4af90a157f5557795395a5f94d99ed5d` | 2026-08-10 |
 
 ## Who appends what, and when
 
-The task that generates the 18 new specs appends **21** rows in one commit: the 18
+The task that generates the 18 new specs appends **20** rows in one commit: the 18
 `generated-2/<id>.md` files, `blind-map-2.json` and `fixture-map-2.json`. **Nothing else is appended
 by this run** — verdicts, adjudications, escalations, the calibration record and `RESULTS-2.md` are
 measurements, and a measurement is evidence rather than a frozen input.
@@ -84,3 +84,73 @@ Re-verifying by hand is still what a task owes at a gate rather than at CI time 
 `git hash-object --no-filters <path>` for each row. The generation task does exactly this before its
 first probe, so the freeze is confirmed at the moment it is relied on and not merely at some point
 since.
+
+## Recorded breach of the append-only rule — `PROTOCOL-2.md`'s row, T1, 2026-08-10
+
+**This section is appended, not an edit**, and it records that the rule at the top of this file was
+broken by the task that wrote the rule, one commit after writing it. Leaving it discoverable only in
+`git log -p` would make this a freeze record whose violations are invisible in the record.
+
+**What happened.** T1 committed `PROTOCOL-2.md` (`ea011be3`), then appended its row here
+(`d35bbbf3`), then ran its review — which found four claims `PROTOCOL-2.md` made about itself that
+were not true, the largest being that it cited eleven `spec_length_2_*` tests in the present tense
+when none of them existed. T1 corrected the file (`128a5f2d`, window 1, no governed rule touched) and
+then **rewrote this file's existing row in place** rather than leaving a hash that no longer matched.
+That in-place rewrite is what the top of this file forbids: *"a wrong hash is a finding, not an
+edit."*
+
+**Root cause, and it is verbatim the one `FREEZE.md` already recorded: the freeze happened before the
+checking finished.** `FREEZE.md`'s own breach section closes with *"T4 onward: finish every check the
+protocol names, then freeze."* T1 read that sentence, wrote it into this file's preamble as the thing
+not to repeat, and then repeated it — by committing the row before its own review had run rather than
+after. **The instruction is unchanged and it now binds with a second worked example behind it: run
+every check first, then write the row.**
+
+**Why it was not resolved the other way.** Appending a corrected row is impossible:
+`spec_length_2_freeze_rows_still_hash_to_their_files` re-hashes **every** row, so a superseded row
+would sit permanently red, and history may not be rewritten on this branch. Reverting
+`PROTOCOL-2.md` to `ea011be3`'s bytes was the alternative, and it was rejected: it would have left a
+pre-registration asserting in the present tense that eleven checks were already policing it when the
+suite contained none of them — a worse artifact than a corrected row with a disclosed correction.
+The choice was between an undisclosed edit and a disclosed one.
+
+**What it does and does not cost.** It does **not** contaminate any measurement: no probe has run,
+`calibration-2.json`, `generated-2/`, `blind-map-2.json` and `retention-2/` do not exist, and
+`PROTOCOL-2.md` is still committed strictly before all of them. What it costs is auditability — **no
+test can detect that a row's value was swapped rather than appended**, which is precisely why it is
+written down here.
+
+**The rule is not weakened. It binds every later task unchanged: once the first probe runs, a wrong
+hash is a finding and STOP, never an edit.** This is a record of one breach, not a precedent for a
+second.
+
+### The structural problem underneath it — escalated, not resolved here
+
+**A hash-frozen `PROTOCOL-2.md` and `PROTOCOL-2.md`'s own three windows cannot both hold.** The
+windows exist so the protocol can be corrected while nothing has been measured — window 1 permits
+even *weakening* a governed item — and `plan.md` T2 says in as many words to *"amend `PROTOCOL-2.md`,
+append a row to its revision table in the same commit, and carry on"*, because the tests it writes
+are expected to find ambiguities in item 8's boundary rule. But the row above makes any such
+amendment turn `spec_length_2_freeze_rows_still_hash_to_their_files` red until the row is rewritten,
+and rewriting it is the breach recorded above. **`PROTOCOL.md` did not have this problem: it is not
+in `FREEZE.md` at all, and it was revised eight times.** Its protection is the *ordering* plus its
+revision table, which is what a document that may legitimately move needs.
+
+This is a defect in the plan's T1, not a choice T1 made, and T1 has not resolved it — the row above
+exists because `plan.md` T1 requires exactly one, and this file's own test requires a non-empty
+table. **The next task and the driver should decide between three options, and the decision belongs
+to them:**
+
+1. **Accept the coupling**: treat `PROTOCOL-2.md` as immutable from now on, and read windows 1 and 2
+   as already closed for it. Cheapest, and it forfeits exactly the correction that just caught four
+   false claims.
+2. **Drop `PROTOCOL-2.md`'s row** and protect the protocol the way `PROTOCOL.md` is protected —
+   ordering plus revision table plus `spec_length_2_protocol_stops_moving_before_the_first_probe`,
+   which already asserts every commit touching it precedes `generated-2/`. This file's first row
+   would then be appended by the generation task, and the freeze test's vacuity condition changes
+   from *"never"* to *"until `generated-2/` exists"*. **That is a real loosening of a planned test
+   and must be argued for, not slipped in.**
+3. **Keep the row and re-record it on every window-1 amendment**, each disclosed here as this one
+   is. Honest, and it makes this section a list rather than an incident.
+
+**Whichever is chosen, it is chosen before the first probe, not after.**
