@@ -4426,6 +4426,426 @@ fn spec_length_retention_verdicts_are_complete_and_quoted() {
     );
 }
 
+/// The run's write-up (`docs/skill-evidence/spec-length.md`), sibling of
+/// `voice.md` and `tdd.md`. T10's deliverable.
+fn spec_length_write_up_path() -> PathBuf {
+    evidence_dir().join("spec-length.md")
+}
+
+/// The pre-registered protocol (`docs/skill-evidence/spec-length/PROTOCOL.md`).
+fn spec_length_protocol_path() -> PathBuf {
+    spec_length_dir().join("PROTOCOL.md")
+}
+
+/// The heading of `PROTOCOL.md`'s stated-limitations list, which T10 must carry
+/// into the write-up **verbatim** rather than summarise.
+const SPEC_LENGTH_LIMITATIONS_HEADING: &str = "### What this measurement cannot do";
+
+/// The body of a markdown section, from just after `heading` to the next
+/// same-or-higher-level heading or thematic break.
+///
+/// Returns `None` when the heading is absent, which callers must treat as a
+/// failure rather than as an empty section — a section that moved would
+/// otherwise make every check over it pass having compared nothing.
+fn markdown_section_body<'a>(text: &'a str, heading: &'a str) -> Option<&'a str> {
+    let start = text.find(heading)? + heading.len();
+    let rest = &text[start..];
+    let end = rest
+        .match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&i| {
+            let line = rest[i..].split('\n').next().unwrap_or("");
+            line.starts_with("## ") || line.starts_with("### ") || line.trim_end() == "---"
+        })
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim_matches('\n'))
+}
+
+/// Split a top-level markdown numbered list into its items, each carried
+/// **whole** — the `N. ` line plus every continuation line under it.
+///
+/// The numbers are returned so a caller can insist the list is sequential: a
+/// list that reads `1. 2. 2. 4.` has an item that was duplicated rather than
+/// added, and a verbatim-quoting check over it would compare one item twice.
+fn markdown_numbered_items(body: &str) -> Vec<(usize, String)> {
+    let mut items: Vec<(usize, String)> = Vec::new();
+    for line in body.lines() {
+        let number = line
+            .split_once(". ")
+            .and_then(|(n, _)| n.parse::<usize>().ok())
+            .filter(|_| !line.starts_with(char::is_whitespace));
+        match number {
+            Some(n) => items.push((n, line.to_string())),
+            None => {
+                if let Some((_, item)) = items.last_mut() {
+                    item.push('\n');
+                    item.push_str(line);
+                }
+            }
+        }
+    }
+    for (_, item) in items.iter_mut() {
+        while item.ends_with('\n') {
+            item.pop();
+        }
+    }
+    items
+}
+
+/// The write-up carries all seven of `PROTOCOL.md`'s stated limitations
+/// **verbatim**, not paraphrased.
+///
+/// The plan asks for them verbatim for a reason this run then went on to
+/// demonstrate twice over: every one of the corrections in `RESULTS.md` §7.8 was
+/// a figure or a claim restated from memory instead of copied from the record.
+/// A summary of a limitation is a limitation with its sharp edge filed off —
+/// limitation 7's *"the residual risk runs toward a **false pass**"* and
+/// limitation 2's *"Do not describe this scoring as fully blind anywhere"* are
+/// each one clause, and each is the whole point of its item.
+///
+/// **`PROTOCOL.md` is the authority and this test never edits the comparison to
+/// suit the write-up.** If a limitation is missing here, the write-up is what is
+/// wrong: `PROTOCOL.md` is a governed file in window 3, where any edit at all is
+/// a deviation.
+#[test]
+fn spec_length_write_up_quotes_every_limitation_verbatim() {
+    let protocol_path = spec_length_protocol_path();
+    let protocol = fs::read_to_string(&protocol_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", protocol_path.display()));
+    let body = markdown_section_body(&protocol, SPEC_LENGTH_LIMITATIONS_HEADING).unwrap_or_else(
+        || {
+            panic!(
+                "{} has no `{SPEC_LENGTH_LIMITATIONS_HEADING}` section. It is the source of \
+                 the seven limitations the write-up must quote, so this check just compared \
+                 nothing.",
+                protocol_path.display()
+            )
+        },
+    );
+
+    let items = markdown_numbered_items(body);
+    assert!(
+        items.len() >= 7,
+        "{}'s `{SPEC_LENGTH_LIMITATIONS_HEADING}` parsed as {} item(s); the run's own \
+         limitation 7 is the seventh, so fewer than seven means the parse lost some",
+        protocol_path.display(),
+        items.len(),
+    );
+    for (i, (number, _)) in items.iter().enumerate() {
+        assert_eq!(
+            *number,
+            i + 1,
+            "{}'s limitations are numbered {:?}, which is not sequential — a duplicated \
+             number would have this check compare one item twice and never notice a missing one",
+            protocol_path.display(),
+            items.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        );
+    }
+
+    let write_up_path = spec_length_write_up_path();
+    let write_up = fs::read_to_string(&write_up_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. It is the run's write-up and T10's deliverable.",
+            write_up_path.display()
+        )
+    });
+
+    let missing: Vec<String> = items
+        .iter()
+        .filter(|(_, item)| !write_up.contains(item.as_str()))
+        .map(|(n, item)| {
+            let first = item.lines().next().unwrap_or("").trim();
+            format!("  limitation {n}: {first}")
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} does not carry {} of {}'s limitations verbatim:\n{}\n\nCopy them; do not \
+         restate them. A near-match fails here on purpose.",
+        write_up_path.display(),
+        missing.len(),
+        protocol_path.display(),
+        missing.join("\n"),
+    );
+}
+
+/// The write-up's design figures agree with the artifacts they describe.
+///
+/// **Every number in this run that went wrong went wrong the same way**: it was
+/// written from memory beside a number that had been recomputed, and the
+/// paragraph built on it was not swept (`RESULTS.md` §7.8, corrections 3, 4, 6
+/// and 8 — four figures, three correction rounds). The fixture lengths and
+/// ledger row counts are the write-up's load-bearing denominators and the two
+/// this repository can check mechanically, so they are checked here rather than
+/// re-read by the next person.
+///
+/// The `233` miscount is the specific hazard: `grep -c '^| '` over a ledger
+/// counts its header row, and 92 / 85 / 56 = 233 is the number the run was
+/// commissioned with. The ledgers' own `Closed list: N rows.` declarations are
+/// authoritative, and this reads them through the same parser the retention
+/// checks use.
+#[test]
+fn spec_length_write_up_figures_match_their_authorities() {
+    let write_up_path = spec_length_write_up_path();
+    let write_up = fs::read_to_string(&write_up_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. It is the run's write-up and T10's deliverable.",
+            write_up_path.display()
+        )
+    });
+
+    const HEADER: &str = "| fixture | fixture lines | ledger rows |";
+    let table = write_up
+        .split_once(HEADER)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no `{HEADER}` table. That table is what makes the write-up's sample \
+                 sizes checkable against the fixtures and ledgers instead of taken on trust.",
+                write_up_path.display()
+            )
+        })
+        .1;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut line_total = 0usize;
+    let mut row_total = 0usize;
+    let mut declared_totals: Option<(usize, usize)> = None;
+
+    for line in table.lines().skip(1) {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        // The `|---|---|---|` rule under the header carries no cells.
+        if line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+            continue;
+        }
+        let cells = split_ledger_row(line)
+            .unwrap_or_else(|| panic!("{}: cannot split `{line}`", write_up_path.display()));
+        assert_eq!(
+            cells.len(),
+            3,
+            "{}: `{line}` has {} cells, not 3",
+            write_up_path.display(),
+            cells.len(),
+        );
+        let name = cells[0].trim_matches(|c| c == '`' || c == '*').to_string();
+        let lines: usize = cells[1]
+            .trim_matches('*')
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: `{}` is not a line count: {e}", write_up_path.display(), cells[1]));
+        let rows: usize = cells[2]
+            .trim_matches('*')
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: `{}` is not a row count: {e}", write_up_path.display(), cells[2]));
+
+        if name == "all three" {
+            declared_totals = Some((lines, rows));
+            continue;
+        }
+
+        let ledger_path = retention_ledger_path(&name)
+            .unwrap_or_else(|e| panic!("{}: {e}", write_up_path.display()));
+        let ledger = fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+        let index = parse_ledger_ids(&ledger)
+            .unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()));
+        assert_eq!(
+            rows,
+            index.declared,
+            "{} says the `{name}` ledger has {rows} rows; {} declares {}. The ledger is \
+             authoritative — 233 is what counting table rows gives, because it picks up each \
+             file's header.",
+            write_up_path.display(),
+            ledger_path.display(),
+            index.declared,
+        );
+
+        let fixture_path = spec_length_dir()
+            .join("fixtures")
+            .join(format!("{name}.spec.md"));
+        let fixture = fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", fixture_path.display()));
+        let actual = fixture.lines().count();
+        assert_eq!(
+            lines,
+            actual,
+            "{} says `{name}` is {lines} lines; {} is {actual}. This is `R3`'s reference \
+             point — the length every generation of that fixture is reported against.",
+            write_up_path.display(),
+            fixture_path.display(),
+        );
+
+        seen.push(name);
+        line_total += lines;
+        row_total += rows;
+    }
+
+    let mut expected: Vec<String> = SPEC_LENGTH_FIXTURE_NAMES.iter().map(|s| s.to_string()).collect();
+    seen.sort();
+    expected.sort();
+    assert_eq!(
+        seen,
+        expected,
+        "{}'s table covers {seen:?}; the design is 3 arms x 3 fixtures x 2 samples and all \
+         three fixtures are scored unconditionally (`PROTOCOL.md` item 2, deviation 3)",
+        write_up_path.display(),
+    );
+
+    let (declared_lines, declared_rows) = declared_totals.unwrap_or_else(|| {
+        panic!(
+            "{}'s table has no `**all three**` total row. The 230-row total is the gate's \
+             denominator and is where the 233 miscount lands.",
+            write_up_path.display()
+        )
+    });
+    assert_eq!(
+        (declared_lines, declared_rows),
+        (line_total, row_total),
+        "{}'s totals row says ({declared_lines} lines, {declared_rows} rows); its own rows \
+         sum to ({line_total}, {row_total})",
+        write_up_path.display(),
+    );
+
+    // The generation count the write-up states, against the generations on disk.
+    let generated = spec_length_generated_dir();
+    let count = fs::read_dir(&generated)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", generated.display()))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+        .count();
+    assert_eq!(
+        count, 18,
+        "{} holds {count} generated specs, not the design's 18",
+        generated.display(),
+    );
+    assert!(
+        write_up.contains("18 generations"),
+        "{} never says `18 generations`. The sample size is the first thing a reader of a \
+         null needs, and it is 3 arms x 3 fixtures x 2 samples.",
+        write_up_path.display(),
+    );
+}
+
+/// `brainstorm.md` step 4's body is still the frozen control arm, byte for byte.
+///
+/// **This is the run's outcome, applied.** No arm cleared `R2` — no arm has a
+/// defined retention count at all — so under `R3a` nothing ships and
+/// `brainstorm.md` is not touched. That is a claim about a file, so it is checked
+/// against the file rather than asserted in prose.
+///
+/// It also guards the case this run exists to prevent: a later reader who likes
+/// the look of `S2` or `S3` and pastes it into step 4. The arms are frozen text
+/// that **no admissible verdict was ever produced for**, and shipping one would
+/// be the experiment grading itself. If an arm is ever shipped legitimately —
+/// after a redesigned item 8a is re-frozen and a new run clears the gate — this
+/// test is updated to name that arm in the same commit as the paste, and its
+/// going red is the reminder to do so.
+#[test]
+fn spec_length_step_4_is_still_the_frozen_control_arm() {
+    let brainstorm = skills_dir()
+        .join("pipeline")
+        .join("phase-prompts")
+        .join("brainstorm.md");
+    let text = fs::read_to_string(&brainstorm)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", brainstorm.display()));
+
+    let body = brainstorm_step_4_body(&text)
+        .unwrap_or_else(|e| panic!("{}: {e}", brainstorm.display()));
+
+    let arm_path = spec_length_arms_dir().join("S1.md");
+    let arm = fs::read_to_string(&arm_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", arm_path.display()));
+
+    assert_eq!(
+        body,
+        arm,
+        "{}'s step 4 is no longer byte-identical to {} — the frozen control arm.\n\nThe \
+         spec-length A/B ended in a null: no arm has a defined retention count, so under \
+         `R3a` nothing ships and step 4 is not touched. See \
+         `docs/skill-evidence/spec-length.md`.",
+        brainstorm.display(),
+        arm_path.display(),
+    );
+}
+
+/// `brainstorm.md` step 4's body — the numbered item's text with its `4. `
+/// numeral removed, which is the shape `PROTOCOL.md`'s D1 freezes an arm in.
+///
+/// Located **structurally**, by the numeral and the next heading, rather than by
+/// D1's `sed -n '89,103p'` line range. The range is correct at the commit D1
+/// names and is scoped to it; resolving it against `HEAD` would check a claim D1
+/// never made, and would go red for any edit anywhere above step 4.
+fn brainstorm_step_4_body(text: &str) -> Result<String, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("4. "))
+        .ok_or("no line begins `4. `, so step 4 could not be located")?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map(|i| start + 1 + i)
+        .unwrap_or(lines.len());
+
+    let mut body: Vec<&str> = lines[start..end].to_vec();
+    while body.last().is_some_and(|l| l.trim().is_empty()) {
+        body.pop();
+    }
+    let mut out = body.join("\n");
+    out.push('\n');
+    Ok(out
+        .strip_prefix("4. ")
+        .ok_or("step 4's first line lost its numeral")?
+        .to_string())
+}
+
+/// [`brainstorm_step_4_body`] takes the item and nothing else.
+///
+/// **The test above passes today and passed the moment it was written**, because
+/// the outcome it pins is "nothing changed". A check in that position is exactly
+/// the one that ships never having discriminated anything, so its extraction is
+/// exercised here over inputs where each rule visibly bites.
+#[test]
+fn brainstorm_step_4_body_takes_the_item_and_nothing_else() {
+    let doc = "# Phase\n\n\
+               3. **Earlier step** with a body.\n   and its continuation.\n\n\
+               4. **Write the spec** to a path.\n   continuation, indented.\n\n   \
+               a second paragraph of the same item.\n\n\n\
+               ## The next heading\n\nprose that is not step 4.\n";
+    let body = brainstorm_step_4_body(doc).expect("step 4 is present");
+    assert_eq!(
+        body,
+        "**Write the spec** to a path.\n   continuation, indented.\n\n   \
+         a second paragraph of the same item.\n",
+        "the `4. ` numeral goes, the continuation and the blank line inside the item stay, \
+         and the trailing blank lines before the heading do not"
+    );
+    assert!(!body.contains("Earlier step"), "step 3 is not step 4's body");
+    assert!(!body.contains("next heading"), "the item stops at the next heading");
+    assert!(body.ends_with(".\n"), "exactly one trailing newline — `D1`'s shape rule");
+
+    // The last item in a list runs to the end of the document when no heading
+    // follows it — the shape `brainstorm.md` would take if its trailing sections
+    // were ever removed.
+    let no_heading = "4. **Write the spec** to a path.\n   continuation.\n";
+    assert_eq!(
+        brainstorm_step_4_body(no_heading).expect("step 4 is present"),
+        "**Write the spec** to a path.\n   continuation.\n",
+    );
+
+    // A document with no step 4 is an error, never an empty body: an empty
+    // string would compare equal to nothing and the check above would then pass
+    // on a `brainstorm.md` whose spec-authoring step had been deleted outright.
+    let err = brainstorm_step_4_body("# Phase\n\n3. only three steps here.\n")
+        .expect_err("a document with no `4. ` line has no step 4 body");
+    assert!(err.contains("4. "), "{err:?}");
+
+    // An indented `4. ` is a nested list item, not the top-level step.
+    let err = brainstorm_step_4_body("3. a step\n   4. a nested item\n")
+        .expect_err("a nested `4. ` is not step 4");
+    assert!(err.contains("4. "), "{err:?}");
+}
+
 /// Build a throwaway repository so the git helpers above can be exercised
 /// against history this file controls.
 ///

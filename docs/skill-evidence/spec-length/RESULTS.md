@@ -690,3 +690,33 @@ Recorded rather than silently applied, because §7 is the record behind an escal
    and certified it, missing this line too**, and round 3 caught it. **Every figure in §7.3 has now
    been recomputed from `adjudication/` in one pass rather than one at a time**, which is what
    should have happened at correction 3.
+
+---
+
+## 8. T10 — the run closed, and what §6 is owed
+
+**Written by T10, the final task. Nothing above this line is edited, and §3 is untouched.**
+
+**T6, T7, T8 and T9 did not run.** T5's escalation was carried to the human, whose decision was to
+**publish the null and not deviate from frozen item 8a**. With no admissible `skill-stickiness`
+verdict, T6 would have spent 30 dispatches to reach the same wall, T7 has nothing to join and no arm
+to gate, and T8/T9 are skipped **by `R7`'s pre-registered rule** rather than by judgement.
+
+**§6's list is therefore discharged as moot, not forgotten.** The per-arm unions under `R1`, the
+per-generation counts under `R1a`, the dropped-row lists, the `R2` verdict and the `R3`/`R3a`
+comparison all require verdicts that do not exist. Two items in §6 were live and are done:
+
+- **The `R5a` copy check was re-derived, not inherited**, from `wc -l` over `generated/*.md` against
+  791 / 463 / 414. **No generation is flagged**; the top of the range is `f8729b` at 90.3% and the
+  bottom is `bbd141` at 47.6%. §3's reading stands.
+- **The instrument reading under `R4`** is the run's whole result, and it is in the write-up.
+
+**Nothing was unblinded.** `blind-map.json` was not opened by T5 or T10, and no arm is named against
+any generation id anywhere in this file or the write-up. `R3`'s compared set is empty, so no length
+comparison is licensed, and printing an arm column would publish the map to buy nothing. This is not
+a claim that the assignment is secret — §5's deviation 4 is precisely that it is not.
+
+**The write-up is `docs/skill-evidence/spec-length.md`**, sibling of `voice.md` and `tdd.md`. It
+carries the complete thirteen-deviation list, all five `R6a` doubts, the `R6` re-run log, and
+`PROTOCOL.md`'s seven stated limitations verbatim. Every figure in §7 was recomputed from
+`invalidated/adjudication/` in one pass while writing it and **reproduces §7 exactly**.

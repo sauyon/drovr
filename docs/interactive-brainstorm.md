@@ -145,11 +145,19 @@ These bind, and the plan's text does not:
 Two things a reader will reasonably expect to find and will not:
 
 1. **The spec-length A/B was deliberately out of scope for this run** — no *candidate* arm was
-   written (only the control `S0`, which T1 froze), no fixture scored, no outcome applied. The
-   frozen ledger under `docs/skill-evidence/spec-length/`
-   is **unscored** — T1 of this run is what created it (3 fixtures, 230 ledger rows, control arm
-   `S0`), and nothing since has touched it. Everything the A/B needs exists; nobody has run it.
-   The freeze-precedes-every-arm ordering still holds, so it can be picked up as-is.
+   written (only the control `S0`, which T1 froze), no fixture scored, no outcome applied. T1 of
+   this run is what created the frozen ledger under `docs/skill-evidence/spec-length/`
+   (3 fixtures, 230 ledger rows, control arm `S0`).
+
+   **It has since been run, and the answer is a null about the instrument rather than about spec
+   length — see `docs/skill-evidence/spec-length.md`.** That run re-baselined the control onto
+   `S1`, the shipped step 4, rather than the historical `S0`; froze two candidate arms; and
+   generated 18 specs. Retention scoring then failed its own pre-registered relevance
+   adjudication in every file it produced, so **no arm has a defined retention count and none
+   could have cleared the gate, the control included**. Nothing shipped: step 4 is untouched, and
+   `spec_length_step_4_is_still_the_frozen_control_arm` pins that. A redesigned instrument,
+   pre-registered and re-frozen before any new arm is measured, is legitimate follow-up work; the
+   18 generated specs are frozen and re-scorable, so it would not have to start over.
 2. **The review page cannot show an *answered* interview.** The panel renders only the pending
    ask and empties itself once nothing is pending; `interview.jsonl` is on disk and served at
    `GET /api/runs/<run>/interview`, but a human reviewing the spec never sees the Q&A that
@@ -164,5 +172,10 @@ longer: **103 lines on `main` → 160 here.** Ten of those 57 came with `drovr/s
 **47 are this run's own** — T7 added the ask directive
 (113 → 135) and T8 the interview loop and decision-record framing (135 → 160). A longer prompt
 costs context in **every** brainstorm phase, forever, and that is a real price paid up front
-against a spec-length saving that has not yet been measured. Only the A/B in (1) can say whether
-the trade pays.
+against a spec-length saving that has not yet been measured.
+
+**The A/B in (1) has now run, and it did not settle this.** It ended in a null attributable to the
+measuring instrument — no arm, control included, has a defined retention count — so the trade is
+**still unmeasured**, and the 57 lines are still being paid. That is a weaker statement than "the
+trade did not pay", and deliberately so: nothing in that run says a shorter step 4 would have lost
+key points, and nothing says it would not.
