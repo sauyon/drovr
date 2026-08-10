@@ -345,9 +345,11 @@ pub fn compose_phase_brief(
         )
     })?;
 
-    // Substitution is an ALLOWLIST. The templates contain prose that merely looks like a
-    // placeholder — `answers[<id>]` in brainstorm.md describes a JSON shape — so
-    // "replace anything in angle brackets" would corrupt the brief it is composing.
+    // Substitution is an ALLOWLIST. The templates contain angle-bracket text that merely
+    // looks like a placeholder — `"<one line: what changed since last version>"` in
+    // brainstorm.md is what the agent is told to write for itself, and the ask directive's
+    // `--question "<what you need decided>"` likewise — so "replace anything in angle
+    // brackets" would corrupt the brief it is composing.
     let mut body = strip_editorial_comment(template(kind)).replace("<run>", &run.name);
     if let PhaseKind::ImplementTask(n) = kind {
         body = body.replace("<N>", &n.to_string());
@@ -572,16 +574,167 @@ mod tests {
         );
     }
 
-    /// `answers[<id>]` in brainstorm.md is prose about a JSON shape, not a placeholder.
-    /// Substitution is therefore an allowlist, never "replace anything in angle
-    /// brackets".
+    /// Every `<...>` in `body`, in order, duplicates included.
+    ///
+    /// Crude on purpose: the templates are prose, and the only thing this has to
+    /// separate is "angle-bracket token" from "not one".
+    ///
+    /// Two rules, and both exist because a stray `<` — a less-than in prose, a
+    /// `Vec<T`, a shell redirect — otherwise **swallows real tokens silently**,
+    /// leaving the caller's derived corpus quietly smaller than it looks. A guard
+    /// that checks fewer things without failing is the exact defect this whole
+    /// area keeps producing.
+    ///
+    /// 1. **Per line.** A token never spans a newline, while a stray `<` does
+    ///    meet a Markdown block-quote `>` two lines down.
+    /// 2. **Innermost pairing.** A `<` inside the candidate means the outer one
+    ///    was the stray, so re-anchor on the last one and check the real token
+    ///    instead of a garbled span containing it. Without this,
+    ///    `<a> x < y <b>` yields `<a>` and `< y <b>` — and `<b>` is never checked.
+    ///
+    /// Slicing is at `<` and `>`, both ASCII, so the byte offsets `find`/`rfind`
+    /// return are always char boundaries however much non-ASCII prose surrounds
+    /// them. Every branch advances `rest` by at least one byte, so it terminates.
+    fn angle_tokens(body: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let mut rest = line;
+            while let Some(open) = rest.find('<') {
+                let Some(len) = rest[open..].find('>') else { break };
+                let end = open + len + 1;
+                let token = &rest[open..end];
+                match token[1..].rfind('<') {
+                    Some(inner) => rest = &rest[open + 1 + inner..],
+                    None => {
+                        out.push(token);
+                        rest = &rest[end..];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// [`angle_tokens`] against the two shapes that make it lie rather than fail:
+    /// a stray `<` before a real token, and one that never closes.
+    ///
+    /// Direct, because the guard that uses it cannot see this. A swallowed token
+    /// leaves the derived corpus non-empty and every surviving token still
+    /// present, so `composition_leaves_non_placeholder_angle_brackets_alone`
+    /// stays green while checking less than it claims.
+    #[test]
+    fn angle_tokens_are_not_swallowed_by_a_stray_bracket() {
+        assert_eq!(
+            angle_tokens("<first> ok. Then a stray x < y with no close. <second> lost?"),
+            vec!["<first>", "<second>"],
+            "a stray `<` paired with a later token's `>` and ate the token between them"
+        );
+        assert_eq!(
+            angle_tokens("count < limit, and <kept> after it"),
+            vec!["<kept>"]
+        );
+        // Unclosed on its own line stops THAT line, not the scan.
+        assert_eq!(
+            angle_tokens("a < b\n<still-seen>\n"),
+            vec!["<still-seen>"],
+            "an unmatched `<` must not abandon the rest of the document"
+        );
+        // A quote marker two lines down is not a closer.
+        assert_eq!(angle_tokens("x < y\n> quoted\n"), Vec::<&str>::new());
+    }
+
+    /// Substitution is an allowlist, never "replace anything in angle brackets".
+    ///
+    /// **Derived from the template**, so it pins the rule and not a sentence: the
+    /// non-placeholders are whatever `brainstorm.md` currently carries besides
+    /// `<run>` and `<N>`, and every one of them must survive composition
+    /// verbatim. A reworded placeholder is then just a different token that still
+    /// has to survive — which is the point, since this file has no business
+    /// failing over the prompt's copy-editing.
+    ///
+    /// **Counted exactly, not merely present.** Several tokens repeat (`<value>`
+    /// four times, `<text>`/`<path>`/`<label>` twice each), so a presence check
+    /// would accept a rule that ate three of four `<value>`s and left one
+    /// standing — green, while asserting something weaker than the sentence
+    /// above. Not reachable through today's two literal `str::replace` calls,
+    /// which are all-or-nothing per pattern; asserted anyway, because the whole
+    /// point of deriving the corpus is that the rule outlives the implementation
+    /// that happens to satisfy it.
+    ///
+    /// **And counted against the template's own text**, not the assembled brief.
+    /// [`compose_phase_brief`] splices the run's task and the driver's context
+    /// into the middle of the template, and both are free text. A count over the
+    /// whole brief is therefore paddable: a reviewer demonstrated a real dropped
+    /// `<value>` going undetected because the run's task happened to quote
+    /// `--option <value>=<label>` — not a contrived input in a repo whose tasks
+    /// are often *about* the ask directive.
+    ///
+    /// So the spliced span is **excised** before counting. Asserting the fixture
+    /// disjoint field by field was the first fix and the wrong shape: it closed
+    /// `task` and left `context` open, which a second reviewer caught
+    /// immediately. Excision closes the class, and stays closed when a later
+    /// section is added.
+    ///
+    /// Both halves, because half of an allowlist is not one. `<run>` must be
+    /// **gone** from the composed brief — the ask directive tells the agent to run
+    /// `drovr ask <run> …` verbatim, and an unsubstituted one there is a command
+    /// that errors — while `<what you need decided>` beside it must remain.
+    ///
+    /// (This previously pinned `answers[<id>]`, prose about the retired
+    /// `questions.json` answer map. That text is gone with the channel; the guard
+    /// is not.)
     #[test]
     fn composition_leaves_non_placeholder_angle_brackets_alone() {
         let _env = TestEnv::new();
-        let brief = compose_phase_brief(&make_run(), "brainstorm", None).unwrap();
+        let run = make_run();
+        let brief = compose_phase_brief(&run, "brainstorm", None).unwrap();
+
+        // The editorial comment is stripped before substitution, so tokens inside
+        // it are absent from the brief for an unrelated reason and would report a
+        // failure this test is not about.
+        let mut prose: std::collections::BTreeMap<&str, usize> = Default::default();
+        for token in angle_tokens(strip_editorial_comment(BRAINSTORM)) {
+            if token != "<run>" && token != "<N>" {
+                *prose.entry(token).or_default() += 1;
+            }
+        }
         assert!(
-            brief.contains("answers[<id>]"),
-            "prose that merely looks like a placeholder must survive: {brief}"
+            !prose.is_empty(),
+            "brainstorm.md carries no angle-bracket prose outside the substituted \
+             placeholders, so the survival assertion below would pass having checked \
+             nothing"
+        );
+
+        // Everything `compose_phase_brief` spliced in, cut back out: from the
+        // run's-task heading to the closing `## Done when` it inserts before.
+        // What is left is the template's own text, and only that is this test's
+        // business.
+        let start = brief
+            .find("\n## The run's task")
+            .expect("a composed brief carries the run's task");
+        let end = brief[start..]
+            .find("\n## Done when")
+            .map_or(brief.len(), |i| start + i);
+        assert!(
+            brief[start..end].contains(&run.task),
+            "the excised span is not the driver's sections — the headings this test \
+             splits on have moved: {brief}"
+        );
+        let template_text = format!("{}{}", &brief[..start], &brief[end..]);
+
+        for (token, wanted) in &prose {
+            let seen = template_text.matches(token).count();
+            assert_eq!(
+                seen, *wanted,
+                "`{token}` is prose, not a placeholder: the template carries it {wanted} \
+                 time(s) and the composed brief {seen}. Substitution must stay an \
+                 allowlist, and must leave every occurrence alone: {brief}"
+            );
+        }
+        assert!(
+            !brief.contains("<run>"),
+            "an unsubstituted `<run>` reached the agent, inside commands it is told \
+             to run verbatim: {brief}"
         );
     }
 

@@ -21,6 +21,19 @@ You are the **driver** (single writer of the orchestration). The phase agents ar
 single writers of their own artifacts. Read-only fan-out goes to explorers, never to
 parallel writing agents.
 
+## Bind checklists to tracked task state
+
+Driving a run is a long sequence of numbered steps — this skill's flow, the gate loop, the
+implement loop, and every phase-prompt you inject.
+
+> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+> before you start step 1. Mark each in-progress when you start it and complete when its
+> evidence is in hand. If the harness exposes no task tool, write the checklist to
+> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+> repo root otherwise, and tick items there. An untracked checklist decays with the context
+> window; that decay is the exact failure drovr exists to fight.
+
 ## The flow
 
 ```
@@ -48,19 +61,28 @@ The review server is **always on** — you do not start it per run. `drovr revie
 single writer of `spec.md`; you convey the reviewer's decisions. The run's page lives at
 `http://127.0.0.1:8791/#/runs/<run>` (the root `/` is the session list of all runs).
 
-1. **Nothing to start.** The agent's first `drovr review summary` brings the server up if it
-   isn't already. Use a Tailscale host instead of localhost only on a trusted tailnet — there
-   is no auth (`drovr serve --host <tailscale-host>` if you want to pre-bind it). **Do NOT
-   hand the human the run URL yet** — the page is EMPTY until the first summary lands, and an
-   empty page reads as "the tool is broken."
+1. **Nothing to start.** The agent's first `drovr ask` or `drovr review summary` brings the
+   server up if it isn't already. Use a Tailscale host instead of localhost only on a trusted
+   tailnet — there is no auth (`drovr serve --host <tailscale-host>` if you want to pre-bind it).
 
-1b. **Wait for the first summary before announcing the URL or starting `review wait`.** The
-   brainstorm agent writes `spec.md` then runs `drovr review summary`, flipping state
-   `idle → ready`. Only once `spec.md` exists **and** state reports `ready` do you give the
-   human the URL and start `drovr review wait`. Until then there is nothing to review and a
-   `review wait` against a specless run just churns. If the agent stalls without producing a
-   spec, inspect its pane (`drovr attach <run>`) — do not point the human at an empty page.
-   (Background a poll on the run's state for the `ready` transition; don't busy-wait inline.)
+1b. **Two different things put the human on that page, and only one of them waits for the
+   spec.** Do not conflate them:
+
+   - **A pending ask.** The brainstorm agent interviews the human *before* it writes the spec,
+     so the page carries a question long before `spec.md` exists. `drovr ask` prints the URL, but
+     it prints it into a pane nobody is required to be watching, and **nothing notifies anyone** —
+     so **you** hand the link to the human as soon as you see the agent has asked. **Do not gate
+     that on state.** Announce it as *a question waiting*, not as a review, and then stay out of
+     the interview itself (step 5): you pass the link, never the Q&A. A page with a pending ask is
+     not empty and not broken.
+   - **The review gate.** Here the old caution still holds: with no spec and no ask, the page has
+     nothing on it, and an empty page reads as "the tool is broken." The brainstorm agent writes
+     `spec.md` then runs `drovr review summary`, flipping state `idle → ready`. Only once
+     `spec.md` exists **and** state reports `ready` do you announce it *as a review* and start
+     `drovr review wait` — before that there is nothing to review and the wait just churns. If
+     the agent stalls without producing a spec **and** without asking anything, inspect its pane
+     (`drovr attach <run>`). (Background a poll on the run's state for the `ready` transition;
+     don't busy-wait inline.)
 
 2. **Per-run state machine** (`/api/runs/<run>/state` → `{state, turn}`; files in the run dir):
 
@@ -106,8 +128,16 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
-   `{turn, decision, feedback, answers, annotations}`. An empty `feedback` does not mean an empty
-   turn — the reviewer may have said everything in `annotations` (per-line comments on the spec).
+   `{turn, decision, feedback, annotations}`, plus a vestigial `answers` the review page no
+   longer populates — questions are asked with `drovr ask` and answered into `interview.jsonl`,
+   never here. An empty `feedback` does not mean an empty turn — the reviewer may have said
+   everything in `annotations` (per-line comments on the spec).
+
+   **You stay out of the interview.** A pending `drovr ask` is answered by the human in the
+   web UI and read back by the phase agent that posted it. Never forward one into your own
+   context and never answer one yourself: the Q&A is exactly what this channel exists to keep
+   out of the driver, and an ask you answer is a design decision the human never saw.
+
    Forward it to the agent:
    ```
    drovr phase send <run> brainstorm "Reviewer requested changes (see feedback.json). Revise spec.md, then run: drovr review summary <run> \"<what changed>\""
@@ -308,7 +338,7 @@ A bad handoff poisons every phase downstream; a stopped run is recoverable, a ca
 | Mistake | Fix |
 |---|---|
 | Manually babysitting a per-run server | The server is always on and auto-starts on demand; just run `drovr review summary`/`wait`. |
-| Announcing the URL / starting `review wait` before the first summary | Wait for `spec.md` + state = `ready`; an empty page reads as broken and a specless `review wait` churns. |
+| Announcing the URL **as a review** / starting `review wait` before the first summary | Wait for `spec.md` + state = `ready` **before calling it a review**; an empty page reads as broken and a specless `review wait` churns. A **pending ask** is the separate case — hand that link over immediately, ungated on state (step 1b). |
 | Agent edits `spec.md` but reviewer sees nothing | Agent must run `drovr review summary` after each edit. |
 | Busy-polling state for the decision | Background `drovr review wait <run>`; it exits when the reviewer acts. |
 | Gating plan/implement/review | Only `spec.md` gates. The rest run unattended. |

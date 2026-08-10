@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# UserPromptSubmit hook for the drovr plugin — the per-turn gate.
+#
+# Injects a small card (<=600 bytes) before a user turn — every turn except the
+# one right after the agent SUCCESSFULLY invoked a drovr:* skill (a call that
+# failed to load still gets a card) — re-asserting the
+# routing rule the SessionStart reflex established: even a 1% chance a drovr:*
+# skill applies means invoking it. A SessionStart injection is one prompt at the
+# top of a session and scrolls out from under the agent as the context fills;
+# the gate is what keeps the discipline reachable at turn 200.
+#
+# This hook is deliberately thin: it delegates every decision to
+# `drovr reflex --gate`, which reads the `[reflex]` config (`enabled`,
+# `per_turn`) and the transcript named on stdin, and prints the hook JSON or
+# nothing at all. Keeping the logic in the CLI keeps it unit-testable.
+#
+# DELIBERATE DIFFERENCES FROM hooks/session-start. Every one is load-bearing;
+# none is an oversight to be tidied away.
+#
+# NO COUNT IS GIVEN HERE ON PURPOSE. Two successive attempts to state one ("two",
+# then "four", then "six") were each wrong, because the boundary between "a
+# difference in this script" and "a difference in the CLI path it reaches" is not
+# crisp, and the CLI half is long: the gate reads stdin and a transcript and owns
+# the whole suppression scan, session mode reads neither; session mode has a
+# mandatory skill-file read that exits 1, the gate has no mandatory read; config
+# SHAPES the session reflex (preamble, sections) but only SWITCHES the gate; the
+# envelope's hookEventName differs. A hard number invites the next editor to
+# defend the number instead of the behaviour. What follows is this script's own
+# logic; the CLI's differences are documented at their sites.
+#
+#   1. NO DROVR_PHASE SUPPRESSION. The SessionStart reflex no-ops inside a
+#      drovr-spawned phase because the phase agent runs on its injected briefing.
+#      The gate does the opposite: a phase is exactly where the discipline has to
+#      hold, and a phase agent's briefing scrolls out of the window like anything
+#      else. Adding an `if [ -n "${DROVR_PHASE:-}" ]` block here would silence
+#      the gate precisely where it matters most — and the CLI does not check
+#      DROVR_PHASE at all, so this script is the only place that asymmetry can be
+#      got wrong.
+#
+#   2. STDIN IS PASSED THROUGH. Claude Code writes the hook payload — including
+#      `transcript_path` — to stdin, and that path is the gate's only evidence
+#      that the previous turn already invoked a drovr:* skill and needs no card.
+#      drovr runs as a child and inherits this process's stdin unchanged.
+#      Nothing in this script may consume stdin (no `read`, no heredoc): a
+#      script that ate the payload would leave the gate emitting on every single
+#      turn, which looks exactly like a healthy hook.
+#
+#   3. A MISSING BINARY DEGRADES SILENTLY, where session-start fails loudly.
+#      See the `command -v` guard below.
+#
+#   4. IT NEVER EXITS 2. See the mapping at the bottom — on this harness exit 2
+#      from a UserPromptSubmit hook discards the user's prompt.
+
+set -euo pipefail
+
+# NO PLUGIN-ROOT RESOLUTION, deliberately. hooks/session-start resolves
+# CLAUDE_PLUGIN_ROOT because it must locate skills/using-drovr/SKILL.md on disk.
+# The gate card is a `const` compiled into the CLI, which reads
+# CLAUDE_PLUGIN_ROOT nowhere at all — so the same block here would be dead code
+# that still fails: `PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"` under
+# `set -e` aborts the hook if that directory is unreadable or the script is
+# reached through a broken symlink, silencing the gate for a reason that has
+# nothing to do with the gate. That is fail-CLOSED inside a fail-open design.
+# If a future card ever reads from disk, resolve the root then.
+# Pinned by `user_prompt_hook_needs_no_plugin_root`.
+
+DROVR="${DROVR_BIN:-drovr}"
+
+# NO drovr INSTALLED -> DEGRADE SILENTLY. The plugin is installable on its own
+# (`.claude-plugin/marketplace.json`) while the CLI is a separate build-and-PATH
+# step, so "plugin without binary" is a normal state, not a broken one. There is
+# no drovr discipline to re-assert when drovr is not installed, and a hook that
+# complained here would complain before EVERY PROMPT OF EVERY SESSION, forever.
+# hooks/session-start still fails loudly in that case — once per session, which
+# is the right number of times to tell someone their CLI is missing.
+#
+# `command -v` is a resolvability check, NOT an executability check: for a bare
+# name found on PATH it returns 0 even when the file is mode 644. That case
+# falls through to bash's own 126, which the mapping below turns into 1 — safe,
+# just not silent.
+#
+# NOTE THE OTHER HALF OF THIS TRADE, which the argument above does not cover: a
+# `drovr` that IS installed but predates `--gate` — the more likely of the two
+# states — exits non-zero with clap's usage error on stderr, before every
+# prompt, forever. That noise is deliberate. It is recoverable by rebuilding;
+# an eaten prompt is not, and silence would hide a gate that had stopped
+# working. Loud-and-working beats quiet-and-broken; only "not installed at all"
+# is quiet, because there is no discipline to re-assert in that state.
+command -v "$DROVR" >/dev/null 2>&1 || exit 0
+
+# NEVER `exec`, and NEVER let a non-zero status through unmapped.
+#
+# MEASURED on Claude Code 2.1.220: a `UserPromptSubmit` hook that exits **2** is
+# a BLOCKING error — the user's prompt is discarded unprocessed and the harness
+# prints "Original prompt: …" instead of answering it. Three other outcomes were
+# verified to let the turn through untouched: exit **1** (this line's mapping,
+# confirmed end-to-end behind a stub reproducing clap's usage error), exit 127,
+# and being killed at the hook `timeout`. Only those are known-safe, which is why
+# the mapping targets 1 exactly rather than "some non-zero".
+#
+# `exec` would hand the child's status straight to the harness, and clap exits
+# **2** on a usage error. The binary is installed by hand, independently of the
+# plugin's hooks/, so a `drovr` predating `--gate` is the expected skew — and it
+# would erase every prompt the user typed, in every session, with only stderr as
+# a clue. Mapping every failure reached here to 1 keeps it loud and visible while
+# making it structurally impossible for this hook to eat a prompt. (The one
+# non-zero path that does NOT reach here is the `command -v` guard above, which
+# exits 0 on purpose.)
+#
+# stdin still reaches drovr: a child inherits the shell's stdin, so dropping
+# `exec` costs a fork, not the payload. `set -e` does not fire on the left of
+# `||`, which is why the mapping is written this way rather than as an `if`.
+"$DROVR" reflex --gate || exit 1

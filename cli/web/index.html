@@ -469,44 +469,73 @@
     line-height: 1;
   }
 
-  /* ---- Open questions (multiple choice) ---- */
-  .questions-panel {
+  .rec-badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.7rem;
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-weight: 600;
+    letter-spacing: .03em;
+  }
+
+  /* ---- The interview (the agent's live ask channel) ---- */
+  /* The accent edge is what separates this from the read-only panels around it: it
+     carries a question the run ITSELF posted and cannot settle without. Two other
+     things here can want a human — the review gate below, and a blocked agent (the
+     Agents panel's `needs-human` badge, answered in the live-session panel). Unlike
+     the gate, this one is live at any run state; unlike a blocked agent, the run
+     asked for it explicitly. */
+  .interview-panel {
     background: var(--surface);
     border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
     border-radius: var(--radius);
     padding: 16px 20px;
     margin-bottom: 16px;
   }
-  .questions-panel .panel-title { margin-bottom: 12px; }
-  .question-item {
-    margin-bottom: 14px;
+  .interview-panel .panel-title { margin-bottom: 12px; }
+  .interview-count {
+    margin-left: 8px;
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 0.78rem;
   }
-  .question-item:last-child { margin-bottom: 0; }
-  .question-prompt {
+  .interview-question {
     font-size: 0.92rem;
     font-weight: 600;
     margin-bottom: 6px;
     color: var(--text);
   }
-  .question-options {
+  .interview-context {
+    font-size: 0.86rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+  }
+  .interview-recommend {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .interview-rows {
     display: flex;
     flex-direction: column;
     gap: 5px;
   }
-  .question-options label {
+  .interview-row {
     display: flex;
     align-items: center;
     gap: 7px;
     font-size: 0.88rem;
+  }
+  .interview-row label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
     cursor: pointer;
   }
-  .question-other {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 0.88rem;
-  }
-  .question-other input[type="text"] {
+  .interview-row-other input[type="text"] {
     flex: 1;
     min-width: 0;
     padding: 4px 8px;
@@ -517,15 +546,7 @@
     font: inherit;
     font-size: 0.86rem;
   }
-  .rec-badge {
-    background: var(--accent);
-    color: #fff;
-    font-size: 0.7rem;
-    border-radius: 3px;
-    padding: 1px 5px;
-    font-weight: 600;
-    letter-spacing: .03em;
-  }
+  .interview-row-submit { margin-top: 6px; }
 
   /* ---- Form / controls ---- */
   .form-section { margin-top: 24px; }
@@ -832,12 +853,14 @@
   /* ---- Keyboard navigation ---- */
   /* The cursor is a rendered class, not DOM focus: the run list re-renders every
      two seconds, which would blow away real focus. Left bar + tint so it stays
-     legible against .run-row:hover and the question panel's own background. */
+     legible against .run-row:hover and the interview panel's own background. */
   .nav-cursor {
     background: var(--hover, rgba(127,127,127,0.10));
     box-shadow: inset 3px 0 0 var(--accent);
   }
-  .question-item.nav-cursor { border-radius: 4px; }
+  /* The rows sit flush against each other inside .interview-rows, so the tint
+     needs its own corners to read as one highlighted row rather than a band. */
+  .interview-row.nav-cursor { border-radius: 4px; padding-left: 4px; }
   /* Hidden via the inline style attribute, not here: showEl() clears
      `style.display`, so a `display:none` in this rule would win and the box
      would never open. */
@@ -944,8 +967,8 @@
          tabindex="-1" onclick="event.stopPropagation()">
       <h2 id="key-help-title">Move</h2>
       <table>
-        <tr><td>j &nbsp;&darr; &nbsp;C-n<sup class="ctrl-n-note">&dagger;</sup></td><td>next row / question</td></tr>
-        <tr><td>k &nbsp;&uarr; &nbsp;C-p</td><td>previous row / question</td></tr>
+        <tr><td>j &nbsp;&darr; &nbsp;C-n<sup class="ctrl-n-note">&dagger;</sup></td><td>next row</td></tr>
+        <tr><td>k &nbsp;&uarr; &nbsp;C-p</td><td>previous row</td></tr>
         <tr><td>g &nbsp;M-&lt;</td><td>first</td></tr>
         <tr><td>G &nbsp;M-&gt;</td><td>last</td></tr>
         <tr><td>C-v &nbsp;M-v</td><td>page down / up</td></tr>
@@ -959,9 +982,9 @@
       </p>
       <h2>Act</h2>
       <table>
-        <tr><td>Enter &nbsp;o &nbsp;l &nbsp;&rarr;</td><td>open the session under the cursor</td></tr>
-        <tr><td>1&ndash;9</td><td>pick that option on the question under the cursor</td></tr>
-        <tr><td>i</td><td>type a custom answer on that question</td></tr>
+        <tr><td>Enter &nbsp;o &nbsp;l &nbsp;&rarr;</td><td>open the session, or activate the answer row under the cursor</td></tr>
+        <tr><td>1&ndash;9</td><td>pick that option of the agent's question</td></tr>
+        <tr><td>i</td><td>type a custom answer</td></tr>
         <tr><td>a</td><td>archive / restore the session under the cursor</td></tr>
         <tr><td>/ &nbsp;C-s</td><td>filter sessions</td></tr>
       </table>
@@ -979,11 +1002,17 @@
     <span id="summary-text"></span>
   </div>
 
-  <!-- Open questions (multiple choice) — populated dynamically. Sits at the TOP
-       of the page, above the spec and the session mirror: the agent is blocked on
-       these, so they are the first thing the reviewer should see. Answers are
-       submitted with the decision form at the bottom. -->
-  <div id="questions-area"></div>
+  <!-- The interview: the agent's live ask channel (`drovr ask`), populated
+       dynamically and polled on its own 2s timer. Above everything else on the
+       page because it carries a question the run itself posted: until it is
+       answered the agent cannot settle the decision it asked about, whatever state
+       the gate below is in. (The gate, and a blocked agent surfaced by the Agents
+       panel, can also want a human — but this is the only one the run asked for
+       explicitly, and the only one nothing raises an alarm for.) It renders
+       independently of the review gate: a question can arrive at any point in a
+       run's life, including on a run whose spec is already approved and whose
+       gate will never move again. -->
+  <div id="interview-area"></div>
 
   <!-- Live session mirror: a snapshot of the run's real agent pane (herdr
        read), with an input box that types back into it (herdr prompt). This is
@@ -1188,8 +1217,8 @@ var md = (function() {
   // name source files constantly, so require an explicit scheme.
   instance.linkify.set({ fuzzyLink: false });
 
-  // Citations open in a new tab: unsubmitted answers are read straight off the
-  // live radio buttons (collectAnswers) and an annotation draft isn't in
+  // Citations open in a new tab: a half-typed answer to the agent's question is
+  // held nowhere but the live controls, and an annotation draft isn't in
   // localStorage until Save, so navigating this page away mid-review loses both.
   // In-document fragments are left alone — they scroll, they don't navigate.
   var origLinkOpen = instance.renderer.rules.link_open;
@@ -1231,7 +1260,7 @@ function renderMd(text) {
 }
 
 // Escapes for BOTH text content and quoted attribute values, and tolerates
-// non-strings: agent-authored JSON (questions.json) reaches this with numeric or
+// non-strings: agent-authored JSON (interview.jsonl) reaches this with numeric or
 // missing fields, and a throw here would abort a whole render mid-refresh.
 function escHtml(s) {
   return String(s == null ? '' : s)
@@ -1942,118 +1971,418 @@ function needsWrittenFeedback(feedbackVal) {
   return !feedbackVal && !collectAnnotations().length;
 }
 
-// ---- Open questions (multiple choice) ----
-var currentQuestions = [];
-
-// Value carried by the per-question "Other" radio. Not a real option value: it
-// is swapped for the typed text in collectAnswers, and never submitted as-is.
+// ---- The interview (the agent's live ask channel) ----
+// The agent posts a question with `drovr ask`, which returns IMMEDIATELY, and
+// picks the answer up later through a backgrounded `drovr ask wait` — post and
+// wait are split precisely so nothing blocks while the human is away. So do not
+// assume a live waiter behind what is on screen: a pending ask can sit here with
+// no `ask wait` armed at all (between an exit-2 timeout and the re-arm, or from an
+// agent that posted and moved on). It is still worth answering — the answer is
+// durable, and the wait is re-armable.
+//
+// This panel is the human's side of that channel, and the page's ONLY question
+// channel — it replaced a `questions.json` panel that rendered a whole batch out
+// of the review gate and submitted the answers with the decision form. Two things
+// define it, and both are what that batch panel could not do:
+//
+//  * it is NOT gated on the review state. A question arrives whenever the agent
+//    has one — mid-plan, mid-implement, on a run whose spec was approved turns ago
+//    and whose gate will never move again — so it polls on its own timer instead
+//    of rendering out of refresh()'s state branches. Only `cancelled` mutes it.
+//  * it answers ONE ask at a time, straight to the server (`POST answer`), rather
+//    than collecting a form and submitting it with a decision. `brainstorm.md` lets
+//    genuinely independent questions go out together; the `1 of N` counter is wider
+//    than that, counting every ask still pending on the run whatever phase or agent
+//    posted it and however far apart in time. This panel serialises all of them, so
+//    each answer is durable the moment it is given and none of them ride on a gate
+//    submission that may never come.
+//
+// Value carried by the "Other" radio. A reserved sentinel, never a legal option
+// `value`: submitAnswer swaps it for the text the human typed, so it is never
+// what reaches the log.
 var OTHER_SENTINEL = '__drovr_other__';
 
-function renderQuestions(questions) {
-  currentQuestions = questions || [];
-  var area = document.getElementById('questions-area');
-  if (!currentQuestions.length) { area.innerHTML = ''; return; }
+// The KIND of an answer row, carried as a machine-readable attribute —
+// `data-row-kind` — and deliberately NOT as the `.interview-row-*` CSS classes
+// those rows also have. activateCursorRow reads a row's BEHAVIOUR off this, and
+// the classes exist to style it: keyed on the class, a stylesheet rename by
+// someone who never opens this JS would silently change what Enter does.
+//
+// EVERY row carries one, options included. Inferring "option" from the absence of
+// the attribute would make it a kind by convention — a third state nothing
+// declares, that every future handler has to know about and the next row type
+// added would silently join. `data-value` stays, but as the option's PAYLOAD
+// only; this attribute is the single thing that says what a row is.
+var ROW_KIND_OPTION = 'option';
+var ROW_KIND_OTHER = 'other';
+var ROW_KIND_SUBMIT = 'submit';
+function rowKind(el) { return el.getAttribute('data-row-kind'); }
 
-  var html = '<div class="questions-panel"><div class="panel-title">Open questions</div>';
-  currentQuestions.forEach(function(q, qi) {
-    var group = 'q_' + escHtml(q.id);
-    var opts = q.options || [];
-    html += '<div class="question-item">';
-    html += '<div class="question-prompt">' + escHtml(q.prompt) + '</div>';
-    html += '<div class="question-options">';
-    opts.forEach(function(opt, oi) {
-      var inputId = 'q_' + qi + '_' + oi;
-      var checked = opt.recommended ? ' checked' : '';
-      html += '<label for="' + inputId + '">';
-      html += '<input type="radio" id="' + inputId + '" name="' + group + '" value="' + escHtml(opt.value) + '"' + checked + '>';
-      html += escHtml(opt.label);
-      if (opt.recommended) html += ' <span class="rec-badge">recommended</span>';
-      html += '</label>';
-    });
-    // Free-text escape hatch: the offered options are never exhaustive, so every
-    // question also takes a custom answer. Typing selects the radio, so the text
-    // can't be silently ignored. A question with no options at all is just this
-    // row — a plain free-text ask. The radio is never pre-checked: an untouched
-    // question must read as unanswered, not as an empty custom answer.
-    var otherId = 'q_' + qi + '_other';
-    var textId = 'q_' + qi + '_othertext';
-    html += '<div class="question-other">';
-    html += '<input type="radio" id="' + otherId + '" name="' + group + '" value="' + OTHER_SENTINEL + '">';
-    html += '<label for="' + otherId + '">' + (opts.length ? 'Other' : 'Answer') + '</label>';
-    html += '<input type="text" id="' + textId + '" aria-label="Custom answer" ' +
-            'placeholder="type your own answer…" ' +
-            'oninput="document.getElementById(\'' + otherId + '\').checked = true">';
-    html += '</div>';
-    html += '</div></div>';
+var currentInterview = [];   // the whole folded array from GET interview
+var currentAsk = null;       // the oldest entry still unanswered, or null
+// The ask id the CURRENT DOM was built from. See renderInterview: this panel
+// holds the controls the human is USING and is repainted by a 2s poll, so what
+// gets rebuilt has to be decided, not assumed.
+var renderedAskId = null;
+var answerInFlight = false;  // true between the POST and its response
+var interviewMuted = false;  // true only while the run is `cancelled`
+var interviewTimer = null;
+// What #interview-error is saying, and WHO said it — `null`, or
+// `{kind, text}` with kind one of:
+//
+//   'poll'       the last read failed. Lowest priority: it recovers by itself, so
+//                a recovery clears it and it never overwrites the other two.
+//   'submit'     an answer did not land, or the human's own input was refused.
+//                Cleared when they submit again or the question changes — NOT by
+//                a poll, which is how "your answer was not recorded" used to
+//                vanish within 2s and leave the panel looking perfectly normal.
+//   'cancelled'  terminal, and stands in PLACE of a question rather than beside
+//                one.
+//
+// It is state rather than DOM because the panel repaints every 2s: a message
+// written straight into the container is erased two seconds after the human was
+// told, which is worse than never having said it. renderInterview is the one
+// thing that paints this container, so everything it says goes through here.
+var interviewMsg = null;
+
+// `read` returns seq order, so the first unanswered entry is the oldest one. The
+// server always sends `answer: null` when there is none; `undefined` is tolerated
+// so a hand-built array (a test, a scripted render) folds the same way.
+function pendingAsks(asks) {
+  return (asks || []).filter(function(a) {
+    return a && (a.answer === null || a.answer === undefined);
   });
+}
+
+function renderInterview(asks) {
+  // Mid-POST the rows are disabled and submitAnswer's own re-render is already
+  // on its way. Repainting here re-enables the button underneath an in-flight
+  // request, which is a double-submit window.
+  if (answerInFlight) return;
+
+  currentInterview = asks || [];
+  var area = document.getElementById('interview-area');
+  var pending = pendingAsks(currentInterview);
+  var ask = interviewMuted ? null : (pending[0] || null);
+  currentAsk = ask;
+  if (!ask) {
+    area.innerHTML = '';
+    renderedAskId = null;
+    paintInterviewMsg();          // re-raises a standing message, if there is one
+    applyNavCursor(false);
+    return;
+  }
+
+  var countText = '1 of ' + pending.length;
+
+  // ⚠ The rows are what the human is TYPING INTO and PICKING FROM, and this runs
+  // every 2s. A rebuild on every tick wipes the characters going into
+  // #interview-text (a multi-word answer takes longer than 2s) and — worse,
+  // because it is silent — reverts a hand-picked radio to the `recommend`
+  // preselection: the human picks `memory`, does not notice the flicker, clicks
+  // Answer, and `redis` is appended to the log with no error anywhere.
+  //
+  // So the rows are rebuilt only when the ASK changes; an unchanged ask updates
+  // the count and nothing else. This is the same split pollPane makes one panel
+  // down — the poll owns the read-only #session-view and never touches the
+  // sibling #session-text the human types into.
+  if (ask.id === renderedAskId) {
+    var countEl = area.querySelector('.interview-count');
+    if (countEl) countEl.textContent = countText;
+    paintInterviewMsg();
+    applyNavCursor(false);
+    return;
+  }
+  // A new question. Whatever the human was told about the LAST one is spent —
+  // "type an answer", "that answer was not recorded" — and carrying it over would
+  // read as a complaint about a question they have not answered yet. A cancelled
+  // run has no next question, so that message never reaches here.
+  if (interviewMsg && interviewMsg.kind === 'submit') interviewMsg = null;
+
+  var opts = ask.options || [];
+  // A `recommend` naming an offered option preselects it. One that names nothing
+  // offered (the free-text case) is a suggestion, not a pick: show it, but leave
+  // every radio unchecked and never prefill the text box — an untouched question
+  // must read as unanswered, not as an answer nobody gave.
+  //
+  // `interview::check_options` already refuses an ask whose `recommend` names no
+  // offered option WHEN there are options, so in practice the free-text branch is
+  // reached only by an ask with none. It is decided here anyway rather than
+  // assumed: this is the client of a wire format, and a rule it cannot enforce is
+  // not a rule it should crash on.
+  var recIsOption = false;
+  opts.forEach(function(o) { if (ask.recommend && o.value === ask.recommend) recIsOption = true; });
+
+  var html = '<div class="interview-panel">';
+  html += '<div class="panel-title">Question from the agent' +
+          '<span class="interview-count">' + countText + '</span></div>';
+  html += '<div class="interview-question">' + escHtml(ask.question) + '</div>';
+  if (ask.context) html += '<div class="interview-context">' + escHtml(ask.context) + '</div>';
+  if (ask.recommend && !recIsOption) {
+    html += '<div class="interview-recommend">recommended: ' + escHtml(ask.recommend) + '</div>';
+  }
+  html += '<div class="interview-rows">';
+  opts.forEach(function(o, i) {
+    var inputId = 'iv_opt_' + i;
+    var isRec = recIsOption && o.value === ask.recommend;
+    html += '<div class="interview-row" data-row-kind="' + ROW_KIND_OPTION +
+            '" data-value="' + escHtml(o.value) + '">';
+    html += '<input type="radio" id="' + inputId + '" name="iv_answer" value="' +
+            escHtml(o.value) + '"' + (isRec ? ' checked' : '') + '>';
+    html += '<label for="' + inputId + '">' + escHtml(o.label);
+    if (isRec) html += ' <span class="rec-badge">recommended</span>';
+    html += '</label></div>';
+  });
+  // Free-text escape hatch: the offered options are never exhaustive. Typing
+  // selects the radio, so the text cannot be silently ignored. An ask with no
+  // options at all is just this row.
+  html += '<div class="interview-row interview-row-other" data-row-kind="' + ROW_KIND_OTHER + '">';
+  html += '<input type="radio" id="iv_other" name="iv_answer" value="' + OTHER_SENTINEL + '">';
+  html += '<label for="iv_other">' + (opts.length ? 'Other' : 'Answer') + '</label>';
+  html += '<input type="text" id="interview-text" aria-label="Custom answer" ' +
+          'placeholder="type your own answer…" ' +
+          'oninput="document.getElementById(\'iv_other\').checked = true">';
+  html += '</div>';
+  html += '<div class="interview-row interview-row-submit" data-row-kind="' + ROW_KIND_SUBMIT + '">' +
+          '<button class="primary" id="interview-answer-btn" onclick="submitAnswer()">Answer</button></div>';
+  html += '</div>';
+  html += '<div id="interview-error" class="error-msg" style="display:none"></div>';
   html += '</div>';
   area.innerHTML = html;
+  renderedAskId = ask.id;
+  // Start the cursor over, on the REBUILD path only. applyNavCursor merely clamps
+  // an index that is past the end, so on an ask with as many rows as the last one
+  // the cursor stays exactly where it was — typically the submit row it was just
+  // used on, now sitting over a question the human has not read, one Enter away
+  // from answering it. The count-only path must NOT do this: it runs every 2s and
+  // would drag the cursor back to the top under the human twice a second.
+  navCursor = 0;
+  paintInterviewMsg();
   applyNavCursor(false);
 }
 
-function clearQuestions() {
-  currentQuestions = [];
-  document.getElementById('questions-area').innerHTML = '';
+// `interviewMuted` is deliberately NOT reset here: refresh() sets it and then
+// calls this on the cancelled branch, so clearing it would unmute the run it just
+// muted and the next poll would paint the panel straight back. route() owns the
+// cross-run reset instead.
+//
+// `answerInFlight` IS reset, and that is also deliberate. Holding it across a
+// teardown would freeze the NEXT run's panel behind a POST that no longer
+// concerns it — renderInterview returns early while it is set — for as long as
+// that request takes to settle, which a hung one never does. The two things the
+// flag guards are covered without it: a late response cannot touch the page
+// (submitAnswer pins `routeGen` and returns), and the only re-enabled-button
+// window left is a re-entry to the SAME run mid-POST, where a second answer to
+// the same ask is well-defined — the fold takes the last one.
+function clearInterview() {
+  currentInterview = [];
+  currentAsk = null;
+  renderedAskId = null;
+  answerInFlight = false;
+  interviewMsg = null;
+  document.getElementById('interview-area').innerHTML = '';
+  // These rows ARE the detail view's cursor rows, so tearing them down without
+  // this leaves the cursor pointing at nothing: it drives renderKeyhint() and
+  // announceCursor(null), so skipping it leaves stale keyboard hints and a stale
+  // screen-reader announcement behind after a cancel or a run switch.
   applyNavCursor(false);
 }
 
-// The checked radio is found by walking the question's own rendered container,
-// not by `input[name="q_<id>"]` — an agent-authored id can carry characters that
-// make that selector throw (or, if two questions share an id, match the wrong
-// question's radio while reading this one's text box).
-function questionItemEl(qi) {
-  return document.querySelectorAll('#questions-area .question-item')[qi] || null;
+// Puts `interviewMsg` on screen — the ONLY thing that writes #interview-error, so
+// what the panel says is decided by the state above and not by whichever handler
+// last got there. Idempotent: every repaint re-asserts it.
+function paintInterviewMsg() {
+  var el = document.getElementById('interview-error');
+  if (!el) {
+    if (!interviewMsg) return;
+    // A failure with nowhere to show it is invisible, which is the defect this
+    // whole panel exists to retire — so when no panel is on screen to carry the
+    // message, give it a container of its own. It holds no question, so
+    // renderedAskId stays null and the next good poll rebuilds over it.
+    document.getElementById('interview-area').innerHTML =
+      '<div class="interview-panel"><div id="interview-error" class="error-msg"></div></div>';
+    el = document.getElementById('interview-error');
+  }
+  el.textContent = interviewMsg ? interviewMsg.text : '';
+  el.style.display = interviewMsg ? '' : 'none';
 }
 
-function checkedRadio(qi) {
-  var item = questionItemEl(qi);
-  return item ? item.querySelector('input[type="radio"]:checked') : null;
+function setInterviewMsg(kind, text) {
+  interviewMsg = { kind: kind, text: text };
+  paintInterviewMsg();
 }
 
-function collectAnswers() {
-  var answers = {};
-  currentQuestions.forEach(function(q, qi) {
-    var checked = checkedRadio(qi);
-    if (!checked) return;
-    if (checked.value === OTHER_SENTINEL) {
-      var el = document.getElementById('q_' + qi + '_othertext');
-      var custom = el ? el.value.trim() : '';
-      if (custom) answers[q.id] = custom;
+// A read failure is the least urgent thing this panel can say — it recovers by
+// itself — so it never speaks over an answer that did not land or a run that was
+// cancelled. Neither of those recovers on its own.
+function sayPollFailed(text) {
+  if (!interviewMsg || interviewMsg.kind === 'poll') setInterviewMsg('poll', text);
+}
+
+async function pollInterview(gen) {
+  if (gen !== routeGen) return;
+  try {
+    var r = await fetch(api('interview'));
+    if (gen !== routeGen) return;
+    // The `r.ok` check is NOT the sibling pollers' pattern, and it is load-bearing
+    // here: `fetch` RESOLVES on 500, and this endpoint answers an unreadable log
+    // with an OBJECT rather than an array. Without the check that object reaches
+    // pendingAsks, which throws on it — the re-arm below is outside the try, so
+    // the poll survives, but every tick fails the same way and the panel just sits
+    // there showing the last question it managed to read, or nothing, saying
+    // nothing. An unreadable interview log presented as an ordinary quiet page is
+    // exactly what T4's 500 exists to prevent, one layer up. Neither pollAlarms nor
+    // pollPane needs this; their endpoints cannot fail structurally.
+    if (!r.ok) {
+      var msg = 'The interview log could not be read.';
+      try {
+        var errBody = await r.json();
+        if (errBody && errBody.error) msg = errBody.error;
+      } catch (e) { /* not JSON; keep the generic message */ }
+      if (gen === routeGen) sayPollFailed(msg);
     } else {
-      answers[q.id] = checked.value;
+      var data = await r.json();
+      if (gen === routeGen) {
+        renderInterview(data);
+        // Cleared AFTER the render, not before it: a recovery that then throws
+        // would otherwise have taken the only message on screen with it, leaving
+        // a stale question and nothing said. A recovery also clears ONLY what a
+        // read failure put there — clearing more is how "your answer was not
+        // recorded" used to vanish inside 2s, leaving an unanswered question on a
+        // panel that looked perfectly normal.
+        if (interviewMsg && interviewMsg.kind === 'poll') {
+          interviewMsg = null;
+          paintInterviewMsg();
+        }
+      }
     }
-  });
-  return answers;
+  } catch (e) {
+    // Not silent, unlike its sibling pollers: they mirror state the human only
+    // reads, while this panel is where an answer an agent is BLOCKED on gets
+    // typed. A page quietly showing a question it can no longer refresh, on a
+    // channel that can no longer deliver, is the failure this panel exists to
+    // retire. Self-clearing, so a single blip costs one tick's message.
+    if (gen === routeGen) sayPollFailed('The interview could not be reached. Retrying…');
+  }
+  if (gen === routeGen) interviewTimer = setTimeout(function(){ pollInterview(gen); }, 2000);
 }
 
-// `answers` is keyed by question id, so two questions sharing an id cannot both
-// be represented — the second would overwrite the first and the reviewer would
-// never know one of their answers was dropped. The radios themselves are read
-// per-container (see `questionItemEl`), so this is purely about the submitted
-// shape. An agent authoring questions.json is the only thing that can cause it,
-// and silently losing an answer is worse than refusing to submit. Returns the
-// offending id, or null.
-function duplicateQuestionId() {
-  var seen = {};
-  for (var i = 0; i < currentQuestions.length; i++) {
-    var id = String(currentQuestions[i].id);
-    if (Object.prototype.hasOwnProperty.call(seen, id)) return id;
-    seen[id] = true;
-  }
-  return null;
-}
+async function submitAnswer() {
+  var ask = currentAsk;
+  if (!ask || answerInFlight) return;
+  // Pin the view this answer belongs to, BEFORE any await. `api()` reads the
+  // mutable currentRun, and every branch below runs after a network round trip —
+  // by which time the human may be on another run. The URLs are snapshotted so a
+  // POST can never address the run that slid in behind it, and `gen` gates every
+  // write to the page: without it, a 409 for run A's cancellation mutes run B's
+  // panel, and nothing on an idle/ready run ever unmutes it.
+  var gen = routeGen;
+  var answerUrl = api('answer');
+  var interviewUrl = api('interview');
+  var area = document.getElementById('interview-area');
+  // Whatever the panel was saying is spent the moment the human submits — and
+  // dropping it here is also what stops a recovering poll from later mistaking
+  // this call's own error for the read failure it cleared up.
+  interviewMsg = null;
+  paintInterviewMsg();
 
-// "Other" checked with an empty box is an explicit half-answer: the reviewer
-// meant to say something. Submitting would drop it silently, so block instead.
-// Returns the offending text input, or null.
-function blankCustomAnswer() {
-  for (var qi = 0; qi < currentQuestions.length; qi++) {
-    var checked = checkedRadio(qi);
-    if (!checked || checked.value !== OTHER_SENTINEL) continue;
-    var el = document.getElementById('q_' + qi + '_othertext');
-    if (el && !el.value.trim()) return el;
+  var opts = ask.options || [];
+  var checked = area.querySelector('input[type="radio"]:checked');
+  // An ask with no options has nothing to pick, so "pick one" is not advice — it
+  // names a control that is not on screen. Both refusals below say what this ask
+  // actually offers.
+  if (!checked && opts.length) { setInterviewMsg('submit', 'Pick an answer, or type one.'); return; }
+  var text;
+  if (!checked || checked.value === OTHER_SENTINEL) {
+    var box = document.getElementById('interview-text');
+    text = box ? box.value.trim() : '';
+    // The server accepts an empty answer — "I have nothing to add" is a decision
+    // the human is entitled to make. What this refuses is the ACCIDENTAL empty
+    // one: the free-text row explicitly chosen with nothing typed. On an ask with
+    // no options that makes the deliberate empty answer unreachable from the
+    // browser; the plan specifies this refusal unconditionally, and giving that
+    // answer its own affordance is UI nobody has agreed to yet.
+    if (!text) {
+      setInterviewMsg('submit', opts.length
+        ? 'Type an answer, or pick one of the options.'
+        : 'Type an answer.');
+      if (box) box.focus();
+      return;
+    }
+  } else {
+    text = checked.value;
   }
-  return null;
+
+  var btn = document.getElementById('interview-answer-btn');
+  answerInFlight = true;
+  if (btn) btn.disabled = true;
+  var status = 0, body = null;
+  try {
+    var r = await fetch(answerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: ask.id, answer: text })
+    });
+    status = r.status;
+    try { body = await r.json(); } catch (e) { body = null; }
+  } catch (e) {
+    status = 0;                      // network failure; nothing was recorded
+  } finally {
+    answerInFlight = false;
+  }
+  // Navigated away mid-flight. The answer landed (or did not) on the run it was
+  // addressed to; this page is now showing a different one and owes it nothing.
+  if (gen !== routeGen) return;
+
+  if (status === 200) {
+    // ONE direct fetch, deliberately not pollInterview(): that re-arms its own
+    // timer, so calling it here stacks a second chain on top of the tick already
+    // scheduled — and that scheduled tick is what keeps the panel live afterwards.
+    var asks = null;
+    try {
+      var r2 = await fetch(interviewUrl);
+      if (r2.ok) asks = await r2.json();
+    } catch (e) { /* handled below, same as a non-ok answer */ }
+    if (gen !== routeGen) return;
+    if (asks) {
+      // Guarded like the poll's own render: this one is on the SUCCESS path, and
+      // an unhandled throw here rejects submitAnswer's promise with the button
+      // still disabled and nothing said — a silently dead control reporting a
+      // successful answer, which is the exact defect this panel retires. Falls
+      // through to the same message instead.
+      try { renderInterview(asks); return; } catch (e) { /* say so below */ }
+    }
+    // The answer landed; only the read-back did not. Say so — the question is
+    // still on screen and looks unanswered, which reads as "nothing happened" and
+    // invites a resubmit. Re-enable too, rather than leave a dead button over it.
+    // A 'poll' message, because the next successful tick is exactly what resolves
+    // this, and clears it on the way.
+    if (btn) btn.disabled = false;
+    sayPollFailed('Your answer was recorded. The question could not be reloaded; retrying…');
+    return;
+  }
+
+  if (status === 409) {
+    // The run was cancelled, so `drovr ask wait` has already exited 5 and nobody
+    // is listening. Stop offering the answer — and say why, in place of the
+    // question rather than beside a control that no longer does anything.
+    interviewMuted = true;
+    clearInterview();
+    // AFTER clearInterview, which drops it: this notice has to outlive the
+    // question it replaces, and the 2s poll repaints over anything left loose in
+    // the DOM. renderInterview paints it, so it survives every tick.
+    setInterviewMsg('cancelled',
+      'This run was cancelled — the agent is no longer waiting for an answer.');
+    return;
+  }
+
+  // Never a silently disabled button: a failure the human cannot see is the exact
+  // defect this panel retires. The server's `error` is a fixed string that never
+  // echoes the request, so showing it verbatim is safe.
+  if (btn) btn.disabled = false;
+  setInterviewMsg('submit', (body && body.error)
+    ? body.error
+    : 'The answer could not be sent, and was not recorded. It is still unanswered.');
 }
 
 // ---- State ----
@@ -2079,12 +2408,11 @@ async function refresh() {
   clearTimeout(pollTimer);
   var gen = routeGen;
 
-  var [stateRes, docText, priorText, summaryText, questionsData] = await Promise.all([
+  var [stateRes, docText, priorText, summaryText] = await Promise.all([
     fetch(api('state')).then(function(r){ return r.json(); }),
     fetchText(api('doc')),
     fetchText(api('prior')),
-    fetchText(api('summary')),
-    fetch(api('questions')).then(function(r){ return r.json(); }).catch(function(){ return []; })
+    fetchText(api('summary'))
   ]);
 
   // Navigated away while these fetches were in flight → drop this stale render.
@@ -2153,20 +2481,33 @@ async function refresh() {
   // loop state; only renders when the page was opened with ?task=<task>.
   refreshReview().catch(function(){});
 
-  // questions
-  renderQuestions(questionsData);
+  // The interview is NOT rendered from here — pollInterview owns it, so a question
+  // posted while the human sits on the page appears without any gate transition.
+  // All this branch decides is whether anyone is still listening:
+  // `cancelled` means `drovr ask wait` has exited 5 and the agent is gone, so the
+  // panel is muted. Every other state — idle, ready, waiting, approved — keeps it,
+  // and `waiting`/`approved` are the load-bearing ones: an agent asking mid-phase
+  // is exactly when the gate is not at `ready`. This runs BEFORE the state
+  // branches below, each of which returns.
+  //
+  // It only ever SETS the mute, never clears it. A run does not un-cancel, and
+  // `state` here was read when this refresh's fetches went out — while a 409 from
+  // POST answer is a strictly fresher reading of the same marker. Assigning the
+  // stale one back would unmute a run the human has just been told is cancelled,
+  // and the panel would resume offering answers that can only 409 again. route()
+  // clears it, on the one transition where a mute becomes wrong: a different run.
+  if (state === 'cancelled') {
+    interviewMuted = true;
+    clearInterview();
+  }
 
   // Any re-render disarms Cancel: a half-armed button must never carry over a
   // state change or a navigation to another run.
   disarmCancel();
 
   // Show correct overlay / form
-  // The questions panel lives outside #form-section (it renders at the top of the
-  // page), so every branch that hides the form must clear it too — otherwise
-  // answerable radios linger with no way to submit them.
   if (state === 'approved') {
     hideEl('form-section');
-    clearQuestions();
     hideEl('waiting-overlay');
     hideEl('cancelled-overlay');
     showEl('approved-overlay');
@@ -2175,7 +2516,6 @@ async function refresh() {
 
   if (state === 'cancelled') {
     hideEl('form-section');
-    clearQuestions();
     hideEl('waiting-overlay');
     hideEl('approved-overlay');
     showEl('cancelled-overlay');
@@ -2184,7 +2524,6 @@ async function refresh() {
 
   if (state === 'waiting') {
     hideEl('form-section');
-    clearQuestions();
     hideEl('approved-overlay');
     hideEl('cancelled-overlay');
     showEl('waiting-overlay');
@@ -2248,24 +2587,10 @@ async function submitDecision(forced) {
         // guess. Say what is observable — there is no text to match against.
         : 'There is no spec text to match your inline comments against. ' +
           'Reload the page, or type feedback here.');
-    document.getElementById('feedback').focus();  // as blankCustomAnswer does below
+    // Point at the box the message names, so the refusal is one keystroke from
+    // being fixed rather than a sentence to go hunting after.
+    document.getElementById('feedback').focus();
     return;
-  }
-
-  // Cancel is terminal and discards the spec — don't hold it up over questions.
-  if (decisionVal !== 'cancel') {
-    var dupe = duplicateQuestionId();
-    if (dupe) {
-      showError('questions.json has two questions with id "' + dupe + '" — one answer ' +
-                'would be silently dropped. Ask the agent to give each question a unique id.');
-      return;
-    }
-    var blank = blankCustomAnswer();
-    if (blank) {
-      showError('An open question has "Other" selected with no answer typed.');
-      blank.focus();
-      return;
-    }
   }
 
   btn.disabled = true;
@@ -2274,7 +2599,15 @@ async function submitDecision(forced) {
   var payload = {
     decision: decisionVal,
     feedback: feedbackVal,
-    answers: collectAnswers(),
+    // ALWAYS EMPTY from here on, and that is not a placeholder for something this
+    // page forgot to fill. The panel that produced it is gone; the reviewer's
+    // answers to the agent's questions are recorded one at a time by POST answer
+    // into `interview.jsonl`, so `feedback.json#answers` is no longer where any
+    // reader should look for them. The KEY stays on the wire because dropping it
+    // is a server-side contract change — `handle_post_submit` still reads and
+    // persists it and `submit_approve_persists_question_answers` still guards
+    // that — and the plan puts that change out of this task's scope.
+    answers: {},
     annotations: collectAnnotations()
   };
 
@@ -2652,7 +2985,7 @@ async function toggleArchive(name, archived, live) {
   // Captured BEFORE the awaits below, like every other async flow here. The POST
   // blocks on a herdr round-trip, and the reviewer can open a run meanwhile —
   // re-rendering the list then would run applyNavCursor against the detail
-  // view's question rows (they share `navCursor`) and yank the cursor on a page
+  // view's answer rows (they share `navCursor`) and yank the cursor on a page
   // that has nothing to do with this action.
   var gen = routeGen;
   if (!archived && live !== '0') {
@@ -3213,6 +3546,7 @@ async function route() {
   clearTimeout(paneTimer);
   clearTimeout(agentsTimer);
   clearTimeout(alarmsTimer);
+  clearTimeout(interviewTimer);
   routeGen++;                 // invalidate any in-flight poll/refresh
   var h = parseHash();
   // Only a real navigation resets the cursor. route() also re-runs every 2s to
@@ -3235,7 +3569,7 @@ async function route() {
   if (!currentRun) {
     // Session list landing view.
     DETAIL_PANELS.forEach(hideEl);
-    clearQuestions();           // dynamic container, not in DETAIL_PANELS
+    clearInterview();           // a dynamic container, not in DETAIL_PANELS
     hideEl('back-link');
     document.getElementById('turn-badge').textContent = '';
     showEl('run-list');
@@ -3246,10 +3580,11 @@ async function route() {
 
   // Run detail view.
   hideEl('run-list');
-  // Drop the previous run's questions immediately: refresh() below re-renders
-  // them, but if it throws mid-flight the stale panel would otherwise stay live
-  // and its answers could be submitted against THIS run.
-  clearQuestions();
+  // Drop the previous run's question immediately: pollInterview re-renders it
+  // below, but until that lands the stale panel is live and its Answer button
+  // POSTs straight to api('answer'), which already addresses THIS run — the
+  // previous run's answer, filed against this one.
+  clearInterview();
   showEl('back-link');
   // Everything below is a CROSS-RUN reset, so it is gated on the run actually
   // changing. `#/runs/<run>?task=<t>` is a supported URL (see reviewTask() and the
@@ -3257,7 +3592,7 @@ async function route() {
   // on that run — re-enters route() with the same run; wiping the form there would
   // destroy the reviewer's half-typed feedback, which is persisted nowhere.
   if (h.run !== prevRun) {
-    // Same reasoning as clearQuestions() above, and deliberately NOT showEl: the
+    // Same reasoning as clearInterview() above, and deliberately NOT showEl: the
     // doc panel is shown by refresh() only once THIS run's spec is in hand, so a
     // run with no spec never flashes the previously-viewed run's doc — and if
     // refresh() throws mid-flight the stale spec is already gone rather than left
@@ -3265,6 +3600,12 @@ async function route() {
     hideEl('doc-panel');
     document.getElementById('doc-content').innerHTML = '';
     currentDocText = '';   // keep it in step with the DOM it describes
+    // The mute belongs to the run being left, and nothing else resets it:
+    // clearInterview deliberately does not (refresh() would unmute the run it had
+    // just muted). Carrying it across would hide a live question on the run being
+    // entered until its first refresh() lands. Same-run re-entry — `?task=<t>`,
+    // back/forward — keeps it, which is what makes it stable there.
+    interviewMuted = false;
     // The review panel is fetched by refreshReview() behind two awaits, so on a
     // direct run-to-run jump it would otherwise keep painting the OLD task's
     // findings and diff under the new run's name until those resolve.
@@ -3305,13 +3646,19 @@ async function route() {
   pollAgents(routeGen);
   pollPane(routeGen);
   pollAlarms(routeGen);
+  // Polled like its three siblings and for the same reason: a question posted
+  // while the human sits on the page has to appear on its own. It cannot wait on
+  // a gate transition — on a run whose spec is already approved, the gate may
+  // never move again.
+  pollInterview(routeGen);
   await refresh();
 }
 
 // ---- Keyboard navigation (vim + emacs) ----
 // The page is driven like a TUI: a cursor moves over the session list on the
-// landing view and over the open questions on a run's detail view. The cursor is
-// an index into the rendered rows plus a `.nav-cursor` class — deliberately NOT
+// landing view and over the interview panel's answer rows on a run's detail view.
+// The cursor is an index into the rendered rows plus a `.nav-cursor` class —
+// deliberately NOT
 // DOM focus, because both lists re-render on a poll timer (the list every 2s)
 // and real focus would be destroyed on every tick.
 var navCursor = 0;
@@ -3320,7 +3667,7 @@ var listFilter = '';
 // touched, so any run's activity can reorder the list under a 2s refresh; an
 // index alone would leave the cursor sitting on whatever row slid into that slot,
 // and Enter would open a session the reviewer never pointed at. Empty on the
-// detail view, where questions have a fixed order.
+// detail view, where the answer rows of the one displayed ask have a fixed order.
 var navCursorKey = '';
 // Every run name the last list fetch returned, before filtering. This is what
 // separates "the anchored row is hidden" from "the anchored run is gone" — see
@@ -3337,10 +3684,16 @@ var knownRunNames = [];
 var listFetchSeq = 0;
 
 // Rows the cursor moves over, chosen by view. Detail view has no run rows, and
-// the list view has no questions, so one of these is always empty. On the detail
-// view this is the same node set `questionItemEl` indexes into — both go through
-// QUESTION_ITEM_SEL so the two can never disagree about what a question is.
-var QUESTION_ITEM_SEL = '#questions-area .question-item';
+// the list view has no interview panel, so one of these is always empty. On the
+// detail view they are the answer rows of the ONE ask on screen — every option,
+// then the free-text row, then submit. Read by navRows() and by nav.mjs.
+var INTERVIEW_ROW_SEL = '#interview-area .interview-row';
+// The option rows alone, which is a different index space: `1`-`9` count options,
+// and counting the free-text and submit rows among them would put a digit on a
+// row with no option to pick. Selected by KIND, the same attribute
+// activateCursorRow branches on, so the digits and Enter can never disagree about
+// what an option row is.
+var INTERVIEW_OPTION_SEL = INTERVIEW_ROW_SEL + '[data-row-kind="option"]';
 
 // Rows inside a COLLAPSED "Completed" group are deliberately excluded: they are
 // not on screen, and j/k must never park the cursor somewhere invisible. The two
@@ -3349,7 +3702,7 @@ var RUN_ROW_SEL = '#run-list-items > .run-row-wrap > .run-row, ' +
                   '#run-list-items details[open] .run-row-wrap > .run-row';
 
 function navRows() {
-  var sel = currentRun ? QUESTION_ITEM_SEL : RUN_ROW_SEL;
+  var sel = currentRun ? INTERVIEW_ROW_SEL : RUN_ROW_SEL;
   return Array.prototype.slice.call(document.querySelectorAll(sel));
 }
 
@@ -3459,8 +3812,12 @@ function announceCursor(el) {
   if (!live) return;
   if (!el) { live.textContent = ''; return; }
   var rows = navRows();
+  // The row's own label — an option's text, "Other", or the submit button. The
+  // submit row has no <label>, so fall back to the row: an announcement that
+  // named nothing there would leave a screen reader with no way to tell the one
+  // row that ANSWERS from the ones that only pick.
   var what = currentRun
-    ? (el.querySelector('.question-prompt') || {}).textContent
+    ? (el.querySelector('label') || el).textContent
     : rowKey(el) + ', ' + ((el.querySelector('.run-state') || {}).textContent || '');
   live.textContent = (what || '') + ' (' + (navCursor + 1) + ' of ' + rows.length + ')';
 }
@@ -3480,42 +3837,85 @@ function cursorTo(i) {
   applyNavCursor(true);
 }
 
-// Enter / o / l — open the session under the cursor. List view only.
-function openCursorRow() {
-  var rows = navRows();
-  if (currentRun || !rows[navCursor]) return;
-  location.hash = rows[navCursor].getAttribute('href');
-}
-
-// 1-9 on the detail view select the nth option of the question under the cursor.
-// Radios inside the cursor's own container, so an agent-authored question id
-// that isn't a valid selector can't misroute the pick (same reason
-// `questionItemEl` walks containers).
-function pickOption(n) {
-  var item = questionItemEl(navCursor);
-  if (!currentRun || !item) return;
-  var radios = item.querySelectorAll('.question-options input[type="radio"]');
-  if (n < 1 || n > radios.length) return;
-  radios[n - 1].checked = true;
+// Enter / o / l / → — act on the row under the cursor. On the list view that is
+// "open the session"; on the detail view the rows are answer rows, so it is
+// whatever that row is for.
+//
+// Submit is deliberately a row you have to LAND on: it is the only keyboard path
+// to an answer, so a stray Enter with the cursor on an option can never send one.
+function activateCursorRow() {
+  var el = navRows()[navCursor];
+  if (!el) return;
+  if (!currentRun) { location.hash = el.getAttribute('href'); return; }
+  var kind = rowKind(el);
+  if (kind === ROW_KIND_SUBMIT) { submitAnswer(); return; }
+  // Checked BEFORE the option branch, not after: the free-text row carries both a
+  // radio and the box, and activating it has to reach the box — selecting its
+  // radio and stopping would arm an empty custom answer that submitAnswer then
+  // refuses.
+  if (kind === ROW_KIND_OTHER) { focusCustomAnswer(); return; }
+  // Every kind is named, so an unrecognised one does nothing rather than falling
+  // into whichever branch happens to be last. A row type added without a case
+  // here is inert, which is visible; picking a radio it did not mean to is not.
+  if (kind !== ROW_KIND_OPTION) return;
+  var radio = el.querySelector('input[type="radio"]');
+  if (!radio) return;
+  radio.checked = true;
   // Scripted .checked fires no event, so anything listening for a change (and
   // assistive tech watching the group) would never learn of the pick.
-  radios[n - 1].dispatchEvent(new Event('change', { bubbles: true }));
-  var live = document.getElementById('nav-live');
-  if (live) live.textContent = 'selected: ' + radios[n - 1].parentNode.textContent.trim();
-  renderKeyhint();
+  radio.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-// `i` — jump into the cursor question's free-text box, vim-insert style.
+// 1-9 on the detail view select the nth OPTION of the ask on screen — not the nth
+// row, which would let a digit land on the free-text or submit row and quietly do
+// nothing. Moves the cursor onto what it picked, so the two never disagree about
+// which answer is armed.
+function pickOption(n) {
+  if (!currentRun) return;
+  var rows = navRows();
+  var opts = Array.prototype.slice.call(document.querySelectorAll(INTERVIEW_OPTION_SEL));
+  if (n < 1 || n > opts.length) return;
+  var row = opts[n - 1];
+  var radio = row.querySelector('input[type="radio"]');
+  if (!radio) return;
+  radio.checked = true;
+  radio.dispatchEvent(new Event('change', { bubbles: true }));
+  var i = rows.indexOf(row);
+  if (i >= 0) cursorTo(i);
+  // AFTER cursorTo, which announces the row it moved to: the pick is the news
+  // here, and announcing the move over it would leave a screen reader told that
+  // the cursor moved and never told that anything was selected.
+  var live = document.getElementById('nav-live');
+  if (live) live.textContent = 'selected: ' + ((row.querySelector('label') || row).textContent || '').trim();
+}
+
+// `i` — jump into the ask's free-text box, vim-insert style. One question at a
+// time means one box, so WHICH box this reaches no longer depends on the cursor.
+//
+// It moves the cursor onto that row anyway, and that is load-bearing rather than
+// cosmetic — the same invariant pickOption keeps: the cursor and the armed answer
+// must never disagree. Typing in the box selects its radio (the `oninput` in
+// renderInterview), so after `i` the free-text row IS the armed answer. Leaving
+// the cursor on an option row meant the next Enter activated THAT row, checking
+// its radio and silently disarming the text still visibly sitting in the box —
+// and submitAnswer then reads the option. The reviewer types "linear backoff",
+// presses Enter twice, and `exp` reaches the log with nothing said. That is the
+// same failure the render guard exists to retire, arriving by the keyboard.
 function focusCustomAnswer() {
-  var item = questionItemEl(navCursor);
-  if (!currentRun || !item) return;
-  var box = item.querySelector('.question-other input[type="text"]');
-  if (box) { box.focus(); box.select(); }
+  if (!currentRun) return;
+  var box = document.getElementById('interview-text');
+  if (!box) return;
+  var rows = navRows();
+  for (var i = 0; i < rows.length; i++) {
+    if (rowKind(rows[i]) === ROW_KIND_OTHER) { cursorTo(i); break; }
+  }
+  box.focus();
+  box.select();
 }
 
 // Clicking is the other way to point at a row. Without this the visual cursor
-// and the thing the reviewer just touched drift apart, and a following 1-9 would
-// answer a different question than the one they clicked on.
+// and the thing the reviewer just touched drift apart, and a following Enter
+// would activate a different row than the one they clicked on.
 function syncCursorToClick(e) {
   var rows = navRows();
   for (var i = 0; i < rows.length; i++) {
@@ -3550,7 +3950,8 @@ function closeFilter(clear) {
     // Re-check the generation inside the .then as well: renderRunList drops its
     // own stale render, but the continuation would still run, and by then the
     // reviewer may be inside a run — where applyNavCursor(true) would grab the
-    // question rows and scroll the detail page out from under them.
+    // interview panel's answer rows and scroll the detail page out from under
+    // them.
     var gen = routeGen;
     renderRunList(gen).then(function(){ if (gen === routeGen) applyNavCursor(true); });
   }
@@ -3582,8 +3983,8 @@ function keyHelpOpen() { return document.getElementById('key-help').classList.co
 function renderKeyhint() {
   var n = navRows().length;
   var parts = currentRun
-    ? ['<kbd>j</kbd>/<kbd>k</kbd> question', '<kbd>1</kbd>-<kbd>9</kbd> pick',
-       '<kbd>i</kbd> custom', '<kbd>h</kbd> back']
+    ? ['<kbd>j</kbd>/<kbd>k</kbd> row', '<kbd>1</kbd>-<kbd>9</kbd> pick',
+       '<kbd>i</kbd> type', '<kbd>&crarr;</kbd> activate', '<kbd>h</kbd> back']
     : ['<kbd>j</kbd>/<kbd>k</kbd> move', '<kbd>&crarr;</kbd> open', '<kbd>/</kbd> filter'];
   if (currentRun && !n) parts = ['<kbd>h</kbd> back to sessions'];
   parts.push('<button type="button" onclick="openKeyHelp()" aria-haspopup="dialog">' +
@@ -3630,7 +4031,7 @@ function initKeyNav() {
     // Enter, and the move keys, act on the list without leaving the box — so a
     // filter can be narrowed and its result opened without reaching for a mouse.
     if (e.key === 'Enter') {
-      e.preventDefault(); e.stopPropagation(); closeFilter(false); openCursorRow(); return;
+      e.preventDefault(); e.stopPropagation(); closeFilter(false); activateCursorRow(); return;
     }
     if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) {
       e.preventDefault(); e.stopPropagation(); moveCursor(1); return;
@@ -3640,7 +4041,7 @@ function initKeyNav() {
     }
   });
 
-  // Clicking a row or a question adopts it as the cursor.
+  // Clicking a session row or an answer row adopts it as the cursor.
   document.addEventListener('click', syncCursorToClick, true);
 
   // A spec's own `[text](#heading)` link must scroll, not route. Delegated so it
@@ -3719,7 +4120,7 @@ function initKeyNav() {
       case 'g':                    e.preventDefault(); cursorTo(0); break;
       case 'G':                    e.preventDefault(); cursorTo(navRows().length - 1); break;
       case 'Enter': case 'o': case 'l': case 'ArrowRight':
-        e.preventDefault(); openCursorRow(); break;
+        e.preventDefault(); activateCursorRow(); break;
       case 'h': case 'ArrowLeft':
         // Back out of a run to the session list. On the list itself there is
         // nowhere further back, so this is a no-op rather than a history pop.

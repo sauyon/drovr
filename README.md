@@ -233,23 +233,47 @@ ran under it degrades to a **reseed** (fresh agent, seed re-sent).
 
 ### Reflex
 
+Two hooks, one `[reflex]` table.
+
 The `session-start` hook injects the `drovr:using-drovr` router skill as the
 always-on reflex for human-facing sessions (it no-ops inside a drovr-spawned
-phase). The hook delegates rendering to `drovr reflex`, so the reflex is shaped
-by the `[reflex]` table — with no `[reflex]` table the built-in reflex is
-injected unchanged:
+phase). The `user-prompt` hook injects a much smaller **per-turn gate card**
+before a prompt — every one except the turn right after a `drovr:*` skill ran
+successfully — because a `SessionStart` injection scrolls out from under
+the agent as the context fills and the discipline has to still be reachable at
+turn 200. Both delegate to `drovr reflex`, so both are governed by the
+`[reflex]` table — the SessionStart reflex is *shaped* by it, the gate is only
+switched on and off. With no `[reflex]` table both are injected unchanged:
 
 ```toml
 [reflex]
-# Master switch. false suppresses the reflex entirely for human sessions.
+# Master switch. false suppresses both the SessionStart reflex and the
+# per-turn gate.
 enabled = true
+# The per-turn gate card (UserPromptSubmit). Defaults to TRUE. Unlike the
+# SessionStart reflex, it deliberately does NOT no-op inside a drovr-spawned
+# phase — a phase is exactly where the discipline has to hold. It is skipped
+# for one turn after the agent SUCCESSFULLY invokes a `drovr:*` skill, since a
+# session already running the discipline does not need re-telling. A skill call
+# that failed to load does not count, and still gets the card.
+#
+# Cost is cumulative, not a rate: the card is 547 bytes (budgeted at <=600) and
+# each injection *stays* in the context window, so an unsuppressed 100-turn
+# session carries ~55 KB by the end. The suppression rule is what keeps the
+# common case to a handful of injections.
+#
+# This switch is GLOBAL, not per-project: config resolves to the single path
+# ${XDG_CONFIG_HOME:-$HOME/.config}/drovr/config.toml, so `false` turns the gate
+# off in every repo and `true` injects the card in every repo, drovr or not.
+per_turn = true
 # Optional: replace the framing text before the skill body inside the
-# <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing.
+# <EXTREMELY_IMPORTANT> wrapper. Absent → the built-in framing. Applies to the
+# SessionStart reflex only; the gate card is a fixed const.
 preamble = "You are running drovr. Apply the discipline below."
 
 # Per-discipline toggles, keyed by the section names tagged in the router skill
 # (skills/using-drovr/SKILL.md). A section omitted here stays enabled;
-# set one to false to drop it from the injected reflex.
+# set one to false to drop it from the injected reflex. SessionStart only.
 [reflex.sections]
 single-writer = true   # the single-writer / read-only-explorers principle
 always-review = true   # the "always review before done" rule
@@ -275,21 +299,28 @@ escalation    = true   # the phases / handoff escalation contract
 ### Review UI keyboard navigation
 
 The review server's pages are drivable without a mouse, vim- or emacs-style. A
-cursor moves over the session list on the landing page, and over the run's open
-questions on a run page. Press <kbd>?</kbd> in the UI for the same table.
+cursor moves over the session list on the landing page, and on a run page over
+the **answer rows of the one interview question currently on screen** — every
+option, then the free-text row, then submit. The interview panel shows exactly
+one pending question at a time, behind a `1 of N` counter; answer it and the
+next one takes its place. Press <kbd>?</kbd> in the UI for the same table.
 
 | Keys | Action |
 |---|---|
-| `j` `↓` `C-n`* · `k` `↑` `C-p` | next / previous row or question |
+| `j` `↓` `C-n`* · `k` `↑` `C-p` | next / previous row |
 | `g` `M-<` · `G` `M->` | first / last |
 | `C-v` `M-v` | page down / up |
-| `Enter` `o` `l` `→` | open the session under the cursor |
-| `1`–`9` | pick that option on the question under the cursor |
-| `i` | type a custom answer on that question |
+| `Enter` `o` `l` `→` | open the session, or activate the answer row under the cursor |
+| `1`–`9` | pick that option of the agent's question |
+| `i` | type a custom answer |
+| `a` | archive / restore the session under the cursor |
 | `/` `C-s` | filter the session list |
 | `h` `←` | back to the session list |
 | `Esc` `C-g` | close the filter or help, or leave a text box |
 | `?` | key help |
+
+`1`–`9` count **options only**: the free-text and submit rows are not in that
+index space, so a digit can never land on a row with no option to pick.
 
 Keys never fire while you are typing in a text box — `Esc`/`C-g` steps out
 first. \* `C-n` only reaches the page on macOS, where the browser's own modifier
@@ -311,7 +342,10 @@ is hidden on macOS where it does not apply.
 | `drovr collect <run> <phase>` | Print the handoff doc for a finished phase. |
 | `drovr review summary <run> <text>` | POST summary text to the always-on review server (auto-starting it if needed), flipping that run's state to `ready`. |
 | `drovr review wait <run> [--timeout-ms N]` | Block until the reviewer acts, then exit (default 30 min). Exit 0 = approved, 3 = changes requested, 2 = timeout (re-run to resume), 1 = error. |
+| `drovr ask <run> --question <text\|@file> [--context <text> \| --context-file <path>] [--option <value>=<label>]... [--recommend <value>]` | Post one question for the human and **return immediately** — it never blocks. Appends a pending record to `interview.jsonl` and prints three lines: the ask id, then the run's page URL (starting the review server if it is not already up — only if it could not be *started* does it instead note that the question is on disk and will appear as soon as the server is), then the `drovr ask wait` command to background. `--context` and `--context-file` are mutually exclusive; `@<path>` on `--question` reads the text from a file (`@@` escapes a leading `@`). Exit 0 = posted, 5 = the run was cancelled (terminal — stop work), 1 = error. Run by phase agents, not by the driver. |
+| `drovr ask wait <run> [--timeout-ms N]` | Block until every question **that was outstanding when it started** has an answer, then print those asks — each with its latest answer — as JSON. Not the whole log: earlier answered asks are not included, except in the nothing-was-pending case, which prints the entire folded interview rather than a bare `[]`. A file poller, so it needs no server. Exit 0 = answered, 2 = timeout (re-run to resume; the question is still on disk and still on screen), 5 = run cancelled, 1 = error, including a run dir that is not there. |
 | `drovr reflex --skill <path>` | Render the SessionStart reflex JSON from `<path>`, shaped by `[reflex]` config. Run by the `session-start` hook; prints nothing when the reflex is disabled. |
+| `drovr reflex --gate` | Render the per-turn gate card JSON (`UserPromptSubmit`). Run by the `user-prompt` hook; reads the hook payload on **stdin** to find `transcript_path`. Prints nothing when `enabled` or `per_turn` is false, or when the previous turn already invoked a `drovr:*` skill **successfully** (a failed call still gets a card). Exactly one of `--skill` / `--gate` is required. |
 
 ### Reaping and rehydrating a pane
 
@@ -451,7 +485,7 @@ The server reads and writes these files in each run dir:
 | `review.state.json` | server on state change | Durable `{state, turn}` — makes the server restart-safe. |
 | `feedback.json` | server on submit | Human feedback JSON for the current turn. |
 | `summary.txt` | server on POST summary | Agent summary text. |
-| `questions.json` | agent | MC questions for the reviewer (optional). |
+| `interview.jsonl` | agent (`drovr ask`) **and** server (`POST answer`) | The agent↔human interview log: append-only, one JSON object per line. The agent appends a pending question, the reviewer's answer is appended against it. |
 | `approved` | server on approve | Marker file written when the spec is approved. |
 
 ### Other per-run files
@@ -487,8 +521,18 @@ supervised across logins/reboots, install the `systemd --user` unit at
 `packaging/drovr.service` (`systemctl --user enable --now drovr`).
 
 1. In a run's detail view, state starts as `idle`.
-2. Read the spec, leave annotations, answer questions, and choose
-   **Request changes** or **Approve**.
+2. Read the spec, leave annotations, and choose **Request changes** or
+   **Approve**. Separately from this loop, the run page carries the **interview
+   panel**: whenever an agent has posted a question with `drovr ask`, it appears
+   there and you answer it in place. That is a different channel from the gate —
+   answering appends to `interview.jsonl` and does not touch the run's review
+   state, so it works at any point in the run's life, including before a spec
+   exists and after one is approved. The one run *state* that refuses is a
+   cancelled run (409). Otherwise: **400** for a malformed body, an over-long
+   answer, or an append that would push the log past its cap; **404** for an
+   unknown ask id — or an unknown run; **500** if the log itself is unusable
+   (already over-cap, a symlink, not a regular file) or the append fails; and
+   **403** if the host/origin write guard refuses the POST.
 3. The driver posts a summary, then **waits** for the reviewer instead of
    busy-polling state:
    ```

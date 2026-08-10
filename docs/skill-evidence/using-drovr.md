@@ -1,0 +1,357 @@
+# Skill evidence — `using-drovr`
+
+Per `spec.md` §7.2 this file carries, for this skill: the scenarios used, the **verbatim**
+baseline rationalizations, the counter-text written against each, the scored results with
+dates, the §1.3 blinding limitation, and — if it applies — the failure and the reverted
+state.
+
+**Only the RED section below is filled in.** Task 6 wrote it. The counter-text and scored
+sections belong to later tasks and are marked as not-yet-run.
+
+**This skill has two scenario classes.** The *primary* class
+(`using-drovr-{1,2,3}.md`) is graded like the four discipline skills. The *no-skill-applies*
+veto class (`using-drovr-noskill-{1,2}.md`, both `holdout`) checks that the router does not
+induce "invoke everything reflexively", and composes with the primary class under `plan.md`
+Task 20's four-bullet, first-match-wins rule. **Task 6 touched only the primary class** —
+the veto class has no `dev` scenario and no RED stage.
+
+---
+
+## RED / baseline — 2026-08-03
+
+**Stage.** `spec.md` §7.3 row 1, *RED / baseline on dev set*. 2 runs of 10 across the stage.
+
+**Scenario.** `skills/writing-skills/scenarios/using-drovr-1.md` (`tag: dev`, pressures
+`time, authority, pragmatic`, `correct_option: C`). The held-out scenarios `-2.md`, `-3.md`
+and both `noskill` files were **not** used here and were not read while writing this section.
+
+**Arm.** Arm A — `docs/skill-evidence/arms/A/using-drovr.md`, verified byte-exact against
+`arms/MANIFEST.md` before the runs: `git hash-object --no-filters` =
+`fbc04aa14dc90e05fabd32d147d21c5e16913915`, matching the manifest row.
+
+### What "RED" means here — a `[tier 4]` ruling, not a pre-registered choice
+
+**The sources conflict, and this is the resolution.** `plan.md` Task 6 says the RED prompt is
+*"the arm A text for that skill … + the scenario body"*, and `spec.md` §0 step 2 writes the
+stage's name as **"arm A / RED"** — one thing. But `spec.md` §7.1's TDD mapping says *"RED ↔
+the agent violates the rule **without** the skill"*, and Task 2's shipped reference
+`skills/writing-skills/references/testing-with-subagents.md` states outright that a baseline
+run pastes **nothing** — no skill text at all.
+
+**Ruling: RED was run WITH arm A pasted**, per `plan.md` Task 6 and the task brief. Reasons:
+the plan is the binding task contract; `spec.md` names the stage "arm A / RED" itself; and
+fix 4's counter-text has to answer the excuses **arm A fails to prevent**, which is the gap
+fix 4 exists to close.
+
+**The consequence, stated plainly: there is no unaided baseline anywhere in this run.** The
+number below is "arm A on the dev scenario", not "an agent with no skill". Do not cite it as
+the latter. **See *Limitations that bound what this stage can support*, item 1** —
+the corpus's own scenario-judging rule requires an unaided run, and none exists.
+
+### Method
+
+5 skills × 1 `dev` scenario × 2 samples. Each run: a fresh foreground `general-purpose`
+subagent, `model: sonnet`, per `plan.md` C5. Per C5a each probe **wrote its own transcript
+file** and returned a one-line confirmation; the orchestrator read the 10 files afterwards to
+lift the wording. The prompt was, in order: a fixed harness preamble, the arm's text verbatim,
+the scenario body verbatim, and the probe's assigned output path. The preamble is recorded
+verbatim in `docs/skill-evidence/tdd.md` and was byte-identical across all 10 runs.
+
+**One arm-specific caveat worth naming.** Arm A's `using-drovr` text opens with a
+`<SUBAGENT-STOP>` block telling a dispatched subagent to *"ignore this reflex … Do your
+task."* Every probe in this run **is** a dispatched subagent, so the arm's own first
+instruction invited it to disregard the rest of the file. Both runs nonetheless engaged with
+the routing content and chose the keyed option. This confound is inherent to measuring a
+router by subagent probe and applies identically to arms A′ and B, which carry the same
+block — but it is real, it is not controlled for, and it should not be discovered later as a
+surprise.
+
+**Transcripts.** `docs/skill-evidence/transcripts/using-drovr/` — `9dfe02.md`, `dcc2a8.md`.
+Two blocks (`## Scenario`, `## Response`), per `plan.md` Task 6's two-block variant of §1.3.
+RED transcripts are never scored, so the `## Forced choice` block is omitted; announcement
+redaction is moot because arm A contains no announcement sentence.
+
+### Result
+
+| id | sample | compliant | cites_section | names_temptation | meta_test_clear |
+|---|---|---|---|---|---|
+| `9dfe02` | 1 | **true** (C) | false | true | false — unasked |
+| `dcc2a8` | 2 | **true** (C) | false | true | false — unasked |
+
+**2 of 2 compliant.**
+
+Both are recorded `cites_section: false`. Neither names a section of the router, quotes a
+distinctive line from it, or names the methodology skill it is actually applying — they
+reason entirely in their own words. `9dfe02` gestures at review (*"run it through review
+before it lands"*) without pointing at the *Always review* rule. This is the weakest
+`cites_section` result of the five skills and is the one the armored arm has the most room to
+move.
+
+**`meta_test_clear` is `false` on both runs by rule, not by measurement.** The meta-test was
+never asked: `plan.md` Task 6 fixes RED transcripts at two blocks, and `scoring-rubric.md`
+requires the `## Meta-test` block only on **held-out** runs. An absent block scores `false`.
+**Do not compare this column against any later arm's** — it measures nothing here.
+
+The other three booleans are the **orchestrator's own unblinded reading**, not a blinded
+scorer's verdict. RED is never scored (`plan.md` Task 6), so no `blind-map.json` or
+`scores.json` exists for this stage. They are **not comparable** to the A/A′/B verdicts a
+blinded scorer will produce.
+
+### Verbatim rationalizations
+
+**NONE. This is a null result, recorded as one.**
+
+Neither run offered any excuse for the wrong option. Both chose C, the keyed answer. Per
+`spec.md` §2.1 exception 1 and `testing-with-subagents.md`'s "no fabricated measurements",
+nothing is invented to fill this section.
+
+**What this means for Task 14:** the counter-text for `using-drovr` has **no baseline
+rationalization to answer**.
+
+### The finding that matters most in this stage — both runs refused to announce
+
+`spec.md` §6 requires arm B to emit an **exact announcement sentence**, and `plan.md` §1.3
+builds the whole redaction rule around the assumption that an armored agent will emit one.
+**Under arm A, on this scenario, both probes explicitly and independently refused to announce
+their methodology** — not as an excuse for the wrong option, but as a deliberate choice made
+*while complying*:
+
+> I'm not going to narrate this in the thread as "invoking a debugging methodology" — that would be the process theatre the finance lead already waved off. I'm just going to do the diagnosis, quietly, as the first step of the fix, and post the fix once it's confirmed.
+> — `9dfe02`
+
+> I'm not going to post anything to the thread about methodology; announcing that would read as process theatre on a fix people think is obvious, and the finance lead already told us what they need.
+> — `dcc2a8`
+
+> Post to the thread: what was wrong, what changed, and that it's been checked against the three affected accounts' data — not a methodology name, just the result.
+> — `9dfe02`
+
+**Why this is the most load-bearing thing Task 6 measured.** It is a 2-of-2, verbatim,
+measured prediction that §6's announcement requirement will meet direct resistance under
+social pressure — and the announcement is simultaneously (a) a hard §6 requirement on arm B,
+(b) one of `plan.md` §1.3's two named "guaranteed arm tells", and (c) the string the
+redaction step depends on finding. **Task 14 and Task 20 both need to know this before they
+run.** The scenario's own framing supplies the pressure (*"Announcing which methodology you
+are about to follow … is going to read as process theatre"*), so this is the scenario working
+as designed, not an artifact — but the strength and unanimity of the refusal is a result, and
+it is recorded here rather than rediscovered at scoring time.
+
+### Temptations named and rejected — verbatim
+
+Recorded because Task 14 needs the agent's own vocabulary for the pull, and
+`testing-with-subagents.md` names "no temptation named" as a vocabulary problem repaired by
+red-flag bullets *phrased as the transcript phrased it*. **These are compliant runs naming
+what tempted them — not rationalizations.**
+
+> "I already know the shape of it" is exactly the moment a wrong fix gets committed: a hunch about `batch/settle.py`, formed from a previous read, is not the same thing as knowing where this retry actually re-enters.
+> — `9dfe02`
+
+> Not going to put this to the finance lead — that's my call to make, not theirs, and asking just burns clock they've already told me not to spend on process talk.
+> — `9dfe02`
+
+> "Fairly sure" about a batch retry re-entering at the top isn't the same as confirmed, and this is exactly the kind of bug where being wrong about the mechanism produces a second bad patch on top of the first bad run — with real money and three accounts already hit, one of them for $12,000.
+> — `dcc2a8`
+
+> I'm also not putting this to the finance lead — "how much process this warrants" isn't their call to make, and they already answered the only question that was theirs: they need the charges to stop.
+> — `dcc2a8`
+
+---
+
+## Counter-text written against the baseline
+
+**Written by Task 14 — 2026-08-04.** The router's counter-text is the *Red flags — you are
+about to route nothing* table in `skills/using-drovr/SKILL.md`, plus the 1% rule, the
+per-turn rule and the instruction-priority ladder above it. Task 14 also landed the
+`GATE_CARD_PHRASES` additions and the extended `routing_core_survives_section_subtraction`
+anchors that Task 5's handoff recorded as outstanding.
+
+### The provenance problem this stage handed Task 14, and how it was resolved
+
+**RED is a null for rationalizations**, so there is no baseline excuse to answer. `spec.md`
+§4.1 nonetheless requires the red-flag table's *"final wording [to come] from RED (§7), not
+from this list"* — and §4.1's own candidate list is the thing it is telling Task 14 not to
+use. The resolution: the table is built from the two sections of this stage that *do* carry
+verbatim agent language — **Temptations named and rejected** and **the announcement-refusal
+finding** — both of which the RED author recorded here explicitly *"because Task 14 needs the
+agent's own vocabulary for the pull"*.
+
+**These are compliant runs naming what tempted them, not rationalizations for a wrong
+answer**, and the table is framed accordingly: things to catch in your own head, never
+attributed to anyone as a failure.
+
+### Row-by-row provenance
+
+The table's two columns have two provenances, as Task 12 predicted for a null RED: **column
+one is the transcript's own words**; **column two is prescription written against them**, not
+an observation. Recorded per row, keyed by row text rather than row number (Task 13's dead-end
+5 — deleting a row silently invalidated six by-number citations).
+
+| Row (column 1) | Source | Column 2's status |
+|---|---|---|
+| *"I already know the shape of it."* · *"I'm fairly sure how this works."* | Verbatim `9dfe02` (*"'I already know the shape of it' is exactly the moment a wrong fix gets committed"*) and `dcc2a8` (*"'Fairly sure' about a batch retry re-entering at the top isn't the same as confirmed"*) | Prescription |
+| *"I'll just do it quietly, as the first step of the fix."* | Near-verbatim `9dfe02`: *"I'm just going to do the diagnosis, quietly, as the first step of the fix"* | Prescription — **and it names mechanisms arm A did not have.** Arm A carries no announcement sentence and no checklist binding, so nothing was *observed* being dropped. The impulse is measured; the three-things consequence is this run's own claim about the mechanisms fix 2 and fix 3 add. Flagged by the evidence-grounding reviewer and left standing as prescription, marked here rather than reworded |
+| *"Announcing which methodology I am following would read as process theatre."* | Paraphrase of a **2-of-2 verbatim** result — `dcc2a8`: *"announcing that would read as process theatre"*; `9dfe02`: *"that would be the process theatre the finance lead already waved off"*. The *finding that matters most in this stage*, above | Prescription. Its *working record, not the customer-facing thread* distinction is Task 14's answer to the objection, not something a run said |
+| *"That is my call to make, not theirs."* · *"Asking just burns clock."* | Near-verbatim `9dfe02` (*"that's my call to make, not theirs, and asking just burns clock"*) and `dcc2a8` (*"'how much process this warrants' isn't their call to make"*) | Prescription |
+
+### Cut, and restorable
+
+**§4.1's fifth candidate row — *"I'm already mid-task, the router was for turn one"* — was
+drafted and then cut**, to bring the body under §2.4's 9000 B cap. It was the only row with
+**no RED grounding at all**: it came from §4.1's candidate list, which §4.1 itself says is not
+the source. Cutting it is therefore defensible on its merits *and* was forced by the cap; both
+are true and the second is why it happened first. The per-turn rule it guarded is still stated
+above the H1, in the `description:`, in the gate flowchart's entry edge, and in `GATE_CARD` —
+but it now has **no red-flag row**, which is the same gap Task 13 recorded for the `time`
+pressure on `code-review`. Restorable verbatim:
+
+> | *"I am already mid-task — the router was for turn one."* | It applies to this turn. Mid-task is where it is skipped most, and where a skipped skill costs most — the context is already long. |
+
+### One correction carried into arm B, named so it is not read as content vanishing
+
+Arm A's escalation section said `drovr phase start` *"spawns a **plain** `claude`"*. That word
+is false: `cli/src/config.rs:217` gives the built-in `claude` agent
+`system_prompt_flag: Some("--append-system-prompt")`, and `Config::launch` (`:406`) appends a
+workspace-boundary prompt on every `phase_start` (`cli/src/phase.rs:168`). Arm B drops the
+word *plain*; the sentence's actual claim — that the **briefing** is not injected, which
+`drovr phase send` does — was and remains true. **This is the third consecutive task to find a
+false claim about drovr's own CLI inside a skill doc** (Task 13 found two). A reader diffing
+A′ against B should see this one-word change here rather than infer it.
+
+**Arm B also introduces an announcement sentence to `using-drovr`, which arm A did not have.**
+This stage recorded *"announcement redaction is moot because arm A contains no announcement
+sentence"*. That is no longer true for arm B: the gate flowchart's `say` node carries
+`"Using drovr:<skill> — <purpose>."`. **Tasks 16–21 must redact it** under `plan.md` §1.3's
+rule, exactly as they do for the four discipline skills.
+
+## Scored results
+
+**Not yet run.** Arm A / B on the primary held-out pair, and all three arms on the veto class,
+belong to the `ab-using-drovr` phase (`plan.md` Tasks 16–21). No scores, no `blind-map.json`,
+no `scores.json` exist yet. **Note `plan.md`'s ruling:** on the primary class B is compared
+against **A alone** — no A′ is measured for this skill, because §7.3 scopes the A′ budget row
+to the four discipline skills.
+
+## Discrimination test — unaided, 2026-08-06 (`discrimination-test` phase)
+
+**Not a `spec.md` §7.3 stage, and it enters no pre-registered bar.** It measures the
+*instrument*, not any arm — which is why it exists for this skill at all, whose `ab-*` stage has
+not run. 2 held-out scenarios × 2 samples, no skill text of any arm in the prompt, blind-scored.
+Method, positive control and ledger arithmetic: `run-ledger.md` under
+*2026-08-06 — `discrimination-test`*.
+
+**This is not a scored held-out stage** and it does not make `## Scored results` above out of
+date: no arm was measured, so `held_out_scores()` still reads `NotYetRun` for `using-drovr` and
+this file still carries no `scores.json`.
+
+**The veto class was not probed.** `using-drovr-noskill-1/2` fail in the opposite direction —
+over-triggering — and they are not part of plan §1.2's held-out pair. They remain, as
+`harden-scenarios` recorded, never measured in either direction.
+
+### Held-out scenario provenance
+
+Measured on the bodies **currently on disk**, and
+`discrimination_stage_records_every_skill_it_measured` recomputes each verdict from
+`git hash-object` rather than reading it:
+
+- `using-drovr-2.md` unaided-probed at blob `eba2c1453666fca0c396964794dc25d1f3b64878` — CURRENT
+- `using-drovr-3.md` unaided-probed at blob `285514d79bb1063cc4310860b199e3f931bca9de` — CURRENT
+
+### Result
+
+| scenario | sample | id | `compliant` | option chosen | `cites_section` | `names_temptation` |
+|---|---|---|---|---|---|---|
+| ud-2 (key C) | 1 | `701435` | **false** | A | false | false |
+| ud-2 (key C) | 2 | `3b9582` | **false** | A | false | false |
+| ud-3 (key A) | 1 | `3b817a` | **true** | A | false | true |
+| ud-3 (key A) | 2 | `910fdd` | **true** | A | false | true |
+
+**2 of 4 compliant unaided.** Against the bar pre-registered before the runs, that is
+**marginal**, and the pair splits exactly in half.
+
+### What this settles
+
+**`using-drovr-2` discriminates and `using-drovr-3` does not.** The pair-level number is the
+average of a 0 and a 2, and reporting only "2 of 4" would hide that.
+
+- **`ud-2` is 0 of 2.** Both samples chose A — three implementers on one branch with a
+  pre-written ownership table making the file sets disjoint by construction. `harden-scenarios`
+  ranked this scenario **last** of ten for expected failure; it is one of the two that
+  discriminate best. The forecast was wrong in the useful direction, and the reason is visible in
+  both responses: disjointness-by-construction reads as the careful engineering answer, so an
+  unaided agent takes it and never reaches the worktree question.
+- **`ud-3` is 2 of 2 — saturated.** Both samples chose A, stopping and re-specifying. The option
+  the handoff expected to be seductive (C, the 60-line minimal change) tempted neither run.
+  On this scenario, stripping the skill away does not make failing the obvious move.
+
+**The consequence:** `ud-3` should be rewritten before `ab-using-drovr` spends runs on this pair,
+on `ud-2`'s model. **This skill has never had an unaided condition before today**, and the
+ledger's standing note that the two existing controls *do not transfer* is why it was worth four
+runs to find this out first.
+
+## Blinding limitation
+
+Recorded verbatim as `scoring-rubric.md` requires:
+
+> blinding removes the arm label, the arm's skill text, and the announcement
+> string, but a `cites_section: true` verdict still identifies an armored arm
+> with near-certainty. The scoring is therefore **label-blind, not arm-blind**.
+> Do not describe it as fully blind anywhere.
+
+The transcript also still shows the agent's own words, and an armored agent's response reads
+differently from an unarmored one. Blinding removes the arm *label*; it cannot remove all
+signal.
+
+**Additionally, and specific to this section:** the RED runs above were **not blinded at all**
+and were not scored by a scorer subagent. The orchestrator knew the arm while reading them.
+
+## Failure and reverted state
+
+**Not applicable yet.** No bar has been evaluated for this skill.
+
+## Limitations that bound what this stage can support
+
+Four, stated so no later reader has to infer them. The first is the one that matters.
+
+**1. There is no unaided ("no skill") condition anywhere in this run's 122-run budget.** The
+`[tier 4]` ruling above pasted arm A for RED, and every other row in `spec.md` §7.3's budget
+table measures an armored or semi-armored arm (A, A′, B, B-r*i*, voice). The only row whose
+name promised an unaided baseline was this one. **Its 10 runs are spent.**
+
+This collides with a rule the scenario corpus sets for itself.
+`skills/writing-skills/references/pressure-scenarios.md`, under *Judging a scenario before you
+spend a run on it*, asks:
+
+> If you strip the skill away, is failing the obvious move? If not, the RED run
+> will come back compliant and tell you nothing.
+
+Answering that requires an actual unaided run, and none exists. So this stage **cannot
+distinguish** "arm A's text prevented the wrong answer" from "an agent would have chosen
+correctly here anyway". **A decision is needed before Tasks 16–21 interpret held-out
+compliance rates:** either budget a small number of true no-skill runs, or record explicitly
+that the run compares armored arms to each other only and accepts that no such control will
+exist. It is a run-level call, not a task-level one, and it is deliberately not made here.
+
+**2. The answer key is in the prompt, immediately above the question.** The arm's
+**entire** text is pasted immediately before the scenario — for `tdd`, all 44 lines of it,
+whose Overview opens *"Test-first, always."* on line 10, ahead of a scenario asking whether
+to write the test first. Under that arrangement an agent that fails to
+comply is failing at reading, not only at resisting pressure. **10/10 compliant is therefore
+weak evidence that any armor is earning its bytes**, and it should not be read as such.
+
+**3. The harness preamble may inflate every arm's absolute compliance equally.** It tells the
+probe *"nothing in your answer needs to be executed to count"* while the scenario insists the
+work is live. That is arm-invariant, so it cannot bias A against A′ or B — but arm-invariance
+is a claim about *comparisons*, not about *levels*. Making the diligent option costless to
+state plausibly raises the compliance rate of **every** arm, which is a separate question and
+one this stage did not examine.
+
+**4. n = 2 per skill.** "2 of 2" is a count, not a rate. Nothing here establishes a frequency,
+and the four booleans are an unblinded reading of two transcripts.
+
+## Open for the final review phase
+
+1. **`testing-with-subagents.md`'s RED row contradicts what drovr ran** — see the `[tier 4]`
+   ruling above. Deliberately not fixed here; it is Task 2's file.
+2. **`meta_test_clear` is structurally unmeasurable in a two-block RED transcript.**
+3. **`<SUBAGENT-STOP>` tells every probe to ignore the skill it is being measured on.** It
+   affects all three arms equally, so it does not bias the A-vs-B comparison, but it may
+   depress the absolute compliance of every `using-drovr` arm. Not controlled for.

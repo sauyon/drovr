@@ -341,24 +341,51 @@ pub struct AgentSpec {
     pub mcp: Option<McpDelivery>,
 }
 
-/// Controls the SessionStart reflex the `session-start` hook injects (see
-/// `drovr reflex`). All fields are optional; an absent `[reflex]` table yields
-/// the built-in reflex unchanged.
+/// Controls **both** reflexes (see `drovr reflex`): the `SessionStart` router
+/// injection from `hooks/session-start`, and the per-turn gate card from
+/// `hooks/user-prompt`. All fields are optional; an absent `[reflex]` table
+/// yields both unchanged.
+///
+/// Only `enabled` spans both. `preamble` and `sections` shape the SessionStart
+/// reflex alone, and `per_turn` governs the gate alone.
+///
+/// **The table is flat on purpose and neither consumer sees all of it.** This
+/// type is the single deserialized surface — its shape is the public
+/// `config.toml` schema, so it cannot be split into nested tables without
+/// breaking every file already written. The consumer split lives one level up
+/// instead: [`ReflexConfig::session`] and [`ReflexConfig::gate`] hand each caller
+/// only its own fields, so applying the wrong one is a compile error rather than
+/// a convention. **A new field belongs in this struct and in exactly one view**
+/// (or both, if it genuinely spans them) — adding it here alone leaves it
+/// unreachable, which is the failure mode to expect.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct ReflexConfig {
-    /// Master switch. `false` suppresses the reflex entirely for human sessions
-    /// (the `DROVR_PHASE` phase-suppression is separate and always applies).
+    /// Master switch over both reflexes. `false` suppresses the SessionStart
+    /// injection *and* the per-turn gate.
+    ///
+    /// `DROVR_PHASE` suppression is separate and **applies to the SessionStart
+    /// reflex only** — `hooks/user-prompt` deliberately does not check it,
+    /// because a phase is exactly where the discipline has to hold. See
+    /// `docs/skill-evidence/per-turn-gate.md`.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Overrides the framing text placed before the skill body inside the
     /// `<EXTREMELY_IMPORTANT>` wrapper. Absent → the built-in framing.
+    /// **SessionStart only**; the gate card is a `const` and takes no framing.
     #[serde(default)]
     pub preamble: Option<String>,
     /// Per-section overrides keyed by the section name tagged in the skill
     /// markdown (`<!-- reflex:section:NAME -->`). A section absent from this map
     /// defaults to enabled; `NAME = false` omits that section from the reflex.
+    /// **SessionStart only** — the gate card has no sections.
     #[serde(default)]
     pub sections: BTreeMap<String, bool>,
+    /// Per-turn gate (the `UserPromptSubmit` hook). Default **true**: the gate
+    /// is the mechanism that keeps the discipline alive after turn one, so an
+    /// omitted key must not silently disable it. Named default fn for the same
+    /// reason as `enabled` — see the note above [`default_true`].
+    #[serde(default = "default_true")]
+    pub per_turn: bool,
 }
 
 impl Default for ReflexConfig {
@@ -367,6 +394,63 @@ impl Default for ReflexConfig {
             enabled: true,
             preamble: None,
             sections: BTreeMap::new(),
+            per_turn: true,
+        }
+    }
+}
+
+/// What the `SessionStart` reflex is allowed to see of `[reflex]`.
+///
+/// `per_turn` is deliberately absent: it governs the gate, and a renderer that
+/// cannot name it cannot accidentally branch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionReflex<'a> {
+    pub enabled: bool,
+    pub preamble: Option<&'a str>,
+    pub sections: &'a BTreeMap<String, bool>,
+}
+
+/// What the per-turn gate is allowed to see of `[reflex]`.
+///
+/// `preamble` and `sections` are deliberately absent: the gate card is a `const`
+/// with no framing and no sections, so a gate that *could* read them would be a
+/// gate someone could plausibly expect to honour them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateReflex {
+    pub enabled: bool,
+    pub per_turn: bool,
+}
+
+impl ReflexConfig {
+    /// The `SessionStart` reflex's view.
+    ///
+    /// **One deserialized surface, two narrow views — deliberately not two
+    /// tables.** `ReflexConfig` is parsed straight out of the user's
+    /// `config.toml`, so its *shape* is a public schema: splitting it into
+    /// `[reflex.session]` / `[reflex.gate]` would silently stop reading every
+    /// `config.toml` already written. The confusion worth fixing is that
+    /// `preamble`/`sections` and `per_turn` drive disjoint code paths, and that
+    /// is a property of the *consumers*, not of the file. So the file keeps one
+    /// flat `[reflex]` table and each consumer is handed only its own fields —
+    /// which makes applying the wrong field unrepresentable at the boundary
+    /// where it would actually be wrong.
+    ///
+    /// `reflex_config_keeps_its_flat_toml_schema` pins the file half of that
+    /// bargain.
+    pub fn session(&self) -> SessionReflex<'_> {
+        SessionReflex {
+            enabled: self.enabled,
+            preamble: self.preamble.as_deref(),
+            sections: &self.sections,
+        }
+    }
+
+    /// The per-turn gate's view. See [`ReflexConfig::session`] for why this is a
+    /// view rather than a nested table.
+    pub fn gate(&self) -> GateReflex {
+        GateReflex {
+            enabled: self.enabled,
+            per_turn: self.per_turn,
         }
     }
 }
@@ -405,7 +489,8 @@ pub struct Config {
     /// asked for explicitly, because that is a command rather than a policy.
     #[serde(default = "default_true")]
     pub reap_finished_panes: bool,
-    /// SessionStart reflex configuration (see [`ReflexConfig`]).
+    /// Reflex configuration for **both** hooks — the `SessionStart` router
+    /// injection and the per-turn gate card (see [`ReflexConfig`]).
     #[serde(default)]
     pub reflex: ReflexConfig,
     #[serde(default = "default_agents")]
@@ -2240,6 +2325,156 @@ escalation = true
         let cfg = load_config().unwrap();
         assert!(cfg.reflex.enabled);
         assert_eq!(cfg.reflex.preamble.as_deref(), Some("only a preamble here"));
+    }
+
+    #[test]
+    fn reflex_config_keeps_its_flat_toml_schema() {
+        // THE POINT OF THIS TEST: `ReflexConfig` is deserialized straight out of
+        // the user's config.toml, so its shape is a PUBLIC SCHEMA. The
+        // consumer-facing split into `session()` / `gate()` views is allowed
+        // precisely because it leaves this file format untouched — and a
+        // refactor of a config type that nobody proved still reads old configs
+        // is exactly the failure class this repo keeps hitting.
+        //
+        // So: one flat `[reflex]` table naming ALL FOUR keys plus a
+        // `[reflex.sections]` subtable — i.e. everything a user could already
+        // have written — must still parse, and parse to these values.
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[reflex]\n\
+             enabled = true\n\
+             per_turn = false\n\
+             preamble = \"BESPOKE FRAMING\"\n\
+             \n\
+             [reflex.sections]\n\
+             escalation = false\n\
+             methodology = true\n",
+        )
+        .unwrap();
+
+        let cfg = load_config().unwrap().reflex;
+        assert!(cfg.enabled);
+        assert!(!cfg.per_turn);
+        assert_eq!(cfg.preamble.as_deref(), Some("BESPOKE FRAMING"));
+        assert_eq!(cfg.sections.get("escalation"), Some(&false));
+        assert_eq!(cfg.sections.get("methodology"), Some(&true));
+
+        // Each view carries its own fields and no others — the whole reason the
+        // split exists. Asserted on the SAME parsed config, so this cannot pass
+        // by testing a hand-built value that no config.toml produces.
+        //
+        // THE `enabled = true` / `per_turn = false` SKEW ABOVE IS LOAD-BEARING:
+        // it is what catches a view that crosses the wires (e.g. `session()`
+        // returning `enabled: self.enabled && self.per_turn`). Do not "tidy" the
+        // fixture so the two bools agree.
+        // Asserted absolutely, not against `cfg`'s own fields — `x == x` would
+        // hold for a view that copied the wrong field into the right slot.
+        let session = cfg.session();
+        assert!(session.enabled);
+        assert_eq!(session.preamble, Some("BESPOKE FRAMING"));
+        assert_eq!(session.sections.get("escalation"), Some(&false));
+        assert_eq!(session.sections.get("methodology"), Some(&true));
+
+        let gate = cfg.gate();
+        assert_eq!(
+            gate,
+            GateReflex {
+                enabled: true,
+                per_turn: false
+            },
+            "the gate view must carry enabled and per_turn, and nothing else"
+        );
+    }
+
+    #[test]
+    fn nested_reflex_tables_are_not_the_schema() {
+        // The guard on the other direction: if someone later "fixes" the flat
+        // struct by moving to `[reflex.session]` / `[reflex.gate]`, every
+        // config.toml already on disk keeps parsing (unknown tables are
+        // ignored) while silently reverting to defaults — a change that is
+        // invisible to every other test in this file. Pinning the flat spelling
+        // here makes that migration fail loudly instead.
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[reflex]\n\
+             enabled = false\n\
+             \n\
+             [reflex.gate]\n\
+             per_turn = false\n\
+             \n\
+             [reflex.session]\n\
+             preamble = \"X\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_config().unwrap().reflex;
+
+        // POSITIVE CONTROL FIRST. Without it this whole test asserts only that
+        // some values equal their defaults — which is also what "the config file
+        // was never read at all" produces, so a renamed `config_path()`, a
+        // wrong env var in `set_config_home`, or a `load_config` that swallowed
+        // the parse error would all keep it green while it claims to guard this
+        // exact direction.
+        assert!(
+            !cfg.enabled,
+            "the flat [reflex] key must have been read — if this fails the rest \
+             of this test proves nothing, because unread and ignored look alike"
+        );
+
+        // Now the negatives, for BOTH nested spellings: a migration that moved
+        // only one of them would otherwise slip past.
+        assert!(
+            cfg.per_turn,
+            "`per_turn` lives at the top of [reflex], not under [reflex.gate]; \
+             if this ever starts passing, the schema moved and every existing \
+             config.toml silently lost its setting"
+        );
+        assert!(
+            cfg.preamble.is_none(),
+            "`preamble` lives at the top of [reflex], not under [reflex.session]"
+        );
+    }
+
+    #[test]
+    fn per_turn_defaults_true_with_reflex_table_present() {
+        // Same trap as `enabled`, one key over: a `[reflex]` table that names
+        // `enabled` but omits `per_turn` must still gate every turn. A bare
+        // `#[serde(default)]` here would yield `false` and silently kill the
+        // per-turn gate for every user who has ever written a `[reflex]` table.
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[reflex]\nenabled = true\n").unwrap();
+
+        let cfg = load_config().unwrap();
+        assert!(
+            cfg.reflex.per_turn,
+            "per_turn must default to true under a present [reflex] table"
+        );
+        // And the built-in default (no config file at all) agrees.
+        assert!(ReflexConfig::default().per_turn);
+    }
+
+    #[test]
+    fn per_turn_false_is_honored() {
+        // The key is suppressible: an explicit `false` must survive round-trip,
+        // or the "suppressible per-user" half of the contract is a claim with
+        // nothing keeping it.
+        let env = TestEnv::new();
+        let dir = env.config_root().join("drovr");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[reflex]\nper_turn = false\n").unwrap();
+
+        let cfg = load_config().unwrap();
+        assert!(!cfg.reflex.per_turn);
+        // Disabling the per-turn gate must not disable the SessionStart reflex.
+        assert!(cfg.reflex.enabled);
     }
 
     #[test]

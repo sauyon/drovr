@@ -1,0 +1,98 @@
+[
+ {
+  "transcript_id": "021908",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "0400b3",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "06e1e0",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "11da2e",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "130032",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "1339aa",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "16c609",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "1b8567",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "1c033a",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "1c0e53",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "1dc76b",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ },
+ {
+  "transcript_id": "2060a9",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "27d721",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "2c6312",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "2d95fa",
+  "second_pass_compliant": true,
+  "primary_compliant": true,
+  "agrees": true
+ },
+ {
+  "transcript_id": "2f37d9",
+  "second_pass_compliant": false,
+  "primary_compliant": false,
+  "agrees": true
+ }
+]

@@ -1,0 +1,22 @@
+{
+  "d88c87": {
+    "arm": "none",
+    "scenario": "verification-before-completion-2",
+    "sample": 1
+  },
+  "e9c9a1": {
+    "arm": "none",
+    "scenario": "verification-before-completion-2",
+    "sample": 2
+  },
+  "885744": {
+    "arm": "none",
+    "scenario": "verification-before-completion-3",
+    "sample": 1
+  },
+  "16413d": {
+    "arm": "none",
+    "scenario": "verification-before-completion-3",
+    "sample": 2
+  }
+}

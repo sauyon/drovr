@@ -1384,6 +1384,21 @@ fn parse_agent_session(value: &Value) -> Option<AgentSession> {
 // FakeHerdr — records calls; scripted return values for tests
 // ---------------------------------------------------------------------------
 
+/// What `agent_read` reports when a test has queued nothing for the pane.
+///
+/// The SAME fiction `pane_info`'s default tells: a booted agent parked at its
+/// composer with nothing pending. It must not be the empty string, because empty
+/// is now a distinct fact — `ComposerEvidence::Blank`, an agent that has not
+/// finished drawing — and defaulting to it would make every test that does not
+/// care about pane contents look like a launch that never came up. A test that
+/// wants a blank pane pushes one.
+///
+/// Deliberately carries no paste placeholder and no line long enough to be
+/// mistaken for a payload prefix, so the default can never read as evidence that
+/// a seed arrived.
+#[cfg(test)]
+pub const DEFAULT_FAKE_PANE: &str = "  Plan, search, build anything\n\n  > \n  agent 1.0";
+
 #[cfg(test)]
 pub struct FakeHerdr {
     calls: RefCell<Vec<String>>,
@@ -1433,6 +1448,11 @@ pub struct FakeHerdr {
     /// When true, EVERY `agent_read` returns an error — models a pane drovr
     /// cannot inspect, so callers that reason about pane contents must fail safe.
     fail_agent_read: RefCell<bool>,
+    /// When true, every `agent_read` succeeds and comes back EMPTY — a pane whose
+    /// agent has taken the alternate screen and not drawn into it yet. Distinct
+    /// from `fail_agent_read` in exactly the way the caller cares about: this is a
+    /// successful look at nothing, not a failure to look.
+    blank_agent_read: RefCell<bool>,
     /// `Some(n)`: only the next `n` `agent_read`s fail, and the rest succeed.
     /// Bounds `fail_agent_read` so a test can model a caller whose FIRST look at a
     /// pane failed and whose second succeeded — the two-look asymmetry a single
@@ -1499,6 +1519,7 @@ impl FakeHerdr {
             live_workspaces: RefCell::new(Some(Vec::new())),
             fail_workspace_close: RefCell::new(false),
             fail_agent_read: RefCell::new(false),
+            blank_agent_read: RefCell::new(false),
             agent_read_failures_left: RefCell::new(None),
             dead_panes: RefCell::new(std::collections::HashSet::new()),
             dead_workspaces: RefCell::new(std::collections::HashSet::new()),
@@ -1803,6 +1824,13 @@ impl FakeHerdr {
         *self.fail_agent_read.borrow_mut() = true;
     }
 
+    /// Make every `agent_read` come back EMPTY: a pane that reads fine and has
+    /// nothing on it, which is what an agent looks like between taking the
+    /// alternate screen and painting its interface.
+    pub fn blank_agent_read(&self) {
+        *self.blank_agent_read.borrow_mut() = true;
+    }
+
     /// Let `agent_read` start working again after `n` more failures — for the
     /// case a single failure mode cannot express: a caller that looks TWICE and
     /// gets a different answer each time.
@@ -1987,6 +2015,9 @@ impl Herdr for FakeHerdr {
                 None => return Err(io::Error::other("scripted agent_read failure")),
             }
         }
+        if *self.blank_agent_read.borrow() {
+            return Ok(String::new());
+        }
         // A transcript queued for this exact pane wins; otherwise fall back to the
         // pane-agnostic queue most tests use.
         if let Some(text) = self
@@ -1997,7 +2028,11 @@ impl Herdr for FakeHerdr {
         {
             return Ok(text);
         }
-        let text = self.read_queue.borrow_mut().pop_front().unwrap_or_default();
+        let text = self
+            .read_queue
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| DEFAULT_FAKE_PANE.to_string());
         Ok(text)
     }
 

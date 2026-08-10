@@ -5,6 +5,7 @@ mod config;
 mod env;
 mod findings;
 mod herdr;
+mod interview;
 mod mcp_findings;
 mod phase;
 mod reflex;
@@ -154,21 +155,78 @@ enum Commands {
         sub: ReviewCmd,
     },
 
+    /// Ask the human a question mid-phase, without blocking on the answer.
+    ///
+    /// `drovr ask <run> --question …` appends the question to the run's interview
+    /// log, makes sure the panel is up, and **exits immediately**. It never waits.
+    /// That is the whole design: a blocking ask dies on its timeout while the human
+    /// is away, and a dead call takes the question with it. Here the question is on
+    /// disk before the process exits, so nothing can lose it.
+    ///
+    /// `drovr ask wait <run>` is the separate, re-armable half: background it, end
+    /// your turn, and re-run it if it times out. A timeout costs nothing — the
+    /// question is still on disk and still on screen.
+    ///
+    /// The bare form and the `wait` subcommand share one positional slot, and
+    /// **`args_conflicts_with_subcommands` is the switch that makes that safe**: it
+    /// is what stops `ask wait <run> --question …` from parsing as something halfway
+    /// between the two forms, and `ask_cannot_be_both_the_bare_form_and_the_wait_
+    /// subcommand` is what keeps it. Do not drop it as redundant.
+    ///
+    /// `subcommand_negates_reqs` is inert as the fields stand — clap-derive already
+    /// treats `Option`/`Vec` as not required, so it relaxes nothing. It is kept
+    /// because it is what would let `run` become a required `String` here; until then
+    /// `run` and `question` are `Option` and [`validate_ask_request`] enforces them by
+    /// hand. Neither the emptiness of one switch nor the necessity of the other is
+    /// guessable from the attribute, which is why it is written down.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Ask {
+        #[command(subcommand)]
+        sub: Option<AskCmd>,
+        /// Run to ask (bare form).
+        run: Option<String>,
+        /// The question. `@<path>` reads it from a file; `@@` escapes a leading `@`.
+        #[arg(long)]
+        question: Option<String>,
+        /// Text shown alongside the question. Mutually exclusive with
+        /// `--context-file`; the pair means the same here as on `phase brief` and
+        /// `code-review run`, deliberately — `--context` naming a PATH in exactly one
+        /// command is how `--context "some text"` becomes a confusing failure.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+        /// File whose contents are shown alongside the question.
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+        /// A selectable answer, as `<value>=<label>`. Repeatable.
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Pre-select this option `value` (must be one of `--option`'s, when any
+        /// are offered).
+        #[arg(long)]
+        recommend: Option<String>,
+    },
+
     /// Automatic review-until-clean panel (see drovr:code-review).
     CodeReview {
         #[command(subcommand)]
         sub: CodeReviewCmd,
     },
 
-    /// Emit the SessionStart reflex context as Claude Code hook JSON.
+    /// Emit reflex context as Claude Code hook JSON.
     ///
-    /// Run by the `session-start` hook. Reads `--skill`, shapes it per the
+    /// Two modes, exactly one of which must be selected. `--skill` is the
+    /// `SessionStart` reflex: read the router markdown, shape it per the
     /// `[reflex]` config (master switch, preamble override, section toggles),
-    /// and prints the hook JSON — or nothing when the reflex is disabled.
+    /// print the hook JSON. `--gate` is the per-turn `UserPromptSubmit` card:
+    /// read the hook payload from stdin and print the gate JSON — or nothing
+    /// when the gate is off or the previous turn already invoked a drovr skill.
     Reflex {
-        /// Path to the router skill markdown to inject.
-        #[arg(long)]
-        skill: PathBuf,
+        /// Path to the router skill markdown to inject (SessionStart reflex).
+        #[arg(long, required_unless_present = "gate")]
+        skill: Option<PathBuf>,
+        /// Emit the per-turn gate card instead (UserPromptSubmit).
+        #[arg(long, conflicts_with = "skill", required_unless_present = "skill")]
+        gate: bool,
     },
 
     /// Serve the review panel's one-tool MCP findings channel on stdio.
@@ -324,6 +382,36 @@ enum ReviewCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum AskCmd {
+    /// Block until every question that was outstanding when this started has an
+    /// answer, then print them as JSON.
+    ///
+    /// A pure file poller — it needs no server. The set of questions is snapshotted
+    /// once, at start: an ask posted after that is not waited on, so the contract is
+    /// exactly "the questions I had outstanding when I backgrounded this".
+    ///
+    /// Exit codes: 0 = every snapshotted question is answered (the JSON array is on
+    /// stdout), 2 = timeout (re-run to resume — nothing is lost), 5 = the run was
+    /// cancelled (terminal — stop work), 1 = error.
+    ///
+    /// Only stdout carries the JSON; the other outcomes report on stderr. Do not
+    /// pipe this command — a pipeline's status is its LAST command's, which turns a
+    /// timeout into a success (`docs/known-issues.md`, *"Piping a `wait` command
+    /// destroys its exit-code contract — a timeout reads as approval"*).
+    ///
+    /// One collision to know about, shared with `review wait` and not introduced
+    /// here: clap exits 2 on a bad flag, so `--bogus` is indistinguishable BY CODE
+    /// from a timeout. Both stay on stderr, and a timeout always names the run and
+    /// says to re-run; a caller that retries a mistyped flag forever should read the
+    /// message, not just the status.
+    Wait {
+        run: String,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CodeReviewCmd {
     /// Record HEAD as the review base for `task` (run by the implement phase at
     /// task start, before any code is written, so HEAD is the pre-task SHA).
@@ -392,8 +480,36 @@ fn validate_label(kind: &str, s: &str) -> io::Result<()> {
 
 /// Reject run names that are empty or contain path-separator characters.
 /// Thin wrapper over the shared [`validate_label`] predicate.
+///
+/// Deliberately does NOT reserve `wait` — see [`validate_askable_run_name`]. This is
+/// the validator every command uses to *operate on* a run, and a run named `wait`
+/// that predates the reservation must stay operable, `cleanup` above all. Reserving a
+/// name for new runs and refusing to touch existing ones are different decisions.
 fn validate_run_name(name: &str) -> io::Result<()> {
     validate_label("run name", name)
+}
+
+/// [`validate_run_name`], plus the reservation of the literal name `wait`.
+///
+/// `drovr ask` takes its run as a bare positional and `drovr ask wait <run>` as a
+/// subcommand, so a run actually named `wait` makes `drovr ask wait` mean two things —
+/// and clap resolves that in favour of the subcommand, silently. Such a run therefore
+/// cannot be asked a question at all.
+///
+/// Used by the two commands where that matters: `drovr new` (so the name cannot be
+/// taken from here on) and `drovr ask` (which cannot honour it). Everything else keeps
+/// the general validator, so a `wait` run created before this existed is still
+/// listable, attachable and — the one that would really hurt — cleanable.
+fn validate_askable_run_name(name: &str) -> io::Result<()> {
+    validate_run_name(name)?;
+    if name == "wait" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "run name \"wait\" is reserved: `drovr ask wait <run>` is the wait subcommand, \
+             so a run called \"wait\" could never be asked a question",
+        ));
+    }
+    Ok(())
 }
 
 fn load_run(name: &str) -> RunState {
@@ -556,7 +672,10 @@ fn cmd_new(
     no_worktree_flag: bool,
     herdr: &SystemHerdr,
 ) {
-    if let Err(e) = validate_run_name(name) {
+    // The one place the `wait` reservation belongs: a name refused here can never be
+    // taken, which is cheaper than discovering at ask time that this run's questions
+    // have nowhere to go.
+    if let Err(e) = validate_askable_run_name(name) {
         eprintln!("drovr: {e}");
         process::exit(1);
     }
@@ -1899,13 +2018,16 @@ fn cmd_review(sub: ReviewCmd) {
             }
             match review_wait(&run, timeout_ms) {
                 Ok(WaitOutcome::Approved) => {
-                    // Approval can carry answers: the reviewer may have answered
-                    // the spec's open questions on the way to approving, and
-                    // feedback.json is the only place those land. Say so, or the
-                    // agent moves on and re-asks the human what they just told us.
-                    println!(
-                        "review approved for run '{run}' (any answers to open questions are in feedback.json)"
-                    );
+                    // This used to add "(any answers to open questions are in
+                    // feedback.json)". A spec no longer HAS open questions — they
+                    // are asked with `drovr ask` and answered one at a time into
+                    // `interview.jsonl` — and the review page no longer submits
+                    // any (`answers: {}`, `cli/web/index.html`). Pointing the
+                    // agent at `feedback.json#answers` on approval now sends it
+                    // to an empty map looking for decisions it already has, and
+                    // contradicts `phase-prompts/brainstorm.md`, which tells it
+                    // outright that question answers never land there.
+                    println!("review approved for run '{run}'");
                 }
                 Ok(WaitOutcome::ChangesRequested) => {
                     println!("review: changes requested for run '{run}' (see feedback.json)");
@@ -1932,18 +2054,338 @@ fn cmd_review(sub: ReviewCmd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ask — post a question without blocking, and the separate wait for its answer
+// ---------------------------------------------------------------------------
+
+/// The bare form, spelled out. Printed under every usage error, because the errors
+/// exist to say which of these parts was wrong.
+const ASK_USAGE: &str = "usage: drovr ask <run> --question <text|@file> \
+                         [--context <text> | --context-file <path>] \
+                         [--option <value>=<label>]... [--recommend <value>]";
+
+/// Where `--question`'s text comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum QuestionSource {
+    /// The argument is the question.
+    Literal(String),
+    /// The argument was `@<path>`; the question is that file's contents.
+    File(PathBuf),
+}
+
+/// Split `--question`'s argument into "this is the text" or "read this file".
+///
+/// A leading `@` is the ONLY form meaning "file", so a question that legitimately
+/// opens with `@` (`@channel: which arm?`) needs an escape, and `@@` is it. Without
+/// one, that question would be read as a path and the command would fail with a
+/// confusing "cannot read" — or, worse on some other day, succeed against a file that
+/// happens to exist.
+fn question_source(raw: &str) -> QuestionSource {
+    if let Some(rest) = raw.strip_prefix("@@") {
+        QuestionSource::Literal(format!("@{rest}"))
+    } else if let Some(path) = raw.strip_prefix('@').filter(|p| !p.is_empty()) {
+        QuestionSource::File(PathBuf::from(path))
+    } else {
+        // Includes a bare `@`, which names no file and so is just an odd question.
+        QuestionSource::Literal(raw.to_string())
+    }
+}
+
+/// A hand-validated `drovr ask` invocation. `question` is still raw — `@<path>` is
+/// resolved later, in [`cmd_ask`], because that is I/O and this is not.
+#[derive(Debug)]
+struct AskRequest {
+    run: String,
+    question: String,
+    options: Vec<interview::AskOption>,
+    recommend: Option<String>,
+}
+
+/// Validate the bare form's arguments, which clap cannot.
+///
+/// `run` and `question` are `Option` at the clap layer because the bare form shares
+/// its positional slot with the `wait` subcommand (see [`Commands::Ask`]). So `drovr
+/// ask myrun` parses fine, and this is the only thing that refuses it. Do not relax
+/// either check into a default.
+///
+/// Every error is `InvalidInput` and names the part that was wrong; the caller prints
+/// [`ASK_USAGE`] beneath it.
+fn validate_ask_request(
+    run: Option<&str>,
+    question: Option<&str>,
+    option_specs: &[String],
+    recommend: Option<&str>,
+) -> io::Result<AskRequest> {
+    let usage = |msg: String| -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("ask: {msg}"))
+    };
+
+    let run = run.ok_or_else(|| usage("missing <run>".to_string()))?;
+    validate_askable_run_name(run)?;
+    let question = question.ok_or_else(|| usage("missing --question".to_string()))?;
+
+    let mut options = Vec::with_capacity(option_specs.len());
+    for spec in option_specs {
+        // Split on the FIRST `=`, so a label may contain one. Only the SHAPE of the
+        // argument string is checked here — that is the one part of an option that
+        // exists solely at the CLI. Whether the halves are usable is
+        // `interview::check_options`'s call, below, so a caller reaching the module
+        // any other way meets the same rule.
+        let (value, label) = spec
+            .split_once('=')
+            .ok_or_else(|| usage(format!("--option {spec:?} is not <value>=<label>")))?;
+        options.push(interview::AskOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        });
+    }
+
+    // Both are `interview`'s own predicates, not second copies of them, and both are
+    // checked here only so the failure is a usage error before anything is written
+    // rather than an I/O error after — and, since `cmd_ask` checks the run dir and
+    // reads `--context` first, so the message names the actual mistake rather than
+    // whatever the disk happened to object to first. Calling the module's functions is
+    // what keeps the CLI from being stricter or laxer than the writer it goes through;
+    // `ask_recommend_rule_is_one_implementation_not_two` and
+    // `ask_option_values_must_be_distinct_and_the_cli_says_so_first` hold them in step.
+    interview::check_options(&options).map_err(usage)?;
+    if !interview::recommend_is_offered(recommend, &options) {
+        return Err(usage(format!(
+            "--recommend {:?} names no offered --option",
+            recommend.unwrap_or_default()
+        )));
+    }
+
+    Ok(AskRequest {
+        run: run.to_string(),
+        question: question.to_string(),
+        options,
+        recommend: recommend.map(str::to_string),
+    })
+}
+
+/// Whether the reviewer has cancelled this run.
+///
+/// The marker `handle_post_submit` writes (`cli/src/review.rs`), read off disk rather
+/// than from the server, so `ask wait` needs nothing running to see it. One predicate
+/// for the four places that ask — `cmd_ask`, `cmd_ask_wait` before and inside its loop,
+/// and the server's `POST answer` — because a condition spelled out per call site is one
+/// that drifts. `pub(crate)` for that last caller, running the same direction
+/// `close_run_panes` already does: crate root down into `review`.
+pub(crate) fn run_is_cancelled(dir: &std::path::Path) -> bool {
+    dir.join("cancelled").exists()
+}
+
+/// Print the cancellation message both `ask` and `ask wait` use, and exit 5.
+///
+/// Cancellation reads the same way in both directions: there is no point asking a
+/// question of a run nobody intends to finish, and no point waiting for an answer to
+/// one. 5 is the same terminal code `review wait` uses — the driver already routes it
+/// to "stop work and tear the run down".
+fn ask_cancelled(run: &str) -> ! {
+    eprintln!("ask: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down");
+    process::exit(5);
+}
+
+fn cmd_ask(
+    sub: Option<AskCmd>,
+    run: Option<String>,
+    question: Option<String>,
+    context: Option<String>,
+    context_file: Option<PathBuf>,
+    options: Vec<String>,
+    recommend: Option<String>,
+) {
+    if let Some(AskCmd::Wait { run, timeout_ms }) = sub {
+        cmd_ask_wait(&run, timeout_ms);
+        return;
+    }
+
+    let req = validate_ask_request(
+        run.as_deref(),
+        question.as_deref(),
+        &options,
+        recommend.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("drovr: {e}");
+        eprintln!("{ASK_USAGE}");
+        process::exit(1);
+    });
+
+    let dir = run_dir(&req.run);
+    if !dir.is_dir() {
+        eprintln!(
+            "drovr: ask: no run '{}' at {} — create it with `drovr new` first",
+            req.run,
+            dir.display()
+        );
+        process::exit(1);
+    }
+    // Before the append, not after: refusing to post is only meaningful if nothing
+    // was posted.
+    if run_is_cancelled(&dir) {
+        ask_cancelled(&req.run);
+    }
+
+    let question = match question_source(&req.question) {
+        QuestionSource::Literal(text) => text,
+        QuestionSource::File(path) => read_bounded_file("--question @<file>", &path),
+    };
+    // The CLI-wide resolver, not a private one: clap has already enforced that the
+    // two are exclusive, and this applies the same cap and the same guarded read that
+    // every other command's context gets.
+    let context = read_context_arg(context, context_file);
+
+    let ask = interview::append_ask(
+        &dir,
+        &question,
+        context.as_deref(),
+        &req.options,
+        req.recommend.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("drovr: ask failed: {e}");
+        process::exit(1);
+    });
+
+    // Deliberately `review summary`'s shape: the agent gets the page to point the
+    // human at and the watch to background, in the same two lines it already knows.
+    println!("ask: posted {} for run '{}'", ask.id, req.run);
+    match review::ensure_server() {
+        Ok(addr) => println!("  page:  http://{}/#/runs/{}", display_addr(&addr), req.run),
+        // The record is ALREADY on disk, so this is not a failure of the ask. A
+        // question that cannot be displayed yet is not a question that was lost, and
+        // exiting non-zero here would tell the agent to re-ask one the human will see
+        // the moment the panel comes up.
+        Err(e) => println!(
+            "  note:  review server not up ({e}); the question is on disk and appears as soon as it is"
+        ),
+    }
+    println!(
+        "  wait:  drovr ask wait {}   # run this BACKGROUNDED, then end your turn",
+        shell_single_quote(&req.run)
+    );
+    // No wait, no poll, no answer: this returns NOW. `ask` blocking on its answer is
+    // the design this replaces — a blocking call dies on its timeout while the human
+    // is away, and takes the unanswered question with it.
+}
+
+/// Block until every question outstanding at start has an answer. Exits 0/2/5/1.
+///
+/// A pure file poller — no server, so it works while the panel is down and the
+/// question is merely waiting to be displayed.
+fn cmd_ask_wait(run: &str, timeout_ms: u64) {
+    if let Err(e) = validate_run_name(run) {
+        eprintln!("drovr: {e}");
+        process::exit(1);
+    }
+    let dir = run_dir(run);
+    // The same guard the post half applies, and for a sharper reason: a run dir that
+    // is not there folds, through `interview::read`, to exactly what a fully answered
+    // interview folds to — an empty log. Ungated, the wait would print `[]` and exit 0,
+    // i.e. "answered, nothing outstanding", to a caller that typo'd the run name.
+    //
+    // Re-checked every poll, not just here: a wait can outlive its run (`drovr cleanup
+    // <run> --purge` removes the dir), and a 30-minute wait is a long exposure. One
+    // entry check would let a purged run poll out its whole timeout and then exit 2
+    // claiming the question is "still on disk and still on screen" — false in both
+    // halves, and the re-run it recommends answers differently (1).
+    let require_run_dir = || {
+        if !dir.is_dir() {
+            eprintln!(
+                "drovr: ask wait: no run '{run}' at {} — nothing to wait for",
+                dir.display()
+            );
+            process::exit(1);
+        }
+    };
+    require_run_dir();
+    // An unreadable-but-present log is a real failure (exit 1), never "no questions":
+    // reporting a broken interview as an empty one would exit 0 and wave the caller on.
+    let read_log = || -> Vec<interview::Ask> {
+        interview::read(&dir).unwrap_or_else(|e| {
+            eprintln!("drovr: ask wait failed: {e}");
+            process::exit(1);
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    // Checked before the snapshot as well as inside the loop: on a cancelled run with
+    // nothing outstanding, the nothing-pending shortcut below would exit 0, which tells
+    // the caller to carry on with a run that is over.
+    if run_is_cancelled(&dir) {
+        ask_cancelled(run);
+    }
+
+    // Snapshotted ONCE. An ask posted after this is not waited on, so the contract is
+    // "the questions I had outstanding when I backgrounded this" — a later ask has its
+    // own wait, armed by whoever posted it.
+    let asks = read_log();
+    let snapshot = interview::pending(&asks);
+    if snapshot.is_empty() {
+        // Nothing to wait for, so return the interview as it stands — NOT a bare `[]`.
+        // The difference is the re-arm race: a wait times out, the human answers in the
+        // seconds before the caller re-arms, and the new wait finds nothing pending. A
+        // `[]` there would pair exit 0 ("answered") with no answer, and the caller would
+        // walk on without it — the timeout costing exactly what it promised not to. An
+        // empty log still prints `[]`, because that is its fold.
+        println!("{}", interview::to_json(&asks));
+        return;
+    }
+
+    loop {
+        // Cancellation first — it is terminal, and outranks an answer that arrived on
+        // the same tick. Then the run dir, so a purge is an error and not a slow
+        // timeout. Only then is an unchanged log genuinely "no answer yet".
+        if run_is_cancelled(&dir) {
+            ask_cancelled(run);
+        }
+        require_run_dir();
+        let asks = read_log();
+        let mut waited: Vec<interview::Ask> = asks
+            .into_iter()
+            .filter(|a| snapshot.contains(&a.id))
+            .collect();
+        waited.sort_by_key(|a| a.seq);
+        // Length too: an id that vanished from the log (only a hand-edit can do that)
+        // can never be answered, and reporting the rest as the answer set would hand
+        // the caller a short array it has no way to notice.
+        if waited.len() == snapshot.len() && waited.iter().all(|a| a.answer.is_some()) {
+            println!("{}", interview::to_json(&waited));
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Costs nothing: the question is still on disk and still on screen, and
+            // re-running re-arms the same wait. This is why `ask` never blocks.
+            eprintln!(
+                "ask wait: no answer for run '{run}' within timeout — the question is still on \
+                 disk and still on screen; re-run to resume"
+            );
+            process::exit(2);
+        }
+        std::thread::sleep(review::POLL_INTERVAL.min(deadline - now));
+    }
+}
+
 /// Resolve `--context` / `--context-file` into the context text. clap enforces that
 /// the two are mutually exclusive, so this only has to read the file. An unreadable
 /// `--context-file` EXITS rather than proceeding contextless: the driver asked for that
 /// context to be in the brief, and silently reviewing without it is the failure this
 /// whole mechanism exists to prevent.
-/// Read `--context-file`: a regular file, not through a symlink, size-bounded.
+/// Read a file named by `flag`: a regular file, not through a symlink, size-bounded.
 ///
 /// The path is often inside the run dir, which agents write to (handoffs live there), so it
 /// gets the same treatment as a recorded context: a symlink there would inject an arbitrary
 /// readable file into the brief, a FIFO would hang the driver on `read_to_string`, and a
 /// metadata-only size check is a TOCTOU the read itself has to enforce.
-fn read_context_file(path: &std::path::Path) -> String {
+///
+/// `flag` is only for the messages — every caller's path arrives the same way and gets the
+/// same treatment. One reader for all of them on purpose: `--question @<file>` and
+/// `--context` reach exactly the same untrusted directory, so a second, laxer reader for
+/// the newer flag is how the guard above gets quietly lost.
+fn read_bounded_file(flag: &str, path: &std::path::Path) -> String {
     use brief::MAX_CONTEXT;
     let bail = |msg: String| -> ! {
         eprintln!("drovr: {msg}");
@@ -1951,26 +2393,20 @@ fn read_context_file(path: &std::path::Path) -> String {
     };
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) => bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        )),
+        Err(e) => bail(format!("cannot read {flag} {}: {e}", path.display())),
     };
     if meta.file_type().is_symlink() {
         bail(format!(
-            "--context-file {} is a symlink; pass the real path",
+            "{flag} {} is a symlink; pass the real path",
             path.display()
         ));
     }
     if !meta.file_type().is_file() {
-        bail(format!(
-            "--context-file {} is not a regular file",
-            path.display()
-        ));
+        bail(format!("{flag} {} is not a regular file", path.display()));
     }
     if meta.len() > MAX_CONTEXT {
         bail(format!(
-            "--context-file {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
+            "{flag} {} is {} bytes, over the {MAX_CONTEXT}-byte limit — that is not a \
              context; check what you passed",
             path.display(),
             meta.len()
@@ -1978,22 +2414,16 @@ fn read_context_file(path: &std::path::Path) -> String {
     }
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) => bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        )),
+        Err(e) => bail(format!("cannot read {flag} {}: {e}", path.display())),
     };
     let mut text = String::new();
     if let Err(e) = io::Read::read_to_string(&mut io::Read::take(file, MAX_CONTEXT + 1), &mut text)
     {
-        bail(format!(
-            "cannot read --context-file {}: {e}",
-            path.display()
-        ));
+        bail(format!("cannot read {flag} {}: {e}", path.display()));
     }
     if text.len() as u64 > MAX_CONTEXT {
         bail(format!(
-            "--context-file {} grew past the {MAX_CONTEXT}-byte limit while being read",
+            "{flag} {} grew past the {MAX_CONTEXT}-byte limit while being read",
             path.display()
         ));
     }
@@ -2014,7 +2444,7 @@ fn read_context_arg(context: Option<String>, context_file: Option<PathBuf>) -> O
             process::exit(1);
         }
         (Some(text), _) => Some(text),
-        (None, Some(path)) => Some(read_context_file(&path)),
+        (None, Some(path)) => Some(read_bounded_file("--context-file", &path)),
         (None, None) => None,
     }
 }
@@ -2187,13 +2617,35 @@ fn cmd_code_review(sub: CodeReviewCmd) {
     }
 }
 
-/// Emit the SessionStart reflex context, or nothing when the reflex is disabled.
+/// Emit reflex context, or nothing when the relevant reflex is disabled.
 ///
-/// The `DROVR_PHASE` phase-suppression lives in the bash hook (it gates before
-/// this runs). Here we honor the config master switch and, when enabled, read
-/// the skill file — failing loudly on a read error rather than injecting a
-/// poisoned or partial context.
-fn cmd_reflex(skill: &std::path::Path) {
+/// The `DROVR_PHASE` phase-suppression lives in the `session-start` bash hook
+/// (it gates before this runs) and applies to the SessionStart reflex only —
+/// the per-turn gate deliberately does *not* suppress inside a phase, because a
+/// phase is exactly where the discipline has to hold.
+///
+/// Clap guarantees exactly one of `--skill` / `--gate`.
+fn cmd_reflex(mode: ReflexMode<'_>) {
+    let skill = match mode {
+        ReflexMode::Gate => {
+            // The gate fails OPEN on a bad config, unlike the branch below.
+            // `load_config` fails for reasons that have nothing to do with
+            // `[reflex]` — a typo anywhere in `config.toml`, an `[agents]`
+            // entry with a relative command — and exiting here would disable
+            // the gate for the whole session on any of them. A gate that goes
+            // quiet because of an unrelated typo is exactly the silent drift
+            // the rest of this code is built to avoid, so it warns and runs on
+            // defaults instead.
+            let cfg = config::load_config().unwrap_or_else(|e| {
+                eprintln!("drovr: failed to load config ({e}); gating on reflex defaults");
+                config::Config::default()
+            });
+            return cmd_reflex_gate(cfg.reflex.gate());
+        }
+        ReflexMode::Session(path) => path,
+    };
+    // The SessionStart reflex fails LOUD: it injects a whole skill body, and a
+    // half-read config would frame it wrongly.
     let cfg = config::load_config().unwrap_or_else(|e| {
         eprintln!("drovr: failed to load config: {e}");
         process::exit(1);
@@ -2204,7 +2656,60 @@ fn cmd_reflex(skill: &std::path::Path) {
     });
     // `reflex_json` is the single authority on the `enabled` switch: it returns
     // `None` (emit nothing) when the reflex is disabled, `Some(json)` otherwise.
-    if let Some(json) = reflex::reflex_json(&skill_md, &cfg.reflex) {
+    if let Some(json) = reflex::reflex_json(&skill_md, cfg.reflex.session()) {
+        println!("{json}");
+    }
+}
+
+/// Which hook `drovr reflex` is serving. The two modes are mutually exclusive
+/// and one is required; [`ReflexMode::from_flags`] is the single place that
+/// decides, so `cmd_reflex` itself is total over its input and has no
+/// impossible case to assert away.
+enum ReflexMode<'a> {
+    /// `SessionStart` — render the router skill at this path.
+    Session(&'a std::path::Path),
+    /// `UserPromptSubmit` — emit the per-turn gate card.
+    Gate,
+}
+
+impl<'a> ReflexMode<'a> {
+    /// `None` for the two flag combinations clap already rejects: neither flag
+    /// (`required_unless_present`) and both flags (`conflicts_with`). Returning
+    /// `None` rather than picking a winner keeps this function honest if that
+    /// wiring is ever loosened — the caller reports the usage error instead of
+    /// silently serving the wrong hook.
+    fn from_flags(skill: Option<&'a std::path::Path>, gate: bool) -> Option<Self> {
+        match (skill, gate) {
+            (Some(path), false) => Some(ReflexMode::Session(path)),
+            (None, true) => Some(ReflexMode::Gate),
+            _ => None,
+        }
+    }
+}
+
+/// Emit the per-turn gate card, or nothing when it is off or already redundant.
+///
+/// **Every failure on this path falls through to emitting** — an unreadable
+/// stdin payload, an absent or unreadable transcript, and (in the caller) a
+/// config that will not load at all. Unlike the SessionStart reflex, where a
+/// partial read would inject a poisoned context and so exits loudly, the gate's
+/// only inputs are evidence that the card is *unnecessary*. Absent evidence is
+/// not evidence of absence: a hook that went quiet on a bad read would trade
+/// silent drift for a redundant 600-byte injection, which is the wrong way
+/// round.
+///
+/// The one thing that does silence it is an explicit decision — `enabled` or
+/// `per_turn` set to `false` in a config that loaded successfully.
+/// Takes the [`config::GateReflex`] view, not the whole `[reflex]` table, so the
+/// gate command cannot name `preamble`/`sections` either — narrowing at
+/// `gate_json` alone would leave this frame able to read them.
+fn cmd_reflex_gate(cfg: config::GateReflex) {
+    // A hook that is somehow run without a payload still gets a decision.
+    let stdin_json = reflex::read_hook_input(std::io::stdin());
+    let transcript = reflex::transcript_path_from_hook_input(&stdin_json)
+        .and_then(|p| reflex::read_transcript_tail(&p));
+
+    if let Some(json) = reflex::gate_json(cfg, transcript.as_deref()) {
         println!("{json}");
     }
 }
@@ -2244,8 +2749,23 @@ fn main() {
             force,
         } => cmd_handoff_scaffold(&run, &phase_name, force),
         Commands::Review { sub } => cmd_review(sub),
+        Commands::Ask {
+            sub,
+            run,
+            question,
+            context,
+            context_file,
+            options,
+            recommend,
+        } => cmd_ask(sub, run, question, context, context_file, options, recommend),
         Commands::CodeReview { sub } => cmd_code_review(sub),
-        Commands::Reflex { skill } => cmd_reflex(&skill),
+        Commands::Reflex { skill, gate } => match ReflexMode::from_flags(skill.as_deref(), gate) {
+            Some(mode) => cmd_reflex(mode),
+            None => {
+                eprintln!("drovr: reflex needs exactly one of --skill <PATH> or --gate");
+                process::exit(2);
+            }
+        },
         Commands::McpFindings { run, task, iter } => {
             // Both reach the filesystem as path components. The panel always supplies
             // names it has already validated, but this is a write-capable entrypoint
@@ -3461,6 +3981,350 @@ mod tests {
         }
     }
 
+    // -- ask --------------------------------------------------------------------
+
+    #[test]
+    fn ask_bare_form_parses_run_and_question() {
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "which arm?",
+            "--option",
+            "a=Arm A",
+            "--recommend",
+            "a",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub,
+                run,
+                question,
+                context,
+                context_file,
+                options,
+                recommend,
+            } => {
+                assert!(sub.is_none(), "the bare form must not select a subcommand");
+                assert_eq!(run.as_deref(), Some("myrun"));
+                assert_eq!(question.as_deref(), Some("which arm?"));
+                assert_eq!(context, None);
+                assert_eq!(context_file, None);
+                assert_eq!(options, vec!["a=Arm A".to_string()]);
+                assert_eq!(recommend.as_deref(), Some("a"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_subcommand_parses() {
+        // The bare form and the subcommand share a positional slot; `wait` must win.
+        let cli = parse(&["drovr", "ask", "wait", "myrun", "--timeout-ms", "500"]).unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub: Some(AskCmd::Wait { run, timeout_ms }),
+                ..
+            } => {
+                assert_eq!(run, "myrun");
+                assert_eq!(timeout_ms, 500);
+            }
+            _ => panic!("`ask wait <run>` must parse as the subcommand, not as run='wait'"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_default_timeout_matches_review_wait() {
+        // One default across both waits: a driver that backgrounds either gets the
+        // same 30 minutes, so the two are interchangeable in a phase prompt.
+        let cli = parse(&["drovr", "ask", "wait", "myrun"]).unwrap();
+        match cli.command {
+            Commands::Ask {
+                sub: Some(AskCmd::Wait { timeout_ms, .. }),
+                ..
+            } => assert_eq!(timeout_ms, 1_800_000),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ask_rejects_a_run_named_wait() {
+        // `drovr ask wait <run>` is only unambiguous while no run is called `wait`, so
+        // `new` and `ask` both refuse the name...
+        assert!(validate_askable_run_name("wait").is_err());
+        assert!(validate_askable_run_name("waiting").is_ok());
+        assert!(validate_ask_request(Some("wait"), Some("q"), &[], None).is_err());
+
+        // ...but the GENERAL validator must not, or a run named `wait` that predates
+        // the reservation becomes unmanageable: `status`, `attach` and above all
+        // `cleanup` would all refuse it, leaving no CLI way to tear it down. Reserving
+        // a name for new runs and refusing to operate on existing ones are different
+        // decisions, and only the first is ours to make.
+        assert!(validate_run_name("wait").is_ok());
+        assert!(validate_run_name("../x").is_err());
+    }
+
+    #[test]
+    fn ask_bare_form_requires_a_question() {
+        // `run`/`question` are `Option` because the bare form shares its positional
+        // slot with the `wait` subcommand, so clap accepts `drovr ask myrun` and this
+        // hand-check is what refuses it.
+        let e = validate_ask_request(Some("myrun"), None, &[], None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--question"), "{e}");
+        let e = validate_ask_request(None, Some("q"), &[], None).unwrap_err();
+        assert!(e.to_string().contains("<run>"), "{e}");
+        assert!(validate_ask_request(Some("myrun"), Some("q"), &[], None).is_ok());
+    }
+
+    #[test]
+    fn ask_option_without_equals_is_a_usage_error() {
+        // The `=` is the CLI's own concern: it is about the shape of the ARGUMENT
+        // STRING, which only the CLI ever sees.
+        let e = validate_ask_request(Some("r"), Some("q"), &["justavalue".to_string()], None)
+            .expect_err("no =");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            e.to_string().contains("<value>=<label>"),
+            "message must name the form: {e}"
+        );
+        // Emptiness is NOT the CLI's concern — `interview` refuses a blank value or
+        // label, and the CLI only relays that, so a caller reaching the module some
+        // other way (the server, a later task) gets the same refusal rather than a
+        // rule that lived in this function's string-splitting all along.
+        for blank in ["=Label", "value=", " =Label"] {
+            let e = validate_ask_request(Some("r"), Some("q"), &[blank.to_string()], None)
+                .expect_err(blank);
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{blank}: {e}");
+            assert!(e.to_string().contains("empty"), "{blank}: {e}");
+        }
+        let ok = validate_ask_request(
+            Some("r"),
+            Some("q"),
+            &["a=Arm A".to_string(), "b=has=equals".to_string()],
+            None,
+        )
+        .unwrap();
+        // Split on the FIRST `=`, so a label may contain one.
+        assert_eq!(ok.options[1].value, "b");
+        assert_eq!(ok.options[1].label, "has=equals");
+    }
+
+    #[test]
+    fn ask_option_values_must_be_distinct_and_the_cli_says_so_first() {
+        // `interview::append_ask` refuses these too — it is the authority. The CLI
+        // calls the SAME predicate purely to get the diagnosis out before `cmd_ask`
+        // touches the disk, exactly as it does for `--recommend`: otherwise a typo'd
+        // run name is reported instead of the actual mistake, because the run-dir
+        // check runs first and the duplicate is only noticed at the append.
+        let dup = ["a=Arm A".to_string(), "a=Arm B".to_string()];
+        let e = validate_ask_request(Some("r"), Some("q"), &dup, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--option"), "{e}");
+
+        // Two options may share a LABEL; only the value is a key.
+        let ok = ["a=Arm".to_string(), "b=Arm".to_string()];
+        assert!(validate_ask_request(Some("r"), Some("q"), &ok, None).is_ok());
+
+        // And, as with recommend, the CLI is neither stricter nor laxer than the
+        // module it writes through — for every rule about the options themselves, not
+        // just uniqueness.
+        let blank = ["=Arm".to_string(), "a=".to_string()];
+        for specs in [&dup, &ok, &blank] {
+            let parsed: Vec<interview::AskOption> = specs
+                .iter()
+                .map(|s| {
+                    let (v, l) = s.split_once('=').unwrap();
+                    interview::AskOption {
+                        value: v.into(),
+                        label: l.into(),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                validate_ask_request(Some("r"), Some("q"), specs, None).is_ok(),
+                interview::check_options(&parsed).is_ok(),
+                "CLI and module disagree on {specs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_recommend_must_name_an_offered_option() {
+        let e = validate_ask_request(Some("r"), Some("q"), &["a=Arm A".to_string()], Some("z"))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("--recommend"), "{e}");
+        assert!(
+            validate_ask_request(Some("r"), Some("q"), &["a=Arm A".to_string()], Some("a")).is_ok()
+        );
+        // With no options at all a recommendation is free-text advice, which
+        // `interview::append_ask` accepts — the CLI must not be stricter than the
+        // module it writes through, or the two rules drift.
+        assert!(validate_ask_request(Some("r"), Some("q"), &[], Some("z")).is_ok());
+    }
+
+    #[test]
+    fn ask_recommend_rule_is_one_implementation_not_two() {
+        // The CLI refuses early so the human gets a usage error instead of an I/O one,
+        // but the PREDICATE is `interview`'s — the comment above is not what keeps them
+        // in step, this is. Every disagreement between the two here is a case where a
+        // question passes the CLI and dies at the append, or vice versa.
+        let opts = [
+            interview::AskOption {
+                value: "a".into(),
+                label: "Arm A".into(),
+            },
+            interview::AskOption {
+                value: "b".into(),
+                label: "Arm B".into(),
+            },
+        ];
+        for (recommend, options) in [
+            (Some("a"), &opts[..]),
+            (Some("z"), &opts[..]),
+            (None, &opts[..]),
+            (Some("z"), &[][..]),
+            (None, &[][..]),
+        ] {
+            let specs: Vec<String> = options
+                .iter()
+                .map(|o| format!("{}={}", o.value, o.label))
+                .collect();
+            assert_eq!(
+                validate_ask_request(Some("r"), Some("q"), &specs, recommend).is_ok(),
+                interview::recommend_is_offered(recommend, options),
+                "CLI and module disagree on recommend={recommend:?} with {} options",
+                options.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ask_cannot_be_both_the_bare_form_and_the_wait_subcommand() {
+        // `Commands::Ask` is a struct: at the Rust type level `sub` and the bare
+        // form's flags can be populated together, an invalid state. Only clap's
+        // `args_conflicts_with_subcommands` keeps it unreachable — so pin it, or a
+        // clap upgrade or an attribute tidy-up reintroduces it silently.
+        //
+        // ORDER MATTERS, and the obvious ordering does not test this. With the flag
+        // AFTER the subcommand, `--question` is simply not an argument of `wait` and
+        // clap rejects it on that ground alone — the assertion passes with the switch
+        // removed. Only a flag BEFORE the subcommand reaches the conflict: without the
+        // switch, `drovr ask --question q wait myrun` parses as BOTH forms at once,
+        // dispatches to `cmd_ask_wait`, and silently discards the question — a
+        // question the caller believes it posted, dropped without a word, which is the
+        // exact failure this whole command exists to prevent.
+        assert!(
+            parse(&["drovr", "ask", "--question", "q", "wait", "myrun"]).is_err(),
+            "a bare-form flag before the subcommand must be refused, not silently dropped"
+        );
+        assert!(
+            parse(&["drovr", "ask", "--option", "a=A", "wait", "myrun"]).is_err(),
+            "a bare-form flag before the subcommand must be refused, not silently dropped"
+        );
+        // The trailing ordering too, which clap refuses for its own reason.
+        assert!(
+            parse(&["drovr", "ask", "wait", "myrun", "--question", "q"]).is_err(),
+            "the two forms must not be mixable"
+        );
+        // And neither form is broken by the switch.
+        assert!(parse(&["drovr", "ask", "wait", "myrun"]).is_ok());
+        assert!(parse(&["drovr", "ask", "myrun", "--question", "q"]).is_ok());
+    }
+
+    #[test]
+    fn ask_context_follows_the_cli_wide_text_or_file_convention() {
+        // `--context <text>` + `--context-file <path>`, as `phase brief` and every
+        // `code-review` subcommand already spell it. `ask` briefly had `--context`
+        // typed as a PATH, which is the one thing that flag never means anywhere else
+        // in this CLI: `drovr ask r --question q --context "the spec is 791 lines"`
+        // would have failed with "cannot read --context the spec is 791 lines".
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "q?",
+            "--context",
+            "inline text",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                context,
+                context_file,
+                ..
+            } => {
+                assert_eq!(context.as_deref(), Some("inline text"));
+                assert_eq!(context_file, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let cli = parse(&[
+            "drovr",
+            "ask",
+            "myrun",
+            "--question",
+            "q?",
+            "--context-file",
+            "/tmp/c.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ask {
+                context,
+                context_file,
+                ..
+            } => {
+                assert_eq!(context, None);
+                assert_eq!(context_file, Some(PathBuf::from("/tmp/c.md")));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Mutually exclusive, as everywhere else — clap enforces it, not `cmd_ask`.
+        assert!(
+            parse(&[
+                "drovr",
+                "ask",
+                "myrun",
+                "--question",
+                "q?",
+                "--context",
+                "t",
+                "--context-file",
+                "/tmp/c.md",
+            ])
+            .is_err(),
+            "the two context forms must conflict, as they do on `phase brief`"
+        );
+    }
+
+    #[test]
+    fn ask_question_at_prefix_reads_a_file_and_at_at_escapes_it() {
+        // A question is usually prose; `@` is the only "read this file" marker, so a
+        // question that legitimately starts with `@` needs an escape.
+        assert_eq!(
+            question_source("@/tmp/q.md"),
+            QuestionSource::File(PathBuf::from("/tmp/q.md"))
+        );
+        assert_eq!(
+            question_source("@@channel: which arm?"),
+            QuestionSource::Literal("@channel: which arm?".to_string())
+        );
+        assert_eq!(
+            question_source("which arm?"),
+            QuestionSource::Literal("which arm?".to_string())
+        );
+        // A bare `@` names no file; it is prose.
+        assert_eq!(
+            question_source("@"),
+            QuestionSource::Literal("@".to_string())
+        );
+    }
+
     #[test]
     fn parse_code_review_base() {
         let cli = parse(&["drovr", "code-review", "base", "myrun", "task-1"]).unwrap();
@@ -3680,8 +4544,9 @@ mod tests {
     fn parse_reflex() {
         let cli = parse(&["drovr", "reflex", "--skill", "/p/SKILL.md"]).unwrap();
         match cli.command {
-            Commands::Reflex { skill } => {
-                assert_eq!(skill, std::path::PathBuf::from("/p/SKILL.md"));
+            Commands::Reflex { skill, gate } => {
+                assert_eq!(skill, Some(std::path::PathBuf::from("/p/SKILL.md")));
+                assert!(!gate);
             }
             _ => panic!("wrong variant"),
         }
@@ -3689,8 +4554,49 @@ mod tests {
 
     #[test]
     fn parse_reflex_requires_skill() {
-        // `--skill` is mandatory: the hook must always name the source markdown.
+        // Bare `drovr reflex` must still error — now because neither `--skill`
+        // nor `--gate` was given, so the command can never guess which hook it
+        // is serving.
         assert!(parse(&["drovr", "reflex"]).is_err());
+    }
+
+    #[test]
+    fn parse_reflex_gate() {
+        let cli = parse(&["drovr", "reflex", "--gate"]).unwrap();
+        match cli.command {
+            Commands::Reflex { skill, gate } => {
+                assert_eq!(skill, None);
+                assert!(gate);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reflex_mode_admits_only_the_two_legal_flag_combinations() {
+        // clap rejects the other two combinations, but this function must not
+        // depend on that: it is what keeps `cmd_reflex` total, and the clap
+        // wiring lives in an attribute far from either.
+        let p = std::path::Path::new("/p/SKILL.md");
+        assert!(matches!(
+            ReflexMode::from_flags(Some(p), false),
+            Some(ReflexMode::Session(_))
+        ));
+        assert!(matches!(
+            ReflexMode::from_flags(None, true),
+            Some(ReflexMode::Gate)
+        ));
+        // Neither flag, and both flags — no mode, no arbitrary winner.
+        assert!(ReflexMode::from_flags(None, false).is_none());
+        assert!(ReflexMode::from_flags(Some(p), true).is_none());
+    }
+
+    #[test]
+    fn parse_reflex_gate_conflicts_with_skill() {
+        // The two modes emit different hook events; asking for both is a
+        // wiring bug in hooks.json and must fail loudly rather than pick one.
+        assert!(parse(&["drovr", "reflex", "--gate", "--skill", "/p/SKILL.md"]).is_err());
+        assert!(parse(&["drovr", "reflex", "--skill", "/p/SKILL.md", "--gate"]).is_err());
     }
 
     #[test]

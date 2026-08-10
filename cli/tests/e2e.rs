@@ -23,7 +23,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -622,4 +622,397 @@ fn e2e_cancel_gate_exits_5() {
         "cancelled marker missing from the run dir"
     );
     println!("e2e cancel: review wait exited 5 and the marker is on disk");
+}
+
+// ---------------------------------------------------------------------------
+// `drovr ask` / `drovr ask wait`, end to end through the real binary
+// ---------------------------------------------------------------------------
+//
+// These need no herdr, no claude, and no server — so unlike the tests above they
+// carry no skip guard and run everywhere, including the Nix build sandbox. That is
+// possible because `ask` is a file append and `ask wait` is a file poller; the only
+// network call in the pair is `ensure_server`, which `DROVR_NO_SPAWN` turns into a
+// clean "server is down" instead of a spawned daemon (see `review::ensure_server`).
+//
+// What is under test is the EXIT-CODE CONTRACT: 0 answered, 2 timeout, 5 cancelled,
+// 1 error. A timeout that reads as success is the exact silent failure recorded in
+// `docs/known-issues.md`, *"Piping a `wait` command destroys its exit-code contract —
+// a timeout reads as approval"*, so these assert the code, never the message alone.
+
+/// An empty run dir under an isolated `XDG_DATA_HOME`. Returns the tempdir (kept
+/// alive by the caller), the data home, and the run dir.
+fn ask_fixture(tag: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("drovr-e2e-{tag}-"))
+        .tempdir()
+        .expect("tempdir");
+    let xdg = tmp.path().to_path_buf();
+    let run_dir = xdg.join("drovr/runs").join(tag);
+    fs::create_dir_all(&run_dir).expect("run dir");
+    (tmp, xdg, run_dir)
+}
+
+/// `drovr <args>` with the fixture's data home and no daemon spawning.
+fn ask_cmd(xdg: &Path) -> Command {
+    let mut c = Command::new(drovr_binary());
+    c.env("XDG_DATA_HOME", xdg);
+    c.env("DROVR_NO_SPAWN", "1");
+    c
+}
+
+/// Post one question through the real CLI and assert the post itself did not block.
+fn post_ask(xdg: &Path, run: &str, question: &str) {
+    let started = Instant::now();
+    let out = ask_cmd(xdg)
+        .args(["ask", run, "--question", question])
+        .output()
+        .expect("drovr ask");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ask must exit 0 even with the server down (the record is already on disk); \
+         stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("posted ask-"),
+        "ask must name the id: {stdout}"
+    );
+    // The whole point of the design: `ask` returns immediately, with the question
+    // still unanswered. If this ever starts waiting, a human who steps away turns
+    // every ask into a dead call that takes its question with it.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "ask must not wait for an answer; took {elapsed:?}"
+    );
+}
+
+/// Append the answer record the server's `POST answer` will write in T4: exactly
+/// `id`, `seq`, `answer`, `answered_at`, on a new line — the ask's own line is never
+/// rewritten.
+fn append_answer_line(run_dir: &Path, id: &str, seq: u64, answer: &str) {
+    use std::fs::OpenOptions;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("interview.jsonl"))
+        .expect("open interview.jsonl");
+    writeln!(
+        f,
+        r#"{{"id":"{id}","seq":{seq},"answer":"{answer}","answered_at":"2026-08-06T12:00:00Z"}}"#
+    )
+    .expect("append answer");
+}
+
+#[test]
+fn e2e_ask_wait_exits_0_when_answered() {
+    let run = "e2e-ask-answered";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+    post_ask(&xdg, run, "which arm ships?");
+
+    let mut wait_child = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "20000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("drovr ask wait");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_child.try_wait().expect("try_wait").is_none(),
+        "ask wait must still be blocking while the question is unanswered"
+    );
+
+    append_answer_line(&run_dir, "ask-0", 0, "arm-b");
+
+    let out = wait_child.wait_with_output().expect("wait for ask wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ask wait must exit 0 once answered; stdout={stdout}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be a JSON array: {e}; stdout={stdout}"));
+    let arr = parsed.as_array().expect("JSON array");
+    assert_eq!(arr.len(), 1, "one snapshotted ask: {stdout}");
+    assert_eq!(arr[0]["id"], "ask-0");
+    assert_eq!(arr[0]["question"], "which arm ships?");
+    assert_eq!(arr[0]["answer"], "arm-b");
+    assert_eq!(arr[0]["answered_at"], "2026-08-06T12:00:00Z");
+    println!("e2e ask: wait exited 0 with the folded answer on stdout");
+}
+
+#[test]
+fn e2e_ask_wait_exits_5_when_cancelled() {
+    let run = "e2e-ask-cancelled";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+    post_ask(&xdg, run, "which arm ships?");
+
+    let mut wait_child = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "20000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("drovr ask wait");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_child.try_wait().expect("try_wait").is_none(),
+        "ask wait must still be blocking before the cancellation"
+    );
+
+    // The human hits Cancel; the server writes this marker (`review.rs`'s
+    // `handle_post_submit`). `ask wait` reads the marker, not the server.
+    fs::write(run_dir.join("cancelled"), b"cancelled\n").expect("cancelled marker");
+
+    let out = wait_child.wait_with_output().expect("wait for ask wait");
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "ask wait must exit 5 on cancel, not 0/1/2; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("cancel"),
+        "message must name the cancellation: {stderr}"
+    );
+
+    // And the other direction: a cancelled run refuses to take a NEW question, and
+    // refuses it without appending anything.
+    let before = fs::read_to_string(run_dir.join("interview.jsonl")).expect("log");
+    let out = ask_cmd(&xdg)
+        .args(["ask", run, "--question", "one more?"])
+        .output()
+        .expect("drovr ask on a cancelled run");
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "ask must refuse a cancelled run with 5; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = fs::read_to_string(run_dir.join("interview.jsonl")).expect("log");
+    assert_eq!(before, after, "a refused ask must append nothing");
+    println!("e2e ask: wait exited 5 on cancel, and a cancelled run refuses new asks");
+}
+
+#[test]
+fn e2e_ask_wait_times_out_without_losing_the_question() {
+    let run = "e2e-ask-timeout";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+    post_ask(&xdg, run, "which arm ships?");
+    let log = run_dir.join("interview.jsonl");
+    let before = fs::read_to_string(&log).expect("log");
+
+    // Two rounds: a timeout must be re-armable, and cost nothing each time. This is
+    // what makes a non-blocking `ask` safe — the caller re-runs the wait instead of
+    // holding a call open that could die with the question inside it.
+    for round in 1..=2 {
+        let out = ask_cmd(&xdg)
+            .args(["ask", "wait", run, "--timeout-ms", "500"])
+            .output()
+            .expect("drovr ask wait");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "round {round}: timeout must exit 2, never 0; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("re-run"),
+            "round {round}: the message must say the wait is resumable: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "round {round}: a timeout must put nothing on stdout — stdout is the answer channel"
+        );
+        // The question survived the timeout, byte for byte, still unanswered.
+        assert_eq!(
+            fs::read_to_string(&log).expect("log"),
+            before,
+            "round {round}: a timed-out wait must not touch the log"
+        );
+    }
+    println!("e2e ask: two timeouts, exit 2 each, question untouched on disk");
+}
+
+#[test]
+fn e2e_ask_wait_still_yields_an_answer_that_landed_before_the_re_arm() {
+    // The race the whole non-blocking design turns on. A wait times out; the human
+    // answers in the seconds it takes the agent to wake and re-arm; the re-armed
+    // wait now has nothing PENDING. If that case returned a bare `[]`, exit 0 would
+    // mean "answered" while carrying no answer, and the caller would walk on without
+    // it — a timeout that cost exactly the thing it was promised not to cost.
+    //
+    // So: with nothing pending, the wait returns the folded interview rather than an
+    // empty array. An empty log still yields `[]`, because that IS its fold.
+    let run = "e2e-ask-rearm";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+
+    // Nothing asked yet — genuinely empty, and `[]` is the whole truth.
+    let out = ask_cmd(&xdg)
+        .args(["ask", "wait", run])
+        .output()
+        .expect("drovr ask wait");
+    assert_eq!(out.status.code(), Some(0), "an empty interview exits 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "[]",
+        "no asks at all folds to []"
+    );
+
+    // Now: ask, time out, and let the answer land before the re-arm.
+    post_ask(&xdg, run, "which arm ships?");
+    let out = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "300"])
+        .output()
+        .expect("drovr ask wait");
+    assert_eq!(out.status.code(), Some(2), "still unanswered, so a timeout");
+    append_answer_line(&run_dir, "ask-0", 0, "arm-b");
+
+    let out = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "300"])
+        .output()
+        .expect("drovr ask wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the re-arm must exit 0; stdout={stdout}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; stdout={stdout}"));
+    let arr = parsed.as_array().expect("JSON array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "the answer must survive the re-arm window: {stdout}"
+    );
+    assert_eq!(arr[0]["answer"], "arm-b");
+    println!("e2e ask: an answer that landed between the timeout and the re-arm still comes back");
+}
+
+#[test]
+fn e2e_ask_wait_fails_fast_when_the_run_is_deleted_under_it() {
+    // A wait can outlive its run — `drovr cleanup <run> --purge` removes the run dir,
+    // and a 30-minute wait is a long time to be exposed to that. A one-shot entry
+    // check is not enough: `interview::read` reads the now-missing log as an EMPTY
+    // one, so the wait would poll out its whole timeout and then exit 2 saying "the
+    // question is still on disk and still on screen" — advice that is false in both
+    // halves, and whose suggested re-run gives a different answer (exit 1).
+    let run = "e2e-ask-vanished";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+    post_ask(&xdg, run, "which arm ships?");
+
+    let mut wait_child = ask_cmd(&xdg)
+        .args(["ask", "wait", run, "--timeout-ms", "20000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("drovr ask wait");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_child.try_wait().expect("try_wait").is_none(),
+        "ask wait must still be blocking before the run goes away"
+    );
+
+    let started = Instant::now();
+    fs::remove_dir_all(&run_dir).expect("purge the run out from under the wait");
+
+    let out = wait_child.wait_with_output().expect("wait for ask wait");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a vanished run is an error, not a timeout; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it must fail fast, not poll out the full timeout; took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "an error must put nothing on stdout"
+    );
+    println!("e2e ask: a run deleted mid-wait fails fast with 1, not a false timeout");
+}
+
+#[test]
+fn e2e_ask_usage_errors_exit_1() {
+    let run = "e2e-ask-usage";
+    let (_tmp, xdg, run_dir) = ask_fixture(run);
+
+    // 1 is the error code, distinct from every outcome: a malformed ask must never
+    // be mistaken for a posted one (0) or a timeout (2).
+    for (label, args) in [
+        ("missing --question", vec!["ask", run]),
+        (
+            "--option without =",
+            vec!["ask", run, "--question", "q?", "--option", "novalue"],
+        ),
+        (
+            "--recommend naming no option",
+            vec![
+                "ask",
+                run,
+                "--question",
+                "q?",
+                "--option",
+                "a=Arm A",
+                "--recommend",
+                "z",
+            ],
+        ),
+        (
+            "two --options sharing a value",
+            vec![
+                "ask",
+                run,
+                "--question",
+                "q?",
+                "--option",
+                "a=Arm A",
+                "--option",
+                "a=Arm B",
+            ],
+        ),
+        (
+            "unknown run",
+            vec!["ask", "no-such-run", "--question", "q?"],
+        ),
+        // The half `ask wait` must not get wrong: a run that does not exist reads,
+        // through `interview::read`, exactly like a run whose questions are all
+        // answered — both fold to an empty log. Without its own check the wait would
+        // print `[]` and exit 0, which is "answered, nothing outstanding". A driver
+        // that typo'd the run name, or whose run was torn down under it, would be
+        // waved on. Same guard, same code, as the post half one function up.
+        (
+            "ask wait on an unknown run",
+            vec!["ask", "wait", "no-such-run", "--timeout-ms", "500"],
+        ),
+    ] {
+        let out = ask_cmd(&xdg).args(&args).output().expect("drovr ask");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{label}: must exit 1; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "{label}: an error must put nothing on stdout — stdout is the answer channel"
+        );
+    }
+    assert!(
+        !run_dir.join("interview.jsonl").exists(),
+        "no usage error may create the log"
+    );
+    println!("e2e ask: every usage error exits 1 and writes nothing");
 }

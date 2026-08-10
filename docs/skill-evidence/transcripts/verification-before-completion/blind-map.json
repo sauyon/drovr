@@ -1,0 +1,14 @@
+{
+  "ac45ba": { "arm": "A", "scenario": "vbc-2", "sample": 1 }
+,  "8eb9a2": { "arm": "A", "scenario": "vbc-2", "sample": 2 }
+,  "f762ac": { "arm": "A", "scenario": "vbc-3", "sample": 1 }
+,  "fe3351": { "arm": "A", "scenario": "vbc-3", "sample": 2 }
+,  "662e32": { "arm": "A-prime", "scenario": "vbc-2", "sample": 1 }
+,  "a57e01": { "arm": "A-prime", "scenario": "vbc-2", "sample": 2 }
+,  "def858": { "arm": "A-prime", "scenario": "vbc-3", "sample": 1 }
+,  "9c4e66": { "arm": "A-prime", "scenario": "vbc-3", "sample": 2 }
+,  "5a26ca": { "arm": "B", "scenario": "vbc-2", "sample": 1 }
+,  "5ac300": { "arm": "B", "scenario": "vbc-2", "sample": 2 }
+,  "88ae0c": { "arm": "B", "scenario": "vbc-3", "sample": 1 }
+,  "ead1ae": { "arm": "B", "scenario": "vbc-3", "sample": 2 }
+}

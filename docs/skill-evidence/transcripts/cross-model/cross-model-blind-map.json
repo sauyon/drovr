@@ -1,0 +1,548 @@
+{
+ "021908": {
+  "arm": "B",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "0400b3": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "06e1e0": {
+  "arm": "none",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "11da2e": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "130032": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "1339aa": {
+  "arm": "B",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "16c609": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "1b8567": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "1c033a": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "1c0e53": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "1dc76b": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "2060a9": {
+  "arm": "A",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "27d721": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "2c6312": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "2d95fa": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "2f37d9": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "2ff20b": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "305217": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "323b08": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "34ba92": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "36a56b": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "4ae396": {
+  "arm": "A",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "4d20da": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "5088b7": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "53b0db": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "56f6a3": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "58a8b8": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "5cdbb0": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "5fd9de": {
+  "arm": "A-prime",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "616af0": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "72d15c": {
+  "arm": "A-prime",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "777c0c": {
+  "arm": "A-prime",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "7e50d9": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "864008": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "8a9dca": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "8bf9bb": {
+  "arm": "B",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "968c9a": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "997031": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "99c271": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "9b8371": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "9bdd66": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "a4749b": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "a481d4": {
+  "arm": "none",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "a5ae74": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "a6fcbf": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "ab07a7": {
+  "arm": "A-prime",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "ab7ee3": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "af38f1": {
+  "arm": "none",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "b3f824": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "b501f7": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "ba5648": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "bc8818": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "c0535a": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "c39404": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "c3cca3": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "c558d2": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "c6f4b4": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "c93486": {
+  "arm": "A",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "ca28f9": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "cb9735": {
+  "arm": "A",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "cfec1f": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "d1cabb": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "d335ac": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "d36c83": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "d38cb0": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "d4cb61": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "d8f140": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "da1902": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "dc18e0": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "e0a544": {
+  "arm": "B",
+  "model": "opus",
+  "sample": 1,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "ec3558": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "f3695d": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "f73516": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 4,
+  "scenario": "tdd-3",
+  "skill": "tdd"
+ },
+ "fadbf8": {
+  "arm": "B",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "fbe67e": {
+  "arm": "A",
+  "model": "qwen",
+  "sample": 3,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ },
+ "fdca15": {
+  "arm": "none",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "tdd-2",
+  "skill": "tdd"
+ },
+ "fdda5e": {
+  "arm": "A-prime",
+  "model": "qwen",
+  "sample": 1,
+  "scenario": "systematic-debugging-2",
+  "skill": "systematic-debugging"
+ },
+ "fe6512": {
+  "arm": "none",
+  "model": "opus",
+  "sample": 2,
+  "scenario": "systematic-debugging-3",
+  "skill": "systematic-debugging"
+ }
+}

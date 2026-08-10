@@ -283,6 +283,23 @@ fn phase_done_command(run_name: &str, phase: &str, pass: Option<&PassToken>) -> 
 /// and claude resolves a session beneath `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/`,
 /// so the wrong one silently finds no conversation at all. Fresh launches pass
 /// [`agent_profile_env`], which is also what they record on the phase.
+/// The `DROVR_PHASE=…` assignment [`launch_in_pane`] puts at the head of every
+/// launch command — and, because `pane_run` hands that command to the pane's
+/// interactive shell, the string the shell ECHOES back onto the pane while the
+/// agent boots.
+///
+/// It is therefore two things at once, and the second is why this is a function
+/// rather than an inline `format!`: it is the one piece of text drovr can look for
+/// on a pane and know for certain the agent did not write it. `wait_for_started_pane`
+/// uses it to tell "the shell is still showing my command" apart from "the agent has
+/// drawn its interface", so the two spellings must not be allowed to drift.
+fn launch_echo_marker(run_name: &str, phase: &str) -> String {
+    format!(
+        "DROVR_PHASE={}",
+        shell_single_quote(&format!("{run_name}/{phase}"))
+    )
+}
+
 fn launch_in_pane<H: Herdr>(
     h: &H,
     run_name: &str,
@@ -314,8 +331,8 @@ fn launch_in_pane<H: Herdr>(
     //     recorded. Real secrets (API keys) are never inlined.
     // Values are single-quoted so spaces/metacharacters can't break out.
     let mut env_prefix = format!(
-        "env DROVR_PHASE={} {PASS_ENV}={}",
-        shell_single_quote(&format!("{run_name}/{phase}")),
+        "env {} {PASS_ENV}={}",
+        launch_echo_marker(run_name, phase),
         shell_single_quote(pass.as_str()),
     );
     if let Some(dir) = profile {
@@ -3327,28 +3344,112 @@ const MAX_VERBATIM_EVIDENCE: usize = 40;
 /// this check press Enter on claude's "New MCP server" approval and accept it.
 /// What one look at the composer region established about `text`.
 ///
-/// Three states, not a `bool`, because the third one is a different FACT and it
-/// sends a human somewhere else: "I looked and the payload is not there" points
-/// at a dialog on the screen, while "I could not look" points at herdr. Both
-/// forbid the nudge — but a `bool` can only carry one of them, and whichever it
-/// borrows makes `phase_send` assert a cause it has no evidence for. That is the
-/// same confidently-wrong diagnosis this whole change exists to remove.
+/// Four states, not a `bool`, because each is a different FACT and they send a
+/// human somewhere else: "I looked and the payload is not there" points at a
+/// dialog on the screen, "I could not look" points at herdr, and "I looked and the
+/// agent has not put anything on the screen yet" points at a launch still in
+/// progress. All but the first forbid the nudge — but a `bool` can only carry one
+/// of them, and whichever it borrows makes `phase_send` assert a cause it has no
+/// evidence for. That is the same confidently-wrong diagnosis this whole change
+/// exists to remove.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ComposerEvidence {
     /// The payload's signature is in the composer region right now.
     Present,
     /// The pane was read, and the payload is not in the composer region.
     Absent,
+    /// The pane was read and NOTHING ON IT CAME FROM THE AGENT. Either it is
+    /// blank — a cleared alternate screen the TUI has not drawn into yet — or it
+    /// still shows the launch command drovr itself typed into the shell. Both are
+    /// the same fact: the agent has not started drawing.
+    ///
+    /// Kept apart from `Absent` because the two license opposite actions.
+    /// `Absent` is a screen with something on it that drovr did not put there, so
+    /// drovr must not guess at it; `Unstarted` is a screen with nothing to guess
+    /// at, and the only honest response is to wait.
+    Unstarted,
     /// The pane could not be read at all, so nothing was established.
     Unreadable,
 }
 
 /// Read `pane_id` once and classify what the composer region says about `text`.
-fn read_composer_evidence<H: Herdr>(h: &H, pane_id: &str, text: &str) -> ComposerEvidence {
+///
+/// `launch_marker` is [`launch_echo_marker`] for this phase — the one string on a
+/// pane drovr can be certain the agent did not write.
+fn read_composer_evidence<H: Herdr>(
+    h: &H,
+    pane_id: &str,
+    text: &str,
+    launch_marker: &str,
+) -> ComposerEvidence {
     match h.agent_read(pane_id) {
         Ok(pane) if pane_shows_payload(&pane, text) => ComposerEvidence::Present,
+        // Whitespace-only, not merely empty: a terminal that has been cleared and
+        // resized reads back as rows of blanks, and that is the same fact.
+        Ok(pane) if pane.trim().is_empty() || pane.contains(launch_marker) => {
+            ComposerEvidence::Unstarted
+        }
         Ok(_) => ComposerEvidence::Absent,
         Err(_) => ComposerEvidence::Unreadable,
+    }
+}
+
+/// Poll `pane_id` until the AGENT has put something on it, and return the pre-send
+/// composer evidence from the look that saw it.
+///
+/// This is the second half of the readiness gate, and it exists because the first
+/// half asks herdr a question herdr cannot always answer. `wait_agent_ready` trusts
+/// `agent_status`, which is only evidence of a live composer when herdr's detection
+/// manifest for that backend can positively observe one. **opencode's cannot**: its
+/// manifest (`opencode.toml`, herdr 0.7.5) carries rules for `blocked` and `working`
+/// only, so every opencode pane answers `idle` through herdr's
+/// `default_known_agent_idle_fallback` — a default, not a sighting, and `herdr agent
+/// explain` says so in as many words. Measured on a fresh pane: that fallback `idle`
+/// lands ~0.7s after `pane run`, and opencode paints its composer at ~3.4s. In the
+/// ~2.7s between, `agent.prompt` types a whole briefing into a terminal that is not
+/// reading, the bytes are dropped entirely, and herdr reports `agent_prompt_stalled`
+/// against an empty composer — which drovr then reported as a seed "swallowed rather
+/// than left unsubmitted", sending its human to look for a dialog that never existed.
+///
+/// **claude has the same race**; it is merely fast enough to usually win it. Measured
+/// the same way: `idle` at ~0.57s with the pane still showing the shell, drawn by
+/// ~1.1s. That half-second is the long-standing "phase send is flaky" flake, and this
+/// gate closes it too.
+///
+/// What the wait keys on is the one thing that cannot be mistaken for the agent: a
+/// pane holding NOTHING BUT WHAT DROVR PUT THERE. Straight after `pane_run` the pane
+/// shows the shell's echo of drovr's own launch command; a moment later the TUI takes
+/// the alternate screen and it is blank; then the agent draws. An agent parked on a
+/// dialog, by contrast, is showing the dialog — text drovr never wrote — so it is
+/// `Absent`, passes this gate, and still gets the refusal it always did.
+///
+/// Both agents were measured clearing the echo when their TUI starts (claude by 1.1s,
+/// opencode by 3.4s), which is what makes it a signal rather than a permanent
+/// fixture. A backend that instead left drovr's command line on screen would wait out
+/// the budget and fail with the honest message below — no seed sent, phase untouched
+/// — rather than sending into the dark.
+///
+/// The look this performs is the same one `phase_send` needs anyway (the "before"
+/// snapshot that makes later evidence attributable to THIS send), so the healthy path
+/// costs no extra herdr round trip — the agent has drawn, the first read answers both
+/// questions, and the loop exits immediately.
+///
+/// An UNREADABLE pane is deliberately not waited on. "I could not look" does not
+/// establish anything about what is on the screen, and blocking on it would turn a
+/// herdr that cannot read panes into a phase that never sends. It is passed straight
+/// through to `phase_send`, which already refuses to nudge on it and says why.
+fn wait_for_started_pane<H: Herdr>(
+    h: &H,
+    pane_id: &str,
+    text: &str,
+    launch_marker: &str,
+    polling: Polling,
+) -> ComposerEvidence {
+    loop {
+        let evidence = read_composer_evidence(h, pane_id, text, launch_marker);
+        if evidence != ComposerEvidence::Unstarted || !polling.sleep() {
+            return evidence;
+        }
     }
 }
 
@@ -3534,6 +3635,15 @@ fn phase_send_with_timeout<H: Herdr>(
 ) -> io::Result<()> {
     require_phase_name(phase)?;
     let pane_id = require_pane_id(run, phase)?;
+    // ONE budget across both halves of the readiness gate — the status poll below
+    // and the paint wait after it — because two `ready_timeout`s in series would
+    // let a slow launch hold the caller for twice as long as the constant
+    // promises. No floor is reserved for the second half: it only runs when the
+    // first returned EARLY, which is the whole case it exists for (herdr's
+    // fallback `idle` arrives seconds before the agent paints). A status poll that
+    // spends the entire budget ends in the not-ready error below and never reaches
+    // the paint wait at all.
+    let ready_deadline = Instant::now() + ready_timeout;
     if !wait_agent_ready(h, run, phase, ready_timeout, poll_interval) {
         // Render sub-second timeouts as ms so an injected test timeout doesn't
         // print a misleading "within 0s"; production (30s) reads "within 30s".
@@ -3553,19 +3663,49 @@ fn phase_send_with_timeout<H: Herdr>(
             ),
         ));
     }
+    // The second half of the gate, and it doubles as the pre-send snapshot —
+    // taken FIRST, so evidence found afterwards can be attributed to THIS send. A
+    // pane that already shows the payload's signature — a long-lived pane whose
+    // previous briefing is still in the composer region, or one the browser
+    // mirror's fire-and-forget `/send` typed into — cannot produce fresh evidence,
+    // and must not be nudged on the strength of someone else's paste.
+    //
+    // Before the re-open, for the same reason the status poll is: a seed that is
+    // never sent must leave the phase exactly as it found it.
+    let launch_marker = launch_echo_marker(&run.name, phase);
+    let evidence_before = wait_for_started_pane(
+        h,
+        &pane_id,
+        text,
+        &launch_marker,
+        Polling::until(ready_deadline, poll_interval),
+    );
+    if evidence_before == ComposerEvidence::Unstarted {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "agent for phase '{phase}' of run '{run_name}' reports a started status \
+                 but has DRAWN NOTHING on its pane — it is blank, or still showing the \
+                 launch command drovr typed into the shell. There is no composer to \
+                 receive the seed and drovr will not type into one that is not there. \
+                 herdr's status is not proof of a live composer for every backend: \
+                 where its detection manifest has no `idle` rule (opencode's has none), \
+                 `idle` is a DEFAULT it falls back to as soon as it recognises the \
+                 process — seconds before the agent paints. Nothing was sent and this \
+                 phase was left untouched. If the agent is simply slow to start, \
+                 re-send; otherwise look at it: {attach}",
+                run_name = run.name,
+                attach = attach_command(&run.name),
+            ),
+        ));
+    }
+
     // Re-open ONLY now. The agent is at its composer and has not seen `text`, so
     // any marker on disk is from earlier work and is safe to discard — while
     // sweeping before the readiness gate would destroy the record of a genuine
     // completion on every failed send (a phase parked on a permission prompt
     // would lose its `Done` and its marker without any new work being requested).
     let reopened = reopen_for_re_entry(run, phase)?;
-
-    // Snapshot FIRST, so evidence found afterwards can be attributed to THIS send.
-    // A pane that already shows the payload's signature — a long-lived pane whose
-    // previous briefing is still in the composer region, or one the browser
-    // mirror's fire-and-forget `/send` typed into — cannot produce fresh evidence,
-    // and must not be nudged on the strength of someone else's paste.
-    let evidence_before = read_composer_evidence(h, &pane_id, text);
 
     let outcome = h
         .agent_prompt_confirm(&pane_id, text, confirm_timeout)
@@ -3585,7 +3725,7 @@ fn phase_send_with_timeout<H: Herdr>(
     // The agent did not move. Only nudge if the payload is demonstrably sitting in
     // the composer NOW and was not there before — see `pane_shows_payload` for why
     // this must be positive evidence rather than "the pane changed".
-    let evidence_after = read_composer_evidence(h, &pane_id, text);
+    let evidence_after = read_composer_evidence(h, &pane_id, text, &launch_marker);
     // Exactly ONE pairing licenses the keystroke: the composer was looked at
     // before and did NOT hold the payload, and holds it now. Spelled as a match on
     // both values rather than `after == Present && before != Present`, because
@@ -3636,11 +3776,29 @@ fn phase_send_with_timeout<H: Herdr>(
                  pane — if that is your seed, submit it by hand: {attach}",
                 attach = attach_command(&run.name),
             ),
+            // The agent's own output went AWAY across the send: the pane is blank
+            // now, or back to the launch command. It was showing something the
+            // agent drew when drovr looked before (the gate above guarantees
+            // that), so the agent redrew or restarted underneath the prompt. Not a
+            // swallow: there is no dialog to blame and no composer to have held
+            // the payload.
+            (_, ComposerEvidence::Unstarted) => format!(
+                "the seed was NOT delivered — herdr saw no state change after the prompt, and \
+                 the agent's interface is GONE from the pane: it is blank, or back to the \
+                 launch command. It was drawn before the prompt, so the agent redrew or \
+                 restarted across the send and the payload went to a terminal that is no \
+                 longer there. Deliberately NOT pressing a key into an empty screen. Look at \
+                 the pane, then re-send: {attach}",
+                attach = attach_command(&run.name),
+            ),
             // Everything left has `after == Absent`: drovr looked, and the
-            // composer does not hold the payload. `(Absent, Present)` is the nudge
-            // path, returned above; it is named only to keep this match total.
+            // composer does not hold the payload. `(Absent, Present)` and
+            // `(Unstarted, Present)` are named only to keep this match total —
+            // `(Absent, Present)` is the nudge path, returned above, and an
+            // `Unstarted` before cannot reach here at all (the gate raises on it).
             (_, ComposerEvidence::Absent)
-            | (ComposerEvidence::Absent, ComposerEvidence::Present) => {
+            | (ComposerEvidence::Absent, ComposerEvidence::Present)
+            | (ComposerEvidence::Unstarted, ComposerEvidence::Present) => {
                 format!(
                     "the seed was NOT delivered — herdr saw no state change after the prompt, \
                      and the payload is nowhere in the agent's composer, so it was swallowed \
@@ -6238,6 +6396,205 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.contains("agent_wait_started")),
             "must confirm the nudge actually got the agent moving: {calls:?}"
+        );
+    }
+
+    // A pane with NOTHING on it. Captured from a real `opencode` pane ~1.3s after
+    // launch: the TUI has taken the alternate screen and cleared it, and has not
+    // drawn anything yet. herdr's `agent.read` returns the empty string for the
+    // whole ~2s this lasts.
+    const CLEARED_PANE: &str = "";
+
+    // And what the SAME pane reads back half a second earlier, at the instant
+    // herdr's status first says `idle`: the shell's echo of the launch command
+    // drovr asked it to run. Captured verbatim except for the run/phase names,
+    // which are this test's.
+    fn shell_echo_pane(run_name: &str, phase: &str) -> String {
+        format!(
+            "  ❯ env DROVR_PHASE='{run_name}/{phase}' DROVR_PASS='abc-123' opencode \
+             --agent plan '/tmp/proj'"
+        )
+    }
+
+    // What that same pane looks like once opencode has drawn its interface.
+    const OPENCODE_COMPOSER_PANE: &str = "\
+  ┃  Ask anything... \"Fix a TODO in the codebase\"
+  ┃
+  ┃  Plan · Qwen3.6 35B A3B (abliterated) ko.ag
+  ~/devel/drovr  ⊙ 1 MCP /status                     1.18.3";
+
+    // THE OPENCODE LAUNCH RACE. herdr's opencode detection manifest defines rules
+    // for `blocked` and `working` only — it has no `idle` rule — so every opencode
+    // pane answers `idle` through herdr's `default_known_agent_idle_fallback`, from
+    // the moment the process is identified. Measured on this host: the fallback
+    // `idle` appears ~0.7s after `pane run`, and opencode does not paint its
+    // composer until ~3.4s. The readiness gate accepted that `idle`, `phase_send`
+    // prompted into a terminal that was not reading, and the payload was dropped
+    // whole — which drovr then reported as "swallowed", pointing its human at a
+    // dialog that was never there.
+    //
+    // The reads below are the measured sequence: the shell's echo of drovr's own
+    // launch command, then a cleared screen, then the composer. Neither of the
+    // first two is anything the AGENT wrote, which is what distinguishes this from
+    // the swallow below — a pane parked on a dialog is showing the dialog.
+    #[test]
+    fn send_waits_for_a_pane_the_agent_has_not_drawn_on_yet() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "send-unpainted-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        // herdr's fallback `idle` — reported while the pane is still the shell.
+        h.push_status(Some("idle"));
+        h.push_read(shell_echo_pane("send-unpainted-test", "code"));
+        h.push_read(CLEARED_PANE);
+        h.push_read(OPENCODE_COMPOSER_PANE);
+        // Sent to a painted composer, the prompt takes on the first try.
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        // The assertion that matters is ORDER, not merely success: the prompt must
+        // not be issued until a read has come back with something on the screen.
+        let calls = h.calls();
+        let prompt_at = calls
+            .iter()
+            .position(|c| c.contains("agent_prompt"))
+            .unwrap_or_else(|| panic!("the seed must eventually be sent: {calls:?}"));
+        let reads_before_prompt = calls[..prompt_at]
+            .iter()
+            .filter(|c| c.contains("agent_read"))
+            .count();
+        assert!(
+            reads_before_prompt >= 3,
+            "must keep looking while nothing on the pane came from the agent, and only \
+             prompt once it has drawn — saw {reads_before_prompt} read(s) before the \
+             prompt: {calls:?}"
+        );
+    }
+
+    // The same race one beat earlier, on its own: a pane showing ONLY the shell's
+    // echo of drovr's launch command is a pane the agent has not taken over yet.
+    // This is the state herdr's fallback `idle` actually coincides with — measured
+    // at 0.85s on opencode and 0.57s on claude — so a gate that waited on blankness
+    // alone would sail straight past it, which is exactly what the first cut of this
+    // fix did.
+    #[test]
+    fn send_waits_while_the_pane_still_shows_drovrs_own_launch_command() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "send-shell-echo-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        h.push_read(shell_echo_pane("send-shell-echo-test", "code"));
+        h.push_read(OPENCODE_COMPOSER_PANE);
+        h.push_outcome(PromptOutcome::Started);
+
+        phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap();
+
+        let calls = h.calls();
+        let prompt_at = calls
+            .iter()
+            .position(|c| c.contains("agent_prompt"))
+            .unwrap_or_else(|| panic!("the seed must eventually be sent: {calls:?}"));
+        assert!(
+            calls[..prompt_at]
+                .iter()
+                .filter(|c| c.contains("agent_read"))
+                .count()
+                >= 2,
+            "the shell's echo of drovr's own command is not the agent: {calls:?}"
+        );
+    }
+
+    // The marker the gate looks for is not a guess about shell prompts — it is the
+    // exact string `launch_in_pane` puts at the head of every launch command, so the
+    // two spellings cannot drift apart without this failing.
+    #[test]
+    fn the_launch_echo_marker_is_what_launch_in_pane_actually_writes() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "marker-agreement-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+
+        let launched = h
+            .calls()
+            .iter()
+            .find(|c| c.contains("pane_run"))
+            .cloned()
+            .expect("the phase must have been launched");
+        let marker = launch_echo_marker("marker-agreement-test", "code");
+        assert!(
+            launched.contains(&marker),
+            "the gate looks for {marker:?}, which must be in the launch command: {launched}"
+        );
+    }
+
+    // The other side of the gate: a pane the agent never draws on must fail saying
+    // so, and must not be prompted at all. The old code prompted into it and then
+    // blamed a dialog.
+    #[test]
+    fn send_raises_naming_the_blank_pane_when_it_never_paints() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "send-never-paints-test");
+
+        phase_start(&h, &mut run, "code", None).unwrap();
+        h.push_status(Some("idle"));
+        // Every look comes back empty, for as long as drovr keeps looking.
+        h.blank_agent_read();
+
+        let err = phase_send_with_timeout(
+            &h,
+            &mut run,
+            "code",
+            "hello agent",
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            CONFIRM,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !h.calls().iter().any(|c| c.contains("agent_prompt")),
+            "must not send a seed into a terminal that has drawn nothing: {:?}",
+            h.calls()
+        );
+        assert!(
+            err.to_string().contains("DRAWN NOTHING"),
+            "the error must name what drovr actually saw — a pane the agent has not \
+             drawn on: {err}"
+        );
+        assert!(
+            !err.to_string().contains("swallowed"),
+            "nothing was sent, so nothing was swallowed: {err}"
+        );
+        // Nothing was delivered and nothing was attempted, so the phase must be
+        // exactly as it was — in particular its completion marker must survive.
+        assert!(
+            !err.to_string().contains("ALREADY been re-opened"),
+            "a send that never happened must not re-open the phase: {err}"
         );
     }
 

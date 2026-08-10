@@ -94,6 +94,9 @@ const KEYS = {
   '?': { key: '?', code: 'Slash', vk: 191, text: '?', mods: 8 },
   '1': { key: '1', code: 'Digit1', vk: 49, text: '1' },
   '2': { key: '2', code: 'Digit2', vk: 50, text: '2' },
+  // One past the last OPTION of the ask the digit checks run against, which is a
+  // different boundary from '9' (past every row there is).
+  '3': { key: '3', code: 'Digit3', vk: 51, text: '3' },
   '9': { key: '9', code: 'Digit9', vk: 57, text: '9' },
   Enter: { key: 'Enter', code: 'Enter', vk: 13 },
   Escape: { key: 'Escape', code: 'Escape', vk: 27 },
@@ -151,14 +154,29 @@ const metaFor = name => evaluate(`
   var rows = Array.from(document.querySelectorAll('#run-list-items .run-row'));
   var row = rows.find(function(r){ return r.querySelector('.run-name').textContent === ${JSON.stringify(name)}; });
   return row ? row.querySelector('.run-state').textContent : null;`);
-const cursorQuestion = () => evaluate(`
-  var el = document.querySelector('#questions-area .question-item.nav-cursor');
-  return el ? el.querySelector('.question-prompt').textContent : null;`);
-const checkedIn = qi => evaluate(`
-  var it = document.querySelectorAll('#questions-area .question-item')[${qi}];
-  if (!it) return null;
-  var r = it.querySelector('input[type="radio"]:checked');
+// The interview panel renders ONE pending ask at a time, so these are singular by
+// construction — there is no per-question index to pass.
+const ivQuestion = () => evaluate(`
+  var el = document.querySelector('#interview-area .interview-question');
+  return el ? el.textContent : null;`);
+const ivCount = () => evaluate(`
+  var el = document.querySelector('#interview-area .interview-count');
+  return el ? el.textContent : null;`);
+const ivChecked = () => evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
   return r ? r.value : null;`);
+// The detail-view cursor moves over the displayed ask's ANSWER ROWS. Two probes,
+// because one is not enough: an ask with no options renders "Answer" as BOTH its
+// free-text label and its submit button, so a motion check written on the label
+// alone passes without the cursor having moved at all. Index for motion, label
+// for what the reviewer actually reads.
+const cursorRowIndex = () => evaluate(`
+  var rows = Array.prototype.slice.call(document.querySelectorAll('#interview-area .interview-row'));
+  for (var i = 0; i < rows.length; i++) if (rows[i].classList.contains('nav-cursor')) return i;
+  return null;`);
+const cursorRowLabel = () => evaluate(`
+  var el = document.querySelector('#interview-area .interview-row.nav-cursor');
+  return el ? ((el.querySelector('label') || el).textContent || '').trim() : null;`);
 const hash = () => evaluate(`return location.hash;`);
 const docText = () => evaluate(`return (document.getElementById('doc-content').textContent || '').trim();`);
 const filterOpen = () => evaluate(`return document.getElementById('nav-filter').style.display !== 'none';`);
@@ -189,7 +207,9 @@ async function reload(ready) {
   await waitFor(ready.probe, ready.ok, 8000, ready.label);
 }
 const LIST_READY = { probe: rowNames, ok: r => r.length > 0, label: 'session list' };
-const QUESTIONS_READY = { probe: cursorQuestion, ok: q => !!q, label: 'questions panel' };
+// The detail view's readiness gate: the interview panel is what the cursor lives
+// on there, so "a cursor exists" is the same statement as "the panel is up".
+const INTERVIEW_READY = { probe: cursorRowIndex, ok: i => i !== null, label: 'interview panel' };
 const agentNodes = () => evaluate(`
   return Array.from(document.querySelectorAll('#agents-tree .agent-node')).map(function(e){
     return { name: e.querySelector('.agent-name').textContent,
@@ -1231,7 +1251,7 @@ await press('Enter');
 await waitFor(hash, h => h.indexOf('#/runs/alpha-deploy') === 0, 8000, 'run detail hash');
 check('Enter opens the row under the cursor', (await hash()).indexOf('#/runs/alpha-deploy'), 0);
 check('the filter closed on the way in', await filterOpen(), false);
-await waitFor(cursorQuestion, q => !!q, 8000, 'questions panel');
+await waitFor(INTERVIEW_READY.probe, INTERVIEW_READY.ok, 8000, INTERVIEW_READY.label);
 check('no stale list rebuild races the detail view', await evaluate(`return window.__lateRenders;`), 0);
 
 console.log('\n== run detail: what the agent asked for ==');
@@ -1377,39 +1397,562 @@ check('a fragment link into a non-ASCII heading actually scrolls to it', await e
   scratch.remove();
   return got;`), { hrefWasEncoded: true, scrolledTo: 'spec-h-設計方針' });
 
-console.log('\n== run detail: answering questions ==');
-check('cursor lands on the first question', await cursorQuestion(), 'Which cache backend should the deploy use?');
+console.log('\n== run detail: the interview ==');
+// The agent's live ask channel (`drovr ask` / `ask wait`), which is deliberately
+// NOT tied to the review gate: a question can arrive at any point in a run's life,
+// so this panel polls on its own 2s timer rather than rendering out of refresh().
+await waitFor(ivQuestion, q => !!q, 8000, 'interview panel');
+check('the panel shows the oldest pending question', await ivQuestion(),
+  'Which cache backend should the deploy use?');
+check('the count reads the pending total', await ivCount(), '1 of 3');
+check('the recommended option is preselected', await ivChecked(), 'redis');
+check('the context block renders', await evaluate(`
+  var el = document.querySelector('#interview-area .interview-context');
+  return el ? el.textContent : null;`), 'The rollout runs in three regions.');
+
+// Other checked with an empty box is an explicit half-answer, refused in the
+// browser with no request at all. The SERVER accepts an empty answer — "nothing
+// to add" is a decision the human is entitled to make — so what this blocks is
+// the accidental empty one, not the deliberate one.
+check('Other with an empty box is refused', await evaluate(`
+  document.getElementById('iv_other').checked = true;
+  document.getElementById('interview-text').value = '';
+  submitAnswer();
+  var err = document.getElementById('interview-error');
+  return err.style.display !== 'none' && err.textContent;`),
+  'Type an answer, or pick one of the options.');
+check('...and nothing advanced', await ivQuestion(), 'Which cache backend should the deploy use?');
+check('...and the box it tells you to fill gets the focus', await activeId(), 'interview-text');
+// Hand focus back, as the questions section does: the navigator goes inert while
+// a text box holds it.
+await evaluate(`document.getElementById('interview-text').blur(); return 1;`);
+
+// ⚠ The repaint checks. This panel holds the controls the human is USING and a 2s
+// poll repaints it, so a renderInterview that rebuilds on every tick reverts a
+// hand-picked radio to the `recommend` default — and the human, who did not
+// notice the flicker, then logs an answer they never chose, with no error
+// anywhere. Both of these pass trivially against a rebuild-always version only if
+// the tick happens to miss, which is why they call renderInterview DIRECTLY.
+check('a hand-picked option survives a repaint of the same ask', await evaluate(`
+  document.querySelector('#interview-area input[value="memory"]').checked = true;
+  renderInterview(currentInterview);
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return r ? r.value : null;`), 'memory');
+check('half-typed text survives it too, in the very same node', await evaluate(`
+  var n = document.getElementById('interview-text');
+  n.value = 'half-typed answ';
+  renderInterview(currentInterview);
+  var after = document.getElementById('interview-text');
+  return { same: after === n, value: after.value };`),
+  { same: true, value: 'half-typed answ' });
+
+// End to end, and the point of the two checks above: the HAND-PICKED value is
+// what reaches the log, not the recommended one it would have been reverted to.
+await evaluate(`document.getElementById('interview-answer-btn').click(); return 1;`);
+await waitFor(ivQuestion, q => q === 'Retry policy on a failed rollout?', 8000, 'the next question');
+check('answering advances to the next pending question', await ivQuestion(),
+  'Retry policy on a failed rollout?');
+check('...and the count drops with it', await ivCount(), '1 of 2');
+check('...and it has no context block of its own', await evaluate(`
+  return !!document.querySelector('#interview-area .interview-context');`), false);
+check('the answer really landed in the log', await evaluate(`
+  return fetch(api('interview')).then(function(r){ return r.json(); }).then(function(a){
+    var ask0 = a.filter(function(x){ return x.id === 'ask-0'; })[0];
+    return { answer: ask0.answer, answered: ask0.answered_at !== null };
+  });`), { answer: 'memory', answered: true });
+
+console.log('\n== run detail: the keyboard drives the interview panel ==');
+// One question at a time removes the row set the detail cursor used to move over
+// (one per open question), so the cursor moves to the ANSWER ROWS of the single
+// displayed ask instead — options, the free-text row, then submit. ask-1 is on
+// screen and carries two options, so there are four rows.
+check('the cursor lands on the first answer row', await cursorRowIndex(), 0);
+check('...which is the first option', await cursorRowLabel(), 'Exponential backoff');
 await press('j');
-check('j moves to the next question', await cursorQuestion(), 'Retry policy on a failed rollout?');
+check('j moves to the next option', await cursorRowLabel(), 'Fixed 5s');
+await press('j');
+check('...then onto the free-text row', await cursorRowLabel(), 'Other');
+await press('j');
+check('...then onto the submit row', await cursorRowIndex(), 3);
 await press('k');
-check('k moves back', await cursorQuestion(), 'Which cache backend should the deploy use?');
-await press('2');
-check('2 picks the second option of the question under the cursor', await checkedIn(0), 'memory');
+check('k moves back', await cursorRowLabel(), 'Other');
+// The row's OWN label is what gets announced, and with a real count. Pinned here
+// rather than in the assistive-technology section further down: the ask on screen
+// there carries no options, so its free-text row and its submit row both read
+// "Answer" and an announcement check cannot tell which one it named. These four
+// rows all read differently.
+await evaluate(`document.getElementById('nav-live').textContent = ''; return 1;`);
+await press('k');
+check('moving announces the row it landed on, by that row\'s own label',
+  await evaluate(`return document.getElementById('nav-live').textContent;`),
+  'Fixed 5s (2 of 4)');
 await press('j');
-await press('1');
-check('1 picks on the second question after moving', await checkedIn(1), 'exp');
-check('the first question keeps its own pick', await checkedIn(0), 'memory');
+// Enter on the free-text row types into it. That branch is checked BEFORE the
+// generic radio branch, and the order is the whole point: this row carries a
+// radio AND the box, so falling through to the radio would arm an empty custom
+// answer nobody typed — one submitAnswer then refuses, on a question the human
+// thinks they just answered.
+await press('Enter');
+check('Enter on the free-text row goes to the box, it arms no empty answer',
+  await evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return { focused: document.activeElement.id, checked: r ? r.value : null };`),
+  { focused: 'interview-text', checked: null });
+await press('Escape');
+await press('2');
+check('2 picks the second option', await ivChecked(), 'fixed');
+check('...and brings the cursor onto the row it picked', await cursorRowIndex(), 1);
 await press('9');
-check('an out-of-range digit is ignored', await checkedIn(1), 'exp');
+check('an out-of-range digit is ignored', await ivChecked(), 'fixed');
+// The digits index the OPTION rows, which is a smaller set than the rows the
+// cursor moves over: ask-1 offers two options but has four rows. `3` indexed over
+// the rows would land on the free-text row and select its radio — arming an empty
+// custom answer the reviewer never typed, in place of the option they did pick.
+await press('3');
+check('a digit past the last OPTION is ignored, not counted into the other rows',
+  await ivChecked(), 'fixed');
+await press('j');
+await press('k');
+check('the pick survives moving the cursor', await ivChecked(), 'fixed');
 await press('i');
-check('i focuses that question\'s custom-answer box', await activeId(), 'q_1_othertext');
+check('i focuses the free-text box, wherever the cursor is', await activeId(), 'interview-text');
+// ...and brings the cursor with it. Not cosmetic: typing arms the free-text row,
+// so a cursor left behind on an option row is a cursor pointing at an answer that
+// is NOT the armed one — and the next Enter activates the row it points at.
+check('...and moves the cursor onto the row it just armed', await cursorRowIndex(), 2);
 await typeText('linear backoff');
-check('typing a custom answer selects its Other radio', await checkedIn(1), '__drovr_other__');
+check('typing a custom answer selects the Other radio', await ivChecked(), '__drovr_other__');
 await press('Escape');
 check('Escape leaves the text box', await activeId(), 'body');
-check('collectAnswers maps every question to its answer',
-  await evaluate(`return collectAnswers();`),
-  { cache: 'memory', retry: 'linear backoff' });
+// The whole sequence a reviewer actually performs: type an answer, leave the box,
+// press Enter. Before the cursor moved with `i`, this checked the option row the
+// cursor had been parked on, silently disarmed the text still visible in the box,
+// and sent that option instead — no error, no highlight change, the typed answer
+// simply gone. Enter here lands back in the box, which is inert and correct.
+await press('Enter');
+check('Enter after typing does not disarm the typed answer', await evaluate(`
+  var r = document.querySelector('#interview-area input[type="radio"]:checked');
+  return { armed: r ? r.value : null,
+           text: document.getElementById('interview-text').value };`),
+  { armed: '__drovr_other__', text: 'linear backoff' });
+await press('Escape');
+await evaluate(`document.getElementById('interview-text').value = ''; return 1;`);
+await press('2');
+check('re-picking an option takes the selection back off Other', await ivChecked(), 'fixed');
+// Submit is a row the reviewer has to LAND on, never a stray Enter on an option
+// — and it is the only keyboard path to an answer. Enter FROM an option row picks
+// that option and stops. Driven from row 0, whose option is NOT the one currently
+// checked: on the row already picked, "it picked it" and "it did nothing" are the
+// same observation, and a build where the option branch just returns would pass.
+await press('k');
+check('the cursor is on the option that is not picked', await cursorRowIndex(), 0);
+await press('Enter');
+// The sleep is load-bearing, and reading the LOG is what makes it decisive.
+// press() returns the moment the keydown is dispatched, so a build that DOES
+// submit from an option row has an unresolved POST in flight at that instant and
+// the panel still reads exactly as it should — this check passed against such a
+// build. Wait past a local round trip (the real submit below settles inside one),
+// then ask the server, which cannot be mid-render.
+await sleep(500);
+check('Enter on an option row picks it and answers nothing', await evaluate(`
+  return fetch(api('interview')).then(function(r){ return r.json(); }).then(function(a){
+    var ask1 = a.filter(function(x){ return x.id === 'ask-1'; })[0];
+    var r = document.querySelector('#interview-area input[type="radio"]:checked');
+    return { picked: r ? r.value : null, answer: ask1.answer,
+             onScreen: (document.querySelector('#interview-area .interview-question') || {}).textContent };
+  });`), { picked: 'exp', answer: null, onScreen: 'Retry policy on a failed rollout?' });
+// Back onto the option the submit check below expects to reach the log.
+await press('2');
+await press('G');
+check('G lands on the submit row', await cursorRowIndex(), 3);
+await press('Enter');
+await waitFor(ivQuestion, q => q === 'Anything else the plan phase should know?', 8000,
+  'the free-text question');
+check('Enter on the submit row answers the ask and the panel advances', await ivQuestion(),
+  'Anything else the plan phase should know?');
+check('...and the value under the keyboard\'s own control is what reached the log',
+  await evaluate(`
+  return fetch(api('interview')).then(function(r){ return r.json(); }).then(function(a){
+    var ask1 = a.filter(function(x){ return x.id === 'ask-1'; })[0];
+    return { answer: ask1.answer, answered: ask1.answered_at !== null };
+  });`), { answer: 'fixed', answered: true });
+check('...and the cursor starts over on the new ask\'s first row', await cursorRowIndex(), 0);
+// ...which the check above does NOT actually pin, and neither does the one at the
+// top of this section: the fixture's asks shrink monotonically (5 rows, then 4,
+// then 2), so every real advance ALSO clamps an out-of-range index down, and a
+// reset that never ran would be invisible behind the clamp. The case the reset
+// exists for is the opposite one — a new ask with at least as many rows, where
+// the clamp is a no-op and the stale cursor sits on a row of a question nobody
+// has read yet. Forced here with a synthesised ask, the way the repaint checks
+// above call renderInterview directly.
+check('a new ask with MORE rows still starts the cursor over', await evaluate(`
+  var saved = currentInterview;
+  navCursor = 1;                       // in range for the ask on screen AND the new one
+  renderInterview([{ id: 'ask-synthetic', seq: 9, question: 'A wholly new question?',
+                     options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }]);
+  var rows = document.querySelectorAll('#interview-area .interview-row');
+  var at = null;
+  for (var i = 0; i < rows.length; i++) if (rows[i].classList.contains('nav-cursor')) at = i;
+  renderInterview(saved);              // put the real ask back for the sections below
+  return { rows: rows.length, cursor: at };`), { rows: 4, cursor: 0 });
 
-console.log('\n== run detail: answers cannot be silently dropped ==');
-// answers is keyed by question id, so two questions sharing one cannot both be
-// represented; refusing to submit beats losing an answer the reviewer gave.
-check('duplicate question ids are refused', await evaluate(`
-  var saved = currentQuestions;
-  currentQuestions = [{id:'dup',prompt:'a',options:[]},{id:'dup',prompt:'b',options:[]}];
-  var got = duplicateQuestionId();
-  currentQuestions = saved;
-  return got;`), 'dup');
+// ask-2 carries no options at all — a plain free-text ask.
+check('a question with no options is a bare free-text row', await evaluate(`
+  return { optionRows: document.querySelectorAll('#interview-area .interview-row[data-value]').length,
+           label: document.querySelector('#interview-area label[for="iv_other"]').textContent,
+           count: document.querySelector('#interview-area .interview-count').textContent };`),
+  { optionRows: 0, label: 'Answer', count: '1 of 1' });
+// ...so its refusal must not name options that are not on screen. "or pick one of
+// the options" is not advice when there is nothing to pick — it points at a
+// control the human cannot find.
+check('...and its refusal names only what it actually offers', await evaluate(`
+  document.getElementById('interview-text').value = '   ';
+  submitAnswer();
+  var err = document.getElementById('interview-error');
+  return err.style.display !== 'none' && err.textContent;`), 'Type an answer.');
+await evaluate(`
+  document.getElementById('interview-text').value = '';
+  document.getElementById('interview-text').blur();
+  return 1;`);
+
+// A poll recovery clears the message the FAILED poll left behind — and nothing
+// else. A submit failure the human has not read yet must survive the next tick,
+// or the only evidence that the answer was not recorded disappears within 2s.
+check('a recovering poll does not wipe an unread submit error', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    // Start from a quiet panel: the refusal the check above left standing is a
+    // 'submit' message, which a read failure deliberately does NOT speak over —
+    // so leaving it here would arm nothing. (That precedence is what
+    // duringSecondRead below asserts, on purpose rather than by accident.)
+    interviewMsg = null; paintInterviewMsg();
+    // 1. a read failure, so the recovery path is armed
+    window.fetch = function() {
+      return Promise.resolve({ ok: false, status: 500,
+        json: function() { return Promise.resolve({ ok: false, error: 'interview log unreadable' }); } });
+    };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var afterRead = document.getElementById('interview-error').textContent;
+    // 2. a failed submit on top of it
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 500,
+          json: function() { return Promise.resolve({ ok: false, error: 'could not append the answer' }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'a real answer';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var afterSubmit = document.getElementById('interview-error').textContent;
+    // 3. ANOTHER read failure on top of the submit failure. A read recovers by
+    //    itself; an answer that did not land does not — so the read must not
+    //    speak over it, and must not clear it on the way back out either.
+    window.fetch = function() {
+      return Promise.resolve({ ok: false, status: 500,
+        json: function() { return Promise.resolve({ ok: false, error: 'interview log unreadable' }); } });
+    };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var duringSecondRead = document.getElementById('interview-error').textContent;
+    // 4. the read recovers
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var afterRecovery = document.getElementById('interview-error');
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    return { afterRead: afterRead, afterSubmit: afterSubmit,
+             duringSecondRead: duringSecondRead,
+             stillShown: afterRecovery.style.display !== 'none' && afterRecovery.textContent };
+  })();`), {
+    afterRead: 'interview log unreadable',
+    afterSubmit: 'could not append the answer',
+    duringSecondRead: 'could not append the answer',
+    stillShown: 'could not append the answer',
+  });
+
+// The failures the poll can hit that are NOT an HTTP status: the request never
+// completing, and the render throwing on what came back. Both used to be swallowed
+// whole, leaving a question on screen that the page could no longer refresh and an
+// answer channel that could no longer deliver, with nothing said.
+check('the poll says so when it cannot reach the server, and recovers', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var duringOutage = document.getElementById('interview-error');
+    var said = !!duringOutage && duringOutage.style.display !== 'none' && duringOutage.textContent;
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var back = document.getElementById('interview-error');
+    var got = { said: said,
+                clearedOnRecovery: !back || back.style.display === 'none',
+                askBack: !!document.querySelector('#interview-area .interview-question') };
+    await pollInterview(routeGen);      // re-arm the chain for the checks below
+    return got;
+  })();`), { said: 'The interview could not be reached. Retrying…', clearedOnRecovery: true, askBack: true });
+
+check('a render that throws does not take the message with it', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, savedRender = renderInterview;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function() { return Promise.reject(new Error('forced network failure')); };
+    await pollInterview(routeGen);      // arm a poll message
+    clearTimeout(interviewTimer);
+    window.fetch = saved;
+    // A successful read whose render blows up. Clearing the message BEFORE the
+    // render means this path ends with a stale panel and nothing on it.
+    window.renderInterview = function() { throw new Error('forced render failure'); };
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    window.renderInterview = savedRender;
+    var el = document.getElementById('interview-error');
+    var got = !!el && el.style.display !== 'none' && el.textContent;
+    interviewMsg = null; paintInterviewMsg();
+    await pollInterview(routeGen);
+    return got;
+  })();`), 'The interview could not be reached. Retrying…');
+
+// The answer landed and only the read-back did not, so the question is still on
+// screen looking exactly as unanswered as before. Saying nothing reads as "the
+// button did nothing" and invites a resubmit of an answer already in the log.
+check('an answer whose read-back fails still says it was recorded', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ ok: true, id: currentAsk.id }); } });
+      }
+      return Promise.reject(new Error('forced read-back failure'));
+    };
+    document.getElementById('interview-text').value = 'recorded but not read back';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var el = document.getElementById('interview-error');
+    var btn = document.getElementById('interview-answer-btn');
+    var got = { said: !!el && el.style.display !== 'none' && el.textContent,
+                buttonUsable: !!btn && !btn.disabled };
+    window.fetch = saved;
+    interviewMsg = null; paintInterviewMsg();
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    clearTimeout(interviewTimer);
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    said: 'Your answer was recorded. The question could not be reloaded; retrying…',
+    buttonUsable: true,
+  });
+// The same guarantee one step later: the read-back SUCCEEDS and painting it is
+// what fails. Unguarded, that rejects submitAnswer's promise with the button
+// still disabled and nothing said — a dead control reporting a successful answer.
+check('...and so does one whose read-back cannot be painted', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, savedRender = renderInterview;
+    interviewMsg = null; paintInterviewMsg();
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ ok: true, id: currentAsk.id }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    window.renderInterview = function() { throw new Error('forced render failure'); };
+    document.getElementById('interview-text').value = 'recorded but not painted';
+    document.getElementById('iv_other').checked = true;
+    var threw = false;
+    try { await submitAnswer(); } catch (e) { threw = true; }
+    window.renderInterview = savedRender;
+    window.fetch = saved;
+    var el = document.getElementById('interview-error');
+    var btn = document.getElementById('interview-answer-btn');
+    var got = { rejected: threw,
+                said: !!el && el.style.display !== 'none' && el.textContent,
+                buttonUsable: !!btn && !btn.disabled };
+    interviewMsg = null; paintInterviewMsg();
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    clearTimeout(interviewTimer);
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    rejected: false,
+    said: 'Your answer was recorded. The question could not be reloaded; retrying…',
+    buttonUsable: true,
+  });
+
+// The POST is addressed to the run that was on screen when the button was
+// clicked, and its response belongs to that run too. A 409 says THAT run was
+// cancelled — applying it to whatever is on screen now mutes a live run's panel,
+// and nothing on an idle/ready run ever unmutes it: the human simply stops being
+// asked, with no error and no way back short of re-entering the run.
+check('a response that lands after a navigation touches nothing', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, url = null, release;
+    var gate = new Promise(function(r) { release = r; });
+    window.fetch = function(u, opts) {
+      if (opts && opts.method === 'POST') {
+        url = String(u);
+        return gate.then(function() {
+          return { ok: false, status: 409, json: function() {
+            return Promise.resolve({ ok: false, error: 'this run was cancelled' }); } };
+        });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'an answer overtaken by a navigation';
+    document.getElementById('iv_other').checked = true;
+    var posting = submitAnswer();
+    routeGen++;                    // the human left while the POST was in flight
+    release();
+    await posting;
+    window.fetch = saved;
+    var err = document.getElementById('interview-error');
+    var got = { sentToThisRun: /\\/runs\\/alpha-deploy\\/answer$/.test(url),
+                muted: interviewMuted,
+                errorShown: !!err && err.style.display !== 'none',
+                stillAsking: !!document.querySelector('#interview-area .interview-question') };
+    // Put the generation back and restart the chain the bump above stranded.
+    routeGen--;
+    clearTimeout(interviewTimer);
+    pollInterview(routeGen);
+    // Null-guarded on purpose: a build WITHOUT the generation check tears the
+    // panel down here, and this teardown throwing would abort the whole driver
+    // instead of letting the check above report what went wrong.
+    var box = document.getElementById('interview-text');
+    if (box) box.value = '';
+    return got;
+  })();`), { sentToThisRun: true, muted: false, errorShown: false, stillAsking: true });
+
+// A live 409 — the run was cancelled while the human had the question on screen.
+// The explanation replaces the question, so it has to survive the repaint that
+// takes the question away: written loose into the DOM it is erased by the next
+// tick, under two seconds after the human was told, and the panel goes blank with
+// nothing to say why. This is the ONE status the plan says to explain.
+check('a cancellation explanation outlives the poll that clears the question', await evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 409, json: function() {
+          return Promise.resolve({ ok: false, error: 'this run was cancelled' }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    document.getElementById('interview-text').value = 'too late';
+    document.getElementById('iv_other').checked = true;
+    await submitAnswer();
+    var shown = document.getElementById('interview-error');
+    var immediately = !!shown && shown.style.display !== 'none' && shown.textContent;
+    // The tick that would erase it, run for real rather than waited out.
+    window.fetch = saved;
+    await pollInterview(routeGen);
+    clearTimeout(interviewTimer);
+    var after = document.getElementById('interview-error');
+    // ...and a refresh() whose /state was read BEFORE the cancellation must not
+    // hand the panel back. A run does not un-cancel, so the 409 is the fresher
+    // reading of the same marker; assigning the stale one over it resumes offering
+    // answers that can now only 409 again.
+    window.fetch = function(url, opts) {
+      if (String(url).indexOf('/state') !== -1) {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ state: 'ready', turn: 0 }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    await refresh();
+    clearTimeout(pollTimer);
+    window.fetch = saved;
+    var afterStaleRefresh = document.getElementById('interview-error');
+    var got = { immediately: immediately,
+                afterATick: !!after && after.textContent,
+                askGone: !document.querySelector('#interview-area .interview-question'),
+                stillMuted: interviewMuted,
+                afterStaleRefresh: !!afterStaleRefresh && afterStaleRefresh.textContent };
+    // Undo the mute and let the panel come back for the sections below.
+    interviewMuted = false;
+    clearInterview();
+    await pollInterview(routeGen);
+    return got;
+  })();`), {
+    immediately: 'This run was cancelled — the agent is no longer waiting for an answer.',
+    afterATick: 'This run was cancelled — the agent is no longer waiting for an answer.',
+    askGone: true,
+    stillMuted: true,
+    afterStaleRefresh: 'This run was cancelled — the agent is no longer waiting for an answer.',
+  });
+
+console.log('\n== run detail: the interview is not gated on the review state ==');
+// `waiting` and `approved` are the load-bearing states: an agent asking mid-phase
+// is exactly when the gate is NOT at `ready`, and the gate on an approved spec may
+// never move again. Only `cancelled` mutes the panel — `drovr ask wait` exits 5 on
+// that marker, so nobody is listening. An implementation that inverted this would
+// pass every other check in this section.
+// Only the state endpoint is stubbed; everything else still hits the real server.
+const withState = state => evaluate(`
+  return (async function() {
+    var saved = window.fetch;
+    window.fetch = function(url, opts) {
+      if (String(url).indexOf('/state') !== -1) {
+        return Promise.resolve({ ok: true, status: 200, json: function() {
+          return Promise.resolve({ state: ${JSON.stringify(state)}, turn: 0 }); } });
+      }
+      return saved.apply(window, arguments);
+    };
+    // refresh() arms pollState on 'waiting'; drop it, or that chain outlives the stub.
+    try { await refresh(); } finally { window.fetch = saved; clearTimeout(pollTimer); }
+    return { rendered: !!document.querySelector('#interview-area .interview-question'),
+             muted: interviewMuted };
+  })();`);
+check('a `waiting` gate keeps the panel', await withState('waiting'), { rendered: true, muted: false });
+check('an `approved` one keeps it too', await withState('approved'), { rendered: true, muted: false });
+check('a cancelled run clears it', await withState('cancelled'), { rendered: false, muted: true });
+check('...and answering a cleared panel posts nothing', await evaluate(`
+  return (async function() {
+    var saved = window.fetch, sent = 0;
+    window.fetch = function(url, opts) {
+      if (opts && opts.method === 'POST') { sent++; }
+      return saved.apply(window, arguments);
+    };
+    try { await submitAnswer(); } finally { window.fetch = saved; }
+    return sent;
+  })();`), 0);
+// Back to the run's real state, and let the poll re-arm the panel for the sections
+// below (which navigate away from and back to this run).
+await evaluate(`interviewMuted = false; return refresh().then(function(){ return 1; });`);
+await waitFor(ivQuestion, q => !!q, 8000, 'the interview panel again');
+await waitFor(INTERVIEW_READY.probe, INTERVIEW_READY.ok, 8000, 'the cursor back on its rows');
+
+console.log('\n== run detail: the decision form no longer carries answers ==');
+// The questions panel that filled `answers` is gone; the agent's questions are
+// answered live through the interview channel instead. The KEY stays on the wire
+// — `handle_post_submit` still reads and persists it — so this asserts the shape
+// the server is still guaranteed, not the absence of the field.
+check('the submitted payload carries an empty answers map', await evaluate(`
+  var sent = null, saved = window.fetch;
+  window.fetch = function(url, opts) {
+    if (opts && opts.method === 'POST' && String(url).indexOf('/submit') !== -1) {
+      sent = JSON.parse(opts.body);
+      return Promise.resolve({ ok: true, status: 200,
+                               json: function(){ return Promise.resolve({ ok: false }); } });
+    }
+    return saved.apply(window, arguments);
+  };
+  document.querySelector('input[name="decision"][value="request-changes"]').checked = true;
+  document.getElementById('feedback').value = 'something to say';
+  return submitDecision().then(function() {
+    window.fetch = saved;
+    document.getElementById('feedback').value = '';
+    hideEl('form-error');
+    return sent && { hasKey: 'answers' in sent, answers: sent.answers };
+  });`), { hasKey: true, answers: {} });
 
 console.log('\n== run detail: request-changes must say something ==');
 // Driven through the real submit path, not the helper: this is the gate that
@@ -1719,19 +2262,31 @@ check('an old-shape comment is migrated at load, not left borrowing the line quo
   });
 
 console.log('\n== pointer and keyboard agree ==');
-check('clicking a question adopts it as the cursor', await evaluate(`
-  var items = document.querySelectorAll('#questions-area .question-item');
-  items[2].click();
-  return items[2].classList.contains('nav-cursor');`), true);
+// ask-2 is on screen and carries no options, so the rows here are the free-text
+// row and the submit row. Move the cursor OFF the target first: clicking the row
+// it is already on passes whether or not the click is wired up at all.
+await press('j');
+check('the cursor really moved off the first row', await cursorRowIndex(), 1);
+// The ROW, deliberately, not a control inside it — the submit row's button would
+// answer the ask and the free-text row's label would steal the focus.
+check('clicking an answer row adopts it as the cursor', await evaluate(`
+  var rows = document.querySelectorAll('#interview-area .interview-row');
+  rows[0].click();
+  return rows[0].classList.contains('nav-cursor');`), true);
 
 console.log('\n== assistive technology ==');
 check('the cursor is exposed as aria-current', await evaluate(`
-  return !!document.querySelector('#questions-area .question-item.nav-cursor[aria-current="true"]');`), true);
+  return !!document.querySelector('#interview-area .interview-row.nav-cursor[aria-current="true"]');`), true);
 await evaluate(`document.getElementById('nav-live').textContent = ''; return 1;`);
-await press('k');
-const announced = await evaluate(`return document.getElementById('nav-live').textContent || '';`);
-check('moving the cursor announces the row it landed on',
-  announced.indexOf(await cursorQuestion()) !== -1 && /\(\d+ of \d+\)/.test(announced), true);
+await press('j');
+// The exact string, counts included. This ask carries no options, so both of its
+// rows read "Answer" and a substring test cannot say which was named — what this
+// pins is that the submit row, which has no <label> of its own, still announces
+// something rather than a bare " (2 of 2)". WHICH row gets announced is pinned in
+// the keyboard section above, against an ask whose rows all read differently.
+check('the row the cursor landed on is announced, with its position',
+  await evaluate(`return document.getElementById('nav-live').textContent || '';`),
+  'Answer (2 of 2)');
 check('the help is reachable by pointer, not only by its own key',
   await evaluate(`return !!document.querySelector('#keyhint button');`), true);
 check('the help card is a labelled modal dialog', await evaluate(`
@@ -1746,6 +2301,11 @@ check('closing the help returns focus to whatever opened it', await evaluate(`
   return document.activeElement !== document.querySelector('#key-help .card');`), true);
 
 console.log('\n== help overlay ==');
+// Park the cursor on the LAST row first, and move UPWARDS below. The ask on
+// screen has two answer rows, so pressing into the end of the list cannot tell
+// "the modal blocked it" from "it was already there" — the inert check would
+// pass against a modal that blocks nothing.
+await press('G');
 // Opened with the KEY, not by calling openKeyHelp() — otherwise the `?` binding
 // itself, which the README and the in-app help both advertise, goes untested.
 check('the help is closed to start with', await helpOpen(), false);
@@ -1753,14 +2313,14 @@ await press('?');
 check('? opens the help', await helpOpen(), true);
 // Capture the cursor BEFORE the keypress. Comparing two reads taken after it is
 // a tautology that passes even if the modal stops blocking motion entirely.
-const beforeHelp = await cursorQuestion();
-await press('j');
-check('motion is inert while the help is open', await cursorQuestion(), beforeHelp);
+const beforeHelp = await cursorRowIndex();
+await press('k');
+check('motion is inert while the help is open', await cursorRowIndex(), beforeHelp);
 await press('Escape');
 check('Escape closes the help', await helpOpen(), false);
-await press('j');
+await press('k');
 check('motion resumes once the help is closed',
-  (await cursorQuestion()) !== beforeHelp, true);
+  (await cursorRowIndex()) !== beforeHelp, true);
 
 console.log('\n== layout ==');
 // The regression this guards dropped padding from 60px to 34px, which still
@@ -1880,7 +2440,7 @@ check('a response arriving after navigation is dropped, not filed under the new 
   await evaluate(`return document.getElementById('agents-note').textContent;`), '');
 
 console.log('\n== leaving a run ==');
-await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await goto('#/runs/alpha-deploy', INTERVIEW_READY);
 await press('h');
 await waitFor(hash, h => h === '#/', 8000, 'back at the list');
 check('h returns to the session list', await hash(), '#/');
@@ -2004,7 +2564,7 @@ console.log('\n== the decision form does not carry across runs ==');
 // them on navigation: prose typed for one run stayed in the box and the radio kept
 // its pick, and submitting on the next run wrote them into THAT run's
 // feedback.json — a decision the reviewer never made about a spec they never read.
-await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await goto('#/runs/alpha-deploy', INTERVIEW_READY);
 await evaluate(`
   document.getElementById('feedback').value = 'alpha-only feedback, must not follow me';
   document.querySelector('input[name="decision"][value="approve"]').checked = true;
@@ -2029,7 +2589,7 @@ console.log('\n== staying on the same run keeps the reviewer\'s work ==');
 // already on that run — re-enters route() with the SAME run. Feedback is never
 // persisted anywhere, so clearing it there destroys the reviewer's typed prose
 // with no warning and no way back.
-await goto('#/runs/alpha-deploy', QUESTIONS_READY);
+await goto('#/runs/alpha-deploy', INTERVIEW_READY);
 await evaluate(`
   document.getElementById('feedback').value = 'half-written feedback I am still editing';
   document.querySelector('input[name="decision"][value="approve"]').checked = true;

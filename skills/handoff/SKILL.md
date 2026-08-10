@@ -27,6 +27,18 @@ exists. Preserve decisions + interfaces, drop narration.
 > truth. Compaction is one of drovr's three context-engineering levers (with note-taking/git
 > and sub-agents — see `drovr:using-drovr`); this skill is the compaction lever.
 
+## Bind checklists to tracked task state
+
+The four steps below are a checklist, and so is the 7-section handoff they end in.
+
+> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**
+> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —
+> before you start step 1. Mark each in-progress when you start it and complete when its
+> evidence is in hand. If the harness exposes no task tool, write the checklist to
+> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the
+> repo root otherwise, and tick items there. An untracked checklist decays with the context
+> window; that decay is the exact failure drovr exists to fight.
+
 ## The four steps
 
 Assume a run exists (`drovr new <run> --task "..."` — see `drovr:using-drovr` for setup).
@@ -129,6 +141,8 @@ Run name is `<run>`; the phase you are running is `<phase>`.
 | re-brief | `drovr phase brief … \| drovr phase send <run> <phase> -` | for a phase already running; `phase send "<text>"` is for free-form nudges only |
 | wait | `drovr phase wait <run> <phase> --timeout-ms <ms>` | **run backgrounded, then end the turn**; polls for the `done` marker (not herdr idle). `0`=done → step 4 · `4`=blocked on a prompt → answer it, re-arm · `2`=timeout → re-arm · `5`=superseded by a newer pass → re-arm, not a stuck agent · `1`=io-error → stop. Default timeout is only 30 s — always override. Foreground Bash caps at 600 000 ms, so a foreground wait times out on healthy long phases |
 | watch | `drovr watch [<run>] --timeout-ms <ms>` | **run backgrounded**; exits when ANY agent (of the run, or of every run drovr can read) stops on a prompt drovr will not answer. `4`=needs a human, the report names the phase and quotes the prompt · `0`=nothing left to watch (every agent gone AND every run's phases finished) · `2`=timeout → re-arm · `1`=error, including any run whose state could not be read. Routine permission dialogs do not wake it — a running `phase wait` answers those. Safe to background BEFORE `phase start`: a run with phases outstanding keeps it watching |
+| ask | `drovr ask <run> --question <text\|@file> [--context <text> \| --context-file <path>] [--option <value>=<label>]... [--recommend <value>]` | run by the AGENT, never the driver: posts one question for the human and **returns immediately** — it never blocks and never waits. Prints three lines — the ask id, the reviewer's page URL (starting the review server if it is not already up; only a server that could not be started gets a note instead, and the question is on disk either way), and the `ask wait` command to background. `0`=posted · `5`=run cancelled (terminal — stop work, do not re-ask) · `1`=error. `--context`/`--context-file` are mutually exclusive; `@<path>` on `--question` reads the text from a file (`@@` escapes a leading `@`). The record is append-only in `<run_dir>/interview.jsonl`, so it survives the agent that posted it |
+| ask wait | `drovr ask wait <run> --timeout-ms <ms>` | **run backgrounded, then end the turn**; a file poller, so it works while the panel is down. `0`=every question it was armed on is answered — those asks, each with its latest answer, as JSON on stdout (**not** the whole log; earlier answered asks are not in it) · `2`=timeout → re-arm, **nothing is lost** (the question is still on disk and still on screen) · `5`=run cancelled · `1`=error, including a run dir that is not there. Nothing pending at start also exits `0`, and that case prints the whole folded interview rather than a bare `[]` |
 | done | `drovr phase done <run> <phase>` | run by the AGENT as its final action; **refuses until `<phase>-HANDOFF.md` exists**; drops the marker `wait` polls |
 | scaffold | `drovr handoff-scaffold <run> <phase>` | writes the empty 7 sections for the AGENT to fill; refuses to overwrite an authored one. Structure only — drovr does not guess which commits are yours. `phase done` refuses while any section is still `TODO` |
 | collect | `drovr collect <run> <phase>` | reads `<phase>-HANDOFF.md` |
