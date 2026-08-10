@@ -37,7 +37,7 @@
 //! [`resolve_corpus`]. Absence has to be said out loud, because a skip prints
 //! `ok` having compared nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -3754,6 +3754,202 @@ fn retention_ledger_path(name: &str) -> Result<PathBuf, String> {
     Ok(spec_length_dir().join("ledger").join(format!("{name}.md")))
 }
 
+/// The two protocols' item-8 span rules, as data.
+///
+/// A struct rather than a bare `max_spans: usize` because the second difference
+/// is a boolean and a second positional argument of a bare type is exactly how a
+/// call site ends up passing the wrong one. Both instances are `const`, so the
+/// only way to reach [`check_retention_verdict`] is by naming one of them.
+#[derive(Clone, Copy)]
+struct RetentionRules {
+    /// The upper bound on `quotes` for a `present: true` row.
+    max_spans: usize,
+    /// Does `PROTOCOL-2.md` item 8's self-containment rule apply?
+    self_contained_spans: bool,
+}
+
+/// `PROTOCOL.md` item 8: 1–3 spans, no boundary rule.
+const RETENTION_RULES_V1: RetentionRules = RetentionRules {
+    max_spans: 3,
+    self_contained_spans: false,
+};
+
+/// `PROTOCOL-2.md` item 8: 1–5 spans, and every span self-contained.
+///
+/// The cap rose because 3 was manufacturing false negatives —
+/// `skill-stickiness-65` has four operative parts and cannot be evidenced by
+/// three spans. The boundary rule was added because `skill-stickiness-55`'s two
+/// spans in `invalidated/db3e2d.json` are one hard-wrapped clip, and item 8's
+/// mechanical rules passed both halves of it.
+const RETENTION_RULES_V2: RetentionRules = RetentionRules {
+    max_spans: 5,
+    self_contained_spans: true,
+};
+
+/// The byte range `[start, end)` of the line containing offset `at`, excluding
+/// the terminating newline.
+fn line_bounds(text: &str, at: usize) -> (usize, usize) {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    (start, end)
+}
+
+/// Byte offset, within `line`, of its first non-marker character —
+/// `PROTOCOL-2.md` item 8's *"markers being leading whitespace, a run of `#`, a
+/// `-`, `*` or `+` bullet, a `>`, a `|`, or `<digits>.`"*.
+///
+/// **A `-`, `*` or `+` counts as a bullet only when a space follows it, and that
+/// reading is deliberate.** Without it, `- **Loop** (…)` — a real line of
+/// `generated/db3e2d.md` — has its `**` eaten as two bullet markers, so a span
+/// starting at the bold text would be judged to start at a marker while a span
+/// starting *inside* the bold run would be judged to start on a boundary. The
+/// frozen rule says *"bullet"*, and a bullet in markdown is followed by a space;
+/// an emphasis run is not.
+fn first_non_marker(line: &str) -> usize {
+    let b = line.as_bytes();
+    let mut i = 0;
+    loop {
+        let before = i;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i < b.len() {
+            match b[i] {
+                b'#' => {
+                    while i < b.len() && b[i] == b'#' {
+                        i += 1;
+                    }
+                }
+                b'-' | b'*' | b'+' => {
+                    if i + 1 >= b.len() || b[i + 1] == b' ' || b[i + 1] == b'\t' {
+                        i += 1;
+                    }
+                }
+                b'>' | b'|' => i += 1,
+                b'0'..=b'9' => {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'.' {
+                        i = j + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if i == before {
+            return i;
+        }
+    }
+}
+
+/// Does the occurrence of a span starting at `at` begin on a boundary?
+///
+/// The four ways, exactly as `PROTOCOL-2.md` item 8 lists them: offset 0; a cell
+/// start; a sentence start; a block start.
+///
+/// **The cell rule is a literal `| ` and the sentence rule takes any run of
+/// spaces, and that asymmetry is the frozen text's, not this function's.** Item 8
+/// writes *"immediately preceded on the same line by `. `, `! ` or `? ` (any run
+/// of spaces)"* and, separately, *"immediately preceded by `| `"* with no such
+/// parenthetical. Widening the cell rule to match would be an edit to a frozen
+/// rule made for tidiness, so a padded table cell (`|  text`) is left failing
+/// this clause. It is a finding for whoever meets one, not something to loosen
+/// here.
+fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
+    if at == 0 {
+        return true;
+    }
+    let before = &spec[..at];
+    if before.ends_with("| ") {
+        return true;
+    }
+    let unspaced = before.trim_end_matches(' ');
+    if unspaced.len() < before.len() && unspaced.ends_with(['.', '!', '?']) {
+        return true;
+    }
+
+    let (line_start, line_end) = line_bounds(spec, at);
+    if line_start + first_non_marker(&spec[line_start..line_end]) != at {
+        return false;
+    }
+    // The span opens its own line. Whether that is a boundary depends on what
+    // came before it — a continuation of a wrapped sentence is not.
+    if line_start == 0 {
+        // There is no preceding line, so nothing contradicts the block start.
+        return true;
+    }
+    let prev_end = line_start - 1;
+    let prev_start = spec[..prev_end].rfind('\n').map_or(0, |i| i + 1);
+    let prev = spec[prev_start..prev_end].trim();
+    prev.is_empty()
+        || prev.starts_with('#')
+        || prev.starts_with('|')
+        || prev.ends_with(['.', '!', '?', ':', ';'])
+}
+
+/// Does an occurrence of a span ending at `end` stop on a boundary?
+///
+/// EOF, a sentence terminator, a block end, or a table cell end — item 8's four.
+fn span_ends_on_boundary(spec: &str, end: usize) -> bool {
+    if end == spec.len() {
+        return true;
+    }
+    if spec[..end].ends_with(['.', '!', '?', ':', ';']) {
+        return true;
+    }
+    let after = &spec[end..];
+    if after.starts_with('|') || after.starts_with(" |") {
+        return true;
+    }
+    let Some(rest) = after.strip_prefix('\n') else {
+        return false;
+    };
+    let next = rest.split('\n').next().unwrap_or("");
+    if next.trim().is_empty() {
+        return true;
+    }
+    let opener = next.trim_start().as_bytes();
+    match opener[0] {
+        b'|' | b'#' | b'-' | b'*' | b'+' | b'>' => true,
+        b'0'..=b'9' => {
+            let mut j = 0;
+            while j < opener.len() && opener[j].is_ascii_digit() {
+                j += 1;
+            }
+            j < opener.len() && opener[j] == b'.'
+        }
+        _ => false,
+    }
+}
+
+/// `PROTOCOL-2.md` item 8's self-containment rule: **some** occurrence of `span`
+/// in `spec` begins on a boundary **and** ends on a boundary.
+///
+/// Some occurrence, not every occurrence, because item 8 says so and gives the
+/// reason: *"the scorer is quoting the document and not an offset into it"*.
+///
+/// **The two ends are symmetric on purpose.** The failure this rule was written
+/// against is a span clipped across a hard wrap, which produces two fragments —
+/// one ending mid-phrase, one beginning mid-phrase. A rule that demanded a
+/// terminator only on the right would accept the second fragment, so catching
+/// the clip would depend on which half the scorer happened to quote.
+/// [`retention_2_check_refuses_a_span_that_is_not_self_contained`] runs the real
+/// pair from `invalidated/db3e2d.json` and refuses both.
+///
+/// **What it cannot see:** a well-formed sentence lifted out of an *Out of
+/// scope* container begins and ends on boundaries and is **accepted**. Item 8
+/// says that case belongs to tiers 2 and 3, and the unit test demonstrates the
+/// acceptance rather than leaving it to be discovered.
+fn span_is_self_contained(spec: &str, span: &str) -> bool {
+    if span.is_empty() {
+        return false;
+    }
+    spec.match_indices(span)
+        .any(|(at, _)| span_begins_on_boundary(spec, at) && span_ends_on_boundary(spec, at + span.len()))
+}
+
 /// Every rule `PROTOCOL.md` item 8 states about an assembled retention verdict,
 /// as a pure function over already-read bytes.
 ///
@@ -3774,15 +3970,26 @@ fn retention_ledger_path(name: &str) -> Result<PathBuf, String> {
 /// equal `spec_id`. [`retention_scan_surfaces_every_misfiled_verdict`]'s scan
 /// deliberately does not do this — its job is to surface entries no check
 /// classifies, and a file named after a plausible id is classified fine.
+///
+/// **`pool` and `rules` are parameters rather than constants because two
+/// protocols now share this checker.** `PROTOCOL.md` item 8 caps `quotes` at 3
+/// and says nothing about span boundaries; `PROTOCOL-2.md` item 8 raises the cap
+/// to 5 and adds the self-containment rule. Forking the function would have left
+/// two copies of the completeness and double-citation logic to keep in step, and
+/// the v1 copy is the one nobody would touch again. Every v1 call site passes
+/// [`SPEC_LENGTH_ID_POOL`] and [`RETENTION_RULES_V1`], so v1 behaviour is
+/// unchanged down to the wording of the span-count complaint.
 fn check_retention_verdict(
     stem: &str,
     verdict: &RetentionVerdict,
     ledger_ids: &[String],
     spec: &str,
+    pool: &[&str],
+    rules: RetentionRules,
 ) -> Vec<String> {
     let mut wrong = Vec::new();
 
-    if !SPEC_LENGTH_ID_POOL.contains(&stem) {
+    if !pool.contains(&stem) {
         wrong.push(format!(
             "the file is named `{stem}.json`, and `{stem}` is not one of the eighteen pool \
              ids. A verdict filed under an invented id is scanned, checked and counted — \
@@ -3797,7 +4004,7 @@ fn check_retention_verdict(
             verdict.spec_id,
         ));
     }
-    if !SPEC_LENGTH_ID_POOL.contains(&verdict.spec_id.as_str()) {
+    if !pool.contains(&verdict.spec_id.as_str()) {
         wrong.push(format!(
             "`spec_id` is `{}`, which is not one of the eighteen pool ids",
             verdict.spec_id,
@@ -3877,13 +4084,15 @@ fn check_retention_verdict(
     // still has 90 rows whose spans are worth reporting in the same pass.
     for row in &verdict.rows {
         if row.present {
-            if row.quotes.is_empty() || row.quotes.len() > 3 {
+            if row.quotes.is_empty() || row.quotes.len() > rules.max_spans {
                 wrong.push(format!(
-                    "row `{}` is `present: true` with {} span(s); item 8 requires 1 to 3. \
-                     Zero is an unevidenced retention claim; more than three is a row \
+                    "row `{}` is `present: true` with {} span(s); item 8 requires 1 to {}. \
+                     Zero is an unevidenced retention claim; more than {} is a row \
                      established by assembling the document rather than by citing it.",
                     row.id,
                     row.quotes.len(),
+                    rules.max_spans,
+                    rules.max_spans,
                 ));
             }
             for (i, quote) in row.quotes.iter().enumerate() {
@@ -3900,6 +4109,17 @@ fn check_retention_verdict(
                          {:?}. Every span is copied from the document, never from the ledger \
                          row and never reconstructed — a near-miss paraphrase is the shape a \
                          span takes when the scorer wrote it from memory.",
+                        row.id,
+                        i + 1,
+                        quote,
+                    ));
+                } else if rules.self_contained_spans && !span_is_self_contained(spec, quote) {
+                    wrong.push(format!(
+                        "row `{}` span {} is in the spec but no occurrence of it begins and \
+                         ends on a boundary: {:?}. `PROTOCOL-2.md` item 8's self-containment \
+                         rule — a span clipped at a hard wrap can look like evidence while \
+                         establishing nothing, and both halves of such a clip are refused, \
+                         not just the one that ends mid-phrase.",
                         row.id,
                         i + 1,
                         quote,
@@ -3975,13 +4195,15 @@ fn retention_check_refuses_a_verdict_that_is_not_complete_and_quoted() {
            ]}"#,
     );
     assert!(
-        check_retention_verdict("4a73ef", &sound, &ids, spec).is_empty(),
+        check_retention_verdict("4a73ef", &sound, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1)
+            .is_empty(),
         "a well-formed verdict must pass: {:?}",
-        check_retention_verdict("4a73ef", &sound, &ids, spec)
+        check_retention_verdict("4a73ef", &sound, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1)
     );
 
     let complains = |stem: &str, v: &RetentionVerdict, needle: &str, why: &str| {
-        let found = check_retention_verdict(stem, v, &ids, spec);
+        let found =
+            check_retention_verdict(stem, v, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1);
         assert!(
             found.iter().any(|c| c.contains(needle)),
             "{why}: expected a complaint mentioning `{needle}`, got {found:?}"
@@ -4404,7 +4626,14 @@ fn spec_length_retention_verdicts_are_complete_and_quoted() {
         };
 
         rows_checked += verdict.rows.len();
-        for complaint in check_retention_verdict(&stem, &verdict, &ids, &spec) {
+        for complaint in check_retention_verdict(
+            &stem,
+            &verdict,
+            &ids,
+            &spec,
+            SPEC_LENGTH_ID_POOL,
+            RETENTION_RULES_V1,
+        ) {
             wrong.push(format!("  {}: {complaint}", path.display()));
         }
     }
@@ -5132,6 +5361,2947 @@ fn spec_length_write_up_arithmetic_matches_the_adjudication_records() {
         !tabled.is_empty(),
         "{}'s row-failure table parsed as empty",
         write_up_path.display(),
+    );
+}
+
+// ===========================================================================
+// The second attempt — `PROTOCOL-2.md`.
+//
+// `RESULTS.md` records a null about the *instrument*: `PROTOCOL.md` item 8a
+// invalidated a whole verdict file for any single unestablished row, so no arm
+// could pass and neither could the control. `PROTOCOL-2.md` redesigns that
+// disposition and this block is its mechanical half.
+//
+// **Most of these checks are vacuous today and each one says where it stops
+// being vacuous.** A check that passes because it matched nothing reads
+// identically to one that passes because the thing is right, and this corpus
+// has already shipped that mistake more than once. Nothing below skips
+// silently: either the vacuity is stated in the doc comment with the task that
+// ends it, or the check refuses to be vacuous at all.
+// ===========================================================================
+
+/// The redesigned protocol (`docs/skill-evidence/spec-length/PROTOCOL-2.md`).
+fn spec_length_2_protocol_path() -> PathBuf {
+    spec_length_dir().join("PROTOCOL-2.md")
+}
+
+/// The second attempt's freeze record. A **separate** file from `FREEZE.md`,
+/// which is not edited by this run and whose rows are not re-frozen here.
+fn spec_length_2_freeze_path() -> PathBuf {
+    spec_length_dir().join("FREEZE-2.md")
+}
+
+/// The 18 new generated specs. Absent until the generation task runs.
+fn spec_length_2_generated_dir() -> PathBuf {
+    spec_length_dir().join("generated-2")
+}
+
+/// Tier-1 retention verdicts — `PROTOCOL-2.md` item 8.
+fn spec_length_2_retention_dir() -> PathBuf {
+    spec_length_dir().join("retention-2")
+}
+
+/// Tier-2 relevance adjudications — item 8a.
+fn spec_length_2_adjudication_dir() -> PathBuf {
+    spec_length_dir().join("adjudication-2")
+}
+
+/// Tier-3 escalations — item 8b. A generation with no flagged row has **no
+/// file**, and that absence is the record.
+fn spec_length_2_escalation_dir() -> PathBuf {
+    spec_length_dir().join("escalation-2")
+}
+
+/// The new arm↔id assignment — item 7.
+fn spec_length_2_blind_map_path() -> PathBuf {
+    spec_length_dir().join("blind-map-2.json")
+}
+
+/// The arm-free id→fixture map — item 7a. It exists so that no task in the
+/// scoring chain ever has a legitimate reason to open the blind map.
+fn spec_length_2_fixture_map_path() -> PathBuf {
+    spec_length_dir().join("fixture-map-2.json")
+}
+
+/// The pre-measurement calibration record — item 12a.
+fn spec_length_2_calibration_path() -> PathBuf {
+    spec_length_dir().join("calibration-2.json")
+}
+
+/// The second attempt's raw record. `RESULTS.md` is **not** extended.
+fn spec_length_2_results_path() -> PathBuf {
+    spec_length_dir().join("RESULTS-2.md")
+}
+
+// The same paths spelled repo-relative, for `git log -- <path>` and
+// `git rev-parse <commit>:<path>`, both of which resolve against the repository
+// root rather than the filesystem.
+const SPEC_LENGTH_2_PROTOCOL_REPO_PATH: &str = "docs/skill-evidence/spec-length/PROTOCOL-2.md";
+const SPEC_LENGTH_2_GENERATED_REPO_DIR: &str = "docs/skill-evidence/spec-length/generated-2";
+const SPEC_LENGTH_2_RETENTION_REPO_DIR: &str = "docs/skill-evidence/spec-length/retention-2";
+const SPEC_LENGTH_2_BLIND_MAP_REPO_PATH: &str = "docs/skill-evidence/spec-length/blind-map-2.json";
+const SPEC_LENGTH_2_ADJUDICATION_REPO_DIR: &str = "docs/skill-evidence/spec-length/adjudication-2";
+const SPEC_LENGTH_2_ESCALATION_REPO_DIR: &str = "docs/skill-evidence/spec-length/escalation-2";
+const SPEC_LENGTH_2_TRANSMISSION_REPO_DIR: &str = "docs/skill-evidence/spec-length/transmission-2";
+const SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR: &str =
+    "docs/skill-evidence/spec-length/transmission-2/questions";
+const SPEC_LENGTH_2_GAPS_REPO_DIR: &str = "docs/skill-evidence/spec-length/gaps-2";
+const SPEC_LENGTH_2_CALIBRATION_REPO_PATH: &str =
+    "docs/skill-evidence/spec-length/calibration-2.json";
+const SPEC_LENGTH_2_RESULTS_REPO_PATH: &str = "docs/skill-evidence/spec-length/RESULTS-2.md";
+
+/// The eighteen opaque generation ids, transcribed from `PROTOCOL-2.md` item 6.
+///
+/// **Disjoint from [`SPEC_LENGTH_ID_POOL`] by construction**, which is what makes
+/// `generated/<id>.md` and `generated-2/<id>.md` unambiguous about which attempt
+/// they belong to. The disjointness is asserted rather than trusted, in
+/// [`spec_length_2_generations_are_unlabelled_and_cover_the_design`].
+///
+/// **The listing order maps to nothing.** Item 6 lists them lexicographically
+/// for exactly that reason: a sorted list carries no information about the draw.
+const SPEC_LENGTH_2_ID_POOL: &[&str] = &[
+    "031cc4", "054872", "08ae18", "26d7a2", "2c4295", "2d2629", "47173f", "48527b", "66530f",
+    "6e7393", "a9fcf9", "b2b8cf", "b49ff1", "e085f2", "e790f5", "fd230c", "fd2c24", "fe4059",
+];
+
+/// `91 + 84 + 55` — the total ledger rows across the three fixtures, and `R2`'s
+/// raw denominator. `R8` narrows the *gate* denominator to the discriminating
+/// set; this stays the number reported beside it.
+const SPEC_LENGTH_2_LEDGER_TOTAL: usize = 230;
+
+/// Item 8a's `sample_rule` cell, fixed here so two dispatches cannot describe
+/// the same stride two ways.
+const SPEC_LENGTH_2_SAMPLE_RULE: &str =
+    "every 5th present:true row in ledger order, 1-based among present:true rows";
+
+/// One tier-2 record — `PROTOCOL-2.md` item 8a.
+///
+/// Deliberately **not** [`AdjudicationRecord`], whose `attempt` field is a
+/// first-attempt artifact of the `R6` re-run: a v2 record has no attempts, and
+/// sharing the type would let a v2 file carry one.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adjudication2Record {
+    spec_id: String,
+    ledger: String,
+    sample_rule: String,
+    pairs: Vec<AdjudicationPair>,
+}
+
+/// One tier-3 row — item 8b. `reason` is required, so an escalation that
+/// overturns a row without saying why does not parse.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EscalationRow {
+    id: String,
+    present: bool,
+    #[allow(dead_code)]
+    reason: String,
+}
+
+/// One tier-3 record — item 8b. Closed, like every other verdict struct here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EscalationRecord {
+    spec_id: String,
+    ledger: String,
+    rows: Vec<EscalationRow>,
+}
+
+/// One calibration dispatch — item 12a. Same row shape as an escalation,
+/// because it **is** the tier-3 instrument applied unchanged.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalibrationRecord {
+    spec_id: String,
+    attempt: String,
+    #[allow(dead_code)]
+    ledger: String,
+    rows: Vec<EscalationRow>,
+}
+
+/// `calibration-2.json` — item 12a.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalibrationFile {
+    #[allow(dead_code)]
+    instrument: String,
+    records: Vec<CalibrationRecord>,
+}
+
+/// What git says about the most recent commit touching a path.
+///
+/// **Three-way where [`last_commit_touching`] is two-way, and that is the whole
+/// reason this is a new function rather than a reuse.** That helper's own doc
+/// comment says *"Do not copy this collapse to a new caller without restoring
+/// the distinction"*, and every v2 ordering check needs the distinction: an
+/// uncommitted `generated-2/` is a legitimate vacuous pass, while a git that
+/// cannot be asked is a hard error. Wiring the existing helper in would either
+/// fail the vacuous case or report a broken toolchain as "not measured yet".
+enum Touched {
+    /// `git log -1` named a commit.
+    At(GitObjectId),
+    /// git answered, and nothing in history touches this path.
+    NotCommitted,
+    /// git could not be asked, or answered something unusable.
+    Undetermined { how: String },
+}
+
+/// The most recent commit touching `repo_relative_path`, or the reason there
+/// isn't one. See [`Touched`].
+fn last_commit_touching_or_absent(repo: &Path, repo_relative_path: &str) -> Touched {
+    let shown = format!("git log -1 --format=%H -- {repo_relative_path}");
+    let out = match git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "log".to_string(),
+        "-1".to_string(),
+        "--format=%H".to_string(),
+        "--".to_string(),
+        repo_relative_path.to_string(),
+    ]) {
+        Ok(out) => out,
+        Err(how) => return Touched::Undetermined { how },
+    };
+    if !out.status.success() {
+        return Touched::Undetermined {
+            how: format!("`{shown}` failed: {}", git_stderr(&out)),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = stdout.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return Touched::NotCommitted;
+    };
+    match GitObjectId::parse(line) {
+        Ok(id) => Touched::At(id),
+        Err(e) => Touched::Undetermined {
+            how: format!("`{shown}` printed {e}"),
+        },
+    }
+}
+
+/// **Every** commit touching `repo_relative_path`, oldest first.
+///
+/// [`last_commit_touching_or_absent`] answers *has it moved since*;
+/// [`spec_length_2_protocol_stops_moving_before_the_first_probe`] needs *how
+/// many times has it moved, and which commits were they*, because window 2's
+/// logging obligation is per-commit.
+fn commits_touching(repo: &Path, repo_relative_path: &str) -> Result<Vec<GitObjectId>, String> {
+    let shown = format!("git log --format=%H -- {repo_relative_path}");
+    let out = git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "log".to_string(),
+        "--format=%H".to_string(),
+        "--".to_string(),
+        repo_relative_path.to_string(),
+    ])?;
+    if !out.status.success() {
+        return Err(format!("`{shown}` failed: {}", git_stderr(&out)));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut ids = Vec::new();
+    // git prints newest-first; the caller reasons in authoring order.
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()).rev() {
+        ids.push(GitObjectId::parse(line).map_err(|e| format!("`{shown}` printed {e}"))?);
+    }
+    Ok(ids)
+}
+
+/// The ids of one fixture's key-point ledger, in ledger order.
+///
+/// The ledgers are `FREEZE.md`-frozen first-attempt artifacts and are reused
+/// unchanged by the second attempt — `PROTOCOL-2.md` item 3 and `FREEZE-2.md`'s
+/// preamble both say so, and nothing here re-freezes them.
+fn spec_length_ledger_ids(fixture: &str) -> Vec<String> {
+    let path = retention_ledger_path(fixture).unwrap_or_else(|e| panic!("{e}"));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    parse_ledger_ids(&text)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .ids
+}
+
+/// Read `blind-map-2.json`, or `None` if it does not exist yet.
+///
+/// **Unlike [`read_spec_length_blind_map`] this tolerates absence, and the
+/// difference is not a weakening.** The v1 map is on disk and its absence would
+/// mean a finished measurement had lost its attribution; the v2 map has not been
+/// written yet, so a hard failure here would fail the suite for every task
+/// before the generation task. Each caller states what it does with the `None`.
+fn read_spec_length_2_blind_map() -> Option<BTreeMap<String, SpecLengthCell>> {
+    let path = spec_length_2_blind_map_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!(
+            "cannot read {}: {e}. This is NOT the same as the map not existing — refusing \
+             to report on an assignment this check could not open.",
+            path.display()
+        ),
+    };
+    Some(serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}\n\n\
+             Expected `PROTOCOL-2.md` item 7's schema: an object of \
+             `\"<id>\": {{\"arm\": ..., \"fixture\": ..., \"sample\": ...}}` and no other keys. \
+             Item 7 is explicit that there is **no `salt` field**: the closed schema is what \
+             stops a second copy of the draw being written down.",
+            path.display()
+        )
+    }))
+}
+
+/// Read `fixture-map-2.json` — item 7a — or `None` if it does not exist yet.
+fn read_spec_length_2_fixture_map() -> Option<BTreeMap<String, String>> {
+    let path = spec_length_2_fixture_map_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("cannot read {}: {e}", path.display()),
+    };
+    Some(serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}\n\nExpected item 7a's schema: `{{\"<id>\": \"<fixture>\"}}` and nothing \
+             else. It never carries an arm and it never carries a sample.",
+            path.display()
+        )
+    }))
+}
+
+/// Every assembled tier-1 verdict under `retention-2/`, keyed by file stem.
+/// `None` when the directory does not exist.
+///
+/// **Panics on a stray or a malformed file rather than collecting complaints,
+/// and that is a division of labour, not a shortcut.**
+/// [`spec_length_2_retention_verdicts_are_complete_and_quoted`] owns the
+/// item-8 shape report and names every problem in one run; the callers of this
+/// helper are the *join* and *arithmetic* checks, which have nothing useful to
+/// say about a file they cannot parse and must not compute a gate figure from a
+/// partial read.
+fn read_spec_length_2_verdicts() -> Option<BTreeMap<String, RetentionVerdict>> {
+    let dir = spec_length_2_retention_dir();
+    let scan = scan_retention_dir(&dir)?;
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries no check classifies:\n{}",
+        dir.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let mut out = BTreeMap::new();
+    for path in &scan.verdicts {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| panic!("{}: no file stem", path.display()))
+            .to_string();
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let verdict: RetentionVerdict = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!(
+                "{}: does not match `PROTOCOL-2.md` item 8's schema: {e}\n\n\
+                 `spec_length_2_retention_verdicts_are_complete_and_quoted` reports every \
+                 shape problem in one pass; this check refuses to compute anything from a \
+                 verdict set it could not read whole.",
+                path.display()
+            )
+        });
+        out.insert(stem, verdict);
+    }
+    Some(out)
+}
+
+/// Read one directory of closed JSON records keyed by file stem, or `None` if
+/// the directory does not exist.
+///
+/// Every entry must be an immediate `*.json` child: a subdirectory or a
+/// `.json.bak` is refused rather than skipped, because a record this walk does
+/// not see is a record no check ever opens. (`retention-2/` is the exception
+/// that has a sanctioned `parts/`, and it uses [`scan_retention_dir`] instead.)
+fn read_json_records<T: serde::de::DeserializeOwned>(dir: &Path) -> Option<BTreeMap<String, T>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!(
+            "cannot read {}: {e}. This is NOT the same as holding no records.",
+            dir.display()
+        ),
+    };
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", dir.display()))
+            .path();
+        assert!(
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json"),
+            "{}: not an immediate `*.json` child. Every file here is a record; an \
+             unrecognised entry is never opened by any check.",
+            path.display(),
+        );
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| panic!("{}: no file stem", path.display()))
+            .to_string();
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(
+            stem,
+            serde_json::from_str(&text).unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e}\n\nThe schema is closed — an extra key, a missing key, a wrong \
+                     type or a `null` is a hard error under `PROTOCOL-2.md` item 8.",
+                    path.display()
+                )
+            }),
+        );
+    }
+    Some(out)
+}
+
+/// Item 8a's sample, recomputed: the ids of every 5th `present: true` row of
+/// `verdict`, in ledger order, 1-based **among `present: true` rows**.
+///
+/// `floor(n/5)` rows out of `n`, which is why item 8a calls 20% the nominal
+/// figure and this the real one. Fewer than five `present: true` rows gives an
+/// **empty** sample, and item 8a forbids re-striding to manufacture one.
+fn adjudication_sample(verdict: &RetentionVerdict) -> Vec<String> {
+    verdict
+        .rows
+        .iter()
+        .filter(|r| r.present)
+        .enumerate()
+        .filter(|(i, _)| (i + 1) % 5 == 0)
+        .map(|(_, r)| r.id.clone())
+        .collect()
+}
+
+/// The final `present` of every `(spec_id, ledger row)` — `PROTOCOL-2.md` item
+/// 8b's join, as a pure function.
+///
+/// **Tier 3's call where an `escalation-2` record exists for that pair, tier 1's
+/// otherwise.** There is no third source and no manual override, so an
+/// escalation row that no tier-1 verdict scored is an error rather than a new
+/// entry: it would be a disposition for a row nobody looked at, which is exactly
+/// the shape a hand-written override takes.
+///
+/// `Err` carries one string per inconsistency, all of them, so a caller reports
+/// the whole join rather than its first problem.
+fn final_disposition(
+    verdicts: &BTreeMap<String, RetentionVerdict>,
+    escalations: &BTreeMap<String, EscalationRecord>,
+) -> Result<BTreeMap<(String, String), bool>, Vec<String>> {
+    let mut wrong: Vec<String> = Vec::new();
+    let mut out: BTreeMap<(String, String), bool> = BTreeMap::new();
+
+    for (id, verdict) in verdicts {
+        if &verdict.spec_id != id {
+            wrong.push(format!(
+                "tier 1: `retention-2/{id}.json` scores `{}`. The join is keyed by id, so a \
+                 verdict filed under the wrong stem attributes every one of its rows to the \
+                 wrong generation.",
+                verdict.spec_id,
+            ));
+        }
+        for row in &verdict.rows {
+            if out
+                .insert((id.clone(), row.id.clone()), row.present)
+                .is_some()
+            {
+                wrong.push(format!(
+                    "tier 1: `{id}` scores row `{}` more than once, so the join has two \
+                     answers for one cell and the later one silently wins.",
+                    row.id,
+                ));
+            }
+        }
+    }
+
+    for (id, escalation) in escalations {
+        if &escalation.spec_id != id {
+            wrong.push(format!(
+                "tier 3: `escalation-2/{id}.json` names `{}`",
+                escalation.spec_id,
+            ));
+        }
+        let Some(verdict) = verdicts.get(id) else {
+            wrong.push(format!(
+                "tier 3: `escalation-2/{id}.json` exists with no `retention-2/{id}.json` \
+                 behind it. Item 8b's escalator answers rows tier 2 flagged in a tier-1 \
+                 verdict; an escalation with no verdict is a disposition with no record \
+                 behind it."
+            ));
+            continue;
+        };
+        if escalation.ledger != verdict.ledger {
+            wrong.push(format!(
+                "tier 3: `{id}` is escalated against ledger `{}` but was scored against \
+                 `{}`. The two must name the same ledger or the rows are not the same rows.",
+                escalation.ledger, verdict.ledger,
+            ));
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for row in &escalation.rows {
+            if !seen.insert(row.id.as_str()) {
+                wrong.push(format!(
+                    "tier 3: `{id}` escalates row `{}` twice",
+                    row.id
+                ));
+                continue;
+            }
+            let key = (id.clone(), row.id.clone());
+            if !out.contains_key(&key) {
+                wrong.push(format!(
+                    "tier 3: `{id}` overturns row `{}`, which its tier-1 verdict does not \
+                     score. Tier 3 governs a row tier 2 flagged out of tier 1's own output — \
+                     it does not add rows, and a row appearing here for the first time is an \
+                     override with nothing behind it.",
+                    row.id,
+                ));
+                continue;
+            }
+            out.insert(key, row.present);
+        }
+    }
+
+    if wrong.is_empty() {
+        Ok(out)
+    } else {
+        Err(wrong)
+    }
+}
+
+/// `R8`'s universal-drop set: every ledger row that **every generation scored
+/// against it** drops under the final disposition.
+///
+/// **Six generations of the row's own fixture, never all 18** — a generation is
+/// only ever scored against its own fixture's ledger (item 3), so an "all 18"
+/// reading would exclude nothing, ever. Item 12's `R8` records that correction
+/// and the reason for it.
+///
+/// **Its only inputs are the dispositions and the id→fixture map, so it cannot
+/// read an arm.** That is what makes the exclusion symmetric under permutation
+/// of the arm labels rather than merely claimed to be:
+/// [`spec_length_2_r8_exclusion_is_arm_symmetric`] locks this signature and then
+/// executes the permutation.
+///
+/// **A row that NO generation judged is an error, not an exclusion.** That state
+/// means a fixture was never scored, and silently excluding its rows would
+/// shrink the gate denominator for rows nobody looked at.
+fn universally_dropped(
+    final_disposition: &BTreeMap<(String, String), bool>,
+    fixture_of_id: &BTreeMap<String, String>,
+    ledger_ids: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeSet<String>, Vec<String>> {
+    let mut wrong: Vec<String> = Vec::new();
+
+    // Every disposition must belong to a known generation and to a row of that
+    // generation's own ledger. Checked first: a stray cell would otherwise be
+    // silently ignored by the walk below, which iterates the ledgers.
+    for (id, row) in final_disposition.keys() {
+        match fixture_of_id.get(id) {
+            None => wrong.push(format!(
+                "a disposition exists for generation `{id}`, which the id->fixture map does \
+                 not name"
+            )),
+            Some(fixture) => match ledger_ids.get(fixture) {
+                None => wrong.push(format!(
+                    "generation `{id}` is mapped to fixture `{fixture}`, which has no ledger"
+                )),
+                Some(ids) if !ids.iter().any(|l| l == row) => wrong.push(format!(
+                    "`{id}` carries a disposition for `{row}`, which is not a row of the \
+                     `{fixture}` ledger"
+                )),
+                Some(_) => {}
+            },
+        }
+    }
+
+    let mut excluded = BTreeSet::new();
+    for (fixture, ids) in ledger_ids {
+        let generations: Vec<&String> = fixture_of_id
+            .iter()
+            .filter(|(_, f)| *f == fixture)
+            .map(|(id, _)| id)
+            .collect();
+        for row in ids {
+            let judged: Vec<bool> = generations
+                .iter()
+                .filter_map(|id| {
+                    final_disposition
+                        .get(&((*id).clone(), row.clone()))
+                        .copied()
+                })
+                .collect();
+            if judged.is_empty() {
+                wrong.push(format!(
+                    "no generation judged `{row}` (fixture `{fixture}`). `R8` excludes a row \
+                     every generation DROPS; a row nobody looked at is an unscored fixture, \
+                     and excluding it would shrink the gate denominator for a row that was \
+                     never measured."
+                ));
+                continue;
+            }
+            if judged.iter().all(|present| !present) {
+                excluded.insert(row.clone());
+            }
+        }
+    }
+
+    if wrong.is_empty() {
+        Ok(excluded)
+    } else {
+        Err(wrong)
+    }
+}
+
+/// Every integer in a markdown table cell, in order — `88 / 91` gives
+/// `[88, 91]`.
+///
+/// The figures are the claim; the surrounding punctuation, backticks and
+/// `descriptive, not a pass` labels are not, and pinning them would make
+/// `RESULTS-2.md` unwritable without a test edit.
+fn cell_numbers(cell: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in cell.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(cur.parse().expect("digits parse"));
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur.parse().expect("digits parse"));
+    }
+    out
+}
+
+/// The data rows of the one markdown table in `text` whose header row is exactly
+/// `header`.
+///
+/// **Exactly one, and absence is a failure rather than an empty result.** A
+/// header that moved would otherwise make every check over its table pass having
+/// compared nothing — the failure this whole file keeps rediscovering.
+fn table_rows_under(text: &str, header: &str, whose: &str) -> Vec<Vec<String>> {
+    let matches = text.lines().filter(|l| l.trim() == header).count();
+    assert_eq!(
+        matches, 1,
+        "{whose} carries {matches} row(s) reading exactly:\n  {header}\n\nExactly one is \
+         required. The header is pinned by string so that a renamed column is a failure \
+         here rather than a silently unchecked table."
+    );
+
+    let mut rows = Vec::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        if line.trim() == header {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some(cells) = split_ledger_row(line) else {
+            break;
+        };
+        if is_separator_row(&cells) {
+            continue;
+        }
+        rows.push(cells);
+    }
+    rows
+}
+
+/// Strip the backticks a markdown cell wraps an identifier in.
+fn cell_token(cell: &str) -> &str {
+    cell.trim().trim_matches('`').trim()
+}
+
+/// A contiguous run of blockquote lines, carried **whole and verbatim** —
+/// indentation included, because `PROTOCOL.md` item 4 indents its task lines
+/// under a bullet and a de-indented copy is not the same bytes.
+fn markdown_blockquotes(body: &str) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if line.trim_start().starts_with('>') {
+            current.push(line);
+        } else if !current.is_empty() {
+            runs.push(current.join("\n"));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current.join("\n"));
+    }
+    runs
+}
+
+/// One top-level `- **<name> — …` bullet of `PROTOCOL.md` item 12, carried whole:
+/// the bullet line plus every indented continuation, sub-bullet and blank line
+/// beneath it, with trailing blanks trimmed.
+///
+/// Returns `None` when no such bullet exists, which callers must treat as a
+/// failure — a rule that was renamed would otherwise be a rule this check
+/// silently stopped comparing.
+fn markdown_rule_bullet(body: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let prefix = format!("- **{name} — ");
+    let start = lines.iter().position(|l| l.starts_with(&prefix))?;
+    let mut end = start + 1;
+    while end < lines.len()
+        && (lines[end].trim().is_empty() || lines[end].starts_with([' ', '\t']))
+    {
+        end += 1;
+    }
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    Some(lines[start..end].join("\n"))
+}
+
+/// The ten rules `PROTOCOL-2.md` item 15 says are inherited from `PROTOCOL.md`
+/// item 12 **byte-for-byte**.
+const SPEC_LENGTH_2_INHERITED_RULES: &[&str] =
+    &["R1", "R1a", "R3", "R3a", "R4", "R4a", "R5", "R5a", "R6a", "R7"];
+
+/// The three rules item 15 says are **not** inherited verbatim, and why. Each is
+/// asserted absent, so a later edit that pastes `PROTOCOL.md`'s wording back in
+/// is caught rather than quietly reinstating a superseded rule.
+const SPEC_LENGTH_2_REWRITTEN_RULES: &[(&str, &str)] = &[
+    ("R2", "its denominator is the discriminating set, resolved by R8 (item 15 row 5)"),
+    ("R6", "its closed re-run list loses `a verdict fails item 8a` (item 15 row 6)"),
+];
+
+// ---------------------------------------------------------------------------
+// The checks.
+// ---------------------------------------------------------------------------
+
+/// `PROTOCOL-2.md` carries, byte-for-byte, every block it says it inherits from
+/// `PROTOCOL.md`.
+///
+/// **This turns the word "verbatim" from a claim into a check.** The inherited
+/// blocks were spliced out of `PROTOCOL.md` rather than retyped, and this is what
+/// proves it stayed that way: an em dash, a `×`, a `≥` or a three-space
+/// continuation indent is exactly the kind of thing that drifts silently and that
+/// nothing else would notice.
+///
+/// **Limitation 7 needs two assertions, not one, and item 15 says so.** Item 1's
+/// limitation 7 is *replaced* in `PROTOCOL-2.md` — item 8a no longer invalidates
+/// a verdict file, so inheriting the old text would have frozen a false
+/// statement. But its superseded text is quoted in full in item 15, so a literal
+/// seven-way `.contains()` over `PROTOCOL.md`'s limitations goes **green without
+/// the replacement being operative**. So: limitations 1–6 are required verbatim,
+/// limitation 7 is required to appear (which is what keeps the quotation
+/// byte-exact) **and** `PROTOCOL-2.md`'s own operative limitation 7 is required
+/// to differ from it and to carry the replacement's clause.
+///
+/// **Never vacuous**, and the authority runs one way: if a block has drifted,
+/// `PROTOCOL-2.md` is what is wrong. `PROTOCOL.md` is a first-attempt artifact
+/// and is never edited to make a check here pass.
+#[test]
+fn spec_length_2_protocol_inherits_its_verbatim_blocks() {
+    let v1_path = spec_length_protocol_path();
+    let v1 = fs::read_to_string(&v1_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", v1_path.display()));
+    let v2_path = spec_length_2_protocol_path();
+    let v2 = fs::read_to_string(&v2_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", v2_path.display()));
+
+    let section = |text: &str, heading: &'static str, whose: &str| -> String {
+        markdown_section_body(text, heading)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{whose} has no `{heading}` section, so this check just compared nothing"
+                )
+            })
+            .to_string()
+    };
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut require = |what: String, block: &str, v2: &str| {
+        if !v2.contains(block) {
+            let first = block.lines().next().unwrap_or("").trim();
+            missing.push(format!("  {what}: {first}"));
+        }
+    };
+
+    // Item 1's limitations. `PROTOCOL.md` has seven; 1-6 are inherited and 7 is
+    // replaced but quoted.
+    let v1_limits = markdown_numbered_items(&section(
+        &v1,
+        SPEC_LENGTH_LIMITATIONS_HEADING,
+        "PROTOCOL.md",
+    ));
+    assert_eq!(
+        v1_limits.len(),
+        7,
+        "{} parsed {} limitation(s), not 7 — the parse lost or gained one, and every \
+         comparison below is against that list",
+        v1_path.display(),
+        v1_limits.len(),
+    );
+    for (i, (number, _)) in v1_limits.iter().enumerate() {
+        assert_eq!(
+            *number,
+            i + 1,
+            "{}'s limitations are numbered {:?}, which is not sequential",
+            v1_path.display(),
+            v1_limits.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        );
+    }
+    for (number, item) in &v1_limits[..6] {
+        require(format!("item 1 limitation {number}"), item, &v2);
+    }
+    let v1_limit_7 = &v1_limits[6].1;
+    require(
+        "item 15's fenced quotation of the superseded limitation 7".to_string(),
+        v1_limit_7,
+        &v2,
+    );
+
+    // Item 4's three task lines, and item 9's first blockquote.
+    let task_lines = markdown_blockquotes(&section(
+        &v1,
+        "## 4. The three task lines",
+        "PROTOCOL.md",
+    ));
+    assert_eq!(
+        task_lines.len(),
+        3,
+        "{}'s item 4 parsed as {} blockquote(s), not 3 — one per fixture",
+        v1_path.display(),
+        task_lines.len(),
+    );
+    for (i, line) in task_lines.iter().enumerate() {
+        require(format!("item 4 task line {}", i + 1), line, &v2);
+    }
+    let present = markdown_blockquotes(&section(
+        &v1,
+        "## 9. The `present` definition",
+        "PROTOCOL.md",
+    ));
+    assert!(
+        !present.is_empty(),
+        "{}'s item 9 has no blockquote — it is the `present` definition every scorer and \
+         every escalator is handed verbatim",
+        v1_path.display(),
+    );
+    require("item 9's `present` blockquote".to_string(), &present[0], &v2);
+
+    // Item 12's inherited rules.
+    let rules = section(&v1, "## 12. The decision rules", "PROTOCOL.md");
+    for name in SPEC_LENGTH_2_INHERITED_RULES {
+        let block = markdown_rule_bullet(&rules, name).unwrap_or_else(|| {
+            panic!(
+                "{}'s item 12 has no `- **{name} — ` bullet. A renamed rule is a rule this \
+                 check silently stopped comparing.",
+                v1_path.display()
+            )
+        });
+        require(format!("item 12 rule {name}"), &block, &v2);
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} does not carry {} block(s) of {} verbatim:\n{}\n\n\
+         `PROTOCOL-2.md` item 15 lists exactly what is inherited byte-for-byte. Copy the \
+         bytes; do not restate them. A near-match fails here on purpose — and the authority \
+         runs one way: `PROTOCOL.md` is a first-attempt artifact and is NEVER edited to make \
+         this pass.",
+        v2_path.display(),
+        missing.len(),
+        v1_path.display(),
+        missing.join("\n"),
+    );
+
+    // The rules item 15 says are NOT inherited. Asserted absent, so a later
+    // paste of `PROTOCOL.md`'s wording cannot quietly reinstate a superseded
+    // rule beside the rewritten one.
+    for (name, why) in SPEC_LENGTH_2_REWRITTEN_RULES {
+        let block = markdown_rule_bullet(&rules, name).unwrap_or_else(|| {
+            panic!("{}'s item 12 has no `- **{name} — ` bullet", v1_path.display())
+        });
+        assert!(
+            !v2.contains(&block),
+            "{} carries `PROTOCOL.md`'s `{name}` verbatim, but item 15 says it is rewritten: \
+             {why}. Two copies of a rule, one superseded, is the state where nobody can say \
+             which one governs.",
+            v2_path.display(),
+        );
+    }
+
+    // The replacement, which the `.contains()` sweep above cannot see: item 15
+    // spells out why, and this is the half it asks for.
+    let v2_limits = markdown_numbered_items(&section(
+        &v2,
+        SPEC_LENGTH_LIMITATIONS_HEADING,
+        "PROTOCOL-2.md",
+    ));
+    assert!(
+        v2_limits.len() >= 13,
+        "{} parsed {} limitation(s); item 15 row 3 says item 1 gains limitations 8 through \
+         13, so fewer than 13 means the parse lost some",
+        v2_path.display(),
+        v2_limits.len(),
+    );
+    for (i, (number, _)) in v2_limits.iter().enumerate() {
+        assert_eq!(
+            *number,
+            i + 1,
+            "{}'s limitations are numbered {:?}, which is not sequential",
+            v2_path.display(),
+            v2_limits.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        );
+    }
+    let operative_7 = &v2_limits[6].1;
+    assert_ne!(
+        operative_7, v1_limit_7,
+        "{}'s operative limitation 7 is `PROTOCOL.md`'s, not the replacement. Item 15 row 2 \
+         says limitation 7 is the one limitation the redesign falsified — it claims a caught \
+         row invalidates all 91, which item 8a no longer does — so inheriting it would freeze \
+         a false statement.",
+        v2_path.display(),
+    );
+    for clause in [
+        "and the redesign makes an",
+        "caught row is escalated to tier 3, which sees the spec and may restore it",
+        "false pass",
+    ] {
+        assert!(
+            operative_7.contains(clause),
+            "{}'s operative limitation 7 does not carry {clause:?}. The replacement has to \
+             say what the redesign cost: an adjudication failure is now LESS consequential, \
+             which is a deliberate loosening toward a false pass. A limitation 7 that omits \
+             it is a limitation with its point filed off.",
+            v2_path.display(),
+        );
+    }
+}
+
+/// `FREEZE-2.md`'s rows still hash to the files they name.
+///
+/// The same check as [`freeze_rows_still_hash_to_their_files`], over the second
+/// attempt's separate record. **Not an extension of `FREEZE.md`**: nothing that
+/// file froze is re-frozen here, so a path appearing in both would be two records
+/// claiming one identity with no check able to say which was right.
+///
+/// **Never vacuous** — the pre-registration task landed a row for
+/// `PROTOCOL-2.md`, and an empty table fails.
+#[test]
+fn spec_length_2_freeze_rows_still_hash_to_their_files() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, and these rows are `git hash-object` blob SHAs. Skipping \
+         would turn this into a check that passes when it cannot run"
+    );
+
+    let path = spec_length_2_freeze_path();
+    let contents =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let rows = parse_freeze(&contents).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        !rows.is_empty(),
+        "{}: no rows, so this check compared nothing. The protocol's own row is the \
+         foundation the whole second attempt rests on.",
+        path.display()
+    );
+
+    let v1_path = spec_length_freeze_path();
+    let v1_contents = fs::read_to_string(&v1_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", v1_path.display()));
+    let v1_paths: BTreeSet<String> = parse_freeze(&v1_contents)
+        .unwrap_or_else(|e| panic!("{}: {e}", v1_path.display()))
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+
+    let repo = repo_root();
+    let mut wrong = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for row in &rows {
+        if !seen.insert(row.path.as_str()) {
+            wrong.push(format!(
+                "  `{}`: recorded twice. This file is append-only; a second row for one path \
+                 is the in-place correction `FREEZE.md`'s recorded breach was.",
+                row.path
+            ));
+        }
+        if v1_paths.contains(&row.path) {
+            wrong.push(format!(
+                "  `{}`: already frozen by {}. Nothing FREEZE.md froze is re-frozen here.",
+                row.path,
+                v1_path.display(),
+            ));
+        }
+        let file = repo.join(&row.path);
+        if !file.is_file() {
+            wrong.push(format!(
+                "  `{}`: recorded in the freeze but not on disk",
+                row.path
+            ));
+            continue;
+        }
+        let found = git_hash_object(&file);
+        if found != row.hash {
+            wrong.push(format!(
+                "  `{}`: hashes to {}, but the freeze records {}",
+                row.path,
+                found.as_str(),
+                row.hash.as_str(),
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} problem(s) in {}:\n{}\n\n\
+         A wrong hash means the frozen artifact changed, which is the thing that must not \
+         happen — so it is a finding, not an edit. If a governed item genuinely had to be \
+         amended inside a permitted window, the row is re-recorded in the same round and the \
+         breach section says so; a stale hash left standing is worse than either.",
+        wrong.len(),
+        path.display(),
+        wrong.join("\n"),
+    );
+}
+
+/// `PROTOCOL-2.md` was committed before every artifact it governs.
+///
+/// **The pre-registration claim, executed.** A protocol committed after the
+/// measurements it scores is a protocol that could have been written to fit
+/// them, and no amount of prose distinguishes the two. The commit graph does.
+///
+/// **`PROTOCOL-2.md` must resolve to a commit — that half is never vacuous.**
+/// Each governed path is independently vacuous while it is uncommitted, which is
+/// the correct state for every one of them until its task runs, and each is
+/// listed in the failure message so a reader can see which were compared.
+///
+/// Item 12a's own ordering claim is executed here too: `calibration-2.json`
+/// precedes `generated-2/`, so the calibration pass really did run before any new
+/// generation existed.
+#[test]
+fn spec_length_2_protocol_precedes_every_generation() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no artifact's position relative to `PROTOCOL-2.md` can \
+         be verified"
+    );
+    let repo = repo_root();
+    let protocol = spec_length_2_protocol_path();
+    let protocol_at = match introducing_commit_in(&repo, &protocol) {
+        Introduced::At(commit) => commit,
+        Introduced::NotCommitted => panic!(
+            "{} exists on disk but no commit introduces it.\n\n\
+             It is the pre-registration: every artifact of this attempt is measured as a \
+             descendant of the commit that added it, so an uncommitted protocol makes the \
+             whole ordering guarantee inert.",
+            protocol.display()
+        ),
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when {} was introduced: {how}\n\n\
+             This is NOT a finding about the protocol — it is this check reporting that it \
+             could not run.",
+            protocol.display()
+        ),
+    };
+
+    let governed: &[(&str, &str)] = &[
+        ("item 12a's calibration record", SPEC_LENGTH_2_CALIBRATION_REPO_PATH),
+        ("item 5's generations", SPEC_LENGTH_2_GENERATED_REPO_DIR),
+        ("item 8's tier-1 verdicts", SPEC_LENGTH_2_RETENTION_REPO_DIR),
+        ("item 8a's adjudications", SPEC_LENGTH_2_ADJUDICATION_REPO_DIR),
+        ("item 8b's escalations", SPEC_LENGTH_2_ESCALATION_REPO_DIR),
+        ("item 14's transmission test", SPEC_LENGTH_2_TRANSMISSION_REPO_DIR),
+        ("item 14a's gap test", SPEC_LENGTH_2_GAPS_REPO_DIR),
+        ("the raw record", SPEC_LENGTH_2_RESULTS_REPO_PATH),
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut not_yet: Vec<String> = Vec::new();
+    for (what, path) in governed {
+        match last_commit_touching_or_absent(&repo, path) {
+            Touched::At(commit) => match descends_from_in(&repo, &protocol_at, &commit) {
+                Descent::Yes => {}
+                Descent::No => violations.push(format!(
+                    "  {what} (`{path}`): last touched by {}, which does NOT descend from \
+                     the protocol's introducing commit {}",
+                    commit.as_str(),
+                    protocol_at.as_str(),
+                )),
+                Descent::Undetermined { how } => unreadable.push(format!("  `{path}`: {how}")),
+            },
+            Touched::NotCommitted => not_yet.push(format!("  {what} (`{path}`)")),
+            Touched::Undetermined { how } => unreadable.push(format!("  `{path}`: {how}")),
+        }
+    }
+
+    // Item 12a's ordering claim: calibration runs before any new generation
+    // exists. Both halves must be committed for this to say anything, and the
+    // failure message says which was missing.
+    let calibration_intro = introducing_commit_in(&repo, &spec_length_2_calibration_path());
+    let generated_intro = introducing_commit_in(&repo, &spec_length_2_generated_dir());
+    match (&calibration_intro, &generated_intro) {
+        (Introduced::At(cal), Introduced::At(first_gen)) => {
+            match descends_from_in(&repo, cal, first_gen) {
+                Descent::Yes => {}
+                Descent::No => violations.push(format!(
+                    "  item 12a: `calibration-2.json` was introduced by {}, which \
+                     `generated-2/`'s introducing commit {} does not descend from. The \
+                     calibration pass is pre-registered as running BEFORE any new generation \
+                     exists — that is what keeps it from being read against the new arms.",
+                    cal.as_str(),
+                    first_gen.as_str(),
+                )),
+                Descent::Undetermined { how } => unreadable.push(format!("  item 12a: {how}")),
+            }
+        }
+        (Introduced::Undetermined { how }, _) | (_, Introduced::Undetermined { how }) => {
+            unreadable.push(format!("  item 12a's ordering: {how}"))
+        }
+        _ => not_yet.push("  item 12a's calibration-before-generation ordering".to_string()),
+    }
+
+    // Item 14: the blind question set precedes the transmission verdicts it is
+    // answered against.
+    let questions = last_commit_touching_or_absent(
+        &repo,
+        SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR,
+    );
+    let transmission = last_commit_touching_or_absent(&repo, SPEC_LENGTH_2_TRANSMISSION_REPO_DIR);
+    match (&questions, &transmission) {
+        (Touched::At(q), Touched::At(t)) if q.as_str() != t.as_str() => {
+            match descends_from_in(&repo, q, t) {
+                Descent::Yes => {}
+                Descent::No => violations.push(format!(
+                    "  item 14: `transmission-2/questions/` was last touched by {}, which \
+                     `transmission-2/`'s own last commit {} does not descend from. The \
+                     questions are written blind and committed first.",
+                    q.as_str(),
+                    t.as_str(),
+                )),
+                Descent::Undetermined { how } => unreadable.push(format!("  item 14: {how}")),
+            }
+        }
+        (Touched::Undetermined { how }, _) | (_, Touched::Undetermined { how }) => {
+            unreadable.push(format!("  item 14's ordering: {how}"))
+        }
+        _ => not_yet.push("  item 14's questions-before-verdicts ordering".to_string()),
+    }
+
+    assert!(
+        unreadable.is_empty(),
+        "{} ordering question(s) could not be asked at all:\n{}\n\n\
+         This is NOT a finding about the artifacts — it is this check reporting that it could \
+         not run.",
+        unreadable.len(),
+        unreadable.join("\n"),
+    );
+    assert!(
+        violations.is_empty(),
+        "{} artifact(s) do not descend from {}:\n{}\n\n\
+         The protocol is pre-registered so that no rule can be written once a result is \
+         visible. An artifact that predates it is outside that guarantee.",
+        violations.len(),
+        protocol.display(),
+        violations.join("\n"),
+    );
+    // Not an assertion: the point of printing it is that a reader of a green run
+    // can see how much of this check was live. `PROTOCOL-2.md` itself always was.
+    if !not_yet.is_empty() {
+        eprintln!(
+            "spec_length_2_protocol_precedes_every_generation: {} governed path(s) are not \
+             committed yet and were not compared:\n{}",
+            not_yet.len(),
+            not_yet.join("\n"),
+        );
+    }
+}
+
+/// `PROTOCOL-2.md` stopped moving before the first probe, and every move it made
+/// is on the record.
+///
+/// **Window 3's rule, executed rather than trusted.** `PROTOCOL-2.md`'s preamble
+/// opens three windows: until the first calibration probe anything may change;
+/// until the first item-5 probe a governed item may be clarified but not
+/// weakened; after that nothing moves. Only the third is mechanical, and this is
+/// it — **every** commit touching the protocol must be an ancestor of the
+/// commit that introduced `generated-2/`.
+///
+/// **And every commit beyond the first must be named by SHA in `RESULTS-2.md`.**
+/// That is window 2's logging obligation made mechanical. Without it the
+/// protocol is amendable throughout the calibration pass with only prose
+/// forbidding it, which is the gap that matters: calibration is the one moment
+/// where a result is visible and the protocol is still editable.
+///
+/// **Two independently vacuous halves, and the protocol itself is neither.** The
+/// ancestry half waits for `generated-2/`; the logging half waits for
+/// `RESULTS-2.md`. The protocol must always resolve to at least one commit.
+#[test]
+fn spec_length_2_protocol_stops_moving_before_the_first_probe() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so nothing can be said about when the protocol moved"
+    );
+    let repo = repo_root();
+    let protocol = spec_length_2_protocol_path();
+    let commits = commits_touching(&repo, SPEC_LENGTH_2_PROTOCOL_REPO_PATH)
+        .unwrap_or_else(|how| panic!("cannot list the commits touching {SPEC_LENGTH_2_PROTOCOL_REPO_PATH}: {how}"));
+    assert!(
+        !commits.is_empty(),
+        "{} exists on disk but no commit touches it. The pre-registration must be in \
+         history before anything is measured against it.",
+        protocol.display(),
+    );
+
+    // Ancestry: nothing may touch the protocol after the generations exist.
+    match introducing_commit_in(&repo, &spec_length_2_generated_dir()) {
+        Introduced::At(first_probe) => {
+            let mut late: Vec<String> = Vec::new();
+            for commit in &commits {
+                match descends_from_in(&repo, commit, &first_probe) {
+                    Descent::Yes => {}
+                    Descent::No => late.push(format!("  {}", commit.as_str())),
+                    Descent::Undetermined { how } => panic!(
+                        "cannot order {} against the first probe: {how}\n\n\
+                         This is NOT a finding about the protocol — it is this check \
+                         reporting that it could not run.",
+                        commit.as_str()
+                    ),
+                }
+            }
+            assert!(
+                late.is_empty(),
+                "{} commit(s) touching {} are not ancestors of `generated-2/`'s introducing \
+                 commit {}:\n{}\n\n\
+                 Window 3 is terminal: once the first probe of item 5 is dispatched, no \
+                 governed item may be revised at all. A protocol edited after the \
+                 generations exist is a protocol that could have been edited to fit them.",
+                late.len(),
+                protocol.display(),
+                first_probe.as_str(),
+                late.join("\n"),
+            );
+        }
+        Introduced::NotCommitted => {
+            // The generations do not exist. Window 3 has not opened, so there is
+            // nothing to order against — but the logging half below still runs.
+        }
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when `generated-2/` was introduced: {how}\n\n\
+             This is NOT a finding — it is this check reporting that it could not run."
+        ),
+    }
+
+    // Logging: every amendment beyond the introducing commit is named by SHA.
+    let results = spec_length_2_results_path();
+    let Ok(record) = fs::read_to_string(&results) else {
+        // `RESULTS-2.md` is the unblinding task's deliverable. Until it exists
+        // there is nothing to read the SHAs out of — but the obligation is real
+        // and it is stated here so a reader of a green run knows it is pending.
+        if commits.len() > 1 {
+            eprintln!(
+                "spec_length_2_protocol_stops_moving_before_the_first_probe: {} amendment \
+                 commit(s) to {} are awaiting disclosure in {} (not written yet): {}",
+                commits.len() - 1,
+                SPEC_LENGTH_2_PROTOCOL_REPO_PATH,
+                results.display(),
+                commits[1..]
+                    .iter()
+                    .map(|c| c.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        return;
+    };
+
+    let undisclosed: Vec<String> = commits[1..]
+        .iter()
+        // A short SHA is how a document names a commit, so a prefix match is the
+        // right comparison; the full SHA is accepted by the same test.
+        .filter(|c| !(8..=40).any(|n| record.contains(&c.as_str()[..n])))
+        .map(|c| format!("  {}", c.as_str()))
+        .collect();
+    assert!(
+        undisclosed.is_empty(),
+        "{} commit(s) amended {} and are not named in {}:\n{}\n\n\
+         A governed item may be clarified in window 2, and every such edit is logged with \
+         its reason and its commit. An amendment that is not in the record is an amendment \
+         nobody can audit, which is the same as one that did not have to justify itself.",
+        undisclosed.len(),
+        protocol.display(),
+        results.display(),
+        undisclosed.join("\n"),
+    );
+}
+
+/// Item 8's shape rules over `retention-2/`, under the v2 span rules.
+///
+/// The v1 walk with three substitutions: the `-2` directory, the v2 id pool, and
+/// [`RETENTION_RULES_V2`] — 1–5 spans, each self-contained.
+///
+/// **Vacuous until tier-1 scoring runs**, at which point `retention-2/` appears.
+/// The rules themselves are exercised regardless, by
+/// [`retention_check_refuses_a_verdict_that_is_not_complete_and_quoted`] for the
+/// shared logic and
+/// [`retention_2_check_refuses_a_span_that_is_not_self_contained`] for the part
+/// that is new here.
+#[test]
+fn spec_length_2_retention_verdicts_are_complete_and_quoted() {
+    let retention = spec_length_2_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        return;
+    };
+
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries this completeness check cannot classify:\n{}\n\n\
+         Every immediate child is an `<id>.json` verdict and `parts/` is item 8's only \
+         sanctioned subdirectory. An unrecognised entry is not checked — it is simply never \
+         opened.",
+        retention.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut rows_checked = 0usize;
+    let mut ledger_cache: HashMap<String, Vec<String>> = HashMap::new();
+
+    for path in &scan.verdicts {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| panic!("{}: no file stem", path.display()))
+            .to_string();
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+        let verdict: RetentionVerdict = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                wrong.push(format!(
+                    "  {}: does not match item 8's schema: {e}\n    Expected exactly \
+                     {{\"spec_id\", \"ledger\", \"rows\":[{{\"id\", \"present\", \
+                     \"quotes\"}}]}} — an extra key, a missing key, a wrong type or a `null` \
+                     is a hard error. A malformed verdict is re-run WHOLE under R6, never \
+                     patched.",
+                    path.display(),
+                ));
+                continue;
+            }
+        };
+
+        let ledger_path = match retention_ledger_path(&verdict.ledger) {
+            Ok(p) => p,
+            Err(e) => {
+                wrong.push(format!("  {}: {e}", path.display()));
+                continue;
+            }
+        };
+        let ids = ledger_cache
+            .entry(verdict.ledger.clone())
+            .or_insert_with(|| {
+                let text = fs::read_to_string(&ledger_path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+                parse_ledger_ids(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()))
+                    .ids
+            })
+            .clone();
+
+        // Pool membership before path building, exactly as the v1 walk does it:
+        // `spec_id` is a string out of a JSON file a subagent wrote, and joining
+        // it onto `generated-2/` unchecked would let `"../arms/S3"` name the one
+        // file a scoring path must never read.
+        if !SPEC_LENGTH_2_ID_POOL.contains(&verdict.spec_id.as_str()) {
+            wrong.push(format!(
+                "  {}: `spec_id` is {:?}, which is not one of the eighteen pool ids of \
+                 `PROTOCOL-2.md` item 6 — refusing to resolve a generated-spec path from it",
+                path.display(),
+                verdict.spec_id,
+            ));
+            continue;
+        }
+        let spec_path = spec_length_2_generated_dir().join(format!("{}.md", verdict.spec_id));
+        let spec = match fs::read_to_string(&spec_path) {
+            Ok(s) => s,
+            Err(e) => {
+                wrong.push(format!(
+                    "  {}: scores `{}` but {} cannot be read: {e}",
+                    path.display(),
+                    verdict.spec_id,
+                    spec_path.display(),
+                ));
+                continue;
+            }
+        };
+
+        rows_checked += verdict.rows.len();
+        for complaint in check_retention_verdict(
+            &stem,
+            &verdict,
+            &ids,
+            &spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V2,
+        ) {
+            wrong.push(format!("  {}: {complaint}", path.display()));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} problem(s) across {} retention verdict(s) in {}:\n{}\n\n\
+         Each of these is a protocol failure under `R6`, and the remedy is a WHOLE re-run of \
+         the offending verdict with the reason logged in `RESULTS-2.md` — never a patch.",
+        wrong.len(),
+        scan.verdicts.len(),
+        retention.display(),
+        wrong.join("\n"),
+    );
+    assert!(
+        scan.verdicts.is_empty() || rows_checked > 0,
+        "{} holds {} verdict(s) but no rows were checked",
+        retention.display(),
+        scan.verdicts.len(),
+    );
+}
+
+/// Item 8a's sample is the stride rule, recomputed — not whatever the dispatch
+/// happened to send.
+///
+/// **Without this a dispatch that sampled the wrong rows is invisible to the
+/// whole suite**, and item 8a's own text says so. The sample is fully determined
+/// — every 5th `present: true` row in ledger order, 1-based among `present: true`
+/// rows — precisely so that two dispatches cannot select different rows, and a
+/// fixed stride is what makes the arms comparable at all: every generation is
+/// audited on the same rows of its own ledger.
+///
+/// **Vacuous until the tier-2 pass runs.** An `adjudication-2/<id>.json` with no
+/// `retention-2/<id>.json` behind it is a hard error, not a vacuous case: there
+/// is nothing to recompute the sample from.
+#[test]
+fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
+    let dir = spec_length_2_adjudication_dir();
+    let Some(records) = read_json_records::<Adjudication2Record>(&dir) else {
+        return;
+    };
+    let verdicts = read_spec_length_2_verdicts().unwrap_or_else(|| {
+        panic!(
+            "{} holds {} adjudication(s) but {} does not exist. Item 8a adjudicates a sample \
+             of a tier-1 verdict's own rows; with no verdicts there is nothing the sample \
+             could have been drawn from.",
+            dir.display(),
+            records.len(),
+            spec_length_2_retention_dir().display(),
+        )
+    });
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut pairs_checked = 0usize;
+    for (stem, record) in &records {
+        if &record.spec_id != stem {
+            wrong.push(format!(
+                "  {stem}: the file is named `{stem}.json` but adjudicates `{}`",
+                record.spec_id
+            ));
+        }
+        if record.sample_rule != SPEC_LENGTH_2_SAMPLE_RULE {
+            wrong.push(format!(
+                "  {stem}: `sample_rule` is {:?}; item 8a pins {:?}. The cell records which \
+                 rule drew the sample, so a second wording is a second rule.",
+                record.sample_rule, SPEC_LENGTH_2_SAMPLE_RULE,
+            ));
+        }
+        let Some(verdict) = verdicts.get(stem) else {
+            wrong.push(format!(
+                "  {stem}: no `retention-2/{stem}.json`, so the sample cannot be recomputed \
+                 and the pairs below are unauditable"
+            ));
+            continue;
+        };
+        if record.ledger != verdict.ledger {
+            wrong.push(format!(
+                "  {stem}: adjudicated against ledger `{}` but scored against `{}`",
+                record.ledger, verdict.ledger,
+            ));
+        }
+
+        let expected = adjudication_sample(verdict);
+        let got: Vec<String> = record.pairs.iter().map(|p| p.row.clone()).collect();
+        if got != expected {
+            wrong.push(format!(
+                "  {stem}: adjudicates {:?}\n      but the stride rule selects {:?}",
+                got, expected,
+            ));
+        }
+        for (i, pair) in record.pairs.iter().enumerate() {
+            if pair.n != i + 1 {
+                wrong.push(format!(
+                    "  {stem}: pair {} carries `n` = {}; `n` is the 1-based position in this \
+                     file's own list, and the adjudicator's reply is joined back on it",
+                    i + 1,
+                    pair.n,
+                ));
+            }
+        }
+        pairs_checked += record.pairs.len();
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} problem(s) across {} adjudication record(s):\n{}\n\n\
+         Item 8a's sample is fully determined, offset included. Do not adjust the stride or \
+         the offset to hit a true 20%, and do not substitute a different sample when a \
+         verdict has fewer than five `present: true` rows — record the empty sample in \
+         `RESULTS-2.md` against that verdict id.",
+        wrong.len(),
+        records.len(),
+        wrong.join("\n"),
+    );
+    // A record set that contributed no pairs at all would print `ok` having
+    // compared nothing — unless every verdict legitimately sampled empty, which
+    // the recomputation above has already established.
+    let expected_total: usize = records
+        .keys()
+        .filter_map(|stem| verdicts.get(stem))
+        .map(|v| adjudication_sample(v).len())
+        .sum();
+    assert_eq!(
+        pairs_checked, expected_total,
+        "{} adjudicated pair(s) were checked against {} the stride rule selects",
+        pairs_checked, expected_total,
+    );
+}
+
+/// Item 8b's join: tier 3 governs where it spoke, tier 1 everywhere else, and
+/// nothing overrides a row without a record behind it.
+///
+/// **The join is the redesign.** Under `PROTOCOL.md` an unestablished row
+/// invalidated a whole verdict file; under `PROTOCOL-2.md` it is escalated, and
+/// the escalator's call replaces tier 1's for that row alone. That makes the
+/// final `present` a *derived* quantity for the first time, and a derived
+/// quantity nobody recomputes is one a hand edit can move.
+///
+/// It also checks item 8b's two-way correspondence with tier 2: a row in
+/// `escalation-2/` that tier 2 did not flag is a hard error, and so is a flagged
+/// row missing from it.
+///
+/// **Vacuous while `retention-2/` does not exist.** An `escalation-2/` with no
+/// `retention-2/` is a hard error, not a vacuous case.
+#[test]
+fn spec_length_2_final_disposition_is_the_recorded_join() {
+    let escalations =
+        read_json_records::<EscalationRecord>(&spec_length_2_escalation_dir()).unwrap_or_default();
+    let Some(verdicts) = read_spec_length_2_verdicts() else {
+        assert!(
+            escalations.is_empty(),
+            "{} holds {} escalation(s) but {} does not exist. Tier 3 answers rows tier 2 \
+             flagged in a tier-1 verdict; an escalation with no verdict behind it is a \
+             disposition with no record behind it.",
+            spec_length_2_escalation_dir().display(),
+            escalations.len(),
+            spec_length_2_retention_dir().display(),
+        );
+        return;
+    };
+
+    let disposition = final_disposition(&verdicts, &escalations).unwrap_or_else(|wrong| {
+        panic!(
+            "{} inconsistency/ies in item 8b's join:\n{}\n\n\
+             `present` is tier 3's call where an `escalation-2` record exists for that \
+             `(id, row)`, and tier 1's otherwise. There is no third source, no manual \
+             override, and no row whose disposition is decided by a human reading.",
+            wrong.len(),
+            wrong.join("\n"),
+        )
+    });
+
+    // Item 8b: `rows` carries EXACTLY the rows item 8a flagged, once each.
+    let adjudications =
+        read_json_records::<Adjudication2Record>(&spec_length_2_adjudication_dir())
+            .unwrap_or_default();
+    let mut wrong: Vec<String> = Vec::new();
+    for id in verdicts.keys() {
+        let flagged: BTreeSet<&str> = adjudications
+            .get(id)
+            .map(|a| {
+                a.pairs
+                    .iter()
+                    .filter(|p| !p.establishes)
+                    .map(|p| p.row.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let escalated: BTreeSet<&str> = escalations
+            .get(id)
+            .map(|e| e.rows.iter().map(|r| r.id.as_str()).collect())
+            .unwrap_or_default();
+
+        for row in escalated.difference(&flagged) {
+            wrong.push(format!(
+                "  {id}: `escalation-2` answers `{row}`, which tier 2 did not flag. Tier 3 \
+                 runs on the flagged set and nothing else — a row escalated without a tier-2 \
+                 `establishes: false` behind it is an override that chose its own scope."
+            ));
+        }
+        for row in flagged.difference(&escalated) {
+            wrong.push(format!(
+                "  {id}: tier 2 flagged `{row}` and no `escalation-2` record answers it. A \
+                 flagged row keeps tier 1's call by default, so a missing escalation is a \
+                 silent decision not to look."
+            ));
+        }
+        if !flagged.is_empty() && !escalations.contains_key(id) {
+            wrong.push(format!(
+                "  {id}: {} flagged row(s) and no `escalation-2/{id}.json` at all. Item 8b \
+                 makes the ABSENCE of that file the record that nothing was flagged, so an \
+                 absent file beside a non-empty flagged set says something untrue.",
+                flagged.len(),
+            ));
+        }
+    }
+    for id in escalations.keys() {
+        if !verdicts.contains_key(id) {
+            wrong.push(format!("  {id}: escalated with no tier-1 verdict"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} problem(s) in the tier-2 -> tier-3 correspondence:\n{}",
+        wrong.len(),
+        wrong.join("\n"),
+    );
+
+    // Every override is a row tier 3 actually spoke about, and every row tier 3
+    // spoke about is overridden. Recomputed rather than trusted, because this is
+    // the property the whole join rests on.
+    let mut overridden = 0usize;
+    for (id, escalation) in &escalations {
+        for row in &escalation.rows {
+            let key = (id.clone(), row.id.clone());
+            assert_eq!(
+                disposition.get(&key).copied(),
+                Some(row.present),
+                "{id}/{}: the join did not take tier 3's call",
+                row.id,
+            );
+            overridden += 1;
+        }
+    }
+    for (id, verdict) in &verdicts {
+        let escalated: BTreeSet<&str> = escalations
+            .get(id)
+            .map(|e| e.rows.iter().map(|r| r.id.as_str()).collect())
+            .unwrap_or_default();
+        for row in &verdict.rows {
+            if escalated.contains(row.id.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                disposition.get(&(id.clone(), row.id.clone())).copied(),
+                Some(row.present),
+                "{id}/{}: an unescalated row must keep tier 1's call",
+                row.id,
+            );
+        }
+    }
+    assert!(
+        disposition.len() >= overridden,
+        "the join produced fewer cells than there were overrides"
+    );
+}
+
+/// `R8`'s exclusion cannot be aimed at an arm.
+///
+/// **Two halves, and the first is honestly the weaker.**
+///
+/// **(a) The signature.** [`universally_dropped`] takes the final dispositions
+/// and an id→fixture map, and nothing else — no arm, no blind map. Arm-blindness
+/// is therefore structural rather than behavioural, and this half **locks that
+/// signature** so a later "convenience" parameter is a compile error. It
+/// discovers nothing; the write-up must say so rather than implying a runtime
+/// finding.
+///
+/// **(b) The permutation, which does bite.** Over an inline fixture of
+/// dispositions plus a blind map, permuting the arm labels leaves the exclusion
+/// set **identical** while the per-arm retention counts **permute
+/// correspondingly**. That is the real claim — `R8` cannot be steered, but the
+/// gate it feeds is arm-sensitive — and it would fail if anyone later routed an
+/// arm into the exclusion.
+///
+/// **Never vacuous:** the fixture is inline, so this runs today and it ran the
+/// day `R8` was adopted. `R8` was adopted post-hoc, after the first attempt
+/// failed and before any new measurement — this test is the reason that is
+/// legitimate, and `PROTOCOL-2.md` item 12 says so in the same breath.
+#[test]
+fn spec_length_2_r8_exclusion_is_arm_symmetric() {
+    // (a) The signature lock. If a later edit gives `universally_dropped` an arm
+    // — even as an `Option` — this stops compiling. Written out rather than
+    // hidden behind a `type` alias: the point of the assertion is that a reader
+    // can see there is no arm in it.
+    #[allow(clippy::type_complexity)]
+    let _arm_blind: fn(
+        &BTreeMap<(String, String), bool>,
+        &BTreeMap<String, String>,
+        &BTreeMap<String, Vec<String>>,
+    ) -> Result<BTreeSet<String>, Vec<String>> = universally_dropped;
+
+    // (b) One fixture, six generations — 3 arms x 2 samples, the set `R8`'s
+    // denominator actually is.
+    let fixture = "fx";
+    let rows = ["fx-01", "fx-02", "fx-03", "fx-04"];
+    let ledger_ids: BTreeMap<String, Vec<String>> = BTreeMap::from([(
+        fixture.to_string(),
+        rows.iter().map(|r| r.to_string()).collect(),
+    )]);
+    let generations = ["g1", "g2", "g3", "g4", "g5", "g6"];
+    let fixture_of_id: BTreeMap<String, String> = generations
+        .iter()
+        .map(|g| (g.to_string(), fixture.to_string()))
+        .collect();
+
+    // `fx-01` is dropped by everything (universal). `fx-02` is dropped only by
+    // the arm holding g3/g4. `fx-03` and `fx-04` are dropped only by the arm
+    // holding g1/g2, one each — so the three arms end on three DIFFERENT
+    // retention counts. That matters: the first draft of this fixture gave two
+    // arms the same count, and a permutation of equal numbers is satisfied by
+    // any function at all.
+    let dropped_by: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
+        ("g1", vec!["fx-01", "fx-03"]),
+        ("g2", vec!["fx-01", "fx-04"]),
+        ("g3", vec!["fx-01", "fx-02"]),
+        ("g4", vec!["fx-01", "fx-02"]),
+        ("g5", vec!["fx-01"]),
+        ("g6", vec!["fx-01"]),
+    ]);
+    let mut disposition: BTreeMap<(String, String), bool> = BTreeMap::new();
+    for g in &generations {
+        for row in &rows {
+            let present = !dropped_by[g].contains(row);
+            disposition.insert((g.to_string(), row.to_string()), present);
+        }
+    }
+
+    let excluded = universally_dropped(&disposition, &fixture_of_id, &ledger_ids)
+        .expect("the fixture judges every row");
+    assert_eq!(
+        excluded,
+        BTreeSet::from(["fx-01".to_string()]),
+        "`R8` excludes exactly the rows every generation of the row's own fixture drops"
+    );
+
+    // The per-arm gate reading, over the discriminating set. `R1`: an arm's
+    // dropped set is the union of its generations'.
+    let discriminating: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|r| !excluded.contains(*r))
+        .collect();
+    let retention = |assignment: &BTreeMap<&str, &str>| -> BTreeMap<String, usize> {
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for arm in assignment.values() {
+            let mut dropped: BTreeSet<&str> = BTreeSet::new();
+            for (member, a) in assignment {
+                if a != arm {
+                    continue;
+                }
+                for row in &discriminating {
+                    if !disposition[&((*member).to_string(), (*row).to_string())] {
+                        dropped.insert(row);
+                    }
+                }
+            }
+            out.insert((*arm).to_string(), discriminating.len() - dropped.len());
+        }
+        out
+    };
+
+    let straight: BTreeMap<&str, &str> = BTreeMap::from([
+        ("g1", "S1"),
+        ("g2", "S1"),
+        ("g3", "S2"),
+        ("g4", "S2"),
+        ("g5", "S3"),
+        ("g6", "S3"),
+    ]);
+    // The same generations, relabelled: S1 -> S2 -> S3 -> S1.
+    let permuted: BTreeMap<&str, &str> = BTreeMap::from([
+        ("g1", "S2"),
+        ("g2", "S2"),
+        ("g3", "S3"),
+        ("g4", "S3"),
+        ("g5", "S1"),
+        ("g6", "S1"),
+    ]);
+
+    let excluded_again = universally_dropped(&disposition, &fixture_of_id, &ledger_ids)
+        .expect("the exclusion does not depend on the labels");
+    assert_eq!(
+        excluded, excluded_again,
+        "the exclusion set must be identical under a permutation of the arm labels — it is \
+         a function of the union across all arms, so nothing in it can be steered toward one"
+    );
+
+    let before = retention(&straight);
+    let after = retention(&permuted);
+    assert_eq!(
+        before["S1"], after["S2"],
+        "the arm relabelled S1 -> S2 must carry its retention count with it"
+    );
+    assert_eq!(
+        before["S2"], after["S3"],
+        "the arm relabelled S2 -> S3 must carry its retention count with it"
+    );
+    assert_eq!(
+        before["S3"], after["S1"],
+        "the arm relabelled S3 -> S1 must carry its retention count with it"
+    );
+    assert_ne!(
+        before["S1"], before["S2"],
+        "the fixture must make the arms distinguishable, or the permutation above proves \
+         nothing: three equal counts permute trivially"
+    );
+
+    // A row NO generation judged is an error, not an exclusion. This is the
+    // branch that would otherwise shrink the gate denominator for a row nobody
+    // looked at.
+    let mut unscored = disposition.clone();
+    for g in &generations {
+        unscored.remove(&((*g).to_string(), "fx-04".to_string()));
+    }
+    let complaints = universally_dropped(&unscored, &fixture_of_id, &ledger_ids)
+        .expect_err("a row no generation judged must be an error");
+    assert!(
+        complaints.iter().any(|c| c.contains("fx-04")),
+        "the error must name the unjudged row, got {complaints:?}"
+    );
+}
+
+/// The 18 new generations exist, are unlabelled, and the two maps agree about
+/// every one of them.
+///
+/// The v1 check ([`spec_length_generations_are_unlabelled_and_cover_the_design`])
+/// over `generated-2/` and `blind-map-2.json`, plus one assertion v1 has no
+/// analogue for: **`fixture-map-2.json` agrees with the blind map on every id**.
+/// Item 7a exists so the scoring chain never opens the blind map, and two maps
+/// that disagree mean nobody knows which ledger a verdict was scored against.
+///
+/// **The pools are asserted disjoint here** — item 6's claim, executed. Two
+/// pools sharing a token would make `generated/<id>.md` and `generated-2/<id>.md`
+/// name the same id, and every path join between the attempts ambiguous.
+///
+/// **Vacuous until the generation task runs.** Absence of `generated-2/` is a
+/// pass; absence of *one* of the three artifacts once any exists is not.
+#[test]
+fn spec_length_2_generations_are_unlabelled_and_cover_the_design() {
+    let pool: HashSet<&str> = SPEC_LENGTH_2_ID_POOL.iter().copied().collect();
+    assert_eq!(
+        pool.len(),
+        18,
+        "`PROTOCOL-2.md` item 6's pool transcribes {} distinct tokens, not 18",
+        pool.len(),
+    );
+    let v1_pool: HashSet<&str> = SPEC_LENGTH_ID_POOL.iter().copied().collect();
+    let shared: Vec<&&str> = pool.intersection(&v1_pool).collect();
+    assert!(
+        shared.is_empty(),
+        "the two id pools share {:?}. Item 6 requires them disjoint so that \
+         `generated/<id>.md` and `generated-2/<id>.md` can never name the same `<id>` and no \
+         path join, prompt or table row is ambiguous about which attempt it belongs to.",
+        shared,
+    );
+
+    let gen_dir = spec_length_2_generated_dir();
+    let map = read_spec_length_2_blind_map();
+    let fixtures = read_spec_length_2_fixture_map();
+    if map.is_none() && fixtures.is_none() && !gen_dir.exists() {
+        // The generation task has not run. All three land in one commit.
+        return;
+    }
+    let map_path = spec_length_2_blind_map_path();
+    let fixture_map_path = spec_length_2_fixture_map_path();
+    let map = map.unwrap_or_else(|| {
+        panic!(
+            "{} is missing while the rest of the generation task's output exists. The blind \
+             map, the fixture map and the 18 specs land in ONE commit — without the map every \
+             generation is anonymous and no verdict can ever be attributed to an arm.",
+            map_path.display()
+        )
+    });
+    let fixtures = fixtures.unwrap_or_else(|| {
+        panic!(
+            "{} is missing. Item 7a is what lets the tier-1/2/3 tasks learn which ledger an \
+             id is scored against WITHOUT opening the blind map; without it every scoring \
+             task has a standing reason to open the file item 7 forbids it.",
+            fixture_map_path.display()
+        )
+    });
+
+    let mut off_pool: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !pool.contains(id))
+        .collect();
+    off_pool.sort_unstable();
+    assert!(
+        off_pool.is_empty(),
+        "{} uses {} id(s) that are not in `PROTOCOL-2.md` item 6's pool: {}",
+        map_path.display(),
+        off_pool.len(),
+        off_pool.join(", "),
+    );
+
+    let mut bad_cells = Vec::new();
+    for (id, cell) in &map {
+        if !SPEC_LENGTH_GENERATED_ARMS.contains(&cell.arm.as_str()) {
+            bad_cells.push(format!(
+                "  {id}: arm `{}` is not one of {SPEC_LENGTH_GENERATED_ARMS:?}",
+                cell.arm
+            ));
+        }
+        if !SPEC_LENGTH_FIXTURE_NAMES.contains(&cell.fixture.as_str()) {
+            bad_cells.push(format!(
+                "  {id}: fixture `{}` is not one of {SPEC_LENGTH_FIXTURE_NAMES:?}",
+                cell.fixture
+            ));
+        }
+        if !SPEC_LENGTH_SAMPLES.contains(&cell.sample) {
+            bad_cells.push(format!(
+                "  {id}: sample {} is not one of {SPEC_LENGTH_SAMPLES:?}",
+                cell.sample
+            ));
+        }
+        match fixtures.get(id) {
+            None => bad_cells.push(format!("  {id}: named by the blind map, absent from item 7a's fixture map")),
+            Some(f) if *f != cell.fixture => bad_cells.push(format!(
+                "  {id}: the fixture map says `{f}`, the blind map says `{}`. A disagreement \
+                 is a hard error, not a fallback: if the two disagree, nobody knows which \
+                 ledger the verdict was scored against.",
+                cell.fixture,
+            )),
+            Some(_) => {}
+        }
+    }
+    for id in fixtures.keys() {
+        if !map.contains_key(id) {
+            bad_cells.push(format!(
+                "  {id}: in item 7a's fixture map, absent from the blind map"
+            ));
+        }
+    }
+    bad_cells.sort();
+    assert!(
+        bad_cells.is_empty(),
+        "{} cell problem(s) across {} and {}:\n{}",
+        bad_cells.len(),
+        map_path.display(),
+        fixture_map_path.display(),
+        bad_cells.join("\n"),
+    );
+
+    for arm in SPEC_LENGTH_GENERATED_ARMS {
+        for fixture in SPEC_LENGTH_FIXTURE_NAMES {
+            for sample in SPEC_LENGTH_SAMPLES {
+                let hits: Vec<&str> = map
+                    .iter()
+                    .filter(|(_, c)| c.arm == *arm && c.fixture == *fixture && c.sample == *sample)
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "{}: the triple ({arm}, {fixture}, sample {sample}) is covered {} time(s), \
+                     not exactly once{}",
+                    map_path.display(),
+                    hits.len(),
+                    if hits.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (by {})", hits.join(", "))
+                    },
+                );
+            }
+        }
+    }
+    assert_eq!(
+        map.len(),
+        18,
+        "{} holds {} entries; the design is 3 arms x 3 fixtures x 2 samples = 18",
+        map_path.display(),
+        map.len(),
+    );
+
+    let entries = fs::read_dir(&gen_dir).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}\n\n`blind-map-2.json` names 18 generations; this is where \
+             their text lives.",
+            gen_dir.display()
+        )
+    });
+    let mut on_disk: HashSet<String> = HashSet::new();
+    let mut strays: Vec<String> = Vec::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", gen_dir.display()))
+            .path();
+        let stem = path.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+        let is_md = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
+        match stem {
+            Some(stem) if is_md && map.contains_key(&stem) => {
+                on_disk.insert(stem);
+            }
+            _ => strays.push(path.display().to_string()),
+        }
+    }
+    strays.sort();
+    assert!(
+        strays.is_empty(),
+        "{} holds {} file(s) that no blind-map entry names:\n  {}",
+        gen_dir.display(),
+        strays.len(),
+        strays.join("\n  "),
+    );
+    let mut missing: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !on_disk.contains(*id))
+        .collect();
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "{} names {} generation(s) with no `<id>.md` in {}: {}",
+        map_path.display(),
+        missing.len(),
+        gen_dir.display(),
+        missing.join(", "),
+    );
+
+    let mut leaks: Vec<String> = Vec::new();
+    for id in map.keys() {
+        let path = gen_dir.join(format!("{id}.md"));
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            !text.trim().is_empty(),
+            "{} is empty. An empty generation is a probe that did not run, not a spec that \
+             says nothing — re-running it is the one re-run `R6` permits.",
+            path.display(),
+        );
+        for label in ["S0", "S1", "S2", "S3"] {
+            if let Some(at) = token_position(&text, label) {
+                leaks.push(format!(
+                    "  {}:{} carries the arm label `{label}`",
+                    path.display(),
+                    line_of_offset(&text, at),
+                ));
+            }
+        }
+        if let Some(at) = text.find(id.as_str()) {
+            leaks.push(format!(
+                "  {}:{} carries its own id `{id}`",
+                path.display(),
+                line_of_offset(&text, at),
+            ));
+        }
+        for marker in ["BEGIN INSTRUCTION", "END INSTRUCTION"] {
+            if let Some(at) = text.find(marker) {
+                leaks.push(format!(
+                    "  {}:{} echoes the probe template's `{marker}` marker",
+                    path.display(),
+                    line_of_offset(&text, at),
+                ));
+            }
+        }
+    }
+    leaks.sort();
+    assert!(
+        leaks.is_empty(),
+        "{} generated spec(s) carry a label a scorer must never see:\n{}\n\n\
+         Item 5: the generated file holds ONLY the spec body. Fixing this by editing the \
+         generated text is NOT available — the specs are the raw measurement. A leak means \
+         the probe was mis-prompted, and the repair is to re-run that probe under `R6` and \
+         log it.",
+        leaks.len(),
+        leaks.join("\n"),
+    );
+}
+
+/// No property of a v2 generation id is a function of the arm it was assigned
+/// to — item 6's inherited constraint, on which item 14a's `A`/`B` rule rests.
+///
+/// The v1 check ([`spec_length_id_assignment_does_not_track_the_arm`]) over
+/// `blind-map-2.json`, with its limits unchanged and worth restating: it refuses
+/// the degenerate outcome, it does not prove the draw was independent, and the
+/// third property item 14a names — position in item 6's listing — is **not**
+/// checked here at all.
+///
+/// **Vacuous until the blind map exists.**
+#[test]
+fn spec_length_2_id_assignment_does_not_track_the_arm() {
+    let Some(map) = read_spec_length_2_blind_map() else {
+        return;
+    };
+    let map_path = spec_length_2_blind_map_path();
+
+    let id_for = |arm: &str, fixture: &str, sample: u32| -> String {
+        map.iter()
+            .find(|(_, c)| c.arm == arm && c.fixture == fixture && c.sample == sample)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no entry for ({arm}, {fixture}, sample {sample}) — \
+                     `spec_length_2_generations_are_unlabelled_and_cover_the_design` reports \
+                     the coverage failure in full",
+                    map_path.display()
+                )
+            })
+    };
+
+    for candidate in SPEC_LENGTH_CANDIDATE_ARMS {
+        let mut control_is_a: Vec<&str> = Vec::new();
+        let mut candidate_is_a: Vec<&str> = Vec::new();
+        for fixture in SPEC_LENGTH_FIXTURE_NAMES {
+            let control = id_for("S1", fixture, 1);
+            let other = id_for(candidate, fixture, 1);
+            assert_ne!(
+                control, other,
+                "{}: ({fixture}, sample 1) gives S1 and {candidate} the same id",
+                map_path.display()
+            );
+            if control < other {
+                control_is_a.push(fixture);
+            } else {
+                candidate_is_a.push(fixture);
+            }
+        }
+        assert!(
+            !control_is_a.is_empty() && !candidate_is_a.is_empty(),
+            "{}: across all three fixtures at sample 1, `{}` always holds position `A` in the \
+             S1-vs-{candidate} pairing (A on: {}).\n\n\
+             Item 14a fixes `A` as the lexicographically smaller id so that position cannot \
+             carry a hint. A clean sweep hands the gap adjudicator the correlation the A/B \
+             relabelling exists to remove. This is a finding about the ASSIGNMENT, not about \
+             any spec: before scoring the repair is to re-draw and regenerate; afterwards it \
+             is not repairable and the write-up records it as a limitation.",
+            map_path.display(),
+            if control_is_a.is_empty() { candidate } else { "S1" },
+            if control_is_a.is_empty() {
+                candidate_is_a.join(", ")
+            } else {
+                control_is_a.join(", ")
+            },
+        );
+    }
+}
+
+/// `blind-map-2.json` was committed before any tier-1 verdict, and has not moved
+/// since the first one.
+///
+/// The v1 check ([`spec_length_blind_map_precedes_every_retention_verdict`]) over
+/// the `-2` paths, including its third assertion — the one the descent check
+/// alone does not give you. A map that moves after even one verdict exists is a
+/// map that could have been edited to fit results already on disk, and the commit
+/// graph cannot see verdicts written but not yet committed.
+/// [`blind_map_is_immovable`] is reused unchanged.
+///
+/// **Vacuous until the blind map exists.** Once it does, it must resolve to an
+/// introducing commit and to a finalising commit and hash to what that commit
+/// recorded, whether or not any verdict exists — three real facts, checked from
+/// the generation task onward.
+#[test]
+fn spec_length_2_blind_map_precedes_every_retention_verdict() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no verdict's position relative to the blind map can be \
+         verified"
+    );
+    let map_path = spec_length_2_blind_map_path();
+    if !map_path.is_file() {
+        return;
+    }
+    let repo = repo_root();
+
+    let introduced_at = match introducing_commit_in(&repo, &map_path) {
+        Introduced::At(commit) => commit,
+        Introduced::NotCommitted => panic!(
+            "{} exists on disk but no commit introduces it. Item 7 requires it committed \
+             before the first scorer is dispatched — commit it now, before scoring anything.",
+            map_path.display()
+        ),
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when {} was introduced: {how}\n\nThis is NOT a finding about \
+             the map — it is this check reporting that it could not run.",
+            map_path.display()
+        ),
+    };
+    let map_final = last_commit_touching(&repo, SPEC_LENGTH_2_BLIND_MAP_REPO_PATH).unwrap_or_else(
+        |how| panic!("cannot find the last commit touching {SPEC_LENGTH_2_BLIND_MAP_REPO_PATH}: {how}"),
+    );
+
+    let at_commit = format!("{}:{SPEC_LENGTH_2_BLIND_MAP_REPO_PATH}", map_final.as_str());
+    let out = git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "rev-parse".to_string(),
+        at_commit.clone(),
+    ])
+    .unwrap_or_else(|how| panic!("cannot ask git for `{at_commit}`: {how}"));
+    assert!(
+        out.status.success(),
+        "`git rev-parse {at_commit}` failed: {}\n\nThis is NOT a finding about the map — it \
+         is this check reporting that it could not read the blob that commit recorded.",
+        git_stderr(&out),
+    );
+    let committed = GitObjectId::parse(String::from_utf8_lossy(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("`git rev-parse {at_commit}` printed {e}"));
+    assert_eq!(
+        git_hash_object(&map_path).as_str(),
+        committed.as_str(),
+        "{} has uncommitted changes: it does not hash to the blob its last commit ({}) \
+         recorded. Every ordering claim below is about the committed map.",
+        map_path.display(),
+        map_final.as_str(),
+    );
+
+    let retention = spec_length_2_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        return;
+    };
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries this ordering check cannot classify:\n{}",
+        retention.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert!(
+        blind_map_is_immovable(scan.verdicts.len(), &map_final, &introduced_at),
+        "{} was modified after it was introduced, and {} retention verdict(s) already \
+         exist.\n\n  introduced by {}\n  last touched by {}\n\n\
+         The assignment may be re-drawn freely while nothing has been scored. Once a single \
+         verdict exists it may not move again: a map edited with results in hand is a map \
+         that could have been edited to fit them, and nothing in the commit graph can \
+         distinguish the two.",
+        map_path.display(),
+        scan.verdicts.len(),
+        introduced_at.as_str(),
+        map_final.as_str(),
+    );
+
+    let mut violations = Vec::new();
+    let mut uncommitted = Vec::new();
+    let mut unreadable = Vec::new();
+    for path in scan.verdicts {
+        let at = format!("verdict `{}`", path.display());
+        let verdict_commit = match introducing_commit_in(&repo, &path) {
+            Introduced::At(commit) => commit,
+            Introduced::NotCommitted => {
+                uncommitted.push(format!("  {at}: not yet committed — not verifiable"));
+                continue;
+            }
+            Introduced::Undetermined { how } => {
+                unreadable.push(format!("  {at}: {how}"));
+                continue;
+            }
+        };
+        match descends_from_in(&repo, &map_final, &verdict_commit) {
+            Descent::Yes => {}
+            Descent::No => violations.push(format!(
+                "  {at}: introduced by {}, which does NOT descend from the blind map's last \
+                 commit {}",
+                verdict_commit.as_str(),
+                map_final.as_str(),
+            )),
+            Descent::Undetermined { how } => unreadable.push(format!("  {at}: {how}")),
+        }
+    }
+    assert!(
+        unreadable.is_empty(),
+        "{} retention verdict(s) could not be checked at all:\n{}\n\nThis is NOT a finding \
+         about the verdicts — it is this check reporting that it could not run.",
+        unreadable.len(),
+        unreadable.join("\n"),
+    );
+    assert!(
+        uncommitted.is_empty(),
+        "{} retention verdict(s) are on disk with no introducing commit:\n{}",
+        uncommitted.len(),
+        uncommitted.join("\n"),
+    );
+    assert!(
+        violations.is_empty(),
+        "{} retention verdict(s) predate the blind map {}:\n{}\n\nA map written after the \
+         verdicts is a map that could have been written to fit them.",
+        violations.len(),
+        map_path.display(),
+        violations.join("\n"),
+    );
+}
+
+/// `calibration-2.json` scores exactly the flagged set, recomputed from the
+/// first attempt's raw adjudications.
+///
+/// **This is what stops the calibration set being trimmed to the rows that
+/// confirm the diagnosis.** Item 12a runs the tier-3 instrument over the 24 rows
+/// the first attempt's operative six passes marked `establishes: false`; a pass
+/// that quietly dropped the awkward ones would confirm `spec.md` §2 by
+/// construction, exactly as `PROTOCOL.md` item 8a made every verdict fail by
+/// construction. The operative six are [`SPEC_LENGTH_OPERATIVE_PASSES`] —
+/// attempt 2 for `4a73ef`, whose `R6` re-run superseded attempt 1, and attempt 1
+/// for the other five.
+///
+/// **Vacuous until the calibration pass runs.** The 24-row recomputation is not:
+/// it runs today against `invalidated/adjudication/`, so a drift in the operative
+/// set is caught whether or not `calibration-2.json` exists.
+#[test]
+fn spec_length_2_calibration_is_the_recorded_flagged_set() {
+    let adjudication = spec_length_dir().join("invalidated").join("adjudication");
+    let records: BTreeMap<String, AdjudicationRecord> = read_json_records(&adjudication)
+        .unwrap_or_else(|| panic!("{} does not exist", adjudication.display()));
+
+    // The flagged set, recomputed. Keyed `(spec_id, attempt, row)` so a row
+    // flagged in both of `4a73ef`'s attempts cannot be counted twice.
+    let mut flagged: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for (spec_id, attempt) in SPEC_LENGTH_OPERATIVE_PASSES {
+        let stem = format!("{spec_id}-{attempt}");
+        let record = records.get(&stem).unwrap_or_else(|| {
+            panic!(
+                "{}/{stem}.json is missing; it is one of the operative six passes the \
+                 calibration set is recomputed from",
+                adjudication.display()
+            )
+        });
+        assert_eq!(&record.spec_id, spec_id, "{stem}.json names another generation");
+        assert_eq!(&record.attempt, attempt, "{stem}.json names another attempt");
+        for pair in record.pairs.iter().filter(|p| !p.establishes) {
+            flagged.insert((
+                (*spec_id).to_string(),
+                (*attempt).to_string(),
+                pair.row.clone(),
+            ));
+        }
+    }
+    assert_eq!(
+        flagged.len(),
+        24,
+        "the operative six passes flag {} row(s), not the 24 `PROTOCOL-2.md` item 12a and \
+         `RESULTS.md` §7.3 both record. Item 12a's whole corpus is that set, so a different \
+         number means the calibration pass is measuring something else.",
+        flagged.len(),
+    );
+
+    let path = spec_length_2_calibration_path();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return;
+    };
+    let file: CalibrationFile = serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}\n\nExpected item 12a's schema: \
+             `{{\"instrument\", \"records\":[{{\"spec_id\", \"attempt\", \"ledger\", \
+             \"rows\":[{{\"id\", \"present\", \"reason\"}}]}}]}}`.",
+            path.display()
+        )
+    });
+
+    // **The `attempt` cell has two spellings in the record and both are
+    // accepted, deliberately and narrowly.** `invalidated/adjudication/`'s files
+    // and [`SPEC_LENGTH_OPERATIVE_PASSES`] spell it `attempt-1`; item 12a's own
+    // JSON illustration spells it `"1"`. Neither is a rule stated in prose, so
+    // normalising the label is not a weakening — the SET of `(generation,
+    // attempt, row)` triples is still required to be exactly the 24, which is
+    // the claim. Anything that is not one of the four accepted spellings is
+    // refused.
+    let normalise = |attempt: &str, whose: &str| -> String {
+        match attempt {
+            "1" | "attempt-1" => "attempt-1".to_string(),
+            "2" | "attempt-2" => "attempt-2".to_string(),
+            other => panic!(
+                "{whose}: `attempt` is {other:?}. Item 12a's corpus is the operative six \
+                 passes of the first attempt, spelled `attempt-1`/`attempt-2` in \
+                 `invalidated/adjudication/` and `1`/`2` in item 12a's illustration. A third \
+                 spelling cannot be joined to either."
+            ),
+        }
+    };
+
+    let mut recorded: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for record in &file.records {
+        let attempt = normalise(&record.attempt, &format!("{} record `{}`", path.display(), record.spec_id));
+        for row in &record.rows {
+            assert!(
+                recorded.insert((record.spec_id.clone(), attempt.clone(), row.id.clone())),
+                "{}: `{}` {attempt} scores `{}` twice",
+                path.display(),
+                record.spec_id,
+                row.id,
+            );
+        }
+    }
+    assert_eq!(
+        file.records.len(),
+        SPEC_LENGTH_OPERATIVE_PASSES.len(),
+        "{} holds {} record(s); item 12a is six dispatches, one per operative pass",
+        path.display(),
+        file.records.len(),
+    );
+
+    let missing: Vec<String> = flagged
+        .difference(&recorded)
+        .map(|(s, a, r)| format!("  {s} {a} {r}"))
+        .collect();
+    let extra: Vec<String> = recorded
+        .difference(&flagged)
+        .map(|(s, a, r)| format!("  {s} {a} {r}"))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "{} does not score exactly the flagged set.\n{} flagged row(s) missing:\n{}\n\
+         {} row(s) scored that were never flagged:\n{}\n\n\
+         Item 12a's corpus is the 24 `establishes: false` pairs of the operative six passes \
+         and nothing else. A trimmed set would confirm `spec.md` §2's diagnosis by \
+         construction — which is the failure mode of the instrument this attempt exists to \
+         replace.",
+        path.display(),
+        missing.len(),
+        if missing.is_empty() { "  (none)".to_string() } else { missing.join("\n") },
+        extra.len(),
+        if extra.is_empty() { "  (none)".to_string() } else { extra.join("\n") },
+    );
+}
+
+/// Every figure in `RESULTS-2.md` recomputed from the records behind it.
+///
+/// **The standard the first attempt set, kept.** `RESULTS.md` §7.8 records eight
+/// corrections over three rounds, five of them wrong figures, and three of those
+/// were failures of an *earlier* correction. Every case had the same cause: a
+/// number written from memory beside one that had been recomputed. The three
+/// tables below are parsed by exact header string and every cell is recomputed
+/// from `retention-2/`, `escalation-2/`, `adjudication-2/`, `blind-map-2.json`
+/// and the frozen ledgers.
+///
+/// **The headers are pinned; the punctuation around the numbers is not.** A cell
+/// is compared by the integers in it, so `88 / 91`, `88/91` and `88 / 91
+/// (descriptive, not a pass)` all read the same. The figures are the claim.
+///
+/// **Vacuous until the unblinding task writes `RESULTS-2.md`.**
+#[test]
+fn spec_length_2_gate_arithmetic_matches_the_records() {
+    let path = spec_length_2_results_path();
+    let Ok(record) = fs::read_to_string(&path) else {
+        return;
+    };
+    let whose = path.display().to_string();
+
+    let verdicts = read_spec_length_2_verdicts().unwrap_or_else(|| {
+        panic!("{whose} exists but {} does not", spec_length_2_retention_dir().display())
+    });
+    let escalations =
+        read_json_records::<EscalationRecord>(&spec_length_2_escalation_dir()).unwrap_or_default();
+    let adjudications =
+        read_json_records::<Adjudication2Record>(&spec_length_2_adjudication_dir())
+            .unwrap_or_default();
+    let map = read_spec_length_2_blind_map()
+        .unwrap_or_else(|| panic!("{whose} exists but {} does not", spec_length_2_blind_map_path().display()));
+
+    let disposition = final_disposition(&verdicts, &escalations)
+        .unwrap_or_else(|wrong| panic!("item 8b's join is inconsistent:\n{}", wrong.join("\n")));
+    let ledger_ids: BTreeMap<String, Vec<String>> = SPEC_LENGTH_FIXTURE_NAMES
+        .iter()
+        .map(|f| ((*f).to_string(), spec_length_ledger_ids(f)))
+        .collect();
+    let fixture_of_id: BTreeMap<String, String> = map
+        .iter()
+        .filter(|(id, _)| verdicts.contains_key(*id))
+        .map(|(id, cell)| (id.clone(), cell.fixture.clone()))
+        .collect();
+    let excluded = universally_dropped(&disposition, &fixture_of_id, &ledger_ids)
+        .unwrap_or_else(|wrong| panic!("`R8` cannot be computed:\n{}", wrong.join("\n")));
+    let discriminating = SPEC_LENGTH_2_LEDGER_TOTAL - excluded.len();
+
+    let mut wrong: Vec<String> = Vec::new();
+
+    // Table 1 — one row per generation.
+    let per_generation = table_rows_under(
+        &record,
+        "| id | arm | fixture | sample | tier-1 present / N | tier-2 sampled | tier-2 false | tier-3 present | final present / N |",
+        &whose,
+    );
+    let mut tabled: BTreeSet<String> = BTreeSet::new();
+    for cells in &per_generation {
+        if cells.len() != 9 {
+            wrong.push(format!("  `{}` has {} cells, not 9", cells.join(" | "), cells.len()));
+            continue;
+        }
+        let id = cell_token(&cells[0]).to_string();
+        let Some(cell) = map.get(&id) else {
+            wrong.push(format!("  {id}: not in the blind map"));
+            continue;
+        };
+        let Some(verdict) = verdicts.get(&id) else {
+            wrong.push(format!("  {id}: no `retention-2/{id}.json`"));
+            continue;
+        };
+        if !tabled.insert(id.clone()) {
+            wrong.push(format!("  {id}: tabled twice"));
+        }
+        let n = ledger_ids[&cell.fixture].len();
+        let tier1 = verdict.rows.iter().filter(|r| r.present).count();
+        let sampled = adjudication_sample(verdict).len();
+        let tier2_false = adjudications
+            .get(&id)
+            .map(|a| a.pairs.iter().filter(|p| !p.establishes).count())
+            .unwrap_or(0);
+        let tier3 = escalations
+            .get(&id)
+            .map(|e| e.rows.iter().filter(|r| r.present).count())
+            .unwrap_or(0);
+        let final_present = verdict
+            .rows
+            .iter()
+            .filter(|r| disposition[&(id.clone(), r.id.clone())])
+            .count();
+
+        let check = |what: &str, got: &str, want: Vec<usize>| -> Option<String> {
+            let numbers = cell_numbers(got);
+            (numbers != want).then(|| {
+                format!("  {id}: `{what}` reads `{got}` ({numbers:?}); the records give {want:?}")
+            })
+        };
+        if cell_token(&cells[1]) != cell.arm {
+            wrong.push(format!("  {id}: arm `{}`, the blind map says `{}`", cells[1], cell.arm));
+        }
+        if cell_token(&cells[2]) != cell.fixture {
+            wrong.push(format!(
+                "  {id}: fixture `{}`, the blind map says `{}`",
+                cells[2], cell.fixture
+            ));
+        }
+        wrong.extend(
+            [
+                check("sample", &cells[3], vec![cell.sample as usize]),
+                check("tier-1 present / N", &cells[4], vec![tier1, n]),
+                check("tier-2 sampled", &cells[5], vec![sampled]),
+                check("tier-2 false", &cells[6], vec![tier2_false]),
+                check("tier-3 present", &cells[7], vec![tier3]),
+                check("final present / N", &cells[8], vec![final_present, n]),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    let untabled: Vec<&String> = verdicts.keys().filter(|id| !tabled.contains(*id)).collect();
+    if !untabled.is_empty() {
+        wrong.push(format!(
+            "  {} generation(s) have a verdict and no row in the per-generation table: {:?}. \
+             A table that reports 17 of 18 reads as a complete record.",
+            untabled.len(),
+            untabled,
+        ));
+    }
+
+    // Table 2 — one row per arm.
+    let per_arm = table_rows_under(
+        &record,
+        "| arm | dropped rows | retention / 230 | retention / discriminating |",
+        &whose,
+    );
+    let mut armed: BTreeSet<String> = BTreeSet::new();
+    for cells in &per_arm {
+        if cells.len() != 4 {
+            wrong.push(format!("  `{}` has {} cells, not 4", cells.join(" | "), cells.len()));
+            continue;
+        }
+        let arm = cell_token(&cells[0]).to_string();
+        if !SPEC_LENGTH_GENERATED_ARMS.contains(&arm.as_str()) {
+            wrong.push(format!("  `{arm}` is not one of {SPEC_LENGTH_GENERATED_ARMS:?}"));
+            continue;
+        }
+        armed.insert(arm.clone());
+        // `R1`: an arm's dropped set is the union of its generations' dropped
+        // sets — an AND across generations, not a majority.
+        let mut dropped: BTreeSet<&String> = BTreeSet::new();
+        for (id, cell) in &map {
+            if cell.arm != arm {
+                continue;
+            }
+            let Some(verdict) = verdicts.get(id) else { continue };
+            for row in &verdict.rows {
+                if !disposition[&(id.clone(), row.id.clone())] {
+                    dropped.insert(&row.id);
+                }
+            }
+        }
+        let gated: usize = dropped.iter().filter(|r| !excluded.contains(**r)).count();
+        let want: [(&str, Vec<usize>); 3] = [
+            ("dropped rows", vec![dropped.len()]),
+            ("retention / 230", vec![SPEC_LENGTH_2_LEDGER_TOTAL - dropped.len(), SPEC_LENGTH_2_LEDGER_TOTAL]),
+            ("retention / discriminating", vec![discriminating - gated, discriminating]),
+        ];
+        for (i, (what, expect)) in want.iter().enumerate() {
+            let got = &cells[i + 1];
+            let numbers = cell_numbers(got);
+            if &numbers != expect {
+                wrong.push(format!(
+                    "  {arm}: `{what}` reads `{got}` ({numbers:?}); the records give {expect:?}"
+                ));
+            }
+        }
+    }
+    for arm in SPEC_LENGTH_GENERATED_ARMS {
+        if !armed.contains(*arm) {
+            wrong.push(format!(
+                "  `{arm}` has no row in the per-arm table. `R4` makes the control's own \
+                 failure a live outcome, so `S1` is reported exactly like the candidates."
+            ));
+        }
+    }
+
+    // Table 3 — `R8`'s universal-drop set. Every cell reads `0 / 6`.
+    let r8 = table_rows_under(&record, "| row | fixture | retained by / 6 |", &whose);
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    for cells in &r8 {
+        if cells.len() != 3 {
+            wrong.push(format!("  `{}` has {} cells, not 3", cells.join(" | "), cells.len()));
+            continue;
+        }
+        let row = cell_token(&cells[0]).to_string();
+        listed.insert(row.clone());
+        if !excluded.contains(&row) {
+            wrong.push(format!(
+                "  `{row}` is listed as universally dropped, but the records show at least \
+                 one generation of its fixture retaining it. A row any generation retains \
+                 stays in the gate in full force."
+            ));
+            continue;
+        }
+        let fixture = ledger_ids
+            .iter()
+            .find(|(_, ids)| ids.contains(&row))
+            .map(|(f, _)| f.clone())
+            .unwrap_or_default();
+        if cell_token(&cells[1]) != fixture {
+            wrong.push(format!("  `{row}`: fixture `{}`, the ledgers say `{fixture}`", cells[1]));
+        }
+        let numbers = cell_numbers(&cells[2]);
+        if numbers != vec![0, 6] {
+            wrong.push(format!(
+                "  `{row}`: `retained by / 6` reads `{}` ({numbers:?}); a universally dropped \
+                 row is retained by 0 of the 6 generations of its own fixture — six, not 18, \
+                 because a generation is only ever scored against its own fixture's ledger",
+                cells[2],
+            ));
+        }
+    }
+    for row in &excluded {
+        if !listed.contains(row) {
+            wrong.push(format!(
+                "  `{row}` is excluded by `R8` and is not in the universal-drop table. Both \
+                 numbers are always reported — the raw `N/230` and the gate reading \
+                 `N/|discriminating set|` — and the exclusion list is what makes the second \
+                 auditable."
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} figure(s) in {} disagree with the records they are derived from:\n{}\n\n\
+         Every figure here is recomputable from files on disk. A number written from memory \
+         beside one that was recomputed is how all five of `RESULTS.md` §7.8's wrong figures \
+         got in.",
+        wrong.len(),
+        whose,
+        wrong.join("\n"),
+    );
+}
+
+/// [`span_is_self_contained`] refuses both halves of a real clipped span, and
+/// accepts text lifted whole — including the case it deliberately cannot catch.
+///
+/// **The fixture is the real one.** `invalidated/db3e2d.json`'s two spans for
+/// `skill-stickiness-55` are the row's operative content clipped at a hard wrap
+/// in `generated/db3e2d.md:451-452`. Under `PROTOCOL.md` item 8 both passed every
+/// mechanical rule: each is a verbatim substring of the spec, neither is empty,
+/// and two spans is inside the cap. They are why the rule exists.
+///
+/// **Both must be rejected, and that is the point of running both.** Rejecting
+/// only the fragment that ends mid-phrase would make the catch an accident of
+/// which half of the clip the scorer happened to quote — the second half ends in
+/// a full stop and would sail through a right-hand-only rule.
+///
+/// **Never vacuous:** inline fixtures, no repository state.
+#[test]
+fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
+    // `generated/db3e2d.md:450-453`, verbatim.
+    let clipped = "\
+  held-out scenarios → apply the four-part closure to each new rationalization → repeat until a
+  run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever
+  comes first. The ceiling is not optional — an uncapped loop is the unbounded-cost defect this
+  spec exists to fix elsewhere.
+";
+    let left_half = "run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever";
+    let right_half = "comes first.";
+    assert!(
+        clipped.contains(left_half) && clipped.contains(right_half),
+        "the fixture must reproduce the real spans, or this test is checking its own typo"
+    );
+    assert!(
+        !span_is_self_contained(clipped, left_half),
+        "the fragment ending `whichever` must be refused: it neither begins on a boundary \
+         (its line continues a wrapped sentence) nor ends on one"
+    );
+    assert!(
+        !span_is_self_contained(clipped, right_half),
+        "the fragment `comes first.` must be refused too. It ENDS cleanly — that is exactly \
+         the trap. It begins its line, but the line before it ends in `whichever`, so it \
+         starts mid-phrase. A rule that only looked rightwards would accept this half and \
+         reject the other, making the catch depend on which half was quoted."
+    );
+
+    // A document whose spans are lifted whole.
+    let clean = "\
+# The picker
+
+The picker binds `j` and `k` to move. It refuses an empty selection.
+
+| key | action |
+|---|---|
+| `V` | switch config |
+
+- Every deployment lists its linked configs.
+
+## Out of scope
+
+- The picker does not create a new config.
+";
+    for (span, why) in [
+        (
+            "The picker binds `j` and `k` to move.",
+            "a whole sentence opening its own paragraph",
+        ),
+        (
+            "It refuses an empty selection.",
+            "a whole sentence preceded by `. ` on the same line",
+        ),
+        ("switch config", "a whole table cell, `| ` before and ` |` after"),
+        (
+            "Every deployment lists its linked configs.",
+            "a whole list item — the `- ` bullet is a marker, not part of the span",
+        ),
+    ] {
+        assert!(
+            span_is_self_contained(clean, span),
+            "{span:?} must be accepted: {why}"
+        );
+    }
+
+    // The bound, demonstrated rather than described. Item 8 says so in the same
+    // paragraph that states the rule: a span lifted cleanly out of a container
+    // that inverts its meaning passes the mechanical check, and only tiers 2 and
+    // 3 catch it.
+    assert!(
+        span_is_self_contained(clean, "The picker does not create a new config."),
+        "a well-formed sentence under an `Out of scope` heading is ACCEPTED. The mechanical \
+         rule cannot see the container, and no reader should take a green here as evidence \
+         that a span is relevant."
+    );
+
+    // And the rule reaches `check_retention_verdict` under the v2 rules only.
+    let ids: Vec<String> = ["fx-01"].iter().map(|s| s.to_string()).collect();
+    let verdict: RetentionVerdict = serde_json::from_str(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["comes first."]}
+           ]}"#,
+    )
+    .expect("fixture parses");
+    let v2 = check_retention_verdict(
+        "031cc4",
+        &verdict,
+        &ids,
+        clipped,
+        SPEC_LENGTH_2_ID_POOL,
+        RETENTION_RULES_V2,
+    );
+    assert!(
+        v2.iter().any(|c| c.contains("boundary")),
+        "the v2 rules must carry the self-containment refusal into the verdict check, got \
+         {v2:?}"
+    );
+    let v1 = check_retention_verdict(
+        "031cc4",
+        &verdict,
+        &ids,
+        clipped,
+        SPEC_LENGTH_2_ID_POOL,
+        RETENTION_RULES_V1,
+    );
+    assert!(
+        v1.is_empty(),
+        "`PROTOCOL.md` item 8 has no boundary rule, and the first attempt's record must not \
+         change shape because the second attempt tightened one. Got {v1:?}"
+    );
+}
+
+/// [`final_disposition`] takes tier 3's call where there is one, keeps tier 1's
+/// where there is not, and refuses an override with no record behind it.
+///
+/// Inline fixtures, for the reason the v1 verdict unit test gives: a malformed
+/// file dropped into `retention-2/` to watch RED is a file nothing deletes, and a
+/// leftover one silently corrupts the unblinding task's accounting.
+///
+/// **Never vacuous.**
+#[test]
+fn final_disposition_join_refuses_an_unrecorded_override() {
+    let verdict = |json: &str| -> RetentionVerdict {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("fixture does not parse: {e}"))
+    };
+    let escalation = |json: &str| -> EscalationRecord {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("fixture does not parse: {e}"))
+    };
+
+    let verdicts = BTreeMap::from([(
+        "031cc4".to_string(),
+        verdict(
+            r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","present":true,"quotes":["a"]},
+                 {"id":"fx-02","present":true,"quotes":["b"]},
+                 {"id":"fx-03","present":false,"quotes":[]}
+               ]}"#,
+        ),
+    )]);
+
+    // No escalation: every row keeps tier 1's call.
+    let plain = final_disposition(&verdicts, &BTreeMap::new()).expect("tier 1 alone is a join");
+    assert!(
+        plain[&("031cc4".to_string(), "fx-01".to_string())],
+        "tier 1 said `present`, and nothing overrode it"
+    );
+    assert!(
+        !plain[&("031cc4".to_string(), "fx-03".to_string())],
+        "tier 1 said `absent`, and nothing overrode it"
+    );
+
+    // Tier 3 governs the row it answered, and only that row.
+    let escalations = BTreeMap::from([(
+        "031cc4".to_string(),
+        escalation(
+            r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-02","present":false,"reason":"the spec drops the bound"}
+               ]}"#,
+        ),
+    )]);
+    let joined = final_disposition(&verdicts, &escalations).expect("a recorded override joins");
+    assert!(
+        !joined[&("031cc4".to_string(), "fx-02".to_string())],
+        "tier 3's call replaces tier 1's for the row it answered"
+    );
+    assert!(
+        joined[&("031cc4".to_string(), "fx-01".to_string())],
+        "and for no other row — tier 3 governs one row at a time, not the file"
+    );
+
+    let complains = |escalations: BTreeMap<String, EscalationRecord>, needle: &str, why: &str| {
+        let found = final_disposition(&verdicts, &escalations)
+            .expect_err("this join must be refused");
+        assert!(
+            found.iter().any(|c| c.contains(needle)),
+            "{why}: expected a complaint mentioning `{needle}`, got {found:?}"
+        );
+    };
+
+    // An override of a row the tier-1 verdict does not score. This is the shape
+    // a hand-written disposition takes: a real id, a plausible row, and no
+    // record of anyone having judged it.
+    complains(
+        BTreeMap::from([(
+            "031cc4".to_string(),
+            escalation(
+                r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+                     {"id":"fx-99","present":true,"reason":"invented"}
+                   ]}"#,
+            ),
+        )]),
+        "fx-99",
+        "a row that reaches the join for the first time through tier 3 is an override with \
+         nothing behind it",
+    );
+
+    // An escalation for a generation nobody scored.
+    complains(
+        BTreeMap::from([(
+            "054872".to_string(),
+            escalation(
+                r#"{"spec_id":"054872","ledger":"tui-dc-picker","rows":[
+                     {"id":"fx-01","present":true,"reason":"invented"}
+                   ]}"#,
+            ),
+        )]),
+        "054872",
+        "tier 3 answers rows out of a tier-1 verdict; without one there is nothing to \
+         override",
+    );
+
+    // A record filed under one id that names another.
+    complains(
+        BTreeMap::from([(
+            "031cc4".to_string(),
+            escalation(
+                r#"{"spec_id":"fd230c","ledger":"tui-dc-picker","rows":[
+                     {"id":"fx-01","present":false,"reason":"misfiled"}
+                   ]}"#,
+            ),
+        )]),
+        "fd230c",
+        "both ids are real, which is what makes a misfiled escalation quiet",
+    );
+
+    // A ledger disagreement: the same id scored against one ledger and
+    // escalated against another.
+    complains(
+        BTreeMap::from([(
+            "031cc4".to_string(),
+            escalation(
+                r#"{"spec_id":"031cc4","ledger":"skill-stickiness","rows":[
+                     {"id":"fx-01","present":false,"reason":"wrong ledger"}
+                   ]}"#,
+            ),
+        )]),
+        "skill-stickiness",
+        "if the two records name different ledgers the rows are not the same rows",
+    );
+
+    // The same row escalated twice.
+    complains(
+        BTreeMap::from([(
+            "031cc4".to_string(),
+            escalation(
+                r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+                     {"id":"fx-01","present":false,"reason":"first"},
+                     {"id":"fx-01","present":true,"reason":"second"}
+                   ]}"#,
+            ),
+        )]),
+        "twice",
+        "two answers for one row means the later one silently wins",
     );
 }
 
