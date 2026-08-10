@@ -159,12 +159,13 @@ This section's figures are recomputed here, in one pass, from
 `spec-length/invalidated/adjudication/*.json`. They reproduce `RESULTS.md` §7.3 exactly, and
 `cli/tests/skills_valid.rs::spec_length_write_up_arithmetic_matches_the_adjudication_records`
 re-derives both tables below from those records cell by cell — so the next reader checks them by
-running the suite rather than by trusting this paragraph. `RESULTS.md` §7.8 is why: five figures in
-that section were wrong across three correction rounds, and **two of the eight entries it records
-are failures of an earlier correction** — its correction 6 is a correction that was itself wrong,
-and its correction 7 is one applied to a file but not to its sibling, which left the tree asserting
-both. The common cause is one thing: a number written from memory beside one that had just been
-recomputed.
+running the suite rather than by trusting this paragraph. `RESULTS.md` §7.8 is why: it records
+**eight corrections over three rounds, five of them wrong figures** — and **three of the eight are
+failures of an earlier correction.** Its correction 6 is a correction that was itself wrong; its
+corrections 7 and 8 are both one correction that fixed a figure in one place and missed another copy
+of it — 7 in a sibling file, 8 four sentences down the same section. The common cause is one thing:
+a number written from memory beside one that had just been recomputed, with the paragraphs built on
+it left unswept.
 
 **The per-file record.** The "operative six" are attempt 2 for `4a73ef` (the `R6` re-run) and
 attempt 1 for the other five.

@@ -740,12 +740,12 @@ depends on either — the structural argument rests on `-55` and `-65` at 4/4 an
 stride.
 
 **The pattern is §7.8's, twice more: a sentence written from the shape of a table rather than run
-against it.** §7.8 catalogues eight figures that were wrong before they were right; these are the
-same failure in prose instead of arithmetic, and they survived T5's five review rounds, this task's
-own writing, and a review round here that checked every number and found them all correct. They were
-caught by an adversarial reviewer asked to attack the *reasoning* instead. **Both kinds of round are
-needed** — the number-checking rounds passed these sentences every time, because every number in
-them is right.
+against it.** §7.8 records eight corrections, five of them wrong figures; these two are the same
+failure in prose instead of arithmetic, and they survived every review round that produced the
+corrections above, this task's own writing, and a review round here that checked every number in the
+write-up and found them all correct. They were caught by an adversarial reviewer asked to attack the
+*reasoning* instead. **Both kinds of round are needed** — the number-checking rounds passed these
+sentences every time, because every number in them is right.
 
 **And a third instance, in this section's own first draft.** It claimed `invalidated/README.md`
 repeated the first sentence. It does not. That was a claim about a file, written without opening the

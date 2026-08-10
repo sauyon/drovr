@@ -4296,7 +4296,14 @@ fn parse_ledger_ids_refuses_a_table_that_disagrees_with_its_declared_count() {
 fn spec_length_retention_verdicts_are_complete_and_quoted() {
     let retention = spec_length_retention_dir();
     let Some(scan) = scan_retention_dir(&retention) else {
-        // T5 has not run. Nothing to check, and nothing wrong.
+        // No verdicts to check, and nothing wrong. This is the repository's
+        // permanent state, not a pre-T5 one: T5 ran, item 8a invalidated all six
+        // of its verdicts in whole, and none was filed. `retention/` stays
+        // absent until a redesigned instrument produces an admissible verdict —
+        // see `docs/skill-evidence/spec-length.md` §11. So this walk is vacuous
+        // against the repo today, and the rules it enforces are exercised by
+        // `retention_check_refuses_a_verdict_that_is_not_complete_and_quoted`
+        // instead.
         return;
     };
 
@@ -4841,12 +4848,12 @@ const SPEC_LENGTH_OPERATIVE_PASSES: &[(&str, &str)] = &[
 
 /// The write-up's item-8a arithmetic, recomputed from the raw adjudications.
 ///
-/// **This is the check `RESULTS.md` §7.8 wishes had existed.** Five figures in
-/// that section were wrong across three correction rounds, and two of the eight
-/// entries §7.8 records are failures of an *earlier* correction — one that was
-/// itself wrong, and one applied to a file but not to its sibling. Every case
-/// had the same cause: a number written from memory beside one that had been
-/// recomputed, with the paragraphs built on it left unswept. The write-up
+/// **This is the check `RESULTS.md` §7.8 wishes had existed.** It records eight
+/// corrections over three rounds, five of them wrong figures — and three of the
+/// eight are failures of an *earlier* correction: one that was itself wrong, and
+/// two that fixed a figure in one place while missing another copy of it. Every
+/// case had the same cause: a number written from memory beside one that had
+/// been recomputed, with the paragraphs built on it left unswept. The write-up
 /// restates those figures a third time, which is a third chance to make the same
 /// mistake — so they are derived here from `invalidated/adjudication/*.json` and
 /// compared against the document.
