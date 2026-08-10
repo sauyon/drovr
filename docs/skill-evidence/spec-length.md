@@ -147,7 +147,13 @@ recorded nowhere**, so "the same instrument" cannot be fully verified against th
 ## 5. Why it failed — items 8a and 9 apply different standards
 
 This section's figures are recomputed here, in one pass, from
-`spec-length/invalidated/adjudication/*.json`. They reproduce `RESULTS.md` §7.3 exactly.
+`spec-length/invalidated/adjudication/*.json`. They reproduce `RESULTS.md` §7.3 exactly, and
+`cli/tests/skills_valid.rs::spec_length_write_up_arithmetic_matches_the_adjudication_records`
+re-derives both tables below from those records cell by cell — so the next reader checks them by
+running the suite rather than by trusting this paragraph. `RESULTS.md` §7.8 is why: five figures in
+that section were wrong across three correction rounds, three of them introduced *by* a correction,
+and every one had the same cause — a number written from memory beside one that had just been
+recomputed.
 
 **The per-file record.** The "operative six" are attempt 2 for `4a73ef` (the `R6` re-run) and
 attempt 1 for the other five.
@@ -520,6 +526,7 @@ T5's 21 dispatches did, or the verdicts are not comparable to each other either.
   and why no gate reads it.
 - **In-repo checks:** `cli/tests/skills_valid.rs` — `spec_length_write_up_quotes_every_limitation_verbatim`,
   `spec_length_write_up_figures_match_their_authorities`,
+  `spec_length_write_up_arithmetic_matches_the_adjudication_records`,
   `spec_length_step_4_is_still_the_frozen_control_arm`,
   `spec_length_retention_verdicts_are_complete_and_quoted`,
   `spec_length_ledgers_are_the_closed_lists_they_claim`, `freeze_precedes_every_candidate_arm`.

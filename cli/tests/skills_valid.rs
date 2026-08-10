@@ -4799,6 +4799,328 @@ fn brainstorm_step_4_body(text: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// One item-8a adjudication: the sampled row and the adjudicator's own call.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdjudicationPair {
+    #[allow(dead_code)]
+    n: usize,
+    row: String,
+    establishes: bool,
+}
+
+/// One dispatch's raw item-8a record (`invalidated/adjudication/<id>-attempt-<k>.json`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdjudicationRecord {
+    spec_id: String,
+    /// Spelled `attempt-<k>` in the records, not as a bare number.
+    attempt: String,
+    #[allow(dead_code)]
+    ledger: String,
+    #[allow(dead_code)]
+    sample_rule: String,
+    pairs: Vec<AdjudicationPair>,
+}
+
+/// The **operative six** scoring passes — attempt 2 for `4a73ef`, which `R6`
+/// re-ran whole, and attempt 1 for the other five.
+///
+/// Transcribed from `RESULTS.md` §7.2, and the reason it is a constant is
+/// `RESULTS.md` §7.8 correction 3: a figure that mixed attempt 1's numerator
+/// with attempt 2's denominator survived one correction round because "the
+/// operative set" lived in prose. Naming it here makes the mix impossible.
+const SPEC_LENGTH_OPERATIVE_PASSES: &[(&str, &str)] = &[
+    ("4a73ef", "attempt-2"),
+    ("aa3199", "attempt-1"),
+    ("d25798", "attempt-1"),
+    ("80d9a2", "attempt-1"),
+    ("db3e2d", "attempt-1"),
+    ("87e5a5", "attempt-1"),
+];
+
+/// The write-up's item-8a arithmetic, recomputed from the raw adjudications.
+///
+/// **This is the check `RESULTS.md` §7.8 wishes had existed.** Five figures in
+/// that section were wrong across three correction rounds, three of them
+/// *introduced by a correction*, and every one had the same cause: a number
+/// written from memory beside one that had been recomputed, with the paragraphs
+/// built on it left unswept. The write-up restates those figures a third time,
+/// which is a third chance to make the same mistake — so they are derived here
+/// from `invalidated/adjudication/*.json` and compared against the document.
+///
+/// **It checks the tables cell by cell, not just the headline.** Correction 4
+/// was three wrong *denominators* in the row-failure table while the headline
+/// was right, and correction 8 was a paragraph four sentences below a headline
+/// that had just been fixed.
+#[test]
+fn spec_length_write_up_arithmetic_matches_the_adjudication_records() {
+    let invalidated = spec_length_dir().join("invalidated");
+    let adjudication = invalidated.join("adjudication");
+    let mut records: Vec<AdjudicationRecord> = Vec::new();
+    let entries = fs::read_dir(&adjudication)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", adjudication.display()));
+    for entry in entries {
+        let path = entry.expect("read dir entry").path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        records.push(
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+        );
+    }
+    assert_eq!(
+        records.len(),
+        7,
+        "{} holds {} adjudication record(s); T5 ran seven — six operative passes and \
+         `4a73ef`'s superseded attempt 1",
+        adjudication.display(),
+        records.len(),
+    );
+
+    let operative: Vec<&AdjudicationRecord> = SPEC_LENGTH_OPERATIVE_PASSES
+        .iter()
+        .map(|(id, attempt)| {
+            records
+                .iter()
+                .find(|r| r.spec_id == *id && r.attempt == *attempt)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} has no record for `{id}` ({attempt}), which \
+                         `RESULTS.md` §7.2 names as operative",
+                        adjudication.display()
+                    )
+                })
+        })
+        .collect();
+
+    let write_up_path = spec_length_write_up_path();
+    let write_up = fs::read_to_string(&write_up_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", write_up_path.display()));
+
+    // The per-file table: one row per pass, including the superseded one.
+    const FILE_HEADER: &str =
+        "| id | present / 91 | rows absent | 8a sample | `establishes: false` | verdict |";
+    let table = write_up
+        .split_once(FILE_HEADER)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no `{FILE_HEADER}` table",
+                write_up_path.display()
+            )
+        })
+        .1;
+    let mut rows_checked = 0usize;
+    for line in table.lines().skip(1) {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        if line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+            continue;
+        }
+        let cells = split_ledger_row(line)
+            .unwrap_or_else(|| panic!("{}: cannot split `{line}`", write_up_path.display()));
+        assert_eq!(cells.len(), 6, "{}: `{line}` has {} cells, not 6", write_up_path.display(), cells.len());
+
+        let id = cells[0]
+            .split('`')
+            .nth(1)
+            .unwrap_or_else(|| panic!("{}: `{}` names no id in backticks", write_up_path.display(), cells[0]))
+            .to_string();
+        let attempt = if cells[0].contains("attempt 2") { "attempt-2" } else { "attempt-1" };
+        let record = records
+            .iter()
+            .find(|r| r.spec_id == id && r.attempt == attempt)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: row `{line}` describes `{id}` ({attempt}), which has no record under {}",
+                    write_up_path.display(),
+                    adjudication.display(),
+                )
+            });
+
+        let sample: usize = cells[3].parse().unwrap_or_else(|e| {
+            panic!("{}: `{}` is not a sample size: {e}", write_up_path.display(), cells[3])
+        });
+        assert_eq!(
+            sample,
+            record.pairs.len(),
+            "{}: `{id}` ({attempt}) is tabled at {sample} sampled row(s); its record holds {}",
+            write_up_path.display(),
+            record.pairs.len(),
+        );
+
+        let claimed_false: usize = cells[4].parse().unwrap_or_else(|e| {
+            panic!("{}: `{}` is not a count: {e}", write_up_path.display(), cells[4])
+        });
+        let actual_false = record.pairs.iter().filter(|p| !p.establishes).count();
+        assert_eq!(
+            claimed_false,
+            actual_false,
+            "{}: `{id}` ({attempt}) is tabled at {claimed_false} `establishes: false`; its \
+             record holds {actual_false}",
+            write_up_path.display(),
+        );
+
+        // `present / 91` against the assembled verdict the pass produced.
+        let verdict_name = if SPEC_LENGTH_OPERATIVE_PASSES.contains(&(id.as_str(), attempt)) {
+            format!("{id}.json")
+        } else {
+            format!("{id}.{attempt}.json")
+        };
+        let verdict_path = invalidated.join(&verdict_name);
+        let verdict_text = fs::read_to_string(&verdict_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", verdict_path.display()));
+        let verdict: RetentionVerdict = serde_json::from_str(&verdict_text)
+            .unwrap_or_else(|e| panic!("{}: {e}", verdict_path.display()));
+        let claimed_present: usize = cells[1].parse().unwrap_or_else(|e| {
+            panic!("{}: `{}` is not a count: {e}", write_up_path.display(), cells[1])
+        });
+        let actual_present = verdict.rows.iter().filter(|r| r.present).count();
+        assert_eq!(
+            claimed_present,
+            actual_present,
+            "{}: `{id}` ({attempt}) is tabled at {claimed_present} present rows; {} holds \
+             {actual_present}",
+            write_up_path.display(),
+            verdict_path.display(),
+        );
+
+        rows_checked += 1;
+    }
+    assert_eq!(
+        rows_checked,
+        records.len(),
+        "{}'s per-file table describes {rows_checked} pass(es); {} holds {}",
+        write_up_path.display(),
+        adjudication.display(),
+        records.len(),
+    );
+
+    // The two aggregate rates, and the base of the probability argument.
+    let op_pairs: usize = operative.iter().map(|r| r.pairs.len()).sum();
+    let op_false: usize = operative
+        .iter()
+        .map(|r| r.pairs.iter().filter(|p| !p.establishes).count())
+        .sum();
+    let all_pairs: usize = records.iter().map(|r| r.pairs.len()).sum();
+    let all_false: usize = records
+        .iter()
+        .map(|r| r.pairs.iter().filter(|p| !p.establishes).count())
+        .sum();
+
+    let op_rate = 100.0 * op_false as f64 / op_pairs as f64;
+    let operative_claim = format!(
+        "{op_false} of {op_pairs} adjudicated rows across the operative six ({op_rate:.1}%)"
+    );
+    assert!(
+        write_up.contains(&operative_claim),
+        "{} does not state the operative rate as `{operative_claim}`. That figure was wrong \
+         twice before it was right (`RESULTS.md` §7.8, corrections 3 and 8).",
+        write_up_path.display(),
+    );
+
+    let all_rate = 100.0 * all_false as f64 / all_pairs as f64;
+    let all_claim = format!("{all_false} of {all_pairs} ({all_rate:.1}%)");
+    assert!(
+        write_up.contains(&all_claim),
+        "{} does not state the all-seven rate as `{all_claim}`",
+        write_up_path.display(),
+    );
+
+    let survival = 1.0 - op_false as f64 / op_pairs as f64;
+    let base = format!("{survival:.3}");
+    assert!(
+        write_up.contains(&format!("`{base}^18`")),
+        "{}'s probability argument is not based on `{base}^18` — the per-row pass rate that \
+         follows from the counts above",
+        write_up_path.display(),
+    );
+    let passing = 100.0 * survival.powi(18);
+    assert!(
+        write_up.contains(&format!("{passing:.1}%")),
+        "{}: `{base}^18` is {passing:.1}%, which the write-up does not state",
+        write_up_path.display(),
+    );
+
+    // The row-failure table, cell by cell — correction 4 was three wrong
+    // denominators here while the headline above was right.
+    const ROW_HEADER: &str = "| row | failed / operative files that sampled it |";
+    let table = write_up
+        .split_once(ROW_HEADER)
+        .unwrap_or_else(|| panic!("{} has no `{ROW_HEADER}` table", write_up_path.display()))
+        .1;
+
+    let mut sampled: HashMap<&str, usize> = HashMap::new();
+    let mut failed: HashMap<&str, usize> = HashMap::new();
+    for record in &operative {
+        for pair in &record.pairs {
+            *sampled.entry(pair.row.as_str()).or_default() += 1;
+            if !pair.establishes {
+                *failed.entry(pair.row.as_str()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut tabled: HashSet<String> = HashSet::new();
+    for line in table.lines().skip(1) {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        if line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+            continue;
+        }
+        let cells = split_ledger_row(line)
+            .unwrap_or_else(|| panic!("{}: cannot split `{line}`", write_up_path.display()));
+        assert_eq!(cells.len(), 2, "{}: `{line}` has {} cells, not 2", write_up_path.display(), cells.len());
+
+        let (claimed_failed, claimed_sampled) = cells[1]
+            .trim_end_matches(" each")
+            .split_once(" / ")
+            .and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?)))
+            .unwrap_or_else(|| {
+                panic!("{}: `{}` is not `failed / sampled`", write_up_path.display(), cells[1])
+            });
+
+        // A cell may name several rows that share a count, and abbreviate all
+        // but the first to its `-NN` suffix.
+        for token in cells[0].split(',') {
+            let name = token.trim().trim_matches('`');
+            let row = if let Some(suffix) = name.strip_prefix('-') {
+                format!("skill-stickiness-{suffix}")
+            } else {
+                name.to_string()
+            };
+            assert_eq!(
+                (failed.get(row.as_str()).copied().unwrap_or(0), sampled.get(row.as_str()).copied().unwrap_or(0)),
+                (claimed_failed, claimed_sampled),
+                "{}: `{row}` is tabled at {claimed_failed} / {claimed_sampled}",
+                write_up_path.display(),
+            );
+            tabled.insert(row);
+        }
+    }
+
+    let should_be_tabled: HashSet<String> = failed.keys().map(|r| r.to_string()).collect();
+    let mut missing: Vec<&String> = should_be_tabled.difference(&tabled).collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "{}'s row-failure table omits {} row(s) that failed at least once: {missing:?}. A \
+         table that lists only some of them reads as the complete set.",
+        write_up_path.display(),
+        missing.len(),
+    );
+    assert!(
+        !tabled.is_empty(),
+        "{}'s row-failure table parsed as empty",
+        write_up_path.display(),
+    );
+}
+
 /// [`brainstorm_step_4_body`] takes the item and nothing else.
 ///
 /// **The test above passes today and passed the moment it was written**, because
