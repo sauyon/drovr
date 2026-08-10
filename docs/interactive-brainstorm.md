@@ -1,8 +1,9 @@
 # Interactive brainstorm: the ask channel, and shorter specs
 
 **Status:** approved design (spec gate turn 3, 2026-08-06). **T1–T9 implemented** — the whole
-ask channel ships. The spec-length A/B is deliberately still outstanding; see
-*"What was not built"* at the end.
+ask channel ships. The spec-length A/B was deliberately out of scope for this run and **has since
+been run separately, ending in a null attributable to its measuring instrument** — see
+`docs/skill-evidence/spec-length.md`, and *"What was not built"* at the end.
 
 Reconstructed into the repo after the original `spec.md` was destroyed with the run directory —
 see `known-issues.md`, *"`cargo test` deleted the real `~/.local/share/drovr`, twice"*. The

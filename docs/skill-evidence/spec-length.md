@@ -147,7 +147,7 @@ individually:
   arm that clears `R2`. None did. **They are skipped by rule, not by judgement.**
 
 **T5's own arithmetic, and its budget.** 14 scorer dispatches plus 7 item-8a adjudications, 21 in
-total against a planned 18 — the extra three are the `R6` re-run and are recorded as deviation 9.
+total against a planned 18 — the extra three are the `R6` re-run and are recorded as §10's deviation 13.
 All were `subagent_type: general-purpose`, `model: sonnet`. **T4's feasibility scorer's model is
 recorded nowhere**, so "the same instrument" cannot be fully verified against that one reading.
 
@@ -202,13 +202,16 @@ Four (`-50`, `-80`, `-85`, `-90`) were sampled four times and failed exactly onc
 1/1 are sampled by one file each, because `d25798` and `87e5a5` drop rows and their stride-5 sample
 lands elsewhere.
 
-**`RESULTS.md` §7.3 and `invalidated/README.md` both say *"every row that was sampled more than once
-and failed, failed on multiple generations"*. That sentence is wrong**, and the four rows at 1/4 in
-the table above are its counterexamples. It is corrected here rather than edited into T5's own
-section; `RESULTS.md` §8 records the correction. Nothing else in §7 depends on it — the structural
-argument below rests on the two rows at 4/4 and on item 8a's fixed stride, not on that sentence.
-Note what it was: **a summary written from the shape of a table rather than run against it**, which
-is the ninth instance of the pattern §7.8 catalogues eight of.
+**`RESULTS.md` §7.3 carries two summary sentences about this table that its own figures refute, and
+neither is repeated here.** Its *"every row that was sampled more than once and failed, failed on
+multiple generations"* has the four rows at 1/4 as counterexamples, and its *"the failures are a
+property of the ledger row, not of the generation"* is refuted by the same four plus `-05` and
+`-10`, which several files sampled and only some failed. `invalidated/README.md` repeats **neither**
+— it states only the narrower `-55`/`-65` claim, which is true. Both are corrected in `RESULTS.md`
+§8.1 rather than edited into T5's own section, and nothing else in §7 depends on either: the
+structural argument rests on the two rows at 4/4 and on item 8a's fixed stride. Note what they were:
+**summaries written from the shape of a table rather than run against it**, which is the same
+pattern §7.8 catalogues eight arithmetic instances of.
 
 **The two rows at 4/4 are what carries the argument — and they are not the same kind of evidence.**
 
@@ -216,11 +219,16 @@ is the ninth instance of the pattern §7.8 catalogues eight of.
   `A′`, `B`) and what separates them; establishing it from three quoted fragments means spending one
   span per arm and having none left for the claim they support. That is a limit of the instrument,
   and no spec however good gets around it.
-- **`skill-stickiness-55` is at least partly about the ledger row.** Its operative detail includes a
-  cross-reference — *"the §7.3 REFACTOR ceiling"* — to a section of the fixture that the generated
-  specs renumbered while compressing. A row hinging on a section number is brittle under **any**
-  legitimate compression, which is a defect in that row as much as a finding about item 8a. It is
-  counted in the figures above and it is **not** counted toward the instrument claim.
+- **`skill-stickiness-55` is read differently here than in `RESULTS.md`, and the disagreement is
+  flagged rather than resolved.** Its operative detail includes a cross-reference — *"the §7.3
+  REFACTOR ceiling"* — to a section of the fixture that the generated specs renumbered while
+  compressing. `RESULTS.md` §7.3 groups it with `-65` as *"neither is reachable within item 8's
+  3-span cap however good the spec is"*. This file's reading is that a row hinging on a section
+  number is brittle under **any** legitimate compression, so its failure is at least partly a
+  property of that row rather than of the 3-span cap. **A reader may prefer T5's reading**, and
+  under this file's own tie-break `RESULTS.md` governs where the two disagree. It is counted in
+  every figure above either way; it is excluded from the instrument claim, which is the cautious
+  direction — the claim then rests on `-65` alone.
 
 **The arithmetic, and what it does and does not assume.** Item 8a's stride and offset are fixed, so
 every verdict with all 91 rows present samples **the same eighteen rows**, and any single
@@ -359,7 +367,7 @@ did not run. With no cleared set there is no comparison to license, so printing 
 publish the map to buy nothing. `blind-map.json` was never opened by T5 or T10. The 18 frozen
 generations therefore stay usable by a future re-scoring under a redesigned instrument, which is
 their main remaining value. **This is not a claim that the assignment is secret** — see §10
-deviation 4, which is precisely that it is not.
+deviation 8, which is precisely that it is not.
 
 **`R4` — the instrument reading.** This is the whole result. `R4` pre-registers the universal null
 as likely and requires T10 to *"state plainly when the null is attributable to the instrument rather
@@ -439,7 +447,7 @@ paraphrased or dropped.
 **Limitation 7 is the one this run turned out to be about**, from the other side than expected: the
 adjudication that covers 20% of `present: true` rows did not let a false pass through — it
 invalidated everything it touched. And limitation 2's *"Do not describe this scoring as fully blind
-anywhere"* is understated for this run rather than overstated; see §10 deviation 4.
+anywhere"* is understated for this run rather than overstated; see §10 deviation 8.
 
 ---
 
@@ -489,7 +497,8 @@ run broke or scope it added.
    criterion satisfied first time — which makes that file a second in-repo copy of the assignment and
    is why it is handled exactly like `blind-map.json`.
 
-   **The dispatches known to have been exposed, which deviation 4 alone does not surface.**
+   **The dispatches known to have been exposed, which this entry's headline alone does not
+   surface.**
    `RESULTS.md` §5 deviation 1's closing paragraphs record that T4's own feasibility scorer ran with
    a working directory inside this worktree, *after* the salt was already in the history — so it
    could have recovered its own arm from `git log` had it gone looking. Nothing suggests it did.
@@ -513,7 +522,7 @@ run broke or scope it added.
 **From `RESULTS.md` §7.6:**
 
 11. **T5's scorers read their spec, and wrote their shards, at paths outside this repository** — the
-    control §5 deviation 4 prescribes, with the copies verified identical by `sha256` in both
+    control `RESULTS.md` §5's deviation 4 prescribes, with the copies verified identical by `sha256` in both
     directions. **The control is incomplete and the channel stayed open:** the harness gives no way
     to set a subagent's working directory, so every dispatch ran with a cwd inside this worktree.
     Recorded as open rather than assumed shut. The only substitutions to item 10's frozen template
@@ -553,7 +562,9 @@ the raw item-8a records under `adjudication/`. **No gate reads any of it.** Item
 path, so nothing required the `adjudication/` records to exist; they are committed because without
 them every figure in §5 would rest on one agent's transcription and a later auditor could only
 re-check it by re-dispatching a non-deterministic subagent. **Anyone can now recompute §5 from the
-files** — this write-up did, and it reproduces `RESULTS.md` §7.3 exactly.
+files** — this write-up did, and every figure reproduces `RESULTS.md` §7.3 exactly. Two of §7.3's
+*summary sentences* about those figures do not survive the recomputation; see §5 and `RESULTS.md`
+§8.1.
 
 **Nothing here may be promoted into `retention/` without the escalation being resolved.**
 
