@@ -160,8 +160,10 @@ This section's figures are recomputed here, in one pass, from
 `cli/tests/skills_valid.rs::spec_length_write_up_arithmetic_matches_the_adjudication_records`
 re-derives both tables below from those records cell by cell — so the next reader checks them by
 running the suite rather than by trusting this paragraph. `RESULTS.md` §7.8 is why: five figures in
-that section were wrong across three correction rounds, three of them introduced *by* a correction,
-and every one had the same cause — a number written from memory beside one that had just been
+that section were wrong across three correction rounds, and **two of the eight entries it records
+are failures of an earlier correction** — its correction 6 is a correction that was itself wrong,
+and its correction 7 is one applied to a file but not to its sibling, which left the tree asserting
+both. The common cause is one thing: a number written from memory beside one that had just been
 recomputed.
 
 **The per-file record.** The "operative six" are attempt 2 for `4a73ef` (the `R6` re-run) and

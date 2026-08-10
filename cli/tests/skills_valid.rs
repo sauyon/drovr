@@ -4842,12 +4842,14 @@ const SPEC_LENGTH_OPERATIVE_PASSES: &[(&str, &str)] = &[
 /// The write-up's item-8a arithmetic, recomputed from the raw adjudications.
 ///
 /// **This is the check `RESULTS.md` §7.8 wishes had existed.** Five figures in
-/// that section were wrong across three correction rounds, three of them
-/// *introduced by a correction*, and every one had the same cause: a number
-/// written from memory beside one that had been recomputed, with the paragraphs
-/// built on it left unswept. The write-up restates those figures a third time,
-/// which is a third chance to make the same mistake — so they are derived here
-/// from `invalidated/adjudication/*.json` and compared against the document.
+/// that section were wrong across three correction rounds, and two of the eight
+/// entries §7.8 records are failures of an *earlier* correction — one that was
+/// itself wrong, and one applied to a file but not to its sibling. Every case
+/// had the same cause: a number written from memory beside one that had been
+/// recomputed, with the paragraphs built on it left unswept. The write-up
+/// restates those figures a third time, which is a third chance to make the same
+/// mistake — so they are derived here from `invalidated/adjudication/*.json` and
+/// compared against the document.
 ///
 /// **It checks the tables cell by cell, not just the headline.** Correction 4
 /// was three wrong *denominators* in the row-failure table while the headline
