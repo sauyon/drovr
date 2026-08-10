@@ -716,6 +716,26 @@ any generation id anywhere in this file or the write-up. `R3`'s compared set is 
 comparison is licensed, and printing an arm column would publish the map to buy nothing. This is not
 a claim that the assignment is secret — §5's deviation 4 is precisely that it is not.
 
+### 8.1 A ninth correction, to §7.3 — recorded here, not edited into §7
+
+**§7.3's sentence *"Every row that was sampled more than once and failed, failed on multiple
+generations"* is false, and `invalidated/README.md` does not repeat it but §7.3 does.** Of the 18
+rows sampled more than once across the operative six, 8 failed at least once, and **four of those
+eight — `skill-stickiness-50`, `-80`, `-85`, `-90` — were sampled four times and failed exactly
+once.** They are in §7.3's own table at 1/4 each, one line above the sentence.
+
+**It is corrected in the write-up and recorded here rather than rewritten above**, because §7 is
+T5's section and its figures are correct; only that summary of them is not. Nothing in §7 depends on
+the sentence — the structural argument rests on `-55` and `-65` at 4/4 and on item 8a's fixed
+stride.
+
+**The pattern is §7.8's, for a ninth time: a sentence written from the shape of a table rather than
+run against it.** §7.8 catalogues eight figures that were wrong before they were right; this is the
+same failure in prose instead of arithmetic, and it survived T5's five review rounds, this task's
+own writing, and one review round here. It was caught by an adversarial reviewer asked to attack the
+reasoning rather than to re-check the numbers. **Both kinds of round are needed** — the
+number-checking rounds passed this sentence every time, because every number in it is right.
+
 **The write-up is `docs/skill-evidence/spec-length.md`**, sibling of `voice.md` and `tdd.md`. It
 carries the complete thirteen-deviation list, all five `R6a` doubts, the `R6` re-run log, and
 `PROTOCOL.md`'s seven stated limitations verbatim. Every figure in §7 was recomputed from

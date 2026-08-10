@@ -20,6 +20,12 @@ ledger row as *present* when it is recoverable and actionable **from the generat
 with the spec withheld**, establish the row. The second question is strictly harder than the first.
 Every scored file failed it.
 
+**The scope of that claim, stated up front rather than in a footnote.** Six of the eighteen verdicts
+were ever scored, all on one fixture's ledger. The *mechanism* — whole-file invalidation over a
+fixed ~18-row sample — is a property of the protocol and applies to any ledger; the *failure rate*
+was measured on `skill-stickiness` alone. §5's *"one ledger of three"* subsection is the full
+accounting, and it is where a sceptical reader should start.
+
 **No arm has a defined retention count — not a low one, an undefined one.** `R2` gates on an arm
 reaching 230/230 and `R1`'s dropped set is the union over an arm's six generations across all three
 ledgers, so a single missing verdict leaves every arm's count undefined. Six of the eighteen
@@ -129,9 +135,12 @@ were conditional on a candidate clearing the gate.
 **T6–T9 are moot, and skipping them silently would have been the dishonest option.** Stated
 individually:
 
-- **T6** would have scored twelve more verdicts on the identical instrument. Its 30 dispatches buy
-  no new information: §5 shows the failure is a property of item 8a's standard and its fixed stride,
-  neither of which is fixture-specific.
+- **T6** would have scored twelve more verdicts on the identical instrument, on the two ledgers T5
+  never touched. It was skipped because item 8a's whole-file rule and fixed stride are properties of
+  the protocol rather than of a fixture, so the same wall was expected. **That is an inference, not
+  a measurement** — the per-row failure rate was measured on `skill-stickiness` only, and §5's
+  *"one ledger of three"* subsection states exactly what it does and does not license. Not running
+  T6 is a judgement made with T5's result visible, and it is recorded as reversible.
 - **T7** joins eighteen verdicts and applies `R2`. Six exist and are inadmissible; twelve do not
   exist. There is nothing to join and no arm to gate.
 - **T8** and **T9** are conditional by pre-registered rule (`R7`): they run only on a *candidate*
@@ -174,8 +183,8 @@ come from. They are printed because they are what the escalation is about, and b
 requires the doubt about them to be recorded — see §7.
 
 **24 of 106 adjudicated rows across the operative six (22.6%) came back `establishes: false`**;
-across all seven passes it is 30 of 124 (24.2%). The failures are a property of the **ledger row**,
-not of the generation:
+across all seven passes it is 30 of 124 (24.2%). Two rows failed in **every** file that sampled
+them:
 
 | row | failed / operative files that sampled it |
 |---|---|
@@ -186,29 +195,89 @@ not of the generation:
 | `skill-stickiness-50`, `-80`, `-85`, `-90` | 1 / 4 each |
 | `-13`, `-17`, `-24`, `-29`, `-42`, `-69`, `-79`, `-87` | 1 / 1 each |
 
-51 distinct rows were sampled across the operative six and 16 of them failed at least once. The
-eight rows at 1/1 are sampled by exactly one file each, because `d25798` and `87e5a5` drop rows and
-their stride-5 sample therefore lands elsewhere. **Every row sampled more than once that failed,
-failed on more than one generation.**
+**Read that table carefully, because a stronger claim and a weaker one both live in it.** 51
+distinct rows were sampled across the operative six and 16 failed at least once. Of the 18 rows
+sampled more than once, 8 failed at least once — and **only two of those eight failed every time**.
+Four (`-50`, `-80`, `-85`, `-90`) were sampled four times and failed exactly once. The eight rows at
+1/1 are sampled by one file each, because `d25798` and `87e5a5` drop rows and their stride-5 sample
+lands elsewhere.
 
-**Two rows carry the structural argument.** `skill-stickiness-65` requires three arm descriptions
-(`A`, `A′`, `B`) to be established inside three spans; `skill-stickiness-55` cites a `§7.3` section
-number that exists in no generation, the specs having renumbered under compression. Neither is
-reachable within item 8's 3-span cap however good the spec is.
+**`RESULTS.md` §7.3 and `invalidated/README.md` both say *"every row that was sampled more than once
+and failed, failed on multiple generations"*. That sentence is wrong**, and the four rows at 1/4 in
+the table above are its counterexamples. It is corrected here rather than edited into T5's own
+section; `RESULTS.md` §8 records the correction. Nothing else in §7 depends on it — the structural
+argument below rests on the two rows at 4/4 and on item 8a's fixed stride, not on that sentence.
+Note what it was: **a summary written from the shape of a table rather than run against it**, which
+is the ninth instance of the pattern §7.8 catalogues eight of.
 
-**The arithmetic closes it.** Item 8a's stride and offset are fixed, so every verdict with all 91
-rows present samples **the same eighteen rows**, and any single `establishes: false` invalidates the
-whole file. A file passes only if all ~18 sampled rows pass. At the observed 22.6% per-row failure
-rate that is `0.774^18` ≈ **1.0%**; even at a 5% per-row rate it is only ≈ 40%. **Item 8a as
-pre-registered cannot be cleared by this ledger at this sample size, and re-running does not change
-that.**
+**The two rows at 4/4 are what carries the argument — and they are not the same kind of evidence.**
 
-**What was ruled out before the instrument was blamed.** The first suspect was T5's own scorer
-prompt, whose one-line `SPANS:` layout could have encouraged spans clipped to a single hard-wrapped
-source line. It does not survive the data: across the operative six, **all 7** adjudicated pairs
-whose spans contained a newline passed, against **75 of 99** single-line pairs. Seven is a small
-sample and proves little on its own — what it does is point *away* from the prompt layout rather
-than toward it, which is all the check was for.
+- **`skill-stickiness-65` is about item 8's 3-span cap.** The row states a three-arm design (`A`,
+  `A′`, `B`) and what separates them; establishing it from three quoted fragments means spending one
+  span per arm and having none left for the claim they support. That is a limit of the instrument,
+  and no spec however good gets around it.
+- **`skill-stickiness-55` is at least partly about the ledger row.** Its operative detail includes a
+  cross-reference — *"the §7.3 REFACTOR ceiling"* — to a section of the fixture that the generated
+  specs renumbered while compressing. A row hinging on a section number is brittle under **any**
+  legitimate compression, which is a defect in that row as much as a finding about item 8a. It is
+  counted in the figures above and it is **not** counted toward the instrument claim.
+
+**The arithmetic, and what it does and does not assume.** Item 8a's stride and offset are fixed, so
+every verdict with all 91 rows present samples **the same eighteen rows**, and any single
+`establishes: false` invalidates the whole file. A file passes only if all ~18 sampled rows pass. At
+the observed 22.6% per-row failure rate that is `0.774^18` ≈ **1.0%**; even at a 5% per-row rate it
+is only ≈ 40%.
+
+That model treats the eighteen rows as independent draws at the average rate, which is the
+**conservative** reading and not the sharpest one available. `skill-stickiness-65` is in the
+fixed sample of every 91/91 verdict and failed 4 of the 4 that sampled it; on the observed data,
+that alone makes a passing 91/91 verdict not a 1% event but an unobserved one. The 1.0% figure is
+kept as the headline because four observations do not establish determinism, and the weaker claim is
+enough. **Item 8a as pre-registered was not cleared by this ledger at this sample size, and
+re-running did not change it.**
+
+### The measurement covers one ledger of three, and that bounds what it licenses
+
+**Every figure above is a `skill-stickiness` measurement.** T5's scope was that fixture's 91-row
+ledger; `tiered-review` (84 rows) and `tui-dc-picker` (55) were never put through item 8a at all,
+because T6 did not run. So the 22.6% per-row failure rate is measured on one ledger of three, and
+this document must not be read as having measured the other two.
+
+**What generalises, and what does not.** Item 8a's whole-file invalidation rule and its fixed stride
+are properties of the *protocol*, not of a fixture: on any ledger, a verdict passes only if every
+one of its ~18 sampled rows passes, and (1 − r)^18 is small for any r a real scorer produces — at
+r = 5% it is still only ≈ 40%. That much is fixture-independent. **The value of r is not**, and
+neither is the row-level structure: another ledger might have no `-65`.
+
+**The one cross-fixture signal, and it is weak.** T4's second `R6a` doubt (`RESULTS.md` §4) reads a
+`tui-dc-picker` verdict and names `tui-dc-picker-41` and `-36` as rows whose spans do not establish
+them, noting that both fall inside item 8a's sample and that *"an 8a pass on this file is not the
+default outcome"*. That is one reader's prediction about one file on a second fixture, made before
+any adjudication ran, and it was borne out on the fixture that was scored. It is not a measurement.
+
+**So the honest form of the claim** is: the gate is demonstrably unclearable on the ledger that was
+scored, and the mechanism that makes it unclearable is not specific to that ledger. Whether the
+other two would have produced 22.6% or 5% is untested — and at 5% every arm still fails, which is
+why the run's outcome does not turn on it. **Deciding not to run T6 was a judgement, made after
+T5's result was visible**, and it is the second judgement in this run a reader might reasonably
+reverse; the first is in §6. Reversing it costs 30 dispatches and would replace an inference with a
+measurement.
+
+### What was ruled out before the instrument was blamed — and what was not
+
+**Ruled out: the scorer prompt's span layout.** The first suspect was T5's own scorer prompt, whose
+one-line `SPANS:` layout could have encouraged spans clipped to a single hard-wrapped source line.
+It does not survive the data: across the operative six, **all 7** adjudicated pairs whose spans
+contained a newline passed, against **75 of 99** single-line pairs. Seven is a small sample and
+proves little on its own — what it does is point *away* from the prompt layout rather than toward
+it, which is all the check was for.
+
+**Not tested, and stated rather than glossed:** whether a differently-calibrated adjudicator would
+have returned the same 24, and whether some share of the failures are brittle ledger rows rather
+than an over-strict standard — `skill-stickiness-55` above is one, and nothing here establishes it
+is the only one. Both would need a second adjudication pass under a different prompt, which is
+exactly the redesign §12 says belongs in a follow-up and not here. **The claim this section supports
+is that the gate as pre-registered is unclearable, not that every failure it produced was correct.**
 
 **And one thing this is not.** It is not a T5 judgement substituted for the adjudicator's: every
 `establishes: false` above is an adjudicator's own call, unedited. But it is also not a claim that
@@ -218,7 +287,12 @@ claim rests on the row-level concentration and the arithmetic, not on the scorer
 
 ---
 
-## 6. The one judgement a reader might reasonably reverse
+## 6. The judgements a reader might reasonably reverse
+
+**Two, and both were made with T5's result already visible.** The second is in §5 — **not running
+T6**, which turns a measurement on two of the three ledgers into an inference. It is written up
+there, beside the scope limit it creates, rather than repeated here. The first is this one, and it
+is `RESULTS.md` §7.4's:
 
 **`R6`'s remedy was applied once and failed; the other five were not re-run.**
 
@@ -229,9 +303,8 @@ came back with different spans. It failed again, 4 of 18.
 The other five were not re-run. `R6` forbids re-running to chase a result, and once a fresh scoring
 pass had failed on a fresh set of spans there was no protocol-failure remedy left to apply — only
 the expectation of the same outcome five more times, at 15 dispatches. **That is a judgement, not a
-rule, and it is the one thing in this run a reader might reasonably want reversed.** It is stated
-here and in `RESULTS.md` §7.4 so that it can be, rather than firmed up because the conclusion is
-convenient. Reversing it would cost 15 dispatches and, on the arithmetic in §5, would be expected to
+rule.** It is stated here and in `RESULTS.md` §7.4 so that it can be reversed, rather than firmed up
+because the conclusion is convenient. Reversing it would cost 15 dispatches and, on the arithmetic in §5, would be expected to
 produce five more invalidations.
 
 ---

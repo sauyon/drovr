@@ -4930,6 +4930,9 @@ fn spec_length_write_up_arithmetic_matches_the_adjudication_records() {
             .nth(1)
             .unwrap_or_else(|| panic!("{}: `{}` names no id in backticks", write_up_path.display(), cells[0]))
             .to_string();
+        // Two-way, because `4a73ef` is the only id with a second attempt and
+        // `R6` produced no third. A row naming an attempt this does not resolve
+        // fails loudly at the record lookup below rather than being mis-bucketed.
         let attempt = if cells[0].contains("attempt 2") { "attempt-2" } else { "attempt-1" };
         let record = records
             .iter()
@@ -5031,18 +5034,20 @@ fn spec_length_write_up_arithmetic_matches_the_adjudication_records() {
         write_up_path.display(),
     );
 
+    // The base and the result are checked as ONE phrase. Split into two
+    // `contains` calls, the second reduces to a bare `1.0%` — four characters
+    // that a statistics-heavy document can easily carry somewhere else, which
+    // would let a wrong figure at the one place it matters pass on a coincidence
+    // elsewhere. Review demonstrated exactly that against the split version.
     let survival = 1.0 - op_false as f64 / op_pairs as f64;
     let base = format!("{survival:.3}");
-    assert!(
-        write_up.contains(&format!("`{base}^18`")),
-        "{}'s probability argument is not based on `{base}^18` — the per-row pass rate that \
-         follows from the counts above",
-        write_up_path.display(),
-    );
     let passing = 100.0 * survival.powi(18);
+    let argument = format!("`{base}^18` ≈ **{passing:.1}%**");
     assert!(
-        write_up.contains(&format!("{passing:.1}%")),
-        "{}: `{base}^18` is {passing:.1}%, which the write-up does not state",
+        write_up.contains(&argument),
+        "{} does not state the probability argument as `{argument}`. Both halves follow from \
+         the counts above: the base is the per-row pass rate, and the exponent is item 8a's \
+         sample size on a verdict with all 91 rows present.",
         write_up_path.display(),
     );
 
