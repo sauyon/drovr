@@ -8,12 +8,25 @@ ordering is the whole claim, and it is checkable:
 `cli/tests/skills_valid.rs::spec_length_2_protocol_precedes_every_generation` requires this file's
 introducing commit to precede every commit that introduces `calibration-2.json`, `generated-2/`,
 `retention-2/`, `adjudication-2/`, `escalation-2/`, `transmission-2/`, `gaps-2/` and `RESULTS-2.md`.
-Unlike `PROTOCOL.md`, whose own preamble says *"No test parses this file"*, this one **is** parsed:
-`spec_length_2_protocol_inherits_its_verbatim_blocks` checks the blocks below that claim to be
-inherited verbatim against `PROTOCOL.md` itself, and
+Unlike `PROTOCOL.md`, whose own preamble says *"No test parses this file"*, this one is **written to
+be** parsed: `spec_length_2_protocol_inherits_its_verbatim_blocks` checks the blocks below that claim
+to be inherited verbatim against `PROTOCOL.md` itself, and
 `spec_length_2_protocol_stops_moving_before_the_first_probe` checks that this file stopped moving
-before the first probe. Every ordering claim this run makes is executed, never left to a human
-reading `git log`.
+before the first probe. Every ordering claim this run makes is meant to be executed, never left to a
+human reading `git log`.
+
+> **Read every `spec_length_2_*` name in this file as an OBLIGATION, not as a report. None of these
+> tests exists at this file's first commit** — `grep -rn 'spec_length_2_' --include='*.rs' .` returns
+> nothing at that commit, and the suite stands at its pre-existing 92 tests. They are landed by the
+> **next task, inside window 1**, which is where §*What may change, and when* deliberately puts the
+> test-writing: writing the checker is how an ambiguity in this file gets found, and finding it there
+> is free. **Until each one exists and is green, the property it names is asserted here and not
+> checked** — including `R8`'s arm-symmetry, which item 12 calls executed rather than asserted and
+> which is, at this commit, asserted. This paragraph is here because a pre-registration that
+> criticises `PROTOCOL.md` for unchecked claims must not make its own in the present tense. **The
+> honest reading of every such citation is: this is the check that must exist, and the task that
+> lands it may not weaken it to fit what is already written — if the check and this file disagree,
+> one of them is wrong and the disagreement is a finding.**
 
 **Why there is a second attempt.** The first attempt returned a null **about its instrument, not
 about spec length**. `PROTOCOL.md` item 8a made any single `establishes: false` invalidate the entire
@@ -74,19 +87,32 @@ makes the edit. Windows 2 and 3 log to `RESULTS-2.md` **as well**, not instead.
 stricter than `PROTOCOL.md`.** `spec_length_2_protocol_stops_moving_before_the_first_probe` asserts
 that **every** commit touching this file is an ancestor of `generated-2/`'s introducing commit — that
 is window 3's rule, executed — **and** that every such commit beyond the first is named by SHA in
-`RESULTS-2.md` — that is window 2's logging obligation, executed. `PROTOCOL.md`'s own revision count
-was wrong twice, both times by one, with `git log -p` the only witness; this file does not rely on a
-human counting rows.
+`RESULTS-2.md`. `PROTOCOL.md`'s own revision count was wrong twice, both times by one, with
+`git log -p` the only witness; this file does not rely on a human counting rows.
+
+**Note what the second half of that check does and does not distinguish: it names *every* commit
+beyond the first, and it does not ask which window the commit fell in.** Window 2's rule requires
+the log; window 1's does not. So a window-1 amendment — which the revision table alone would have
+covered — still has to appear by SHA in `RESULTS-2.md`. **That is deliberate and it is a tightening,
+not an inconsistency.** A check that had to classify a commit by window would have to decide when the
+first calibration probe was dispatched, which no artifact records; a check that logs everything needs
+to decide nothing. The cost is one extra line in `RESULTS-2.md` per window-1 amendment, and the
+window rules above are unchanged by it.
 
 | commit | what changed |
 |---|---|
-| the commit that added this file (`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL-2.md` resolves it; it is the **last** line, and `FREEZE-2.md`'s one row names the same commit by SHA) | first commit — items 1–15, including 7a, 8a, 8b, 12a and 14a; rules `R1`, `R1a`, `R2`, `R3`, `R3a`, `R4`, `R4a`, `R5`, `R5a`, `R6`, `R6a`, `R7`, `R8`. |
+| `ea011be3` | first commit — items 1–15, including 7a, 8a, 8b, 12a and 14a; rules `R1`, `R1a`, `R2`, `R3`, `R3a`, `R4`, `R4a`, `R5`, `R5a`, `R6`, `R6a`, `R7`, `R8`. |
+| the commit that added this row (**T1, window 1**, T1's own correction round; `git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL-2.md` resolves it — it is the **first** line, `ea011be3` being the last) | **Four corrections found by T1's own review before T1 reported done, none of them a rule change.** (a) **Every `spec_length_2_*` citation in this file was written in the present tense, and none of those tests existed** — the blockquote in the preamble above now says so plainly, because a file that criticises `PROTOCOL.md` for unchecked claims may not make its own. (b) Item 15's departure table **claimed to be complete and was not**: item 6's out-of-arm-order / id-lexicographic-rewrite constraint is a *new rule*, not a restatement, and is now row 12a. (c) Item 11 addition (c) credited `RESULTS.md` §5 **deviation 5** with the second, cheaper disclosure of the first attempt's arm map; `RESULTS.md` records it as *"part of deviation 4"* and the citation is corrected. (d) The preamble now states what the window-3 check does **not** distinguish — it logs every commit beyond the first regardless of window, which is stricter than window 1 requires — and item 15 now warns that a seven-limitation `.contains()` would pass on the fenced copy of the superseded limitation 7 without the replacement being operative. **No governed rule was added, weakened or clarified; every change is a correction to a claim this file makes about itself.** This is window 1, where even a weakening would have been legal; none was needed. |
 
 **A row cannot name its own commit, and this file does not pretend otherwise.** `PROTOCOL.md` wrote
 `the commit that added this row` for the same reason and later had to relabel it, which produced an
-ambiguity when a second row wanted the same words. Here the first row is the **only** row that may
-use that phrasing, and it is disambiguated by `FREEZE-2.md`, which records the SHA in a separate
-commit. **Every later row names a SHA.**
+ambiguity when a second row wanted the same words. Here **only the newest row may ever carry that
+phrasing, and the task that appends the next one relabels it with its real SHA in the same commit** —
+that is the rule `PROTOCOL.md` arrived at only after the ambiguity had already happened. There are
+**two rows**, and that number and this sentence must always agree with
+`git log --oneline -- docs/skill-evidence/spec-length/PROTOCOL-2.md`. **`PROTOCOL.md`'s own count was
+wrong twice, both times by one, because the commit doing the correcting adds a row of its own** — so
+when you update it, count the table *after* adding your row, not before.
 
 **This file does not restate the freeze.** `docs/skill-evidence/spec-length/FREEZE-2.md` is this
 attempt's hash record, `docs/skill-evidence/spec-length/FREEZE.md` is the first attempt's and is
@@ -893,8 +919,11 @@ not silently repeated.**
 
 **(c) The first attempt's arm assignment is recoverable from this branch's history.** `RESULTS.md` §5
 deviation 4 records that a commit message published the salt and the ordering rule, which gives up
-the three-way arm partition, and deviation 5 records a second, cheaper disclosure of the same
-assignment. That is **immaterial to this attempt's gate**, which uses a disjoint id pool (item 6) and
+the three-way arm partition — **and a second, cheaper disclosure of the same assignment, an 18-digit
+by-arm sequence published while closing the filesystem channel of deviation 5.** That second
+disclosure is *"recorded as part of deviation 4"* by `RESULTS.md`'s own words, even though the
+paragraph describing it sits physically inside deviation 5's entry; deviation 4 is the authority for
+it and is cited as such here. That is **immaterial to this attempt's gate**, which uses a disjoint id pool (item 6) and
 a fresh assignment recorded only in `blind-map-2.json` (item 7) — but it is **not** immaterial to
 item 12a's calibration pass, which runs on the first attempt's own generations and whose arms are
 therefore recoverable by anyone who goes looking. Item 12a scores **per row, not per arm**, and
@@ -1470,6 +1499,7 @@ the substitution is named here.
 | 10 | **Item 8a's disposition changes** — an `establishes: false` flags a row for tier 3 instead of invalidating the verdict file — and **item 8b is new.** | This is the redesign. `RESULTS.md` §7 is the record of what the old disposition produced. |
 | 11 | **Item 9 gains a second blockquote** (the fixture-internal-cross-reference clarification). The inherited blockquote is unchanged. | `spec.md` §3.3. Pre-registered before any new measurement, applied identically to every arm. |
 | 12 | **Item 6's pool is new and disjoint**, and item 7 adds the no-salt-field procedure. **Item 7a (`fixture-map-2.json`) is new.** | `q_regen` = regenerate; and the scoring chain needs id→fixture without id→arm. |
+| 12a | **Item 6 adds a constraint `PROTOCOL.md` item 6 does not have**: T4 must dispatch out of arm order and rewrite all 18 files in id-lexicographic order before committing them. **This is a new rule, not a restatement**, and it is listed separately from row 12 because row 12 would have read as *"the pool is new"* and hidden it. | `RESULTS.md` §5 deviation 5: the first attempt's probes ran arm by arm, and mtime, inode allocation order and readdir order each reproduced the three-way arm partition exactly. `touch -d` was tried and was **not** sufficient. A rule stated only in that deviation's prose would bind nothing here. |
 | 13 | **Item 12a is new.** | `spec.md` §3.5. |
 | 14 | **Item 13 is discharged**, not deleted. | No arm is authored this run; the numbering is kept so the two files diff item by item. |
 | 15 | **Item 11 gains three additions** (tier 3 sees the spec; the subagent-cwd / `git log` channel, re-disclosed; the first attempt's recoverable arm map, which bears on item 12a). | Every channel this run knows about is written down. `RESULTS.md` §7.6 deviation 7 and §5 deviations 4 and 5 are the inherited ones. |
@@ -1529,6 +1559,14 @@ following from `PROTOCOL.md` and requires each to appear in this file byte-for-b
 - **the text of `R1`, `R1a`, `R3`, `R3a`, `R4`, `R4a`, `R5`, `R5a`, `R6a` and `R7`.** `R2` is excluded
   by name (row 5), and so are `R6` (row 6) and `R8` (row 7), which is new.
 
-A near-match fails that check on purpose. If a block below drifts, **`PROTOCOL.md` is the authority
+**A consequence worth stating, because it decides how that test should be written.** Limitation 7's
+`PROTOCOL.md` text appears in this file — in the fenced block above, marked non-operative — so a
+`.contains()` over all **seven** limitations passes here without limitation 7 being operative. That
+is honest as far as it goes (the quotation really must be byte-exact, and this is what checks it),
+but it does **not** verify that item 1's operative limitation 7 is the replacement. **The test must
+therefore assert the replacement's presence separately**; a seven-limitation `.contains()` alone
+would report coverage it does not have.
+
+A near-match fails that check on purpose. If a block drifts, **`PROTOCOL.md` is the authority
 and this file is what is wrong** — `PROTOCOL.md` is a first-attempt artifact and is never edited to
 make a check here pass.
