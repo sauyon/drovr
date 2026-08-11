@@ -3965,12 +3965,18 @@ fn line_opens_a_block(line: &str) -> bool {
             delimited(j)
         }
         b'-' | b'*' | b'+' => {
-            // A bullet, or a thematic break (`---`, `***`), which is also a block.
-            let mut j = 0;
-            while j < b.len() && b[j] == b[0] {
-                j += 1;
-            }
-            j >= 3 || delimited(1)
+            // A bullet, or a thematic break (`---`, `***`), which is also a
+            // block. **A thematic break is the WHOLE line** — three or more of
+            // the one marker and nothing else but spaces. Counting only the
+            // leading run would read `***bold***` and `---text` as breaks, which
+            // is the same false accept as reading `**every**` as a bullet: a
+            // clipped span would end on a "boundary" because the next line
+            // happened to open with emphasis. `+` is excluded because it is a
+            // bullet only; CommonMark's break characters are `-`, `_` and `*`.
+            let is_break = b[0] != b'+'
+                && t.bytes().filter(|c| *c == b[0]).count() >= 3
+                && t.bytes().all(|c| c == b[0] || c == b' ' || c == b'\t');
+            is_break || delimited(1)
         }
         b'0'..=b'9' => {
             let mut j = 0;
@@ -8319,12 +8325,44 @@ The breaker opens after a delay of
          block and the clip before it is not on a boundary"
     );
     // And the markers that genuinely do open a block still do.
-    for opener in ["- a bullet", "# A heading", "| a | row |", "> a quote", "1. an item", "---"] {
+    for opener in [
+        "- a bullet",
+        "* a bullet",
+        "+ a bullet",
+        "# A heading",
+        "### A deeper heading",
+        "| a | row |",
+        "> a quote",
+        ">no space is still a quote",
+        "1. an item",
+        "---",
+        "***",
+        "  - an indented bullet",
+    ] {
         let doc = format!("Intro here.\n\nA clipped line\n{opener}\n");
         assert!(
             span_is_self_contained(&doc, "A clipped line"),
             "{opener:?} opens a block, so a span ending at the line before it ends on a \
              boundary"
+        );
+    }
+    // And the lines that only LOOK like markers do not. Each of these is a
+    // wrapped paragraph continuing, so a span ending just before it is a clip.
+    for impostor in [
+        "**bold** continues the sentence",
+        "***bold italic*** continues the sentence",
+        "---text is not a thematic break",
+        "--- and neither is this, said the paragraph",
+        "#hashtag needs a space to be a heading",
+        "12.5 seconds is a decimal",
+        "1)text uses the other list delimiter",
+        "-dash-prefixed word",
+        "=== is a setext underline, not one of item 8's markers",
+    ] {
+        let doc = format!("Intro here.\n\nA clipped line\n{impostor}\n");
+        assert!(
+            !span_is_self_contained(&doc, "A clipped line"),
+            "{impostor:?} does NOT open a block, so the clip before it must stay refused"
         );
     }
 
