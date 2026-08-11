@@ -626,12 +626,15 @@ and wrote nothing (round 12).
 1. **The 99.8% ceiling does not reproduce.** Every `skill-stickiness` round **of this run** sat at a
    99.8% present rate (§T5a: 2543 of 2548), and §7 item 4 carries that as an undischarged doubt.
    **An earlier draft said "this run and the last", attaching 99.8% to v1 as well. That was wrong and
-   review caught it: `99.8%` appears nowhere in `RESULTS.md`**, whose own aggregate is close to but
-   not equal to it. What v1 actually recorded is the same *shape* and the same *doubt*, qualitatively
+   review caught it: `99.8%` appears nowhere in `RESULTS.md`.** What v1 actually recorded is the same
+   *shape* and the same *doubt*, qualitatively
    — §7.5's *"implausibly high … four of six generations scored 91/91"* — and that is all §T5a ever
    claimed of it. **No v1 aggregate is computed here**: recomputing the first attempt's numbers is
    not this file's business, and inventing one to make a comparison symmetrical is how a figure with
-   no source ends up quoted downstream. **`tiered-review`
+   no source ends up quoted downstream. **Nor is v1's rate characterised here — not as higher, lower,
+   or close** — because any such phrase is a quantitative claim wearing a qualitative coat, and a
+   second review round caught this paragraph doing exactly that. **If T8 wants a v1 number it must
+   derive one and say from what.** **`tiered-review`
    present rates run 73–84 of 84 — 87% to 100% — with real spread between generations and between
    attempts on the same generation.** That is what a measurement with some discriminating power
    looks like, and it is the first sign in either attempt that the instrument is not simply
@@ -703,9 +706,12 @@ prompt directory.
    tier 1 in this attempt — and it is a fact about scorer compliance with item 8, not about what any
    arm retained.
 6. **`FREEZE-2.md` is still closed at this run's rows.** T5b added none.
-7. **Hash your shards as they land.** §9.6 records a byte-identical attempt pair found only at
-   review. A one-line `sha256sum` check per round would have caught it when it happened, when a
-   re-dispatch was still affordable.
+7. **§9.6's duplicate-shard finding, both halves.** **(a) `RESULTS-2.md` must carry it** — that one
+   shard's attempt 4 is byte-identical to its attempt 2, that this is the only duplicate among 150
+   shard files, and that "six attempts per shard" therefore means six dispatches rather than six
+   independent samples. **(b) T5c should hash its own shards as they land**: a one-line `sha256sum`
+   per round would have caught this while a re-dispatch was still affordable, instead of at review
+   with the cap already spent.
 8. **(§8.4 item 2) `RESULTS-2.md` must report the cap extension AND its failure, together.**
    Reporting a raised cap without reporting that it produced no verdict for the four ids it was
    opened for would misdescribe the run in the flattering direction. §2b's post-hoc disclosure
