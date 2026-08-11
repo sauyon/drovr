@@ -7,3 +7,7 @@ result
 # rustc's default output name, from a bare `rustc foo.rs` — a stray one got
 # auto-committed by `drovr cleanup` (see docs/known-issues.md).
 rust_out
+
+# python bytecode, e.g. from importing docs/skill-evidence/spec-length/tools/*.py
+__pycache__/
+*.pyc
