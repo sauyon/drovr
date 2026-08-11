@@ -830,7 +830,18 @@ land rather than discovering this at review.
 **Why this list exists.** Twelve review rounds found twenty-four things, and almost all of them were
 this document describing itself wrongly rather than the data being wrong. Recording each one inline
 started to crowd out the record it was attached to — a reviewer said so — so the **drafting-history
-minutiae live here**, and the sections above carry the corrected figure with a pointer.
+minutiae live here**.
+
+**What "consolidated" does and does not mean, because the first version of this sentence overstated
+it.** Three rows — **b, c, d** — were genuinely pointerised: their sections now carry the corrected
+figure and a `(§9.7 …)` backlink, nothing more. **Rows e, h, i and j keep a sentence or two inline,
+deliberately**, because in those places the correction is part of an argument a reader needs rather
+than provenance they can skip: §8.3's pair list is the worked example for "derive, do not
+transcribe"; §8.1's round-number collision has to be explained where the tables are or the tables
+are unreadable; §9.5a's numbering note explains why one list carries two provenances; and §9.3's
+withdrawn v1 figure is the reason that paragraph refuses to characterise v1 at all. **Rows a, f, g
+and k left no inline trace** — they were pure fixes with nothing to say. Review caught the first
+version of this preface claiming all eleven had been pointerised.
 
 **What is NOT in this list, and must not be moved here.** The substantive withdrawals are findings,
 not drafting notes, and they stay where they are because a reader meets them in context: the
@@ -844,7 +855,7 @@ pointer and nothing else.
 | **a** | a dead `§7.7` cross-reference — §7 is a flat 1–8 list, and the target is item 8 | §2a |
 | **b** | spans per present row: 1.43 → **1.44** (1700/1181 = 1.4395) | §2a |
 | **c** | the appended item-8 block: "5614 bytes" → **5614 characters, 5640 bytes** in UTF-8, the gap being 13 non-ASCII dashes at 3 bytes each | §2a |
-| **d** | "94 shard files from 96 dispatches" was the whole task's, given as `tiered-review`'s own; that is **70 from 72** | §9.2 |
+| **d** | "94 shard files from 96 dispatches" was the whole task's, given as `tiered-review`'s own; that is **70 from 72**. **The third population-pooling slip in this task**, after §9.3's `46/51` and §8.3's short pair list — *"a summary line pooled populations its own tables kept separate"* is T5a's handoff warning in its own words, and reviewers caught T5a on the same thing three rounds running | §9.2 |
 | **e** | §8.3's shared-span pair list named seven while the text counted nine; the missing two were `09`/`56` and `39`/`87` | §8.3 |
 | **f** | which filed verdict cleared first: `e085f2` on its first corrected attempt, `6e7393` on its second — an earlier draft had them the other way round | §8.2 |
 | **g** | three dead `§7.4` references — §7 has no subsections | §2b, §9.3 |
