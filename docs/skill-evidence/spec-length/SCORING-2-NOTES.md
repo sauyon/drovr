@@ -696,6 +696,9 @@ prompt directory.
    tier 1 in this attempt — and it is a fact about scorer compliance with item 8, not about what any
    arm retained.
 6. **`FREEZE-2.md` is still closed at this run's rows.** T5b added none.
+7. **Hash your shards as they land.** §9.6 records a byte-identical attempt pair found only at
+   review. A one-line `sha256sum` check per round would have caught it when it happened, when a
+   re-dispatch was still affordable.
 
 #### 9.5a Carried forward UNDISCHARGED from §7 — T5b resolved none of these
 
@@ -726,3 +729,47 @@ of §9 alone still meets them. **T5b discharged §7 items 1–3 and NONE of thes
 11. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
     rests on `tools/build-tier1-prompts.py` being deterministic — checkable by re-running it, not by
     diffing an artifact. T5b built and dispatched from that builder and added no prompt artifact.
+
+### 9.6 One shard's attempt 4 is byte-identical to its attempt 2 — recorded under `R6a`, unexplained
+
+**Found by a review subagent of this task, not by me.**
+`parts/superseded/b49ff1-2-corrected-attempt4.json` and
+`parts/superseded/b49ff1-2-corrected-attempt2.json` have the **same SHA-256**. Hashing **all 150**
+shard files in `retention-2/` — 144 superseded and 6 live — turns up **exactly one** duplicate pair,
+this one. The same shard's attempts 1, 3, 5 and 6 are all distinct from each other and from these,
+and **every one of `b49ff1-1`'s six attempts is distinct**.
+
+**What is established, and what is not.**
+
+- **A dispatch did happen.** The round-11 batch was dispatched, its agent reported writing the
+  shard, my poll saw 12 of 12 files present before assembly, and `attempt4`'s mtime (`12:30:23`)
+  sits in round 11's window, well after `attempt2`'s (`12:12:49`). The file that
+  `corrected-round11.txt` gate-tested is this file. **This is not a mislabelled archive of an older
+  attempt.**
+- **Whether the CONTENT is an independent draw is not established.** Two candidate explanations, and
+  this file picks neither: a scorer genuinely re-emitting ~10.8 KB of quoted prose byte-for-byte two
+  rounds later, with a different attempt 3 in between; or the dispatch returning a cached completion
+  for a prompt that §2.3 deliberately holds byte-identical across re-runs. **The second is the more
+  plausible and it is not checkable from anything in this repository.**
+- **It cannot be resolved by re-running.** `b49ff1` has spent all six attempts, and dispatching a
+  seventh to satisfy curiosity is exactly what §2b's cap and `R6` forbid.
+
+**What it affects, precisely.**
+
+- **No filed verdict.** `b49ff1` never cleared the gate and is not in `retention-2/`. All three filed
+  verdicts — `6e7393`, `e085f2`, `48527b` — are unaffected, and none of their shards is in the
+  duplicate pair.
+- **No published count changes.** 94 shard files were written from 96 dispatches, and that is still
+  true; §9.2's table is a log of dispatches, not of distinct outputs. **But "six attempts per shard"
+  should be read as six dispatches, not as six independent samples** — for this shard it is
+  demonstrably at most five distinct results, and for every other shard independence is assumed
+  rather than shown.
+- **It sharpens a lesson T5a already recorded.** §3a's finding was that holding the prompt
+  byte-identical across re-runs makes re-runs measure variance and nothing else. **A byte-identical
+  output is the limiting case of that**, and it is the first direct evidence in either attempt that
+  the re-run budget can buy strictly nothing. §8.1's "it does not converge" reading is unchanged;
+  this is one more reason not to read a re-run count as a measurement.
+
+**Recorded under `R6a`** — *"you may never silently accept a verdict you believe is wrong … record
+the specific doubt and carry it into the write-up"*. **`RESULTS-2.md` must carry it**, and T5c
+should hash its own shards as they land rather than discovering this at review.
