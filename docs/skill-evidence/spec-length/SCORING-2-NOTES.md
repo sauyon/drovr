@@ -131,7 +131,10 @@ own trigger.
 **Three disclosures about what the correction actually put in front of a scorer**, so a reader does
 not have to find them in the source:
 
-1. **The appended block is item 8 entire — 5614 bytes — not only its schema.** Item 10 says "the
+1. **The appended block is item 8 entire — 5614 characters, 5640 bytes in UTF-8 — not only its
+   schema.** (An earlier version said "5614 bytes". That is the Python `len()` of the extracted
+   string, which counts characters; item 8 holds 13 non-ASCII dashes that cost 3 bytes each. Review
+   recomputed it. Inherited from before T5b, and no conclusion turns on it.) Item 10 says "the
    item-8 schema" and also says the scorer never gets "this file"; the two clauses are in tension and
    this resolves toward the enumerated handover. It means the scorer also saw item 8's rationale, its
    sharding subsection, the gate test's own name, and pointers to two v1 artifacts. Item 9's
