@@ -135,6 +135,56 @@ rate across the 26 defective shards is **1181 / 1183 = 99.8%**; across the 26 su
 shards it is **1181 / 1183 = 99.8%**. Spans per present row go 1.45 → 1.43. If the appended rule had
 coached scorers toward finding more content, this is where it would show, and it does not.
 
+### 2b. The cap was extended AFTER four ids had missed — a post-hoc amendment, on the driver's decision
+
+**Opened by T5b before it dispatched anything.** Everything below §2b in this file that describes a
+dispatch was written after this subsection was committed; the commit that adds §2b adds no shard
+file, exactly as `ed583e9` did for §2a. **That commit ordering is checkable. As in §2 and §2a, that
+the dispatch followed the commit remains the author's word.**
+
+**Say the shape of this plainly, because it is the thing a reader should be suspicious of.** §2's cap
+was fixed before any re-run ran, and §4 records that it was honoured: after round 6 the four ids
+`66530f`, `e790f5`, `fd2c24` and `fe4059` had each spent three corrected attempts per shard and were
+reported as failing rather than re-run. **The cap is now being raised, and it is being raised by a
+decision taken after seeing that exactly those four missed.** That is post-hoc. §5 escalated it for
+that reason, and the decision came back from the human driver, on the record, as option 1: **extend
+the re-run budget, uniformly, and re-run.**
+
+**The amendment.**
+
+> Under the corrected prompt the cap is **at most five re-runs per shard — six attempts in all**,
+> replacing §2.1's two re-runs / three attempts. §2.2–§2.5 are unchanged and still bind: the cap
+> applies identically to every shard whatever any attempt returns, a re-run re-runs the shard whole
+> with the byte-identical prompt, a shard still failing after its last attempt is reported failing
+> and not fixed, and every attempt is logged.
+
+**Three properties are what keep it from being result-shaped, and all three are load-bearing.**
+
+1. **It is uniform across all three fixtures and all eighteen generations**, not granted to the four
+   that missed. Every `tiered-review` and `tui-dc-picker` generation has the same six attempts per
+   shard available from its first dispatch. A cap raised for the shards that failed and no others
+   would be a cap fitted to a result; a cap raised for the instrument is a change to the instrument.
+2. **A passing verdict is still never re-run.** `R6` licenses a re-run on a failure trigger and a
+   cleared verdict has none. Uniformity here means equal *opportunity*, never re-rolling a result
+   already in hand: **`e085f2` and `6e7393` stand exactly as filed** and no attempt is dispatched
+   against either.
+3. **It is disclosed as post-hoc, here and in `RESULTS-2.md`.** T8 must carry this forward and must
+   not present the six-attempt cap as though it had been the plan. It was not.
+
+**What the extra attempts can and cannot buy, stated before they are spent.** §5 already weighed
+this and the weighing does not change because the answer came back yes: the trend the extension
+banks on is a trend in **gate-passing**, on an instrument whose retention output is saturated at
+99.8% (§7.4). More filed verdicts buy T6 well-formed *inputs*. They buy no additional retention
+signal, and a verdict that clears on attempt six is not better evidence than one that cleared on
+attempt one — it is the same well-formedness assertion, reached later. **Nothing in `RESULTS-2.md`
+may read the post-extension pass count as a result about spec length.**
+
+**And one of the three options §5 offered was NOT taken.** Option 3 — treat separately the two ids
+that failed on shared spans alone, with zero boundary refusals — is not adopted. Those two get the
+same six attempts as everything else, because a remedy applied only to the shards with one failure
+mode is the result-shaped thing property 1 exists to forbid. **The shared-span non-compliance
+remains an open finding about scorer behaviour** (§3, §7) and is not treated as a protocol defect.
+
 ---
 
 ## 3. What the correction changed — the finding of this task
@@ -262,6 +312,9 @@ each used their two corrected re-runs. Extending the cap *after seeing which fou
 the decision pre-registration exists to prevent, so it was not extended. Re-opening that budget is a
 **driver** call, not this task's — §5.
 
+**The driver re-opened it. §2b is the amendment and §8 is the log of what the extra attempts did.**
+Rounds 0–6 above are T5a's complete record under the original cap and are not rewritten.
+
 ---
 
 ## 5. Escalation — what only the driver can decide
@@ -283,6 +336,14 @@ the decision pre-registration exists to prevent, so it was not extended. Re-open
 **T5b and T5c should not start until this is decided**, because whatever is decided applies to them:
 they will run the same instrument over `tiered-review` and `tui-dc-picker`, and they should run the
 **corrected** builder from the first dispatch rather than rediscovering §2a.
+
+### 5a. Resolved — the human driver chose option 1
+
+**Decided by the human, after being shown that four ids missed and which four**, and passed to T5b
+through the phase brief. **Option 1: re-open the re-run budget, uniformly, and re-run.** Option 2
+(accept a scoped two-of-six result) and option 3 (treat the shared-span failures separately) were
+not taken. §2b is the amendment, with the three properties that make it legitimate and the
+disclosure obligation it puts on `RESULTS-2.md`. **T5b executed it; T5c inherits the same cap.**
 
 ---
 
