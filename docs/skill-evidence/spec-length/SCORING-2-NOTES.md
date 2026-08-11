@@ -496,20 +496,33 @@ which this file's author has no basis for and must not make.
 
 ### 8.3 A hypothesis about the shared-span failures, checked and WITHDRAWN
 
-Round 5's shared-span refusals fell on strikingly repetitive ledger pairs — `16`/`89`, `43`/`47`,
-`09`/`55`, `04`/`90`, `01`/`65`, `02`/`83`, `36`/`63` — and the **same pairs recurred across
-different scorers scoring different generations**. Several of those pairs are semantically nested:
-row 89 is the `grep` that row 16 describes, row 90 is the overlap check that row 04 requires. The
-hypothesis was that the ledger contains entailment pairs a well-written spec states in one
-sentence, so item 8's no-shared-span rule makes both rows un-evidenceable at once — an
-**instrument** defect, and a much more serious finding than scorer non-compliance.
+Round 5's shared-span refusals fell on strikingly repetitive ledger pairs, and the **same pairs
+recurred across different scorers scoring different generations**. There are **nine**, extracted
+from `corrected-round5.txt` rather than listed from memory:
+
+`01`/`65`, `02`/`83`, `04`/`90`, `09`/`55`, `09`/`56`, `16`/`89`, `36`/`63`, `39`/`87`, `43`/`47`.
+
+Several are semantically nested: row 89 is the `grep` that row 16 describes, row 90 is the overlap
+check that row 04 requires. The hypothesis was that the ledger contains entailment pairs a
+well-written spec states in one sentence, so item 8's no-shared-span rule makes both rows
+un-evidenceable at once — an **instrument** defect, and a much more serious finding than scorer
+non-compliance.
 
 **It is false, and checking it cost two minutes.** Both filed verdicts were examined against all
-nine pairs: `6e7393` evidences **both** members of every pair with **disjoint** spans, and
-`e085f2` does the same for eight of nine, marking one row `false`. A second witness exists in
-these documents and two scorers found it every time. **The pairs are attractors for the violation,
-not forcers of it**, and §3's reading — scorer non-compliance with a rule the prompt states
-verbatim — stands unamended.
+nine pairs, and **neither shares a span on any of them**: `6e7393` evidences **both** members of
+all nine with **disjoint** spans, and `e085f2` does the same for eight of the nine. `e085f2`'s one
+exception is the pair `09`/`56`, where it marks **`skill-stickiness-56` `present: false`** — which
+is that verdict's only `false` row in all 91. A second witness exists in these documents and two
+scorers found it every time. **The pairs are attractors for the violation, not forcers of it**, and
+§3's reading — scorer non-compliance with a rule the prompt states verbatim — stands unamended.
+
+**A review of this task caught the list above short by two.** An earlier draft named seven pairs
+while the surrounding sentences counted nine, which also left `e085f2`'s single `false` row
+belonging to no named pair and so unverifiable against the files. The count of nine was right and
+the list was wrong. It is now derived by regex from the round-5 report, like §9.3's totals, for the
+same reason: **this is the second hand-transcription slip in this task's own writing**, and a
+subsection whose entire argument is "a cheap mechanical check beats a plausible story" is the worst
+possible place to keep a hand-typed list.
 
 **Recorded because the check is the point, not the hypothesis.** §3a's whole lesson is that a
 plausible story about a frozen instrument being broken deserves a cheap mechanical check before it
