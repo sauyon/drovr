@@ -5686,7 +5686,7 @@ fn last_commit_touching_or_absent(repo: &Path, repo_relative_path: &str) -> Touc
     }
 }
 
-/// The **earliest** commit touching `dir` once `excluded` is subtracted from it.
+/// The **earliest** commit touching the files `pathspec` selects.
 ///
 /// **This exists because a `git log` over a directory silently includes its own
 /// subdirectories, and one ordering check was a tautology for exactly that
@@ -5695,23 +5695,29 @@ fn last_commit_touching_or_absent(repo: &Path, repo_relative_path: &str) -> Touc
 /// violation: every commit touching the questions also touches the parent, so
 /// the parent's last commit is never earlier than the questions' last commit,
 /// and when they differ the parent's is a descendant by construction. The check
-/// could neither fail nor meaningfully pass. Subtracting the subdirectory with
-/// git's `:(exclude)` pathspec is what makes the two path sets disjoint, and
-/// asking for the *earliest* verdict rather than the latest is what makes the
-/// claim *"the questions precede **any** verdict"* rather than "some verdict".
+/// could neither fail nor meaningfully pass.
 ///
-/// Returns [`Touched::NotCommitted`] when the subtracted set is empty — the
-/// correct and expected state until T8 writes its first transmission verdict.
-fn first_commit_touching_excluding(repo: &Path, dir: &str, excluded: &str) -> Touched {
-    let shown = format!("git log --format=%H -- {dir} :(exclude){excluded}");
+/// **Why a `:(glob)` pathspec rather than `:(exclude)` on the subdirectory.**
+/// Both make the two sides disjoint, but subtracting `questions/` would make
+/// *any* other file under `transmission-2/` count as a verdict — a README beside
+/// the questions would read as a probe result and accuse the questions of
+/// postdating it. Item 14 says verdicts land at `transmission-2/<id>.json`, so
+/// that is what this matches: under `:(glob)` a `*` does not cross a `/`, which
+/// selects the immediate `.json` children and nothing deeper or differently
+/// suffixed. Asking for the *earliest* of them is what makes the claim *"the
+/// questions precede **any** verdict"* rather than "some verdict".
+///
+/// Returns [`Touched::NotCommitted`] when nothing matches — the correct and
+/// expected state until T8 writes its first transmission verdict.
+fn first_commit_touching_glob(repo: &Path, pathspec: &str) -> Touched {
+    let shown = format!("git log --format=%H -- :(glob){pathspec}");
     let out = match git_output(&[
         "-C".to_string(),
         repo.display().to_string(),
         "log".to_string(),
         "--format=%H".to_string(),
         "--".to_string(),
-        dir.to_string(),
-        format!(":(exclude){excluded}"),
+        format!(":(glob){pathspec}"),
     ]) {
         Ok(out) => out,
         Err(how) => return Touched::Undetermined { how },
@@ -6627,28 +6633,27 @@ fn spec_length_2_protocol_precedes_every_generation() {
     // Item 14: the blind question set precedes the transmission verdicts it is
     // answered against.
     //
-    // **The verdict side subtracts `questions/`, and without that subtraction
-    // this check cannot fail.** `questions/` is a subdirectory of
-    // `transmission-2/`, so a `git log` over the parent counts the questions'
-    // own commits as touches of the parent. Comparing the two directories' last
-    // commits therefore compares a set against its own superset: the superset's
-    // last commit is never the earlier one, so the descent assertion holds
-    // vacuously, and when the questions are the most recent touch the two
-    // collapse to the same SHA and the comparison is skipped entirely. That was
-    // the state this check shipped in — it reported "not compared" while the
-    // questions sat committed, and a question rewritten *after* a verdict
-    // existed passed it. Subtracting the subdirectory makes the two sides
-    // disjoint, and taking the verdicts' EARLIEST commit is what makes this the
-    // claim item 14 actually states: the questions are fixed before **any**
-    // verdict, not merely before the last one.
+    // **The verdict side names the verdict files, and without that this check
+    // cannot fail.** `questions/` is a subdirectory of `transmission-2/`, so a
+    // `git log` over the parent counts the questions' own commits as touches of
+    // the parent. Comparing the two directories' last commits therefore compares
+    // a set against its own superset: the superset's last commit is never the
+    // earlier one, so the descent assertion holds vacuously, and when the
+    // questions are the most recent touch the two collapse to the same SHA and
+    // the comparison is skipped entirely. That was the state this check shipped
+    // in — it reported "not compared" while the questions sat committed, and a
+    // question rewritten *after* a verdict existed passed it. Matching item 14's
+    // `transmission-2/<id>.json` makes the two sides disjoint, and taking the
+    // verdicts' EARLIEST commit is what makes this the claim item 14 actually
+    // states: the questions are fixed before **any** verdict, not merely before
+    // the last one.
     let questions = last_commit_touching_or_absent(
         &repo,
         SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR,
     );
-    let first_verdict = first_commit_touching_excluding(
+    let first_verdict = first_commit_touching_glob(
         &repo,
-        SPEC_LENGTH_2_TRANSMISSION_REPO_DIR,
-        SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR,
+        &format!("{SPEC_LENGTH_2_TRANSMISSION_REPO_DIR}/*.json"),
     );
     match (&questions, &first_verdict) {
         (Touched::At(q), Touched::At(v)) => match descends_from_in(&repo, q, v) {
