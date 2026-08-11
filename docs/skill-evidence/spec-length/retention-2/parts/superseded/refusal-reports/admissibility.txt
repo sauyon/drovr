@@ -1,0 +1,9 @@
+66530f      517   121   23.4%      450    55   12.2%
+6e7393      431   100   23.2%      377    47   12.5%
+e085f2      346   101   29.2%      295    52   17.6%
+e790f5      463   124   26.8%      396    58   14.6%
+fd2c24      636   123   19.3%      566    54    9.5%
+fe4059      341   100   29.3%      295    55   18.6%
+TOTAL      2734   669   24.5%     2379   321   13.5%
+
+`prose` excludes table rows, headings, separators, breaks and fences — admissible furniture no scorer would cite. 91 rows must be evidenced.

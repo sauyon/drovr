@@ -75,6 +75,24 @@ fences = re.findall(r"^```\n(.*?)^```$", item("10"), re.M | re.S)
 assert len(fences) == 1, f"item 10 has {len(fences)} fenced blocks, expected exactly 1"
 TEMPLATE = fences[0]
 
+# **Item 10's template is not the whole of what item 10 hands over**, and reading
+# it as though it were is the delivery defect this script was written with. Item
+# 10's own prose: *"The scorer is handed only the generated spec file, its
+# fixture's ledger rows for its shard, and the item-8 schema plus the item-9
+# definition."* `plan.md` T5a says the same in fewer words — "items 8 + 9". The
+# template carries item 9 through an explicit placeholder and carries item 8 only
+# as a one-sentence paraphrase ("begin at the start of a sentence, table cell,
+# list item, heading or line-block"), which is NOT the character-level predicate
+# the gate actually runs.
+#
+# So item 8 is handed over too, verbatim and entire, appended after the template.
+# **The template itself is not edited** — it is delivered byte-identical, and this
+# is an addition to the handover, not a rewrite of the frozen text. Nor is it
+# steering: no guidance is invented, the same frozen bytes go to every shard of
+# every generation, and a rule the protocol says the scorer receives is the
+# opposite of a hint aimed at one arm.
+ITEM8 = item("8").strip("\n")
+
 
 def main(argv):
     if len(argv) < 3:
@@ -119,6 +137,12 @@ def main(argv):
             # placeholders inside the example object and stay as they are.
             for leftover in ("<abs path", "<fixture>", "<path>", '"<id>"', "<k>"):
                 assert leftover not in p, f"unsubstituted {leftover!r} in {spec_id}-{k}"
+            p = (
+                f"{p}\n"
+                "--- BEGIN THE ITEM-8 SCHEMA, WHICH GOVERNS AND IS NOT A SUMMARY ---\n"
+                f"{ITEM8}\n"
+                "--- END THE ITEM-8 SCHEMA ---\n"
+            )
             d = out_dir / f"{spec_id}-{k}"
             d.mkdir(parents=True, exist_ok=True)
             (d / "prompt.txt").write_text(p)

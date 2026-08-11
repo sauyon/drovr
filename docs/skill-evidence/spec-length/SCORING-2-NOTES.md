@@ -111,6 +111,49 @@ the part that is trust.
 shard's ledger rows, and items 8 and 9, and nothing else. The cap is a fixed number applied to every
 shard before any of them ran. No arm can carry a row a different arm cannot.
 
+### 2a. A delivery defect in this task's own tooling, and the corrected re-run
+
+**Pre-registered here before the corrected prompt was dispatched, for the same reason §2 was.**
+
+**Item 10 does not say the scorer gets the template. It says what the scorer gets, and item 8 is on
+the list:**
+
+> The scorer is handed **only** the generated spec file, its fixture's ledger rows for its shard, and
+> **the item-8 schema** plus the item-9 definition.
+
+`plan.md` T5a says the same in fewer words — *"items 8 + 9"*. **Rounds 0 through 2 delivered item 9
+and not item 8.** `tools/build-tier1-prompts.py` substituted item 9's two blockquotes through the
+template's explicit placeholder, and for item 8 the scorer got only the template's one-sentence
+paraphrase — *"begin at the start of a sentence, table cell, list item, heading or line-block"* —
+which is **not** the character-level predicate the gate runs. Item 8's self-containment blockquote
+reached no scorer in 26 dispatches.
+
+**That is this task's tooling, not the frozen protocol**, and T4's handoff records the lesson it
+breaks: *"when one artifact looks wrong, the first question is whether the tooling did it, because
+that question is about all of them."* §4 as first written asked the wrong question. It concluded from
+thirteen attempts that the instrument is unusable, when all thirteen were draws from **one**
+distribution: the same under-delivered prompt, held byte-identical by §2.3 precisely so re-runs would
+measure variance. The hypothesis that would actually settle it — *does a scorer told the real rule
+satisfy it?* — was never run.
+
+**The correction, and why it is not steering.** Item 8 is now handed over verbatim and entire,
+appended after the template. **The template itself is unedited and still goes out byte-identical** —
+this adds to the handover, it does not rewrite frozen text. §2.3 forbids adjusting the prompt to
+steer a scorer away from the refused shape; delivering a frozen rule that item 10 says the scorer
+receives is the opposite of inventing a hint, and the same bytes go to every shard of every
+generation, so it is arm-symmetric by §2's own argument.
+
+**The budget, fixed before the outcome is known.** One generation is probed first — `66530f`, as in
+§1, so the two are comparable — and the other five are dispatched only if the corrected prompt
+materially changes the refusal rate. **The §2.1 cap restarts at two re-runs per shard for the
+corrected prompt**, because a corrected delivery is a different dispatch from the one §2.1 capped;
+`R6` licenses the re-run independently, its trigger being a verdict that failed the item-8 mechanical
+check. Attempts under the old prompt stay in the §3 log and are not deleted.
+
+**What this costs, said plainly:** if the corrected prompt clears the gate, then §4's blocked finding
+was a finding about this task's tooling wearing the protocol's clothes, and the honest record is that
+it took two review rounds to ask whether the tool did it.
+
 **Superseded attempts are kept.** Every shard of every attempt is at
 `retention-2/parts/superseded/<id>-<k>-attempt<n>.json`, and the raw failure report of every round —
 naming every refused span — is at `retention-2/parts/superseded/refusal-reports/`. `parts/` is item
