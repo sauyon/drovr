@@ -10,8 +10,15 @@ one. It classifies lines by markdown SHAPE, which is a different question, and
 hands every admissibility verdict to the Rust check.
 
 Method: cite each distinct non-blank line of the spec as a one-span `present: true`
-row, 91 rows at a time (the ledger's size), run the check, count how many the check
+row, one ledger's worth of rows at a time, run the check, count how many the check
 names. Runs in a throwaway clone; writes nothing to the real corpus.
+
+**Aggregates only, by design.** An earlier version printed a per-id row. Six
+generations of one fixture are three arms of two samples each, so a size-ordered
+per-id table is a plausible guess at the arm partition — `SCORING-2-NOTES.md` §6
+records T5a making exactly that mistake and T4's instruction against it. The
+dispatching context does not need per-id sizes and must not hold them, so this
+prints one line per fixture and nothing finer.
 
 **Reported in two populations, because the first alone misleads.** A whole table
 row, a heading, a `|---|---|` separator and a `---` break are all admissible and
@@ -31,7 +38,14 @@ be written; the `all` column is what a naive census returns.
     per-position admissibility.
   - It is a property of THIS corpus's markup, not a claim about prose generally.
 
-Usage: measure-span-admissibility.py <path-to-a-throwaway-clone>
+Usage: measure-span-admissibility.py <path-to-a-throwaway-clone> <fixture>
+
+The fixture argument is REQUIRED and is not optional politeness. The first
+version of this script took only a clone path and hardcoded `skill-stickiness`
+— its id list, its ledger path and a bare `assert len(LEDGER) == 91`. Handed
+`tiered-review` it ignored the word, measured `skill-stickiness` anyway and
+exited 0 with a table that looked entirely plausible. A tool that answers a
+question you did not ask, successfully, is worse than one that crashes.
 
 A record of what ran, committed beside the artifact.
 """
@@ -57,7 +71,18 @@ def repo_root(start):
     raise SystemExit(f"{start} is not inside a git checkout")
 
 
+# Item 10's ledger sizes. The same table the two other tools carry; a fixture
+# this script does not know the size of is a fixture it will not measure.
+EXPECTED_ROWS = {"skill-stickiness": 91, "tiered-review": 84, "tui-dc-picker": 55}
+
+if len(sys.argv) != 3:
+    sys.exit(__doc__)
+
 CLONE = pathlib.Path(sys.argv[1]).resolve()
+FIXTURE = sys.argv[2]
+if FIXTURE not in EXPECTED_ROWS:
+    sys.exit(f"unknown fixture {FIXTURE!r}; expected one of {sorted(EXPECTED_ROWS)}")
+
 REAL = repo_root(pathlib.Path(__file__).resolve())
 # This script deletes `retention-2/` outright.
 if CLONE == REAL or repo_root(CLONE) != CLONE:
@@ -69,14 +94,20 @@ if CLONE == REAL or repo_root(CLONE) != CLONE:
 EV = CLONE / "docs/skill-evidence/spec-length"
 RET = EV / "retention-2"
 TEST = "spec_length_2_retention_verdicts_are_complete_and_quoted"
-IDS = ["66530f", "6e7393", "e085f2", "e790f5", "fd2c24", "fe4059"]
+
+# The id list comes from `fixture-map-2.json`, which is arm-free (plan P2). The
+# blind map is never opened by anything in the scoring chain.
+FIXTURE_MAP = json.loads((EV / "fixture-map-2.json").read_text())
+IDS = sorted(i for i, f in FIXTURE_MAP.items() if f == FIXTURE)
+assert IDS, f"no generations mapped to {FIXTURE!r} in fixture-map-2.json"
 
 LEDGER = [
     l.split("|")[1].strip()
-    for l in (EV / "ledger/skill-stickiness.md").read_text().splitlines()
-    if l.startswith("| skill-stickiness-")
+    for l in (EV / "ledger" / f"{FIXTURE}.md").read_text().splitlines()
+    if l.startswith(f"| {FIXTURE}-")
 ]
-assert len(LEDGER) == 91
+assert len(LEDGER) == EXPECTED_ROWS[FIXTURE], \
+    f"{len(LEDGER)} ledger rows for {FIXTURE}, expected {EXPECTED_ROWS[FIXTURE]}"
 
 
 def is_structural(line):
@@ -95,7 +126,7 @@ def is_structural(line):
 
 
 def refusals_for(spec_id, batch):
-    """How many of `batch` (<=91 distinct spans) does the check refuse?"""
+    """How many of `batch` (<= one ledger's worth of distinct spans) is refused?"""
     if RET.exists():
         shutil.rmtree(RET)
     RET.mkdir(parents=True)
@@ -106,7 +137,7 @@ def refusals_for(spec_id, batch):
         for i, rid in enumerate(LEDGER)
     ]
     (RET / f"{spec_id}.json").write_text(
-        json.dumps({"spec_id": spec_id, "ledger": "skill-stickiness", "rows": rows})
+        json.dumps({"spec_id": spec_id, "ledger": FIXTURE, "rows": rows})
     )
     p = subprocess.run(
         ["cargo", "test", "--manifest-path", "cli/Cargo.toml", "--test", "skills_valid",
@@ -134,12 +165,12 @@ def refusals_for(spec_id, batch):
 
 def admissible(spec_id, cands):
     refused = 0
-    for i in range(0, len(cands), 91):
-        refused += refusals_for(spec_id, cands[i:i + 91])
+    n = len(LEDGER)
+    for i in range(0, len(cands), n):
+        refused += refusals_for(spec_id, cands[i:i + n])
     return len(cands) - refused
 
 
-print(f"{'spec':8} {'lines':>6} {'adm':>5} {'all%':>7}   {'prose':>6} {'adm':>5} {'prose%':>7}")
 t_all = t_alladm = t_pr = t_pradm = 0
 for spec_id in IDS:
     seen, cands = set(), []
@@ -148,13 +179,16 @@ for spec_id in IDS:
             seen.add(l)
             cands.append(l)
     prose = [l for l in cands if not is_structural(l)]
-    a_all, a_pr = admissible(spec_id, cands), admissible(spec_id, prose)
-    t_all += len(cands); t_alladm += a_all; t_pr += len(prose); t_pradm += a_pr
-    print(f"{spec_id:8} {len(cands):6d} {a_all:5d} {a_all/len(cands):7.1%}   "
-          f"{len(prose):6d} {a_pr:5d} {a_pr/len(prose):7.1%}")
+    # Accumulated only. Nothing per-id is printed — see the aggregates note above.
+    t_all += len(cands); t_alladm += admissible(spec_id, cands)
+    t_pr += len(prose); t_pradm += admissible(spec_id, prose)
 
 shutil.rmtree(RET)
-print(f"{'TOTAL':8} {t_all:6d} {t_alladm:5d} {t_alladm/t_all:7.1%}   "
-      f"{t_pr:6d} {t_pradm:5d} {t_pradm/t_pr:7.1%}")
-print("\n`prose` excludes table rows, headings, separators, breaks and fences — "
-      "admissible furniture no scorer would cite. 91 rows must be evidenced.")
+print(f"{'fixture':16} {'gens':>4} {'rows':>5} {'lines':>6} {'adm':>5} {'all%':>7}   "
+      f"{'prose':>6} {'adm':>5} {'prose%':>7}")
+print(f"{FIXTURE:16} {len(IDS):4d} {len(LEDGER):5d} {t_all:6d} {t_alladm:5d} "
+      f"{t_alladm/t_all:7.1%}   {t_pr:6d} {t_pradm:5d} {t_pradm/t_pr:7.1%}")
+print(f"\n`prose` excludes table rows, headings, separators, breaks and fences — "
+      f"admissible furniture no scorer would cite. {len(LEDGER)} rows must be "
+      f"evidenced per generation.\nSummed over {len(IDS)} generations; per-id "
+      f"figures are deliberately not printed (`SCORING-2-NOTES.md` §6).")
