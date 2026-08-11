@@ -6624,11 +6624,33 @@ fn spec_length_2_protocol_stops_moving_before_the_first_probe() {
         return;
     };
 
+    // **Matched against the record's own hex runs, not by `contains` on a fixed
+    // prefix, and the difference is a false pass.** A document names a commit
+    // either in full or abbreviated, so the comparison has to accept both — but
+    // `record.contains(&sha[..8])` also accepts an 8-hex substring sitting in the
+    // middle of some unrelated longer hex run, and `RESULTS-2.md` is full of
+    // other SHAs and `git hash-object` blobs. Taking maximal hex runs out of the
+    // record and asking whether the commit *starts with* one is exact in both
+    // directions. Eight is the shortest abbreviation git itself will print here.
+    let mut hex_runs: Vec<&str> = Vec::new();
+    let bytes = record.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i - start >= 8 {
+                hex_runs.push(&record[start..i]);
+            }
+        } else {
+            i += 1;
+        }
+    }
     let undisclosed: Vec<String> = commits[1..]
         .iter()
-        // A short SHA is how a document names a commit, so a prefix match is the
-        // right comparison; the full SHA is accepted by the same test.
-        .filter(|c| !(8..=40).any(|n| record.contains(&c.as_str()[..n])))
+        .filter(|c| !hex_runs.iter().any(|run| c.as_str().starts_with(run)))
         .map(|c| format!("  {}", c.as_str()))
         .collect();
     assert!(
