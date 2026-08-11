@@ -49,6 +49,26 @@ this one row, not a rule about the column.
 | path | `git hash-object --no-filters` | frozen at commit | date |
 |---|---|---|---|
 | `docs/skill-evidence/spec-length/PROTOCOL-2.md` | `7ef62e50ffcfdfebd0941d3f1d3a1c7e9bd939bb` | `128a5f2d4af90a157f5557795395a5f94d99ed5d` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/031cc4.md` | `21b077133190950b8712c55f4b26b4296b4a2c5a` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/054872.md` | `e6b1fed8cdfa8bffa9454636b9dfa825dd7a15a7` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/08ae18.md` | `85a66bc838ea198422e3e8369b02aa1c71fd501e` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/26d7a2.md` | `430613be2cd3b56086472f2feac880f644282261` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/2c4295.md` | `bd46138ba1a1c0b2df0e178134cc973fffb185d6` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/2d2629.md` | `cf46cec221225c303867d1f14ba9367159993d70` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/47173f.md` | `c788860571d6ba45df86dcd06d332609e3267bb1` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/48527b.md` | `ea0aa4c72ad11c94ca36b58ac667d5fc77b22bc8` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/66530f.md` | `774dd6c26f5e0c3bcffca68ebe4d3888aa12839e` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/6e7393.md` | `5e588ebe35a3e743d74a477af18528fa083d6b02` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/a9fcf9.md` | `9691a1764b0b6e670b9fcbfcc7497f480e4faac5` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/b2b8cf.md` | `43f6911feea07439f7498193d8e9257fc9224b95` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/b49ff1.md` | `d93831a81b93aea72ff9e244ebe48f7b1fe863ff` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/e085f2.md` | `02e455e08a333ae199627ad8c729f1c3442373d6` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/e790f5.md` | `404685e005ff191eca9edf40bb86d261c35c7123` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/fd230c.md` | `6805be01db9084098b4aeb0c9d98d64240d68a2a` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/fd2c24.md` | `79525341f6c4699417fc1f8b6b20d84b8ddaacad` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/generated-2/fe4059.md` | `0150b04e8dd1237bc13400597ee4266ba8b33f86` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/blind-map-2.json` | `89a73f25ef1fb779a854b19ace7e91e36fc2142d` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
+| `docs/skill-evidence/spec-length/fixture-map-2.json` | `4d97354261402b03f01ad6550ec2092c0be00d6d` | `2e183a59792158c7a01c95ede049e8c5090e1653` | 2026-08-10 |
 
 ## Who appends what, and when
 
