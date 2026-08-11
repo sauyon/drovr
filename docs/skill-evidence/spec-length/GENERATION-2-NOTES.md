@@ -313,14 +313,24 @@ open and to whom:**
 | open item | owed by | where |
 |---|---|---|
 | flag both `R5a` generations, and read neither as a win | the unblinding task (`plan.md` T8) and the write-up | §2 |
+| log the early publication of the `wc`/`R5a` figures in `RESULTS-2.md`'s deviation list | the same | the section above §1 |
 | do not read `fd2c24`'s free full retention as evidence | the same | §2, §3 |
 | join the title phrasings to the arms and report whether they track | the same, **after** the join | §1 |
 | read §1's title-variance caveat before dispatching item 14a | **`plan.md` T10** (`PROTOCOL-2.md` calls it T9) | §1 |
 | enforce item 5's "no header" / "no fixture name" mechanically, or decide they cannot be | whoever pre-registers a third attempt | §1 |
 
-**Nothing tests any row of that table, and nothing else in the run points at it.** `plan.md` T8's
-own list of what `RESULTS-2.md` must contain does not mention the title-correlation check, because
-that question did not exist when the plan was written and window 3 forbids adding it to
-`PROTOCOL-2.md` now. This file and this task's report and handoff are the only carriers. **A driver
-who wants that made structural should add the row to `plan.md` T8's deliverables — `plan.md` is not
-frozen and is theirs to amend; it is not this note's to change.**
+**Nothing tests any row of that table, and — stated plainly, because it is the weakest link in this
+file — no structural document points at this file at all.** Not `plan.md`, not `PROTOCOL-2.md`, not
+`FREEZE-2.md`. `plan.md` T8's list of what `RESULTS-2.md` must contain does not mention the
+title-correlation check, because the question did not exist when the plan was written; window 3
+forbids adding it to `PROTOCOL-2.md`, and `FREEZE-2.md` is append-only and closed at 20 rows.
+
+**Two carriers exist, and both are people-shaped.** The first is proximity: this file sits beside
+`generated-2/`, and `plan.md` T8 already owes per-generation `wc` figures and `R5a` flags, so the
+task most of these rows are addressed to has a reason to be in this directory. The second is the
+run's own phase handoff — **the generation task's handoff carries this table, and every handoff
+after it must carry any row still undischarged.**
+
+**A driver who wants it structural instead should add the row to `plan.md` T8's deliverables.**
+`plan.md` is not frozen and is the driver's to amend; it is not this note's to change, and the
+generation task deliberately did not change it.
