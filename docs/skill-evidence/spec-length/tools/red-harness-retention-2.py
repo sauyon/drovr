@@ -16,7 +16,30 @@ import shutil
 import subprocess
 import sys
 
-CLONE = pathlib.Path(sys.argv[1])
+def repo_root(start):
+    """The checkout `start` lives in — the first ancestor holding `.git`.
+
+    Found by walking up rather than by counting `.parents[n]`, because counting
+    is exactly how the first version of this guard failed: it resolved to
+    `docs/` and let the harness run against the live worktree, overwriting a
+    frozen generation and deleting `retention-2/`. Both were recoverable from
+    git; the guard is written this way so the next reader does not have to be.
+    """
+    for p in [start, *start.parents]:
+        if (p / ".git").exists():
+            return p
+    raise SystemExit(f"{start} is not inside a git checkout")
+
+
+CLONE = pathlib.Path(sys.argv[1]).resolve()
+REAL = repo_root(pathlib.Path(__file__).resolve())
+# This harness deletes `retention-2/` and OVERWRITES a frozen `generated-2/*.md`.
+if CLONE == REAL or repo_root(CLONE) != CLONE:
+    sys.exit(
+        f"refusing to run against {CLONE}\n"
+        f"  pass the root of a throwaway `git clone --shared`, never {REAL}"
+    )
+
 EV = CLONE / "docs/skill-evidence/spec-length"
 RET = EV / "retention-2"
 TEST = "spec_length_2_retention_verdicts_are_complete_and_quoted"

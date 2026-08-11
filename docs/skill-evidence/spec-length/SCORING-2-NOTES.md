@@ -6,10 +6,14 @@ somewhere in between. **This is that file.** T5a opened it; T5b and T5c append t
 
 **Nothing structural points at this file** — not `plan.md`, not `PROTOCOL-2.md`, not `FREEZE-2.md`,
 and no test opens it. It survives only because each tier-1 handoff names it. Stated here so a reader
-does not mistake it for a checked artifact.
+does not mistake it for a checked artifact. (`plan.md` is likewise not in this repository; it lives
+at `~/.local/share/drovr/runs/spec-length-ab2/plan.md`, the path `PROTOCOL-2.md` §1 discloses.)
 
 **This file records procedure and counts. It records no arm**, and its author never opened
-`blind-map-2.json`. See §4 for what its author *did* come to know, which is not nothing.
+`blind-map-2.json`. See §5 for what its author *did* come to know, which is not nothing.
+
+**T5a did not produce verdicts. It is blocked**, and §4 is the finding. `retention-2/` deliberately
+holds no `<id>.json`.
 
 ---
 
@@ -32,47 +36,43 @@ That is what ran, before any other generation was dispatched.
 | **spans refused by item 8's boundary rule** | **13 — 10.2%** |
 | rows carrying a refused span | 11 (`-02`, `-25`, `-43`, `-44`, `-45`, `-46`, `-47`, `-55`, `-59`, `-75`, `-83`) |
 
-**The refusal rate is 10.2%, not 84.9%, and the difference is not luck.** T2 bounded its own figure
-correctly: those 1127 spans were written under `PROTOCOL.md`, which had **no boundary rule at all**,
-so 84.9% measured v1's quoting habit rather than the rule's severity. Item 10 puts the rule into the
-v2 scorer prompt, and a scorer told the rule mostly obeys it.
+**10.2%, not 84.9%.** T2 bounded its own figure correctly: those 1127 spans were written under
+`PROTOCOL.md`, which had **no boundary rule at all**, so 84.9% measured v1's quoting habit rather
+than the rule's severity.
 
-**The count is the authoritative check's own, not a re-implementation.** It is read off the failure
-report of `cli/tests/skills_valid.rs::spec_length_2_retention_verdicts_are_complete_and_quoted`,
-which names every offending span in one pass. No second boundary checker was written, precisely so
-there is no second answer to the question of what the rule refuses.
+**What it does NOT show, and an earlier draft of this section claimed it did.** It is not that "a
+scorer told the rule mostly obeys it": **item 10's frozen template does not carry item 8's mechanical
+rule.** It carries a prose paraphrase — *"must begin at the start of a sentence, table cell, list
+item, heading or line-block, and end at the end of one"* — and nothing more. `tools/build-tier1-prompts.py`
+inserts item 9's two blockquotes and the shard's ledger rows; item 8's boundary blockquote is never
+extracted and never reaches a scorer. So the drop from 84.9% to 10.2% is a difference between two
+corpora and two quoting habits, **not** evidence that instruction fixed anything. §4 is what the
+probe actually pointed at, and reading 10.2% as reassurance is the error that let five more
+generations be dispatched before the real problem was visible.
 
-### What the surviving 10.2% actually looks like — and it is not v1's failure
+### The refusal shapes
 
-The rule was written against a span **clipped at a hard wrap**, leaving one fragment ending
-mid-phrase and one beginning mid-phrase. `invalidated/db3e2d.json` is item 8's worked example of it.
+Item 8's worked example is a span **clipped at a hard wrap**, leaving one fragment ending mid-phrase
+and one beginning mid-phrase (`invalidated/db3e2d.json`). **None of the 13 is that.** Every one is a
+complete unit — a whole bullet, a whole numbered item, a whole line-block row, or a whole sentence.
 
-**None of the 13 has that shape.** Every one of them is a *complete* unit — a whole bullet, a whole
-numbered item, a whole line-block — refused over a markup delimiter:
+**No left/right split is published here.** Attributing each of the 13 to the end that refused it
+requires evaluating item 8's predicates outside the committed Rust check, and this run keeps exactly
+one implementation of that rule (§4a). What follows is hand-verified against the prose rule, span by
+span, for two spans only, and is offered as mechanism rather than proportion.
 
-| shape | count | example |
-|---|---|---|
-| sentence closing inside a `**…**` emphasis run | 6 | `…marked \`[tier 4]\`.**` |
-| sentence closing inside a `*"…"*` quoted run | 3 | `…before claiming done."*` |
-| fixed-width line-block row, no terminal punctuation | 4 | `ONLY: tdd, systematic-debugging` |
+**Left-end refusals are real and are the counter-intuitive half.** A span can be a flawless complete
+sentence and still be refused because of the line **above** it. Verified: `66530f.md:353`, the whole
+bullet `` - `systematic-debugging` — *"…reproducing before fixing."* ``, is refused because line 352
+ends in `*`. Item 8's block-start clause requires the preceding line to be blank, a heading, a table
+row, or to end in `.!?:;`; a bullet closing inside an emphasis run ends in none of those. **So in a
+list of such bullets each line disqualifies its neighbour**, which is why refusals cluster.
 
-**The mechanism runs through BOTH ends, which a first reading of these misses.** Item 8 requires a
-span's last character to be one of `.!?:;` (or end-of-line before a new block, or `|`) — so a bullet
-whose sentence ends inside an emphasis run closes on `*`, not on the full stop. **And** it requires
-a span that opens its own line to have a *preceding* line that is blank, a heading, a table row, or
-ends in `.!?:;` — so one bullet ending `."*` also disqualifies the bullet **after** it. In a list of
-such bullets each line breaks its neighbour. That is why the refusals cluster.
-
-This is the third strictness T2 found while writing the check and asserted as a refusal rather than
-loosening. Bold-led and bold-closed lines are everywhere in this corpus. §3a measures how far it
-reaches.
-
-**This is recorded, not repaired.** `PROTOCOL-2.md` is frozen and item 10's template is frozen; the
-scorer prompt cannot be given an extra hint about emphasis runs, and the check cannot be relaxed. A
-wrong protocol is a finding to report, not a file to adjust. **The finding, stated plainly: item 8's
-right-hand boundary condition does not recognise a closing emphasis delimiter, so it refuses
-well-formed spans at a rate this corpus makes routine.** It is arm-symmetric — nothing about it
-favours a long arm or a short one — so it does not bias the comparison; it costs re-runs.
+**The same-line rule has the same blind spot.** Verified: `-25` span 2 begins at column 66, directly
+after `…no skill applies." `. It is the start of a sentence, but item 8 requires the span to be
+immediately preceded by `. `, `! ` or `? `, and what precedes it is `." ` — a full stop behind a
+closing quotation mark. Refused. An earlier draft of this file called this span a genuine mid-phrase
+clip; it is not, it is the delimiter problem again on a third clause.
 
 ---
 
@@ -83,9 +83,7 @@ to be logged with its reason. It sets **no cap**, and an uncapped re-run loop ag
 refuses a routine markup shape is a slow way to arrive at `R6`'s own prohibition — re-running until
 the output is acceptable. `RESULTS.md` §7.4 is the precedent that a re-run can itself fail.
 
-**So a cap is fixed here, and it is fixed before any re-run has been dispatched or seen.** The commit
-that adds this section precedes the first re-run dispatch, which is what makes that claim checkable
-rather than a matter of trust.
+**So a cap is fixed here, and it was fixed before any re-run had been dispatched or seen.**
 
 1. **At most two re-runs per shard — three attempts in all.**
 2. **The cap applies identically to every shard of all eighteen generations**, whatever any attempt
@@ -95,141 +93,271 @@ rather than a matter of trust.
    that would be amending a frozen instrument mid-measurement.
 4. **A shard still failing after its third attempt is reported as a failing verdict, not fixed** —
    recorded here and in `RESULTS-2.md` with its refused spans, exactly as `RESULTS.md` §7.4 recorded
-   five verdict files left un-re-run. Its generation is then **not** at full retention by
-   construction, and **T8 must treat it as missing data rather than as a result**, because a verdict
-   the instrument refused says nothing about what the arm retained.
+   five verdict files left un-re-run. **A verdict the instrument refused is missing data, not a low
+   retention score**, and T8 must treat it as such: nothing about what the arm retained can be read
+   off a file the mechanical gate rejected.
 5. **Every attempt is logged in §3**, including the ones that succeed.
+
+**What is checkable about "fixed before", stated precisely, because the strong version is false.**
+Commit `0b4cf46` adds §1–§2 with an **empty** §3 and only the two round-0 shards; commit `d8d28a3`
+adds every re-run artifact. **That ordering between two commits is checkable.** The ordering between
+the commit and the *dispatch* is not: a subagent dispatch leaves no trace in the repository, and
+commit timestamps are author-settable. So the honest claim is: the repository carries the strongest
+ordering evidence it can, and that the dispatch followed the commit remains the author's word. An
+earlier draft of this section said "checkable rather than a matter of trust", which claimed exactly
+the part that is trust.
 
 **Why a cap is arm-symmetric.** Scorers are blind — item 10 hands them one generated spec, their own
 shard's ledger rows, and items 8 and 9, and nothing else. The cap is a fixed number applied to every
 shard before any of them ran. No arm can carry a row a different arm cannot.
 
-**Superseded attempts are kept.** A failed shard's output is moved to
-`retention-2/parts/superseded/<id>-<k>-attempt<n>.json` rather than overwritten, so the log in §3 can
-be checked against the files it describes. `parts/` is item 8's sanctioned working-material directory
-and no test recurses into it.
+**Superseded attempts are kept.** Every shard of every attempt is at
+`retention-2/parts/superseded/<id>-<k>-attempt<n>.json`, and the raw failure report of every round —
+naming every refused span — is at `retention-2/parts/superseded/refusal-reports/`. `parts/` is item
+8's sanctioned working-material directory and no test recurses into it.
 
 ---
 
 ## 3. Re-run log
 
-Every `R6` re-run of a tier-1 shard in this attempt. **Reason is always the protocol trigger, never
-an outcome.** Rounds map to attempts unevenly because `66530f` ran once alone as the §1 calibration
-probe:
+Rounds map to attempts unevenly because `66530f` ran once alone as the §1 calibration probe. **Rows 1
+and 3 are first runs, not re-runs**; they are here so the log is the whole dispatch record.
 
-| round | shards dispatched | attempt no. | trigger | outcome |
+| round | shards | attempt | trigger | outcome |
 |---|---|---|---|---|
-| 0 | `66530f` ×2 | 1 | first run — the §1 calibration probe | **failed** the item-8 check, 13 refusals |
-| 1 | `66530f` ×2 | 2 | `R6` — verdict failed the item-8 mechanical check | **failed**, 16 refusals |
-| 1 | the other five ×2 each | 1 | first run | **all five failed**, 8–20 refusals each |
-| 2 | `66530f` ×2 | 3 | `R6` — same trigger; **cap of §2.1 now exhausted** | **failed**, 14 refusals |
-| 2 | the other five ×2 each | 2 | `R6` — same trigger | **all five failed**, 13–21 refusals each |
+| 0 | `66530f` ×2 | 1 | first run — the §1 calibration probe | **failed** the item-8 check |
+| 1 | `66530f` ×2 | 2 | `R6` — verdict failed the item-8 mechanical check | **failed** |
+| 1 | the other five ×2 each | 1 | first run | **all five failed** |
+| 2 | `66530f` ×2 | 3 | `R6` — same trigger; **cap of §2.1 now exhausted** | **failed** |
+| 2 | the other five ×2 each | 2 | `R6` — same trigger | **all five failed** |
 
-**Fourteen shard-pair attempts. 1581 spans written, 194 refused (12.3%). Zero passing verdicts.**
+**Thirteen shard-pair attempts, 26 shard dispatches. 1709 spans written. Zero passing verdicts.**
 
 | generation | attempt 1 | attempt 2 | attempt 3 |
 |---|---|---|---|
 | `66530f` | 13 / 128 | 16 / 134 | 14 / 132 |
 | `6e7393` | 16 / 125 | 19 / 129 | — |
 | `e085f2` | 20 / 123 | 21 / 121 | — |
-| `e790f5` | 8 / 137 | 15 / 146 | — |
+| `e790f5` | **8 / 137** | 15 / 146 | — |
 | `fd2c24` | 17 / 138 | 19 / 141 | — |
 | `fe4059` | 16 / 128 | 13 / 127 | — |
 
-*(refused spans / spans written. A verdict passes only at **zero**.)*
+*(boundary refusals / spans written. A verdict passes only at **zero**.)*
+**Totals: 207 refusals / 1709 spans = 12.1%.** Per attempt the rate runs **5.8% to 17.4%** — a 3×
+spread, so it is **not** flat, and an earlier draft of this file called it flat. What survives
+without that word: the best single attempt in thirteen still carried 8 refusals where a pass requires
+0.
 
-**The re-runs do not converge, and they were never going to.** The refusal rate is flat across
-attempts and across generations; the best single attempt in the whole set still carried 8 refusals
-where a pass requires 0. Each raw failure report — naming every refused span — is committed under
-`retention-2/parts/superseded/refusal-reports/`, and every shard of every attempt is beside it.
+### 3a. A second, independent failure the boundary rule does not explain
 
-**The last permitted re-run was not spent, and here is why that is not outcome-shaping.** §2.1 allows
-two re-runs per shard; `66530f` used both and is terminal under §2.4. T5a's verification requires
-**all six** verdicts to pass, so no result from a third attempt on the other five could change this
-task's outcome. And the asymmetry that matters: stopping early here leaves every verdict **failing**,
-which is the outcome least favourable to producing any measurement at all. A stopping rule can only
-be accused of chasing a result when stopping helps; this one costs.
+**Ten of the thirteen attempts also violated item 8's no-shared-span rule** — *"no span may be cited
+for more than one row"* — which item 10's prompt states verbatim to every scorer:
+
+| round | verdicts carrying a shared span |
+|---|---|
+| 1 | `6e7393` ×1, `fd2c24` ×2, `fe4059` ×2 |
+| 2 | `66530f` ×1, `6e7393` ×1, `e085f2` ×1, `e790f5` ×1, `fe4059` ×1 |
+
+**8 of the 12 non-probe verdicts fail this rule as well as the boundary rule.** It is plain scorer
+non-compliance with an instruction it was given, it has nothing to do with item 8's boundary
+condition, and **repairing the boundary rule would not have produced passing verdicts in those
+eight.** The round totals in the committed reports (`98 problem(s)`, `106 problem(s)`) are the
+boundary refusals (93, 101) plus these ten. Any claim that T5a was blocked *solely* by the boundary
+rule is false, and §4 is scoped accordingly.
 
 ---
 
-## 3a. The finding: the tier-1 instrument cannot be cleared on this corpus
+## 4. The findings
 
-**Item 10's frozen prompt instructs the scorer to produce spans that item 8's frozen rule refuses.**
+### 4a. Item 10's prompt asks for spans that item 8's rule refuses
+
 The prompt says a span *"must begin at the start of a sentence, table cell, list item, heading or
-line-block, and end at the end of one"*. Every refused span above satisfies that description. Item 8's
-mechanical rule then applies a different test — one written in terms of raw characters:
+line-block, and end at the end of one"*. Item 8's mechanical rule then applies a different test,
+written in raw characters:
 
 - a span **begins** on a boundary only if the **preceding line** is blank, a heading, a table row, or
   ends in one of `.!?:;`;
 - a span **ends** on a boundary only if its **last character** is one of `.!?:;`, or it ends at
   end-of-line with the next line blank or opening a new block, or it is followed by `|`.
 
-**Neither end sees through a closing markup delimiter.** A sentence that ends `done."*` or
-`[tier 4]`.**` terminates in `*`, not in `.`. That breaks the right-hand test for the span itself,
-**and** the left-hand test for whatever span begins on the following line. In a corpus written in
-bold-led bullets, quoted announcement strings and fixed-width line-blocks, that is not a rare shape.
+Most refusals are one of two shapes, both of which satisfy the prompt and fail the rule: a line whose
+sentence closes inside a `**…**` or `*"…"*` run **terminates in `*`, not `.`**; and a fixed-width
+line-block row, or a line following a ``` ``` ``` fence, ends in no terminator at all. Either one
+disqualifies the span **and** the span that opens on the next line.
 
-**What the instrument admits, measured.** Citing every distinct non-blank line of each generated spec
-as a candidate span and running the authoritative check over the result:
+**The proportions are not measured here, and deliberately.** Splitting 207 refusals into left-end and
+right-end causes needs a second implementation of the boundary predicates, and this run keeps exactly
+one — the committed Rust check — so that there is never a second answer to what the rule refuses.
+§1 publishes no split for the same reason, and its two hand-verified spans illustrate the mechanism
+rather than measure its share.
 
-| generation | distinct non-blank lines | admissible | admitted |
-|---|---|---|---|
-| `66530f` | 517 | 121 | 23.4% |
-| `6e7393` | 431 | 100 | 23.2% |
-| `e085f2` | 346 | 101 | 29.2% |
-| `e790f5` | 463 | 124 | 26.8% |
-| `fd2c24` | 636 | 123 | 19.3% |
-| `fe4059` | 341 | 100 | 29.3% |
-| **total** | **2734** | **669** | **24.5%** |
+### 4b. What the rule admits, measured — and the number that matters
 
-**Three of every four complete lines of a generated spec cannot be quoted at all.** A verdict must
-evidence 91 rows, and only 100–124 admissible lines exist per document — so the scorer must not
-merely find admissible spans, it must find admissible spans that also happen to be the ones
-evidencing the specific rows. Admissibility and relevance are close to orthogonal, and the margin
-between them is about zero.
+Citing every distinct non-blank line of each generated spec as a candidate span and handing the
+verdict to the authoritative check (`tools/measure-span-admissibility.py`; raw output committed at
+`retention-2/parts/superseded/refusal-reports/admissibility.txt`):
 
-**Two honest bounds on that 24.5%.** It measures **whole lines**, which is the strategy item 10's
-prompt tells the scorer to use (*"quote the whole sentence"*); admissible sub-line spans exist — a
-sentence preceded by `. ` on the same line qualifies — so 24.5% is not a census of every admissible
-substring. And it is a property of this corpus's markup, not a claim about prose in general.
+| generation | lines | admissible | | citable prose lines | admissible | |
+|---|---|---|---|---|---|---|
+| `66530f` | 517 | 121 | 23.4% | 450 | **55** | 12.2% |
+| `6e7393` | 431 | 100 | 23.2% | 377 | **47** | 12.5% |
+| `e085f2` | 346 | 101 | 29.2% | 295 | **52** | 17.6% |
+| `e790f5` | 463 | 124 | 26.8% | 396 | **58** | 14.6% |
+| `fd2c24` | 636 | 123 | 19.3% | 566 | **54** | 9.5% |
+| `fe4059` | 341 | 100 | 29.3% | 295 | **55** | 18.6% |
+| **total** | **2734** | **669** | **24.5%** | **2379** | **321** | **13.5%** |
 
-**This is the first attempt's failure, relocated.** `RESULTS.md`'s null was *about the instrument*:
-frozen item 8a made every verdict ~1% passable by construction, so no arm could pass and the control
-could not either. **The redesign fixed 8a and did not touch this.** Item 8's self-containment rule is
-new to this attempt, and it now makes every verdict **0%** passable at the mechanical gate — a
-stricter failure than the one it replaced, at an earlier tier.
+**The `prose` column is the one to read.** 348 of the 669 admissible lines are furniture — every
+whole table row, every `|---|---|`, every `---`, and all but one heading are admissible, and none is
+something a scorer would cite as evidence of a ledger row. Excluding them:
 
-**It is arm-symmetric, and that is the one consolation.** The admitted rate varies from 19.3% to
-29.3% with no relation to any arm, and the refusal rate is flat across all fourteen attempts. So it
-does not bias a comparison between arms. **It prevents there being a comparison at all.**
+> **Each document offers 47–58 admissible whole prose lines. A verdict must evidence 91 rows.**
 
-**Nothing was adjusted to get past it.** `PROTOCOL-2.md` is frozen and stays frozen; item 10's
-template was delivered byte-identical on every attempt; the check was not weakened; no span was
-patched. Per the driver's standing constraint, a wrong protocol is a finding to report, not a file to
-adjust. **T5a therefore reports a blocked task rather than a scored one**, and `retention-2/` is left
-holding no verdict, because a verdict the instrument refused is not evidence of retention and must
-not sit there as though it were.
+That is the finding, and it is stronger than the ratio: the citable pool is **smaller than the
+requirement**. A verdict marking most rows present therefore cannot be written from whole prose lines
+at all — it must lean on sub-line spans and on structural lines, in a corpus where the rule refuses
+7 of 8 prose lines outright.
+
+**Bounds, because this figure will get quoted.** It counts **whole lines**, which is the strategy
+item 10's prompt prescribes; admissible sub-line spans exist and are not counted, so the true pool is
+larger than 47–58. Lines are **deduplicated**, so a line counts admissible if any one of its
+occurrences is — an upper bound on per-position admissibility. And it is a property of this corpus's
+markup, not of prose in general.
+
+**On arm-symmetry — an earlier draft of this file overclaimed, and in a length experiment that
+matters.** It said the admitted *rate* varies "with no relation to any arm". The rate in fact falls
+monotonically with document length (`fd2c24`, the longest, is lowest at 9.5%; `fe4059` and `e085f2`,
+the shortest, are highest), and **length is the arm-defining variable of this experiment**, so that
+was close to the opposite of a safe claim — made, moreover, by an author who cannot see the arms. The
+two claims the evidence does support:
+
+1. **The check cannot select on arm by construction** — its inputs are a span and a document, and no
+   arm label reaches it.
+2. **The absolute admissible pool is nearly constant — 47 to 58 prose lines across a 1.9× range of
+   document length.** The requirement (91 rows) is constant too. So the *shortfall* applies to every
+   generation, long or short.
+
+### 4c. The ceiling: tier 1 scored 99.8% of rows present
+
+Across all 26 committed shards: **1181 rows `present: true`, 2 `present: false` — 99.83%.** Both
+absent rows are in one shard (`e085f2-2`). Every generation retains essentially 91 of 91.
+
+**This is a two-attempt pattern, not a v2 artifact.** The first attempt's verdicts under
+`invalidated/` are **631 present of 637 — 99.06%**.
+
+**What it means, stated carefully in both directions.** It does **not** mean the experiment is dead:
+tier 1 is the first stage of a funnel, and items 8a and 8b exist precisely because a `present: true`
+can rest on real-but-irrelevant text. Discrimination is *designed* to happen at tiers 2 and 3. But it
+does mean **the entire discriminating power of this measurement now rests on T6 and T7**, because the
+tier-1 stage separates nothing — and that a tier-1 verdict, once it passes the mechanical gate, will
+say every arm retained everything. **T8 must not read a 91/91 tier-1 result as evidence that
+shortening lost nothing.** That neither attempt of this experiment has remarked on a 99%+ tier-1
+present rate is itself worth the write-up's attention.
+
+### 4d. What this is, and is not, relative to `RESULTS.md`'s null
+
+`RESULTS.md`'s null was about the instrument: frozen item 8a invalidated a whole verdict file on any
+one of ~18 sampled rows failing, and at the **observed** 22.6% per-row failure rate that leaves
+`0.774^18 ≈ 1.0%` of verdicts surviving. Two corrections to how an earlier draft of this file put it:
+the 1% is **empirical and conditional**, not "by construction" — `RESULTS.md` notes that even a 5%
+per-row rate would leave ≈40% — and §7.1's finding is that no arm had a **defined** retention count,
+which is stronger than "no arm could pass".
+
+**The redesign fixed 8a, as it set out to.** What blocks T5a is item 8's self-containment rule, which
+is **new to this attempt**, together with the independent scorer failure in §3a. The parallel worth
+drawing is structural rather than numerical: for the second time, the measurement is stopped by its
+own instrument before any arm comparison is reached.
+
+**What is NOT claimed:** that the instrument is 0% passable by construction. An earlier draft said
+so. The per-shard refusal counts run 1 to 13 — `e790f5-2` attempt 1 refused **1 of 64 spans**, one
+span away from a clean shard — and §2.1's third attempt for `e790f5` was never spent. Thirteen
+attempts all failed and the citable pool is below the row count; that is what the evidence carries,
+and impossibility is not.
+
+### 4e. Nothing was adjusted to get past any of it
+
+`PROTOCOL-2.md` stays frozen. Item 10's template was delivered byte-identical on every attempt. The
+check was not weakened. No span was patched, no shard edited, no verdict assembled by repair. Per the
+driver's standing constraint, a wrong protocol is a finding to report, not a file to adjust.
+`retention-2/` is left holding no verdict.
+
+**A consequence a reader should know: the suite is GREEN at this commit and the blocked state is
+invisible to it.** `spec_length_2_retention_verdicts_are_complete_and_quoted` passes vacuously on an
+empty `retention-2/` — the correct behaviour before scoring runs, and indistinguishable from it here.
+Nothing in the test suite asserts that six verdicts ought to exist.
 
 ---
 
-## 4. What this file's author knew, and what that costs
+## 5. What this file's author knew, and what that costs
 
-Stated because it weakens a claim this task would otherwise make.
+Stated because it weakens claims this task would otherwise make.
 
 **T5a's author never opened `blind-map-2.json`.** Sharding was done from `fixture-map-2.json`, which
-is arm-free, exactly as `plan.md` P2 intends.
+is arm-free, exactly as `plan.md` P2 intends. No committed tool of this task reads the blind map.
 
 **But it did print `wc -l`/`wc -c` for the six `skill-stickiness` generations in one table**, against
 T4's explicit handoff instruction to *"print aggregates, not per-item sizes, if you ever want to stay
 blind to your own draw."* Six generations of one fixture are three arms of two samples each, so a
 size-ordered pairing is a **plausible guess at the arm partition** — not a read of it, but not
-nothing either. **The figures themselves leak nothing new**: `GENERATION-2-NOTES.md` §1 already
-publishes them and `wc -l generated-2/*.md` reproduces them in one command. What was avoidable was
-holding them in the context that dispatches scoring.
+nothing. **The figures leak nothing new**: `GENERATION-2-NOTES.md` §2's `R5a` table already publishes
+per-id `wc` figures for all eighteen generations, and `wc -l generated-2/*.md` reproduces them in one
+command. What was avoidable was holding them in the context that dispatches scoring. **And §4b's
+table publishes a per-generation line count, which is a size proxy keyed by id** — the same class of
+thing this paragraph warns against, published because the finding cannot be stated without it.
 
 **What stands between that inference and the measurement**, in order: the scorers are blind and were
 handed nothing but their own spec and rows; every prompt was machine-built from `PROTOCOL-2.md` by
-`tools/build-tier1-prompts.py` with no per-item transcription; the re-run cap in §2 was fixed before
-any re-run outcome was known; and the pass/fail authority is a committed test, not a judgement.
+`tools/build-tier1-prompts.py` with nothing transcribed by hand; the re-run cap in §2 was fixed
+before any re-run outcome was known; and the pass/fail authority is a committed test, not a
+judgement.
 
 **T5b and T5c should not repeat it.** `wc` the six files as a total, or not at all.
+
+### A frozen artifact was overwritten in the working tree, and restored
+
+**Disclosed because it touched `generated-2/`, which this run treats as frozen.** Both harnesses in
+`tools/` delete `retention-2/` and one of them overwrites a `generated-2/*.md`, by design — they are
+meant to run only inside a throwaway `git clone --shared`. A first version of their safety guard
+computed the repository root as `__file__.parents[3]`, which is `docs/`, not the root. The guard
+therefore never fired, and while it was being *tested* both scripts ran against the live worktree:
+`generated-2/66530f.md` was overwritten with the harness's synthetic document and
+`retention-2/` was deleted entire, including `parts/superseded/`.
+
+**Nothing was lost, and that is checkable rather than asserted.** Every affected path was committed
+at `d8d28a3`; `git checkout` restored all of it, and `git hash-object` of the restored
+`generated-2/66530f.md` is `774dd6c26f5e0c3bcffca68ebe4d3888aa12839e`, which is the blob
+`FREEZE-2.md:60` records for that file. **The freeze row is the check that the restoration was exact,
+and it passes.** `spec_length_2_freeze_rows_still_hash_to_their_files` passes over the whole table.
+
+**The guard now finds the root by walking up to `.git`** instead of counting parents, and refuses the
+worktree root, any subdirectory of it, and any path that is not a checkout root. All three refusals
+are exercised. **The lesson worth carrying: a destructive tool's guard is itself a thing to test
+before trusting, and `parents[n]` is a bad way to name a repository root.**
+
+**Item 11(b)'s re-disclosure, which is owed by every task in this run.** T5a dispatched 26 scorer
+runs whose prompts carry an absolute path into this worktree, so each scorer could in principle have
+read `generated-2/`, `PROTOCOL-2.md` or the git history. Prompts were written outside the repository,
+one per directory, so no scorer could list its siblings; each was told to read exactly one document.
+**This was not audited against the transcripts** — T4 scanned all 18 of its probe transcripts for
+`blind-map` access and found none; T5a ran no equivalent scan, and that is a gap, not a clean bill.
+
+---
+
+## 6. What T5b, T5c and T8 inherit
+
+1. **Do not re-run T5a's shards hoping for a pass.** Thirteen attempts, zero passes. The cap in §2 is
+   spent for `66530f` and the argument for not spending the rest is in the handoff.
+2. **T5b and T5c will hit the same gate** on `tiered-review` and `tui-dc-picker` unless those corpora
+   are markedly less marked-up. Measure admissibility with `tools/measure-span-admissibility.py`
+   **before** dispatching 12 and 6 more scorer runs; it costs one clone and no probes.
+3. **Two undischarged items inherited from `GENERATION-2-NOTES.md`, owed by T8**: flag both `R5a`
+   generations and read neither as a win; and log the early publication of the `wc`/`R5a` figures as
+   a deviation in `RESULTS-2.md`.
+4. **A frozen-instrument inconsistency found here and reported nowhere else.** Item 9's first
+   blockquote — handed verbatim to every scorer by item 10's template — says a paraphrase *"may be
+   evidenced by up to three spans"*, while the same prompt's rules say **1 to 5**. Scorers followed
+   the rules; 5-span rows appear throughout. It bears on §4 directly, since each extra span is
+   another chance to trip the boundary rule.
+5. **The built prompts are not committed.** "Byte-identical on every attempt" rests on
+   `tools/build-tier1-prompts.py` being deterministic, which is checkable by re-running it, rather
+   than on a diffable artifact.
