@@ -1,0 +1,82 @@
+[
+  {
+    "id": "tui-dc-picker-01",
+    "question": "What does this spec say about whether listing calls must pass an explicit count parameter, and what happens if it is omitted?"
+  },
+  {
+    "id": "tui-dc-picker-04",
+    "question": "What does this spec say about how the up/down arrow keys move the cursor through the tree?"
+  },
+  {
+    "id": "tui-dc-picker-07",
+    "question": "What does this spec say about what pressing enter does on a project or config branch node?"
+  },
+  {
+    "id": "tui-dc-picker-10",
+    "question": "What does this spec say about when a project's configs are fetched from the API?"
+  },
+  {
+    "id": "tui-dc-picker-12",
+    "question": "What does this spec say about what a never-expanded branch shows before and immediately after it loads?"
+  },
+  {
+    "id": "tui-dc-picker-15",
+    "question": "What does this spec say about the initial expansion state and cursor position when opening the picker for an unlinked deployment?"
+  },
+  {
+    "id": "tui-dc-picker-18",
+    "question": "What does this spec say about which config `completeDCSelection` uses to populate the confirm state's project/name fields?"
+  },
+  {
+    "id": "tui-dc-picker-21",
+    "question": "What does this spec say about the field added to `appModel` for tracking in-flight branch loads, including how its keys are structured?"
+  },
+  {
+    "id": "tui-dc-picker-24",
+    "question": "What does this spec say about the value of `pick` on nodes produced by the existing config, revision, and diff tree builders?"
+  },
+  {
+    "id": "tui-dc-picker-27",
+    "question": "What does this spec say about the fields of the new `dcConfigsMsg` message struct?"
+  },
+  {
+    "id": "tui-dc-picker-29",
+    "question": "What does this spec say about the `name` field shared by the three messages and when their results get dropped?"
+  },
+  {
+    "id": "tui-dc-picker-32",
+    "question": "What does this spec say about the condition `autoRefreshPaused()` checks to keep auto-refresh from swapping out the selection while the picker is open?"
+  },
+  {
+    "id": "tui-dc-picker-35",
+    "question": "What does this spec say about how a config node is labelled?"
+  },
+  {
+    "id": "tui-dc-picker-38",
+    "question": "What does this spec say about how a version leaf is labelled and what existing label-building logic it reuses?"
+  },
+  {
+    "id": "tui-dc-picker-41",
+    "question": "What does this spec say about how `preserveDeploymentDivergences` behaves when the linked baseline is absent?"
+  },
+  {
+    "id": "tui-dc-picker-44",
+    "question": "What does this spec say about what the `actionSwitchDeployConfig` confirm state tells the user will happen?"
+  },
+  {
+    "id": "tui-dc-picker-46",
+    "question": "What does this spec say about what the confirm state communicates when the chosen config is shared?"
+  },
+  {
+    "id": "tui-dc-picker-49",
+    "question": "What does this spec say about what kinds of changes are out of scope for this work?"
+  },
+  {
+    "id": "tui-dc-picker-52",
+    "question": "What does this spec say about whether `browse_source_config.go` and the new `V` flow get refactored together, and what is reused between them instead?"
+  },
+  {
+    "id": "tui-dc-picker-55",
+    "question": "What does this spec say about what must pass before this work is considered done?"
+  }
+]

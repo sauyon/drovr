@@ -1,0 +1,82 @@
+[
+  {
+    "id": "skill-stickiness-01",
+    "question": "What does this spec say about when Arm A's pre-fix SKILL.md baseline must be captured relative to editing skill files, and why that timing matters?"
+  },
+  {
+    "id": "skill-stickiness-06",
+    "question": "What does this spec say about the relationship between each prohibition in the shipped skills and the required action?"
+  },
+  {
+    "id": "skill-stickiness-10",
+    "question": "What does this spec say about whether making the review UI render dot blocks (paired with a graph as a progress display alongside the plan) is part of this work's scope, and if not, how that is tracked?"
+  },
+  {
+    "id": "skill-stickiness-15",
+    "question": "What does this spec say happens to a skill's content when it exceeds that skill's size cap?"
+  },
+  {
+    "id": "skill-stickiness-20",
+    "question": "What does this spec say about how many known-issues entries document that some descriptions scoped unconditional discipline to phases, how many such descriptions there were, and what convention the entry follows?"
+  },
+  {
+    "id": "skill-stickiness-25",
+    "question": "What does this spec say about the source of the final wording for using-drovr's new red-flag table covering the router's own failure mode of invoking nothing at all?"
+  },
+  {
+    "id": "skill-stickiness-29",
+    "question": "What does this spec say about the size limit on rendered --gate additionalContext, and where/how that limit is asserted?"
+  },
+  {
+    "id": "skill-stickiness-34",
+    "question": "What does this spec say about where the card's text is defined or stored?"
+  },
+  {
+    "id": "skill-stickiness-39",
+    "question": "What does this spec say about whether PreToolUse hard-deny enforcement is included in this run's scope?"
+  },
+  {
+    "id": "skill-stickiness-44",
+    "question": "What does this spec say about which skills contain the table mapping claims to required evidence versus not-sufficient evidence?"
+  },
+  {
+    "id": "skill-stickiness-48",
+    "question": "What does this spec say tdd's Iron Law requires about the order of writing/observing a test versus writing implementation code?"
+  },
+  {
+    "id": "skill-stickiness-53",
+    "question": "What does this spec say happens to code-review's existing FOREGROUND reviewer rule?"
+  },
+  {
+    "id": "skill-stickiness-58",
+    "question": "What does this spec say about the required characteristics scenarios must have, in terms of concreteness, framing, choice structure, and pressure?"
+  },
+  {
+    "id": "skill-stickiness-63",
+    "question": "What does this spec say about what other files or subdirectories are stored under docs/skill-evidence/ besides the main comparison evidence, and what each one is for?"
+  },
+  {
+    "id": "skill-stickiness-67",
+    "question": "What does this spec say should happen when any stage hits its ceiling?"
+  },
+  {
+    "id": "skill-stickiness-72",
+    "question": "What does this spec say about how arm identity is handled during scoring, and when it is restored?"
+  },
+  {
+    "id": "skill-stickiness-77",
+    "question": "What does this spec say happens to a skill's rewrite if Arm A already passes for that skill?"
+  },
+  {
+    "id": "skill-stickiness-82",
+    "question": "What does this spec say determines whether a device ships across all five documents versus the baseline being kept instead?"
+  },
+  {
+    "id": "skill-stickiness-86",
+    "question": "What does this spec say about the scope of the changes applied to the handoff, pipeline, and worktrees skills?"
+  },
+  {
+    "id": "skill-stickiness-91",
+    "question": "What does this spec say the integration check verifies given a clean session and a one-line bugfix request with no mention of drovr, and how is that check's run environment configured?"
+  }
+]

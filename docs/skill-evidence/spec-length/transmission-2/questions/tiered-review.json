@@ -1,0 +1,82 @@
+[
+  {
+    "id": "tiered-review-01",
+    "question": "What does this spec say must happen when the cheap tier fails in any way (unavailable, timed out, crashed, out of context, unparseable, naming a unit outside the range, or silently omitting a unit), relative to the non-cascade baseline?"
+  },
+  {
+    "id": "tiered-review-05",
+    "question": "What does this spec say about how the pre-registered decision rule uses the measured ratio to select among the candidate primary designs?"
+  },
+  {
+    "id": "tiered-review-10",
+    "question": "What does this spec say about how angle mode's AgentLaunch is structured relative to cfg.angles?"
+  },
+  {
+    "id": "tiered-review-14",
+    "question": "What does this spec say about per-file routing's role in the run once the decision rule selects a different primary design?"
+  },
+  {
+    "id": "tiered-review-18",
+    "question": "What does this spec say about the condition under which Class 2 admits a comment?"
+  },
+  {
+    "id": "tiered-review-23",
+    "question": "What does this spec say about how attribution is verified and recorded per fixture, and whether a comment's mere existence counts as attribution?"
+  },
+  {
+    "id": "tiered-review-27",
+    "question": "What does this spec say happens to a thin cell in terms of how it is recorded and whether it can be merged into a neighbouring cell?"
+  },
+  {
+    "id": "tiered-review-32",
+    "question": "What does this spec say about how Stratum D is broken down for scoring and whether it is reported as one combined number?"
+  },
+  {
+    "id": "tiered-review-36",
+    "question": "What does this spec say about where private-repo fixtures and probe transcripts are stored?"
+  },
+  {
+    "id": "tiered-review-40",
+    "question": "What does this spec say about how the guard prevents a fixture's body from being reached without first checking the destination?"
+  },
+  {
+    "id": "tiered-review-45",
+    "question": "What does this spec say Class 3 is gated on, in terms of how defects are tracked across the cascade?"
+  },
+  {
+    "id": "tiered-review-49",
+    "question": "What does this spec say the positive control checks on the expensive tier, and what happens if that check fails?"
+  },
+  {
+    "id": "tiered-review-53",
+    "question": "What does this spec say about the recall bar, including its statistical bound and target sample size, required for designs with an unrecoverable-miss class (per-file, whole-change)?"
+  },
+  {
+    "id": "tiered-review-58",
+    "question": "What does this spec say about which bars determine the ship decision, versus what happens to shipping if the other bars fail?"
+  },
+  {
+    "id": "tiered-review-62",
+    "question": "What does this spec say should happen to reporting when per-stratum recall is more heterogeneous than sampling can explain?"
+  },
+  {
+    "id": "tiered-review-67",
+    "question": "What does this spec say about the default value of `enabled` and whether it changes over the course of the run?"
+  },
+  {
+    "id": "tiered-review-71",
+    "question": "What does this spec say the value of `timeout_ms` is?"
+  },
+  {
+    "id": "tiered-review-75",
+    "question": "What does this spec say about where in the codebase the cascade stage is added and what its initial enabled state is?"
+  },
+  {
+    "id": "tiered-review-80",
+    "question": "What does this spec say about the scope status of fixing the pane bug cited in docs/known-issues.md, and how the system works around it?"
+  },
+  {
+    "id": "tiered-review-84",
+    "question": "What does this spec say about how the plan phase treats the four approved decisions, and how it handles anything they do not cover?"
+  }
+]
