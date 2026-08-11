@@ -1,0 +1,167 @@
+{
+  "instrument": "PROTOCOL-2 item 8b (tier 3)",
+  "records": [
+    {
+      "spec_id": "4a73ef",
+      "attempt": "attempt-2",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-05",
+          "present": true,
+          "reason": "Section 1 states unity is adopted for the four discipline skills deviating from superpowers which withholds it there, and Section 5 lists the exact unity line as a required section on all four skills."
+        },
+        {
+          "id": "skill-stickiness-55",
+          "present": true,
+          "reason": "Section 6.1 states the loop repeats until a run produces no new rationalization or the REFACTOR ceiling is reached, whichever comes first, and the ceiling itself is defined in the Section 6.3 budget table; the section-number label is a fixture-internal cross-reference, not operative detail."
+        },
+        {
+          "id": "skill-stickiness-65",
+          "present": true,
+          "reason": "Section 6.3's arms table lists exactly A (pre-fix HEAD text), A′ (fix-1-only, descriptions un-scoped, no armor), and B (full rewrite), explicitly introduced as three arms so fix 1 and fix 4 are separable."
+        },
+        {
+          "id": "skill-stickiness-90",
+          "present": true,
+          "reason": "Section 8's mechanical verification lists a verbatim-overlap check against the superpowers corpus requiring no shared shingle of 8 words or longer with any drovr SKILL.md."
+        }
+      ]
+    },
+    {
+      "spec_id": "80d9a2",
+      "attempt": "attempt-1",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-10",
+          "present": true,
+          "reason": "§3 and §10 state the review-UI flowchart (progress display for where the agent is in a procedure) is out of scope and tracked as a docs/known-issues.md follow-up rather than built."
+        },
+        {
+          "id": "skill-stickiness-55",
+          "present": true,
+          "reason": "§9.1's loop text matches verbatim except the section pointer (§9.3 vs §7.3), which is a fixture-internal cross-reference and not operative detail."
+        },
+        {
+          "id": "skill-stickiness-65",
+          "present": true,
+          "reason": "§9.3's Arms table defines A, A′, and B exactly as stated, and the accompanying rationale explicitly says A′ isolates fix 4's contribution so B>A would prove nothing about fix 4 specifically, i.e. fix 1 and fix 4 are separable."
+        },
+        {
+          "id": "skill-stickiness-80",
+          "present": true,
+          "reason": "§9.4's variant table matches exactly: V0 plain imperative baseline, V1 unity, V2 full authority, V3 moral framing, each adding one register device to identical structure."
+        },
+        {
+          "id": "skill-stickiness-85",
+          "present": false,
+          "reason": "§9.4 states the winning register 'applies to all five documents,' not to 'the other four documents' as the row claims — this changes the exact bound/count, which is operative detail, not a cross-reference."
+        }
+      ]
+    },
+    {
+      "spec_id": "87e5a5",
+      "attempt": "attempt-1",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-13",
+          "present": true,
+          "reason": "Section 7 states using-drovr gets its own cap and joins the checked list at 9000 bytes."
+        },
+        {
+          "id": "skill-stickiness-24",
+          "present": true,
+          "reason": "Section 3.1 item 5 gives the exact gate-function flowchart chain: message received → skill applies (≥1%) → invoke → announce → checklist → one tracked item per step → follow it → respond."
+        },
+        {
+          "id": "skill-stickiness-29",
+          "present": true,
+          "reason": "Section 3.2 states the ≤600-byte budget and that it is asserted as rendered additionalContext length in cli/src/reflex.rs's test module."
+        },
+        {
+          "id": "skill-stickiness-69",
+          "present": true,
+          "reason": "Section 6.3's Execution shape names ab-<skill> phases (5) plus a sixth ab-voice phase, caps each phase at ~25 runs, and has a driver aggregate."
+        },
+        {
+          "id": "skill-stickiness-79",
+          "present": true,
+          "reason": "Section 6.4 explicitly names verification-before-completion as the probe skill."
+        }
+      ]
+    },
+    {
+      "spec_id": "aa3199",
+      "attempt": "attempt-1",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-05",
+          "present": true,
+          "reason": "§3 states drovr applies the unity line to discipline skills as a deviation from superpowers, which withholds unity from discipline skills on the older 2025 ranking."
+        },
+        {
+          "id": "skill-stickiness-10",
+          "present": true,
+          "reason": "§10 lists rendering dot blocks in the review UI as out of scope, tracked as a docs/known-issues.md follow-up, with §3 giving the graph-alongside-plan detail."
+        },
+        {
+          "id": "skill-stickiness-50",
+          "present": true,
+          "reason": "§8's systematic-debugging entry adds the numeric escalation trigger: after 3 failed fixes, stop and question the design before attempting fix #4."
+        },
+        {
+          "id": "skill-stickiness-55",
+          "present": true,
+          "reason": "§9.1's loop repeats until a run produces no new rationalization or the §9.3 REFACTOR ceiling is reached, whichever comes first; the §7.3 vs §9.3 numbering is a fixture-internal cross-reference, not operative detail."
+        },
+        {
+          "id": "skill-stickiness-65",
+          "present": true,
+          "reason": "§9.3 defines three arms — A (pre-fix HEAD), A′ (fix-1-only, descriptions un-scoped, no armor), and B (full rewrite, fixes 1+3+4) — explicitly so fix 1's and fix 4's contributions are separable."
+        }
+      ]
+    },
+    {
+      "spec_id": "d25798",
+      "attempt": "attempt-1",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-17",
+          "present": true,
+          "reason": "Fix 1's problem statement and the fix-4 section list both state the description must be a trigger, not a workflow summary."
+        },
+        {
+          "id": "skill-stickiness-42",
+          "present": true,
+          "reason": "Fix 3 lists exactly these four sites verbatim: using-drovr's gate branch, each discipline skill's procedure, phase-prompts' Do lists as step 0, and handoff's SKILL.md plus HANDOFF-template.md."
+        },
+        {
+          "id": "skill-stickiness-87",
+          "present": true,
+          "reason": "The Out of scope section states no change to the phase state machine, the review gate, or drovr code-review itself."
+        }
+      ]
+    },
+    {
+      "spec_id": "db3e2d",
+      "attempt": "attempt-1",
+      "ledger": "skill-stickiness",
+      "rows": [
+        {
+          "id": "skill-stickiness-55",
+          "present": true,
+          "reason": "§7.1's loop bullet states verbatim that it repeats until a run produces no new rationalization or the §7.3 REFACTOR ceiling is reached, whichever comes first."
+        },
+        {
+          "id": "skill-stickiness-65",
+          "present": true,
+          "reason": "§7.3's Arms table defines exactly A (pre-fix HEAD), A′ (fix-1-only, descriptions un-scoped, no armor), and B (fixes 1+3+4), with the surrounding text stating this exists so fix 1 and fix 4 are separable."
+        }
+      ]
+    }
+  ]
+}
