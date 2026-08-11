@@ -12,6 +12,12 @@ at `~/.local/share/drovr/runs/spec-length-ab2/plan.md`.)
 **This file records procedure and counts. It records no arm**, and its author never opened
 `blind-map-2.json`. See §6 for what its author *did* come to know, which is not nothing.
 
+**THE RUN'S TIER-1 OUTCOME SO FAR, ACROSS TWO OF THREE FIXTURES: THREE VERDICTS FILED OF TWELVE
+GENERATIONS ATTEMPTED.** `6e7393` and `e085f2` (`skill-stickiness`, §T5a below) and `48527b`
+(`tiered-review`, §9). The other nine are **missing data**, not zero retention — every one of them
+was given up to six corrected attempts per shard under the extended cap of §2b. **§8 and §9 are
+T5b's record; §T5a–§7 are T5a's and are not rewritten.**
+
 ## T5a's outcome, up front
 
 **Two of six verdicts filed. Four not filed.**
@@ -398,6 +404,13 @@ carries `.git`; that is a known remaining hole.
 
 ## 7. What T5b, T5c and T8 inherit
 
+**§7 was written by T5a. T5b has since run: items 1–3 below are DISCHARGED, and §9.5 is the current
+list for T5c.** Item 1 (use the corrected builder) was followed; item 2 (wait for the §5 decision)
+was resolved by §5a and executed as §2b; item 3 (the admissibility tool is hardcoded) is fixed —
+the tool now takes a required fixture argument. **Items 4–8 are still open and are re-listed with
+T5b's own additions in §9.5.** Nothing here is deleted, because the list is also the record of what
+each task was told.
+
 1. **Use the corrected `tools/build-tier1-prompts.py`** — it hands over item 8. Do not rebuild prompts
    from the template alone; §2a is why.
 2. **Wait for the driver's decision in §5** before dispatching, because it governs your budget too.
@@ -423,3 +436,219 @@ carries `.git`; that is a known remaining hole.
    item 10.
 8. **The built prompts are not committed.** "Byte-identical on every attempt" rests on the builder
    being deterministic, which is checkable by re-running it, not on a diffable artifact.
+
+---
+
+## 8. T5b — the extended cap, spent on T5a's four outstanding ids
+
+**Written by T5b (`implement-task-6`), which the driver instructed to finish T5a's four
+outstanding `skill-stickiness` ids under §2b's extended cap before starting `tiered-review`.**
+
+### 8.1 The outcome, up front
+
+**The extension bought nothing. Three further attempts per shard for each of the four ids —
+`66530f`, `e790f5`, `fd2c24`, `fe4059` — and NOT ONE verdict cleared the gate.** All four remain
+what §5 called them: **missing data, not low retention.** `retention-2/` still holds exactly two
+`skill-stickiness` verdicts, `6e7393` and `e085f2`, unchanged and never re-run.
+
+| round | prompt | shards | attempt | trigger | outcome |
+|---|---|---|---|---|---|
+| 5 | corrected | the four ×2 | c4 | `R6` — failed the item-8 check, under §2b's raised cap | none cleared |
+| 6 | corrected | the four ×2 | c5 | `R6` — same trigger | none cleared |
+| 7 | corrected | the four ×2 | c6 | `R6` — same trigger; **cap exhausted for all four** | none cleared |
+
+**Problems per round, for the four ids only** (each round's raw gate output is at
+`parts/superseded/refusal-reports/corrected-round{5,6,7}.txt`; round 5's was reproduced rather than
+captured live, and its file says so):
+
+| round | attempt | boundary | shared-span | total |
+|---|---|---|---|---|
+| 5 | c4 | 7 | 12 | 19 |
+| 6 | c5 | 20 | 4 | 24 |
+| 7 | c6 | 26 | 6 | 32 |
+
+**It does not converge, and the direction is the wrong one.** Under a fixed prompt three more
+draws produced more refusals, not fewer. Read against §3's monotonic *fall* across the earlier
+corrected rounds — 5.5%, 2.8%, 1.7%, 0.8% — which §3 already recorded as unexplained, **the fall
+now looks less like a trend and more like the noise §3 was careful not to claim as an effect.**
+Two rounds moving one way and three moving the other, on a fixed instrument, is what variance
+looks like. **§3's directional claim about the item-8 correction is not affected**: that rests on
+the matched `66530f` probe (1.9×) and on zero-passing-verdicts becoming two, neither of which this
+touches.
+
+### 8.2 What this says about the driver's decision, plainly
+
+**The decision to extend was sound and the result was negative, and those are two different
+things.** §2b pre-registered what the extra attempts could buy — well-formed inputs for T6, never
+retention signal — and said it before they were spent. They bought neither. That is the outcome a
+pre-registration is *for*: had the cap been raised without §2b, three losing rounds would now be
+invisible and only a later winning round would have been written down.
+
+**The honest reading is that T5a's original cap was set in a reasonable place.** §4's "the cap was
+honoured, not extended" turned out to cost nothing, and the four ids look less like ids that
+needed more attempts and more like ids whose documents these scorers do not score compliantly.
+Six corrected attempts per shard — **twelve shard dispatches per id** — with zero passes, against
+`6e7393` clearing on its first corrected attempt and `e085f2` on its second, is a large asymmetry
+that attempt count did not close. **What distinguishes the two groups is not established here and
+must not be guessed at**: it is not document length (`fe4059` is the shortest of the six and fails
+worst, 14 boundary refusals in round 7), and any account of it would be a claim about the arms,
+which this file's author has no basis for and must not make.
+
+### 8.3 A hypothesis about the shared-span failures, checked and WITHDRAWN
+
+Round 5's shared-span refusals fell on strikingly repetitive ledger pairs — `16`/`89`, `43`/`47`,
+`09`/`55`, `04`/`90`, `01`/`65`, `02`/`83`, `36`/`63` — and the **same pairs recurred across
+different scorers scoring different generations**. Several of those pairs are semantically nested:
+row 89 is the `grep` that row 16 describes, row 90 is the overlap check that row 04 requires. The
+hypothesis was that the ledger contains entailment pairs a well-written spec states in one
+sentence, so item 8's no-shared-span rule makes both rows un-evidenceable at once — an
+**instrument** defect, and a much more serious finding than scorer non-compliance.
+
+**It is false, and checking it cost two minutes.** Both filed verdicts were examined against all
+nine pairs: `6e7393` evidences **both** members of every pair with **disjoint** spans, and
+`e085f2` does the same for eight of nine, marking one row `false`. A second witness exists in
+these documents and two scorers found it every time. **The pairs are attractors for the violation,
+not forcers of it**, and §3's reading — scorer non-compliance with a rule the prompt states
+verbatim — stands unamended.
+
+**Recorded because the check is the point, not the hypothesis.** §3a's whole lesson is that a
+plausible story about a frozen instrument being broken deserves a cheap mechanical check before it
+is believed, and the check here was "do the verdicts that already passed do the thing you claim is
+impossible?" **Nothing in this subsection is a finding. It is a hypothesis that was tested and
+died**, kept so the next reader does not re-form it.
+
+### 8.4 What T5c and T8 must carry from this
+
+1. **The four ids are still missing data.** `T6` has no input for `66530f`, `e790f5`, `fd2c24` and
+   `fe4059`, and an absent verdict is **not** a zero. This is unchanged from §5; the extension did
+   not change it.
+2. **`RESULTS-2.md` must report the extension AND its failure**, together. Reporting a raised cap
+   without reporting that it produced no verdict would misdescribe the run in the flattering
+   direction. §2b's post-hoc disclosure obligation and this outcome are one item, not two.
+3. **The negative result is itself evidence about the instrument** — that tier-1 well-formedness
+   is not reliably reachable for four of six `skill-stickiness` generations, by scorers given the
+   frozen rule verbatim and six attempts. That belongs in `RESULTS-2.md` beside the 99.8%
+   present-rate doubt, and it points the same way: **the tier-1 gate is measuring something about
+   scorer compliance, and the discriminating load still sits on T6 and T7.**
+4. **`FREEZE-2.md` is still closed at this run's rows.** T5b added none.
+
+---
+
+## 9. T5b — `tiered-review`, the task's own fixture
+
+### 9.1 The outcome
+
+**One of six verdicts filed.** `retention-2/` now holds **three** verdicts in all.
+
+| | |
+|---|---|
+| filed, passing the gate | **`48527b`** — 84 rows, 80 present, 99 spans, cleared on attempt c5 |
+| **not filed** — cap exhausted, still failing | `054872`, `2c4295`, `2d2629`, `b49ff1`, `fd230c` |
+
+**The five are MISSING DATA, not low retention**, exactly as §5 says of T5a's four. **T6 has no input
+for them.** Across both fixtures this run has now attempted 12 generations and filed 3.
+
+### 9.2 The dispatch log
+
+Rounds continue §4's and §8.1's numbering. Every attempt is at
+`parts/superseded/<id>-<k>-corrected-attempt<n>.json`; every round's raw gate output is at
+`parts/superseded/refusal-reports/corrected-round<n>.txt`.
+
+| round | shards | attempt | trigger | outcome |
+|---|---|---|---|---|
+| 6 | `054872` ×2 | c1 | first run — §1-style calibration probe | failed |
+| 7 | `054872` ×2 | c2 | `R6` | failed |
+| 8 | `054872` ×2; other five ×2 | c3; c1 | `R6`; first run | none cleared |
+| 9 | all six ×2 | c4; c2 | `R6` | none cleared |
+| 10 | all six ×2 | c5; c3 | `R6` | none cleared |
+| 11 | all six ×2 | c6; c4 | `R6`; **`054872` cap exhausted** | none cleared |
+| 12 | five ×2 | c5 | `R6` | **`48527b` cleared** |
+| 13 | four ×2 | c6 | `R6`; **cap exhausted for all six** | none cleared |
+
+**The calibration probe was run and it is why the other five were dispatched.** `054872` went first
+(id-lexicographically), and its first corrected attempt refused **5 boundary spans of 94 — 5.3%**,
+against **5.5% (7/128)** for the `skill-stickiness` corrected probe of round 3. The instrument does
+not behave differently on this corpus, which is what the probe existed to establish. It was
+dispatched alongside the `skill-stickiness` re-runs rather than after them, because the two fixtures
+are independent and neither one's result gates the other's.
+
+**Counts, derived from the files on disk rather than from arithmetic.** `parts/superseded/` holds
+**144** shard files, of which T5a left 52, so **T5b added 92**; with `48527b`'s two live shards that
+is **94 shard files from 96 dispatches**. The two missing dispatches died mid-stream on API errors
+and wrote nothing (round 12).
+
+### 9.3 Two things `tiered-review` does differently, both recorded and neither claimed
+
+1. **The 99.8% ceiling does not reproduce.** Every `skill-stickiness` round of this run and the last
+   sat at a 99.8% present rate, and §7.4 carries that as an undischarged doubt. **`tiered-review`
+   present rates run 73–84 of 84 — 87% to 100% — with real spread between generations and between
+   attempts on the same generation.** That is what a measurement with some discriminating power
+   looks like, and it is the first sign in either attempt that the instrument is not simply
+   saturated. **It is not evidence about spec length**: this file's author cannot see arms, six
+   generations is three arms of two, and the spread could be the fixture, the ledger, the arms or
+   the scorers. **§7.4's doubt is narrowed to `skill-stickiness`, not withdrawn.**
+2. **Shared-span violations dominate here; boundary refusals dominated there.** Over rounds 8–13,
+   counting only the six `tiered-review` ids, the split is **77 boundary / 92 shared-span** of 169
+   problems, where `skill-stickiness` round 7 was **26 boundary / 6 shared-span**. §3's shared-span
+   finding — plain scorer non-compliance with a rule the prompt states verbatim — is the live
+   failure mode for this fixture. **§8.3's withdrawn ledger-entailment hypothesis must not be
+   re-formed from this**; it was tested against the filed verdicts and died.
+
+   | round | boundary | shared-span | total |
+   |---|---|---|---|
+   | 8 | 12 | 18 | 30 |
+   | 9 | 7 | 16 | 23 |
+   | 10 | 25 | 11 | 36 |
+   | 11 | 8 | 22 | 30 |
+   | 12 | 14 | 12 | 26 |
+   | 13 | 11 | 13 | 24 |
+   | **total** | **77** | **92** | **169** |
+
+   **The denominator is the six `tiered-review` ids only** — each round's raw file also scans the
+   filed `skill-stickiness` verdicts, which contribute zero. The totals are summed from the
+   `corrected-round{8..13}.txt` files mechanically, not by hand: a first draft of this subsection
+   carried 46 / 51, which was simply wrong, and pooling populations by hand is the error reviewers
+   caught in T5a three rounds running.
+
+### 9.4 The one filed verdict, and why its crash-retry is disclosed
+
+`48527b` cleared on attempt **c5**, in the same round in which **two dispatches died mid-stream on
+API errors writing no file** — one of them `48527b`'s own shard 1. Both were re-dispatched with the
+byte-identical prompt.
+
+**A crashed dispatch does not consume a scoring attempt, and `48527b` used exactly five.** A dispatch
+that writes no file produced no verdict, so there is nothing for the item-8 check to fail; `R6`'s
+closed trigger list carries *"the probe wrote no file"* as a trigger **separate** from *"a verdict
+fails the item-8 mechanical check"*, and §2/§2b cap scoring attempts rather than process crashes.
+**This is checkable on disk and not merely asserted:** `parts/superseded/` holds exactly **four**
+`48527b-1` and **four** `48527b-2` corrected attempts (c1–c4), and the fifth is the filed shard pair
+under `parts/`. Four superseded plus one filed is five.
+
+**Disclosed at length because it is the verdict that passed.** A crash-retry on the single generation
+that cleared is precisely the thing a sceptical reader should want to check, and the answer should not
+depend on taking this file's word for it.
+
+One of the crashed agents reported that its temporary helper script *"was replaced by another process
+mid-run"* — concurrently dispatched scorers writing scratch scripts to a shared path. **No shard file
+was affected**: the collision was in agents' private scratch space, and each shard is written by
+exactly one agent to its own path. Later dispatches were told to keep scratch files inside their own
+prompt directory.
+
+### 9.5 What T5c and T8 inherit from T5b
+
+1. **`tools/measure-span-admissibility.py` now takes a required fixture argument** and prints
+   aggregates only. T5c can use it directly. Do not read a shortfall out of it — §3a's three faults
+   still apply, it counts whole lines, and most real spans are multi-line. The `tiered-review`
+   measurement is at `parts/superseded/refusal-reports/admissibility-tiered-review.txt`.
+2. **The extended cap (§2b) applies to `tui-dc-picker` too — six attempts per shard, uniformly**,
+   from the first dispatch. It is not a budget T5c may raise further, and it is not one T5c may
+   decline to offer: uniformity is what makes §2b legitimate.
+3. **`tui-dc-picker` is ONE shard of 55 rows**, not two. A single scorer carries the whole verdict,
+   so there is no shard-pair to combine and the gate is all-or-nothing per attempt.
+4. **T6 has no input for nine of twelve generations so far.** Three filed: `6e7393`, `e085f2`,
+   `48527b`. Nine are missing data. **An absent verdict is never a zero.**
+5. **`RESULTS-2.md` must report the pass RATE as an instrument property.** Three verdicts filed from
+   twelve generations, each given up to six corrected attempts per shard, is the headline fact about
+   tier 1 in this attempt — and it is a fact about scorer compliance with item 8, not about what any
+   arm retained.
+6. **`FREEZE-2.md` is still closed at this run's rows.** T5b added none.

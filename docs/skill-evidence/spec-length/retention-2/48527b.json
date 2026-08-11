@@ -1,0 +1,605 @@
+{
+  "spec_id": "48527b",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-01",
+      "present": true,
+      "quotes": [
+        "A cheap-tier failure must degrade to the baseline (a full expensive review), never to less\n> review than the baseline would have given.",
+        "Router unavailable, timed out, crashed, out of context, unparseable, naming a unit not in the\nrange, or silently omitting a unit \u2014 all take the degrade path."
+      ]
+    },
+    {
+      "id": "tiered-review-02",
+      "present": true,
+      "quotes": [
+        "**Task 0** instruments expensive-tier reviews on a sample of fixtures and reports, per fixture (not\njust as a mean), the split between:",
+        "**This run is a measurement\nwith a feature attached, and the design is not chosen until the measurement says which one to\nbuild** \u2014 no cascade mode ships as default regardless of outcome (\u00a78)."
+      ]
+    },
+    {
+      "id": "tiered-review-03",
+      "present": true,
+      "quotes": [
+        "**E \u2014 exploration:** tool calls searching or reading outside the diff (grep, unchanged-file\n  reads, call-site follows, test reads).",
+        "**D \u2014 diff-reading and finding-writing.**"
+      ]
+    },
+    {
+      "id": "tiered-review-04",
+      "present": false,
+      "quotes": []
+    },
+    {
+      "id": "tiered-review-05",
+      "present": true,
+      "quotes": [
+        "measured `E/(E+D)` | primary design",
+        "\u2265 0.60 | cheap-as-explorer (\u00a73.1)",
+        "\u2264 0.30 | per-file routing (\u00a73.4, control arm regardless \u2014 \u00a73.4)",
+        "0.30 \u2013 0.60 | angle routing (\u00a73.2)"
+      ]
+    },
+    {
+      "id": "tiered-review-06",
+      "present": true,
+      "quotes": [
+        "Angle routing is additionally evaluated, in all three branches, as a composable second stage: it\nis orthogonal to the E/D ratio."
+      ]
+    },
+    {
+      "id": "tiered-review-07",
+      "present": true,
+      "quotes": [
+        "The cheap model builds a context bundle (call sites, related tests, invariants, prior art); the\nexpensive model reviews the whole diff with that bundle in its seed."
+      ]
+    },
+    {
+      "id": "tiered-review-08",
+      "present": true,
+      "quotes": [
+        "Its ship metric is **non-inferiority of end-to-end defect recall against the unaided expensive\npanel on the same fixtures** \u2014 not context completeness.",
+        "Context completeness is retained only as a diagnostic for explaining a failure."
+      ]
+    },
+    {
+      "id": "tiered-review-09",
+      "present": false,
+      "quotes": []
+    },
+    {
+      "id": "tiered-review-10",
+      "present": true,
+      "quotes": [
+        "Implementation is a per-angle `AgentLaunch` instead of one shared launch."
+      ]
+    },
+    {
+      "id": "tiered-review-11",
+      "present": true,
+      "quotes": [
+        "Which angles route where is decided from the per-angle recall data\ngathered against the corpus (\u00a75), not assumed from angle name."
+      ]
+    },
+    {
+      "id": "tiered-review-12",
+      "present": true,
+      "quotes": [
+        "3.3 Whole-change triage \u2014 narrow complement only, never the general design",
+        "Reason: one false-clean loses an entire change's review, the highest-stakes failure available."
+      ]
+    },
+    {
+      "id": "tiered-review-13",
+      "present": true,
+      "quotes": [
+        "In\nscope only as a conservative rule (not a model judgement) on near-certain cases \u2014 dependency\nbumps, generated files, pure formatting."
+      ]
+    },
+    {
+      "id": "tiered-review-14",
+      "present": true,
+      "quotes": [
+        "3.4 Per-file routing \u2014 always run as a measured control arm",
+        "Kept in the run **regardless of which design \u00a73's rule selects**, so the spec reports what it would\nhave cost and missed rather than assuming it away."
+      ]
+    },
+    {
+      "id": "tiered-review-15",
+      "present": true,
+      "quotes": [
+        "**Deliverable: empirical recall ceiling for per-file routing.** For every class-3 fixture (\u00a75.1),\ncompare files the *fix* commit touched against files the *introducing* PR changed.",
+        "A defect whose\nfix lands outside the introducing diff is one no per-file router could have routed to.",
+        "That\nfraction is the ceiling, computed from real defects."
+      ]
+    },
+    {
+      "id": "tiered-review-16",
+      "present": true,
+      "quotes": [
+        "1 | human review comment that caused a change in the same PR | review caught it pre-merge",
+        "2 | **accepted** bot review comment that caused a change | same, bot-found",
+        "3 | post-merge fix / revert / regression-fix of code a PR introduced | review MISSED it"
+      ]
+    },
+    {
+      "id": "tiered-review-17",
+      "present": true,
+      "quotes": [
+        "4.1 Ground-truth classes \u2014 never pooled into one recall figure"
+      ]
+    },
+    {
+      "id": "tiered-review-18",
+      "present": true,
+      "quotes": [
+        "Class 2 requires the acceptance filter (a human author agreed and changed the code, not just \"a\nbot said so\") and is reported separately from class 1."
+      ]
+    },
+    {
+      "id": "tiered-review-19",
+      "present": true,
+      "quotes": [
+        "D \u2014 drovr | `skill-stickiness` run artifacts | public | drovr-specific (\u00a74.5)",
+        "M \u2014 modular | `modularml/modular` | private | 1, 2, 3",
+        "Q \u2014 quite-app | `quitesh/quite-app` | private | 2, 3 (class 1 too thin \u2014 \u00a74.3)",
+        "N \u2014 neovim | `neovim/neovim` | public | 1, 2, 3"
+      ]
+    },
+    {
+      "id": "tiered-review-20",
+      "present": true,
+      "quotes": [
+        "4.2 Strata \u2014 every stratum probed by every router model (no \"legs\")",
+        "Design is a full factorial: `router_model \u00d7 stratum \u00d7 class`."
+      ]
+    },
+    {
+      "id": "tiered-review-21",
+      "present": true,
+      "quotes": [
+        "`commits == 1` disqualifies the PR (a single-commit PR cannot contain a comment-driven fix\n  commit)."
+      ]
+    },
+    {
+      "id": "tiered-review-22",
+      "present": true,
+      "quotes": [
+        "A later commit in the same PR must touch the commented file (ideally the commented lines);"
+      ]
+    },
+    {
+      "id": "tiered-review-23",
+      "present": true,
+      "quotes": [
+        "A later commit in the same PR must touch the commented file (ideally the commented lines); how\n  it was verified is recorded per fixture."
+      ]
+    },
+    {
+      "id": "tiered-review-24",
+      "present": true,
+      "quotes": [
+        "Docs-only PRs excluded."
+      ]
+    },
+    {
+      "id": "tiered-review-25",
+      "present": true,
+      "quotes": [
+        "`quite-app` has essentially no human review (13 human comments vs. 287 bot, in the last 300) and\n  cannot carry class 1; neovim is what keeps class 1 off modular alone.",
+        "Class 1 rests on modular and neovim only."
+      ]
+    },
+    {
+      "id": "tiered-review-26",
+      "present": true,
+      "quotes": [
+        "Results reported per repo and per class;"
+      ]
+    },
+    {
+      "id": "tiered-review-27",
+      "present": true,
+      "quotes": [
+        "Results reported per repo and per class; a thin cell is recorded as thin, never merged into a\n  neighbour."
+      ]
+    },
+    {
+      "id": "tiered-review-28",
+      "present": true,
+      "quotes": [
+        "Candidate fix commits: `git log -i --grep` for `revert|regression|broke` and kin.",
+        "`git blame` the lines the fix **deleted or replaced**, at `fix^`."
+      ]
+    },
+    {
+      "id": "tiered-review-29",
+      "present": true,
+      "quotes": [
+        "Require a single introducing commit; fan-out (non-clean attribution) is rejected."
+      ]
+    },
+    {
+      "id": "tiered-review-30",
+      "present": true,
+      "quotes": [
+        "That commit's PR at pre-merge state is the fixture; the fix commit's diff states the defect and\n   location. Human-authored label, no invention."
+      ]
+    },
+    {
+      "id": "tiered-review-31",
+      "present": true,
+      "quotes": [
+        "Harvesters report attrition at every stage (candidates \u2192\nsingle-attribution \u2192 adjudicated-as-defect)."
+      ]
+    },
+    {
+      "id": "tiered-review-32",
+      "present": true,
+      "quotes": [
+        "`D-rs` (79 findings, Rust) and `D-md` (51 findings, prose) are measured and reported separately,\n**never summed**."
+      ]
+    },
+    {
+      "id": "tiered-review-33",
+      "present": true,
+      "quotes": [
+        "**The ship bar must pass on `D-rs` alone**; `D-md` is reported with its own\ninterval and cannot rescue a failing `D-rs`."
+      ]
+    },
+    {
+      "id": "tiered-review-34",
+      "present": true,
+      "quotes": [
+        "Labels: *verified-real* (fix landed, or written up in `docs/known-issues.md`) is the only set that\nfeeds the bar; *unverified* is reported, not scored; *rejected* is excluded with the reason\nrecorded."
+      ]
+    },
+    {
+      "id": "tiered-review-35",
+      "present": true,
+      "quotes": [
+        "Labels: *verified-real* (fix landed, or written up in `docs/known-issues.md`) is the only set that\nfeeds the bar;"
+      ]
+    },
+    {
+      "id": "tiered-review-36",
+      "present": true,
+      "quotes": [
+        "Private fixtures and probe transcripts live outside any checkout, at\n`~/.local/share/drovr/cascade-corpus/`."
+      ]
+    },
+    {
+      "id": "tiered-review-37",
+      "present": true,
+      "quotes": [
+        "Only aggregates (recall, precision, counts, analysis) are\ncommitted to the repo \u2014 no diffs, no source excerpts, no file paths from the private repos, no\ndefect description detailed enough to reconstruct internal design."
+      ]
+    },
+    {
+      "id": "tiered-review-38",
+      "present": true,
+      "quotes": [
+        "**Interface: `provenance: Public | Private`**, assigned per fixture at harvest time from the source\nrepo's GitHub visibility (not a path convention)."
+      ]
+    },
+    {
+      "id": "tiered-review-39",
+      "present": true,
+      "quotes": [
+        "The write guard refuses to write\n`Private`-derived content to any path resolving inside a git checkout, after canonicalisation\n(closes the symlink-escape case)."
+      ]
+    },
+    {
+      "id": "tiered-review-40",
+      "present": true,
+      "quotes": [
+        "A fixture's body is reachable only through an accessor requiring\na token proving the destination was checked \u2014 the guard is a type-level property, not a call-site\ncheck (shaped after `ReviewOutcome::EmptyRange`, `cli/src/code_review.rs:94`)."
+      ]
+    },
+    {
+      "id": "tiered-review-41",
+      "present": false,
+      "quotes": []
+    },
+    {
+      "id": "tiered-review-42",
+      "present": true,
+      "quotes": [
+        "The write guard ships with tests in the same change, including the symlink-escape case."
+      ]
+    },
+    {
+      "id": "tiered-review-43",
+      "present": true,
+      "quotes": [
+        "`router_model \u2208 {qwen, sonnet}` \u00d7 `stratum \u2208 {D, M, Q, N}` \u00d7 `class \u2208 {1, 2, 3}`, plus per-file\nrouting as a control arm (\u00a73.4) alongside whichever design \u00a73 selects."
+      ]
+    },
+    {
+      "id": "tiered-review-44",
+      "present": true,
+      "quotes": [
+        "**The ship decision is per router model** \u2014 `router_agent` / `router_model` are separate config\nkeys (\u00a78); a sonnet-routed cascade and a qwen-routed cascade ship independently."
+      ]
+    },
+    {
+      "id": "tiered-review-45",
+      "present": true,
+      "quotes": [
+        "**Conditional recall** (of the class-3 defects the *expensive tier* finds, how many survive the\n  cascade) is the number that gates."
+      ]
+    },
+    {
+      "id": "tiered-review-46",
+      "present": true,
+      "quotes": [
+        "**Expensive-tier absolute detection rate on class 3** is reported, not gating."
+      ]
+    },
+    {
+      "id": "tiered-review-47",
+      "present": true,
+      "quotes": [
+        "**NULL** (everything cleared, recall 0) and **FLOOD** (everything escalated, recall 1.0) bracket\n  every stratum/class cell."
+      ]
+    },
+    {
+      "id": "tiered-review-48",
+      "present": true,
+      "quotes": [
+        "**NULL** (everything cleared, recall 0) and **FLOOD** (everything escalated, recall 1.0) bracket\n  every stratum/class cell. A real cheap tier must land strictly inside the bracket on both axes,\n  or those fixtures are rebuilt before anything is scored."
+      ]
+    },
+    {
+      "id": "tiered-review-49",
+      "present": true,
+      "quotes": [
+        "**Positive control:** re-running the expensive tier on a sample must re-find recorded class-1/2\n  defects at a high rate; if not, the corpus needs re-cutting, not the cheap tier."
+      ]
+    },
+    {
+      "id": "tiered-review-50",
+      "present": true,
+      "quotes": [
+        "**Dev/held-out split** assigned before any cheap-tier prompt is written, at task/PR level (no\n  diff in both)."
+      ]
+    },
+    {
+      "id": "tiered-review-51",
+      "present": true,
+      "quotes": [
+        "Held-out is scored **once**, after the prompt is frozen and its `git hash-object`\n  recorded."
+      ]
+    },
+    {
+      "id": "tiered-review-52",
+      "present": true,
+      "quotes": [
+        "There is no `blind-map.json` \u2014 the split is the load-bearing control against prompt\n  overfitting, and scoring is set membership with no human judgement, so a blind map adds nothing."
+      ]
+    },
+    {
+      "id": "tiered-review-53",
+      "present": true,
+      "quotes": [
+        "**Designs with an unrecoverable-miss class** (per-file, whole-change): recall \u2265 0.98 with Wilson\n  95% LB \u2265 0.95, target N \u2265 142 per gated cell."
+      ]
+    },
+    {
+      "id": "tiered-review-54",
+      "present": true,
+      "quotes": [
+        "**Designs whose failure degrades to baseline** (angle routing, cheap-as-explorer):\n  non-inferiority against the unaided expensive panel, cascade recall LB \u2265 0.90 of the unaided\n  panel's point estimate, target N \u2265 69."
+      ]
+    },
+    {
+      "id": "tiered-review-55",
+      "present": true,
+      "quotes": [
+        "**Gate order:** 0. N floor met, else null for that cell. 1. Instrument discriminates (NULL/FLOOD\nbracket, \u00a76.3). 2. The recall bar above. 3. Escalation/skip rate leaves a real saving. 4. Measured\nend-to-end cost < 0.80\u00d7 the non-cascade panel."
+      ]
+    },
+    {
+      "id": "tiered-review-56",
+      "present": true,
+      "quotes": [
+        "**Gate order:** 0. N floor met, else null for that cell."
+      ]
+    },
+    {
+      "id": "tiered-review-57",
+      "present": true,
+      "quotes": [
+        "4. Measured\nend-to-end cost < 0.80\u00d7 the non-cascade panel."
+      ]
+    },
+    {
+      "id": "tiered-review-58",
+      "present": true,
+      "quotes": [
+        "**Bars 1 and 2 are the ship decision.** Failing 3 or\n4 ships the code behind its off-by-default flag with the negative economics written up."
+      ]
+    },
+    {
+      "id": "tiered-review-59",
+      "present": true,
+      "quotes": [
+        "Precision,\nhint quality, context completeness, and class-3 absolute detection are reported and are **not**\ndecision inputs."
+      ]
+    },
+    {
+      "id": "tiered-review-60",
+      "present": true,
+      "quotes": [
+        "**Pooling:** the gated number is pooled across **strata** within one `(model \u00d7 class)` cell (24\nper-stratum cells is not reachable at N \u2265 142 each); pooling across **classes** is never done\n(\u00a74.1)."
+      ]
+    },
+    {
+      "id": "tiered-review-61",
+      "present": true,
+      "quotes": [
+        "Per-stratum numbers are always reported alongside pooling, and if per-stratum recall is\nmore heterogeneous than sampling explains, the pooled figure is not reported as the headline \u2014 the\ndiscrepant stratum is reported as the finding."
+      ]
+    },
+    {
+      "id": "tiered-review-62",
+      "present": true,
+      "quotes": [
+        "**Pooling:** the gated number is pooled across **strata** within one `(model \u00d7 class)` cell (24\nper-stratum cells is not reachable at N \u2265 142 each); pooling across **classes** is never done\n(\u00a74.1). Per-stratum numbers are always reported alongside pooling, and if per-stratum recall is\nmore heterogeneous than sampling explains, the pooled figure is not reported as the headline \u2014 the\ndiscrepant stratum is reported as the finding."
+      ]
+    },
+    {
+      "id": "tiered-review-63",
+      "present": true,
+      "quotes": [
+        "Stratum D and N fixtures are frozen by a MANIFEST in the shape of\n  `docs/skill-evidence/arms/MANIFEST.md`: `git hash-object --no-filters` blob SHAs, a commit cell\n  that must contain the blob at the recorded path, header-resolved columns, a test re-checking\n  every row."
+      ]
+    },
+    {
+      "id": "tiered-review-64",
+      "present": true,
+      "quotes": [
+        "Strata M and Q are frozen the same way in the private corpus directory; only row count and the\n  manifest's digest are committed to the repo."
+      ]
+    },
+    {
+      "id": "tiered-review-65",
+      "present": true,
+      "quotes": [
+        "Every cheap-tier invocation (retries included) is counted in an append-only ledger with\n  per-stage ceilings, arithmetic checked by a test."
+      ]
+    },
+    {
+      "id": "tiered-review-66",
+      "present": true,
+      "quotes": [
+        "```toml\n[review.cascade]\nenabled = false            # DEFAULT, stays off in this run regardless of result\nmode = \"<undecided>\"       # explorer | angle | file | change \u2014 set by Task 0 (\u00a73), not before.\n                            # No default ships until the measurement picks one.\ncheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\ntimeout_ms  = 120000        # expiry takes the degrade path of \u00a72\n```"
+      ]
+    },
+    {
+      "id": "tiered-review-67",
+      "present": true,
+      "quotes": [
+        "```toml\n[review.cascade]\nenabled = false            # DEFAULT, stays off in this run regardless of result\nmode = \"<undecided>\"       # explorer | angle | file | change \u2014 set by Task 0 (\u00a73), not before."
+      ]
+    },
+    {
+      "id": "tiered-review-68",
+      "present": true,
+      "quotes": [
+        "```toml\n[review.cascade]\nenabled = false            # DEFAULT, stays off in this run regardless of result\nmode = \"<undecided>\"       # explorer | angle | file | change \u2014 set by Task 0 (\u00a73), not before.\n                            # No default ships until the measurement picks one."
+      ]
+    },
+    {
+      "id": "tiered-review-69",
+      "present": true,
+      "quotes": [
+        "No default ships until the measurement picks one."
+      ]
+    },
+    {
+      "id": "tiered-review-70",
+      "present": true,
+      "quotes": [
+        "cheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\ntimeout_ms  = 120000        # expiry takes the degrade path of \u00a72\n```"
+      ]
+    },
+    {
+      "id": "tiered-review-71",
+      "present": true,
+      "quotes": [
+        "No default ships until the measurement picks one.\ncheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\ntimeout_ms  = 120000        # expiry takes the degrade path of \u00a72\n```"
+      ]
+    },
+    {
+      "id": "tiered-review-72",
+      "present": true,
+      "quotes": [
+        "The cheap tier runs **headless**, not as a herdr pane: `opencode run --agent plan -m <model>`."
+      ]
+    },
+    {
+      "id": "tiered-review-73",
+      "present": true,
+      "quotes": [
+        "Read-only is enforced via `--agent plan` with `--auto` absent, and `readonly_displace`\n(`cli/src/config.rs:589`) runs first."
+      ]
+    },
+    {
+      "id": "tiered-review-74",
+      "present": true,
+      "quotes": [
+        "Reason: every cold `opencode` reviewer pane swallows its seed and the panel cannot converge\n(`docs/known-issues.md:3437`), so the pane path is closed for this backend; `opencode run` stdout\nis a subprocess pipe, not the rendered terminal view `cli/src/code_review.rs:1` refuses to scrape.\nRead-only is enforced via `--agent plan` with `--auto` absent, and `readonly_displace`\n(`cli/src/config.rs:589`) runs first."
+      ]
+    },
+    {
+      "id": "tiered-review-75",
+      "present": true,
+      "quotes": [
+        "Cascade stage in `cli/src/code_review.rs`, behind `enabled = false`."
+      ]
+    },
+    {
+      "id": "tiered-review-76",
+      "present": true,
+      "quotes": [
+        "`docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n   (model \u00d7 stratum \u00d7 class), each bar in order, ship decisions, \u00a76.6 limitations, aggregates only."
+      ]
+    },
+    {
+      "id": "tiered-review-77",
+      "present": true,
+      "quotes": [
+        "**Guard-with-artifact throughout:** every set this run extends \u2014 config keys, the `mode` enum, the\ncheap tier's output vocabulary, ledger columns, MANIFEST rows, fixture list, the class enum \u2014 has\nits guarding test extended in the same change."
+      ]
+    },
+    {
+      "id": "tiered-review-78",
+      "present": true,
+      "quotes": [
+        "**Out, deliberately:** flipping the `enabled` default on; changing the angle set, severity model,\nmerge or resume path;"
+      ]
+    },
+    {
+      "id": "tiered-review-79",
+      "present": true,
+      "quotes": [
+        "**Out, deliberately:** flipping the `enabled` default on; changing the angle set, severity model,\nmerge or resume path; a second measurement instrument;"
+      ]
+    },
+    {
+      "id": "tiered-review-80",
+      "present": true,
+      "quotes": [
+        "**Out, deliberately:** flipping the `enabled` default on; changing the angle set, severity model,\nmerge or resume path; a second measurement instrument; fixing `docs/known-issues.md:3437` (the\nheadless cheap tier routes around it \u2014 the pane bug stays open and documented);"
+      ]
+    },
+    {
+      "id": "tiered-review-81",
+      "present": true,
+      "quotes": [
+        "**Out, deliberately:** flipping the `enabled` default on; changing the angle set, severity model,\nmerge or resume path; a second measurement instrument; fixing `docs/known-issues.md:3437` (the\nheadless cheap tier routes around it \u2014 the pane bug stays open and documented); any tier between\nqwen and opus."
+      ]
+    },
+    {
+      "id": "tiered-review-82",
+      "present": true,
+      "quotes": [
+        "Under every design in \u00a73 its output is\neither a routing decision or a context bundle, never a finding that reaches a verdict."
+      ]
+    },
+    {
+      "id": "tiered-review-83",
+      "present": true,
+      "quotes": [
+        "`ko-ag/qwen3.6-35b-abliterated` is an abliterated build (safety tuning removed) \u2014 recorded because\na writeup omitting it would describe a different experiment."
+      ]
+    },
+    {
+      "id": "tiered-review-84",
+      "present": false,
+      "quotes": []
+    }
+  ]
+}

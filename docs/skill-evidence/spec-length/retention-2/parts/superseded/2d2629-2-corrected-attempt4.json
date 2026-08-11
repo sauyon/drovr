@@ -1,0 +1,306 @@
+{
+  "spec_id": "2d2629",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-43",
+      "present": true,
+      "quotes": [
+        "Full factorial, no legs: `router_model ∈ {qwen, sonnet}` × `stratum ∈ {D, M, Q, N}` × `class ∈ {1,\n2, 3}`, plus per-file routing as a control arm."
+      ]
+    },
+    {
+      "id": "tiered-review-44",
+      "present": true,
+      "quotes": [
+        "The ship decision is per router model — a\nsonnet-routed cascade and a qwen-routed cascade are different products, tracked as separate config\nvalues (decision 9)."
+      ]
+    },
+    {
+      "id": "tiered-review-45",
+      "present": true,
+      "quotes": [
+        "**Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many\n  survive the cascade."
+      ]
+    },
+    {
+      "id": "tiered-review-46",
+      "present": true,
+      "quotes": [
+        "**Expensive-tier absolute detection rate on class 3** (does not gate): reported as the run's\n  most interesting scientific output — the ceiling of the review system as a whole."
+      ]
+    },
+    {
+      "id": "tiered-review-47",
+      "present": true,
+      "quotes": [
+        "Two synthetic, free controls bracket every metric per stratum and per class: NULL (everything\ncleared: recall 0, saving maximal) and FLOOD (everything escalated: recall 1.0, saving 0)."
+      ]
+    },
+    {
+      "id": "tiered-review-48",
+      "present": true,
+      "quotes": [
+        "A real\ncheap tier must land strictly inside the bracket on both axes, or those fixtures are rebuilt before\nscoring."
+      ]
+    },
+    {
+      "id": "tiered-review-49",
+      "present": true,
+      "quotes": [
+        "**Positive control:** re-running the expensive tier on a sample must re-find recorded\nclass-1/2 defects at a high rate, or the fixtures — not the cheap tier — are considered broken."
+      ]
+    },
+    {
+      "id": "tiered-review-50",
+      "present": true,
+      "quotes": [
+        "**Dev/held-out split** assigned before any cheap-tier prompt is written, at task/PR level (no diff\nin both sets)."
+      ]
+    },
+    {
+      "id": "tiered-review-51",
+      "present": true,
+      "quotes": [
+        "Held-out is scored once, after the prompt is frozen and its `git hash-object`\nrecorded."
+      ]
+    },
+    {
+      "id": "tiered-review-52",
+      "present": true,
+      "quotes": [
+        "There is deliberately no `blind-map.json`: the threat this run defends against is prompt\noverfitting, not scorer bias (scoring is set membership, no human judgement), and the split alone\nis the control for that threat."
+      ]
+    },
+    {
+      "id": "tiered-review-53",
+      "present": true,
+      "quotes": [
+        "**Designs with an unrecoverable-miss class** (per-file, whole-change triage): recall ≥ 0.98\n  with Wilson 95% lower bound ≥ 0.95, target N ≥ 142 per gated cell — a miss there is a defect\n  nobody ever looks at again."
+      ]
+    },
+    {
+      "id": "tiered-review-54",
+      "present": true,
+      "quotes": [
+        "**Designs whose failure degrades to baseline** (angle routing, cheap-as-explorer): non-inferiority\n  against the unaided expensive panel, cascade recall LB ≥ 0.90 of the unaided panel's point\n  estimate, target N ≥ 69 — the failure is a cost regression, not a lost defect, so demanding 0.95\n  LB there buys nothing and costs a corpus."
+      ]
+    },
+    {
+      "id": "tiered-review-55",
+      "present": true,
+      "quotes": [
+        "**1.**\nInstrument discriminates (below, decision 6).",
+        "**2.** The recall bar above.",
+        "**3.** Escalation/skip\nrate leaves a real saving."
+      ]
+    },
+    {
+      "id": "tiered-review-56",
+      "present": true,
+      "quotes": [
+        "Gate order, applied in sequence: **0.** N floor met, else the cell is reported null."
+      ]
+    },
+    {
+      "id": "tiered-review-57",
+      "present": true,
+      "quotes": [
+        "**4.** Measured end-to-end cost < 0.80× the non-cascade panel."
+      ]
+    },
+    {
+      "id": "tiered-review-58",
+      "present": true,
+      "quotes": [
+        "Bars 1\nand 2 are the ship decision; failing 3 or 4 ships the code behind `enabled = false` with the\nnegative economics written up."
+      ]
+    },
+    {
+      "id": "tiered-review-59",
+      "present": true,
+      "quotes": [
+        "Precision, hint quality, context completeness, and class-3 absolute\ndetection are reported but are not decision inputs."
+      ]
+    },
+    {
+      "id": "tiered-review-60",
+      "present": true,
+      "quotes": [
+        "**N is pooled across strata within one `(model × class)` cell** (not per `(model × stratum ×\nclass)`, which would be 24 unreachable cells) — pooling across strata buys power; pooling across\n*classes* is never done (decision 3's classes are never pooled)."
+      ]
+    },
+    {
+      "id": "tiered-review-61",
+      "present": true,
+      "quotes": [
+        "Per-stratum numbers are always\nreported alongside;"
+      ]
+    },
+    {
+      "id": "tiered-review-62",
+      "present": true,
+      "quotes": [
+        "Per-stratum numbers are always\nreported alongside; if per-stratum recall is more heterogeneous than sampling explains, the pooled\nfigure is not reported as the headline and the discrepant stratum is reported as its own finding."
+      ]
+    },
+    {
+      "id": "tiered-review-63",
+      "present": true,
+      "quotes": [
+        "Stratum D and N fixtures are frozen by a MANIFEST (shape of `docs/skill-evidence/arms/MANIFEST.md`):\n`git hash-object --no-filters` blob SHAs, a commit cell that must contain the blob at the recorded\npath, header-resolved columns, a test re-checking every row."
+      ]
+    },
+    {
+      "id": "tiered-review-64",
+      "present": true,
+      "quotes": [
+        "Strata M and Q are frozen the same way\nin the private corpus directory, with only the row count and the manifest's digest committed."
+      ]
+    },
+    {
+      "id": "tiered-review-65",
+      "present": true,
+      "quotes": [
+        "Every cheap-tier invocation is counted in an append-only ledger with per-stage ceilings; the\nledger's arithmetic is checked by a test. Retries count toward the ledger."
+      ]
+    },
+    {
+      "id": "tiered-review-66",
+      "present": true,
+      "quotes": [
+        "**Config surface** (`[review.cascade]` in drovr's TOML config):\n  ```toml\n  [review.cascade]\n  enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before\n  cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)\n  ```\n  `router_agent`/`router_model` are separate config keys from the expensive-tier equivalents,\n  because the ship decision is per router model (decision 8)."
+      ]
+    },
+    {
+      "id": "tiered-review-67",
+      "present": true,
+      "quotes": [
+        "```toml\n  [review.cascade]\n  enabled = false            # default;",
+        "Flipping `enabled` to `true` by default."
+      ]
+    },
+    {
+      "id": "tiered-review-68",
+      "present": true,
+      "quotes": [
+        "```toml\n  [review.cascade]\n  enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before\n  cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)\n  ```\n  `router_agent`/`router_model` are separate config keys from the expensive-tier equivalents,\n  because the ship decision is per router model (decision 8)."
+      ]
+    },
+    {
+      "id": "tiered-review-69",
+      "present": true,
+      "quotes": [
+        "The design question — route by explored-context, by angle, or by file — is resolved by a\npre-registered decision rule, not by argument.",
+        "**Reason:** each design's viability depends on where review cost actually goes, which is unknown\nuntil measured; committing to a design before Task 0 runs would be choosing the answer before the\nquestion is asked."
+      ]
+    },
+    {
+      "id": "tiered-review-70",
+      "present": true,
+      "quotes": [
+        "```toml\n  [review.cascade]\n  enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before\n  cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)\n  ```\n  `router_agent`/`router_model` are separate config keys from the expensive-tier equivalents,\n  because the ship decision is per router model (decision 8).\n- **Cheap-tier execution contract:** headless only — `opencode run --agent plan -m <model>`, not a\n  herdr pane."
+      ]
+    },
+    {
+      "id": "tiered-review-71",
+      "present": true,
+      "quotes": [
+        "**Config surface** (`[review.cascade]` in drovr's TOML config):\n  ```toml\n  [review.cascade]\n  enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before\n  cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)\n  ```\n  `router_agent`/`router_model` are separate config keys from the expensive-tier equivalents,\n  because the ship decision is per router model (decision 8).\n- **Cheap-tier execution contract:** headless only — `opencode run --agent plan -m <model>`, not a\n  herdr pane."
+      ]
+    },
+    {
+      "id": "tiered-review-72",
+      "present": true,
+      "quotes": [
+        "**Cheap-tier execution contract:** headless only — `opencode run --agent plan -m <model>`, not a\n  herdr pane."
+      ]
+    },
+    {
+      "id": "tiered-review-73",
+      "present": true,
+      "quotes": [
+        "Read-only via `--agent plan` with `--auto` absent;"
+      ]
+    },
+    {
+      "id": "tiered-review-74",
+      "present": true,
+      "quotes": [
+        "Read-only via `--agent plan` with `--auto` absent; the\n  existing `readonly_displace` protection (`cli/src/config.rs:589`) runs first, unmodified."
+      ]
+    },
+    {
+      "id": "tiered-review-75",
+      "present": true,
+      "quotes": [
+        "**Cascade integration point:** a new stage in `cli/src/code_review.rs`, shipped behind\n  `enabled = false`, alongside the existing per-angle `AgentLaunch` fan-out driven by `cfg.angles`\n  (`cli/src/config.rs:436`)."
+      ]
+    },
+    {
+      "id": "tiered-review-76",
+      "present": true,
+      "quotes": [
+        "(8)\n`docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n`(model × stratum × class)`, each gate in order, ship decisions, stated limitations, aggregates\nonly — no private-repo content."
+      ]
+    },
+    {
+      "id": "tiered-review-77",
+      "present": true,
+      "quotes": [
+        "**Guard-with-artifact applies throughout this run:** every set it extends — config keys, the\n`mode` enum, the cheap tier's output vocabulary, ledger columns, MANIFEST rows, fixture list, the\nclass enum — gets its guarding test extended in the same change that extends it."
+      ]
+    },
+    {
+      "id": "tiered-review-78",
+      "present": true,
+      "quotes": [
+        "Changing the angle set, severity model, or the merge/resume path."
+      ]
+    },
+    {
+      "id": "tiered-review-79",
+      "present": true,
+      "quotes": [
+        "A second measurement instrument beyond this run's design."
+      ]
+    },
+    {
+      "id": "tiered-review-80",
+      "present": true,
+      "quotes": [
+        "Fixing the `opencode` cold-pane seed-swallowing bug (`docs/known-issues.md:3437`) — the headless\n  cheap tier routes around it; the pane bug stays open and documented, not fixed, by this run."
+      ]
+    },
+    {
+      "id": "tiered-review-81",
+      "present": true,
+      "quotes": [
+        "Any tier between qwen and opus (e.g. an intermediate-cost model)."
+      ]
+    },
+    {
+      "id": "tiered-review-82",
+      "present": true,
+      "quotes": [
+        "**Cheap-tier output contract:** under every design, the cheap tier's output is either a routing\n  decision or a context bundle — never a finding that reaches a verdict on its own."
+      ]
+    },
+    {
+      "id": "tiered-review-83",
+      "present": true,
+      "quotes": [
+        "Notes carried for the record",
+        "`ko-ag/qwen3.6-35b-abliterated` is an abliterated build (safety tuning removed)."
+      ]
+    },
+    {
+      "id": "tiered-review-84",
+      "present": true,
+      "quotes": [
+        "Decisions log (gate, 2026-08-06, turn 1)",
+        "No open questions remain from this gate. Anything discovered during the plan phase that these\ndecisions do not cover is a new question for a new gate, not a gap in this spec."
+      ]
+    }
+  ]
+}
