@@ -827,8 +827,15 @@ land rather than discovering this at review.
 
 ### 9.7 Corrections made to this file during T5b's review, consolidated
 
-**Why this list exists.** Twelve review rounds found twenty-four things, and almost all of them were
-this document describing itself wrongly rather than the data being wrong. Recording each one inline
+**Why this list exists.** T5b's review rounds found something in every round, and almost all of it
+was this document describing itself wrongly rather than the data being wrong.
+
+**No count of rounds or findings is stated here, and that is deliberate.** An earlier version opened
+"twelve review rounds found twenty-four things", which the next round's own fix made false — a
+tally of review inside the artifact under review goes stale the moment it is acted on, and both
+angles caught it in the same round. **The table below is the authority on what was corrected**; it
+grows by a row when something is corrected, which is a count that maintains itself. A reader wanting
+the round-by-round history has `git log`, which cannot drift. Recording each one inline
 started to crowd out the record it was attached to — a reviewer said so — so the **drafting-history
 minutiae live here**.
 
