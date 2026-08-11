@@ -48,19 +48,24 @@ The rule was written against a span **clipped at a hard wrap**, leaving one frag
 mid-phrase and one beginning mid-phrase. `invalidated/db3e2d.json` is item 8's worked example of it.
 
 **None of the 13 has that shape.** Every one of them is a *complete* unit — a whole bullet, a whole
-numbered item, a whole line-block — refused at its right-hand end on a markup delimiter:
+numbered item, a whole line-block — refused over a markup delimiter:
 
-| shape | count | example ending |
+| shape | count | example |
 |---|---|---|
-| sentence-final `.` followed by a closing `**` | 6 | `…marked \`[tier 4]\`.**` |
-| sentence-final `.` followed by a closing `*"` | 3 | `…before claiming done."*` |
+| sentence closing inside a `**…**` emphasis run | 6 | `…marked \`[tier 4]\`.**` |
+| sentence closing inside a `*"…"*` quoted run | 3 | `…before claiming done."*` |
 | fixed-width line-block row, no terminal punctuation | 4 | `ONLY: tdd, systematic-debugging` |
 
-Item 8 requires a span's last character to be one of `.!?:;`, or end-of-line with the next line blank
-or opening a new block, or be followed by `|`. **A bullet whose sentence ends inside an emphasis run
-closes on `**`, not on the full stop, and is refused** — which is exactly the third strictness T2
-found while writing the check and asserted as a refusal rather than loosening. Bold-led and
-bold-closed bullets are everywhere in this corpus.
+**The mechanism runs through BOTH ends, which a first reading of these misses.** Item 8 requires a
+span's last character to be one of `.!?:;` (or end-of-line before a new block, or `|`) — so a bullet
+whose sentence ends inside an emphasis run closes on `*`, not on the full stop. **And** it requires
+a span that opens its own line to have a *preceding* line that is blank, a heading, a table row, or
+ends in `.!?:;` — so one bullet ending `."*` also disqualifies the bullet **after** it. In a list of
+such bullets each line breaks its neighbour. That is why the refusals cluster.
+
+This is the third strictness T2 found while writing the check and asserted as a refusal rather than
+loosening. Bold-led and bold-closed lines are everywhere in this corpus. §3a measures how far it
+reaches.
 
 **This is recorded, not repaired.** `PROTOCOL-2.md` is frozen and item 10's template is frozen; the
 scorer prompt cannot be given an extra hint about emphasis runs, and the check cannot be relaxed. A
@@ -108,12 +113,102 @@ and no test recurses into it.
 
 ## 3. Re-run log
 
-Every `R6` re-run of a tier-1 shard in this attempt, in dispatch order. **Reason is always the
-protocol trigger, never an outcome.**
+Every `R6` re-run of a tier-1 shard in this attempt. **Reason is always the protocol trigger, never
+an outcome.** Rounds map to attempts unevenly because `66530f` ran once alone as the §1 calibration
+probe:
 
-| # | shard | attempt | trigger | outcome |
+| round | shards dispatched | attempt no. | trigger | outcome |
 |---|---|---|---|---|
-| — | — | — | — | *(appended as re-runs are dispatched)* |
+| 0 | `66530f` ×2 | 1 | first run — the §1 calibration probe | **failed** the item-8 check, 13 refusals |
+| 1 | `66530f` ×2 | 2 | `R6` — verdict failed the item-8 mechanical check | **failed**, 16 refusals |
+| 1 | the other five ×2 each | 1 | first run | **all five failed**, 8–20 refusals each |
+| 2 | `66530f` ×2 | 3 | `R6` — same trigger; **cap of §2.1 now exhausted** | **failed**, 14 refusals |
+| 2 | the other five ×2 each | 2 | `R6` — same trigger | **all five failed**, 13–21 refusals each |
+
+**Fourteen shard-pair attempts. 1581 spans written, 194 refused (12.3%). Zero passing verdicts.**
+
+| generation | attempt 1 | attempt 2 | attempt 3 |
+|---|---|---|---|
+| `66530f` | 13 / 128 | 16 / 134 | 14 / 132 |
+| `6e7393` | 16 / 125 | 19 / 129 | — |
+| `e085f2` | 20 / 123 | 21 / 121 | — |
+| `e790f5` | 8 / 137 | 15 / 146 | — |
+| `fd2c24` | 17 / 138 | 19 / 141 | — |
+| `fe4059` | 16 / 128 | 13 / 127 | — |
+
+*(refused spans / spans written. A verdict passes only at **zero**.)*
+
+**The re-runs do not converge, and they were never going to.** The refusal rate is flat across
+attempts and across generations; the best single attempt in the whole set still carried 8 refusals
+where a pass requires 0. Each raw failure report — naming every refused span — is committed under
+`retention-2/parts/superseded/refusal-reports/`, and every shard of every attempt is beside it.
+
+**The last permitted re-run was not spent, and here is why that is not outcome-shaping.** §2.1 allows
+two re-runs per shard; `66530f` used both and is terminal under §2.4. T5a's verification requires
+**all six** verdicts to pass, so no result from a third attempt on the other five could change this
+task's outcome. And the asymmetry that matters: stopping early here leaves every verdict **failing**,
+which is the outcome least favourable to producing any measurement at all. A stopping rule can only
+be accused of chasing a result when stopping helps; this one costs.
+
+---
+
+## 3a. The finding: the tier-1 instrument cannot be cleared on this corpus
+
+**Item 10's frozen prompt instructs the scorer to produce spans that item 8's frozen rule refuses.**
+The prompt says a span *"must begin at the start of a sentence, table cell, list item, heading or
+line-block, and end at the end of one"*. Every refused span above satisfies that description. Item 8's
+mechanical rule then applies a different test — one written in terms of raw characters:
+
+- a span **begins** on a boundary only if the **preceding line** is blank, a heading, a table row, or
+  ends in one of `.!?:;`;
+- a span **ends** on a boundary only if its **last character** is one of `.!?:;`, or it ends at
+  end-of-line with the next line blank or opening a new block, or it is followed by `|`.
+
+**Neither end sees through a closing markup delimiter.** A sentence that ends `done."*` or
+`[tier 4]`.**` terminates in `*`, not in `.`. That breaks the right-hand test for the span itself,
+**and** the left-hand test for whatever span begins on the following line. In a corpus written in
+bold-led bullets, quoted announcement strings and fixed-width line-blocks, that is not a rare shape.
+
+**What the instrument admits, measured.** Citing every distinct non-blank line of each generated spec
+as a candidate span and running the authoritative check over the result:
+
+| generation | distinct non-blank lines | admissible | admitted |
+|---|---|---|---|
+| `66530f` | 517 | 121 | 23.4% |
+| `6e7393` | 431 | 100 | 23.2% |
+| `e085f2` | 346 | 101 | 29.2% |
+| `e790f5` | 463 | 124 | 26.8% |
+| `fd2c24` | 636 | 123 | 19.3% |
+| `fe4059` | 341 | 100 | 29.3% |
+| **total** | **2734** | **669** | **24.5%** |
+
+**Three of every four complete lines of a generated spec cannot be quoted at all.** A verdict must
+evidence 91 rows, and only 100–124 admissible lines exist per document — so the scorer must not
+merely find admissible spans, it must find admissible spans that also happen to be the ones
+evidencing the specific rows. Admissibility and relevance are close to orthogonal, and the margin
+between them is about zero.
+
+**Two honest bounds on that 24.5%.** It measures **whole lines**, which is the strategy item 10's
+prompt tells the scorer to use (*"quote the whole sentence"*); admissible sub-line spans exist — a
+sentence preceded by `. ` on the same line qualifies — so 24.5% is not a census of every admissible
+substring. And it is a property of this corpus's markup, not a claim about prose in general.
+
+**This is the first attempt's failure, relocated.** `RESULTS.md`'s null was *about the instrument*:
+frozen item 8a made every verdict ~1% passable by construction, so no arm could pass and the control
+could not either. **The redesign fixed 8a and did not touch this.** Item 8's self-containment rule is
+new to this attempt, and it now makes every verdict **0%** passable at the mechanical gate — a
+stricter failure than the one it replaced, at an earlier tier.
+
+**It is arm-symmetric, and that is the one consolation.** The admitted rate varies from 19.3% to
+29.3% with no relation to any arm, and the refusal rate is flat across all fourteen attempts. So it
+does not bias a comparison between arms. **It prevents there being a comparison at all.**
+
+**Nothing was adjusted to get past it.** `PROTOCOL-2.md` is frozen and stays frozen; item 10's
+template was delivered byte-identical on every attempt; the check was not weakened; no span was
+patched. Per the driver's standing constraint, a wrong protocol is a finding to report, not a file to
+adjust. **T5a therefore reports a blocked task rather than a scored one**, and `retention-2/` is left
+holding no verdict, because a verdict the instrument refused is not evidence of retention and must
+not sit there as though it were.
 
 ---
 
