@@ -415,7 +415,7 @@ carries `.git`; that is a known remaining hole.
 list for T5c.** Item 1 (use the corrected builder) was followed; item 2 (wait for the §5 decision)
 was resolved by §5a and executed as §2b; item 3 (the admissibility tool is hardcoded) is fixed —
 the tool now takes a required fixture argument. **Items 4–8 are still open and are re-listed
-verbatim in substance as §9.5a items 7–11**, alongside T5b's own additions in §9.5 items 1–6.
+verbatim in substance as §9.5a items 8–12**, alongside T5b's own additions in §9.5 items 1–7.
 Nothing here is deleted, because the list is also the record of what each task was told.
 
 1. **Use the corrected `tools/build-tier1-prompts.py`** — it hands over item 8. Do not rebuild prompts
@@ -705,28 +705,33 @@ prompt directory.
 **§7's preface says items 4–8 are re-listed here, and an earlier draft of §9.5 did not actually
 re-list them.** Review caught that: four obligations, one of them a decision that blocks T9, were
 named as carried and then dropped. They are below, verbatim in substance from §7, so that a reader
-of §9 alone still meets them. **T5b discharged §7 items 1–3 and NONE of these.**
+of §9 alone still meets them. **T5b discharged §7 items 1–3 and NONE of these.** They are numbered
+8–12 to continue §9.5's list rather than restart it, because an earlier draft had two different
+"item 7"s in the same section.
 
-7. **(§7 item 4) The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md`
+**§9.5's items 1–7 are T5b's own; §9.5a's items 8–12 are §7's items 4–8 carried.** One numbering,
+two provenances, tagged per item.
+
+8. **(§7 item 4) The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md`
    §7.5's, reproduced. It belongs in `RESULTS-2.md` beside the tier-2 and tier-3 outcomes, and no
    tier-1 number may be published without it. **§9.3 narrows it to `skill-stickiness` and does not
    withdraw it.**
-8. **(§7 item 5) Four obligations owed to T8 from `GENERATION-2-NOTES.md`'s six-row table remain
+9. **(§7 item 5) Four obligations owed to T8 from `GENERATION-2-NOTES.md`'s six-row table remain
    open:** flag both `R5a` generations and read neither as a win; **do not read `fd2c24`'s retention
    as evidence** — and note `fd2c24` never cleared the gate under the extended cap either, so there
    is no verdict to misread, which discharges nothing; log the early publication of the `wc`/`R5a`
    figures as a deviation; and — after the join — report whether generation titles track the arm.
-9. **(§7 item 6) T4's still-open questions, which nothing else keeps alive:** the title-variance
+10. **(§7 item 6) T4's still-open questions, which nothing else keeps alive:** the title-variance
    channel (owed by T8 and the write-up); **whether re-dispatching two transmission questions was
    right — decide before T9; the revert is `git revert 6268365`**; the 20 freeze rows are not checked
    for completeness; and the leak check tells a reader to "re-run under `R6`" for a case `R6`'s
    closed trigger list does not cover.
-10. **(§7 item 7) A frozen-instrument inconsistency.** Item 9's first blockquote — handed verbatim to
+11. **(§7 item 7) A frozen-instrument inconsistency.** Item 9's first blockquote — handed verbatim to
     every scorer, including all 96 of T5b's dispatches — says a paraphrase *"may be evidenced by up
     to three spans"* while the same prompt's rules say **1 to 5**. Scorers followed the rules. With
     §2a this is the second place item 10's template and the items it claims to carry disagree, and
     they belong together as one finding about item 10.
-11. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
+12. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
     rests on `tools/build-tier1-prompts.py` being deterministic — checkable by re-running it, not by
     diffing an artifact. T5b built and dispatched from that builder and added no prompt artifact.
 
@@ -741,11 +746,14 @@ and **every one of `b49ff1-1`'s six attempts is distinct**.
 
 **What is established, and what is not.**
 
-- **A dispatch did happen.** The round-11 batch was dispatched, its agent reported writing the
-  shard, my poll saw 12 of 12 files present before assembly, and `attempt4`'s mtime (`12:30:23`)
-  sits in round 11's window, well after `attempt2`'s (`12:12:49`). The file that
-  `corrected-round11.txt` gate-tested is this file. **This is not a mislabelled archive of an older
-  attempt.**
+- **A dispatch happened — but note which parts of that a reader can check.** **Checkable from the
+  repository:** `corrected-round11.txt` gate-tested this content, so the file was in place for round
+  11 and is not a mislabelled archive of an older attempt. **NOT checkable, and offered as the
+  author's word in the same terms §2 uses:** that the round-11 batch was dispatched, that its agent
+  reported writing the shard, and that my poll saw 12 of 12 files before assembly — a subagent
+  dispatch leaves no trace in the repository. **Mtimes are weaker still**: `attempt4`'s `12:30:23`
+  sits in round 11's window well after `attempt2`'s `12:12:49`, but **git does not record mtimes**,
+  so that evidence exists only in this working tree and vanishes on a fresh clone.
 - **Whether the CONTENT is an independent draw is not established.** Two candidate explanations, and
   this file picks neither: a scorer genuinely re-emitting ~10.8 KB of quoted prose byte-for-byte two
   rounds later, with a different attempt 3 in between; or the dispatch returning a cached completion
@@ -770,6 +778,10 @@ and **every one of `b49ff1-1`'s six attempts is distinct**.
   the re-run budget can buy strictly nothing. §8.1's "it does not converge" reading is unchanged;
   this is one more reason not to read a re-run count as a measurement.
 
-**Recorded under `R6a`** — *"you may never silently accept a verdict you believe is wrong … record
-the specific doubt and carry it into the write-up"*. **`RESULTS-2.md` must carry it**, and T5c
-should hash its own shards as they land rather than discovering this at review.
+**Recorded in the SPIRIT of `R6a`, and the citation is an analogy — say so rather than lean on
+it.** `R6a`'s literal precondition is *"if a verdict is schema-valid, passes adjudication, and still
+looks wrong on inspection"*, and **none of that holds here**: `b49ff1` is missing data, it never
+passed the mechanical gate, and there is no adjudication in tier 1 at all. What carries over is
+`R6a`'s *instruction* — **record the specific doubt rather than quietly accept or quietly re-roll**
+— which fits exactly. **`RESULTS-2.md` must carry it**, and T5c should hash its own shards as they
+land rather than discovering this at review.
