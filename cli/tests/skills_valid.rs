@@ -3794,54 +3794,51 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// Byte offset, within `line`, of its first non-marker character —
-/// `PROTOCOL-2.md` item 8's *"markers being leading whitespace, a run of `#`, a
-/// `-`, `*` or `+` bullet, a `>`, a `|`, or `<digits>.`"*.
+/// Is everything from the start of a line up to a span made only of the markers
+/// `PROTOCOL-2.md` item 8 lists — *"leading whitespace, a run of `#`, a `-`, `*`
+/// or `+` bullet, a `>`, a `|`, or `<digits>.`"*?
 ///
-/// **A `-`, `*` or `+` counts as a bullet only when a space follows it, and that
-/// reading is deliberate.** Without it, `- **Loop** (…)` — a real line of
-/// `generated/db3e2d.md` — has its `**` eaten as two bullet markers, so a span
-/// starting at the bold text would be judged to start at a marker while a span
-/// starting *inside* the bold run would be judged to start on a boundary. The
-/// frozen rule says *"bullet"*, and a bullet in markdown is followed by a space;
-/// an emphasis run is not.
-fn first_non_marker(line: &str) -> usize {
-    let b = line.as_bytes();
+/// This is the frozen rule's *"it starts at the first non-marker character of
+/// its line"* clause, asked as a predicate over the prefix rather than by
+/// computing one canonical offset — **because "the first non-marker character"
+/// is ambiguous on a line that opens `- **Bold lead.** …`, and the two readings
+/// disagree about opposite spans.**
+///
+/// Read `*` as a bullet only when a space follows it and the marker run stops at
+/// the `-`, so a span beginning at `**Bold` is on a boundary and one beginning at
+/// `Bold` is not. Read `*` as a marker unconditionally and it is the other way
+/// round. Neither reading is what the rule is *for*: it exists to refuse spans
+/// that start mid-phrase, and both `**Bold` and `Bold` start the line's content.
+/// So the prefix predicate accepts either — everything before the span is
+/// formatting — which is the union of the two readings and refuses exactly what
+/// both refuse.
+///
+/// **This is not a loosening chosen to make a corpus pass.** Measured against
+/// the first attempt's 1268 real spans, picking one reading over the other moves
+/// the refusal rate by a few points and the union by a few more; the number that
+/// matters (§6 of the task report) is large under all three, and it is reported
+/// rather than engineered away.
+fn line_prefix_is_all_markers(prefix: &str) -> bool {
+    let b = prefix.as_bytes();
     let mut i = 0;
-    loop {
-        let before = i;
-        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-            i += 1;
-        }
-        if i < b.len() {
-            match b[i] {
-                b'#' => {
-                    while i < b.len() && b[i] == b'#' {
-                        i += 1;
-                    }
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'#' | b'-' | b'*' | b'+' | b'>' | b'|' => i += 1,
+            b'0'..=b'9' => {
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
                 }
-                b'-' | b'*' | b'+' => {
-                    if i + 1 >= b.len() || b[i + 1] == b' ' || b[i + 1] == b'\t' {
-                        i += 1;
-                    }
+                if j < b.len() && b[j] == b'.' {
+                    i = j + 1;
+                } else {
+                    return false;
                 }
-                b'>' | b'|' => i += 1,
-                b'0'..=b'9' => {
-                    let mut j = i;
-                    while j < b.len() && b[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    if j < b.len() && b[j] == b'.' {
-                        i = j + 1;
-                    }
-                }
-                _ => {}
             }
-        }
-        if i == before {
-            return i;
+            _ => return false,
         }
     }
+    true
 }
 
 /// Does the occurrence of a span starting at `at` begin on a boundary?
@@ -3870,8 +3867,8 @@ fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
         return true;
     }
 
-    let (line_start, line_end) = line_bounds(spec, at);
-    if line_start + first_non_marker(&spec[line_start..line_end]) != at {
+    let (line_start, _) = line_bounds(spec, at);
+    if !line_prefix_is_all_markers(&spec[line_start..at]) {
         return false;
     }
     // The span opens its own line. Whether that is a boundary depends on what
@@ -8073,8 +8070,15 @@ fn spec_length_2_gate_arithmetic_matches_the_records() {
 /// **Never vacuous:** inline fixtures, no repository state.
 #[test]
 fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
-    // `generated/db3e2d.md:450-453`, verbatim.
+    // `generated/db3e2d.md:446-453`, verbatim — the whole bullet the clip came
+    // out of, plus the line above it, because the rule's left-hand clauses read
+    // the preceding line and a fixture that started at the clip would be asking
+    // an easier question than the real one.
     let clipped = "\
+  violates the rule without the skill; GREEN ↔ it complies with the skill; REFACTOR ↔ close each
+  new loophole.
+- **Loop** (fenced `dot` flowchart, a stop-too-early loop per §2.3): build the scenario set → run
+  the baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on
   held-out scenarios → apply the four-part closure to each new rationalization → repeat until a
   run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever
   comes first. The ceiling is not optional — an uncapped loop is the unbounded-cost defect this
@@ -8097,6 +8101,50 @@ fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
          the trap. It begins its line, but the line before it ends in `whichever`, so it \
          starts mid-phrase. A rule that only looked rightwards would accept this half and \
          reject the other, making the catch depend on which half was quoted."
+    );
+
+    // **And the rule is satisfiable on the very same text**, which is the half
+    // that stops it being a rule nothing can pass — but note WHERE the
+    // satisfying quote has to start, because that is the rule's real cost.
+    //
+    // Gluing the two fragments back together is **still refused**: the clause
+    // `run produces no new rationalization … comes first.` ends cleanly but
+    // begins in the middle of a sentence that started three lines earlier. The
+    // quote that passes is the whole bullet, from `**Loop**` to `comes first.`,
+    // newlines and all. So the rule does not merely forbid clipping at a wrap —
+    // it requires the scorer to carry the span back to the start of its
+    // sentence, which on hard-wrapped prose means multi-line spans are the
+    // normal case rather than the exception. Item 10 puts the rule in the tier-1
+    // prompt so a scorer is told this before writing a verdict rather than after
+    // one is refused. §6 of the task report carries the measurement.
+    // The wrap carries the next line's two-space continuation indent, so the
+    // regluing has to reproduce it or the fixture is checking its own typo.
+    let reglued = format!("{left_half}\n  {right_half}");
+    assert!(
+        clipped.contains(&reglued),
+        "the two fragments really are adjacent across the wrap"
+    );
+    assert!(
+        !span_is_self_contained(clipped, &reglued),
+        "gluing the halves back together is NOT enough — the clause still opens mid-sentence, \
+         and a rule that accepted it here would accept the same clip wherever a scorer chose \
+         to start reading"
+    );
+    let whole_bullet = "**Loop** (fenced `dot` flowchart, a stop-too-early loop per §2.3): build \
+the scenario set → run
+  the baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on
+  held-out scenarios → apply the four-part closure to each new rationalization → repeat until a
+  run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever
+  comes first.";
+    assert!(
+        clipped.contains(whole_bullet),
+        "the whole-bullet fixture must be the real bytes"
+    );
+    assert!(
+        span_is_self_contained(clipped, whole_bullet),
+        "the bullet quoted WHOLE must be ACCEPTED. Something has to pass, or every verdict is \
+         re-run under `R6` forever — the same fails-by-construction shape as the first \
+         attempt's item 8a, which is the thing this second attempt exists to escape."
     );
 
     // A document whose spans are lifted whole.
