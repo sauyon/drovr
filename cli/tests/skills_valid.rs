@@ -3764,14 +3764,37 @@ fn retention_ledger_path(name: &str) -> Result<PathBuf, String> {
 struct RetentionRules {
     /// The upper bound on `quotes` for a `present: true` row.
     max_spans: usize,
-    /// Does `PROTOCOL-2.md` item 8's self-containment rule apply?
-    self_contained_spans: bool,
+    /// Which protocol's span self-containment rule applies.
+    boundaries: SpanBoundaryRule,
+    /// **`PROTOCOL-3.md` §3's disposition.** When true, a boundary refusal and a
+    /// shared span are *class B* — row-local, escalated to tier 3, and never
+    /// fatal. When false they are whole-file failures under `R6`, which is what
+    /// `PROTOCOL.md` and `PROTOCOL-2.md` both say and what the second attempt's
+    /// record must keep meaning.
+    class_b_is_row_local: bool,
+}
+
+/// Which revision of item 8's span self-containment rule to apply.
+///
+/// **An enum rather than a second `bool`**, for the reason the struct exists at
+/// all: the rule now has three states, and a pair of booleans would make
+/// `(false, true)` representable and meaningless.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpanBoundaryRule {
+    /// `PROTOCOL.md` item 8: no boundary rule at all.
+    Off,
+    /// `PROTOCOL-2.md` item 8, as frozen.
+    V2,
+    /// `PROTOCOL-3.md` §2: the v2 rule plus clauses F, M and E. Strictly wider —
+    /// [`retention_3_span_rule_accepts_everything_v2_accepted`] proves it.
+    V3,
 }
 
 /// `PROTOCOL.md` item 8: 1–3 spans, no boundary rule.
 const RETENTION_RULES_V1: RetentionRules = RetentionRules {
     max_spans: 3,
-    self_contained_spans: false,
+    boundaries: SpanBoundaryRule::Off,
+    class_b_is_row_local: false,
 };
 
 /// `PROTOCOL-2.md` item 8: 1–5 spans, and every span self-contained.
@@ -3783,7 +3806,20 @@ const RETENTION_RULES_V1: RetentionRules = RetentionRules {
 /// mechanical rules passed both halves of it.
 const RETENTION_RULES_V2: RetentionRules = RetentionRules {
     max_spans: 5,
-    self_contained_spans: true,
+    boundaries: SpanBoundaryRule::V2,
+    class_b_is_row_local: false,
+};
+
+/// `PROTOCOL-3.md`: the v2 cap and rule, with clauses F, M and E added to the
+/// span rule and item 8's disposition split into class A and class B.
+///
+/// **The cap does not move.** Nothing in the third revision's diagnosis is about
+/// how many spans a row needs; `SCORING-2-NOTES.md` records 1946 spans written
+/// under the corrected v2 prompt and the span-count rule refused none of them.
+const RETENTION_RULES_V3: RetentionRules = RetentionRules {
+    max_spans: 5,
+    boundaries: SpanBoundaryRule::V3,
+    class_b_is_row_local: true,
 };
 
 /// The byte range `[start, end)` of the line containing offset `at`, excluding
@@ -3861,6 +3897,84 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
 ///
 /// A review round tried and failed to construct a mid-phrase span that any of
 /// these lets through; the marker alphabet contains no letters, which is why.
+/// `PROTOCOL-3.md` §2 clause E: strip a trailing run of emphasis and closing
+/// punctuation, so a terminator test sees the sentence rather than the markup
+/// wrapped around it.
+///
+/// `…the rule applies."` and `**…the rule applies.**` are sentences that end. The
+/// full stop is the sentence's; the quotation mark and the emphasis run are
+/// markup. `SCORING-2-NOTES.md` §3b recorded the same-line clause failing on
+/// exactly this, and 69 of the 178 recorded refusals sit in a shape where the
+/// character in the way is one of these.
+///
+/// **This cannot invent a terminator.** It only uncovers one that is already
+/// there — a span clipped mid-phrase has no terminator under its closers, which
+/// is why [`retention_3_span_rule_still_refuses_the_db3e2d_clip`] stays green.
+fn strip_trailing_closers(text: &str) -> &str {
+    text.trim_end_matches(['*', '_', '`', '"', '\'', ')', ']', '}'])
+}
+
+/// The byte ranges strictly **inside** each fenced code block — `PROTOCOL-3.md`
+/// §2 clause F's subject.
+///
+/// A block runs from the line after an opening ` ``` ` line to the line before
+/// the matching closing one; **the two fence lines are not inside it**, which is
+/// why a span straddling a fence is judged by the prose clauses exactly as
+/// before. An unterminated fence opens no block, so a stray ` ``` ` cannot make
+/// the rest of a document uncheckable.
+fn fenced_interiors(spec: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut at = 0usize;
+    for line in spec.split_inclusive('\n') {
+        let is_fence = line.trim_start().starts_with("```");
+        if is_fence {
+            match open.take() {
+                None => open = Some(at + line.len()),
+                Some(start) => {
+                    if start <= at {
+                        out.push((start, at));
+                    }
+                }
+            }
+        }
+        at += line.len();
+    }
+    out
+}
+
+/// `PROTOCOL-3.md` §2 clause F: does the occurrence `[at, end)` lie wholly inside
+/// one fenced code block, starting at the first non-whitespace character of its
+/// line and ending at end of line?
+///
+/// **Why fenced code needs its own clause at all.** Item 8's rule is written
+/// entirely in prose sentence terms — a terminator in `.!?:;`, a blank or
+/// block-opening neighbouring line, a table pipe — and a line of a configuration
+/// block satisfies none of them on either end. So a ledger row whose operative
+/// content is a config key, an enum or a template string is **uncitable by
+/// construction**, identically for every arm: `tiered-review-67`, `-68`, `-70`
+/// and `-71` were refused 56 times between them across the second attempt's
+/// corrected rounds, and `skill-stickiness-46` 38 times on its own.
+///
+/// **Why this is not a hole.** The failure item 8 was written against is a span
+/// clipped across a hard wrap in *prose*. Fenced code is not hard-wrapped prose:
+/// its line breaks are the author's and each line is a unit. This clause demands
+/// whole lines on both ends, so a mid-line clip inside a fence is refused exactly
+/// as a prose clip is.
+fn fenced_occurrence_is_whole_lines(spec: &str, at: usize, end: usize) -> bool {
+    if !fenced_interiors(spec)
+        .iter()
+        .any(|(s, e)| at >= *s && end <= *e)
+    {
+        return false;
+    }
+    let (line_start, _) = line_bounds(spec, at);
+    if !spec[line_start..at].chars().all(char::is_whitespace) {
+        return false;
+    }
+    end == spec.len() || spec[end..].starts_with('\n')
+}
+
 fn line_prefix_is_all_markers(prefix: &str) -> bool {
     let b = prefix.as_bytes();
     let mut i = 0;
@@ -3897,7 +4011,7 @@ fn line_prefix_is_all_markers(prefix: &str) -> bool {
 /// rule made for tidiness, so a padded table cell (`|  text`) is left failing
 /// this clause. It is a finding for whoever meets one, not something to loosen
 /// here.
-fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
+fn span_begins_on_boundary(spec: &str, at: usize, rule: SpanBoundaryRule) -> bool {
     if at == 0 {
         return true;
     }
@@ -3906,13 +4020,37 @@ fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
         return true;
     }
     let unspaced = before.trim_end_matches(' ');
-    if unspaced.len() < before.len() && unspaced.ends_with(['.', '!', '?']) {
+    // **Clause E on the same-line sentence rule.** Under v2 the terminator has to
+    // be the last character before the spaces; under v3 a trailing run of
+    // emphasis or closing punctuation is stripped first, so `…applies." Next`
+    // begins on a boundary. `SCORING-2-NOTES.md` §3b recorded that blind spot.
+    let sentence_end = match rule {
+        SpanBoundaryRule::V3 => strip_trailing_closers(unspaced),
+        _ => unspaced,
+    };
+    if unspaced.len() < before.len() && sentence_end.ends_with(['.', '!', '?']) {
         return true;
     }
 
-    let (line_start, _) = line_bounds(spec, at);
+    let (line_start, line_end) = line_bounds(spec, at);
     if !line_prefix_is_all_markers(&spec[line_start..at]) {
         return false;
+    }
+    // **Clause M — a marked line opens its own block.** The preceding-line test
+    // below exists to tell a block start from the continuation of a wrapped
+    // sentence; a line that carries a marker is a block start and is never a
+    // wrapped continuation, so the test has nothing to do there. As frozen, item
+    // 8 asked it anyway, which is why in a list of bold-closed bullets each
+    // bullet disqualified its neighbour — the preceding line ends in `*`.
+    //
+    // **`line_opens_a_block` is reused deliberately rather than re-deriving
+    // "has a marker" from the prefix.** That predicate already refuses `**every**`
+    // as a bullet and requires a bullet, heading or ordered marker to be
+    // delimited, which is exactly the distinction clause M needs: a bare `**` run
+    // is emphasis, and treating it as a marker would accept the right half of a
+    // hard-wrap clip that happened to begin with emphasis.
+    if rule == SpanBoundaryRule::V3 && line_opens_a_block(&spec[line_start..line_end]) {
+        return true;
     }
     // The span opens its own line. Whether that is a boundary depends on what
     // came before it — a continuation of a wrapped sentence is not.
@@ -3934,20 +4072,33 @@ fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
     let prev_end = line_start - 1;
     let prev_start = spec[..prev_end].rfind('\n').map_or(0, |i| i + 1);
     let prev = spec[prev_start..prev_end].trim();
+    // Clause E again, on the preceding line's terminator: `**…a stop.**` ends a
+    // sentence, and a rule that cannot see past the emphasis run is testing the
+    // markup rather than the sentence.
+    let prev_end_text = match rule {
+        SpanBoundaryRule::V3 => strip_trailing_closers(prev),
+        _ => prev,
+    };
     prev.is_empty()
         || prev.starts_with('#')
         || prev.starts_with('|')
-        || prev.ends_with(['.', '!', '?', ':', ';'])
+        || prev_end_text.ends_with(['.', '!', '?', ':', ';'])
 }
 
 /// Does an occurrence of a span ending at `end` stop on a boundary?
 ///
 /// EOF, a sentence terminator, a block end, or a table cell end — item 8's four.
-fn span_ends_on_boundary(spec: &str, end: usize) -> bool {
+fn span_ends_on_boundary(spec: &str, end: usize, rule: SpanBoundaryRule) -> bool {
     if end == spec.len() {
         return true;
     }
-    if spec[..end].ends_with(['.', '!', '?', ':', ';']) {
+    // Clause E on the right-hand end. A left-half clip has no terminator under
+    // its closers, so this uncovers terminators rather than inventing them.
+    let ending = match rule {
+        SpanBoundaryRule::V3 => strip_trailing_closers(&spec[..end]),
+        _ => &spec[..end],
+    };
+    if ending.ends_with(['.', '!', '?', ':', ';']) {
         return true;
     }
     let after = &spec[end..];
@@ -4041,12 +4192,24 @@ fn line_opens_a_block(line: &str) -> bool {
 /// scope* container begins and ends on boundaries and is **accepted**. Item 8
 /// says that case belongs to tiers 2 and 3, and the unit test demonstrates the
 /// acceptance rather than leaving it to be discovered.
-fn span_is_self_contained(spec: &str, span: &str) -> bool {
+fn span_is_self_contained(spec: &str, span: &str, rule: SpanBoundaryRule) -> bool {
     if span.is_empty() {
         return false;
     }
-    spec.match_indices(span)
-        .any(|(at, _)| span_begins_on_boundary(spec, at) && span_ends_on_boundary(spec, at + span.len()))
+    if rule == SpanBoundaryRule::Off {
+        return true;
+    }
+    spec.match_indices(span).any(|(at, _)| {
+        let end = at + span.len();
+        // **Clause F is evaluated on the occurrence as a whole**, not split
+        // across the two boundary predicates, because it asks whether *both*
+        // ends sit inside *one and the same* fenced block. Splitting it would
+        // accept a span that began inside one fence and ended inside another.
+        if rule == SpanBoundaryRule::V3 && fenced_occurrence_is_whole_lines(spec, at, end) {
+            return true;
+        }
+        span_begins_on_boundary(spec, at, rule) && span_ends_on_boundary(spec, end, rule)
+    })
 }
 
 /// Every rule `PROTOCOL.md` item 8 states about an assembled retention verdict,
@@ -4092,8 +4255,12 @@ fn check_retention_verdict(
     spec: &str,
     pool: &[&str],
     rules: RetentionRules,
-) -> Vec<String> {
-    let mut wrong = Vec::new();
+) -> RetentionComplaints {
+    let mut wrong: Vec<String> = Vec::new();
+    // **`PROTOCOL-3.md` §3's class B**, empty under v1 and v2. A class-B problem
+    // is routed here instead of into `wrong` only when the rules say so, so the
+    // two earlier protocols keep exactly the dispositions they were frozen with.
+    let mut flagged: Vec<(String, String)> = Vec::new();
 
     if !pool.contains(&stem) {
         wrong.push(format!(
@@ -4219,17 +4386,22 @@ fn check_retention_verdict(
                         i + 1,
                         quote,
                     ));
-                } else if rules.self_contained_spans && !span_is_self_contained(spec, quote) {
-                    wrong.push(format!(
+                } else if !span_is_self_contained(spec, quote, rules.boundaries) {
+                    let complaint = format!(
                         "row `{}` span {} is in the spec but no occurrence of it begins and \
-                         ends on a boundary: {:?}. `PROTOCOL-2.md` item 8's self-containment \
-                         rule — a span clipped at a hard wrap can look like evidence while \
-                         establishing nothing, and both halves of such a clip are refused, \
-                         not just the one that ends mid-phrase.",
+                         ends on a boundary: {:?}. Item 8's self-containment rule — a span \
+                         clipped at a hard wrap can look like evidence while establishing \
+                         nothing, and both halves of such a clip are refused, not just the \
+                         one that ends mid-phrase.",
                         row.id,
                         i + 1,
                         quote,
-                    ));
+                    );
+                    if rules.class_b_is_row_local {
+                        flagged.push((row.id.clone(), complaint));
+                    } else {
+                        wrong.push(complaint);
+                    }
                 }
             }
         } else if !row.quotes.is_empty() {
@@ -4249,12 +4421,25 @@ fn check_retention_verdict(
     for row in &verdict.rows {
         for quote in &row.quotes {
             match cited.get(quote.as_str()) {
-                Some(first) if *first != row.id.as_str() => wrong.push(format!(
-                    "the span {:?} is cited for more than one row (`{first}` and `{}`). A \
-                     near-boilerplate sentence pressed into service for several rows is the \
-                     cheapest way to fake retention.",
-                    quote, row.id,
-                )),
+                Some(first) if *first != row.id.as_str() => {
+                    let complaint = format!(
+                        "the span {:?} is cited for more than one row (`{first}` and `{}`). A \
+                         near-boilerplate sentence pressed into service for several rows is \
+                         the cheapest way to fake retention.",
+                        quote, row.id,
+                    );
+                    if rules.class_b_is_row_local {
+                        // **Both rows, not one.** Which of the two the span
+                        // really establishes is a judgement, and tier 3 is where
+                        // judgement lives; picking one mechanically would be
+                        // this check deciding a question it has no means to
+                        // answer. `PROTOCOL-3.md` §3 says so in those terms.
+                        flagged.push((first.to_string(), complaint.clone()));
+                        flagged.push((row.id.clone(), complaint));
+                    } else {
+                        wrong.push(complaint);
+                    }
+                }
                 Some(_) => {}
                 None => {
                     cited.insert(quote.as_str(), row.id.as_str());
@@ -4263,7 +4448,35 @@ fn check_retention_verdict(
         }
     }
 
-    wrong
+    RetentionComplaints {
+        fatal: wrong,
+        flagged,
+    }
+}
+
+/// The outcome of [`check_retention_verdict`], split by `PROTOCOL-3.md` §3's two
+/// classes.
+///
+/// **The split exists because `PROTOCOL-2.md` fixed one disposition and left its
+/// twin standing.** Item 8a used to end *"any `establishes: false` invalidates
+/// the entire verdict file"*; the second attempt's redesign made that row-local
+/// and left item 8 killing a whole verdict for one unciteable span. Nine of the
+/// twelve generations it scored produced no verdict at all under that rule.
+///
+/// **`flagged` is always empty under v1 and v2.** Neither protocol has a
+/// row-local disposition, and the second attempt's record must keep meaning what
+/// it meant when it was written.
+#[derive(Debug, Default)]
+struct RetentionComplaints {
+    /// **Class A — fatal.** The verdict is re-run WHOLE under `R6`, never
+    /// patched. Schema, completeness, the stem rules, the span-count cap, and a
+    /// span that is not a verbatim substring of the spec at all — the last being
+    /// fabrication, which nothing in the third revision softens.
+    fatal: Vec<String>,
+    /// **Class B — row-local**, `(row id, why)`. A boundary refusal or a shared
+    /// span. The row is escalated to tier 3 under item 8b, whose call governs it;
+    /// the rest of the verdict is unaffected and the file is filed.
+    flagged: Vec<(String, String)>,
 }
 
 /// [`check_retention_verdict`] enforces every rule in `PROTOCOL.md` item 8, and
@@ -4302,6 +4515,7 @@ fn retention_check_refuses_a_verdict_that_is_not_complete_and_quoted() {
     );
     assert!(
         check_retention_verdict("4a73ef", &sound, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1)
+            .fatal
             .is_empty(),
         "a well-formed verdict must pass: {:?}",
         check_retention_verdict("4a73ef", &sound, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1)
@@ -4311,7 +4525,7 @@ fn retention_check_refuses_a_verdict_that_is_not_complete_and_quoted() {
         let found =
             check_retention_verdict(stem, v, &ids, spec, SPEC_LENGTH_ID_POOL, RETENTION_RULES_V1);
         assert!(
-            found.iter().any(|c| c.contains(needle)),
+            found.fatal.iter().any(|c| c.contains(needle)),
             "{why}: expected a complaint mentioning `{needle}`, got {found:?}"
         );
     };
@@ -4739,7 +4953,9 @@ fn spec_length_retention_verdicts_are_complete_and_quoted() {
             &spec,
             SPEC_LENGTH_ID_POOL,
             RETENTION_RULES_V1,
-        ) {
+        )
+        .fatal
+        {
             wrong.push(format!("  {}: {complaint}", path.display()));
         }
     }
@@ -6958,7 +7174,9 @@ fn spec_length_2_retention_verdicts_are_complete_and_quoted() {
             &spec,
             SPEC_LENGTH_2_ID_POOL,
             RETENTION_RULES_V2,
-        ) {
+        )
+        .fatal
+        {
             wrong.push(format!("  {}: {complaint}", path.display()));
         }
     }
@@ -8298,12 +8516,12 @@ fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
         "the fixture must reproduce the real spans, or this test is checking its own typo"
     );
     assert!(
-        !span_is_self_contained(clipped, left_half),
+        !span_is_self_contained(clipped, left_half, SpanBoundaryRule::V2),
         "the fragment ending `whichever` must be refused: it neither begins on a boundary \
          (its line continues a wrapped sentence) nor ends on one"
     );
     assert!(
-        !span_is_self_contained(clipped, right_half),
+        !span_is_self_contained(clipped, right_half, SpanBoundaryRule::V2),
         "the fragment `comes first.` must be refused too. It ENDS cleanly — that is exactly \
          the trap. It begins its line, but the line before it ends in `whichever`, so it \
          starts mid-phrase. A rule that only looked rightwards would accept this half and \
@@ -8333,7 +8551,7 @@ fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
         "the two fragments really are adjacent across the wrap"
     );
     assert!(
-        !span_is_self_contained(clipped, &reglued),
+        !span_is_self_contained(clipped, &reglued, SpanBoundaryRule::V2),
         "gluing the halves back together is NOT enough — the clause still opens mid-sentence, \
          and a rule that accepted it here would accept the same clip wherever a scorer chose \
          to start reading"
@@ -8349,7 +8567,7 @@ the scenario set → run
         "the whole-bullet fixture must be the real bytes"
     );
     assert!(
-        span_is_self_contained(clipped, whole_bullet),
+        span_is_self_contained(clipped, whole_bullet, SpanBoundaryRule::V2),
         "the bullet quoted WHOLE must be ACCEPTED. Something has to pass, or every verdict is \
          re-run under `R6` forever — the same fails-by-construction shape as the first \
          attempt's item 8a, which is the thing this second attempt exists to escape."
@@ -8387,7 +8605,7 @@ The picker binds `j` and `k` to move. It refuses an empty selection.
         ),
     ] {
         assert!(
-            span_is_self_contained(clean, span),
+            span_is_self_contained(clean, span, SpanBoundaryRule::V2),
             "{span:?} must be accepted: {why}"
         );
     }
@@ -8405,7 +8623,7 @@ The retry counter climbs by one on
 **every** failed attempt before the breaker trips.
 ";
     assert!(
-        !span_is_self_contained(emphasis_wrap, "The retry counter climbs by one on"),
+        !span_is_self_contained(emphasis_wrap, "The retry counter climbs by one on", SpanBoundaryRule::V2),
         "a span ending mid-phrase must stay refused when the next line only begins with \
          emphasis — `**every**` continues the paragraph, it does not open a block"
     );
@@ -8414,7 +8632,7 @@ The retry counter climbs by one on
             emphasis_wrap,
             "The retry counter climbs by one on\n**every** failed attempt before the breaker \
              trips."
-        ),
+        , SpanBoundaryRule::V2),
         "and the same sentence quoted whole is accepted, so the tightening refuses the clip \
          rather than the content"
     );
@@ -8427,7 +8645,7 @@ The breaker opens after a delay of
 12.5 seconds, measured from the first failure.
 ";
     assert!(
-        !span_is_self_contained(decimal_wrap, "The breaker opens after a delay of"),
+        !span_is_self_contained(decimal_wrap, "The breaker opens after a delay of", SpanBoundaryRule::V2),
         "`12.5 seconds` is a decimal, not a `<digits>.` list marker, so it does not open a \
          block and the clip before it is not on a boundary"
     );
@@ -8448,7 +8666,7 @@ The breaker opens after a delay of
     ] {
         let doc = format!("Intro here.\n\nA clipped line\n{opener}\n");
         assert!(
-            span_is_self_contained(&doc, "A clipped line"),
+            span_is_self_contained(&doc, "A clipped line", SpanBoundaryRule::V2),
             "{opener:?} opens a block, so a span ending at the line before it ends on a \
              boundary"
         );
@@ -8468,7 +8686,7 @@ The breaker opens after a delay of
     ] {
         let doc = format!("Intro here.\n\nA clipped line\n{impostor}\n");
         assert!(
-            !span_is_self_contained(&doc, "A clipped line"),
+            !span_is_self_contained(&doc, "A clipped line", SpanBoundaryRule::V2),
             "{impostor:?} does NOT open a block, so the clip before it must stay refused"
         );
     }
@@ -8510,12 +8728,12 @@ Intro paragraph here.
         ),
     ] {
         assert!(
-            span_is_self_contained(bold_lead, span),
+            span_is_self_contained(bold_lead, span, SpanBoundaryRule::V2),
             "{span:?} must be accepted: {why}"
         );
     }
     assert!(
-        !span_is_self_contained(bold_lead, "**Bold lead.**"),
+        !span_is_self_contained(bold_lead, "**Bold lead.**", SpanBoundaryRule::V2),
         "`**Bold lead.**` alone ends on `**` in mid-line, so it fails the RIGHT boundary — the \
          marker reading governs the left end only"
     );
@@ -8544,7 +8762,7 @@ Intro paragraph here.
         ),
     ] {
         assert!(
-            !span_is_self_contained(bold_lead, span),
+            !span_is_self_contained(bold_lead, span, SpanBoundaryRule::V2),
             "{span:?} must be REFUSED: {why}"
         );
     }
@@ -8554,7 +8772,7 @@ Intro paragraph here.
     // that inverts its meaning passes the mechanical check, and only tiers 2 and
     // 3 catch it.
     assert!(
-        span_is_self_contained(clean, "The picker does not create a new config."),
+        span_is_self_contained(clean, "The picker does not create a new config.", SpanBoundaryRule::V2),
         "a well-formed sentence under an `Out of scope` heading is ACCEPTED. The mechanical \
          rule cannot see the container, and no reader should take a green here as evidence \
          that a span is relevant."
@@ -8577,7 +8795,7 @@ Intro paragraph here.
         RETENTION_RULES_V2,
     );
     assert!(
-        v2.iter().any(|c| c.contains("boundary")),
+        v2.fatal.iter().any(|c| c.contains("boundary")),
         "the v2 rules must carry the self-containment refusal into the verdict check, got \
          {v2:?}"
     );
@@ -8590,7 +8808,7 @@ Intro paragraph here.
         RETENTION_RULES_V1,
     );
     assert!(
-        v1.is_empty(),
+        v1.fatal.is_empty(),
         "`PROTOCOL.md` item 8 has no boundary rule, and the first attempt's record must not \
          change shape because the second attempt tightened one. Got {v1:?}"
     );
@@ -18714,4 +18932,1144 @@ Prose after the table, which ends it.\n\
     let err = parse_grid(&grid("qwen", "tdd", "none")).expect_err("the wire name is not the grid name");
     assert!(err.contains("is not a condition"), "{err:?}");
     assert!(parse_grid(&grid("qwen", "tdd", "unaided")).is_ok(), "the control for all six above");
+}
+
+// ---------------------------------------------------------------------------
+// `PROTOCOL-3.md` — the third tier-1 instrument.
+//
+// Two things change and each has its own checks below: §2's span rule gains
+// clauses F, M and E, and §3 splits item 8's disposition into class A (fatal)
+// and class B (row-local, escalated to tier 3). The v1 and v2 rules are
+// untouched — every check that guarded them still guards them, and
+// [`retention_3_span_rule_accepts_everything_v2_accepted`] proves the widening
+// is one-directional rather than asserting it.
+// ---------------------------------------------------------------------------
+
+fn spec_length_3_protocol_path() -> PathBuf {
+    spec_length_dir().join("PROTOCOL-3.md")
+}
+
+fn spec_length_3_freeze_path() -> PathBuf {
+    spec_length_dir().join("FREEZE-3.md")
+}
+
+fn spec_length_3_retention_dir() -> PathBuf {
+    spec_length_dir().join("retention-3")
+}
+
+fn spec_length_3_notes_path() -> PathBuf {
+    spec_length_dir().join("SCORING-3-NOTES.md")
+}
+
+const SPEC_LENGTH_3_PROTOCOL_REPO_PATH: &str = "docs/skill-evidence/spec-length/PROTOCOL-3.md";
+const SPEC_LENGTH_3_RETENTION_REPO_DIR: &str = "docs/skill-evidence/spec-length/retention-3";
+
+/// Every maximal run of 8 or more hex digits in `text`.
+///
+/// **Matched as maximal runs rather than by `text.contains(&sha[..8])`, and the
+/// difference is a false pass.** A document names a commit either in full or
+/// abbreviated, so the comparison has to accept both — but a `contains` on an
+/// 8-hex prefix also accepts that prefix sitting in the middle of some unrelated
+/// longer hex run, and these records are full of other SHAs and
+/// `git hash-object` blobs. Taking maximal runs out of the record and asking
+/// whether the commit *starts with* one is exact in both directions. Eight is
+/// the shortest abbreviation git itself will print here.
+fn maximal_hex_runs(text: &str) -> Vec<&str> {
+    let mut runs: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i - start >= 8 {
+                runs.push(&text[start..i]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Read one `retention-3/<id>.json` and everything the item-8 checker needs to
+/// grade it: its stem, the parsed verdict, its ledger's ids in ledger order, and
+/// the generated spec it scores.
+///
+/// `Err` carries one already-formatted class-A complaint. **Pool membership is
+/// checked before the spec path is built**, exactly as the v2 walk does it:
+/// `spec_id` is a string out of a JSON file a subagent wrote, and joining it
+/// onto `generated-2/` unchecked would let `"../arms/S3"` name the one file a
+/// scoring path must never read.
+///
+/// **The corpus is `generated-2/`.** The third revision changes an instrument,
+/// not the generations; a `generated-3/` would mean the corpus moved with it.
+fn read_retention_3_verdict(
+    path: &Path,
+) -> Result<(String, RetentionVerdict, Vec<String>, String), String> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| panic!("{}: no file stem", path.display()))
+        .to_string();
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let verdict: RetentionVerdict = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "  {}: does not match item 8's schema: {e}\n    Expected exactly \
+             {{\"spec_id\", \"ledger\", \"rows\":[{{\"id\", \"present\", \"quotes\"}}]}} — an \
+             extra key, a missing key, a wrong type or a `null` is a hard error. A malformed \
+             verdict is class A and is re-run WHOLE under `R6`, never patched.",
+            path.display(),
+        )
+    })?;
+    let ledger_path =
+        retention_ledger_path(&verdict.ledger).map_err(|e| format!("  {}: {e}", path.display()))?;
+    let ledger_text = fs::read_to_string(&ledger_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", ledger_path.display()));
+    let ids = parse_ledger_ids(&ledger_text)
+        .unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()))
+        .ids;
+    if !SPEC_LENGTH_2_ID_POOL.contains(&verdict.spec_id.as_str()) {
+        return Err(format!(
+            "  {}: `spec_id` is {:?}, which is not one of the eighteen pool ids of \
+             `PROTOCOL-2.md` item 6 — refusing to resolve a generated-spec path from it",
+            path.display(),
+            verdict.spec_id,
+        ));
+    }
+    let spec_path = spec_length_2_generated_dir().join(format!("{}.md", verdict.spec_id));
+    let spec = fs::read_to_string(&spec_path).map_err(|e| {
+        format!(
+            "  {}: scores `{}` but {} cannot be read: {e}",
+            path.display(),
+            verdict.spec_id,
+            spec_path.display(),
+        )
+    })?;
+    Ok((stem, verdict, ids, spec))
+}
+
+/// The real fenced TOML block of `generated-2/b49ff1.md:285-292`.
+///
+/// **Pinned to the file rather than retyped**, because the whole point of the
+/// fixture is that it is prose a scorer really met and item 8 really refused —
+/// `tiered-review-67`, `-68`, `-70` and `-71` were refused 56 times between them
+/// across the corrected rounds, every one of them a line of a block like this.
+fn fenced_config_fixture() -> String {
+    let path = spec_length_2_generated_dir().join("b49ff1.md");
+    let real = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let block: String = real
+        .lines()
+        .skip(283)
+        .take(10)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        block.contains("```toml") && block.contains("timeout_ms  = 120000"),
+        "the fixture is no longer {}:284-293 — got {block:?}",
+        path.display(),
+    );
+    block
+}
+
+/// Clause F: a whole line inside a fenced code block is a self-contained span,
+/// and a mid-line clip inside the same fence is still not.
+///
+/// **This is the defect the third revision exists for.** A configuration-key row
+/// can only be evidenced by a line of a config block; such a line ends in a
+/// digit, a quote or a comment and its neighbours are other config lines, so
+/// item 8's prose clauses — a terminator in `.!?:;`, a blank or block-opening
+/// neighbour, a table pipe — reject it on **both** ends. The row is uncitable by
+/// construction, identically for every arm.
+///
+/// **The second half of this test is what keeps clause F from being a hole.**
+/// Clause F requires whole lines on both ends, so a clip taken out of the middle
+/// of a code line is refused exactly as a prose clip is.
+///
+/// **Never vacuous:** the fixture is asserted against the file it claims to be.
+#[test]
+fn retention_3_span_rule_admits_a_fenced_config_line() {
+    let spec = fenced_config_fixture();
+
+    for whole_line in [
+        "timeout_ms  = 120000       # expiry takes the degrade path of §2",
+        "cheap_agent = \"opencode\"",
+        "enabled = false            # DEFAULT, stays off in this run regardless of result",
+        "[review.cascade]",
+    ] {
+        assert!(
+            spec.contains(whole_line),
+            "the fixture must really contain {whole_line:?}, or this test checks its own typo",
+        );
+        assert!(
+            !span_is_self_contained(&spec, whole_line, SpanBoundaryRule::V2),
+            "the v2 rule is what this revision is correcting; if it already accepted \
+             {whole_line:?} the diagnosis in `PROTOCOL-3.md` §1 is wrong",
+        );
+        assert!(
+            span_is_self_contained(&spec, whole_line, SpanBoundaryRule::V3),
+            "`PROTOCOL-3.md` §2 clause F: a whole line inside a fenced code block begins and \
+             ends on a boundary. Refused {whole_line:?}",
+        );
+    }
+
+    // Two adjacent whole lines are still whole lines.
+    let two_lines = "cheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6-35b-abliterated\"";
+    assert!(
+        span_is_self_contained(&spec, two_lines, SpanBoundaryRule::V3),
+        "clause F is stated over every line the occurrence touches, not over one line",
+    );
+
+    // And the clause is not a licence to clip inside a fence.
+    for clip in [
+        "timeout_ms  = 120000       # expiry takes the degrade",
+        "= 120000       # expiry takes the degrade path of §2",
+        "cheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6",
+    ] {
+        assert!(
+            spec.contains(clip),
+            "the clip fixture {clip:?} must be real text of the block",
+        );
+        assert!(
+            !span_is_self_contained(&spec, clip, SpanBoundaryRule::V3),
+            "clause F requires whole lines on both ends; {clip:?} is a mid-line clip and a \
+             clause that accepted it would be a hole rather than a correction",
+        );
+    }
+
+    // The fence lines themselves are not inside the block, so a span that
+    // straddles one is judged by the prose clauses exactly as before.
+    let straddles = "```toml\n[review.cascade]";
+    assert!(
+        spec.contains(straddles),
+        "the straddle fixture must be real text",
+    );
+    assert!(
+        !span_is_self_contained(&spec, straddles, SpanBoundaryRule::V3),
+        "a span that straddles the opening fence is not `wholly inside one and the same \
+         fenced code block`, and clause F does not reach it",
+    );
+}
+
+/// Clauses M and E: a marked line opens its own block, and trailing emphasis or
+/// closing punctuation is transparent to the terminator test.
+///
+/// **Both close blind spots `SCORING-2-NOTES.md` §3b recorded by hand.** In a
+/// list of bold-closed bullets each bullet disqualified its neighbour, because
+/// the preceding line ended in `*` rather than in `.!?:;` — 42 of the 178
+/// recorded refusals sit in that shape. A span opening after `…applies." ` failed
+/// the same-line clause because a quotation mark intervened — 27 more.
+///
+/// **Neither clause can re-admit a clip**, and the second half of this test is
+/// where that is checked rather than argued: a left half has no terminator to
+/// uncover and a right half starts mid-phrase at no marker.
+///
+/// **Never vacuous:** inline fixtures, no repository state.
+#[test]
+fn retention_3_span_rule_sees_past_markup() {
+    // **Clause M, isolated from clause E.** The preceding bullet ends with no
+    // terminator at all, so no amount of closer-stripping can rescue it: only
+    // "this line carries a marker, so it is a block start" accepts the span.
+    let bullets = "Intro line.\n\n- A bullet whose text carries no terminator\n- A second bullet that follows it.\n";
+    let second = "A second bullet that follows it.";
+    assert!(bullets.contains(second));
+    assert!(
+        !span_is_self_contained(bullets, second, SpanBoundaryRule::V2),
+        "if v2 already accepted a bullet whose predecessor does not end in a terminator, \
+         §3b's finding is wrong",
+    );
+    assert!(
+        span_is_self_contained(bullets, second, SpanBoundaryRule::V3),
+        "`PROTOCOL-3.md` §2 clause M: a line carrying a marker is a block start, and the \
+         preceding-line test has nothing to do there",
+    );
+
+    // **And clause M is scoped by `line_opens_a_block`, not by "the prefix has a
+    // marker character".** A wrapped continuation line beginning with an
+    // emphasis run is not a bullet, and reading `**` as one would accept the
+    // right half of a hard-wrap clip.
+    let emphasis_start = "A sentence that runs on across a hard\n**every** time it wraps like this.\n";
+    assert!(
+        !span_is_self_contained(emphasis_start, "**every** time it wraps like this.", SpanBoundaryRule::V3),
+        "a bare `**` run opens no block; clause M must not read emphasis as a bullet",
+    );
+
+    // Clause M leaves the UNMARKED case exactly as frozen — that is where a
+    // wrapped continuation is a real risk and the preceding-line test is doing
+    // real work.
+    let wrapped = "A sentence that runs on across a hard\nwrap and keeps going to its end.\n";
+    let continuation = "wrap and keeps going to its end.";
+    assert!(
+        !span_is_self_contained(wrapped, continuation, SpanBoundaryRule::V3),
+        "clause M is scoped to lines that carry a marker; an unmarked continuation line must \
+         still be refused or the rule has lost its subject",
+    );
+
+    // Clause E — a closing quotation mark between the terminator and the span.
+    let quoted = "He wrote \"the rule applies.\" The next sentence starts here.\n";
+    let after = "The next sentence starts here.";
+    assert!(
+        !span_is_self_contained(quoted, after, SpanBoundaryRule::V2),
+        "if v2 already saw past the quotation mark, §3b's second finding is wrong",
+    );
+    assert!(
+        span_is_self_contained(quoted, after, SpanBoundaryRule::V3),
+        "`PROTOCOL-3.md` §2 clause E: the terminator is the sentence's; the quotation mark is \
+         markup wrapped around it",
+    );
+
+    // **Clause E on the END side, and on the preceding-line test — both on lines
+    // that carry no marker**, so clause M cannot be what accepts them.
+    let emphasised = "Intro.\n\n**A bolded sentence that ends in a stop.**\nA following line here.\n";
+    let bolded = "**A bolded sentence that ends in a stop.**";
+    assert!(
+        !span_is_self_contained(emphasised, bolded, SpanBoundaryRule::V2),
+        "under v2 the span ends in `*`, the next line is neither blank nor a block opener, \
+         and it is refused — if it were not, clause E's end-side half would be untested",
+    );
+    assert!(
+        span_is_self_contained(emphasised, bolded, SpanBoundaryRule::V3),
+        "clause E must strip the trailing emphasis run before testing the terminator",
+    );
+    let following = "A following line here.";
+    assert!(
+        !span_is_self_contained(emphasised, following, SpanBoundaryRule::V2),
+        "under v2 the preceding line ends in `*` rather than a terminator, and it is refused",
+    );
+    assert!(
+        span_is_self_contained(emphasised, following, SpanBoundaryRule::V3),
+        "clause E applies to the preceding-line terminator test too — the previous line ends \
+         a sentence, under a bold run",
+    );
+
+    // And neither clause reaches a clip. A left half ends mid-phrase; a right
+    // half starts mid-phrase at no marker and after no terminator.
+    let clip_doc = "Some text before it.\n\n- **Loop**: repeat until a run produces no new rationalization **or** the ceiling\n  is reached, whichever comes first. The ceiling is not optional.\n";
+    let left = "repeat until a run produces no new rationalization **or** the ceiling";
+    let right = "is reached, whichever comes first.";
+    assert!(clip_doc.contains(left) && clip_doc.contains(right));
+    assert!(
+        !span_is_self_contained(clip_doc, left, SpanBoundaryRule::V3),
+        "the left half of a hard-wrap clip ends mid-phrase; clause E has no terminator to \
+         uncover and must not invent one. Got an accept for {left:?}",
+    );
+    assert!(
+        !span_is_self_contained(clip_doc, right, SpanBoundaryRule::V3),
+        "the right half of a hard-wrap clip starts mid-phrase on an unmarked continuation \
+         line; accepting it would make the catch an accident of which half was quoted. Got \
+         an accept for {right:?}",
+    );
+}
+
+/// The worked example item 8 was written against is still refused under v3, on
+/// **both** halves.
+///
+/// **The whole authority of the third revision is that it widens the rule
+/// without opening it**, and `invalidated/db3e2d.json`'s two spans for
+/// `skill-stickiness-55` are the case that decides whether that is true. They
+/// are a real hard-wrap clip out of `generated/db3e2d.md:451-452`, they passed
+/// every mechanical rule `PROTOCOL.md` item 8 had, and they are why the
+/// self-containment rule exists at all.
+///
+/// **Never vacuous:** the fixture is read from the first-attempt record and
+/// asserted equal to it.
+#[test]
+fn retention_3_span_rule_still_refuses_the_db3e2d_clip() {
+    let real_spec = spec_length_generated_dir().join("db3e2d.md");
+    let spec = fs::read_to_string(&real_spec)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", real_spec.display()));
+
+    let recorded = fs::read_to_string(spec_length_dir().join("invalidated").join("db3e2d.json"))
+        .expect("the first attempt's invalidated verdict is on disk");
+    let recorded: RetentionVerdict = serde_json::from_str(&recorded).expect("it parses");
+    let row_55 = recorded
+        .rows
+        .iter()
+        .find(|r| r.id == "skill-stickiness-55")
+        .expect("`skill-stickiness-55` is in the record");
+    assert_eq!(
+        row_55.quotes.len(),
+        2,
+        "the record carries the two halves of one clip",
+    );
+
+    for (i, half) in row_55.quotes.iter().enumerate() {
+        assert!(
+            spec.contains(half.as_str()),
+            "half {} is not in the spec it was quoted from",
+            i + 1,
+        );
+        assert!(
+            !span_is_self_contained(&spec, half, SpanBoundaryRule::V2),
+            "half {} must be refused under v2 — that is the rule's own worked example",
+            i + 1,
+        );
+        assert!(
+            !span_is_self_contained(&spec, half, SpanBoundaryRule::V3),
+            "half {} of the `db3e2d` clip is accepted under v3. Clauses F, M and E are \
+             supposed to widen the rule for markup it could not read, not to re-admit the \
+             hard-wrap clip it was written to catch: {:?}",
+            i + 1,
+            half,
+        );
+    }
+}
+
+/// `PROTOCOL-3.md` §2 is **one-directional**: no span the v2 rule accepted is
+/// refused under v3.
+///
+/// **Checked over the real corpus, not only over fixtures.** Every span of every
+/// verdict `retention-2/` filed passed the v2 rule — that is what filing meant —
+/// so each is a v2-accepted span with a real document behind it. A v3 that
+/// refused one would silently invalidate work the second attempt already did,
+/// and would make "nothing is removed" a claim rather than a property.
+///
+/// **Partly vacuous by construction and it says so.** `retention-2/` holds three
+/// verdicts; the assertion below fails loudly if it holds none, because a
+/// one-directional claim proved over an empty corpus is proved over nothing.
+#[test]
+fn retention_3_span_rule_accepts_everything_v2_accepted() {
+    // The synthetic half, which never goes vacuous.
+    let doc = "A heading line.\n\n- **A bullet that ends in a stop.**\n\nA plain sentence here. And another one.\n\n| a | b |\n|---|---|\n| cell text | more |\n";
+    for span in [
+        "A plain sentence here.",
+        "And another one.",
+        "**A bullet that ends in a stop.**",
+    ] {
+        if span_is_self_contained(doc, span, SpanBoundaryRule::V2) {
+            assert!(
+                span_is_self_contained(doc, span, SpanBoundaryRule::V3),
+                "v3 refuses {span:?}, which v2 accepted",
+            );
+        }
+    }
+
+    let Some(scan) = scan_retention_dir(&spec_length_2_retention_dir()) else {
+        panic!(
+            "{} does not exist. The second attempt's filed verdicts are this check's corpus.",
+            spec_length_2_retention_dir().display(),
+        );
+    };
+    assert!(
+        !scan.verdicts.is_empty(),
+        "{} holds no verdict, so `nothing v2 accepted is refused` would be proved over an \
+         empty set. Three verdicts were filed by T5a and T5b.",
+        spec_length_2_retention_dir().display(),
+    );
+
+    let mut spans_checked = 0usize;
+    let mut regressed: Vec<String> = Vec::new();
+    for path in &scan.verdicts {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let verdict: RetentionVerdict = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let spec_path = spec_length_2_generated_dir().join(format!("{}.md", verdict.spec_id));
+        let spec = fs::read_to_string(&spec_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", spec_path.display()));
+        for row in &verdict.rows {
+            for quote in &row.quotes {
+                if !span_is_self_contained(&spec, quote, SpanBoundaryRule::V2) {
+                    continue;
+                }
+                spans_checked += 1;
+                if !span_is_self_contained(&spec, quote, SpanBoundaryRule::V3) {
+                    regressed.push(format!(
+                        "  {}: row `{}` span {:?}",
+                        path.display(),
+                        row.id,
+                        quote,
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        regressed.is_empty(),
+        "{} span(s) the v2 rule accepted are refused under v3:\n{}\n\n\
+         `PROTOCOL-3.md` §2 adds clauses and removes none. A v3 that refuses a v2-accepted \
+         span is not the rule the pre-registration describes.",
+        regressed.len(),
+        regressed.join("\n"),
+    );
+    assert!(
+        spans_checked > 0,
+        "no v2-accepted span was found in {} — this check ran over nothing",
+        spec_length_2_retention_dir().display(),
+    );
+}
+
+/// `PROTOCOL-3.md` §3's disposition: class A is fatal, class B is row-local, and
+/// a shared span flags **both** rows.
+///
+/// **This is the change the third revision is really about.** `PROTOCOL-2.md`
+/// diagnosed the first attempt's failure as a disposition in which one flagged
+/// row destroyed ninety-one, fixed it in item 8a, and left the identical
+/// disposition standing one item away in item 8. Under it, 9 of the 12
+/// generations the second attempt scored produced no verdict at all, typically
+/// failing on two to eight rows of eighty-four.
+///
+/// **What must NOT move is fabrication.** A span that is not in the document is
+/// the failure every other rule is downstream of, and it stays a whole-file
+/// kill. That assertion is first below because it is the one that matters.
+///
+/// **Never vacuous:** inline fixtures, no repository state.
+#[test]
+fn retention_3_check_splits_class_a_from_class_b() {
+    let spec = "A heading here.\n\nThe picker binds `j` and `k` to move. It refuses an empty selection.\n\nA third sentence that stands alone.\n";
+    let ids: Vec<String> = ["fx-01", "fx-02", "fx-03"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let check = |json: &str| {
+        let verdict: RetentionVerdict =
+            serde_json::from_str(json).expect("the fixture parses");
+        check_retention_verdict(
+            "031cc4",
+            &verdict,
+            &ids,
+            spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V3,
+        )
+    };
+
+    // Class A — fabrication. Still fatal, and never a flag.
+    let fabricated = check(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["The picker binds j and k to move."]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    assert!(
+        fabricated.fatal.iter().any(|c| c.contains("verbatim substring")),
+        "a span that is not in the document is class A and must be fatal, got {:?}",
+        fabricated.fatal,
+    );
+    assert!(
+        fabricated.flagged.is_empty(),
+        "fabrication is never a row-local flag, got {:?}",
+        fabricated.flagged,
+    );
+
+    // Class A — the completeness and schema rules are untouched by §3.
+    let short = check(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":false,"quotes":[]},
+             {"id":"fx-02","present":false,"quotes":[]}
+           ]}"#,
+    );
+    assert!(
+        !short.fatal.is_empty(),
+        "a verdict missing a ledger row is class A",
+    );
+
+    // Class B — a boundary refusal. Row-local, and the file still files.
+    let clipped = check(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["binds `j` and `k` to move"]},
+             {"id":"fx-02","present":false,"quotes":[]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    assert!(
+        clipped.fatal.is_empty(),
+        "a boundary refusal is class B and must not be fatal under `PROTOCOL-3.md` §3, got \
+         {:?}",
+        clipped.fatal,
+    );
+    assert_eq!(
+        clipped.flagged.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+        vec!["fx-01"],
+        "the row that carried the refused span is the row that is flagged",
+    );
+    assert!(
+        clipped.flagged[0].1.contains("boundary"),
+        "the flag must say why, got {:?}",
+        clipped.flagged[0].1,
+    );
+
+    // Class B — a shared span flags BOTH rows, because which of the two it
+    // really establishes is a judgement and tier 3 is where judgement lives.
+    let shared = check(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["A third sentence that stands alone."]},
+             {"id":"fx-02","present":true,"quotes":["A third sentence that stands alone."]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    assert!(
+        shared.fatal.is_empty(),
+        "a shared span is class B and must not be fatal, got {:?}",
+        shared.fatal,
+    );
+    let mut flagged_rows: Vec<&str> = shared.flagged.iter().map(|(r, _)| r.as_str()).collect();
+    flagged_rows.sort_unstable();
+    flagged_rows.dedup();
+    assert_eq!(
+        flagged_rows,
+        vec!["fx-01", "fx-02"],
+        "a shared span flags every row that cites it, not one of them — picking one \
+         mechanically would be the check deciding a question it has no means to answer",
+    );
+
+    // A clean verdict flags nothing and kills nothing.
+    let sound = check(
+        r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+             {"id":"fx-01","present":true,"quotes":["The picker binds `j` and `k` to move."]},
+             {"id":"fx-02","present":true,"quotes":["It refuses an empty selection."]},
+             {"id":"fx-03","present":false,"quotes":[]}
+           ]}"#,
+    );
+    assert!(
+        sound.fatal.is_empty() && sound.flagged.is_empty(),
+        "a sound verdict must produce neither, got fatal {:?} flagged {:?}",
+        sound.fatal,
+        sound.flagged,
+    );
+
+    // And the v1 and v2 dispositions do not move: everything is fatal there.
+    let v2 = {
+        let verdict: RetentionVerdict = serde_json::from_str(
+            r#"{"spec_id":"031cc4","ledger":"tui-dc-picker","rows":[
+                 {"id":"fx-01","present":true,"quotes":["binds `j` and `k` to move"]},
+                 {"id":"fx-02","present":false,"quotes":[]},
+                 {"id":"fx-03","present":false,"quotes":[]}
+               ]}"#,
+        )
+        .expect("parses");
+        check_retention_verdict(
+            "031cc4",
+            &verdict,
+            &ids,
+            spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V2,
+        )
+    };
+    assert!(
+        v2.fatal.iter().any(|c| c.contains("boundary")) && v2.flagged.is_empty(),
+        "`PROTOCOL-2.md`'s disposition is whole-file fatal and this revision does not \
+         retroactively change it; the second attempt's record must keep meaning what it meant",
+    );
+}
+
+/// Item 8's schema, completeness and **class-A** rules over `retention-3/`,
+/// under `PROTOCOL-3.md` §2's revised span rule.
+///
+/// **Class-B problems are deliberately not asserted here** — that is §3's whole
+/// change, and [`spec_length_3_class_b_flags_are_reported_and_never_fatal`] is
+/// where they are surfaced instead.
+///
+/// **Vacuous until the third tier-1 pass runs**, at which point `retention-3/`
+/// appears. The rules themselves are exercised regardless, by
+/// [`retention_3_check_splits_class_a_from_class_b`].
+#[test]
+fn spec_length_3_retention_verdicts_are_complete_and_quoted() {
+    let retention = spec_length_3_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        return;
+    };
+    assert!(
+        scan.strays.is_empty(),
+        "{} holds {} entry/entries this completeness check cannot classify:\n{}\n\n\
+         Every immediate child is an `<id>.json` verdict and `parts/` is the only sanctioned \
+         subdirectory. An unrecognised entry is not checked — it is simply never opened.",
+        retention.display(),
+        scan.strays.len(),
+        scan.strays
+            .iter()
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut rows_checked = 0usize;
+    for path in &scan.verdicts {
+        let (stem, verdict, ids, spec) = match read_retention_3_verdict(path) {
+            Ok(v) => v,
+            Err(complaint) => {
+                wrong.push(complaint);
+                continue;
+            }
+        };
+        rows_checked += verdict.rows.len();
+        for complaint in check_retention_verdict(
+            &stem,
+            &verdict,
+            &ids,
+            &spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V3,
+        )
+        .fatal
+        {
+            wrong.push(format!("  {}: {complaint}", path.display()));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} class-A problem(s) across {} retention verdict(s) in {}:\n{}\n\n\
+         Each of these is a protocol failure under `R6` as `PROTOCOL-3.md` §3 narrows it, and \
+         the remedy is a WHOLE re-run of the offending verdict with the reason logged in \
+         `SCORING-3-NOTES.md` — never a patch.",
+        wrong.len(),
+        scan.verdicts.len(),
+        retention.display(),
+        wrong.join("\n"),
+    );
+    assert!(
+        scan.verdicts.is_empty() || rows_checked > 0,
+        "{} holds {} verdict(s) but no rows were checked",
+        retention.display(),
+        scan.verdicts.len(),
+    );
+}
+
+/// `PROTOCOL-3.md` §3's disposition over the real corpus: every class-B flag is
+/// surfaced with its row, and **no class-B problem fails this suite**.
+///
+/// **The count is printed rather than bounded.** A threshold here would be a
+/// gate on scorer compliance smuggled back in through the check that was
+/// supposed to remove it — and limitation 7a's obligation is that the flag rate
+/// is *reported per generation*, which is a reporting duty on `RESULTS-2.md`,
+/// not a pass/fail condition. What this test asserts is the disposition itself:
+/// a verdict carrying class-B flags and no class-A problem is a verdict that
+/// files.
+///
+/// **Vacuous until the third tier-1 pass runs.**
+#[test]
+fn spec_length_3_class_b_flags_are_reported_and_never_fatal() {
+    let retention = spec_length_3_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        return;
+    };
+    let mut flagged_total = 0usize;
+    for path in &scan.verdicts {
+        let Ok((stem, verdict, ids, spec)) = read_retention_3_verdict(path) else {
+            // Class A is `spec_length_3_retention_verdicts_are_complete_and_quoted`'s
+            // to report; this check says nothing about a verdict it cannot read.
+            continue;
+        };
+        let complaints = check_retention_verdict(
+            &stem,
+            &verdict,
+            &ids,
+            &spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V3,
+        );
+        flagged_total += complaints.flagged.len();
+        if !complaints.flagged.is_empty() {
+            eprintln!(
+                "spec_length_3_class_b_flags_are_reported_and_never_fatal: {} carries {} \
+                 class-B flag(s), each escalated to tier 3 under `PROTOCOL-3.md` §3:\n{}",
+                path.display(),
+                complaints.flagged.len(),
+                complaints
+                    .flagged
+                    .iter()
+                    .map(|(r, m)| format!("  row `{r}`: {m}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        assert!(
+            complaints
+                .flagged
+                .iter()
+                .all(|(row, _)| verdict.rows.iter().any(|r| &r.id == row)),
+            "{}: a class-B flag names a row the verdict does not score, so tier 3 would be \
+             asked to judge a row nobody looked at",
+            path.display(),
+        );
+    }
+    eprintln!(
+        "spec_length_3_class_b_flags_are_reported_and_never_fatal: {} flag(s) across {} \
+         verdict(s)",
+        flagged_total,
+        scan.verdicts.len(),
+    );
+}
+
+/// Every `FREEZE-3.md` row hashes to its file, and no path it names was already
+/// frozen by `FREEZE.md` **or** by `FREEZE-2.md`.
+///
+/// **The second cross-reference is one more than the v2 check makes.**
+/// `spec_length_2_freeze_rows_still_hash_to_their_files` compares against
+/// `FREEZE.md` only, so nothing has ever checked that a later record does not
+/// re-freeze a `FREEZE-2.md` path. Two records claiming one identity leave no
+/// check able to say which was right, and the gap is closed here rather than
+/// repeated.
+#[test]
+fn spec_length_3_freeze_rows_still_hash_to_their_files() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so no freeze row can be verified"
+    );
+    let path = spec_length_3_freeze_path();
+    let contents = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let rows = parse_freeze(&contents).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        !rows.is_empty(),
+        "{} records no row. `PROTOCOL-3.md` is frozen by this file and by nothing else.",
+        path.display(),
+    );
+
+    let mut earlier: BTreeMap<String, &'static str> = BTreeMap::new();
+    for (label, earlier_path) in [
+        ("FREEZE.md", spec_length_freeze_path()),
+        ("FREEZE-2.md", spec_length_2_freeze_path()),
+    ] {
+        let text = fs::read_to_string(&earlier_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", earlier_path.display()));
+        for row in parse_freeze(&text).unwrap_or_else(|e| panic!("{}: {e}", earlier_path.display()))
+        {
+            earlier.insert(row.path, label);
+        }
+    }
+
+    let repo = repo_root();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for row in &rows {
+        assert!(
+            seen.insert(row.path.clone()),
+            "{}: `{}` is recorded twice. This file is append-only and a corrected hash means \
+             the frozen artifact changed, which is a finding rather than an edit.",
+            path.display(),
+            row.path,
+        );
+        if let Some(label) = earlier.get(&row.path) {
+            panic!(
+                "{}: `{}` is already frozen by {}. Nothing an earlier record froze is \
+                 re-frozen here — two records claiming one identity leave no check able to \
+                 say which was right.",
+                path.display(),
+                row.path,
+                label,
+            );
+        }
+        let file = repo.join(&row.path);
+        assert!(
+            file.is_file(),
+            "{}: `{}` is frozen but is not on disk",
+            path.display(),
+            row.path,
+        );
+        let actual = git_hash_object(&file);
+        assert_eq!(
+            actual, row.hash,
+            "{}: `{}` no longer hashes to its frozen value. A frozen artifact changed, which \
+             is the thing that must not happen.",
+            path.display(),
+            row.path,
+        );
+    }
+
+    // The corpus is not frozen here, and that is a property rather than an
+    // oversight: `PROTOCOL-3.md` revises an INSTRUMENT, and a revision that
+    // reached `generated-2/` or the ledgers would not be an instrument revision.
+    let corpus: Vec<&FreezeRow> = rows
+        .iter()
+        .filter(|r| {
+            r.path.contains("/generated") || r.path.contains("/ledger") || r.path.contains("/fixtures")
+        })
+        .collect();
+    assert!(
+        corpus.is_empty(),
+        "{} freezes {} corpus path(s): {:?}. The third revision changes the instrument only; \
+         a corpus row here would mean the corpus moved with it.",
+        path.display(),
+        corpus.len(),
+        corpus.iter().map(|r| &r.path).collect::<Vec<_>>(),
+    );
+}
+
+/// `PROTOCOL-3.md`'s commit precedes every `retention-3/` commit, and the file
+/// stops moving once the first verdict exists.
+///
+/// **Both halves are the pre-registration's whole warrant.** A protocol edited
+/// after the records it governs exist is a protocol that could have been edited
+/// to fit them, and this run has twice refused to amend one to sanction
+/// something already done.
+///
+/// **The amendment log is `SCORING-3-NOTES.md`, not `RESULTS-2.md`**, and that
+/// is a strengthening rather than a substitution: `RESULTS-2.md` is the
+/// unblinding task's deliverable and does not exist, so the v2 check's logging
+/// half asserts nothing today. Pointing this one at a file that exists in the
+/// same commit makes the obligation enforced.
+#[test]
+fn spec_length_3_protocol_stops_moving_after_the_first_verdict() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so nothing can be said about when the protocol moved"
+    );
+    let repo = repo_root();
+    let protocol = spec_length_3_protocol_path();
+    let commits = commits_touching(&repo, SPEC_LENGTH_3_PROTOCOL_REPO_PATH).unwrap_or_else(|how| {
+        panic!("cannot list the commits touching {SPEC_LENGTH_3_PROTOCOL_REPO_PATH}: {how}")
+    });
+    assert!(
+        !commits.is_empty(),
+        "{} exists on disk but no commit touches it. The pre-registration must be in history \
+         before anything is measured against it.",
+        protocol.display(),
+    );
+
+    match introducing_commit_in(&repo, &spec_length_3_retention_dir()) {
+        Introduced::At(first_verdict) => {
+            let mut late: Vec<String> = Vec::new();
+            for commit in &commits {
+                match descends_from_in(&repo, commit, &first_verdict) {
+                    Descent::Yes => {}
+                    Descent::No => late.push(format!("  {}", commit.as_str())),
+                    Descent::Undetermined { how } => panic!(
+                        "cannot order {} against the first verdict: {how}\n\n\
+                         This is NOT a finding about the protocol — it is this check \
+                         reporting that it could not run.",
+                        commit.as_str()
+                    ),
+                }
+            }
+            assert!(
+                late.is_empty(),
+                "{} commit(s) touching {} are not ancestors of `retention-3/`'s introducing \
+                 commit {}:\n{}\n\n\
+                 `PROTOCOL-3.md` §6 window 2 is terminal: once the first dispatch has been \
+                 made, no rule in that file may be revised at all.",
+                late.len(),
+                protocol.display(),
+                first_verdict.as_str(),
+                late.join("\n"),
+            );
+        }
+        Introduced::NotCommitted => {}
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when `retention-3/` was introduced: {how}\n\n\
+             This is NOT a finding — it is this check reporting that it could not run."
+        ),
+    }
+
+    if commits.len() < 2 {
+        return;
+    }
+    let notes_path = spec_length_3_notes_path();
+    let record = fs::read_to_string(&notes_path).unwrap_or_else(|e| {
+        panic!(
+            "{} has {} amendment commit(s) and {} cannot be read: {e}\n\n\
+             `PROTOCOL-3.md` §6 names that file as the amendment log. An amendment nobody can \
+             audit is the same as one that did not have to justify itself.",
+            protocol.display(),
+            commits.len() - 1,
+            notes_path.display(),
+        )
+    });
+    let undisclosed: Vec<String> = commits[1..]
+        .iter()
+        .filter(|c| !maximal_hex_runs(&record).iter().any(|run| c.as_str().starts_with(run)))
+        .map(|c| format!("  {}", c.as_str()))
+        .collect();
+    assert!(
+        undisclosed.is_empty(),
+        "{} commit(s) amended {} and are not named in {}:\n{}\n\n\
+         Every edit in either window appends a revision-table row AND is named by SHA in the \
+         log. The check does not classify a commit by window, which is a tightening and is \
+         cheaper than one that would have to decide when the first dispatch happened.",
+        undisclosed.len(),
+        protocol.display(),
+        notes_path.display(),
+        undisclosed.join("\n"),
+    );
+}
+
+/// `PROTOCOL-3.md` is committed before every `retention-3/` record.
+///
+/// The companion to [`spec_length_3_protocol_stops_moving_after_the_first_verdict`]:
+/// that one forbids a late edit, this one forbids a late *introduction*. Both
+/// are needed — a file first committed alongside the verdicts it governs has no
+/// late amendment to find.
+///
+/// **Vacuous until `retention-3/` is committed**, which is the correct state
+/// until the pass runs.
+#[test]
+fn spec_length_3_protocol_precedes_every_retention_3_record() {
+    assert!(
+        git_available(),
+        "`git` is not resolvable, so nothing can be said about commit order"
+    );
+    let repo = repo_root();
+    let protocol_at = match introducing_commit_in(&repo, &spec_length_3_protocol_path()) {
+        Introduced::At(c) => c,
+        Introduced::NotCommitted => panic!(
+            "{} is not committed. A pre-registration that exists only in a working tree is \
+             not a pre-registration.",
+            spec_length_3_protocol_path().display(),
+        ),
+        Introduced::Undetermined { how } => panic!("cannot resolve the protocol's commit: {how}"),
+    };
+    match introducing_commit_in(&repo, &spec_length_3_retention_dir()) {
+        Introduced::At(records_at) => match descends_from_in(&repo, &records_at, &protocol_at) {
+            Descent::Yes => {}
+            Descent::No => panic!(
+                "{} was introduced at {}, which does not descend from the commit introducing \
+                 {} ({}). Every verdict in the third pass comes from a dispatch made after \
+                 the rules it is graded by were committed.",
+                SPEC_LENGTH_3_RETENTION_REPO_DIR,
+                records_at.as_str(),
+                SPEC_LENGTH_3_PROTOCOL_REPO_PATH,
+                protocol_at.as_str(),
+            ),
+            Descent::Undetermined { how } => panic!(
+                "cannot order `retention-3/` against the protocol: {how}\n\n\
+                 This is NOT a finding — it is this check reporting that it could not run."
+            ),
+        },
+        Introduced::NotCommitted => {}
+        Introduced::Undetermined { how } => panic!(
+            "cannot determine when `retention-3/` was introduced: {how}\n\n\
+             This is NOT a finding — it is this check reporting that it could not run."
+        ),
+    }
+}
+
+/// What `PROTOCOL-3.md` §2 actually clears of the second attempt's recorded
+/// boundary refusals, measured against the record rather than estimated.
+///
+/// **The refusals are read out of the committed `corrected-round*.txt` reports**,
+/// which are the one implementation's own output over the assembled attempts of
+/// the second attempt's thirteen corrected rounds. Nothing here re-implements
+/// item 8's predicate; a second implementation would give a second answer to
+/// what the rule refuses, and `SCORING-2-NOTES.md` §3b's decision to keep exactly
+/// one still binds.
+///
+/// **The assertion is the diagnosis, not a rate.** `PROTOCOL-3.md` §1 names four
+/// `tiered-review` rows — `-67`, `-68`, `-70` and `-71` — as **uncitable by
+/// construction**: each asks about a configuration key, the evidence for it is a
+/// line of a TOML block, and item 8's prose clauses reject such a line on both
+/// ends. If clause F does not clear every refusal recorded against those four,
+/// the diagnosis is wrong and the revision is aimed at the wrong thing. The
+/// overall counts are printed rather than bounded, because a threshold here
+/// would be a compliance gate smuggled back in through the check that removed
+/// one.
+///
+/// **Never vacuous:** the reports are committed, and the parse count is asserted.
+#[test]
+fn retention_3_clears_the_uncitable_config_rows_of_the_v2_record() {
+    let reports_dir = spec_length_2_retention_dir()
+        .join("parts")
+        .join("superseded")
+        .join("refusal-reports");
+    let mut report_paths: Vec<PathBuf> = fs::read_dir(&reports_dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", reports_dir.display()))
+        .map(|e| e.expect("a readable entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("corrected-round") && n.ends_with(".txt"))
+        })
+        .collect();
+    report_paths.sort();
+    assert!(
+        !report_paths.is_empty(),
+        "{} holds no `corrected-round*.txt`; the second attempt's refusal record is this \
+         measurement's whole input",
+        reports_dir.display(),
+    );
+
+    // Each refusal line names the verdict, the row, and the refused span as a
+    // Rust `{:?}` debug string — which is JSON string syntax for these bytes, so
+    // `serde_json` un-escapes it exactly.
+    let marker = " is in the spec but no occurrence of it begins and ends on a boundary: ";
+    let mut parsed = 0usize;
+    let mut cleared = 0usize;
+    let mut config_rows_still_refused: Vec<String> = Vec::new();
+    let mut specs: HashMap<String, String> = HashMap::new();
+    const UNCITABLE: &[&str] = &[
+        "tiered-review-67",
+        "tiered-review-68",
+        "tiered-review-70",
+        "tiered-review-71",
+    ];
+
+    for report in &report_paths {
+        let body = fs::read_to_string(report)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", report.display()));
+        for line in body.lines() {
+            let Some(cut) = line.find(marker) else {
+                continue;
+            };
+            let (head, tail) = line.split_at(cut);
+            // `…/retention-2/<id>.json: row `<row>` span <n>`
+            let Some(id) = head
+                .rsplit_once("/retention-2/")
+                .and_then(|(_, rest)| rest.split(".json").next())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(row) = head.split('`').nth(1).map(str::to_string) else {
+                continue;
+            };
+            let quoted = &tail[marker.len()..];
+            let Some(close) = quoted.rfind("\". `") else {
+                continue;
+            };
+            let span: String = match serde_json::from_str(&quoted[..close + 1]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let spec = specs.entry(id.clone()).or_insert_with(|| {
+                let p = spec_length_2_generated_dir().join(format!("{id}.md"));
+                fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+            });
+            assert!(
+                spec.contains(span.as_str()),
+                "{}: the recorded refusal for `{row}` of `{id}` is not in the spec it was \
+                 quoted from, so the report and the corpus disagree",
+                report.display(),
+            );
+            assert!(
+                !span_is_self_contained(spec, &span, SpanBoundaryRule::V2),
+                "{}: `{row}` of `{id}` is recorded as refused by v2 but the v2 rule accepts \
+                 it — the report and the check disagree",
+                report.display(),
+            );
+            parsed += 1;
+            if span_is_self_contained(spec, &span, SpanBoundaryRule::V3) {
+                cleared += 1;
+            } else if UNCITABLE.contains(&row.as_str()) {
+                config_rows_still_refused.push(format!("  {id} `{row}`: {span:?}"));
+            }
+        }
+    }
+
+    assert!(
+        parsed > 100,
+        "only {parsed} refusal(s) parsed out of the corrected rounds; the record carries far \
+         more, so this measurement is reading the reports wrong",
+    );
+    eprintln!(
+        "retention_3_clears_the_uncitable_config_rows_of_the_v2_record: {cleared} of {parsed} \
+         recorded v2 boundary refusals are accepted under `PROTOCOL-3.md` §2 ({} still \
+         refused)",
+        parsed - cleared,
+    );
+    assert!(
+        config_rows_still_refused.is_empty(),
+        "{} refusal(s) against the four configuration-key rows survive `PROTOCOL-3.md` §2:\n\
+         {}\n\n\
+         §1's diagnosis is that those rows are uncitable by construction — their evidence is \
+         a line of a TOML block and item 8's prose clauses reject it on both ends. A clause F \
+         that does not clear them is aimed at the wrong defect.",
+        config_rows_still_refused.len(),
+        config_rows_still_refused.join("\n"),
+    );
 }
