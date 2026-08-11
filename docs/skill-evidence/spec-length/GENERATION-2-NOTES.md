@@ -109,11 +109,24 @@ verbatim:**
 So for two of three fixtures the title varies, and **variation is the thing arm-invariance ruled
 out.** The first attempt's guarantee was structural; here it survives only for `tui-dc-picker`.
 
-**Whether the variants correlate with the arm has deliberately not been checked, and will not be.**
-Answering it means reading `blind-map-2.json` against the titles and writing down what came back,
-and item 7 makes that map the only record of any part of the assignment — a sentence here saying
-"they do not correlate" would be a second, weaker record of the same secret, published before the
-unblinding task. **So this is recorded as an open channel, not as a closed one.**
+**Whether the variants correlate with the arm has deliberately not been checked here — and that is
+a deferral, not a refusal.** Answering it now means reading `blind-map-2.json` against the titles
+and writing down what came back, and a sentence here saying "they do not correlate" would be a
+second, weaker record of the same secret. Item 7's prohibition is what forbids it, and **its
+prohibition is temporal**: no artifact states any part of the assignment *"at any point **before**
+the unblinding task has joined the verdicts."*
+
+**After that join the answer costs nothing, so it is owed rather than dropped.** Item 11's stated
+ethos is that *"this run documents every channel it knows about"*, and item 14a's `gaps-2/<id>.md`
+already resolves its `A`/`B` labels to arm names **after** the join — so once the join exists the
+correlation is reconstructable by any reader from committed artifacts, and withholding it protects
+nothing. **The unblinding task (`plan.md` T8) and the write-up owe this check and its answer:**
+recompute the titles per fixture, join them to the arms, and report whether the phrasing variants
+track the arm. If they do, that is a limitation on the blinding and belongs beside item 11's other
+channels; if they do not, saying so retires the question.
+
+**Until then it is recorded as an open channel, not as a closed one**, and the paragraph below is
+what a later task needs to judge how much it matters.
 
 **Where it could bite, so a later task can judge it.** Tier-1 scoring is sharded one generation at a
 time, so a scorer never holds two titles of one fixture. **Item 14a's pairing adjudicator is the one
