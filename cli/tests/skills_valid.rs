@@ -5686,6 +5686,54 @@ fn last_commit_touching_or_absent(repo: &Path, repo_relative_path: &str) -> Touc
     }
 }
 
+/// The **earliest** commit touching `dir` once `excluded` is subtracted from it.
+///
+/// **This exists because a `git log` over a directory silently includes its own
+/// subdirectories, and one ordering check was a tautology for exactly that
+/// reason.** `transmission-2/questions/` sits *inside* `transmission-2/`, so
+/// comparing [`last_commit_touching_or_absent`] on the two can never find a
+/// violation: every commit touching the questions also touches the parent, so
+/// the parent's last commit is never earlier than the questions' last commit,
+/// and when they differ the parent's is a descendant by construction. The check
+/// could neither fail nor meaningfully pass. Subtracting the subdirectory with
+/// git's `:(exclude)` pathspec is what makes the two path sets disjoint, and
+/// asking for the *earliest* verdict rather than the latest is what makes the
+/// claim *"the questions precede **any** verdict"* rather than "some verdict".
+///
+/// Returns [`Touched::NotCommitted`] when the subtracted set is empty — the
+/// correct and expected state until T8 writes its first transmission verdict.
+fn first_commit_touching_excluding(repo: &Path, dir: &str, excluded: &str) -> Touched {
+    let shown = format!("git log --format=%H -- {dir} :(exclude){excluded}");
+    let out = match git_output(&[
+        "-C".to_string(),
+        repo.display().to_string(),
+        "log".to_string(),
+        "--format=%H".to_string(),
+        "--".to_string(),
+        dir.to_string(),
+        format!(":(exclude){excluded}"),
+    ]) {
+        Ok(out) => out,
+        Err(how) => return Touched::Undetermined { how },
+    };
+    if !out.status.success() {
+        return Touched::Undetermined {
+            how: format!("`{shown}` failed: {}", git_stderr(&out)),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Last non-empty line: git printed newest-first, so this is the earliest.
+    let Some(earliest) = stdout.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
+        return Touched::NotCommitted;
+    };
+    match GitObjectId::parse(earliest) {
+        Ok(id) => Touched::At(id),
+        Err(e) => Touched::Undetermined {
+            how: format!("`{shown}` printed {e}"),
+        },
+    }
+}
+
 /// **Every** commit touching `repo_relative_path`, oldest first.
 ///
 /// [`last_commit_touching_or_absent`] answers *has it moved since*;
@@ -6578,25 +6626,44 @@ fn spec_length_2_protocol_precedes_every_generation() {
 
     // Item 14: the blind question set precedes the transmission verdicts it is
     // answered against.
+    //
+    // **The verdict side subtracts `questions/`, and without that subtraction
+    // this check cannot fail.** `questions/` is a subdirectory of
+    // `transmission-2/`, so a `git log` over the parent counts the questions'
+    // own commits as touches of the parent. Comparing the two directories' last
+    // commits therefore compares a set against its own superset: the superset's
+    // last commit is never the earlier one, so the descent assertion holds
+    // vacuously, and when the questions are the most recent touch the two
+    // collapse to the same SHA and the comparison is skipped entirely. That was
+    // the state this check shipped in — it reported "not compared" while the
+    // questions sat committed, and a question rewritten *after* a verdict
+    // existed passed it. Subtracting the subdirectory makes the two sides
+    // disjoint, and taking the verdicts' EARLIEST commit is what makes this the
+    // claim item 14 actually states: the questions are fixed before **any**
+    // verdict, not merely before the last one.
     let questions = last_commit_touching_or_absent(
         &repo,
         SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR,
     );
-    let transmission = last_commit_touching_or_absent(&repo, SPEC_LENGTH_2_TRANSMISSION_REPO_DIR);
-    match (&questions, &transmission) {
-        (Touched::At(q), Touched::At(t)) if q.as_str() != t.as_str() => {
-            match descends_from_in(&repo, q, t) {
-                Descent::Yes => {}
-                Descent::No => violations.push(format!(
-                    "  item 14: `transmission-2/questions/` was last touched by {}, which \
-                     `transmission-2/`'s own last commit {} does not descend from. The \
-                     questions are written blind and committed first.",
-                    q.as_str(),
-                    t.as_str(),
-                )),
-                Descent::Undetermined { how } => unreadable.push(format!("  item 14: {how}")),
-            }
-        }
+    let first_verdict = first_commit_touching_excluding(
+        &repo,
+        SPEC_LENGTH_2_TRANSMISSION_REPO_DIR,
+        SPEC_LENGTH_2_TRANSMISSION_QUESTIONS_REPO_DIR,
+    );
+    match (&questions, &first_verdict) {
+        (Touched::At(q), Touched::At(v)) => match descends_from_in(&repo, q, v) {
+            Descent::Yes => {}
+            Descent::No => violations.push(format!(
+                "  item 14: `transmission-2/questions/` was last touched by {}, which the \
+                 first transmission verdict's commit {} does not descend from. The \
+                 questions are written blind and committed before any probe is dispatched \
+                 against them; a question edited once a verdict exists is a question that \
+                 could have been edited to fit one.",
+                q.as_str(),
+                v.as_str(),
+            )),
+            Descent::Undetermined { how } => unreadable.push(format!("  item 14: {how}")),
+        },
         (Touched::Undetermined { how }, _) | (_, Touched::Undetermined { how }) => {
             unreadable.push(format!("  item 14's ordering: {how}"))
         }
@@ -8665,6 +8732,146 @@ fn final_disposition_join_refuses_an_unrecorded_override() {
         )]),
         "twice",
         "two answers for one row means the later one silently wins",
+    );
+}
+
+/// One entry of `transmission-2/questions/<fixture>.json` — item 14. Closed, so
+/// an answer, an arm or a row's own text cannot ride along beside the question.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransmissionQuestion {
+    id: String,
+    question: String,
+}
+
+/// Item 14's 20 sampled 1-based row indices for a ledger of `n` rows,
+/// **recomputed from the command that defines them**.
+///
+/// Item 14 pins the sample as `seq 0 19 | awk -v n=<N> '{printf "%d\n", 1 +
+/// int($1*(n-1)/19 + 0.5)}'` and then writes the three resulting lists out. The
+/// command is the definition and the lists are a convenience, so this is the
+/// command: `int()` truncates toward zero and every value here is positive, which
+/// is what `as usize` does.
+fn transmission_sample_indices(n: usize) -> Vec<usize> {
+    (0..20)
+        .map(|i| 1 + ((i as f64) * ((n - 1) as f64) / 19.0 + 0.5) as usize)
+        .collect()
+}
+
+/// `transmission-2/questions/` carries item 14's sample, and only it.
+///
+/// **The gap this closes: `calibration-2.json` had a check that recomputes its
+/// corpus and the question set had none.** Item 14's whole claim is that the
+/// same 20 questions per fixture are put to every arm — so a question set that
+/// drifted off the sampled rows, or gained a 21st row, or lost one, would move
+/// what is being compared without moving anything a test reads. The sample is
+/// recomputed from item 14's own `seq | awk` definition rather than from the
+/// three lists item 14 writes out beside it, so a drift between the command and
+/// those lists is caught too.
+///
+/// **What it cannot see, and this is the important half.** Nothing here can
+/// judge whether a question *leaks its row's answer*, which is item 14's actual
+/// standard ("must not contain the answer itself — no exact name, bound or
+/// exclusion that the row supplies"). That is a reading, it is made by the blind
+/// question-writer and by whoever reviews its output, and two questions in this
+/// very set were re-dispatched for failing it. A green run here means the sample
+/// is the right 60 rows; it does not mean the 60 questions are good ones.
+///
+/// **Vacuous until the question-writer runs**, at which point the directory
+/// appears. [`transmission_sample_indices`] is exercised regardless by
+/// [`transmission_sample_is_twenty_spanning_indices`].
+#[test]
+fn spec_length_2_transmission_questions_are_the_sampled_rows() {
+    let dir = spec_length_dir().join("transmission-2").join("questions");
+    if !dir.is_dir() {
+        return;
+    }
+    for fixture in SPEC_LENGTH_FIXTURE_NAMES {
+        let path = dir.join(format!("{fixture}.json"));
+        let raw = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}\n\nItem 14 samples all three fixtures; a question set that covers \
+                 only some of them cannot be put to every arm.",
+                path.display()
+            )
+        });
+        let questions: Vec<TransmissionQuestion> =
+            serde_json::from_str(&raw).unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e}\n\nExpected item 14's schema: `[{{\"id\", \"question\"}}]`.",
+                    path.display()
+                )
+            });
+
+        let ledger_path = retention_ledger_path(fixture).expect("a known fixture name");
+        let ledger_text = fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("{}: {e}", ledger_path.display()));
+        let ledger = parse_ledger_ids(&ledger_text)
+            .unwrap_or_else(|how| panic!("{}: {how}", ledger_path.display()));
+
+        let expected: Vec<String> = transmission_sample_indices(ledger.ids.len())
+            .into_iter()
+            .map(|i| ledger.ids[i - 1].clone())
+            .collect();
+        let found: Vec<String> = questions.iter().map(|q| q.id.clone()).collect();
+        assert_eq!(
+            found,
+            expected,
+            "{} does not carry item 14's sampled rows in order.\n\
+             expected: {}\nfound:    {}\n\n\
+             The sample is `seq 0 19 | awk -v n={} '{{printf \"%d\\n\", 1 + int($1*(n-1)/19 \
+             + 0.5)}}'` over that ledger, which is the definition and not a summary of one. \
+             The same 20 questions are put to every arm, so changing which rows they cover \
+             changes what the transmission test compares.",
+            path.display(),
+            expected.join(" "),
+            found.join(" "),
+            ledger.ids.len(),
+        );
+        for q in &questions {
+            assert!(
+                !q.question.trim().is_empty(),
+                "{}: `{}` has an empty question",
+                path.display(),
+                q.id,
+            );
+        }
+    }
+}
+
+/// [`transmission_sample_indices`] is 20 distinct indices spanning the ledger.
+///
+/// Item 14 asserts this of its own command — *"It yields 20 distinct 1-based row
+/// indices spanning `-01` to `-<N>` inclusive. Confirmed at 20 distinct indices
+/// for all three fixtures"* — and a confirmation nobody executes is a claim. The
+/// three real sizes are checked against the lists item 14 writes out, so the
+/// document and the command are pinned to each other.
+#[test]
+fn transmission_sample_is_twenty_spanning_indices() {
+    for n in [55usize, 84, 91] {
+        let s = transmission_sample_indices(n);
+        assert_eq!(s.len(), 20, "n={n}");
+        assert_eq!(s.first(), Some(&1), "n={n}: the sample must start at row 1");
+        assert_eq!(s.last(), Some(&n), "n={n}: the sample must end at row {n}");
+        assert_eq!(
+            s.iter().collect::<BTreeSet<_>>().len(),
+            20,
+            "n={n}: {s:?} repeats an index, so the sample is smaller than it claims"
+        );
+        assert!(s.windows(2).all(|w| w[0] < w[1]), "n={n}: {s:?} is not ascending");
+    }
+    // The three lists item 14 writes out beside the command.
+    assert_eq!(
+        transmission_sample_indices(91),
+        vec![1, 6, 10, 15, 20, 25, 29, 34, 39, 44, 48, 53, 58, 63, 67, 72, 77, 82, 86, 91],
+    );
+    assert_eq!(
+        transmission_sample_indices(84),
+        vec![1, 5, 10, 14, 18, 23, 27, 32, 36, 40, 45, 49, 53, 58, 62, 67, 71, 75, 80, 84],
+    );
+    assert_eq!(
+        transmission_sample_indices(55),
+        vec![1, 4, 7, 10, 12, 15, 18, 21, 24, 27, 29, 32, 35, 38, 41, 44, 46, 49, 52, 55],
     );
 }
 
