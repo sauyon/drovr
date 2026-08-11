@@ -1,13 +1,28 @@
 # Generation notes — the second attempt's 18 specs
 
-Measurements taken by the generation task over `generated-2/`, recorded here rather than left in a
-task note so that no later task has to be told them. **This file is evidence, not a frozen input:**
-`FREEZE-2.md` says in as many words that measurements are "evidence rather than a frozen input", so
-it has no row here and none is owed. It changes no rule, no gate and no denominator.
+What the generation task observed about `generated-2/` while producing it, recorded beside the
+artifact rather than left in a task note so that no later task has to be told it.
 
-**Every figure below is recomputable from the committed files** — `wc -l`, `wc -c` and
-`git hash-object --no-filters` over `generated-2/` and `fixtures/`. Nothing here is a new fact; it
-is a signpost to facts the corpus already carries.
+**Three things are recorded here, and the first two are breaches of a governed rule:**
+
+1. **Item 5's "no header" is breached by all 18, and "no fixture name" by 11** —
+   [§1](#1-item-5s-no-header-and-no-fixture-name-are-both-breached). Neither is repairable and
+   neither is an arm channel, with one caveat about generation titles that this attempt does
+   **not** inherit from the first, written out in full there.
+2. **`R5a` flags two generations** as having copied their input rather than compressed it —
+   [§2](#2-r5a--the-copy-check).
+3. **One of those two, `fd2c24.md`, is byte-identical to its fixture** —
+   [§3](#3-fd2c24md-is-byte-identical-to-its-fixture). The alternative explanation, a harness bug
+   affecting the other seventeen, is ruled out as far as committed evidence can rule it out.
+
+**This file is evidence, not a frozen input.** `FREEZE-2.md` says in as many words that measurements
+are "evidence rather than a frozen input", so it has no row there and none is owed. It changes no
+rule, no gate, no denominator and no arm.
+
+**Every figure below is recomputable from the committed files** — `wc -l`, `wc -c`,
+`git hash-object --no-filters` and `sed -n '1p'` over `generated-2/` and `fixtures/`. Nothing here
+is a new fact; it is a signpost to facts the corpus already carries. The two places where that is
+not true are labelled as such where they appear.
 
 ## Committing this now is a deviation from `plan.md` T4, and here is the reason
 
@@ -16,15 +31,109 @@ own notes, published in `RESULTS-2.md` at T8"* — that is, kept in the task's r
 file publishes them earlier, and that is a departure from the plan's stated sequencing.** It is
 recorded as one rather than slipped in.
 
-The reason is the `fd2c24` finding below. A task note lives in the run's local state directory and
-reaches T8 only by being carried through four handoffs; the anomaly it describes is one a scoring
-task could otherwise process as ordinary. Committing it puts it beside the artifact it is about.
+The reason is §1 and §3. A task note lives in the run's local state directory and reaches T8 only by
+being carried through four handoffs; the things below are ones a scoring task could otherwise
+process as ordinary. Committing them puts them beside the artifact they are about.
 
 **It changes nothing the plan or the protocol decides.** `RESULTS-2.md` still owes the `R5a`
 publication at T8 — this file does not discharge that. `PROTOCOL-2.md` is untouched: window 3 shut
 at this task's first item-5 dispatch and nothing here revises a governed item.
 
-## `R5a` — the copy check
+---
+
+## 1. Item 5's "no header" and "no fixture name" are both breached
+
+**Item 5:** *"The generated file holds **only the spec body** — no header, no arm name, no fixture
+name, no id. Anything else is a channel to the scorer."* That is four prohibitions. **Two of them
+hold and two do not.**
+
+| clause | how it went |
+|---|---|
+| no arm name | **holds** — no generation carries `S0`, `S1`, `S2` or `S3` as a token |
+| no id | **holds** — no generation carries its own id, or any other id from item 6's pool |
+| **no header** | **breached by 18 of 18** |
+| **no fixture name** | **breached by 11 of 18** |
+
+The two that hold are checked on every test run by
+`spec_length_2_generations_are_unlabelled_and_cover_the_design`. The two that do not are checked by
+nothing, which is why they are written down here.
+
+**The header breach: 18 of 18.** Every generation opens with a `# ` title naming its fixture's
+subject — `# Spec: TUI deploy-config picker — browse any config in the project`,
+`# Tiered (cascade) code review for drovr`, `# Spec: skill stickiness`. One `sed -n '1p'` over the
+directory shows it.
+
+**The fixture-name breach: 11 of 18**, inherited from the fixtures rather than invented by the
+probes:
+
+- **All 6 `tiered-review` generations** reproduce `fixtures/tiered-review.spec.md`'s line 3
+  verbatim, at their own line 3:
+  `` **Run:** `tiered-review` · **Worktree:** `.drovr/wt/tiered-review` · **Branch:** `drovr/tiered-review` ``
+- **5 of the 6 `tui-dc-picker` generations** carry `.drovr/wt/tui-dc-picker`, from that fixture's
+  own text — `26d7a2` does not.
+- The `tiered-review` fixture also names `skill-stickiness` twice and `blind-map` once, and its
+  generations inherit those too.
+- No `skill-stickiness` generation carries its fixture's hyphenated name; that fixture never writes
+  it.
+
+### This is the first attempt's finding too, and one part of its answer does not transfer
+
+`RESULTS.md` §5 item 6 records **exactly this**, in the same proportions — *"breached on the header
+count in every generation and on the fixture-name count in 11 of the 18, and neither could have been
+otherwise"*, all 18 opening with a `# ` title, the hyphenated name in 11. Items 4 and 5 are
+inherited verbatim by `PROTOCOL-2.md`, so the structural cause is unchanged and so is the outcome.
+
+**Its argument that neither is an arm channel had two halves. One transfers intact; the other does
+not, and that is a finding rather than a footnote.**
+
+**What still holds — the fixture name is not an arm channel.** For the `tiered-review` line the
+demonstration is exact: it is byte-identical, at the same line number, in all six generations of
+that fixture — two from each of the three arms. A string present identically in every arm
+distinguishes none of them. And fixture identity is published deliberately anyway: item 7a exists so
+that every scoring task is *told* which fixture an id belongs to, so a scorer learning it from the
+text learns nothing it was not handed. (For the `tui-dc-picker` mentions the shape is looser — 5 of
+6, at varying line numbers — but the same item 7a argument covers it regardless of shape.)
+
+**What does not hold — the titles are no longer arm-invariant.** `RESULTS.md` could say the title
+was *"byte-identical across all six generations of each fixture … arm-invariant by construction, not
+by luck"*, because item 4 defines each task line as the fixture's `# ` title plus a restatement, and
+item 5 hands that same line to every probe. **In this attempt the probes did not all copy it
+verbatim:**
+
+| fixture | distinct titles across its 6 generations |
+|---|---|
+| `tui-dc-picker` | **1** — `# Spec: TUI deploy-config picker — browse any config in the project` ×6 |
+| `skill-stickiness` | **2** — `# Spec: skill stickiness` ×5, `# Spec: Skill Stickiness` ×1 |
+| `tiered-review` | **3** — `# Tiered (cascade) code review for drovr` ×4, `… — spec` ×1, `# Spec: Tiered (cascade) code review for drovr` ×1 |
+
+So for two of three fixtures the title varies, and **variation is the thing arm-invariance ruled
+out.** The first attempt's guarantee was structural; here it survives only for `tui-dc-picker`.
+
+**Whether the variants correlate with the arm has deliberately not been checked, and will not be.**
+Answering it means reading `blind-map-2.json` against the titles and writing down what came back,
+and item 7 makes that map the only record of any part of the assignment — a sentence here saying
+"they do not correlate" would be a second, weaker record of the same secret, published before the
+unblinding task. **So this is recorded as an open channel, not as a closed one.**
+
+**Where it could bite, so a later task can judge it.** Tier-1 scoring is sharded one generation at a
+time, so a scorer never holds two titles of one fixture. **Item 14a's pairing adjudicator is the one
+stage that does** — it is handed two generations of the same fixture relabelled `A` and `B`. A
+title-phrasing difference is visible to it. It is told nothing about arms and is not asked which
+spec is better, and `A`/`B` is fixed by lexicographic id rather than by arm, so the difference is
+uninterpretable to it; but it is a difference the first attempt did not have, and T9 should read
+this paragraph before it runs.
+
+### Not repaired, and not repairable
+
+The specs are the raw measurement; editing generated text to satisfy a rule about generated text
+would destroy the thing being measured, which is why the suite's own leak message says that repair
+is not available. `R6` does not license a re-run either — its trigger list is closed and does not
+include this — and nothing may be added to `PROTOCOL-2.md` now that window 3 is shut. So it is
+recorded.
+
+---
+
+## 2. `R5a` — the copy check
 
 `PROTOCOL-2.md` item 12's `R5a`: a generation whose length is **≥ 95% of its fixture's** (791 / 463
 / 414 lines) has substantially copied its input rather than compressed it. That is **not a failure**
@@ -59,7 +168,22 @@ generation as a win.
 The table carries **no arm**, and it discloses nothing that committing the specs did not already
 disclose: `wc -l generated-2/*.md` reproduces it in one command.
 
-## `fd2c24.md` is byte-identical to its fixture
+**What `R5a` obliges**, quoted rather than extended:
+
+- `RESULTS-2.md` **flags every generation over that threshold** — which is both ids above.
+- The write-up **may not read a flagged generation as a win**.
+
+The rest is commentary, and is marked as such because window 3 is shut and this file may not grow a
+governed rule. That `fd2c24` is a verbatim copy rather than merely a long spec is a measurement
+recorded in §3, not a third clause of `R5a`; `R5a` requires the flag and says nothing about what a
+flag must be annotated with. And `R3` asks for per-arm and per-fixture means against the fixtures'
+own lengths — `fd2c24`'s 791 lines *are* its fixture's length, so its arm's mean is pulled toward
+the reference point by a generation that compressed nothing. Whether to show the per-generation
+numbers beside the means is the write-up's call, not a requirement this file can create.
+
+---
+
+## 3. `fd2c24.md` is byte-identical to its fixture
 
 `generated-2/fd2c24.md` and `fixtures/skill-stickiness.spec.md` are the **same blob**,
 `79525341f6c4699417fc1f8b6b20d84b8ddaacad` — 791 lines, 52355 bytes, zero diff. `FREEZE-2.md`
@@ -136,64 +260,22 @@ reader who discounts (2) and (3) entirely still has (1), which is the part that 
 file*, *a shard or a verdict is malformed*, and *a verdict fails the item-8 mechanical check*. A
 generation that copies its input is none of those — it is the outcome `R5a` and limitation 1 were
 written to anticipate. Re-running it because the output looks wrong is the exact move `R6` exists to
-forbid.
+forbid. Tier-1 will score it at or near full retention for free, and `R1`'s union makes that one of
+six generations for whichever arm holds it.
 
-**What it obliges.** Tier-1 will score it at or near full retention for free, and `R1`'s union makes
-that one of six generations for whichever arm holds it.
+---
 
-Two of these are `R5a`'s own pre-registered requirements, quoted rather than extended:
+## What no test enforces
 
-- `RESULTS-2.md` **flags every generation over that threshold** — which is both ids above.
-- The write-up **may not read a flagged generation as a win**.
+**Nothing in this file is checked by the suite, and that is stated rather than closed.** The two
+item-5 clauses of §1 are unchecked because
+`spec_length_2_generations_are_unlabelled_and_cover_the_design` screens for `S0`–`S3`, a
+generation's own id and the probe template's markers, and for nothing else; a future attempt wanting
+"no header" enforced mechanically would have to decide first what it means for a document whose
+input is full of headers. `R5a` and `R3` are unchecked because they are rules about how a result is
+*read*, and the suite checks shape and ordering, not interpretation.
 
-The rest is commentary, and is marked as such because window 3 is shut and this file may not add to
-a governed rule. That `fd2c24` is a verbatim copy rather than merely a long spec is a measurement
-recorded above, not a third clause of `R5a`; `R5a` requires the flag and says nothing about what a
-flag must be annotated with. And `R3` asks for per-arm and per-fixture means against the
-fixtures' own lengths, and
-`fd2c24`'s 791 lines *are* its fixture's length, so its arm's mean is pulled toward the reference
-point by a generation that compressed nothing. Whether to show the per-generation numbers beside the
-means is the write-up's call, not a requirement this file can create.
-
-## Eleven generations carry their fixture's name, which item 5 forbids
-
-**Item 5:** *"The generated file holds **only the spec body** — no header, no arm name, no fixture
-name, no id. Anything else is a channel to the scorer."* **Eleven of the eighteen breach the letter
-of that**, and the breach is inherited from the fixtures rather than invented by the probes:
-
-- **All 6 `tiered-review` generations** reproduce `fixtures/tiered-review.spec.md`'s line 3
-  verbatim, at their own line 3:
-  `` **Run:** `tiered-review` · **Worktree:** `.drovr/wt/tiered-review` · **Branch:** `drovr/tiered-review` ``
-- **5 of the 6 `tui-dc-picker` generations** carry `.drovr/wt/tui-dc-picker`, from that fixture's
-  own text.
-- The `tiered-review` fixture also names `skill-stickiness` twice and `blind-map` once, and its
-  generations inherit those too.
-
-**The rule's letter is breached; its stated purpose is not.** Item 5 gives the reason in the same
-sentence — *"Anything else is a channel to the scorer"* — and this is not one, for two reasons a
-reader can check:
-
-1. **It carries no arm.** The line is byte-identical, at the same line number, in all six
-   `tiered-review` generations — that is two generations from each of the three arms. A signal
-   present identically in every arm distinguishes none of them, and the arm partition is the only
-   secret item 7 protects.
-2. **Fixture identity is published deliberately.** Item 7a exists precisely so every scoring task is
-   *told* which fixture an id belongs to, so a scorer learning it from the text learns nothing it
-   was not handed.
-
-**Not repaired, and the reason is the same one that governs `fd2c24`.** The specs are the raw
-measurement; editing generated text to satisfy a rule about generated text would destroy the thing
-being measured, which is why the suite's own leak message says that repair is not available. `R6`
-does not license a re-run either — its trigger list is closed and does not include this — and
-nothing may be added to `PROTOCOL-2.md` now that window 3 is shut. So it is recorded.
-
-**No test checks it, and that gap is real.**
-`spec_length_2_generations_are_unlabelled_and_cover_the_design`
-checks for `S0`–`S3`, a generation's own id, and the probe template's markers — not for a header and
-not for a fixture name. A future attempt that wanted item 5 enforced mechanically would have to
-decide first what "no header" means for a document whose input is full of headers.
-
-**No test enforces any of this.** `R5a` is a rule about how a result is *read*, and the suite checks
-shape and ordering, not interpretation. That gap is stated here rather than closed: inventing a new
-checked artifact after the measurement exists is the move this second attempt was set up to rule
-out, and `PROTOCOL-2.md` is closed — window 3 shut at the first item-5 dispatch.
+Closing either gap now would mean inventing a checked artifact after the measurement exists, which
+is the move this second attempt was set up to rule out — and `PROTOCOL-2.md` is closed, window 3
+having shut at the first item-5 dispatch. **The gaps belong to whoever pre-registers a third
+attempt, and this is the note that hands them over.**

@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Normalise `generated-2/`, and move the two maps into the repository.
 
+**THIS IS A RECORD, NOT A TOOL. Do not run it.** It ran exactly once, on
+2026-08-10, and it is committed only so that a reader of `../GENERATION-2-NOTES.md`
+§3 can check a claim made about its behaviour instead of taking it on trust. It
+would not work in a fresh checkout in any case: `REPO` below is one machine's
+absolute worktree path, its `sys.argv[1]` is a scratch directory that no longer
+exists, and re-running it against a populated `generated-2/` would tear down and
+rewrite frozen artifacts that `FREEZE-2.md` pins by hash.
+
+It is deliberately **not** hash-pinned — `FREEZE-2.md` closes this run's row set
+at the generation task's 20 rows — so nothing detects an edit to this file, which
+is why `GENERATION-2-NOTES.md` §3 rests its conclusion on committed artifacts
+rather than on this script.
+
+
 v1's `RESULTS.md` §5 deviation 9: dispatching probes lets `ls -l` mtimes, inode
 order and `readdir` order reconstruct the write order from the filesystem alone.
 The directory is therefore torn down and rebuilt with all 18 files written in
