@@ -69,20 +69,45 @@ records already say this; this section is so that nobody has to notice it by com
 
 That matters because there is a second explanation, and it is not the innocent one: **a harness
 bug.** The generation task rewrites all 18 files in id-lexicographic order before committing, and a
-rewrite that copied the wrong source into a slot would look exactly like this from outside. The two
-explanations are told apart by two pieces of evidence, and their evidentiary status differs — which
-is said here rather than smoothed over, because the rest of this file is recomputable and this part
-is not.
+rewrite that copied the wrong source into a slot would look exactly like this from outside. **If
+that is what happened, the worry is not `fd2c24` — it is the other seventeen.**
 
-**1. The rewrite step is committed, so the claim about it is checkable.**
-`tools/normalise-generated-2.py` is the exact script that tore down and rebuilt the directory. It
-opens `generated-2/`, `blind-map-2.json` and `fixture-map-2.json` and **nothing else** — its only
-mentions of `fixtures` are the fixture *map* and `R5a`'s three reference line counts, neither of
-which is a file under `fixtures/`. It also asserts every body byte-identical across the teardown
-(`assert fh.read() == bodies[i]`). A rewrite that substituted a fixture is not a thing that script
-can do, and a reader can now confirm that rather than take it on trust.
+Three things bear on it. Only the first is checkable without trusting this file's author, and they
+are ordered accordingly.
 
-**2. The probe's own transcript shows it ran the `cp`** — and that transcript is **not committed**.
+**1. The blast radius is bounded, and a reader can confirm that from committed files alone.** Over
+`generated-2/` and `fixtures/`:
+
+- **Exactly one** of the 18 generations hashes to any fixture's blob — `fd2c24`. The other
+  seventeen match none of `79525341f6c4699417fc1f8b6b20d84b8ddaacad` (skill-stickiness),
+  `7f11a08cff6cd95999e55eb353ad38c250b7a78d` (tiered-review),
+  `12ceaa75f26125c93835587815a21e43e96de6b1` (tui-dc-picker).
+- **All 18 generation blobs are distinct**, so no slot holds a duplicate of another slot.
+
+Both are one `git hash-object --no-filters` loop. Whatever produced `fd2c24`, it did not touch
+anything else, and that conclusion needs no testimony.
+
+**2. The rewrite step is committed, and it is the wrong shape to have done this.**
+`tools/normalise-generated-2.py` opens `generated-2/`, `blind-map-2.json` and `fixture-map-2.json`
+and nothing else — its only mentions of `fixtures` are the fixture *map* and `R5a`'s three reference
+line counts, neither of which is a file under `fixtures/` — and it asserts every body byte-identical
+across the teardown (`assert fh.read() == bodies[i]`).
+
+**What this does and does not establish, because the distinction was overclaimed here once already:**
+a reader can check that a script *of this shape* cannot substitute a fixture. A reader **cannot**
+check that these are the bytes that ran. The script was committed at `1dd9a7b`, about half an hour
+after `2e183a5` produced `generated-2/`, and specifically in answer to a review finding; `git
+ls-tree 2e183a5` does not list it, and no hash of it was recorded beforehand. **So this is the same
+category of evidence as point 3 — the author's word — dressed in more legible clothing.** It is
+worth committing anyway, because a claim written as runnable code is one a reader can argue with.
+
+It is also **not hash-pinned**, and that is deliberate rather than an oversight: `FREEZE-2.md`'s
+"Who appends what, and when" closes this run's row set at the generation task's 20 rows and says
+*"Nothing else is appended by this run"*, so giving the script a row would break that file's own
+rule to protect a file that decides nothing. A later edit to it would therefore go undetected. Point
+1 is what does not depend on it.
+
+**3. The probe's own transcript shows it ran the `cp`** — and that transcript is **not committed**.
 It lives in this harness's ephemeral per-session subagent log, which no later reader will have. What
 is committed is this excerpt of it, which is a self-report and should be read as one. The probe made
 five tool calls in total, in this order:
@@ -98,8 +123,9 @@ Bash  mkdir -p .../docs/skill-evidence/spec-length/generated-2
       wc -c .../docs/skill-evidence/spec-length/generated-2/fd2c24.md
 ```
 
-Taken together: (1) rules out the rewrite as the source on committed evidence, and (2) names the
-actor on uncommitted evidence. **The artifact is the raw measurement, and it stands.**
+Taken together: (1) bounds the damage to this one file on committed evidence, and (2) and (3) name
+the actor on the author's word. **The artifact is the raw measurement, and it stands** — and a
+reader who discounts (2) and (3) entirely still has (1), which is the part that would matter.
 
 **It is not an `R6` re-run.** `R6`'s list of protocol failures is closed at *the probe wrote no
 file*, *a shard or a verdict is malformed*, and *a verdict fails the item-8 mechanical check*. A
@@ -112,12 +138,13 @@ that one of six generations for whichever arm holds it.
 
 Two of these are `R5a`'s own pre-registered requirements, quoted rather than extended:
 
-- `RESULTS-2.md` **flags every generation over the threshold** — both ids above, `fd2c24` with the
-  fact that it is a verbatim copy and not merely a long spec.
+- `RESULTS-2.md` **flags every generation over that threshold** — which is both ids above.
 - The write-up **may not read a flagged generation as a win**.
 
-One is commentary, and is marked as such because window 3 is shut and this file may not add to a
-governed rule: `R3` asks for per-arm and per-fixture means against the fixtures' own lengths, and
+The rest is commentary, and is marked as such because window 3 is shut and this file may not add to
+a governed rule. That `fd2c24` is a verbatim copy rather than merely a long spec is a measurement
+recorded above, not a third clause of `R5a`; `R5a` requires the flag and says nothing about what a
+flag must be annotated with. And `R3` asks for per-arm and per-fixture means against the fixtures' own lengths, and
 `fd2c24`'s 791 lines *are* its fixture's length, so its arm's mean is pulled toward the reference
 point by a generation that compressed nothing. Whether to show the per-generation numbers beside the
 means is the write-up's call, not a requirement this file can create.
