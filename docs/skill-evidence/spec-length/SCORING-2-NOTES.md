@@ -180,7 +180,7 @@ the re-run budget, uniformly, and re-run.**
 **What the extra attempts can and cannot buy, stated before they are spent.** §5 already weighed
 this and the weighing does not change because the answer came back yes: the trend the extension
 banks on is a trend in **gate-passing**, on an instrument whose retention output is saturated at
-99.8% (§7.4). More filed verdicts buy T6 well-formed *inputs*. They buy no additional retention
+99.8% (§7 item 4). More filed verdicts buy T6 well-formed *inputs*. They buy no additional retention
 signal, and a verdict that clears on attempt six is not better evidence than one that cleared on
 attempt one — it is the same well-formedness assertion, reached later. **Nothing in `RESULTS-2.md`
 may read the post-extension pass count as a result about spec length.**
@@ -407,9 +407,9 @@ carries `.git`; that is a known remaining hole.
 **§7 was written by T5a. T5b has since run: items 1–3 below are DISCHARGED, and §9.5 is the current
 list for T5c.** Item 1 (use the corrected builder) was followed; item 2 (wait for the §5 decision)
 was resolved by §5a and executed as §2b; item 3 (the admissibility tool is hardcoded) is fixed —
-the tool now takes a required fixture argument. **Items 4–8 are still open and are re-listed with
-T5b's own additions in §9.5.** Nothing here is deleted, because the list is also the record of what
-each task was told.
+the tool now takes a required fixture argument. **Items 4–8 are still open and are re-listed
+verbatim in substance as §9.5a items 7–11**, alongside T5b's own additions in §9.5 items 1–6.
+Nothing here is deleted, because the list is also the record of what each task was told.
 
 1. **Use the corrected `tools/build-tier1-prompts.py`** — it hands over item 8. Do not rebuild prompts
    from the template alone; §2a is why.
@@ -451,21 +451,29 @@ outstanding `skill-stickiness` ids under §2b's extended cap before starting `ti
 what §5 called them: **missing data, not low retention.** `retention-2/` still holds exactly two
 `skill-stickiness` verdicts, `6e7393` and `e085f2`, unchanged and never re-run.
 
-| round | prompt | shards | attempt | trigger | outcome |
+**READ THE ROUND LABELS CAREFULLY — §4 AND §8/§9 COUNT ROUNDS DIFFERENTLY, AND THE NUMBERS
+COLLIDE.** §4's table numbers **overall** rounds 0–6 across both prompts. §8 and §9 label a round by
+**its report file**, `parts/superseded/refusal-reports/corrected-round<n>.txt`, whose series
+continues T5a's `corrected-round1..4`. So §4's "round 5" is a *different* dispatch from
+`corrected-round5.txt`: §4's round 5 is the one that produced `corrected-round3.txt`. **Every table
+below names the file**, because the file is the thing a reader can open and the bare integer is not.
+Review caught this collision; §4 is T5a's record and is not renumbered.
+
+| report file | prompt | shards | attempt | trigger | outcome |
 |---|---|---|---|---|---|
-| 5 | corrected | the four ×2 | c4 | `R6` — failed the item-8 check, under §2b's raised cap | none cleared |
-| 6 | corrected | the four ×2 | c5 | `R6` — same trigger | none cleared |
-| 7 | corrected | the four ×2 | c6 | `R6` — same trigger; **cap exhausted for all four** | none cleared |
+| `corrected-round5.txt` | corrected | the four ×2 | c4 | `R6` — failed the item-8 check, under §2b's raised cap | none cleared |
+| `corrected-round6.txt` | corrected | the four ×2 | c5 | `R6` — same trigger | none cleared |
+| `corrected-round7.txt` | corrected | the four ×2 | c6 | `R6` — same trigger; **cap exhausted for all four** | none cleared |
 
-**Problems per round, for the four ids only** (each round's raw gate output is at
-`parts/superseded/refusal-reports/corrected-round{5,6,7}.txt`; round 5's was reproduced rather than
-captured live, and its file says so):
+**Problems per round, for the four ids only.** `corrected-round5.txt` was reproduced rather than
+captured live, and its own header says so. `corrected-round6.txt` and `corrected-round7.txt` also
+cover `054872`, whose numbers are **excluded** from this table and appear in §9 instead:
 
-| round | attempt | boundary | shared-span | total |
+| report file | attempt | boundary | shared-span | total |
 |---|---|---|---|---|
-| 5 | c4 | 7 | 12 | 19 |
-| 6 | c5 | 20 | 4 | 24 |
-| 7 | c6 | 26 | 6 | 32 |
+| `corrected-round5.txt` | c4 | 7 | 12 | 19 |
+| `corrected-round6.txt` | c5 | 20 | 4 | 24 |
+| `corrected-round7.txt` | c6 | 26 | 6 | 32 |
 
 **It does not converge, and the direction is the wrong one.** Under a fixed prompt three more
 draws produced more refusals, not fewer. Read against §3's monotonic *fall* across the earlier
@@ -578,24 +586,25 @@ for them.** Across both fixtures this run has now attempted 12 generations and f
 
 ### 9.2 The dispatch log
 
-Rounds continue §4's and §8.1's numbering. Every attempt is at
-`parts/superseded/<id>-<k>-corrected-attempt<n>.json`; every round's raw gate output is at
-`parts/superseded/refusal-reports/corrected-round<n>.txt`.
+**Labelled by report file, per §8.1's warning — these are NOT §4's overall round numbers.** Every
+attempt is at `parts/superseded/<id>-<k>-corrected-attempt<n>.json`; every round's raw gate output is
+at `parts/superseded/refusal-reports/corrected-round<n>.txt`. The first two rows share their files
+with §8.1's last two, because `054872`'s probe ran alongside the `skill-stickiness` re-runs.
 
-| round | shards | attempt | trigger | outcome |
+| report file | shards | attempt | trigger | outcome |
 |---|---|---|---|---|
-| 6 | `054872` ×2 | c1 | first run — §1-style calibration probe | failed |
-| 7 | `054872` ×2 | c2 | `R6` | failed |
-| 8 | `054872` ×2; other five ×2 | c3; c1 | `R6`; first run | none cleared |
-| 9 | all six ×2 | c4; c2 | `R6` | none cleared |
-| 10 | all six ×2 | c5; c3 | `R6` | none cleared |
-| 11 | all six ×2 | c6; c4 | `R6`; **`054872` cap exhausted** | none cleared |
-| 12 | five ×2 | c5 | `R6` | **`48527b` cleared** |
-| 13 | four ×2 | c6 | `R6`; **cap exhausted for all six** | none cleared |
+| `corrected-round6.txt` | `054872` ×2 | c1 | first run — §1-style calibration probe | failed |
+| `corrected-round7.txt` | `054872` ×2 | c2 | `R6` | failed |
+| `corrected-round8.txt` | `054872` ×2; other five ×2 | c3; c1 | `R6`; first run | none cleared |
+| `corrected-round9.txt` | all six ×2 | c4; c2 | `R6` | none cleared |
+| `corrected-round10.txt` | all six ×2 | c5; c3 | `R6` | none cleared |
+| `corrected-round11.txt` | all six ×2 | c6; c4 | `R6`; **`054872` cap exhausted** | none cleared |
+| `corrected-round12.txt` | five ×2 | c5 | `R6` | **`48527b` cleared** |
+| `corrected-round13.txt` | four ×2 | c6 | `R6`; **cap exhausted for all six** | none cleared |
 
 **The calibration probe was run and it is why the other five were dispatched.** `054872` went first
 (id-lexicographically), and its first corrected attempt refused **5 boundary spans of 94 — 5.3%**,
-against **5.5% (7/128)** for the `skill-stickiness` corrected probe of round 3. The instrument does
+against **5.5% (7/128)** for the `skill-stickiness` corrected probe of `corrected-round1-66530f.txt`. The instrument does
 not behave differently on this corpus, which is what the probe existed to establish. It was
 dispatched alongside the `skill-stickiness` re-runs rather than after them, because the two fixtures
 are independent and neither one's result gates the other's.
@@ -608,28 +617,28 @@ and wrote nothing (round 12).
 ### 9.3 Two things `tiered-review` does differently, both recorded and neither claimed
 
 1. **The 99.8% ceiling does not reproduce.** Every `skill-stickiness` round of this run and the last
-   sat at a 99.8% present rate, and §7.4 carries that as an undischarged doubt. **`tiered-review`
+   sat at a 99.8% present rate, and §7 item 4 carries that as an undischarged doubt. **`tiered-review`
    present rates run 73–84 of 84 — 87% to 100% — with real spread between generations and between
    attempts on the same generation.** That is what a measurement with some discriminating power
    looks like, and it is the first sign in either attempt that the instrument is not simply
    saturated. **It is not evidence about spec length**: this file's author cannot see arms, six
    generations is three arms of two, and the spread could be the fixture, the ledger, the arms or
-   the scorers. **§7.4's doubt is narrowed to `skill-stickiness`, not withdrawn.**
-2. **Shared-span violations dominate here; boundary refusals dominated there.** Over rounds 8–13,
+   the scorers. **§7 item 4's doubt is narrowed to `skill-stickiness`, not withdrawn.**
+2. **Shared-span violations dominate here; boundary refusals dominated there.** Over `corrected-round8.txt`..`13.txt`,
    counting only the six `tiered-review` ids, the split is **77 boundary / 92 shared-span** of 169
-   problems, where `skill-stickiness` round 7 was **26 boundary / 6 shared-span**. §3's shared-span
+   problems, where `skill-stickiness`'s `corrected-round7.txt` was **26 boundary / 6 shared-span**. §3's shared-span
    finding — plain scorer non-compliance with a rule the prompt states verbatim — is the live
    failure mode for this fixture. **§8.3's withdrawn ledger-entailment hypothesis must not be
    re-formed from this**; it was tested against the filed verdicts and died.
 
-   | round | boundary | shared-span | total |
+   | report file | boundary | shared-span | total |
    |---|---|---|---|
-   | 8 | 12 | 18 | 30 |
-   | 9 | 7 | 16 | 23 |
-   | 10 | 25 | 11 | 36 |
-   | 11 | 8 | 22 | 30 |
-   | 12 | 14 | 12 | 26 |
-   | 13 | 11 | 13 | 24 |
+   | `corrected-round8.txt` | 12 | 18 | 30 |
+   | `corrected-round9.txt` | 7 | 16 | 23 |
+   | `corrected-round10.txt` | 25 | 11 | 36 |
+   | `corrected-round11.txt` | 8 | 22 | 30 |
+   | `corrected-round12.txt` | 14 | 12 | 26 |
+   | `corrected-round13.txt` | 11 | 13 | 24 |
    | **total** | **77** | **92** | **169** |
 
    **The denominator is the six `tiered-review` ids only** — each round's raw file also scans the
@@ -680,3 +689,33 @@ prompt directory.
    tier 1 in this attempt — and it is a fact about scorer compliance with item 8, not about what any
    arm retained.
 6. **`FREEZE-2.md` is still closed at this run's rows.** T5b added none.
+
+#### 9.5a Carried forward UNDISCHARGED from §7 — T5b resolved none of these
+
+**§7's preface says items 4–8 are re-listed here, and an earlier draft of §9.5 did not actually
+re-list them.** Review caught that: four obligations, one of them a decision that blocks T9, were
+named as carried and then dropped. They are below, verbatim in substance from §7, so that a reader
+of §9 alone still meets them. **T5b discharged §7 items 1–3 and NONE of these.**
+
+7. **(§7 item 4) The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md`
+   §7.5's, reproduced. It belongs in `RESULTS-2.md` beside the tier-2 and tier-3 outcomes, and no
+   tier-1 number may be published without it. **§9.3 narrows it to `skill-stickiness` and does not
+   withdraw it.**
+8. **(§7 item 5) Four obligations owed to T8 from `GENERATION-2-NOTES.md`'s six-row table remain
+   open:** flag both `R5a` generations and read neither as a win; **do not read `fd2c24`'s retention
+   as evidence** — and note `fd2c24` never cleared the gate under the extended cap either, so there
+   is no verdict to misread, which discharges nothing; log the early publication of the `wc`/`R5a`
+   figures as a deviation; and — after the join — report whether generation titles track the arm.
+9. **(§7 item 6) T4's still-open questions, which nothing else keeps alive:** the title-variance
+   channel (owed by T8 and the write-up); **whether re-dispatching two transmission questions was
+   right — decide before T9; the revert is `git revert 6268365`**; the 20 freeze rows are not checked
+   for completeness; and the leak check tells a reader to "re-run under `R6`" for a case `R6`'s
+   closed trigger list does not cover.
+10. **(§7 item 7) A frozen-instrument inconsistency.** Item 9's first blockquote — handed verbatim to
+    every scorer, including all 96 of T5b's dispatches — says a paraphrase *"may be evidenced by up
+    to three spans"* while the same prompt's rules say **1 to 5**. Scorers followed the rules. With
+    §2a this is the second place item 10's template and the items it claims to carry disagree, and
+    they belong together as one finding about item 10.
+11. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
+    rests on `tools/build-tier1-prompts.py` being deterministic — checkable by re-running it, not by
+    diffing an artifact. T5b built and dispatched from that builder and added no prompt artifact.
