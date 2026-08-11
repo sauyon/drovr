@@ -15,8 +15,15 @@ at `~/.local/share/drovr/runs/spec-length-ab2/plan.md`.)
 **THE RUN'S TIER-1 OUTCOME SO FAR, ACROSS TWO OF THREE FIXTURES: THREE VERDICTS FILED OF TWELVE
 GENERATIONS ATTEMPTED.** `6e7393` and `e085f2` (`skill-stickiness`, §T5a below) and `48527b`
 (`tiered-review`, §9). The other nine are **missing data**, not zero retention — every one of them
-was given up to six corrected attempts per shard under the extended cap of §2b. **§8 and §9 are
-T5b's record; §T5a–§7 are T5a's and are not rewritten.**
+was given up to six corrected attempts per shard under the extended cap of §2b.
+
+**Who wrote what, precisely, because the loose version of this is false.** §8 and §9 are T5b's.
+Everything from "T5a's outcome" to §7 is T5a's **except three T5b insertions, which say so in their
+own first line**: **§2b** (the extended cap), **§5a** (the driver's decision resolving §5), and §7's
+preface. T5b also appended a pointer at the end of §4 and fixed two dead cross-references. **No T5a
+conclusion, count, table or round number was rewritten** — §4's rounds 0–6 and §3's per-round table
+stand exactly as T5a left them, which is why §8.1 has to warn that the two sections number rounds
+differently rather than renumbering either.
 
 ## T5a's outcome, up front
 
@@ -133,7 +140,7 @@ not have to find them in the source:
    toward no refused shape, but "invents no guidance" is not literally true of them.
 3. **"Byte-identical" means the built prefix matches what the 26 defective dispatches emitted** — not
    that it matches the frozen template, which of course carries substituted paths and rows. What a
-   reader can check without the prompts (uncommitted, §7.7) is the `ed583e9` diff, which is the
+   reader can check without the prompts (uncommitted, §7 item 8) is the `ed583e9` diff, which is the
    stronger evidence anyway: it is purely additive and touches no substitution.
 
 **The correction did not move the measurement, only the span shape — and that is checkable.** Present
