@@ -415,7 +415,7 @@ carries `.git`; that is a known remaining hole.
 list for T5c.** Item 1 (use the corrected builder) was followed; item 2 (wait for the §5 decision)
 was resolved by §5a and executed as §2b; item 3 (the admissibility tool is hardcoded) is fixed —
 the tool now takes a required fixture argument. **Items 4–8 are still open and are re-listed
-verbatim in substance as §9.5a items 8–12**, alongside T5b's own additions in §9.5 items 1–7.
+verbatim in substance as §9.5a items 10–14**, alongside T5b's own additions in §9.5 items 1–9.
 Nothing here is deleted, because the list is also the record of what each task was told.
 
 1. **Use the corrected `tools/build-tier1-prompts.py`** — it hands over item 8. Do not rebuild prompts
@@ -623,8 +623,15 @@ and wrote nothing (round 12).
 
 ### 9.3 Two things `tiered-review` does differently, both recorded and neither claimed
 
-1. **The 99.8% ceiling does not reproduce.** Every `skill-stickiness` round of this run and the last
-   sat at a 99.8% present rate, and §7 item 4 carries that as an undischarged doubt. **`tiered-review`
+1. **The 99.8% ceiling does not reproduce.** Every `skill-stickiness` round **of this run** sat at a
+   99.8% present rate (§T5a: 2543 of 2548), and §7 item 4 carries that as an undischarged doubt.
+   **An earlier draft said "this run and the last", attaching 99.8% to v1 as well. That was wrong and
+   review caught it: `99.8%` appears nowhere in `RESULTS.md`**, whose own aggregate is close to but
+   not equal to it. What v1 actually recorded is the same *shape* and the same *doubt*, qualitatively
+   — §7.5's *"implausibly high … four of six generations scored 91/91"* — and that is all §T5a ever
+   claimed of it. **No v1 aggregate is computed here**: recomputing the first attempt's numbers is
+   not this file's business, and inventing one to make a comparison symmetrical is how a figure with
+   no source ends up quoted downstream. **`tiered-review`
    present rates run 73–84 of 84 — 87% to 100% — with real spread between generations and between
    attempts on the same generation.** That is what a measurement with some discriminating power
    looks like, and it is the first sign in either attempt that the instrument is not simply
@@ -699,6 +706,15 @@ prompt directory.
 7. **Hash your shards as they land.** §9.6 records a byte-identical attempt pair found only at
    review. A one-line `sha256sum` check per round would have caught it when it happened, when a
    re-dispatch was still affordable.
+8. **(§8.4 item 2) `RESULTS-2.md` must report the cap extension AND its failure, together.**
+   Reporting a raised cap without reporting that it produced no verdict for the four ids it was
+   opened for would misdescribe the run in the flattering direction. §2b's post-hoc disclosure
+   obligation and §8.1's outcome are **one item, not two**.
+9. **(§8.4 item 3) The negative result is itself evidence about the instrument.** That tier-1
+   well-formedness is not reliably reachable — 3 verdicts filed from 12 generations, each given up to
+   six corrected attempts per shard, by scorers handed the frozen rule verbatim — belongs in
+   `RESULTS-2.md` beside the present-rate doubt. It points the same way: **the tier-1 gate is
+   measuring scorer compliance, and the discriminating load still sits on T6 and T7.**
 
 #### 9.5a Carried forward UNDISCHARGED from §7 — T5b resolved none of these
 
@@ -706,32 +722,33 @@ prompt directory.
 re-list them.** Review caught that: four obligations, one of them a decision that blocks T9, were
 named as carried and then dropped. They are below, verbatim in substance from §7, so that a reader
 of §9 alone still meets them. **T5b discharged §7 items 1–3 and NONE of these.** They are numbered
-8–12 to continue §9.5's list rather than restart it, because an earlier draft had two different
+10–14 to continue §9.5's list rather than restart it, because an earlier draft had two different
 "item 7"s in the same section.
 
-**§9.5's items 1–7 are T5b's own; §9.5a's items 8–12 are §7's items 4–8 carried.** One numbering,
-two provenances, tagged per item.
+**§9.5's items 1–9 are T5b's own (items 8–9 carrying §8.4's); §9.5a's items 10–14 are §7's items 4–8
+carried.** One numbering, several provenances, tagged per item. **§9.5 + §9.5a together are now the
+complete outstanding list** — a reader who reads only §9 misses nothing from §7 or §8.4.
 
-8. **(§7 item 4) The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md`
+10. **(§7 item 4) The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md`
    §7.5's, reproduced. It belongs in `RESULTS-2.md` beside the tier-2 and tier-3 outcomes, and no
    tier-1 number may be published without it. **§9.3 narrows it to `skill-stickiness` and does not
    withdraw it.**
-9. **(§7 item 5) Four obligations owed to T8 from `GENERATION-2-NOTES.md`'s six-row table remain
+11. **(§7 item 5) Four obligations owed to T8 from `GENERATION-2-NOTES.md`'s six-row table remain
    open:** flag both `R5a` generations and read neither as a win; **do not read `fd2c24`'s retention
    as evidence** — and note `fd2c24` never cleared the gate under the extended cap either, so there
    is no verdict to misread, which discharges nothing; log the early publication of the `wc`/`R5a`
    figures as a deviation; and — after the join — report whether generation titles track the arm.
-10. **(§7 item 6) T4's still-open questions, which nothing else keeps alive:** the title-variance
+12. **(§7 item 6) T4's still-open questions, which nothing else keeps alive:** the title-variance
    channel (owed by T8 and the write-up); **whether re-dispatching two transmission questions was
    right — decide before T9; the revert is `git revert 6268365`**; the 20 freeze rows are not checked
    for completeness; and the leak check tells a reader to "re-run under `R6`" for a case `R6`'s
    closed trigger list does not cover.
-11. **(§7 item 7) A frozen-instrument inconsistency.** Item 9's first blockquote — handed verbatim to
+13. **(§7 item 7) A frozen-instrument inconsistency.** Item 9's first blockquote — handed verbatim to
     every scorer, including all 96 of T5b's dispatches — says a paraphrase *"may be evidenced by up
     to three spans"* while the same prompt's rules say **1 to 5**. Scorers followed the rules. With
     §2a this is the second place item 10's template and the items it claims to carry disagree, and
     they belong together as one finding about item 10.
-12. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
+14. **(§7 item 8) The built prompts are still not committed.** "Byte-identical on every attempt"
     rests on `tools/build-tier1-prompts.py` being deterministic — checkable by re-running it, not by
     diffing an artifact. T5b built and dispatched from that builder and added no prompt artifact.
 
