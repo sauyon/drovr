@@ -125,7 +125,7 @@ runs.** That is the finding, and it retires the earlier one.
 | 3 | the five still failing | 641 | 11 | 6 | **`6e7393`** |
 | 4 | the three with budget left | 397 | 3 | 6 | — |
 
-**One claim from this task's own commit message needs correcting here.** `74e4b0f` says duplicate-span
+**One claim from this task's own commit message needs correcting here.** `43d7715` says duplicate-span
 violations "largely disappear" under the corrected prompt. **They do not.** Under the defective prompt
 there were 10 across 13 attempts (0.8 per attempt); under the corrected prompt 18 across 15 (1.2 per
 attempt). The rule — *"no span may appear under more than one row"* — is stated in the template either
