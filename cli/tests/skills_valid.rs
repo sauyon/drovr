@@ -3818,6 +3818,15 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
 /// the refusal rate by a few points and the union by a few more; the number that
 /// matters (§6 of the task report) is large under all three, and it is reported
 /// rather than engineered away.
+///
+/// **One inherited edge, named rather than left to be found.** `<digits>.` is a
+/// marker per the frozen rule and the rule does not require a space after it, so
+/// the prefix `1.` of a *decimal* counts: a span beginning at `5 GB is the cap.`
+/// on a line reading `1.5 GB is the cap.` is treated as beginning on a block
+/// start. Requiring the space would be the narrower of the two readings again,
+/// and narrowing here — unlike the `*` case, where the two readings refuse
+/// opposite spans — would refuse a real ordered-list item written `1.text`. The
+/// edge is left as the frozen rule writes it.
 fn line_prefix_is_all_markers(prefix: &str) -> bool {
     let b = prefix.as_bytes();
     let mut i = 0;
@@ -3873,9 +3882,20 @@ fn span_begins_on_boundary(spec: &str, at: usize) -> bool {
     }
     // The span opens its own line. Whether that is a boundary depends on what
     // came before it — a continuation of a wrapped sentence is not.
+    //
+    // **On line 1 there is no preceding line, and the clause is a conjunction,
+    // so it simply fails.** An earlier draft returned `true` here on the reading
+    // that "nothing contradicts the block start". That was a clause this code
+    // invented: item 8's block-start rule requires the preceding line to be
+    // blank, a heading, a table row, or terminator-ended, and "there isn't one"
+    // is not on that list. Offset 0 is already its own clause, so what this
+    // refuses is the narrow case of a span starting after a marker on the very
+    // first line — `# Title`'s title text, say. Refusing is the narrower
+    // behaviour and so cannot produce a false accept; it is recorded in the task
+    // report as a place where reading the frozen rule literally costs a real, if
+    // unlikely, span.
     if line_start == 0 {
-        // There is no preceding line, so nothing contradicts the block start.
-        return true;
+        return false;
     }
     let prev_end = line_start - 1;
     let prev_start = spec[..prev_end].rfind('\n').map_or(0, |i| i + 1);
@@ -3904,18 +3924,60 @@ fn span_ends_on_boundary(spec: &str, end: usize) -> bool {
         return false;
     };
     let next = rest.split('\n').next().unwrap_or("");
-    if next.trim().is_empty() {
+    next.trim().is_empty() || line_opens_a_block(next)
+}
+
+/// Does `line` **open a new block** — item 8's `|`, `#`, `-`, `*`, `+`, `>` or
+/// `<digits>.`?
+///
+/// **A bullet, a heading and an ordered-list marker each need their delimiting
+/// space, and leaving that out is a false accept of the exact clip the rule
+/// exists to catch.** `- **Loop**` opens a block; `**every** failed attempt`
+/// does not — it is the continuation of a wrapped paragraph that happens to
+/// begin with emphasis. Without the space check, a span clipped mid-phrase at
+/// the end of a line is judged to *end on a boundary* whenever the next line
+/// starts with `**`, `#`, or a decimal number, which is common in this corpus's
+/// prose. The rule's own worked example is a mid-phrase clip, so accepting one
+/// on a formatting coincidence defeats the whole item.
+///
+/// **This asks a different question from [`line_prefix_is_all_markers`], which
+/// is why the two treat `*` differently and neither is inconsistent.** That one
+/// asks *is everything before the span mere formatting* — where `- **Bold` and
+/// `- **` are both wholly formatting, so both readings are accepted. This one
+/// asks *does the next line START a block* — a structural claim about the line,
+/// which `**every**` does not satisfy under any reading.
+fn line_opens_a_block(line: &str) -> bool {
+    let t = line.trim_start();
+    let b = t.as_bytes();
+    if b.is_empty() {
         return true;
     }
-    let opener = next.trim_start().as_bytes();
-    match opener[0] {
-        b'|' | b'#' | b'-' | b'*' | b'+' | b'>' => true,
-        b'0'..=b'9' => {
+    let delimited = |after: usize| after >= b.len() || b[after] == b' ' || b[after] == b'\t';
+    match b[0] {
+        // A table row and a blockquote need no delimiter — the marker is the
+        // whole signal, and both are unambiguous at the start of a line.
+        b'|' | b'>' => true,
+        b'#' => {
             let mut j = 0;
-            while j < opener.len() && opener[j].is_ascii_digit() {
+            while j < b.len() && b[j] == b'#' {
                 j += 1;
             }
-            j < opener.len() && opener[j] == b'.'
+            delimited(j)
+        }
+        b'-' | b'*' | b'+' => {
+            // A bullet, or a thematic break (`---`, `***`), which is also a block.
+            let mut j = 0;
+            while j < b.len() && b[j] == b[0] {
+                j += 1;
+            }
+            j >= 3 || delimited(1)
+        }
+        b'0'..=b'9' => {
+            let mut j = 0;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            j < b.len() && b[j] == b'.' && delimited(j + 1)
         }
         _ => false,
     }
@@ -3974,8 +4036,15 @@ fn span_is_self_contained(spec: &str, span: &str) -> bool {
 /// to 5 and adds the self-containment rule. Forking the function would have left
 /// two copies of the completeness and double-citation logic to keep in step, and
 /// the v1 copy is the one nobody would touch again. Every v1 call site passes
-/// [`SPEC_LENGTH_ID_POOL`] and [`RETENTION_RULES_V1`], so v1 behaviour is
-/// unchanged down to the wording of the span-count complaint.
+/// [`SPEC_LENGTH_ID_POOL`] and [`RETENTION_RULES_V1`], so **which verdicts v1
+/// accepts and rejects is unchanged**.
+///
+/// **One v1 complaint's wording did change, and it is not "unchanged down to the
+/// wording" as an earlier draft of this comment claimed.** The span-count message
+/// used to read *"more than three is a row…"* spelled out; it now interpolates
+/// `rules.max_spans` and reads *"more than 3"*. Nothing asserts the literal
+/// phrase, so no test moved — but a comment promising an invariant the code does
+/// not hold is worse than the drift it was describing.
 fn check_retention_verdict(
     stem: &str,
     verdict: &RetentionVerdict,
@@ -8074,18 +8143,44 @@ fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
     // out of, plus the line above it, because the rule's left-hand clauses read
     // the preceding line and a fixture that started at the clip would be asking
     // an easier question than the real one.
-    let clipped = "\
-  violates the rule without the skill; GREEN ↔ it complies with the skill; REFACTOR ↔ close each
-  new loophole.
-- **Loop** (fenced `dot` flowchart, a stop-too-early loop per §2.3): build the scenario set → run
-  the baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on
-  held-out scenarios → apply the four-part closure to each new rationalization → repeat until a
-  run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever
-  comes first. The ceiling is not optional — an uncapped loop is the unbounded-cost defect this
-  spec exists to fix elsewhere.
-";
+    let clipped = "  violates the rule without the skill; GREEN ↔ it complies with the skill; REFACTOR ↔ close each\n  new loophole.\n- **Loop** (fenced `dot` flowchart, a stop-too-early loop per §2.3): build the scenario set → run\n  the baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on\n  held-out scenarios → apply the four-part closure to each new rationalization → repeat until a\n  run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever\n  comes first. The ceiling is not optional — an uncapped loop is the unbounded-cost defect this\n  spec exists to fix elsewhere.\n";
+    // **The fixture is checked against the file it claims to be**, because a
+    // fixture that has drifted is a test checking its own typo — and this one's
+    // whole authority is that it is the real clip rather than a plausible
+    // reconstruction of one. `generated/db3e2d.md` is a first-attempt artifact
+    // in the untouchable set, so these bytes do not move.
+    let real_spec = spec_length_generated_dir().join("db3e2d.md");
+    let real = fs::read_to_string(&real_spec)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", real_spec.display()));
+    let real_446_453: String = real
+        .lines()
+        .skip(445)
+        .take(8)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(
+        clipped,
+        real_446_453,
+        "the inline fixture is no longer {}:446-453",
+        real_spec.display(),
+    );
+
     let left_half = "run produces no new rationalization **or** the §7.3 REFACTOR ceiling is reached, whichever";
     let right_half = "comes first.";
+    // And the two spans are the ones the record really carries, not a retyping.
+    let recorded = fs::read_to_string(spec_length_dir().join("invalidated").join("db3e2d.json"))
+        .expect("the first attempt's invalidated verdict is on disk");
+    let recorded: RetentionVerdict = serde_json::from_str(&recorded).expect("it parses");
+    let row_55 = recorded
+        .rows
+        .iter()
+        .find(|r| r.id == "skill-stickiness-55")
+        .expect("`skill-stickiness-55` is in the record");
+    assert_eq!(
+        row_55.quotes,
+        vec![left_half.to_string(), right_half.to_string()],
+        "the two spans under test must be the ones `invalidated/db3e2d.json` really recorded"
+    );
     assert!(
         clipped.contains(left_half) && clipped.contains(right_half),
         "the fixture must reproduce the real spans, or this test is checking its own typo"
@@ -8181,6 +8276,55 @@ The picker binds `j` and `k` to move. It refuses an empty selection.
         assert!(
             span_is_self_contained(clean, span),
             "{span:?} must be accepted: {why}"
+        );
+    }
+
+    // **A clip whose next line merely STARTS with emphasis is still refused.**
+    // This is the false accept a review caught: `**every**` is not a new block,
+    // it is a wrapped paragraph continuing, and reading a bare `*` as a block
+    // opener let a span ending mid-phrase pass whenever the wrap happened to
+    // land before bold text. That is the rule's own worked-example shape passing
+    // on a formatting coincidence.
+    let emphasis_wrap = "\
+Intro paragraph here.
+
+The retry counter climbs by one on
+**every** failed attempt before the breaker trips.
+";
+    assert!(
+        !span_is_self_contained(emphasis_wrap, "The retry counter climbs by one on"),
+        "a span ending mid-phrase must stay refused when the next line only begins with \
+         emphasis — `**every**` continues the paragraph, it does not open a block"
+    );
+    assert!(
+        span_is_self_contained(
+            emphasis_wrap,
+            "The retry counter climbs by one on\n**every** failed attempt before the breaker \
+             trips."
+        ),
+        "and the same sentence quoted whole is accepted, so the tightening refuses the clip \
+         rather than the content"
+    );
+    // The other half of the same mistake: a decimal at the start of the next
+    // line is not an ordered-list marker.
+    let decimal_wrap = "\
+Intro paragraph here.
+
+The breaker opens after a delay of
+12.5 seconds, measured from the first failure.
+";
+    assert!(
+        !span_is_self_contained(decimal_wrap, "The breaker opens after a delay of"),
+        "`12.5 seconds` is a decimal, not a `<digits>.` list marker, so it does not open a \
+         block and the clip before it is not on a boundary"
+    );
+    // And the markers that genuinely do open a block still do.
+    for opener in ["- a bullet", "# A heading", "| a | row |", "> a quote", "1. an item", "---"] {
+        let doc = format!("Intro here.\n\nA clipped line\n{opener}\n");
+        assert!(
+            span_is_self_contained(&doc, "A clipped line"),
+            "{opener:?} opens a block, so a span ending at the line before it ends on a \
+             boundary"
         );
     }
 
