@@ -3825,7 +3825,9 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
 /// the `- **Bold lead.**` case in both directions.
 ///
 /// **It is not a loosening chosen to make a corpus pass.** The refusal rate over
-/// the first attempt's real spans is ~85% under every reading of this clause;
+/// the first attempt's real spans is ~85% under either reading — 957/1127
+/// (84.9%) under this union, 964/1127 (85.5%) under the bullet-needs-a-space
+/// reading, both recomputed independently by a review round;
 /// the number is reported rather than engineered away: **957 of the operative
 /// six generations' 1127 real spans (84.9%) are refused**, measured with this
 /// function over `invalidated/{4a73ef,80d9a2,87e5a5,aa3199,d25798,db3e2d}.json`.
@@ -3837,14 +3839,28 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
 /// It is a fact about the first attempt's quoting habit, not a prediction — but
 /// it is the closest thing to one that exists.
 ///
-/// **One inherited edge, named rather than left to be found.** `<digits>.` is a
-/// marker per the frozen rule and the rule does not require a space after it, so
-/// the prefix `1.` of a *decimal* counts: a span beginning at `5 GB is the cap.`
-/// on a line reading `1.5 GB is the cap.` is treated as beginning on a block
-/// start. Requiring the space would be the narrower of the two readings again,
-/// and narrowing here — unlike the `*` case, where the two readings refuse
-/// opposite spans — would refuse a real ordered-list item written `1.text`. The
-/// edge is left as the frozen rule writes it.
+/// **The edges this admits, named rather than left to be found.** None of them
+/// begins mid-phrase — that is the property above — but each accepts a prefix
+/// that is not one canonical marker construct, and a reader should not have to
+/// discover them:
+///
+/// - `<digits>.` is a marker and the frozen rule requires no space after it, so
+///   the `1.` of a *decimal* counts: a span beginning at `5 GB is the cap.` on a
+///   line reading `1.5 GB is the cap.` is a block start. Requiring the space
+///   would refuse a real ordered-list item written `1.text`.
+/// - `*Text` with no delimiting space is accepted, the same shape one step over.
+/// - A run of several single-character cells, `| - | * | Actual content…`, is
+///   all markers, so a span at `Actual content…` is accepted.
+/// - So is `- - - Actual content…`, and **this one is a genuine asymmetry with
+///   [`line_opens_a_block`]**: identical text on the *next*-line side is
+///   correctly refused there, because it is neither a valid thematic break (it
+///   has trailing content) nor one bullet. The two sides are asking different
+///   questions — see above — and the left-hand question has no reason to care
+///   how many markers preceded the content. Recorded because the disagreement is
+///   real and a reader comparing the two functions will find it.
+///
+/// A review round tried and failed to construct a mid-phrase span that any of
+/// these lets through; the marker alphabet contains no letters, which is why.
 fn line_prefix_is_all_markers(prefix: &str) -> bool {
     let b = prefix.as_bytes();
     let mut i = 0;
