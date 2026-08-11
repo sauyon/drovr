@@ -112,9 +112,16 @@ out.** The first attempt's guarantee was structural; here it survives only for `
 **Whether the variants correlate with the arm has deliberately not been checked here — and that is
 a deferral, not a refusal.** Answering it now means reading `blind-map-2.json` against the titles
 and writing down what came back, and a sentence here saying "they do not correlate" would be a
-second, weaker record of the same secret. Item 7's prohibition is what forbids it, and **its
-prohibition is temporal**: no artifact states any part of the assignment *"at any point **before**
-the unblinding task has joined the verdicts."*
+second, weaker record of the same secret — which is the thing item 7 exists to prevent, and its
+stated reason for having no `salt` field.
+
+**That the bar lifts after the join is a reasoned extension of item 7, not a quotation of it**, and
+the distinction is worth keeping straight in a file this careful. Item 7's explicit temporal
+qualifier — *"at any point **before** the unblinding task has joined the verdicts"* — is attached to
+an enumerated list of draw mechanics: the salt, the ordering rule, the sort direction, the
+within-arm fixture order, the within-fixture sample order, a per-file digit sequence. A correlation
+between title phrasing and arm is none of those. What carries the argument is item 7's *rationale*
+rather than its list, and that rationale is temporal on its face.
 
 **After that join the answer costs nothing, so it is owed rather than dropped.** Item 11's stated
 ethos is that *"this run documents every channel it knows about"*, and item 14a's `gaps-2/<id>.md`
@@ -133,8 +140,16 @@ time, so a scorer never holds two titles of one fixture. **Item 14a's pairing ad
 stage that does** — it is handed two generations of the same fixture relabelled `A` and `B`. A
 title-phrasing difference is visible to it. It is told nothing about arms and is not asked which
 spec is better, and `A`/`B` is fixed by lexicographic id rather than by arm, so the difference is
-uninterpretable to it; but it is a difference the first attempt did not have, and T9 should read
-this paragraph before it runs.
+uninterpretable to it; but it is a difference the first attempt did not have, and **the task that
+runs item 14a should read this paragraph before it dispatches.**
+
+**Name that task carefully, because the two documents number it differently.** It is **`plan.md`
+T10** — *"(conditional, `R7`) The item-14a gap test"*. `PROTOCOL-2.md` item 14a calls the same task
+**T9** (*"T9 runs after T7 has unblinded"*), because it kept the numbering of a decomposition that
+was later replanned — the same staleness `PROTOCOL-2.md` item 2 deviation 1 records for
+`FREEZE.md`'s "Who appends what" table. Under `plan.md`'s numbering T9 is the item-**14**
+transmission test, which is a different task and not the one this paragraph is addressed to.
+Everywhere else in this file, task numbers are `plan.md`'s.
 
 ### Not repaired, and not repairable
 
@@ -290,5 +305,22 @@ input is full of headers. `R5a` and `R3` are unchecked because they are rules ab
 
 Closing either gap now would mean inventing a checked artifact after the measurement exists, which
 is the move this second attempt was set up to rule out — and `PROTOCOL-2.md` is closed, window 3
-having shut at the first item-5 dispatch. **The gaps belong to whoever pre-registers a third
-attempt, and this is the note that hands them over.**
+having shut at the first item-5 dispatch.
+
+**So they are owed by people, not by tests, and here is the whole list of what this file leaves
+open and to whom:**
+
+| open item | owed by | where |
+|---|---|---|
+| flag both `R5a` generations, and read neither as a win | the unblinding task (`plan.md` T8) and the write-up | §2 |
+| do not read `fd2c24`'s free full retention as evidence | the same | §2, §3 |
+| join the title phrasings to the arms and report whether they track | the same, **after** the join | §1 |
+| read §1's title-variance caveat before dispatching item 14a | **`plan.md` T10** (`PROTOCOL-2.md` calls it T9) | §1 |
+| enforce item 5's "no header" / "no fixture name" mechanically, or decide they cannot be | whoever pre-registers a third attempt | §1 |
+
+**Nothing tests any row of that table, and nothing else in the run points at it.** `plan.md` T8's
+own list of what `RESULTS-2.md` must contain does not mention the title-correlation check, because
+that question did not exist when the plan was written and window 3 forbids adding it to
+`PROTOCOL-2.md` now. This file and this task's report and handoff are the only carriers. **A driver
+who wants that made structural should add the row to `plan.md` T8's deliverables — `plan.md` is not
+frozen and is theirs to amend; it is not this note's to change.**
