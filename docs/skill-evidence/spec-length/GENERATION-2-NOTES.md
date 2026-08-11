@@ -21,9 +21,8 @@ reaches T8 only by being carried through four handoffs; the anomaly it describes
 task could otherwise process as ordinary. Committing it puts it beside the artifact it is about.
 
 **It changes nothing the plan or the protocol decides.** `RESULTS-2.md` still owes the `R5a`
-publication at T8 — this file does not discharge that — and no gate, denominator, rule or arm moves.
-`PROTOCOL-2.md` is untouched: window 3 shut at this task's first item-5 dispatch and nothing here
-revises a governed item.
+publication at T8 — this file does not discharge that. `PROTOCOL-2.md` is untouched: window 3 shut
+at this task's first item-5 dispatch and nothing here revises a governed item.
 
 ## `R5a` — the copy check
 
@@ -83,9 +82,15 @@ are ordered accordingly.
   `7f11a08cff6cd95999e55eb353ad38c250b7a78d` (tiered-review),
   `12ceaa75f26125c93835587815a21e43e96de6b1` (tui-dc-picker).
 - **All 18 generation blobs are distinct**, so no slot holds a duplicate of another slot.
+- **Every generation's opening line names the fixture the map assigns it** — 18 of 18, checked
+  against `fixture-map-2.json`. A slot generated under another fixture's prompt would show here.
 
-Both are one `git hash-object --no-filters` loop. Whatever produced `fd2c24`, it did not touch
-anything else, and that conclusion needs no testimony.
+The first two are one `git hash-object --no-filters` loop; the third is one read of each file's
+first line. **State the conclusion no wider than they carry:** they rule out a fixture substituted
+into another slot, two slots holding the same bytes, and a slot written against the wrong fixture.
+They do **not** rule out every shape a bug could take — a truncated file, or one subtly corrupted
+into bytes that are still unique and still on-topic, would pass all three. What they establish is
+that the failure mode `fd2c24` exhibits is confined to `fd2c24`, and that much needs no testimony.
 
 **2. The rewrite step is committed, and it is the wrong shape to have done this.**
 `tools/normalise-generated-2.py` opens `generated-2/`, `blind-map-2.json` and `fixture-map-2.json`
@@ -93,7 +98,7 @@ and nothing else — its only mentions of `fixtures` are the fixture *map* and `
 line counts, neither of which is a file under `fixtures/` — and it asserts every body byte-identical
 across the teardown (`assert fh.read() == bodies[i]`).
 
-**What this does and does not establish, because the distinction was overclaimed here once already:**
+**What this does and does not establish** — the distinction was overclaimed here once already:
 a reader can check that a script *of this shape* cannot substitute a fixture. A reader **cannot**
 check that these are the bytes that ran. The script was committed at `1dd9a7b`, about half an hour
 after `2e183a5` produced `generated-2/`, and specifically in answer to a review finding; `git
@@ -144,10 +149,49 @@ Two of these are `R5a`'s own pre-registered requirements, quoted rather than ext
 The rest is commentary, and is marked as such because window 3 is shut and this file may not add to
 a governed rule. That `fd2c24` is a verbatim copy rather than merely a long spec is a measurement
 recorded above, not a third clause of `R5a`; `R5a` requires the flag and says nothing about what a
-flag must be annotated with. And `R3` asks for per-arm and per-fixture means against the fixtures' own lengths, and
+flag must be annotated with. And `R3` asks for per-arm and per-fixture means against the
+fixtures' own lengths, and
 `fd2c24`'s 791 lines *are* its fixture's length, so its arm's mean is pulled toward the reference
 point by a generation that compressed nothing. Whether to show the per-generation numbers beside the
 means is the write-up's call, not a requirement this file can create.
+
+## Eleven generations carry their fixture's name, which item 5 forbids
+
+**Item 5:** *"The generated file holds **only the spec body** — no header, no arm name, no fixture
+name, no id. Anything else is a channel to the scorer."* **Eleven of the eighteen breach the letter
+of that**, and the breach is inherited from the fixtures rather than invented by the probes:
+
+- **All 6 `tiered-review` generations** reproduce `fixtures/tiered-review.spec.md`'s line 3
+  verbatim, at their own line 3:
+  `` **Run:** `tiered-review` · **Worktree:** `.drovr/wt/tiered-review` · **Branch:** `drovr/tiered-review` ``
+- **5 of the 6 `tui-dc-picker` generations** carry `.drovr/wt/tui-dc-picker`, from that fixture's
+  own text.
+- The `tiered-review` fixture also names `skill-stickiness` twice and `blind-map` once, and its
+  generations inherit those too.
+
+**The rule's letter is breached; its stated purpose is not.** Item 5 gives the reason in the same
+sentence — *"Anything else is a channel to the scorer"* — and this is not one, for two reasons a
+reader can check:
+
+1. **It carries no arm.** The line is byte-identical, at the same line number, in all six
+   `tiered-review` generations — that is two generations from each of the three arms. A signal
+   present identically in every arm distinguishes none of them, and the arm partition is the only
+   secret item 7 protects.
+2. **Fixture identity is published deliberately.** Item 7a exists precisely so every scoring task is
+   *told* which fixture an id belongs to, so a scorer learning it from the text learns nothing it
+   was not handed.
+
+**Not repaired, and the reason is the same one that governs `fd2c24`.** The specs are the raw
+measurement; editing generated text to satisfy a rule about generated text would destroy the thing
+being measured, which is why the suite's own leak message says that repair is not available. `R6`
+does not license a re-run either — its trigger list is closed and does not include this — and
+nothing may be added to `PROTOCOL-2.md` now that window 3 is shut. So it is recorded.
+
+**No test checks it, and that gap is real.**
+`spec_length_2_generations_are_unlabelled_and_cover_the_design`
+checks for `S0`–`S3`, a generation's own id, and the probe template's markers — not for a header and
+not for a fixture name. A future attempt that wanted item 5 enforced mechanically would have to
+decide first what "no header" means for a document whose input is full of headers.
 
 **No test enforces any of this.** `R5a` is a rule about how a result is *read*, and the suite checks
 shape and ordering, not interpretation. That gap is stated here rather than closed: inventing a new
