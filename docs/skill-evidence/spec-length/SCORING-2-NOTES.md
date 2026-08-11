@@ -25,6 +25,17 @@ at `~/.local/share/drovr/runs/spec-length-ab2/plan.md`.)
 read off a file the mechanical gate rejected. **T8 must not treat an absent verdict as a zero, and
 T6 has no input for those four ids.** §5 is the escalation.
 
+**And the two that ARE filed should not be read as retention signal either — v1 said so first.**
+Across all 56 shards of this task the present rate is **2543 of 2548 row-judgements — 99.8%**, and
+the two filed verdicts sit exactly on that ceiling (`6e7393` 91/91, `e085f2` 90/91). `RESULTS.md`
+§7.5 already recorded the same shape and the same doubt: *"The retention numbers are implausibly
+high, and T5 does not believe them. Four of six generations scored 91/91 … exactly the shape a
+lenient scorer produces."* **This attempt reproduces it, and this file inherits the doubt.** The
+gate these two verdicts cleared asserts **well-formedness, never judgement** — item 8 says so in
+terms — so "filed" means "correctly shaped", not "correct". Whether the retention is real is tier
+2's and tier 3's question (items 8a, 8b), and **T6 and T7 now carry the entire discriminating load
+of this measurement.**
+
 **An earlier version of this file concluded that T5a was BLOCKED by a defect in frozen
 `PROTOCOL-2.md`. That conclusion is WITHDRAWN.** It was wrong, and it was wrong because of this
 task's own tooling — §3 is the whole story, kept rather than deleted because the mistake is the most
@@ -76,7 +87,9 @@ commit remains the author's word.
 
 ### 2a. The delivery defect, and the corrected prompt
 
-**Pre-registered in commit `ed583e9` before the corrected prompt was dispatched.**
+**Pre-registered in commit `ed583e9`, which adds §2a and the builder change and zero shard files;
+all 30 corrected shard files arrive in a later commit. That commit ordering is checkable. As in §2,
+that the *dispatch* followed the commit remains the author's word.**
 
 **Item 10 does not say the scorer gets the template. It says what the scorer gets, and item 8 is on
 the list:**
@@ -100,11 +113,33 @@ and the same bytes go to every shard of every generation, so it is arm-symmetric
 is a different dispatch from the one §2.1 capped, and `R6` licenses each re-run independently on its
 own trigger.
 
+**Three disclosures about what the correction actually put in front of a scorer**, so a reader does
+not have to find them in the source:
+
+1. **The appended block is item 8 entire — 5614 bytes — not only its schema.** Item 10 says "the
+   item-8 schema" and also says the scorer never gets "this file"; the two clauses are in tension and
+   this resolves toward the enumerated handover. It means the scorer also saw item 8's rationale, its
+   sharding subsection, the gate test's own name, and pointers to two v1 artifacts. Item 9's
+   blockquotes were already excerpts of the same file, but the surface is wider than before and §6's
+   item-11(b) disclosure should be read with that in mind.
+2. **Two authored lines were added** — `--- BEGIN THE ITEM-8 SCHEMA, WHICH GOVERNS AND IS NOT A
+   SUMMARY ---` and its closing marker. They are not frozen text. They are arm-symmetric and steer
+   toward no refused shape, but "invents no guidance" is not literally true of them.
+3. **"Byte-identical" means the built prefix matches what the 26 defective dispatches emitted** — not
+   that it matches the frozen template, which of course carries substituted paths and rows. What a
+   reader can check without the prompts (uncommitted, §7.7) is the `ed583e9` diff, which is the
+   stronger evidence anyway: it is purely additive and touches no substitution.
+
+**The correction did not move the measurement, only the span shape — and that is checkable.** Present
+rate across the 26 defective shards is **1181 / 1183 = 99.8%**; across the 26 superseded corrected
+shards it is **1181 / 1183 = 99.8%**. Spans per present row go 1.45 → 1.43. If the appended rule had
+coached scorers toward finding more content, this is where it would show, and it does not.
+
 ---
 
 ## 3. What the correction changed — the finding of this task
 
-**54 shard dispatches in all: 26 under the defective prompt, 28 under the corrected one.**
+**56 shard dispatches in all: 26 under the defective prompt, 30 under the corrected one.**
 
 | | defective prompt | corrected prompt |
 |---|---|---|
@@ -113,8 +148,24 @@ own trigger.
 | **boundary refusals** | **207 — 12.1%** | **43 — 2.2%** |
 | verdicts that cleared the gate | **0 of 13** | **2 of 15** |
 
-**The boundary refusal rate falls by a factor of five when the scorer is handed the rule the gate
-runs.** That is the finding, and it retires the earlier one.
+**The boundary refusal rate falls sharply when the scorer is handed the rule the gate runs.** That is
+the finding, and it retires the earlier one.
+
+**How large the fall is depends on which comparison you make, and the pooled 12.1% → 2.2% is the
+least defensible one** — it pools four corrected rounds against three defective ones of different
+composition. The **matched** comparisons, which are the ones §2a pre-registered:
+
+| matched pair | defective | corrected | ratio |
+|---|---|---|---|
+| the `66530f` probe — same id, same two shards | 13 / 128 = 10.2% | 7 / 128 = 5.5% | **1.9×** |
+| the all-six round | 93 / 785 = 11.8% | 22 / 780 = 2.8% | **4.2×** |
+
+**And something the prompt cannot explain is also happening**: within the corrected prompt the rate
+falls monotonically round on round — 5.5%, 2.8%, 1.7%, 0.8% — while the prompt is fixed. Selection
+pressure should push the *other* way, since each round retires the shards that cleared and leaves the
+harder ones. **This is unexplained and is not claimed as an effect of the correction.** The honest
+statement of the finding is directional: handing over item 8 moved the rate down by at least the 1.9×
+of the matched probe, and it is what turned zero passing verdicts into two.
 
 **Per round, under the corrected prompt:**
 
@@ -219,9 +270,11 @@ the decision pre-registration exists to prevent, so it was not extended. Re-open
 `retention-2/<id>.json` and computes a stride-5 sample over it; for `66530f`, `e790f5`, `fd2c24` and
 `fe4059` there is nothing to read. Three options, none of which is T5a's to take:
 
-1. **Re-open the re-run budget** for the four, under the corrected prompt. The trend supports it —
-   two verdicts cleared in two rounds — and `R6` itself sets no cap; the only thing in the way is
-   this task's own pre-registration, which the driver can lift explicitly and on the record.
+1. **Re-open the re-run budget** for the four, under the corrected prompt. Two verdicts cleared in
+   two rounds and `R6` itself sets no cap; the only thing in the way is this task's own
+   pre-registration, which the driver can lift explicitly and on the record. **Weigh it against the
+   ceiling**: that trend is in *gate-passing*, on an instrument whose retention output is saturated
+   at 99.8%, so more filed verdicts buy well-formed inputs for T6 and not more retention signal.
 2. **Accept a scoped result** over the ids that cleared, and carry four ids as missing data into
    `RESULTS-2.md`. Honest, and much weaker: two of six is not a fixture.
 3. **Treat the shared-span failures separately.** Two of the four failed *only* on shared spans, with
@@ -251,7 +304,7 @@ but their own spec, their rows, and items 8 and 9; every prompt was machine-buil
 with nothing transcribed by hand; the caps were pre-registered before their outcomes were known; a
 passing verdict was never re-run; and pass/fail authority is a committed test, not a judgement.
 
-**Item 11(b)'s re-disclosure, owed by every task in this run.** T5a dispatched 54 scorer runs whose
+**Item 11(b)'s re-disclosure, owed by every task in this run.** T5a dispatched 56 scorer runs whose
 prompts carry an absolute path into this worktree, so each could in principle have read `generated-2/`,
 `PROTOCOL-2.md` or the git history. Prompts were written outside the repository, one per directory, so
 no scorer could list its siblings. **This was not audited against the transcripts** — T4 scanned all 18
@@ -290,19 +343,22 @@ carries `.git`; that is a known remaining hole.
 3. **`tools/measure-span-admissibility.py` is hardcoded to `skill-stickiness`** (its id list, ledger
    path and row-count assertion). It needs a fixture argument before T5b or T5c can use it. Given §3a,
    treat what it measures with care: it counts whole lines, and most real spans are multi-line.
-4. **Undischarged obligations owed to T8, carried from `GENERATION-2-NOTES.md`'s six-row table —
+4. **The 99.8% present rate is an undischarged doubt, not a result** — `RESULTS.md` §7.5's, now
+   reproduced. It belongs in `RESULTS-2.md` beside the tier-2 and tier-3 outcomes, and no tier-1
+   number should be published without it.
+5. **Undischarged obligations owed to T8, carried from `GENERATION-2-NOTES.md`'s six-row table —
    four are still open:** flag both `R5a` generations and read neither as a win; do not read
    `fd2c24`'s retention as evidence; log the early publication of the `wc`/`R5a` figures as a
    deviation; and — after the join — report whether generation titles track the arm.
-5. **Still-open questions from T4's handoff, which nothing else keeps alive:** the title-variance
+6. **Still-open questions from T4's handoff, which nothing else keeps alive:** the title-variance
    channel (owed by T8 and the write-up); whether re-dispatching two transmission questions was right
    (decide before T9; the revert is `git revert 6268365`); the 20 freeze rows are not checked for
    completeness; and the leak check tells a reader to "re-run under `R6`" for a case `R6`'s closed
    trigger list does not cover.
-6. **A frozen-instrument inconsistency found here.** Item 9's first blockquote — handed verbatim to
+7. **A frozen-instrument inconsistency found here.** Item 9's first blockquote — handed verbatim to
    every scorer — says a paraphrase *"may be evidenced by up to three spans"*, while the same prompt's
    rules say **1 to 5**. Scorers followed the rules. With §2a this is the *second* place item 10's
    template and the items it claims to carry disagree; they belong together as one finding about
    item 10.
-7. **The built prompts are not committed.** "Byte-identical on every attempt" rests on the builder
+8. **The built prompts are not committed.** "Byte-identical on every attempt" rests on the builder
    being deterministic, which is checkable by re-running it, not on a diffable artifact.
