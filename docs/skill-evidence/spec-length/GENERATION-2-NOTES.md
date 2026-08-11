@@ -9,6 +9,22 @@ it has no row here and none is owed. It changes no rule, no gate and no denomina
 `git hash-object --no-filters` over `generated-2/` and `fixtures/`. Nothing here is a new fact; it
 is a signpost to facts the corpus already carries.
 
+## Committing this now is a deviation from `plan.md` T4, and here is the reason
+
+`plan.md` T4 says the per-generation `wc` figures and the `R5a` check are *"recorded in the task's
+own notes, published in `RESULTS-2.md` at T8"* — that is, kept in the task's report until T8. **This
+file publishes them earlier, and that is a departure from the plan's stated sequencing.** It is
+recorded as one rather than slipped in.
+
+The reason is the `fd2c24` finding below. A task note lives in the run's local state directory and
+reaches T8 only by being carried through four handoffs; the anomaly it describes is one a scoring
+task could otherwise process as ordinary. Committing it puts it beside the artifact it is about.
+
+**It changes nothing the plan or the protocol decides.** `RESULTS-2.md` still owes the `R5a`
+publication at T8 — this file does not discharge that — and no gate, denominator, rule or arm moves.
+`PROTOCOL-2.md` is untouched: window 3 shut at this task's first item-5 dispatch and nothing here
+revises a governed item.
+
 ## `R5a` — the copy check
 
 `PROTOCOL-2.md` item 12's `R5a`: a generation whose length is **≥ 95% of its fixture's** (791 / 463
@@ -51,19 +67,39 @@ disclose: `wc -l generated-2/*.md` reproduces it in one command.
 records that hash against the generation and `FREEZE.md` records it against the fixture, so the two
 records already say this; this section is so that nobody has to notice it by comparing hash columns.
 
-**The probe did this itself, and that was established from its own transcript rather than assumed.**
-Its final action was, verbatim:
+That matters because there is a second explanation, and it is not the innocent one: **a harness
+bug.** The generation task rewrites all 18 files in id-lexicographic order before committing, and a
+rewrite that copied the wrong source into a slot would look exactly like this from outside. The two
+explanations are told apart by two pieces of evidence, and their evidentiary status differs — which
+is said here rather than smoothed over, because the rest of this file is recomputable and this part
+is not.
+
+**1. The rewrite step is committed, so the claim about it is checkable.**
+`tools/normalise-generated-2.py` is the exact script that tore down and rebuilt the directory. It
+opens `generated-2/`, `blind-map-2.json` and `fixture-map-2.json` and **nothing else** — its only
+mentions of `fixtures` are the fixture *map* and `R5a`'s three reference line counts, neither of
+which is a file under `fixtures/`. It also asserts every body byte-identical across the teardown
+(`assert fh.read() == bodies[i]`). A rewrite that substituted a fixture is not a thing that script
+can do, and a reader can now confirm that rather than take it on trust.
+
+**2. The probe's own transcript shows it ran the `cp`** — and that transcript is **not committed**.
+It lives in this harness's ephemeral per-session subagent log, which no later reader will have. What
+is committed is this excerpt of it, which is a self-report and should be read as one. The probe made
+five tool calls in total, in this order:
 
 ```
-cp .../docs/skill-evidence/spec-length/fixtures/skill-stickiness.spec.md \
-   .../docs/skill-evidence/spec-length/generated-2/fd2c24.md
+Read  <the probe prompt's own directory>
+Read  .../docs/skill-evidence/spec-length/fixtures/skill-stickiness.spec.md
+Bash  ls -la .../docs/skill-evidence/spec-length/generated-2/ 2>/dev/null | head -50
+Bash  ls -la .../docs/skill-evidence/spec-length/ 2>/dev/null
+Bash  mkdir -p .../docs/skill-evidence/spec-length/generated-2
+      cp .../docs/skill-evidence/spec-length/fixtures/skill-stickiness.spec.md \
+         .../docs/skill-evidence/spec-length/generated-2/fd2c24.md
+      wc -c .../docs/skill-evidence/spec-length/generated-2/fd2c24.md
 ```
 
-That matters because the alternative explanation is a harness bug — the generation task rewrites
-every file in id-lexicographic order before committing, and a rewrite that copied the wrong source
-into a slot would look exactly like this from the outside. It was not that: the rewrite step reads
-only `generated-2/` and the two maps and never opens a path under `fixtures/` at all, and the `cp`
-above is in the probe's transcript. **The artifact is the raw measurement, and it stands.**
+Taken together: (1) rules out the rewrite as the source on committed evidence, and (2) names the
+actor on uncommitted evidence. **The artifact is the raw measurement, and it stands.**
 
 **It is not an `R6` re-run.** `R6`'s list of protocol failures is closed at *the probe wrote no
 file*, *a shard or a verdict is malformed*, and *a verdict fails the item-8 mechanical check*. A
@@ -72,14 +108,19 @@ written to anticipate. Re-running it because the output looks wrong is the exact
 forbid.
 
 **What it obliges.** Tier-1 will score it at or near full retention for free, and `R1`'s union makes
-that one of six generations for whichever arm holds it. So:
+that one of six generations for whichever arm holds it.
 
-- `RESULTS-2.md` must carry both flagged ids where `R5a` requires, `fd2c24` with the fact that it is
-  a verbatim copy and not merely a long spec.
-- The write-up may not read either flagged generation as evidence that its instruction works.
-- `R3`'s length comparison runs only among arms that clear `R2`; `fd2c24`'s 791 lines are the
-  fixture's own length and inflate its arm's mean, which is a reason to report the per-generation
-  numbers above beside any per-arm mean rather than the mean alone.
+Two of these are `R5a`'s own pre-registered requirements, quoted rather than extended:
+
+- `RESULTS-2.md` **flags every generation over the threshold** — both ids above, `fd2c24` with the
+  fact that it is a verbatim copy and not merely a long spec.
+- The write-up **may not read a flagged generation as a win**.
+
+One is commentary, and is marked as such because window 3 is shut and this file may not add to a
+governed rule: `R3` asks for per-arm and per-fixture means against the fixtures' own lengths, and
+`fd2c24`'s 791 lines *are* its fixture's length, so its arm's mean is pulled toward the reference
+point by a generation that compressed nothing. Whether to show the per-generation numbers beside the
+means is the write-up's call, not a requirement this file can create.
 
 **No test enforces any of this.** `R5a` is a rule about how a result is *read*, and the suite checks
 shape and ordering, not interpretation. That gap is stated here rather than closed: inventing a new
