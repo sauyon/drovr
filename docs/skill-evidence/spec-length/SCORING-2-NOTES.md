@@ -20,8 +20,10 @@ was given up to six corrected attempts per shard under the extended cap of §2b.
 **Who wrote what, precisely, because the loose version of this is false.** §8 and §9 are T5b's.
 Everything from "T5a's outcome" to §7 is T5a's **except three T5b insertions, which say so in their
 own first line**: **§2b** (the extended cap), **§5a** (the driver's decision resolving §5), and §7's
-preface. T5b also appended a pointer at the end of §4 and fixed two dead cross-references. **No T5a
-conclusion, count, table or round number was rewritten** — §4's rounds 0–6 and §3's per-round table
+preface. T5b also appended a pointer at the end of §4 and made two corrections inside T5a's text,
+both of which review found: a dead `§7.7` cross-reference, and a spans-per-present-row figure that
+recomputed to 1.44 rather than 1.43 (§2a). **No T5a conclusion, count, table or round number was
+rewritten** — §4's rounds 0–6 and §3's per-round table
 stand exactly as T5a left them, which is why §8.1 has to warn that the two sections number rounds
 differently rather than renumbering either.
 
@@ -145,7 +147,9 @@ not have to find them in the source:
 
 **The correction did not move the measurement, only the span shape — and that is checkable.** Present
 rate across the 26 defective shards is **1181 / 1183 = 99.8%**; across the 26 superseded corrected
-shards it is **1181 / 1183 = 99.8%**. Spans per present row go 1.45 → 1.43. If the appended rule had
+shards it is **1181 / 1183 = 99.8%**. Spans per present row go **1.45 → 1.44** (1709/1181 → 1700/1181;
+an earlier version of this line said 1.43, which review recomputed — it is inherited from before T5b
+and the conclusion is unaffected). If the appended rule had
 coached scorers toward finding more content, this is where it would show, and it does not.
 
 ### 2b. The cap was extended AFTER four ids had missed — a post-hoc amendment, on the driver's decision
@@ -503,7 +507,7 @@ invisible and only a later winning round would have been written down.
 honoured, not extended" turned out to cost nothing, and the four ids look less like ids that
 needed more attempts and more like ids whose documents these scorers do not score compliantly.
 Six corrected attempts per shard — **twelve shard dispatches per id** — with zero passes, against
-`6e7393` clearing on its first corrected attempt and `e085f2` on its second, is a large asymmetry
+`e085f2` clearing on its first corrected attempt and `6e7393` on its second, is a large asymmetry
 that attempt count did not close. **What distinguishes the two groups is not established here, and
 this file offers no account of it.** Any account would be a claim about the arms, which this file's
 author has no basis for and must not make.
@@ -607,7 +611,7 @@ with §8.1's last two, because `054872`'s probe ran alongside the `skill-stickin
 | `corrected-round10.txt` | all six ×2 | c5; c3 | `R6` | none cleared |
 | `corrected-round11.txt` | all six ×2 | c6; c4 | `R6`; **`054872` cap exhausted** | none cleared |
 | `corrected-round12.txt` | five ×2 | c5 | `R6` | **`48527b` cleared** |
-| `corrected-round13.txt` | four ×2 | c6 | `R6`; **cap exhausted for all six** | none cleared |
+| `corrected-round13.txt` | four ×2 | c6 | `R6`; **cap exhausted for the five that never cleared** | none cleared |
 
 **The calibration probe was run and it is why the other five were dispatched.** `054872` went first
 (id-lexicographically), and its first corrected attempt refused **5 boundary spans of 94 — 5.3%**,
