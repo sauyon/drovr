@@ -323,7 +323,8 @@ open and to whom:**
 file — no structural document points at this file at all.** Not `plan.md`, not `PROTOCOL-2.md`, not
 `FREEZE-2.md`. `plan.md` T8's list of what `RESULTS-2.md` must contain does not mention the
 title-correlation check, because the question did not exist when the plan was written; window 3
-forbids adding it to `PROTOCOL-2.md`, and `FREEZE-2.md` is append-only and closed at 20 rows.
+forbids adding it to `PROTOCOL-2.md`, and `FREEZE-2.md` is append-only and closed at this run's own 20
+rows (the table totals 21; T1's `PROTOCOL-2.md` row is the first).
 
 **Two carriers exist, and both are people-shaped.** The first is proximity: this file sits beside
 `generated-2/`, and `plan.md` T8 already owes per-generation `wc` figures and `R5a` flags, so the
