@@ -20,10 +20,10 @@ was given up to six corrected attempts per shard under the extended cap of §2b.
 **Who wrote what, precisely, because the loose version of this is false.** §8 and §9 are T5b's.
 Everything from "T5a's outcome" to §7 is T5a's **except three T5b insertions, which say so in their
 own first line**: **§2b** (the extended cap), **§5a** (the driver's decision resolving §5), and §7's
-preface. T5b also appended a pointer at the end of §4 and made two corrections inside T5a's text,
-both of which review found: a dead `§7.7` cross-reference, and a spans-per-present-row figure that
-recomputed to 1.44 rather than 1.43 (§2a). **No T5a conclusion, count, table or round number was
-rewritten** — §4's rounds 0–6 and §3's per-round table
+preface. T5b also appended a pointer at the end of §4 and made **three** corrections inside T5a's
+text, all three found by review and all three listed in **§9.7**, which is where this file's
+drafting-history minutiae live so they stop competing with the record. **No T5a conclusion, count,
+table or round number was rewritten** — §4's rounds 0–6 and §3's per-round table
 stand exactly as T5a left them, which is why §8.1 has to warn that the two sections number rounds
 differently rather than renumbering either.
 
@@ -132,9 +132,7 @@ own trigger.
 not have to find them in the source:
 
 1. **The appended block is item 8 entire — 5614 characters, 5640 bytes in UTF-8 — not only its
-   schema.** (An earlier version said "5614 bytes". That is the Python `len()` of the extracted
-   string, which counts characters; item 8 holds 13 non-ASCII dashes that cost 3 bytes each. Review
-   recomputed it. Inherited from before T5b, and no conclusion turns on it.) Item 10 says "the
+   schema** (§9.7 c). Item 10 says "the
    item-8 schema" and also says the scorer never gets "this file"; the two clauses are in tension and
    this resolves toward the enumerated handover. It means the scorer also saw item 8's rationale, its
    sharding subsection, the gate test's own name, and pointers to two v1 artifacts. Item 9's
@@ -150,9 +148,8 @@ not have to find them in the source:
 
 **The correction did not move the measurement, only the span shape — and that is checkable.** Present
 rate across the 26 defective shards is **1181 / 1183 = 99.8%**; across the 26 superseded corrected
-shards it is **1181 / 1183 = 99.8%**. Spans per present row go **1.45 → 1.44** (1709/1181 → 1700/1181;
-an earlier version of this line said 1.43, which review recomputed — it is inherited from before T5b
-and the conclusion is unaffected). If the appended rule had
+shards it is **1181 / 1183 = 99.8%**. Spans per present row go **1.45 → 1.44** (1709/1181 →
+1700/1181; §9.7 b). If the appended rule had
 coached scorers toward finding more content, this is where it would show, and it does not.
 
 ### 2b. The cap was extended AFTER four ids had missed — a post-hoc amendment, on the driver's decision
@@ -636,9 +633,8 @@ because pooling them is the error this task keeps making.**
 they died mid-stream on API errors. `parts/superseded/` holds **144** shard files in all, of which
 T5a left 52, so T5b added 92 — 68 `tiered-review` and 24 `skill-stickiness`.
 
-**A draft of this paragraph gave "94 from 96" as though it were `tiered-review`'s own figure.** It is
-the whole task's. Review caught it, and it is the third time in this task that a summary line pooled
-populations its own tables kept separate — the mistake T5a's handoff warns about in those words.
+**Read the denominators off the table, not off a summary line** — a draft gave "94 from 96" as
+though it were `tiered-review`'s own (§9.7 d).
 
 ### 9.3 Two things `tiered-review` does differently, both recorded and neither claimed
 
@@ -828,3 +824,40 @@ passed the mechanical gate, and there is no adjudication in tier 1 at all. What 
 `R6a`'s *instruction* — **record the specific doubt rather than quietly accept or quietly re-roll**
 — which fits exactly. **`RESULTS-2.md` must carry it**, and T5c should hash its own shards as they
 land rather than discovering this at review.
+
+### 9.7 Corrections made to this file during T5b's review, consolidated
+
+**Why this list exists.** Twelve review rounds found twenty-four things, and almost all of them were
+this document describing itself wrongly rather than the data being wrong. Recording each one inline
+started to crowd out the record it was attached to — a reviewer said so — so the **drafting-history
+minutiae live here**, and the sections above carry the corrected figure with a pointer.
+
+**What is NOT in this list, and must not be moved here.** The substantive withdrawals are findings,
+not drafting notes, and they stay where they are because a reader meets them in context: the
+**withdrawn BLOCKED conclusion** (top of file, §3a), **§3a's withdrawn admissibility reading**,
+**§8.2's withdrawn length claim**, and **§8.3's tested-and-killed ledger-entailment hypothesis**.
+Each is a negative result T8 needs. This list is only for corrections that change a number or a
+pointer and nothing else.
+
+| | correction | where |
+|---|---|---|
+| **a** | a dead `§7.7` cross-reference — §7 is a flat 1–8 list, and the target is item 8 | §2a |
+| **b** | spans per present row: 1.43 → **1.44** (1700/1181 = 1.4395) | §2a |
+| **c** | the appended item-8 block: "5614 bytes" → **5614 characters, 5640 bytes** in UTF-8, the gap being 13 non-ASCII dashes at 3 bytes each | §2a |
+| **d** | "94 shard files from 96 dispatches" was the whole task's, given as `tiered-review`'s own; that is **70 from 72** | §9.2 |
+| **e** | §8.3's shared-span pair list named seven while the text counted nine; the missing two were `09`/`56` and `39`/`87` | §8.3 |
+| **f** | which filed verdict cleared first: `e085f2` on its first corrected attempt, `6e7393` on its second — an earlier draft had them the other way round | §8.2 |
+| **g** | three dead `§7.4` references — §7 has no subsections | §2b, §9.3 |
+| **h** | round numbers: §4 counts overall rounds, §8/§9 count report files, and they collide at 5 and 6 | §8.1 |
+| **i** | §9.5/§9.5a's item numbering and the carry-forward it announces | §7 preface, §9.5a |
+| **j** | a v1 present rate of 99.8% that `RESULTS.md` never states, and the characterisation that replaced it | §9.3 |
+| **k** | a round-13 row reading "cap exhausted for all six" when `48527b` had cleared and was never re-run | §9.2 |
+
+**Rows a, b and c are the three corrections T5b made inside T5a's text**; everything else is T5b
+correcting itself. **No conclusion in this file turns on any of them** — they were found by review,
+not by the author, which is the honest summary of how this document reached its current state.
+
+**The generalisable lesson, and it is not "write more carefully".** Every figure that survived
+review unchanged was one derived mechanically from files; every figure that was wrong was one typed
+by hand from memory or from a prior draft. **T5c should derive and not transcribe**, and should
+expect its own summary lines — not its tables — to be where the errors are.
