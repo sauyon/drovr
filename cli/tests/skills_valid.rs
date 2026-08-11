@@ -3813,11 +3813,29 @@ fn line_bounds(text: &str, at: usize) -> (usize, usize) {
 /// formatting — which is the union of the two readings and refuses exactly what
 /// both refuse.
 ///
-/// **This is not a loosening chosen to make a corpus pass.** Measured against
-/// the first attempt's 1268 real spans, picking one reading over the other moves
-/// the refusal rate by a few points and the union by a few more; the number that
-/// matters (§6 of the task report) is large under all three, and it is reported
-/// rather than engineered away.
+/// **What keeps the union honest is that a marker run can never cover phrase
+/// content.** Every character it accepts is whitespace or one of item 8's own
+/// marker characters, so a prefix that is "all markers" contains no letters and
+/// no ordinary punctuation. The predicate is therefore broader than either
+/// single reading — on `- **Bold lead.**` it accepts a span starting at
+/// `**Bold`, at `*Bold` and at `Bold`, where an offset-returning helper picks
+/// exactly one — but it cannot admit the thing the rule exists to refuse: a span
+/// beginning inside a word or after prose. That is checked, not asserted, by
+/// [`retention_2_check_refuses_a_span_that_is_not_self_contained`], which runs
+/// the `- **Bold lead.**` case in both directions.
+///
+/// **It is not a loosening chosen to make a corpus pass.** The refusal rate over
+/// the first attempt's real spans is ~85% under every reading of this clause;
+/// the number is reported rather than engineered away: **957 of the operative
+/// six generations' 1127 real spans (84.9%) are refused**, measured with this
+/// function over `invalidated/{4a73ef,80d9a2,87e5a5,aa3199,d25798,db3e2d}.json`.
+/// (`4a73ef.attempt-1.json` is excluded — it is the superseded `R6` re-run, and
+/// counting it double-counts one generation, which is what
+/// [`SPEC_LENGTH_OPERATIVE_PASSES`] exists to prevent.) That figure is about
+/// spans written under `PROTOCOL.md`, which had no boundary rule at all;
+/// `PROTOCOL-2.md` item 10 puts this rule into the tier-1 scorer's own prompt.
+/// It is a fact about the first attempt's quoting habit, not a prediction — but
+/// it is the closest thing to one that exists.
 ///
 /// **One inherited edge, named rather than left to be found.** `<digits>.` is a
 /// marker per the frozen rule and the rule does not require a space after it, so
@@ -8217,7 +8235,8 @@ fn retention_2_check_refuses_a_span_that_is_not_self_contained() {
     // sentence, which on hard-wrapped prose means multi-line spans are the
     // normal case rather than the exception. Item 10 puts the rule in the tier-1
     // prompt so a scorer is told this before writing a verdict rather than after
-    // one is refused. §6 of the task report carries the measurement.
+    // one is refused. `line_prefix_is_all_markers`'s doc comment carries the
+    // measured refusal rate over the first attempt's spans.
     // The wrap carries the next line's two-space continuation indent, so the
     // regluing has to reproduce it or the fixture is checking its own typo.
     let reglued = format!("{left_half}\n  {right_half}");
@@ -8363,6 +8382,82 @@ The breaker opens after a delay of
         assert!(
             !span_is_self_contained(&doc, "A clipped line"),
             "{impostor:?} does NOT open a block, so the clip before it must stay refused"
+        );
+    }
+
+    // **The `- **Bold lead.**` case, which is the whole reason
+    // `line_prefix_is_all_markers` exists and which nothing exercised until a
+    // review pointed out that its justification was untested.** The ambiguity is
+    // where "the first non-marker character" falls on a line whose bullet is
+    // followed by an emphasis run. Both candidate answers are accepted, because
+    // both start the line's content — and, far more importantly, a span starting
+    // after real prose on the same line is still refused. The last two cases are
+    // the ones that would matter if the predicate were too broad.
+    let bold_lead = "\
+Intro paragraph here.
+
+- **Bold lead.** Then the rest of the sentence continues here.
+- *emphasis* opens this one instead.
+";
+    // Every accepted case below runs to the end of its bullet, so the RIGHT
+    // boundary is satisfied by the full stop and what is being isolated is the
+    // left clause. (`**Bold lead.**` on its own is correctly refused — it ends
+    // on `**`, mid-line, which is a right-hand failure and a different question.)
+    for (span, why) in [
+        (
+            "**Bold lead.** Then the rest of the sentence continues here.",
+            "the bullet is a marker, so the emphasis run starts the content",
+        ),
+        (
+            "Bold lead.** Then the rest of the sentence continues here.",
+            "and so does the text inside it — the other reading of the same clause",
+        ),
+        (
+            "*emphasis* opens this one instead.",
+            "a bare emphasis run at the start of a bullet",
+        ),
+        (
+            "emphasis* opens this one instead.",
+            "and its inner text, for the same reason",
+        ),
+    ] {
+        assert!(
+            span_is_self_contained(bold_lead, span),
+            "{span:?} must be accepted: {why}"
+        );
+    }
+    assert!(
+        !span_is_self_contained(bold_lead, "**Bold lead.**"),
+        "`**Bold lead.**` alone ends on `**` in mid-line, so it fails the RIGHT boundary — the \
+         marker reading governs the left end only"
+    );
+    for (span, why) in [
+        (
+            "lead.** Then the rest of the sentence continues here.",
+            "begins inside the word `Bold` — a marker run can never cover letters, so no \
+             widening of the marker set can let this through",
+        ),
+        (
+            "the rest of the sentence continues here.",
+            "begins after prose on the same line with no sentence terminator before it",
+        ),
+        (
+            "opens this one instead.",
+            "begins after the word `emphasis` — prose, not a marker",
+        ),
+        (
+            "Then the rest of the sentence continues here.",
+            "**this one is a finding, not a design choice.** It is a whole sentence and it \
+             follows a full stop — but the full stop is followed by `** ` and item 8's \
+             sentence-start clause requires `. `, `! ` or `? ` *immediately* before the span. \
+             An emphasis run closing on the sentence boundary therefore blocks the clause. The \
+             literal frozen rule refuses it, so this check refuses it — and it is one of the \
+             reasons the measured refusal rate over real prose is ~85%",
+        ),
+    ] {
+        assert!(
+            !span_is_self_contained(bold_lead, span),
+            "{span:?} must be REFUSED: {why}"
         );
     }
 
