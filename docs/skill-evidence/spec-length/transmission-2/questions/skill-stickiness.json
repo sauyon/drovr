@@ -69,7 +69,7 @@
   },
   {
     "id": "skill-stickiness-82",
-    "question": "What does this spec say determines whether a device ships across all five documents versus the baseline being kept instead?"
+    "question": "What does this spec say happens to a device depending on whether its variant or V0 wins the comparison by the margin?"
   },
   {
     "id": "skill-stickiness-86",
