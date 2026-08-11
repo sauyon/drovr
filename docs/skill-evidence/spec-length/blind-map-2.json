@@ -1,0 +1,92 @@
+{
+  "031cc4": {
+    "arm": "S3",
+    "fixture": "tui-dc-picker",
+    "sample": 1
+  },
+  "054872": {
+    "arm": "S3",
+    "fixture": "tiered-review",
+    "sample": 1
+  },
+  "08ae18": {
+    "arm": "S1",
+    "fixture": "tui-dc-picker",
+    "sample": 2
+  },
+  "26d7a2": {
+    "arm": "S3",
+    "fixture": "tui-dc-picker",
+    "sample": 2
+  },
+  "2c4295": {
+    "arm": "S1",
+    "fixture": "tiered-review",
+    "sample": 2
+  },
+  "2d2629": {
+    "arm": "S3",
+    "fixture": "tiered-review",
+    "sample": 2
+  },
+  "47173f": {
+    "arm": "S2",
+    "fixture": "tui-dc-picker",
+    "sample": 2
+  },
+  "48527b": {
+    "arm": "S1",
+    "fixture": "tiered-review",
+    "sample": 1
+  },
+  "66530f": {
+    "arm": "S2",
+    "fixture": "skill-stickiness",
+    "sample": 2
+  },
+  "6e7393": {
+    "arm": "S1",
+    "fixture": "skill-stickiness",
+    "sample": 1
+  },
+  "a9fcf9": {
+    "arm": "S2",
+    "fixture": "tui-dc-picker",
+    "sample": 1
+  },
+  "b2b8cf": {
+    "arm": "S1",
+    "fixture": "tui-dc-picker",
+    "sample": 1
+  },
+  "b49ff1": {
+    "arm": "S2",
+    "fixture": "tiered-review",
+    "sample": 2
+  },
+  "e085f2": {
+    "arm": "S3",
+    "fixture": "skill-stickiness",
+    "sample": 2
+  },
+  "e790f5": {
+    "arm": "S1",
+    "fixture": "skill-stickiness",
+    "sample": 2
+  },
+  "fd230c": {
+    "arm": "S2",
+    "fixture": "tiered-review",
+    "sample": 1
+  },
+  "fd2c24": {
+    "arm": "S2",
+    "fixture": "skill-stickiness",
+    "sample": 1
+  },
+  "fe4059": {
+    "arm": "S3",
+    "fixture": "skill-stickiness",
+    "sample": 1
+  }
+}
