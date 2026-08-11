@@ -489,10 +489,25 @@ honoured, not extended" turned out to cost nothing, and the four ids look less l
 needed more attempts and more like ids whose documents these scorers do not score compliantly.
 Six corrected attempts per shard — **twelve shard dispatches per id** — with zero passes, against
 `6e7393` clearing on its first corrected attempt and `e085f2` on its second, is a large asymmetry
-that attempt count did not close. **What distinguishes the two groups is not established here and
-must not be guessed at**: it is not document length (`fe4059` is the shortest of the six and fails
-worst, 14 boundary refusals in round 7), and any account of it would be a claim about the arms,
-which this file's author has no basis for and must not make.
+that attempt count did not close. **What distinguishes the two groups is not established here, and
+this file offers no account of it.** Any account would be a claim about the arms, which this file's
+author has no basis for and must not make.
+
+**A length-based explanation was drafted here and is WITHDRAWN — review caught it, and it was wrong
+twice over.** The draft read *"it is not document length (`fe4059` is the shortest of the six and
+fails worst)"*. By the canonical metric this run uses everywhere else — lines, and lines as a
+percentage of the fixture, `GENERATION-2-NOTES.md` §2 — **`fe4059` is not the shortest**: `e085f2`
+is, at 418 lines / 52.8% against `fe4059`'s 424 / 53.6%. `fe4059` is smaller only by raw byte count,
+by **10 bytes in ~25,800**, on a metric this experiment never uses. **And the corrected fact points
+the opposite way from the claim it was supporting**: the genuinely shortest of the six is one of the
+two that passed.
+
+**Both of those are less bad than where the number came from.** The draft's "shortest" was read off a
+per-generation size table this task printed by accident — §6 records T5a doing exactly this against
+T4's explicit instruction, and §9's own tooling change exists partly to stop the admissibility script
+reprinting it. **Sorting six generations of one fixture by size in a context that dispatches scoring
+is the de-blinding, whatever conclusion is drawn from it**, and drawing a conclusion made it worse.
+Nothing is claimed about length here, and T8 must not read one out of this subsection.
 
 ### 8.3 A hypothesis about the shared-span failures, checked and WITHDRAWN
 
