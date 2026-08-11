@@ -616,10 +616,22 @@ not behave differently on this corpus, which is what the probe existed to establ
 dispatched alongside the `skill-stickiness` re-runs rather than after them, because the two fixtures
 are independent and neither one's result gates the other's.
 
-**Counts, derived from the files on disk rather than from arithmetic.** `parts/superseded/` holds
-**144** shard files, of which T5a left 52, so **T5b added 92**; with `48527b`'s two live shards that
-is **94 shard files from 96 dispatches**. The two missing dispatches died mid-stream on API errors
-and wrote nothing (round 12).
+**Counts, derived from the files on disk rather than from arithmetic — and SPLIT BY POPULATION,
+because pooling them is the error this task keeps making.**
+
+| population | shard files | dispatches |
+|---|---|---|
+| **`tiered-review` — this section's subject** | **70** (68 superseded + `48527b`'s 2 live) | **72** |
+| `skill-stickiness` extended-cap re-runs (§8, attempts c4–c6) | 24 | 24 |
+| **T5b total** | **94** | **96** |
+
+**The two dispatches that produced no file were both `tiered-review`'s**, in `corrected-round12.txt`;
+they died mid-stream on API errors. `parts/superseded/` holds **144** shard files in all, of which
+T5a left 52, so T5b added 92 — 68 `tiered-review` and 24 `skill-stickiness`.
+
+**A draft of this paragraph gave "94 from 96" as though it were `tiered-review`'s own figure.** It is
+the whole task's. Review caught it, and it is the third time in this task that a summary line pooled
+populations its own tables kept separate — the mistake T5a's handoff warns about in those words.
 
 ### 9.3 Two things `tiered-review` does differently, both recorded and neither claimed
 
@@ -790,8 +802,9 @@ and **every one of `b49ff1-1`'s six attempts is distinct**.
 - **No filed verdict.** `b49ff1` never cleared the gate and is not in `retention-2/`. All three filed
   verdicts — `6e7393`, `e085f2`, `48527b` — are unaffected, and none of their shards is in the
   duplicate pair.
-- **No published count changes.** 94 shard files were written from 96 dispatches, and that is still
-  true; §9.2's table is a log of dispatches, not of distinct outputs. **But "six attempts per shard"
+- **No published count changes.** 94 shard files were written from 96 dispatches across the whole
+  task — 70 from 72 for `tiered-review` alone, per §9.2's table — and that is still true; §9.2 logs
+  dispatches, not distinct outputs. **But "six attempts per shard"
   should be read as six dispatches, not as six independent samples** — for this shard it is
   demonstrably at most five distinct results, and for every other shard independence is assumed
   rather than shown.
