@@ -74,7 +74,11 @@ fd2c24  17d218f64c3fc35187e1adea6b18bd537168734ca19f7e1861e8754663b64239  18 pai
 fe4059  c40afc1d44a9e1b8414c440f31b1b76778ef2ecc9924137d5f9c24cb9182df3a  17 pair(s), 4 false: ['skill-stickiness-20', 'skill-stickiness-55', 'skill-stickiness-66', 'skill-stickiness-87']
 ```
 
-## Tier 3 — item 8b, 17 dispatches, one per generation carrying a flagged row
+## Tier 3 — item 8b, 18 dispatches over 17 prompts, one prompt per generation carrying a flagged row
+
+**18 dispatches, 17 prompts, 17 records.** `fe4059`'s prompt was dispatched twice: its first
+dispatch wrote no file and was re-run under `R6` against the byte-identical prompt (see the last
+section of this file). A dispatch that wrote no file still ran, so it is counted here.
 
 `b2b8cf` carried no flagged row — no tier-2 `establishes: false` and no `PROTOCOL-3.md` §3 class-B
 problem — so it has **no prompt and no `escalation-2/b2b8cf.json`**. Item 8b makes that absence the

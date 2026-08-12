@@ -28,9 +28,14 @@ to the write-up.** It was decided after the first attempt failed and before any 
 taken. What makes that legitimate is not the timing but that the criterion **cannot be aimed**: it
 reads only the final dispositions and the id→fixture map, never an arm, so permuting the arm labels
 leaves the excluded set identical while the per-arm counts permute with them.
-`spec_length_2_r8_exclusion_is_arm_symmetric` executes that permutation rather than asserting it.
-Here the point is moot in the most reassuring way available — the exclusion set is empty, so `R8`
-changed no arm's denominator at all.
+`spec_length_2_r8_exclusion_is_arm_symmetric` executes that permutation rather than asserting it —
+**though only half of it does work**: the test's first half locks a type signature, which discovers
+nothing, and its second permutes a synthetic four-row fixture rather than this run's own
+dispositions. `plan.md` T11 pins that caveat and it is repeated here so `R8` is not oversold at the
+point a reader meets it.
+
+**Here the question is moot in the most reassuring way available: the exclusion set is empty, so
+`R8` changed no arm's denominator at all.**
 
 **Before the numbers below are compared to each other, the floor under them:** §12 records an
 inter-dispatch noise floor of **one to three rows per generation** between two dispatches of the
@@ -451,6 +456,25 @@ cites `calibration-2.json` as evidence about an arm.
 
 ## 8. Deviations
 
+0. **Plan tasks T6, T7 and T8 ran in ONE phase context, not three.** `plan.md` §2 specifies
+   *"Thirteen tasks. Each is one clean-context implement-phase agent"*, and its decomposition puts
+   tier 2, tier 3, and unblind-and-gate in separate contexts. This run's driver superseded that and
+   directed one agent to run all three. **Why it matters, stated as the strongest version of the
+   objection:** under the plan's decomposition the separation between *scoring* and *seeing the
+   arms* was **structural** — the tier-2 and tier-3 agents could not have read `blind-map-2.json`
+   because they did not exist yet when it was still unread. Collapsed into one context, that
+   separation becomes an **ordering claim by the agent that made it**, and `plan.md` §0 and
+   `PROTOCOL-2.md` item 11 both forbid a context that has opened the blind map from dispatching any
+   tier.
+
+   **What still checks it, and it is weaker than structure but is not nothing.** The ordering is in
+   `git log` rather than in prose: tiers 2 and 3 were complete and committed at `bb1ca14`, and the
+   first read of `blind-map-2.json` and every artifact derived from it — this file included — landed
+   at `92fea48`, a later commit. `adjudication-2/` and `escalation-2/` are byte-identical across
+   that boundary. **A reader who does not take the agent's word for it can verify that the records
+   existed before the unblinding commit; what no record can show is what a single context knew at
+   what moment.** `RESULTS.md` §5 deviation 2 is the precedent for logging exactly this kind of
+   collapsed separation rather than leaving it implicit.
 1. **The `wc` / `R5a` figures were published early.** `GENERATION-2-NOTES.md` committed the
    per-generation line and byte counts, the fixture percentages and both `R5a` flags at the
    generation task, before tiers 1–3 ran. Logged here because that file's open-items table requires
@@ -458,8 +482,8 @@ cites `calibration-2.json` as evidence about an arm.
    `wc -l generated-2/*.md` reproduces it in one command from files that were already committed. It
    could not have steered a scorer, which is never shown a length figure — but it was published
    ahead of the write-up that owns it, and that is the deviation.
-2. **`R6` re-runs, in full — the standing tier-1 pass, tier 3, and the discarded pass.** The one
-   that matters is **`2d2629`, tier 1, for fabrication.** `R6` requires *every* re-run to be
+2. **`R6` re-runs in tier 1 — the standing pass and the discarded one. (Tier 3's is item 3.)** The
+   one that matters is **`2d2629`, tier 1, for fabrication.** `R6` requires *every* re-run to be
    logged here with its reason, and this is the one that matters most. On its first attempt
    `2d2629` failed the **class-A** check: **twenty-nine spans, all in shard 2, were not verbatim
    substrings of the generated spec** — a whole shard of invented text. Fabrication is the one thing
@@ -587,18 +611,34 @@ directory, the prescribed control — dispatch outside the worktree, hand over a
 was run and was **incomplete**, and the channel was logged as open. This attempt inherits it
 unchanged and on the same terms.
 
-**This task's own 35 dispatches inherit it too, and that is said plainly rather than left to
-inference.** The 18 tier-2 adjudicators and 17 tier-3 escalators each ran inside this worktree. The
+**This task's own 36 dispatches inherit it too, and that is said plainly rather than left to
+inference.** 18 tier-2 adjudicators and **18** tier-3 dispatches — 17 that produced an
+`escalation-2` file plus `fe4059`'s first, which wrote none and was re-run (deviation 3) — each ran
+inside this worktree. **36, not 35: 17 is the count of escalation FILES, and a dispatch that wrote
+no file still ran**, which is the same distinction §5 insists on when it separates 66 dispatches
+from 64 files. The dispatch that produced nothing is exactly the kind this section exists to
+disclose. The
 mitigations were real but are instructions, not controls: their prompts were written **outside** the
 repository, each in its own directory so a subagent could not list its siblings; each was told to
-read one named file and no other, and not to search the repository; and the tier-2 prompt builder
-**asserts** that no prompt contains its generation's id, `generated-2`, `blind-map-2` or
-`fixture-map-2`. Nothing suggests any dispatch used the channel. **But *"was told only to read the
-prompt"* is an instruction and not a control**, exactly as the first attempt's *"was told only to
-read the spec"* was, and the channel stays open.
+read one named file and no other, and not to search the repository; and **the tier-2 builder
+asserts** that no prompt contains its generation's id, `generated-2`, `blind-map-2` or
+`fixture-map-2`.
+
+**The tier-3 builder has no equivalent assertion, and that asymmetry is disclosed rather than
+glossed.** All four guards *could* have been written there and were not — including the
+`generated-2` one: item 8b's template holds that string only inside the placeholder
+`<the contents of generated-2/<id>.md>`, which the builder substitutes away, so such a guard would
+have passed rather than been meaningless. (An earlier draft of this paragraph claimed the opposite
+and was wrong.) Tier 3 is the tier item 8b already exempts from spec-blindness (limitation 9), so
+the marginal risk is small; it is not zero, and **the gap is a fact about this task's tooling, not a
+reasoned exemption.**
+
+Nothing suggests any dispatch used the channel. **But *"was told only to read the prompt"* is an
+instruction and not a control**, exactly as the first attempt's *"was told only to read the spec"*
+was, and the channel stays open.
 
 **(b) The calibration corpus's own arm map is recoverable from this branch's history**
-(`RESULTS.md` §5 deviation 8; item 11 addition (c)). It is immaterial to this attempt, which uses a
+(`RESULTS.md` §5 deviation 4; `PROTOCOL-2.md` item 11 addition (c)). It is immaterial to this attempt, which uses a
 different id pool and never re-scores those generations for a verdict — item 12a's pass is scored
 per row with no arm attached and never opened `blind-map.json` — but it is carried because this run
 documents every channel it knows about. **A mitigation, not a closure.**
@@ -640,7 +680,9 @@ SHA in `SCORING-3-NOTES.md`. **`PROTOCOL-3.md` has one commit and no amendments.
 `GENERATION-2-NOTES.md` §1 found that the generated specs' `# ` titles are **no longer arm-invariant**
 — the first attempt's structural guarantee survives only for `tui-dc-picker` — and deliberately
 deferred the join to this task rather than writing a second, weaker record of the secret before the
-unblind. **Discharged here.**
+unblind. **T8's half is discharged here; the write-up (`plan.md` T11) owes it in its own voice, since
+`GENERATION-2-NOTES.md` and `SCORING-2-NOTES.md` §9.5a item 12 both owe it to T8 *and* the
+write-up.**
 
 | fixture | distinct titles | arms carrying each |
 |---|---|---|
@@ -741,12 +783,17 @@ therefore **not** the same population. Per fixture, which is:
 | `tui-dc-picker` | 321 / 330 | 97.3% |
 | `tiered-review` | 473 / 504 | 93.8% |
 
-**The like-for-like figure is `skill-stickiness` at 98.9% against 99.8% — a gap of about five rows
-over 546, which is inside this file's own one-to-three-rows-per-generation noise floor.** So the
-99.8% ceiling neither reproduced nor visibly moved; **the doubt is not retired.** A rate that high
+**The closest comparable figure is `skill-stickiness` at 98.9% against 99.8% — a gap of about five
+rows over 546, inside this file's own one-to-three-rows-per-generation noise floor.** It is
+*closer*, not like-for-like: **one population difference remains**, since 99.8% is a rate over all
+of that task's shard dispatches, including superseded and re-run ones, while 540/546 is one filed
+verdict per generation. No arithmetic here removes that, so the comparison is indicative and nothing
+is concluded from its sign. What can be said without it: **a 98.9% present rate on the fixture that
+raised the doubt does not retire the doubt.** A rate that high
 on the fixture that raised it is the same doubt limitation 7a states from the other direction, and
-the two should be read together. `tiered-review`'s 93.8% is the one fixture where tier 1 discriminated
-appreciably, and it is also the fixture carrying most of this run's class-B flags.
+the two should be read together. `tiered-review`'s 93.8% is the fixture where tier 1
+discriminated **most** — all three show real spread (`SCORING-3-NOTES.md` §4) — and it also carries
+**42 of the run's 59 class-B flags**.
 
 **§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
 not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
@@ -777,7 +824,7 @@ wording.** All four, with their state:
 
 **§9.5a item 13 — a frozen-instrument inconsistency, and this run's third departure from item 10's
 template.** Item 9's first blockquote — handed verbatim to every scorer, **including all 96 of
-`SCORING-2-NOTES.md` §T5b's dispatches** — says a paraphrase *"may be evidenced by up to three spans"*, while
+`SCORING-2-NOTES.md`'s T5b's dispatches** — says a paraphrase *"may be evidenced by up to three spans"*, while
 the same prompt's item-8 rules say **1 to 5**. Scorers followed the rules. With `SCORING-2-NOTES.md`
 §2a this is the **second place item 10's template contradicts the items it claims to carry**, and
 the two belong together as one finding about item 10. **`PROTOCOL-3.md` §5 answered it by dropping
