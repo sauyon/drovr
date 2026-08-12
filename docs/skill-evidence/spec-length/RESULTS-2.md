@@ -267,10 +267,10 @@ The *files on disk* are 64: the discarded pass left 32 shard files
 (`retention-3/parts/superseded/deviating-prompt/` holds 50 — 30 `-shard.json`, 2
 `fd2c24-{1,2}-attempt1.json` and 18 assembled verdicts) and the standing pass 32 (30 under
 `retention-3/parts/`, 2 under `parts/superseded/`). The *dispatch* counts are 34 and 32: commit
-`9c4860e` records 34 for the discarded pass against its 32 files, the two extra being **dispatches
-that wrote no file**, which no directory listing can show; `SCORING-3-NOTES.md` §2 counts the
-standing pass at 32 dispatches / 32 files with **zero** that wrote no file. **66 is the dispatch
-total and 64 the file total.** An earlier draft of this paragraph said 62, which is neither and
+`9c4860e` records 34 for the discarded pass against its 32 files and **does not itemise the
+difference** — see §8 deviation 2, which withdraws an earlier inference about what those two extra
+dispatches were; `SCORING-3-NOTES.md` §2 counts the standing pass at 32 dispatches / 32 files with
+**zero** that wrote no file. **66 is the dispatch total and 64 the file total.** An earlier draft of this paragraph said 62, which is neither and
 matches no record — it was `30 + 32`, the discarded pass's *shard* count added to the standing
 pass's *dispatch* count.
 
@@ -458,7 +458,8 @@ cites `calibration-2.json` as evidence about an arm.
    `wc -l generated-2/*.md` reproduces it in one command from files that were already committed. It
    could not have steered a scorer, which is never shown a length figure — but it was published
    ahead of the write-up that owns it, and that is the deviation.
-2. **One `R6` re-run in TIER 1: `2d2629`, for fabrication.** `R6` requires *every* re-run to be
+2. **`R6` re-runs, in full — the standing tier-1 pass, tier 3, and the discarded pass.** The one
+   that matters is **`2d2629`, tier 1, for fabrication.** `R6` requires *every* re-run to be
    logged here with its reason, and this is the one that matters most. On its first attempt
    `2d2629` failed the **class-A** check: **twenty-nine spans, all in shard 2, were not verbatim
    substrings of the generated spec** — a whole shard of invented text. Fabrication is the one thing
@@ -480,13 +481,21 @@ cites `calibration-2.json` as evidence about an arm.
    **The full `R6` count, because `R6` says *every* re-run and an earlier draft of this item logged
    only the tier-3 one.** In the **standing** tier-1 pass there is exactly **one**: `2d2629`, above
    — `SCORING-3-NOTES.md` §2's table records 32 dispatches, 30 shards plus those 2 re-runs, and
-   **zero dispatches that wrote no file**. In the **discarded** pass there were **three more**:
-   `fd2c24`'s two shards, re-dispatched after a class-A refusal (§3.1's incident), and — implied by
-   §5's 34-dispatches-against-32-files reconciliation — **two dispatches that wrote no file**, which
-   is `R6`'s first trigger. Those three belong to a pass that no longer stands and no figure in this
-   file rests on them, **but they are re-runs and `R6` does not exempt a discarded pass from the
-   log.** Their reasons are on the record here; their per-dispatch detail is not recoverable from
-   the committed files, which is itself a gap and is stated rather than glossed.
+   **zero dispatches that wrote no file**.
+
+   **In the discarded pass the log is incomplete, and saying so is the honest form.** Two of its
+   re-runs are on the record: **`fd2c24`'s two shards, re-dispatched whole after a class-A refusal
+   for two fabricated spans** (commit `9c4860e`), and separately **one dispatch of `fd2c24-2` that
+   crashed and was re-dispatched** (`SCORING-3-NOTES.md` §3.1, *"re-dispatched after an earlier one
+   crashed"*) — a probe that wrote no file, `R6`'s first trigger. **Beyond that the accounting does
+   not close: `9c4860e` records 34 dispatches against 32 shard files and itemises neither the
+   difference nor a reason for each.** An earlier draft of this bullet asserted "two dispatches that
+   wrote no file" as though the record said so; **it does not — that was an inference from the
+   34-versus-32 gap, and it is withdrawn.** What can be said is that the discarded pass took more
+   dispatches than it left files, that at least one of those was a crash, and that **`R6`'s
+   log-every-re-run duty was not fully met by that pass and cannot now be met retrospectively.** No
+   figure in this file rests on that pass; the gap is recorded because `R6` does not exempt a
+   discarded pass from the log.
 3. **One `R6` re-run, in tier 3.** `fe4059`'s first tier-3 dispatch **wrote no file** — `R6`'s first
    trigger verbatim — returning its answer as reply text instead. The dispatch was re-run whole
    against the byte-identical prompt and the re-run's reply is what `escalation-2/fe4059.json`
@@ -565,6 +574,42 @@ re-hashed.
 
 ---
 
+## 8b. The two open file-access channels, re-disclosed
+
+`PROTOCOL-2.md` item 11 and `plan.md` §0 both require these to be **re-disclosed in `RESULTS-2.md`,
+not silently repeated**, and item 11 adds that every task in the run re-discloses them. They are
+logged **as open, not as controlled.**
+
+**(a) Every dispatched subagent runs with a working directory inside this worktree, so it *could*
+read `blind-map-2.json` or recover an arm from `git log`.** `RESULTS.md` §7.6 deviation 7 recorded
+exactly this for the first attempt's scorers: the harness gives no way to set a subagent's working
+directory, the prescribed control — dispatch outside the worktree, hand over a byte-for-byte copy —
+was run and was **incomplete**, and the channel was logged as open. This attempt inherits it
+unchanged and on the same terms.
+
+**This task's own 35 dispatches inherit it too, and that is said plainly rather than left to
+inference.** The 18 tier-2 adjudicators and 17 tier-3 escalators each ran inside this worktree. The
+mitigations were real but are instructions, not controls: their prompts were written **outside** the
+repository, each in its own directory so a subagent could not list its siblings; each was told to
+read one named file and no other, and not to search the repository; and the tier-2 prompt builder
+**asserts** that no prompt contains its generation's id, `generated-2`, `blind-map-2` or
+`fixture-map-2`. Nothing suggests any dispatch used the channel. **But *"was told only to read the
+prompt"* is an instruction and not a control**, exactly as the first attempt's *"was told only to
+read the spec"* was, and the channel stays open.
+
+**(b) The calibration corpus's own arm map is recoverable from this branch's history**
+(`RESULTS.md` §5 deviation 8; item 11 addition (c)). It is immaterial to this attempt, which uses a
+different id pool and never re-scores those generations for a verdict — item 12a's pass is scored
+per row with no arm attached and never opened `blind-map.json` — but it is carried because this run
+documents every channel it knows about. **A mitigation, not a closure.**
+
+**Nothing in this run is described as fully blind.** Item 11 also carries the inherited
+vocabulary/section-shape channel, tier 3's spec-visibility caveat (limitation 9 — tier 3 sees the
+spec and so can be swayed by how good it looks), and §10's title-phrasing channel, which this file
+adds to the list.
+
+---
+
 ## 9. Freeze re-verification
 
 `FREEZE-3.md` names one path, `PROTOCOL-3.md`, at `959e3f03…`, frozen at `2bee0ee4…`, and
@@ -576,7 +621,7 @@ figures are in the task report.
 **`FREEZE-3.md` deliberately does not freeze `retention-3/`.** Freezing an output would make an `R6`
 re-run a freeze breach rather than the remedy it is.
 
-**What none of these checks does, and §12 item 12.3 records it as open: nothing verifies that the
+**What none of these checks does, and §12's carry of `SCORING-2-NOTES.md` §9.5a item 12, question 3, records it as open: nothing verifies that the
 freeze records are COMPLETE.** Every row that exists is re-hashed to its file; no check asks whether
 an artifact that should carry a row is missing one. A freeze record can be wrong by omission, and
 omission is the one failure mode nothing here looks for.
@@ -682,11 +727,26 @@ comparison to v1 is drawn.**
 
 **The doubt itself, which stands undischarged:** a tier-1 pass that marks essentially everything
 present is measuring something other than retention, and §9.3 narrowed the observation to
-`skill-stickiness` without withdrawing it. **This file publishes 18 tier-1 counts (§2), and this
-run's rate is 1334/1380 = 96.7% present.** That is this pass's own figure, comparable to the second
-attempt's 99.8% and to nothing else. It is lower, and it is still high enough that the doubt is live
-rather than retired — which is the same doubt limitation 7a states from the other direction, and the
-two should be read together.
+`skill-stickiness` without withdrawing it.
+
+**This run's rates, with the populations kept apart — because the comparison that suggests itself is
+between two different denominators, and an earlier draft made it.** 99.8% is `skill-stickiness`
+**only**, across all of that task's shard dispatches. This run's overall tier-1 rate is
+**1334/1380 = 96.7%**, which pools three fixtures over one filed verdict per generation and is
+therefore **not** the same population. Per fixture, which is:
+
+| fixture | tier-1 present | rate |
+|---|---|---|
+| `skill-stickiness` | 540 / 546 | **98.9%** |
+| `tui-dc-picker` | 321 / 330 | 97.3% |
+| `tiered-review` | 473 / 504 | 93.8% |
+
+**The like-for-like figure is `skill-stickiness` at 98.9% against 99.8% — a gap of about five rows
+over 546, which is inside this file's own one-to-three-rows-per-generation noise floor.** So the
+99.8% ceiling neither reproduced nor visibly moved; **the doubt is not retired.** A rate that high
+on the fixture that raised it is the same doubt limitation 7a states from the other direction, and
+the two should be read together. `tiered-review`'s 93.8% is the one fixture where tier 1 discriminated
+appreciably, and it is also the fixture carrying most of this run's class-B flags.
 
 **§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
 not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
@@ -698,12 +758,14 @@ puts it.
 **§9.5a item 12 is four questions, not one, and "nothing else keeps [them] alive" is its own
 wording.** All four, with their state:
 
-1. **The title-variance channel** — **discharged**, §10 of this file.
+1. **The title-variance channel** — **answered in §10 of this file, which discharges T8's half.**
+   §9.5a item 12 and `GENERATION-2-NOTES.md` both owe it to *T8 and the write-up*, so **T11 still
+   owes it in its own voice**, exactly as it owes `R4`'s attribution question.
 2. **Whether re-dispatching two transmission questions was right** (*"decide before T9; the revert is
    `git revert 6268365`"*) — **still open**, and now moot for the outcome, since `R7` skipped the
    transmission test entirely. It remains open as a record question and the revert is still the
    remedy if a later attempt runs that test.
-3. **The 20 `FREEZE-2.md` rows are not checked for completeness** — **still open**. §9 below
+3. **The 20 `FREEZE-2.md` rows are not checked for completeness** — **still open**. §9 above
    re-verifies that every row that *exists* hashes to its file; nothing checks that every artifact
    that *should* have a row has one. A freeze record can be complete-and-wrong only by omission, and
    omission is exactly what no check here looks for.
@@ -714,8 +776,8 @@ wording.** All four, with their state:
    it would mean editing a frozen file, so it is recorded, not fixed.
 
 **§9.5a item 13 — a frozen-instrument inconsistency, and this run's third departure from item 10's
-template.** Item 9's first blockquote — handed verbatim to every scorer, **including all 96 of the
-second attempt's dispatches** — says a paraphrase *"may be evidenced by up to three spans"*, while
+template.** Item 9's first blockquote — handed verbatim to every scorer, **including all 96 of
+`SCORING-2-NOTES.md` §T5b's dispatches** — says a paraphrase *"may be evidenced by up to three spans"*, while
 the same prompt's item-8 rules say **1 to 5**. Scorers followed the rules. With `SCORING-2-NOTES.md`
 §2a this is the **second place item 10's template contradicts the items it claims to carry**, and
 the two belong together as one finding about item 10. **`PROTOCOL-3.md` §5 answered it by dropping
