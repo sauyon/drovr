@@ -6215,7 +6215,7 @@ fn final_disposition(
     for (id, verdict) in verdicts {
         if &verdict.spec_id != id {
             wrong.push(format!(
-                "tier 1: `retention-2/{id}.json` scores `{}`. The join is keyed by id, so a \
+                "tier 1: `retention-3/{id}.json` scores `{}`. The join is keyed by id, so a \
                  verdict filed under the wrong stem attributes every one of its rows to the \
                  wrong generation.",
                 verdict.spec_id,
@@ -6244,10 +6244,9 @@ fn final_disposition(
         }
         let Some(verdict) = verdicts.get(id) else {
             wrong.push(format!(
-                "tier 3: `escalation-2/{id}.json` exists with no `retention-2/{id}.json` \
-                 behind it. Item 8b's escalator answers rows tier 2 flagged in a tier-1 \
-                 verdict; an escalation with no verdict is a disposition with no record \
-                 behind it."
+                "tier 3: `escalation-2/{id}.json` exists with no `retention-3/{id}.json` \
+                 behind it. Item 8b's escalator answers rows flagged in a tier-1 verdict; an \
+                 escalation with no verdict is a disposition with no record behind it."
             ));
             continue;
         };
@@ -7364,9 +7363,12 @@ fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
 /// other, because §3 replaced the v2 disposition that killed the whole verdict
 /// with one that "flags [the row], exactly as an `establishes: false` flags a
 /// row under `PROTOCOL-2.md` item 8a, and escalate[s it] to tier 3 under item
-/// 8b, whose call governs it". Requiring only tier 2's half would let 59
-/// class-B rows keep tier 1's call with nothing behind them — which is the
-/// entire consideration that made §3's loosening defensible.
+/// 8b, whose call governs it". Requiring only tier 2's half would let **51
+/// distinct class-B rows** keep tier 1's call with nothing behind them — which
+/// is the entire consideration that made §3's loosening defensible. (51 rows,
+/// not 59: 59 is the number of `(row, problem)` flags, and a row carrying two
+/// problems is still one row to escalate. The distinct set is what tier 3
+/// receives.)
 ///
 /// **Vacuous while the tier-1 record does not exist.** An `escalation-2/` with
 /// no `retention-3/` is a hard error, not a vacuous case.
