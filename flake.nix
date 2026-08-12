@@ -45,6 +45,32 @@
           # to the check phase so the suite runs as it does locally.
           nativeCheckInputs = [ pkgs.git ];
 
+          # `src = ./.` copies the tree; it does NOT bring `.git`. So `git` is
+          # resolvable here (above) but there is no REPOSITORY, and the two
+          # checks that read history cannot pass in this sandbox no matter what
+          # the code says:
+          #
+          #   freeze_precedes_every_candidate_arm      — arm-vs-freeze ancestry
+          #   manifest_commits_contain_their_snapshots — `git rev-parse <sha>:<path>`
+          #
+          # Both deliberately FAIL rather than skip when they cannot verify
+          # ("a skip prints `ok` having checked nothing"), which is correct on a
+          # developer machine and in CI, where history exists and a missing
+          # commit is a real defect. It is not correct here, where history is
+          # absent by construction. Skipping them in the PACKAGE keeps them
+          # strict everywhere they are meaningful — do not weaken the tests to
+          # make this build pass.
+          checkFlags = [
+            "--skip=freeze_precedes_every_candidate_arm"
+            "--skip=manifest_commits_contain_their_snapshots"
+          ];
+
+          # The superpowers-overlap check compares drovr's skills against a
+          # corpus under $HOME. There is no $HOME here, and its authors built
+          # the declaration for exactly this case: the sentinel makes it say
+          # loudly that NOTHING WAS COMPARED instead of passing quietly.
+          DROVR_SUPERPOWERS_CORPUS = "none";
+
           # Install the Claude Code plugin assets (skills + plugin manifest)
           # alongside the binary. These live at the flake root, not under cli/,
           # so reference them via the flake source paths (Nix copies them into
