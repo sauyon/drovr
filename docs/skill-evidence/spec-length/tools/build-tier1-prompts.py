@@ -9,8 +9,10 @@ prompt that can drift from the frozen instrument between one arm and the next.
 Each prompt is written into its **own directory** so a scorer cannot list its
 siblings and recover which generations share anything. Prompts are written OUTSIDE
 the repository: a scorer runs with a working directory inside the worktree, and
-`v1`'s `RESULTS.md` §5 deviation 1 is the record of what a dispatch that can read
-the run's own working material costs.
+`v1`'s `RESULTS.md` §7.6 deviation 7 is the record of what a dispatch that can
+read the run's own working material costs, and §5 deviation 4 is the control it
+prescribes. (§5 deviation 1 is the feasibility-generation choice and has nothing
+to do with this; the miscitation is corrected here.)
 
 What a scorer is handed is fixed by item 10 and is **only** these: the generated
 spec (by absolute path), its own shard's ledger rows, and the item-8 schema plus

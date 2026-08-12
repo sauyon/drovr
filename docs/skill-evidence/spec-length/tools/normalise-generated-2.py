@@ -15,7 +15,7 @@ is why `GENERATION-2-NOTES.md` §3 rests its conclusion on committed artifacts
 rather than on this script.
 
 
-v1's `RESULTS.md` §5 deviation 9: dispatching probes lets `ls -l` mtimes, inode
+v1's `RESULTS.md` §5 deviation 5: dispatching probes lets `ls -l` mtimes, inode
 order and `readdir` order reconstruct the write order from the filesystem alone.
 The directory is therefore torn down and rebuilt with all 18 files written in
 id-lexicographic order, so nothing about the draw survives in the filesystem.

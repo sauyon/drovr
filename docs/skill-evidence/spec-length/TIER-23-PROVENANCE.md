@@ -4,8 +4,8 @@
 for `PROTOCOL-2.md` item 8a's tier-2 pass and item 8b's tier-3 pass.
 
 **Prompts and replies are hashed; dispatches are counted, and the three numbers differ.** The two
-passes made **36 dispatches** over **35 prompts**, producing **35 replies**: 18 tier-2, and 18
-tier-3 over 17 prompts. `fe4059`'s tier-3 prompt was dispatched twice — its first dispatch **wrote
+passes made **36 dispatches** — 18 tier-2 and 18 tier-3 — over **35 prompts** (18 tier-2 and 17
+tier-3), producing **35 replies**. `fe4059`'s tier-3 prompt was dispatched twice — its first dispatch **wrote
 no file, so there is no reply of it to hash**, and the hash below is the `R6` re-run's. A dispatch
 that produces nothing leaves nothing hashable, which is a limit of this record and is why the
 dispatch count is stated here rather than inferred from the number of rows. It is the tier-2/3 equivalent of

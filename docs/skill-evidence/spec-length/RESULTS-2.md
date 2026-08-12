@@ -307,7 +307,7 @@ honoured: **tiers 2 and 3 were complete and committed before anything in this ru
 map** (commit `bb1ca14`; this file's is `92fea48`, later, and `adjudication-2/` and `escalation-2/`
 are byte-identical across that boundary).
 
-**Read that sentence with §8 deviation 0, which weakens it.** Plan tasks T6, T7 and T8 ran in one
+**Read that sentence with §8 deviations 0 and 8, which weaken it from two directions.** Plan tasks T6, T7 and T8 ran in one
 phase context rather than three, so the separation between scoring and seeing the arms is an
 **ordering claim checkable in `git log`**, not the structural impossibility the plan's decomposition
 would have made it. The commits are the evidence; **what no record can show is what a single context
@@ -511,8 +511,9 @@ cites `calibration-2.json` as evidence about an arm.
    that catch was read from bytes a still-running scorer then overwrote, in a pass that no longer
    stands. One instance is thinner evidence than "twice" would have been.
 
-   **The full `R6` count, because `R6` says *every* re-run and an earlier draft of this item logged
-   only the tier-3 one.** In the **standing** tier-1 pass there is exactly **one**: `2d2629`, above
+   **The `R6` count for the tier-1 passes. The complete run-wide list is this item plus item 3
+   (tier 3) plus item 7 (the two transmission questions), and no single item holds it — an earlier
+   draft of this item claimed to.** In the **standing** tier-1 pass there is exactly **one**: `2d2629`, above
    — `SCORING-3-NOTES.md` §2's table records 32 dispatches, 30 shards plus those 2 re-runs, and
    **zero dispatches that wrote no file**.
 
@@ -570,11 +571,19 @@ cites `calibration-2.json` as evidence about an arm.
    `SCORING-2-NOTES.md` §9.5a item 12 leaves open *whether* it was the right call, and §12 carries
    that question; this item records the deviation itself, which is a separate duty.
    **It changed no result: `R7` skipped the transmission test entirely.**
-8. **`PROTOCOL-3.md` revised five of `PROTOCOL-2.md`'s governed items after `PROTOCOL-2.md`'s
-   window 3 had closed.** `PROTOCOL-2.md`'s window 3 reads *"after the first probe of item 5 is
-   dispatched: **no governed item may be revised at all***", and `PROTOCOL-3.md` §8's own departure
-   table lists five — item 8's span rule, item 8's disposition, item 10's template, `R6`'s trigger
-   list, and item 1's limitations. **`PROTOCOL-2.md` itself was not edited**, which is why §8a's
+8. **`PROTOCOL-3.md` changed `PROTOCOL-2.md`'s governed rules after `PROTOCOL-2.md`'s window 3 had
+   closed — and it added rules too, which window 3 forbids separately.** Window 3 reads *"after the
+   first probe of item 5 is dispatched: **no governed item may be revised at all***", and window 1
+   is *"the only window in which a rule may be added and the only one in which a governed item may
+   be weakened"*.
+
+   **The counts, stated exactly, because three different ones are available and an earlier draft
+   picked a fourth.** `PROTOCOL-3.md`'s own preamble says it *"changes exactly four things"*;
+   §8's departure table has **six rows**; and the departures span **four distinct items** — item 8
+   (twice: its span rule and its disposition), item 10's template, item 12's `R6` trigger list, and
+   item 1's limitations. **The sixth row is `new`** — §5's re-scoring pass, §6's checks and §7's
+   reporting obligations — which are rule *additions* rather than revisions, and are what window 1's
+   clause covers. So: **five revisions across four items, plus one row of additions.** **`PROTOCOL-2.md` itself was not edited**, which is why §8a's
    revision log shows one amendment and classifies it window 1; the rules moved in a second document
    instead. **Stating only the first fact would be true about the file and misleading about the
    rules**, so both are stated.
@@ -618,7 +627,10 @@ trusting this section to exist. The rule is deliberately stricter than any windo
 not classify a commit by window, because a check that had to decide when the first probe happened
 would be a check with a judgement call in it.
 
-**`PROTOCOL-2.md` has two commits. One amendment.**
+**`PROTOCOL-2.md` has two commits. One amendment.** **That is a fact about the FILE, and §8
+ deviation 8 is the fact about the RULES:** `PROTOCOL-3.md` revised five of this file's governed
+ rules and added more, after `PROTOCOL-2.md`'s window 3 had closed, without editing `PROTOCOL-2.md`
+ at all. Read the table below with that deviation, or it reads as a protocol that never moved.
 
 | commit | window | what it changed |
 |---|---|---|
@@ -784,7 +796,9 @@ rather than merely correct.** **§9.5 item 5** — that the tier-1 pass *rate* i
 the instrument — is carried by §5's revision table (~1% → 3 of 12 → 18 of 18) and by the item 9
 paragraph below. **§9.5a item 11** — the four `GENERATION-2-NOTES.md` obligations owed to T8 — is
 discharged across §3 (both `R5a` flags, `fd2c24` not read as a win), §8 deviation 1 (the early `wc`
-publication) and §10 (the title join). Neither is left open; neither was previously named.
+publication) and §10 (the title join) — **where T8's half is discharged and the write-up's half is
+not**, as §10 and question 1 above both say. Neither item is left open *to this file*; neither was
+previously named.
 
 **§9.5 item 7(a) — the duplicate-shard finding, owed here in as many words.** In the second
 attempt's tier-1 pass **one shard's attempt 4 was byte-identical to its attempt 2** — the only
@@ -841,9 +855,16 @@ raised the doubt does not retire the doubt.** A rate that high
 on the fixture that raised it is the same doubt limitation 7a states from the other direction, and
 the two should be read together. `tiered-review`'s 93.8% is the fixture where tier 1
 discriminated **most, and by a wide margin**: its six generations span 72–83 of 84, a range of 11
-rows, against `tui-dc-picker`'s 5 and `skill-stickiness`'s **2** — and a 2-row range is smaller than
-the noise floor this same section invokes, so `skill-stickiness` shows no spread this instrument can
-distinguish from noise. `tiered-review` also carries **42 of the run's 59 class-B flags**.
+rows, against `tui-dc-picker`'s 50–55 (5) and `skill-stickiness`'s 89–91 (**2**). **Applying the
+noise floor evenly, as it must be: at one to three rows per generation, neither the 2-row nor the
+5-row range is outside it, so only `tiered-review`'s 11 is a spread this instrument can distinguish
+from noise.**
+
+**That is a narrowing of `SCORING-3-NOTES.md` §4, and it is named rather than made silently.** §4
+says *"Present rates by fixture, and they have real spread"* of all three. On the ranges it lists,
+two of the three are inside the noise floor §5.2 of the same file measures. **§4 is not wrong about
+the numbers — they are the same numbers — and this file does not re-interpret `retention-3/`; it
+applies §5.2's own bound to §4's own figures and reports where that leaves them.** `tiered-review` also carries **42 of the run's 59 class-B flags**.
 
 **§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
 not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
@@ -958,8 +979,11 @@ two dispatches of the same document — bounds every count in this file.** `R2` 
 gate, so the floor does not corrupt the gate itself; it does mean the 219 / 229 / 206 spread should
 not be read to single-row precision. **It rests on three generations, which is thin.**
 
-`TIER-23-PROVENANCE.md` holds the SHA-256 of every tier-2 and tier-3 prompt as dispatched and every
-reply as read.
+`TIER-23-PROVENANCE.md` holds the SHA-256 of every tier-2 and tier-3 **prompt** as dispatched and
+every **reply** as read — **35 prompts and 35 replies over 36 dispatches.** The gap is `fe4059`'s
+first tier-3 dispatch, which wrote no file: **a dispatch that produces nothing leaves nothing to
+hash**, so the provenance record cannot cover it and says so. Its reply existed only as transcript
+text and was deliberately not harvested (deviation 3).
 
 ---
 
