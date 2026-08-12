@@ -147,25 +147,38 @@ def main(argv):
                           f'"wrote":"{dest}","ok":true}}')
             for leftover in ("<abs path", "<fixture>", "<path>", '"<id>"', "<k>"):
                 assert leftover not in p, f"unsubstituted {leftover!r} in {spec_id}-{k}"
+            # **Delimiters and an ordering statement, and nothing else.** The
+            # first build of this pass wrapped §2 and §3 in editorial framing of
+            # its own — most damagingly a sentence telling scorers there was "NO
+            # reason to ... drop a row you cannot cite cleanly, or to reuse a
+            # span you have already used." §5 pre-registers §2 and §3
+            # **verbatim**, and this run's own `SCORING-2-NOTES.md` §2a finding is
+            # that prompt wording moves scorer behaviour measurably — so that
+            # framing was an undisclosed intervention on both metrics the pass
+            # then reported. `SCORING-3-NOTES.md` §5.1 records it and §5.3
+            # records the re-run.
+            #
+            # **What remains is not framing and is required.** Three frozen texts
+            # are handed over and two of them disagree; a scorer that is not told
+            # which governs has to guess, and item 8's own closing sentence
+            # contradicts §3 on the page. Naming the precedence is the minimum
+            # that makes the handover coherent, it says nothing about what to
+            # score or how to cite, and it is identical for every shard.
             p = (
                 f"{p}\n"
-                "--- BEGIN THE ITEM-8 SCHEMA, WHICH GOVERNS AND IS NOT A SUMMARY ---\n"
+                "--- BEGIN THE ITEM-8 SCHEMA ---\n"
                 f"{ITEM8}\n"
                 "--- END THE ITEM-8 SCHEMA ---\n"
                 "\n"
-                "--- BEGIN `PROTOCOL-3.md` SECTION 2 — THE SPAN RULE THAT ACTUALLY RUNS ---\n"
-                "This SUPERSEDES the boundary rule stated in the item-8 schema above. Where the\n"
-                "two differ, this one governs: it is the rule the mechanical check executes.\n"
+                "--- BEGIN `PROTOCOL-3.md` SECTION 2 ---\n"
+                "Where this section and the item-8 schema above differ on the span boundary\n"
+                "rule, this section governs.\n"
                 f"{SPAN_RULE_V3}\n"
                 "--- END `PROTOCOL-3.md` SECTION 2 ---\n"
                 "\n"
-                "--- BEGIN `PROTOCOL-3.md` SECTION 3 — WHAT A VIOLATION COSTS ---\n"
-                "This SUPERSEDES the item-8 schema's closing sentence that a verdict whose spans\n"
-                "violate the rule is malformed and re-run whole. Read it: a boundary refusal and\n"
-                "a shared span are class B, they flag one row each and are never fatal, and there\n"
-                "is therefore NO reason to hide one, to drop a row you cannot cite cleanly, or to\n"
-                "reuse a span you have already used. Cite the best span you can and let the\n"
-                "check flag what it flags.\n"
+                "--- BEGIN `PROTOCOL-3.md` SECTION 3 ---\n"
+                "Where this section and the item-8 schema above differ on what a violation\n"
+                "costs, this section governs.\n"
                 f"{DISPOSITION_V3}\n"
                 "--- END `PROTOCOL-3.md` SECTION 3 ---\n"
             )

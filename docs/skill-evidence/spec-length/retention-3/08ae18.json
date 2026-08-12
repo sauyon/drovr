@@ -18,14 +18,14 @@
       "id": "tui-dc-picker-03",
       "present": true,
       "quotes": [
-        "`V` opens one tree \u2014 **project \u2192 config \u2192 version** \u2014 built on the browser's existing\n`fieldTree` widget (`browse_fieldtree.go:151`), replacing the `huh.Select` step chain used\ntoday."
+        "One browsable collapsible tree, not three sequential `huh.Select` prompts; same three levels; built on `fieldTree`."
       ]
     },
     {
       "id": "tui-dc-picker-04",
       "present": true,
       "quotes": [
-        "`\u2191`/`\u2193` move the cursor (`fieldTree.up`/`down`); `\u2192`/`l` expand, `\u2190`/`h` collapse\n  (`fieldTree.setCollapsed`); `space` toggles (`fieldTree.toggle`)."
+        "`\u2191`/`\u2193` move the cursor (`fieldTree.up`/`down`);"
       ]
     },
     {
@@ -117,7 +117,7 @@
       "present": true,
       "quotes": [
         "Cross-project adoption falls out of the project level being a root of the tree.",
-        "`enter` on a version leaf arms `confirmState` with that leaf's project and config name (not the\n   linked config's) \u2014 covers the cross-project case."
+        "Cross-project adoption via the tree's project level."
       ]
     },
     {
@@ -152,22 +152,22 @@
       "id": "tui-dc-picker-22",
       "present": true,
       "quotes": [
-        "// dcForm, dcVersions, dcCurrent, dcChoice are REPLACED by the tree.\n// dcVersLoading is replaced by len(dcLoading) > 0."
+        "// dcForm, dcVersions, dcCurrent, dcChoice are REPLACED by the tree.",
+        "// dcVersLoading is replaced by len(dcLoading) > 0."
       ]
     },
     {
       "id": "tui-dc-picker-23",
       "present": true,
       "quotes": [
-        "pick any // non-nil only on picker version leaves; nil on every node the existing trees build",
-        "The picker sets `pick` to the\n`*schemasv1.DeployConfigSchema` on each version leaf; `enter` reads it back."
+        "pick any // non-nil only on picker version leaves; nil on every node the existing trees build"
       ]
     },
     {
       "id": "tui-dc-picker-24",
       "present": true,
       "quotes": [
-        "Zero value `nil` leaves the config/revision/diff trees unaffected."
+        "`fieldNode.pick` is nil on every node the existing config/revision/diff tree builders produce."
       ]
     },
     {
@@ -251,8 +251,7 @@
       "id": "tui-dc-picker-36",
       "present": true,
       "quotes": [
-        "\u251c\u2500 \u25b8 config-x   (latest v7)  (shared)",
-        "`(shared)` / `(current)` / `(latest)` markers; confirm copy per above."
+        "\u251c\u2500 \u25b8 config-x   (latest v7)  (shared)"
       ]
     },
     {
@@ -344,9 +343,7 @@
       "id": "tui-dc-picker-49",
       "present": true,
       "quotes": [
-        "No API or\nserver change is required: `deployConfigService.List` with no name filter already returns the\nlatest version of every distinct config in the project, and `api.Client.ListDeployConfigs` is\nalready used elsewhere in the CLI.",
-        "Any API-server or schema change.",
-        "### Transport \u2014 unchanged"
+        "Any API-server or schema change."
       ]
     },
     {
@@ -367,8 +364,7 @@
       "id": "tui-dc-picker-52",
       "present": true,
       "quotes": [
-        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a live form vs. arm a confirm + PATCH), and entry\n  conditions.",
-        "Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is."
+        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a live form vs. arm a confirm + PATCH), and entry\n  conditions. Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is."
       ]
     },
     {
@@ -382,8 +378,7 @@
       "id": "tui-dc-picker-54",
       "present": true,
       "quotes": [
-        "Merge-semantics tests on `preserveDeploymentDivergences` (pure functions, table-driven, no model):",
-        "`internal/mcloudcli/cli/deployment/deploy_config_test.go` | Tests 12-14 (merge semantics)"
+        "Merge-semantics tests on `preserveDeploymentDivergences` (pure functions, table-driven, no model):"
       ]
     },
     {

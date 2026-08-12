@@ -20,14 +20,15 @@
       "id": "tiered-review-45",
       "present": true,
       "quotes": [
-        "**Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many\n  survive the cascade."
+        "### 3. Class-3 defects gate on conditional recall, not absolute detection (`class3gate: gates-conditional`)",
+        "- **Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many\n  survive the cascade."
       ]
     },
     {
       "id": "tiered-review-46",
       "present": true,
       "quotes": [
-        "**Expensive-tier absolute detection rate on class 3** (does not gate): reported as the run's\n  most interesting scientific output — the ceiling of the review system as a whole."
+        "- **Expensive-tier absolute detection rate on class 3** (does not gate): reported as the run's\n  most interesting scientific output — the ceiling of the review system as a whole."
       ]
     },
     {
@@ -41,6 +42,7 @@
       "id": "tiered-review-48",
       "present": true,
       "quotes": [
+        "Two synthetic, free controls bracket every metric per stratum and per class:",
         "A real\ncheap tier must land strictly inside the bracket on both axes, or those fixtures are rebuilt before\nscoring."
       ]
     },
@@ -97,14 +99,14 @@
       "id": "tiered-review-56",
       "present": true,
       "quotes": [
-        "**0.** N floor met, else the cell is reported null."
+        "N floor met, else the cell is reported null."
       ]
     },
     {
       "id": "tiered-review-57",
       "present": true,
       "quotes": [
-        "**4.** Measured end-to-end cost < 0.80× the non-cascade panel."
+        "Measured end-to-end cost < 0.80× the non-cascade panel."
       ]
     },
     {
@@ -139,7 +141,7 @@
       "id": "tiered-review-62",
       "present": true,
       "quotes": [
-        "if per-stratum recall is more heterogeneous than sampling explains, the pooled\nfigure is not reported as the headline and the discrepant stratum is reported as its own finding."
+        "Per-stratum numbers are always\nreported alongside; if per-stratum recall is more heterogeneous than sampling explains, the pooled\nfigure is not reported as the headline and the discrepant stratum is reported as its own finding."
       ]
     },
     {
@@ -168,10 +170,8 @@
       "id": "tiered-review-66",
       "present": true,
       "quotes": [
-        "- **Config surface** (`[review.cascade]` in drovr's TOML config):",
-        "- Flipping `enabled` to `true` by default.",
-        "mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before",
-        "cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)"
+        "[review.cascade]\n  enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before\n  cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\"\n  timeout_ms  = 120000       # expiry takes the degrade path (decision 2)",
+        "- **Config surface** (`[review.cascade]` in drovr's TOML config):"
       ]
     },
     {
@@ -185,23 +185,21 @@
       "id": "tiered-review-68",
       "present": true,
       "quotes": [
-        "explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before"
+        "mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before"
       ]
     },
     {
       "id": "tiered-review-69",
       "present": true,
       "quotes": [
-        "The design question — route by explored-context, by angle, or by file — is resolved by a\npre-registered decision rule, not by argument.",
-        "`measure-first` — Task 0 measures `E/(E+D)`; the pre-registered rule (decision 1 above) picks explorer / angle / per-file"
+        "enabled = false            # default; stays off for the duration of this run regardless of result\n  mode = \"<undecided>\"       # explorer | angle | file | change — set by Task 0's decision rule (decision 1), not before"
       ]
     },
     {
       "id": "tiered-review-70",
       "present": true,
       "quotes": [
-        "cheap_agent = \"opencode\"",
-        "cheap_model = \"ko-ag/qwen3.6-35b-abliterated\""
+        "cheap_agent = \"opencode\"\n  cheap_model = \"ko-ag/qwen3.6-35b-abliterated\""
       ]
     },
     {
@@ -215,7 +213,7 @@
       "id": "tiered-review-72",
       "present": true,
       "quotes": [
-        "- **Cheap-tier execution contract:** headless only — `opencode run --agent plan -m <model>`, not a\n  herdr pane."
+        "**Cheap-tier execution contract:** headless only — `opencode run --agent plan -m <model>`, not a\n  herdr pane."
       ]
     },
     {
@@ -229,21 +227,21 @@
       "id": "tiered-review-74",
       "present": true,
       "quotes": [
-        "the\n  existing `readonly_displace` protection (`cli/src/config.rs:589`) runs first, unmodified."
+        "Read-only via `--agent plan` with `--auto` absent; the\n  existing `readonly_displace` protection (`cli/src/config.rs:589`) runs first, unmodified."
       ]
     },
     {
       "id": "tiered-review-75",
       "present": true,
       "quotes": [
-        "(7) Cascade stage in `cli/src/code_review.rs` behind `enabled = false`."
+        "**Cascade integration point:** a new stage in `cli/src/code_review.rs`, shipped behind\n  `enabled = false`, alongside the existing per-angle `AgentLaunch` fan-out driven by `cfg.angles`\n  (`cli/src/config.rs:436`)."
       ]
     },
     {
       "id": "tiered-review-76",
       "present": true,
       "quotes": [
-        "(8)\n`docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n`(model × stratum × class)`, each gate in order, ship decisions, stated limitations, aggregates\nonly — no private-repo content."
+        "`docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n`(model × stratum × class)`, each gate in order, ship decisions, stated limitations, aggregates\nonly — no private-repo content."
       ]
     },
     {
@@ -299,8 +297,7 @@
       "id": "tiered-review-84",
       "present": true,
       "quotes": [
-        "No open questions remain from this gate.",
-        "Anything discovered during the plan phase that these\ndecisions do not cover is a new question for a new gate, not a gap in this spec."
+        "No open questions remain from this gate. Anything discovered during the plan phase that these\ndecisions do not cover is a new question for a new gate, not a gap in this spec."
       ]
     }
   ]

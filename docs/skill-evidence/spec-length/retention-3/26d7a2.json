@@ -11,14 +11,14 @@
       "id": "tui-dc-picker-02",
       "present": true,
       "quotes": [
-        "projects | picker opens | `ListBenchmarkProjects` |\n| configs of a project | that project first expanded | `ListDeployConfigs(project)` + `latestPerConfig` |\n| versions of a config | that config first expanded | `fetchDeployConfigVersions(project, name)` |"
+        "`V` opens a single browsable, collapsible tree \u2014 benchmark project \u2192 config \u2192 version \u2014 built\non the browser's existing `fieldTree` widget (`browse_fieldtree.go:151`), reusing its\n`up`/`down`/`toggle`/`setCollapsed`/`reflatten`/`render`."
       ]
     },
     {
       "id": "tui-dc-picker-03",
       "present": true,
       "quotes": [
-        "`V` opens a single browsable, collapsible tree \u2014 benchmark project \u2192 config \u2192 version \u2014 built\non the browser's existing `fieldTree` widget (`browse_fieldtree.go:151`), reusing its\n`up`/`down`/`toggle`/`setCollapsed`/`reflatten`/`render`.",
+        "### D1 \u2014 Picker shape: three-level tree, not sequential prompts",
         "This was decided in two passes: turn 1\nfixed the three levels (Q1), turn 2 replaced the originally-assumed sequential `huh.Select`\nsteps with one navigable tree (Q5), because browsing sideways \u2014 comparing configs without\nbacking out \u2014 is the point of the feature, and a stepped picker makes that awkward."
       ]
     },
@@ -34,8 +34,10 @@
     },
     {
       "id": "tui-dc-picker-06",
-      "present": false,
-      "quotes": []
+      "present": true,
+      "quotes": [
+        "`enter` reads\n`pick` back off the cursor node."
+      ]
     },
     {
       "id": "tui-dc-picker-07",
@@ -53,21 +55,21 @@
       "id": "tui-dc-picker-09",
       "present": true,
       "quotes": [
-        "projects | picker opens | `ListBenchmarkProjects` |"
+        "| projects | picker opens | `ListBenchmarkProjects` |"
       ]
     },
     {
       "id": "tui-dc-picker-10",
       "present": true,
       "quotes": [
-        "configs of a project | that project first expanded | `ListDeployConfigs(project)` + `latestPerConfig` |"
+        "| configs of a project | that project first expanded | `ListDeployConfigs(project)` + `latestPerConfig` |"
       ]
     },
     {
       "id": "tui-dc-picker-11",
       "present": true,
       "quotes": [
-        "versions of a config | that config first expanded | `fetchDeployConfigVersions(project, name)` |"
+        "| versions of a config | that config first expanded | `fetchDeployConfigVersions(project, name)` |"
       ]
     },
     {
@@ -109,7 +111,6 @@
       "id": "tui-dc-picker-17",
       "present": true,
       "quotes": [
-        "Cross-project\nadoption falls out of the project level being a tree root.",
         "Cross-project adoption via the tree's project level."
       ]
     },
@@ -157,8 +158,10 @@
     },
     {
       "id": "tui-dc-picker-24",
-      "present": false,
-      "quotes": []
+      "present": true,
+      "quotes": [
+        "Tests: table-driven model tests in `browse_deploy_config_test.go` covering picker open/gate,\n  branch fill, labelling, auto-expand, cross-project selection, branch-toggle-is-not-a-selection,\n  fetch caching, esc-cancel, stale-result drop, overlay routing, and `pick` nilness on\n  non-picker trees;"
+      ]
     },
     {
       "id": "tui-dc-picker-25",
@@ -241,8 +244,7 @@
       "id": "tui-dc-picker-36",
       "present": true,
       "quotes": [
-        "`(shared)` / `(current)` / `(latest)` labelling;",
-        "`Shared` (`schemasv1.DeployConfigSchema:16`) is already returned by the list endpoint but\ncurrently unused anywhere in the CLI/TUI;"
+        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config."
       ]
     },
     {
@@ -285,8 +287,7 @@
       "id": "tui-dc-picker-42",
       "present": true,
       "quotes": [
-        "**Implementation constraint:** do not reuse `threeWayMerge` with an empty-map baseline \u2014 its\n\"value only current has\" branch takes `curVal` wholesale for any key absent from the baseline,\nso nested keys the target contributes would be dropped and top-level deployment keys would\nreplace the target's wholesale.",
-        "Implement a distinct, recursing map-level helper (the map twin\nof `mergeJSONPtr`)."
+        "**Implementation constraint:** do not reuse `threeWayMerge` with an empty-map baseline \u2014 its\n\"value only current has\" branch takes `curVal` wholesale for any key absent from the baseline,\nso nested keys the target contributes would be dropped and top-level deployment keys would\nreplace the target's wholesale. Implement a distinct, recursing map-level helper (the map twin\nof `mergeJSONPtr`)."
       ]
     },
     {
@@ -307,7 +308,7 @@
       "id": "tui-dc-picker-45",
       "present": true,
       "quotes": [
-        "`actionSwitchDeployConfig`'s confirm states, one line each: that switching redeploys the\ndeployment (unchanged); that overrides are carried across (D6/D7);"
+        "Confirm copy must state that overrides are carried across."
       ]
     },
     {
@@ -328,13 +329,14 @@
       "id": "tui-dc-picker-48",
       "present": true,
       "quotes": [
-        "`preserveDeploymentDivergences` nil-baseline fix (D6) \u2014 also fixes the same gap in\n  `mcloud deployment deploy-config set`, which shares the function."
+        "This change to `preserveDeploymentDivergences` also fixes the same gap on the existing\n`mcloud deployment deploy-config set` CLI path, which shares the function."
       ]
     },
     {
       "id": "tui-dc-picker-49",
       "present": true,
       "quotes": [
+        "No API or server change is required: `deployConfigService.List` with no name filter\n(`api-server/services/deploy_config.go:194-201`) already returns the latest version of every\nconfig in the project, including shared configs (ordinary rows materialised by\n`reconcileShared`), and the typed client (`api.Client.ListDeployConfigs`) already exists.",
         "Any API-server or schema change \u2014 the existing unfiltered `List` and typed client already\n  cover this.",
         "### Transport \u2014 unchanged"
       ]
@@ -357,8 +359,7 @@
       "id": "tui-dc-picker-52",
       "present": true,
       "quotes": [
-        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a form vs. arm a confirm + PATCH), and entry\n  conditions.",
-        "Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is, not refactored."
+        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a form vs. arm a confirm + PATCH), and entry\n  conditions. Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is, not refactored."
       ]
     },
     {

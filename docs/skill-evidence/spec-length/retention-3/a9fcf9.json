@@ -13,14 +13,14 @@
       "id": "tui-dc-picker-02",
       "present": true,
       "quotes": [
-        "**Three-level: project \u2192 config \u2192 version.**"
+        "`V` opens a **single browsable, collapsible tree** with three levels \u2014 benchmark project \u2192\nconfig \u2192 version \u2014 built on the browser's existing `fieldTree` widget\n(`browse_fieldtree.go:151`), not on a chain of modal `huh.Select` steps."
       ]
     },
     {
       "id": "tui-dc-picker-03",
       "present": true,
       "quotes": [
-        "`V` opens a **single browsable, collapsible tree** with three levels \u2014 benchmark project \u2192\nconfig \u2192 version \u2014 built on the browser's existing `fieldTree` widget\n(`browse_fieldtree.go:151`), not on a chain of modal `huh.Select` steps."
+        "**One browsable collapsible tree**, not three sequential `huh.Select` prompts. Same three levels; built on the existing `fieldTree`. Costs type-to-filter \u2014 see *Follow-ups*."
       ]
     },
     {
@@ -111,14 +111,13 @@
       "id": "tui-dc-picker-16",
       "present": true,
       "quotes": [
-        "**Type-to-filter in the picker.** `huh.Select` had `.Filtering(true)`; `fieldTree` has no\n  equivalent, so the tree is cursor-navigated only."
+        "**Type-to-filter in the picker.** `huh.Select` had `.Filtering(true)`; `fieldTree` has no\n  equivalent, so the tree is cursor-navigated only. See *Follow-ups*."
       ]
     },
     {
       "id": "tui-dc-picker-17",
       "present": true,
       "quotes": [
-        "Cross-**project** adoption, via the tree's project level (a consequence of Q1's three-level\n  answer).",
         "Because every project in the org is a root of the tree, a deployment can be switched to a config\nin any of them, not just its current one \u2014 and unlike a stepped picker, the user can see the\nother projects sitting there without committing to one first."
       ]
     },
@@ -126,7 +125,7 @@
       "id": "tui-dc-picker-18",
       "present": true,
       "quotes": [
-        "`switchDeployConfigVersion` (`deploy_config.go:406`) already takes `(project, name, version)`\nvia the confirm state (`dcProject`, `dcName`, `dcVersion` on `confirmState`) and already sends\n`deploy_config_id` + full `configuration`. Cross-config switching needs **no transport change** \u2014\n`completeDCSelection` just has to populate `dcProject`/`dcName` from the chosen config rather\nthan from the linked one."
+        "Cross-config switching needs **no transport change** \u2014\n`completeDCSelection` just has to populate `dcProject`/`dcName` from the chosen config rather\nthan from the linked one."
       ]
     },
     {
@@ -246,21 +245,21 @@
       "id": "tui-dc-picker-35",
       "present": true,
       "quotes": [
-        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config."
+        "\u2514\u2500 \u25b8 config-z   (latest v1)"
       ]
     },
     {
       "id": "tui-dc-picker-36",
       "present": true,
       "quotes": [
-        "\u251c\u2500 \u25b8 config-x   (latest v7)  (shared)"
+        "A shared config's node label carries `(shared)`;"
       ]
     },
     {
       "id": "tui-dc-picker-37",
       "present": true,
       "quotes": [
-        "\u251c\u2500 \u25be config-y   (latest v2)  (current)",
+        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config.",
         "\u2502    \u251c\u2500 v2  2026-07-01 09:14  bump engine image   (latest) (current)"
       ]
     },
@@ -296,8 +295,7 @@
       "id": "tui-dc-picker-42",
       "present": true,
       "quotes": [
-        "The two-way merge recurses. It is implemented as a distinct map-level helper (the map twin of\n`mergeJSONPtr`) rather than by bending `threeWayMerge`.",
-        "**Implementation constraint \u2014 do not pass an empty map into the existing merge.** Reusing\n`threeWayMerge` with an empty-map baseline gives the wrong answer:"
+        "The two-way merge recurses. It is implemented as a distinct map-level helper (the map twin of\n`mergeJSONPtr`) rather than by bending `threeWayMerge`."
       ]
     },
     {
@@ -311,7 +309,7 @@
       "id": "tui-dc-picker-44",
       "present": true,
       "quotes": [
-        "The `actionSwitchDeployConfig` confirm states, in one line each:\n\n- that switching **redeploys** the deployment (already true today);"
+        "that switching **redeploys** the deployment (already true today);"
       ]
     },
     {
@@ -368,7 +366,8 @@
       "id": "tui-dc-picker-52",
       "present": true,
       "quotes": [
-        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker. They differ\n  in presentation (stepped prompts vs. tree), in terminal action (reseed a live form vs. arm a\n  confirm + PATCH), and in entry conditions. Shared *data* helpers (`latestPerConfig`,\n  `findDeployConfigVersion`, `fetchDeployConfigVersions`) are reused as-is."
+        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker.",
+        "Shared *data* helpers (`latestPerConfig`,\n  `findDeployConfigVersion`, `fetchDeployConfigVersions`) are reused as-is."
       ]
     },
     {

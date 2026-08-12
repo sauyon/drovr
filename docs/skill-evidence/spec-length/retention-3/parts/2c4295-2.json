@@ -56,7 +56,7 @@
       "id": "tiered-review-50",
       "present": true,
       "quotes": [
-        "**Contract — dev/held-out split.** Assigned before any cheap-tier prompt is written, at task/PR\nlevel so no diff appears in both splits."
+        "Assigned before any cheap-tier prompt is written, at task/PR\nlevel so no diff appears in both splits."
       ]
     },
     {
@@ -91,21 +91,21 @@
       "id": "tiered-review-55",
       "present": true,
       "quotes": [
-        "**Contract — gate order.** Evaluated in order per gated cell: **0.** N floor met, else null for\nthat cell. **1.** Instrument discriminates (§6.3). **2.** The recall bar above. **3.**\nEscalation/skip rate leaves a real saving. **4.** Measured end-to-end cost < 0.80× the non-cascade\npanel."
+        "Evaluated in order per gated cell: **0.** N floor met, else null for\nthat cell. **1.** Instrument discriminates (§6.3). **2.** The recall bar above. **3.**\nEscalation/skip rate leaves a real saving. **4.** Measured end-to-end cost < 0.80× the non-cascade\npanel."
       ]
     },
     {
       "id": "tiered-review-56",
       "present": true,
       "quotes": [
-        "N floor met, else null for\nthat cell."
+        "Evaluated in order per gated cell: **0.** N floor met, else null for\nthat cell."
       ]
     },
     {
       "id": "tiered-review-57",
       "present": true,
       "quotes": [
-        "Measured end-to-end cost < 0.80× the non-cascade\npanel."
+        "**4.** Measured end-to-end cost < 0.80× the non-cascade\npanel."
       ]
     },
     {
@@ -126,7 +126,8 @@
       "id": "tiered-review-60",
       "present": true,
       "quotes": [
-        "`N ≥ 142` per full `(model × stratum × class)` cell is 24 cells and not\nreachable. The floor applies to the gated number pooled across **strata** within one\n`(model × class)` — pooling across classes is forbidden (§4.1: different classes measure different\nthings)."
+        "`N ≥ 142` per full `(model × stratum × class)` cell is 24 cells and not\nreachable.",
+        "The floor applies to the gated number pooled across **strata** within one\n`(model × class)` — pooling across classes is forbidden (§4.1: different classes measure different\nthings)."
       ]
     },
     {
@@ -147,7 +148,7 @@
       "id": "tiered-review-63",
       "present": true,
       "quotes": [
-        "**Contract — freezing.** Strata D and N: frozen by a MANIFEST in the shape of\n`docs/skill-evidence/arms/MANIFEST.md` — `git hash-object --no-filters` blob SHAs, a commit cell\nthat must contain the blob at the recorded path, header-resolved columns, a test re-checking every\nrow."
+        "Strata D and N: frozen by a MANIFEST in the shape of\n`docs/skill-evidence/arms/MANIFEST.md` — `git hash-object --no-filters` blob SHAs, a commit cell\nthat must contain the blob at the recorded path, header-resolved columns, a test re-checking every\nrow."
       ]
     },
     {
@@ -161,7 +162,7 @@
       "id": "tiered-review-65",
       "present": true,
       "quotes": [
-        "**Contract — ledger.** Every cheap-tier invocation is counted in an append-only ledger with\nper-stage ceilings; arithmetic checked by a test. Retries count."
+        "Every cheap-tier invocation is counted in an append-only ledger with\nper-stage ceilings; arithmetic checked by a test. Retries count."
       ]
     },
     {
@@ -210,7 +211,7 @@
       "id": "tiered-review-72",
       "present": true,
       "quotes": [
-        "**Contract — cheap-tier execution.** Headless, not a herdr pane: `opencode run --agent plan -m\n<model>`."
+        "Headless, not a herdr pane: `opencode run --agent plan -m\n<model>`."
       ]
     },
     {
@@ -224,7 +225,7 @@
       "id": "tiered-review-74",
       "present": true,
       "quotes": [
-        "Read-only via `--agent plan` with `--auto` absent; `readonly_displace`\n(`cli/src/config.rs:589`) runs first."
+        "Headless, not a herdr pane: `opencode run --agent plan -m\n<model>`. Read-only via `--agent plan` with `--auto` absent; `readonly_displace`\n(`cli/src/config.rs:589`) runs first."
       ]
     },
     {
@@ -294,7 +295,8 @@
       "id": "tiered-review-84",
       "present": true,
       "quotes": [
-        "No open questions remain. Anything the plan phase discovers outside these four is a new question\nfor a new gate, not a gap in this one."
+        "12. Decisions — approved 2026-08-06, turn 1",
+        "Anything the plan phase discovers outside these four is a new question\nfor a new gate, not a gap in this one."
       ]
     }
   ]

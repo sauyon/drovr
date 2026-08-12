@@ -11,7 +11,7 @@
       "id": "tui-dc-picker-02",
       "present": true,
       "quotes": [
-        "**Three levels \u2014 project \u2192 config \u2192 version.**"
+        "- **Three levels \u2014 project \u2192 config \u2192 version.**"
       ]
     },
     {
@@ -117,7 +117,8 @@
       "id": "tui-dc-picker-17",
       "present": true,
       "quotes": [
-        "Every project in the org is a root of the tree, so a deployment can switch to a config in any\nproject, not just its own \u2014 a direct consequence of the three-level shape."
+        "Every project in the org is a root of the tree, so a deployment can switch to a config in any\nproject, not just its own \u2014 a direct consequence of the three-level shape.",
+        "- Cross-project adoption via the tree's project level."
       ]
     },
     {
@@ -131,6 +132,7 @@
       "id": "tui-dc-picker-19",
       "present": true,
       "quotes": [
+        "### New state on `appModel` (`browse_model.go`, alongside the existing `dc*` block)",
         "dcTree    *fieldTree                     // the picker; non-nil exactly while it is open"
       ]
     },
@@ -160,7 +162,7 @@
       "present": true,
       "quotes": [
         "pick any // non-nil only on picker version leaves; nil on every node the existing trees build",
-        "The picker sets `pick` to the `*schemasv1.DeployConfigSchema` on each version leaf;\n`enter` reads it back."
+        "The picker sets `pick` to the `*schemasv1.DeployConfigSchema` on each version leaf;"
       ]
     },
     {
@@ -244,14 +246,15 @@
       "id": "tui-dc-picker-35",
       "present": true,
       "quotes": [
-        "- Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config."
+        "\u2514\u2500 \u25b8 config-z   (latest v1)"
       ]
     },
     {
       "id": "tui-dc-picker-36",
       "present": true,
       "quotes": [
-        "\u251c\u2500 \u25b8 config-x   (latest v7)  (shared)"
+        "\u251c\u2500 \u25b8 config-x   (latest v7)  (shared)",
+        "`Shared` (`schemasv1.DeployConfigSchema:16`) is already returned by the list endpoint but\ncurrently surfaced nowhere in the CLI or TUI; this is its first use."
       ]
     },
     {
@@ -302,14 +305,15 @@
       "id": "tui-dc-picker-43",
       "present": true,
       "quotes": [
-        "**Decision:** keep the three-way merge anyway.",
-        "Applies identically to a\ncross-project switch \u2014 the baseline is the config the deployment was linked to, wherever it\nlived."
+        "The three-way merge holds fields where the deployment diverged from the config it was linked\nto; when crossing to a different config, that baseline has no relationship to the target.",
+        "**Decision:** keep the three-way merge anyway."
       ]
     },
     {
       "id": "tui-dc-picker-44",
       "present": true,
       "quotes": [
+        "`actionSwitchDeployConfig`'s confirm states, one line each:",
         "- switching redeploys the deployment (already true today);"
       ]
     },

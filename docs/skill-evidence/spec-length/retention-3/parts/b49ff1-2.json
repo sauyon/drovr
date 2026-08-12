@@ -20,14 +20,14 @@
       "id": "tiered-review-45",
       "present": true,
       "quotes": [
-        "**Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many survive\n  the cascade."
+        "- **Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many survive\n  the cascade."
       ]
     },
     {
       "id": "tiered-review-46",
       "present": true,
       "quotes": [
-        "**Expensive-tier absolute detection rate on class 3** (reported, gates nothing): what fraction of\n  review-missed defects the full panel finds at all."
+        "- **Expensive-tier absolute detection rate on class 3** (reported, gates nothing): what fraction of\n  review-missed defects the full panel finds at all."
       ]
     },
     {
@@ -76,14 +76,14 @@
       "id": "tiered-review-53",
       "present": true,
       "quotes": [
-        "**Designs with an unrecoverable-miss class** (per-file, whole-change): a miss is a defect nobody\n  ever looks at again. Recall ≥ 0.98 with Wilson LB ≥ 0.95, target N ≥ 142 per gated cell."
+        "- **Designs with an unrecoverable-miss class** (per-file, whole-change): a miss is a defect nobody\n  ever looks at again. Recall ≥ 0.98 with Wilson LB ≥ 0.95, target N ≥ 142 per gated cell."
       ]
     },
     {
       "id": "tiered-review-54",
       "present": true,
       "quotes": [
-        "**Designs whose failure degrades to baseline** (angle routing, cheap-as-explorer): the failure is\n  a cost regression, not a lost defect. Non-inferiority against the unaided expensive panel, cascade\n  recall lower bound ≥ 0.90 of the unaided panel's point estimate, target N ≥ 69."
+        "- **Designs whose failure degrades to baseline** (angle routing, cheap-as-explorer): the failure is\n  a cost regression, not a lost defect. Non-inferiority against the unaided expensive panel, cascade\n  recall lower bound ≥ 0.90 of the unaided panel's point estimate, target N ≥ 69."
       ]
     },
     {
@@ -125,7 +125,7 @@
       "id": "tiered-review-60",
       "present": true,
       "quotes": [
-        "`N ≥ 142` per `(model × stratum × class)` cell would be 24 cells\nand is not reachable; the floor applies to the gated number **pooled across strata within one\n`(model × class)`**."
+        "**Cell definition and pooling.** `N ≥ 142` per `(model × stratum × class)` cell would be 24 cells\nand is not reachable; the floor applies to the gated number **pooled across strata within one\n`(model × class)`**."
       ]
     },
     {
@@ -146,7 +146,7 @@
       "id": "tiered-review-63",
       "present": true,
       "quotes": [
-        "Strata D and N are frozen by a MANIFEST in the shape of\n`docs/skill-evidence/arms/MANIFEST.md` — `git hash-object --no-filters` blob SHAs, a commit cell\nthat must contain the blob at the recorded path, header-resolved columns, a test re-checking every\nrow."
+        "**Freezing.** Strata D and N are frozen by a MANIFEST in the shape of\n`docs/skill-evidence/arms/MANIFEST.md` — `git hash-object --no-filters` blob SHAs, a commit cell\nthat must contain the blob at the recorded path, header-resolved columns, a test re-checking every\nrow."
       ]
     },
     {
@@ -160,7 +160,7 @@
       "id": "tiered-review-65",
       "present": true,
       "quotes": [
-        "Every cheap-tier invocation counted in an append-only ledger with per-stage ceilings,\narithmetic checked by a test. Retries count."
+        "**Ledger.** Every cheap-tier invocation counted in an append-only ledger with per-stage ceilings,\narithmetic checked by a test. Retries count."
       ]
     },
     {
@@ -195,7 +195,8 @@
       "id": "tiered-review-70",
       "present": true,
       "quotes": [
-        "cheap_agent = \"opencode\"\ncheap_model = \"ko-ag/qwen3.6-35b-abliterated\""
+        "cheap_agent = \"opencode\"",
+        "cheap_model = \"ko-ag/qwen3.6-35b-abliterated\""
       ]
     },
     {
@@ -244,7 +245,7 @@
       "id": "tiered-review-77",
       "present": true,
       "quotes": [
-        "Every set this run extends — config keys, the `mode` enum, the cheap\ntier's output vocabulary, ledger columns, MANIFEST rows, fixture list, the class enum — has its\nguarding test extended in the same change."
+        "**Guard-with-artifact.** Every set this run extends — config keys, the `mode` enum, the cheap\ntier's output vocabulary, ledger columns, MANIFEST rows, fixture list, the class enum — has its\nguarding test extended in the same change."
       ]
     },
     {
@@ -265,7 +266,8 @@
       "id": "tiered-review-80",
       "present": true,
       "quotes": [
-        "Reason: a cold `opencode` reviewer pane swallows its seed and the\npanel cannot converge (`docs/known-issues.md:3437`); the headless path routes around that bug rather\nthan fixing it, and the bug stays open and documented."
+        "Reason: a cold `opencode` reviewer pane swallows its seed and the\npanel cannot converge (`docs/known-issues.md:3437`); the headless path routes around that bug rather\nthan fixing it, and the bug stays open and documented.",
+        "**Out, deliberately:** flipping the default on; changing the angle set, severity model, merge or\nresume path; a second measurement instrument; fixing `docs/known-issues.md:3437` (routed around, not\nfixed — pane bug stays open and documented);"
       ]
     },
     {

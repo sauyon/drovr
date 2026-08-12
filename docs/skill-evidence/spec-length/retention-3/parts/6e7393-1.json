@@ -6,33 +6,32 @@
       "id": "skill-stickiness-01",
       "present": true,
       "quotes": [
-        "2. **Capture arm A / RED per skill** (§6.3) — at the pre-fix `HEAD`, before any skill file is\n   touched.",
-        "Hard gate: once fix 1 lands, arm A is unrecoverable without a checkout."
+        "**Capture arm A / RED per skill** (§6.3) — at the pre-fix `HEAD`, before any skill file is\n   touched. Hard gate: once fix 1 lands, arm A is unrecoverable without a checkout.",
+        "**A** | Current `SKILL.md` at the pre-fix `HEAD` (captured in §0 step 2) |"
       ]
     },
     {
       "id": "skill-stickiness-02",
       "present": true,
       "quotes": [
-        "**Four-tier precedence governs every stylistic/design choice in this spec**, applied in order:",
-        "1. Published evidence exists → the evidence decides, citation kept in the text.",
-        "2. No published evidence, but the question is reachable by this run's probe loop (expressible as a\n   text variant of an existing probe skill, scorable by the existing rubric, within the §6.3\n   budget) → measure it (§6.4).",
-        "3. Not reachable, or measurement inconclusive, and superpowers has a convention → follow\n   superpowers, marked explicitly as a convention-follow, not evidence-backed.",
-        "4. No superpowers analogue at all → engineering judgement, marked **[tier 4]**."
+        "Published evidence exists → the evidence decides, citation kept in the text.",
+        "No published evidence, but the question is reachable by this run's probe loop (expressible as a\n   text variant of an existing probe skill, scorable by the existing rubric, within the §6.3\n   budget) → measure it (§6.4). Cost may discharge a tier-2 obligation only when measurement would\n   exceed the ceiling — never because it seems not worth it.",
+        "Not reachable, or measurement inconclusive, and superpowers has a convention → follow\n   superpowers, marked explicitly as a convention-follow, not evidence-backed.",
+        "No superpowers analogue at all → engineering judgement, marked **[tier 4]**."
       ]
     },
     {
       "id": "skill-stickiness-03",
       "present": true,
       "quotes": [
-        "1. **No fabricated measurements.** drovr states a number, duration, frequency, or comparative only\n   if drovr measured it or a citation supports it. Rhetorical emphasis is fine; a false measurement\n   claim is not."
+        "**No fabricated measurements.** drovr states a number, duration, frequency, or comparative only\n   if drovr measured it or a citation supports it. Rhetorical emphasis is fine; a false measurement\n   claim is not."
       ]
     },
     {
       "id": "skill-stickiness-04",
       "present": true,
       "quotes": [
-        "2. **No copied text.** Both projects are MIT; drovr still writes its own sentences — mechanisms are\n   ported, expression is drovr's. Any verbatim line found in review gets the MIT notice and credit\n   added."
+        "**No copied text.** Both projects are MIT; drovr still writes its own sentences — mechanisms are\n   ported, expression is drovr's. Any verbatim line found in review gets the MIT notice and credit\n   added."
       ]
     },
     {
@@ -65,7 +64,7 @@
       "id": "skill-stickiness-09",
       "present": true,
       "quotes": [
-        "**Flowcharts** (fenced `dot` blocks): adopted **[tier 3]**, not measured — the variant changes\n  document structure rather than a text register, so it can't share the probe's rubric."
+        "**Flowcharts** (fenced `dot` blocks):"
       ]
     },
     {
@@ -80,14 +79,15 @@
       "id": "skill-stickiness-11",
       "present": true,
       "quotes": [
-        "> **The byte budget applies to teaching content. Binding content is deliberately redundant** —\n> stated 3–4 times per skill (Iron Law, red flag, rationalization row, checklist item)."
+        "**The byte budget applies to teaching content. Binding content is deliberately redundant** —\n> stated 3–4 times per skill (Iron Law, red flag, rationalization row, checklist item)."
       ]
     },
     {
       "id": "skill-stickiness-12",
       "present": true,
       "quotes": [
-        "**`BODY_BUDGET` rises 2200 → 12000 bytes** for the four methodology skills **[tier 4 — no\n  superpowers analogue, no evidence sets a correct length]**."
+        "**`BODY_BUDGET` rises 2200 → 12000 bytes** for the four methodology skills **[tier 4 — no\n  superpowers analogue, no evidence sets a correct length]**.",
+        "Tests: `cli/tests/skills_valid.rs` (`BODY_BUDGET` 2200 → 12000, add `using-drovr` at 9000),\n  `cli/tests/reflex_hook.rs` (per-turn hook cases), and `main.rs:1276-1278`'s bare-`drovr reflex`\n  assertion."
       ]
     },
     {
@@ -115,8 +115,8 @@
       "id": "skill-stickiness-16",
       "present": true,
       "quotes": [
-        "## 3. Fix 1 — un-scope the four methodology skills",
-        "| `skills/tdd/SKILL.md:3` | `Use when implementing any feature or bugfix, before writing implementation code — requires a test you have watched fail before any implementation exists; no production code without a red test first` |"
+        "3. Fix 1 — un-scope the four methodology skills",
+        "`skills/tdd/SKILL.md:3` | `Use when implementing any feature or bugfix, before writing implementation code — requires a test you have watched fail before any implementation exists; no production code without a red test first` |"
       ]
     },
     {
@@ -130,7 +130,7 @@
       "id": "skill-stickiness-18",
       "present": true,
       "quotes": [
-        "| `skills/using-drovr/SKILL.md:3` | `Use at the start of every session and before every response, including before clarifying questions and before reading any file — routes to the right drovr skill and requires invoking it whenever there is even a 1% chance one applies` |"
+        "`skills/using-drovr/SKILL.md:3` | `Use at the start of every session and before every response, including before clarifying questions and before reading any file — routes to the right drovr skill and requires invoking it whenever there is even a 1% chance one applies` |"
       ]
     },
     {
@@ -144,43 +144,42 @@
       "id": "skill-stickiness-20",
       "present": true,
       "quotes": [
-        "**`docs/known-issues.md`**: one entry, in the file's existing convention (`## <symptom title> —\nFIXED <date>`, `**Status:**`, `**Severity:** medium`, `**Found:**`, `### Symptom` / `### Root\ncause` / `### Fix`), recording that four descriptions scoped unconditional discipline to phases\nwhile `using-drovr` makes inline the default."
+        "**`docs/known-issues.md`**: one entry, in the file's existing convention (`## <symptom title> —\nFIXED <date>`, `**Status:**`, `**Severity:** medium`, `**Found:**`, `### Symptom` / `### Root\ncause` / `### Fix`), recording that four descriptions scoped unconditional discipline to phases\nwhile `using-drovr` makes inline the default. One entry only."
       ]
     },
     {
       "id": "skill-stickiness-21",
       "present": true,
       "quotes": [
-        "2. **The 1% rule** — above the H1, inside the existing `<EXTREMELY_IMPORTANT>` framing: even a 1%\n   chance a drovr skill applies means invoke it, paired with a cost-lowering clause (if it turns\n   out not to fit, drop it — invoking costs almost nothing)."
+        "**The 1% rule** — above the H1, inside the existing `<EXTREMELY_IMPORTANT>` framing: even a 1%\n   chance a drovr skill applies means invoke it, paired with a cost-lowering clause (if it turns\n   out not to fit, drop it — invoking costs almost nothing)."
       ]
     },
     {
       "id": "skill-stickiness-22",
       "present": true,
       "quotes": [
-        "3. **The per-turn rule** — check before any response, including before a clarifying question and\n   before read-only exploration."
+        "**The per-turn rule** — check before any response, including before a clarifying question and\n   before read-only exploration."
       ]
     },
     {
       "id": "skill-stickiness-23",
       "present": true,
       "quotes": [
-        "4. **Instruction-priority ladder** — human's explicit instructions > drovr skills > default\n   behaviour. Safety counterweight to the MUST language; not optional."
+        "**Instruction-priority ladder** — human's explicit instructions > drovr skills > default\n   behaviour. Safety counterweight to the MUST language; not optional."
       ]
     },
     {
       "id": "skill-stickiness-24",
       "present": true,
       "quotes": [
-        "5. **Gate function** — fenced `dot` flowchart: message received → does any skill apply (≥1%) →\n   invoke → announce → does it have a checklist → create one tracked item per step → follow it →\n   only then respond."
+        "**Gate function** — fenced `dot` flowchart: message received → does any skill apply (≥1%) →\n   invoke → announce → does it have a checklist → create one tracked item per step → follow it →\n   only then respond."
       ]
     },
     {
       "id": "skill-stickiness-25",
       "present": true,
       "quotes": [
-        "6. **Red-flag table for the router's own failure mode** (invoking nothing at all — currently zero\n   coverage).",
-        "Final wording comes from RED\n   (§6), not this list."
+        "**Red-flag table for the router's own failure mode** (invoking nothing at all — currently zero\n   coverage). Candidate rows: *\"this is a one-line change\"*, *\"I'll just look at the file first\"*,\n   *\"they asked a question, not for work\"*, *\"I'm already mid-task, the router was for turn one\"*,\n   *\"escalating to a phase would be overkill so no skill applies\"*. Final wording comes from RED\n   (§6), not this list."
       ]
     },
     {
@@ -229,14 +228,14 @@
       "id": "skill-stickiness-32",
       "present": true,
       "quotes": [
-        "1. `reflex.rs:143-152`'s `envelope()` hardcodes `\"hookEventName\": \"SessionStart\"` — parameterize\n     to take the event name."
+        "`reflex.rs:143-152`'s `envelope()` hardcodes `\"hookEventName\": \"SessionStart\"` — parameterize\n     to take the event name."
       ]
     },
     {
       "id": "skill-stickiness-33",
       "present": true,
       "quotes": [
-        "2. `main.rs:114-118` declares `Reflex { skill: PathBuf }` as required, and `main.rs:1276-1278`\n     asserts bare `drovr reflex` errors. `--gate` forces `Option<PathBuf>`, a clap arg-group rule\n     (`--gate` xor `--skill`), and an update to that test."
+        "`main.rs:114-118` declares `Reflex { skill: PathBuf }` as required, and `main.rs:1276-1278`\n     asserts bare `drovr reflex` errors. `--gate` forces `Option<PathBuf>`, a clap arg-group rule\n     (`--gate` xor `--skill`), and an update to that test."
       ]
     },
     {
@@ -278,7 +277,6 @@
       "id": "skill-stickiness-39",
       "present": true,
       "quotes": [
-        "### 4.3 Out of scope",
         "`PreToolUse` hard-denial of an `Edit` that skipped `drovr:tdd`, or a `git commit` with no\nverification evidence — enforcement rather than persuasion, a larger design with real\nfalse-positive risk. Not this run."
       ]
     },
@@ -286,7 +284,7 @@
       "id": "skill-stickiness-40",
       "present": true,
       "quotes": [
-        "> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**\n> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —\n> before you start step 1."
+        "When a skill or briefing gives you a numbered checklist, create **one tracked item per step**\n> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —\n> before you start step 1."
       ]
     },
     {
@@ -301,10 +299,10 @@
       "present": true,
       "quotes": [
         "Applied at four sites, no CLI change required:",
-        "1. `skills/using-drovr/SKILL.md` — the gate function's checklist branch (§4.1 step 5).",
-        "2. Each discipline skill's numbered procedure — a one-line binding directive above it.",
-        "3. `skills/pipeline/phase-prompts/*.md` — the `## Do` lists (`implement-task.md:14-64`, 7 steps;\n   and the equivalents in `brainstorm.md`, `plan.md`, `review.md`, `review-angle.md`) gain the\n   directive as step 0.",
-        "4. `skills/handoff/SKILL.md` and `skills/handoff/HANDOFF-template.md` — the 7-section handoff gets\n   the same treatment."
+        "`skills/using-drovr/SKILL.md` — the gate function's checklist branch (§4.1 step 5).",
+        "Each discipline skill's numbered procedure — a one-line binding directive above it.",
+        "`skills/pipeline/phase-prompts/*.md` — the `## Do` lists (`implement-task.md:14-64`, 7 steps;\n   and the equivalents in `brainstorm.md`, `plan.md`, `review.md`, `review-angle.md`) gain the\n   directive as step 0. Pure text change — these are agent-assembled markdown, not compiled into\n   the binary.",
+        "`skills/handoff/SKILL.md` and `skills/handoff/HANDOFF-template.md` — the 7-section handoff gets\n   the same treatment."
       ]
     },
     {
@@ -312,10 +310,7 @@
       "present": true,
       "quotes": [
         "`tdd`, `systematic-debugging`, `verification-before-completion` and `code-review` restructure to a\nfixed section order **[tier 3 — superpowers' convention, adopted wholesale]**:",
-        "2. Overview          core principle + spirit-vs-letter line + the WHY, ≤6 lines\n3. Unity line        \"the next phase agent is you, with your context gone\"",
-        "4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,",
-        "5. Announce          the exact sentence to emit when invoking the skill (commitment device)\n6. The procedure     numbered, preceded by the task-binding directive (fix 3)",
-        "10. Worked example   one ✅/❌ pair of actual utterances. One good example, not five\n11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
+        "1. description:      trigger, not summary (fix 1)\n2. Overview          core principle + spirit-vs-letter line + the WHY, ≤6 lines\n3. Unity line        \"the next phase agent is you, with your context gone\"\n4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,\n                     each bullet pairing the prohibition with the required action\n5. Announce          the exact sentence to emit when invoking the skill (commitment device)\n6. The procedure     numbered, preceded by the task-binding directive (fix 3)\n8. Red flags — STOP  inner-monologue fragments, closed by a catch-all bullet\n9. Rationalizations  thought → reality; the reality column is an INSTRUCTION, not a rebuttal\n10. Worked example   one ✅/❌ pair of actual utterances. One good example, not five\n11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
       ]
     },
     {
@@ -338,9 +333,7 @@
       "quotes": [
         "**Announcement sentences** — template `Using drovr:<skill> to <purpose>.`:",
         "`tdd` — *\"Using drovr:tdd — writing the failing test before the implementation.\"*",
-        "`systematic-debugging` — *\"Using drovr:systematic-debugging — reproducing before fixing.\"*",
-        "`verification-before-completion` — *\"Using drovr:verification-before-completion — running the\n  checks before claiming done.\"*",
-        "`code-review` — *\"Using drovr:code-review — dispatching read-only reviewers before calling this\n  done.\"*"
+        "`systematic-debugging` — *\"Using drovr:systematic-debugging — reproducing before fixing.\"*"
       ]
     }
   ]

@@ -2,60 +2,391 @@
   "spec_id": "08ae18",
   "ledger": "tui-dc-picker",
   "rows": [
-    { "id": "tui-dc-picker-01", "present": false, "quotes": [] },
-    { "id": "tui-dc-picker-02", "present": true, "quotes": ["Three-level: project → config → version."] },
-    { "id": "tui-dc-picker-03", "present": true, "quotes": ["`V` opens one tree — **project → config → version** — built on the browser's existing\n`fieldTree` widget (`browse_fieldtree.go:151`), replacing the `huh.Select` step chain used\ntoday."] },
-    { "id": "tui-dc-picker-04", "present": true, "quotes": ["`↑`/`↓` move the cursor (`fieldTree.up`/`down`); `→`/`l` expand, `←`/`h` collapse\n  (`fieldTree.setCollapsed`); `space` toggles (`fieldTree.toggle`)."] },
-    { "id": "tui-dc-picker-05", "present": true, "quotes": ["`↑`/`↓` move the cursor (`fieldTree.up`/`down`); `→`/`l` expand, `←`/`h` collapse\n  (`fieldTree.setCollapsed`); `space` toggles (`fieldTree.toggle`)."] },
-    { "id": "tui-dc-picker-06", "present": true, "quotes": ["`enter` on a **version leaf** selects it and arms the confirm."] },
-    { "id": "tui-dc-picker-07", "present": true, "quotes": ["`enter` on a project or config\n  branch only toggles it — a branch is never a selection."] },
-    { "id": "tui-dc-picker-08", "present": true, "quotes": ["`esc` cancels the picker with `statusDCCanceled`."] },
-    { "id": "tui-dc-picker-09", "present": true, "quotes": ["projects | picker opens | `ListBenchmarkProjects` (1 request)"] },
-    { "id": "tui-dc-picker-10", "present": true, "quotes": ["configs of a project | that project is first expanded | `ListDeployConfigs(project)` + `latestPerConfig`"] },
-    { "id": "tui-dc-picker-11", "present": true, "quotes": ["versions of a config | that config is first expanded | `fetchDeployConfigVersions(project, name)`"] },
-    { "id": "tui-dc-picker-12", "present": true, "quotes": ["An unexpanded branch holds one placeholder child (`loading…`, replaced on arrival; `(none)` when\nthe listing is empty)."] },
-    { "id": "tui-dc-picker-13", "present": true, "quotes": ["Each branch caches its children after first load; re-collapsing and\nre-expanding does not refetch."] },
-    { "id": "tui-dc-picker-14", "present": true, "quotes": ["**Linked deployment:** auto-expand its project and its config, cursor on the current version."] },
-    { "id": "tui-dc-picker-15", "present": true, "quotes": ["**Unlinked deployment:** auto-expand the sole project when the org has exactly one (Q2),\n  otherwise all projects stay collapsed, cursor on the first."] },
-    { "id": "tui-dc-picker-16", "present": true, "quotes": ["Type-to-filter in the picker: `fieldTree` has no equivalent of `huh.Select`'s\n  `.Filtering(true)`, so the tree is cursor-navigated only in this change (follow-up)."] },
-    { "id": "tui-dc-picker-17", "present": true, "quotes": ["Cross-project adoption falls out of the project level being a root of the tree.", "`enter` on a version leaf arms `confirmState` with that leaf's project and config name (not the\n   linked config's) — covers the cross-project case."] },
-    { "id": "tui-dc-picker-18", "present": true, "quotes": ["`completeDCSelection` populates `dcProject`/`dcName` from the chosen leaf instead\nof from the linked config — no transport change needed for cross-config or cross-project\nswitching."] },
-    { "id": "tui-dc-picker-19", "present": true, "quotes": ["dcTree    *fieldTree                     // the picker; non-nil exactly while it is open"] },
-    { "id": "tui-dc-picker-20", "present": true, "quotes": ["dcLinked  *schemasv1.DeployConfigSchema  // linked config, when any: drives auto-expand,\n                                         // cursor placement, and is the merge baseline"] },
-    { "id": "tui-dc-picker-21", "present": true, "quotes": ["dcLoading map[string]bool                // in-flight branch loads, keyed \"\" (projects) /\n                                         // \"<project>\" / \"<project>\\x00<config>\""] },
-    { "id": "tui-dc-picker-22", "present": true, "quotes": ["// dcForm, dcVersions, dcCurrent, dcChoice are REPLACED by the tree.\n// dcVersLoading is replaced by len(dcLoading) > 0."] },
-    { "id": "tui-dc-picker-23", "present": true, "quotes": ["pick any // non-nil only on picker version leaves; nil on every node the existing trees build", "The picker sets `pick` to the\n`*schemasv1.DeployConfigSchema` on each version leaf; `enter` reads it back."] },
-    { "id": "tui-dc-picker-24", "present": true, "quotes": ["Zero value `nil` leaves the config/revision/diff trees unaffected."] },
-    { "id": "tui-dc-picker-25", "present": true, "quotes": ["Also add `current() *fieldNode` on `fieldTree`, returning the node under the cursor, so the\npicker does not reach into the unexported `flat`/`cursor` internals."] },
-    { "id": "tui-dc-picker-26", "present": true, "quotes": ["type dcProjectsMsg struct { name string; items []*schemasv1.BenchmarkProjectSchema; err error }"] },
-    { "id": "tui-dc-picker-27", "present": true, "quotes": ["type dcConfigsMsg  struct { name, project string; items []*schemasv1.DeployConfigSchema; err error }"] },
-    { "id": "tui-dc-picker-28", "present": true, "quotes": ["type dcVersionsMsg struct { name, project, config string; items []*schemasv1.DeployConfigSchema; err error }"] },
-    { "id": "tui-dc-picker-29", "present": true, "quotes": ["`name` is the deployment name on all three, preserving the existing stale-result drop\n(`msg.name != m.sel.Name`)."] },
-    { "id": "tui-dc-picker-30", "present": true, "quotes": ["`project`/`config` identify which branch the result fills, so a\nresult arriving after the user collapsed that branch lands on the right node rather than the\ncursor's."] },
-    { "id": "tui-dc-picker-31", "present": true, "quotes": ["`currentOverlay()` (`browse_model.go:880`) keeps a single arm, `case m.dcTree != nil:` returning\n`overlayHandler{m.updateDCPicker, m.dcPickerView}`."] },
-    { "id": "tui-dc-picker-32", "present": true, "quotes": ["`autoRefreshPaused()`: the `m.dcVersLoading` arm is replaced by `m.dcTree != nil`, so\nauto-refresh cannot swap `m.sel` while the picker is open, including while idle between branch\nloads (which the old in-flight flag did not cover)."] },
-    { "id": "tui-dc-picker-33", "present": true, "quotes": ["`browse_model.go:1910-1917` drops the `DeployConfigID == nil` rejection — `V` is valid on any\ndetail-screen selection."] },
-    { "id": "tui-dc-picker-34", "present": true, "quotes": ["`helpAdapter.dcLinked` (`browse_model.go:2916`) loses its\n`DeployConfigID != nil` condition so the key is advertised on unlinked deployments too."] },
-    { "id": "tui-dc-picker-35", "present": true, "quotes": ["Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config."] },
-    { "id": "tui-dc-picker-36", "present": true, "quotes": ["├─ ▸ config-x   (latest v7)  (shared)", "`(shared)` / `(current)` / `(latest)` markers; confirm copy per above."] },
-    { "id": "tui-dc-picker-37", "present": true, "quotes": ["├─ ▾ config-y   (latest v2)  (current)", "│    ├─ v2  2026-07-01 09:14  bump engine image   (latest) (current)"] },
-    { "id": "tui-dc-picker-38", "present": true, "quotes": ["Version leaf: `\"v<N>  <created>  <description>\"` (reusing the label\n  `newDeployConfigVersionPicker` builds, `browse_source_config.go:361-362`, and its\n  `trunc`/`sanitizeCell` helpers), plus `\"  (latest)\"` on the newest and `\"  (current)\"` on the\n  deployment's current version."] },
-    { "id": "tui-dc-picker-39", "present": true, "quotes": ["A shared config's node label carries `(shared)`; the linked one carries `(current)`; the\n   newest version leaf carries `(latest)`."] },
-    { "id": "tui-dc-picker-40", "present": true, "quotes": ["Panel label (`browse_panels.go:226-228`): `\"V: switch version\"` → `\"V: switch deploy config\"`."] },
-    { "id": "tui-dc-picker-41", "present": true, "quotes": ["**Rule:** when the linked baseline is absent, `preserveDeploymentDivergences` performs a\n**two-way deep merge** instead of returning the target verbatim: target config is base,\ndeployment's current configuration is overlay, overlay wins on conflicting leaves, keys only the\ntarget carries still land."] },
-    { "id": "tui-dc-picker-42", "present": true, "quotes": ["Implement the two-way merge as a distinct,\nrecursing map-level helper (the map twin of `mergeJSONPtr`), not as `threeWayMerge` with an empty\nbaseline."] },
-    { "id": "tui-dc-picker-43", "present": true, "quotes": ["Keep the three-way divergence merge against the previously-linked baseline; confirm copy states overrides are carried across."] },
-    { "id": "tui-dc-picker-44", "present": true, "quotes": ["switching redeploys the deployment (already true today);"] },
-    { "id": "tui-dc-picker-45", "present": true, "quotes": ["the deployment's overrides are carried across (decision A/B);"] },
-    { "id": "tui-dc-picker-46", "present": true, "quotes": ["when the chosen config is shared: its content is owned by the shared spec, so the next\n  `mcloud deploy-config apply` creates a new version and the config's *latest* moves — the\n  deployment stays pinned to the version selected here, since versions are immutable rows."] },
-    { "id": "tui-dc-picker-47", "present": true, "quotes": ["`V` reaches every deploy config in the project, shared included."] },
-    { "id": "tui-dc-picker-48", "present": true, "quotes": ["`preserveDeploymentDivergences` nil-baseline fix (Q3) — also fixes the same gap for\n  `mcloud deployment deploy-config set`, which shares the function."] },
-    { "id": "tui-dc-picker-49", "present": true, "quotes": ["No API or\nserver change is required: `deployConfigService.List` with no name filter already returns the\nlatest version of every distinct config in the project, and `api.Client.ListDeployConfigs` is\nalready used elsewhere in the CLI.", "Any API-server or schema change.", "### Transport — unchanged"] },
-    { "id": "tui-dc-picker-50", "present": true, "quotes": ["Converting `browse_source_config.go`'s source picker or `browse_form_sync.go`'s sync picker to\n  the tree — they keep their `huh.Select` steps; only `V` changes."] },
-    { "id": "tui-dc-picker-51", "present": true, "quotes": ["Warning that editing a shared config gets reverted: moot, since the TUI/CLI has no deploy-config\n  write path at all (reads only via `internal/mcloudcli/api/deploy_config.go`; the sole write is\n  `mcloud deploy-config apply`, `deploy_config_cmd.go:86`)."] },
-    { "id": "tui-dc-picker-52", "present": true, "quotes": ["Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a live form vs. arm a confirm + PATCH), and entry\n  conditions.", "Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is."] },
-    { "id": "tui-dc-picker-53", "present": true, "quotes": ["Table-driven model tests (`browse_deploy_config_test.go`, driving `appModel.Update` with\nsynthetic messages and a nil client):"] },
-    { "id": "tui-dc-picker-54", "present": true, "quotes": ["Merge-semantics tests on `preserveDeploymentDivergences` (pure functions, table-driven, no model):", "`internal/mcloudcli/cli/deployment/deploy_config_test.go` | Tests 12-14 (merge semantics)"] },
-    { "id": "tui-dc-picker-55", "present": true, "quotes": ["Plus `mise run go:lint`."] }
+    {
+      "id": "tui-dc-picker-01",
+      "present": false,
+      "quotes": []
+    },
+    {
+      "id": "tui-dc-picker-02",
+      "present": true,
+      "quotes": [
+        "Three-level: project → config → version."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-03",
+      "present": true,
+      "quotes": [
+        "One browsable collapsible tree, not three sequential `huh.Select` prompts; same three levels; built on `fieldTree`."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-04",
+      "present": true,
+      "quotes": [
+        "`↑`/`↓` move the cursor (`fieldTree.up`/`down`);"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-05",
+      "present": true,
+      "quotes": [
+        "`↑`/`↓` move the cursor (`fieldTree.up`/`down`); `→`/`l` expand, `←`/`h` collapse\n  (`fieldTree.setCollapsed`); `space` toggles (`fieldTree.toggle`)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-06",
+      "present": true,
+      "quotes": [
+        "`enter` on a **version leaf** selects it and arms the confirm."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-07",
+      "present": true,
+      "quotes": [
+        "`enter` on a project or config\n  branch only toggles it — a branch is never a selection."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-08",
+      "present": true,
+      "quotes": [
+        "`esc` cancels the picker with `statusDCCanceled`."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-09",
+      "present": true,
+      "quotes": [
+        "projects | picker opens | `ListBenchmarkProjects` (1 request)"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-10",
+      "present": true,
+      "quotes": [
+        "configs of a project | that project is first expanded | `ListDeployConfigs(project)` + `latestPerConfig`"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-11",
+      "present": true,
+      "quotes": [
+        "versions of a config | that config is first expanded | `fetchDeployConfigVersions(project, name)`"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-12",
+      "present": true,
+      "quotes": [
+        "An unexpanded branch holds one placeholder child (`loading…`, replaced on arrival; `(none)` when\nthe listing is empty)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-13",
+      "present": true,
+      "quotes": [
+        "Each branch caches its children after first load; re-collapsing and\nre-expanding does not refetch."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-14",
+      "present": true,
+      "quotes": [
+        "**Linked deployment:** auto-expand its project and its config, cursor on the current version."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-15",
+      "present": true,
+      "quotes": [
+        "**Unlinked deployment:** auto-expand the sole project when the org has exactly one (Q2),\n  otherwise all projects stay collapsed, cursor on the first."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-16",
+      "present": true,
+      "quotes": [
+        "Type-to-filter in the picker: `fieldTree` has no equivalent of `huh.Select`'s\n  `.Filtering(true)`, so the tree is cursor-navigated only in this change (follow-up)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-17",
+      "present": true,
+      "quotes": [
+        "Cross-project adoption falls out of the project level being a root of the tree.",
+        "Cross-project adoption via the tree's project level."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-18",
+      "present": true,
+      "quotes": [
+        "`completeDCSelection` populates `dcProject`/`dcName` from the chosen leaf instead\nof from the linked config — no transport change needed for cross-config or cross-project\nswitching."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-19",
+      "present": true,
+      "quotes": [
+        "dcTree    *fieldTree                     // the picker; non-nil exactly while it is open"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-20",
+      "present": true,
+      "quotes": [
+        "dcLinked  *schemasv1.DeployConfigSchema  // linked config, when any: drives auto-expand,\n                                         // cursor placement, and is the merge baseline"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-21",
+      "present": true,
+      "quotes": [
+        "dcLoading map[string]bool                // in-flight branch loads, keyed \"\" (projects) /\n                                         // \"<project>\" / \"<project>\\x00<config>\""
+      ]
+    },
+    {
+      "id": "tui-dc-picker-22",
+      "present": true,
+      "quotes": [
+        "// dcForm, dcVersions, dcCurrent, dcChoice are REPLACED by the tree.",
+        "// dcVersLoading is replaced by len(dcLoading) > 0."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-23",
+      "present": true,
+      "quotes": [
+        "pick any // non-nil only on picker version leaves; nil on every node the existing trees build"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-24",
+      "present": true,
+      "quotes": [
+        "`fieldNode.pick` is nil on every node the existing config/revision/diff tree builders produce."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-25",
+      "present": true,
+      "quotes": [
+        "Also add `current() *fieldNode` on `fieldTree`, returning the node under the cursor, so the\npicker does not reach into the unexported `flat`/`cursor` internals."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-26",
+      "present": true,
+      "quotes": [
+        "type dcProjectsMsg struct { name string; items []*schemasv1.BenchmarkProjectSchema; err error }"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-27",
+      "present": true,
+      "quotes": [
+        "type dcConfigsMsg  struct { name, project string; items []*schemasv1.DeployConfigSchema; err error }"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-28",
+      "present": true,
+      "quotes": [
+        "type dcVersionsMsg struct { name, project, config string; items []*schemasv1.DeployConfigSchema; err error }"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-29",
+      "present": true,
+      "quotes": [
+        "`name` is the deployment name on all three, preserving the existing stale-result drop\n(`msg.name != m.sel.Name`)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-30",
+      "present": true,
+      "quotes": [
+        "`project`/`config` identify which branch the result fills, so a\nresult arriving after the user collapsed that branch lands on the right node rather than the\ncursor's."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-31",
+      "present": true,
+      "quotes": [
+        "`currentOverlay()` (`browse_model.go:880`) keeps a single arm, `case m.dcTree != nil:` returning\n`overlayHandler{m.updateDCPicker, m.dcPickerView}`."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-32",
+      "present": true,
+      "quotes": [
+        "`autoRefreshPaused()`: the `m.dcVersLoading` arm is replaced by `m.dcTree != nil`, so\nauto-refresh cannot swap `m.sel` while the picker is open, including while idle between branch\nloads (which the old in-flight flag did not cover)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-33",
+      "present": true,
+      "quotes": [
+        "`browse_model.go:1910-1917` drops the `DeployConfigID == nil` rejection — `V` is valid on any\ndetail-screen selection."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-34",
+      "present": true,
+      "quotes": [
+        "`helpAdapter.dcLinked` (`browse_model.go:2916`) loses its\n`DeployConfigID != nil` condition so the key is advertised on unlinked deployments too."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-35",
+      "present": true,
+      "quotes": [
+        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared` is true, plus\n  `\"  (current)\"` when it is the linked config."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-36",
+      "present": true,
+      "quotes": [
+        "├─ ▸ config-x   (latest v7)  (shared)"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-37",
+      "present": true,
+      "quotes": [
+        "├─ ▾ config-y   (latest v2)  (current)",
+        "│    ├─ v2  2026-07-01 09:14  bump engine image   (latest) (current)"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-38",
+      "present": true,
+      "quotes": [
+        "Version leaf: `\"v<N>  <created>  <description>\"` (reusing the label\n  `newDeployConfigVersionPicker` builds, `browse_source_config.go:361-362`, and its\n  `trunc`/`sanitizeCell` helpers), plus `\"  (latest)\"` on the newest and `\"  (current)\"` on the\n  deployment's current version."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-39",
+      "present": true,
+      "quotes": [
+        "A shared config's node label carries `(shared)`; the linked one carries `(current)`; the\n   newest version leaf carries `(latest)`."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-40",
+      "present": true,
+      "quotes": [
+        "Panel label (`browse_panels.go:226-228`): `\"V: switch version\"` → `\"V: switch deploy config\"`."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-41",
+      "present": true,
+      "quotes": [
+        "**Rule:** when the linked baseline is absent, `preserveDeploymentDivergences` performs a\n**two-way deep merge** instead of returning the target verbatim: target config is base,\ndeployment's current configuration is overlay, overlay wins on conflicting leaves, keys only the\ntarget carries still land."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-42",
+      "present": true,
+      "quotes": [
+        "Implement the two-way merge as a distinct,\nrecursing map-level helper (the map twin of `mergeJSONPtr`), not as `threeWayMerge` with an empty\nbaseline."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-43",
+      "present": true,
+      "quotes": [
+        "Keep the three-way divergence merge against the previously-linked baseline; confirm copy states overrides are carried across."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-44",
+      "present": true,
+      "quotes": [
+        "switching redeploys the deployment (already true today);"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-45",
+      "present": true,
+      "quotes": [
+        "the deployment's overrides are carried across (decision A/B);"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-46",
+      "present": true,
+      "quotes": [
+        "when the chosen config is shared: its content is owned by the shared spec, so the next\n  `mcloud deploy-config apply` creates a new version and the config's *latest* moves — the\n  deployment stays pinned to the version selected here, since versions are immutable rows."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-47",
+      "present": true,
+      "quotes": [
+        "`V` reaches every deploy config in the project, shared included."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-48",
+      "present": true,
+      "quotes": [
+        "`preserveDeploymentDivergences` nil-baseline fix (Q3) — also fixes the same gap for\n  `mcloud deployment deploy-config set`, which shares the function."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-49",
+      "present": true,
+      "quotes": [
+        "Any API-server or schema change."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-50",
+      "present": true,
+      "quotes": [
+        "Converting `browse_source_config.go`'s source picker or `browse_form_sync.go`'s sync picker to\n  the tree — they keep their `huh.Select` steps; only `V` changes."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-51",
+      "present": true,
+      "quotes": [
+        "Warning that editing a shared config gets reverted: moot, since the TUI/CLI has no deploy-config\n  write path at all (reads only via `internal/mcloudcli/api/deploy_config.go`; the sole write is\n  `mcloud deploy-config apply`, `deploy_config_cmd.go:86`)."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-52",
+      "present": true,
+      "quotes": [
+        "Refactoring `browse_source_config.go` and the new `V` flow into one generic picker: they differ\n  in presentation, terminal action (reseed a live form vs. arm a confirm + PATCH), and entry\n  conditions. Shared data helpers (`latestPerConfig`, `findDeployConfigVersion`,\n  `fetchDeployConfigVersions`) are reused as-is."
+      ]
+    },
+    {
+      "id": "tui-dc-picker-53",
+      "present": true,
+      "quotes": [
+        "Table-driven model tests (`browse_deploy_config_test.go`, driving `appModel.Update` with\nsynthetic messages and a nil client):"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-54",
+      "present": true,
+      "quotes": [
+        "Merge-semantics tests on `preserveDeploymentDivergences` (pure functions, table-driven, no model):"
+      ]
+    },
+    {
+      "id": "tui-dc-picker-55",
+      "present": true,
+      "quotes": [
+        "Plus `mise run go:lint`."
+      ]
+    }
   ]
 }

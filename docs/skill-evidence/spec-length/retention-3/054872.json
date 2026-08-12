@@ -15,8 +15,9 @@
       "present": true,
       "quotes": [
         "Chosen before Task 0's number is known, because that is the only time it can honestly be chosen.",
-        "Task 0 cost instrumentation and its report.",
-        "The measured\nratio picks the primary design:"
+        "The measured\nratio picks the primary design:",
+        "measured `E/(E+D)` | primary design |",
+        "Task 0 cost instrumentation and its report."
       ]
     },
     {
@@ -35,9 +36,9 @@
       "id": "tiered-review-05",
       "present": true,
       "quotes": [
-        "| \u2265 0.60 (exploration dominates) | cheap-as-explorer |",
-        "| \u2264 0.30 (diff-reading dominates) | per-file routing |",
-        "| 0.30\u20130.60 | angle routing (insensitive to the ratio) |"
+        "\u2265 0.60 (exploration dominates) | cheap-as-explorer |",
+        "\u2264 0.30 (diff-reading dominates) | per-file routing |",
+        "0.30\u20130.60 | angle routing (insensitive to the ratio) |"
       ]
     },
     {
@@ -84,8 +85,10 @@
     },
     {
       "id": "tiered-review-13",
-      "present": false,
-      "quotes": []
+      "present": true,
+      "quotes": [
+        "Whole-change triage as a general mechanism (retained only as the narrow rule-based complement\n  described under decision 1)."
+      ]
     },
     {
       "id": "tiered-review-14",
@@ -98,8 +101,7 @@
       "id": "tiered-review-15",
       "present": true,
       "quotes": [
-        "For every class-3 fixture, the files the fix commit touched are compared against the files the\nintroducing PR changed; a defect whose fix lands outside the introducing diff is one no per-file\nrouter could have routed correctly.",
-        "This fraction is computed and reported as the empirical recall\nceiling for any per-file design \u2014 a required deliverable, not optional context."
+        "For every class-3 fixture, the files the fix commit touched are compared against the files the\nintroducing PR changed; a defect whose fix lands outside the introducing diff is one no per-file\nrouter could have routed correctly. This fraction is computed and reported as the empirical recall\nceiling for any per-file design \u2014 a required deliverable, not optional context."
       ]
     },
     {
@@ -125,8 +127,13 @@
     },
     {
       "id": "tiered-review-19",
-      "present": false,
-      "quotes": []
+      "present": true,
+      "quotes": [
+        "**Neovim (stratum N) included.**",
+        "`sauyon/drovr` is public; `modularml/modular` and `quitesh/quite-app` are private.",
+        "Freezing: stratum D and N fixtures frozen by a MANIFEST in the shape of\n  `docs/skill-evidence/arms/MANIFEST.md` (`git hash-object --no-filters` blob SHAs, a commit cell\n  containing the blob at the recorded path, header-resolved columns, a test re-checking every row).",
+        "Strata M and Q are frozen the same way in the private corpus directory, with only the row count\n  and manifest digest committed publicly."
+      ]
     },
     {
       "id": "tiered-review-20",
@@ -289,9 +296,8 @@
       "present": true,
       "quotes": [
         "Strata: `router_model \u00d7 stratum \u00d7 class` is a full factorial \u2014 every stratum (D, M, Q, N) is\n  probed by every router model, since model access is no longer a stratifying factor once the\n  egress constraint is withdrawn.",
-        "`router_agent`/`router_model` are config keys distinct from the expensive-tier agent/model, because\nthe ship decision is per router model \u2014 a sonnet-routed cascade and a qwen-routed cascade are\nevaluated, and may ship, independently.",
-        "Ground-truth classes (never pooled into one recall figure): **1** \u2014 human review comment that\n  caused a same-PR change; **2** \u2014 bot review comment that caused a same-PR change *and* was\n  accepted by a human author (the acceptance filter is what makes this admissible despite being\n  bot-found); **3** \u2014 post-merge fix/revert/regression-fix of code the PR introduced (review missed\n  it).",
-        "Per-file routing is retained as a measured **control arm** regardless of which design wins, so the\nspec reports what it would have cost and missed rather than assuming it away."
+        "Per-file routing is retained as a measured **control arm** regardless of which design wins, so the\nspec reports what it would have cost and missed rather than assuming it away.",
+        "cheap_model = \"ko-ag/qwen3.6-35b-abliterated\""
       ]
     },
     {
@@ -305,14 +311,14 @@
       "id": "tiered-review-45",
       "present": true,
       "quotes": [
-        "**Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many survive\n  the cascade."
+        "- **Conditional recall** (gates): of the class-3 defects the expensive tier finds, how many survive\n  the cascade."
       ]
     },
     {
       "id": "tiered-review-46",
       "present": true,
       "quotes": [
-        "**Expensive-tier absolute detection rate on class 3** (does not gate): what fraction of\n  review-missed defects the full panel finds at all \u2014 reported as the run's most interesting\n  scientific output, not as a decision input."
+        "- **Expensive-tier absolute detection rate on class 3** (does not gate): what fraction of\n  review-missed defects the full panel finds at all \u2014 reported as the run's most interesting\n  scientific output, not as a decision input."
       ]
     },
     {
@@ -326,7 +332,7 @@
       "id": "tiered-review-48",
       "present": true,
       "quotes": [
-        "NULL (everything cleared: recall 0, saving maximal) and FLOOD\n  (everything escalated: recall 1.0, saving 0) bracket every stratum/class cell; a real cheap tier\n  must land strictly inside on both axes or those fixtures are rebuilt before scoring."
+        "**Discrimination controls.** NULL (everything cleared: recall 0, saving maximal) and FLOOD\n  (everything escalated: recall 1.0, saving 0) bracket every stratum/class cell; a real cheap tier\n  must land strictly inside on both axes or those fixtures are rebuilt before scoring."
       ]
     },
     {
@@ -340,7 +346,7 @@
       "id": "tiered-review-50",
       "present": true,
       "quotes": [
-        "Split assigned before any cheap-tier prompt is\n  written, at task/PR level so no diff appears in both;"
+        "**Dev/held-out split, no `blind-map.json`.** Split assigned before any cheap-tier prompt is\n  written, at task/PR level so no diff appears in both;"
       ]
     },
     {
@@ -354,7 +360,6 @@
       "id": "tiered-review-52",
       "present": true,
       "quotes": [
-        "**Dev/held-out split, no `blind-map.json`.**",
         "**Reason:** the threat model here is prompt overfitting,\n  not scorer bias (scoring is set membership, no human judgement), so the split alone is the\n  load-bearing control \u2014 a blind map is unneeded ceremony carried from a prior protocol and is\n  deliberately dropped."
       ]
     },
@@ -474,7 +479,7 @@
       "id": "tiered-review-69",
       "present": true,
       "quotes": [
-        "mode = \"<undecided>\"       # explorer | angle | file | change \u2014 set by Task 0 (decision 1), not before"
+        "enabled = false            # stays off in this run regardless of measured result\nmode = \"<undecided>\"       # explorer | angle | file | change \u2014 set by Task 0 (decision 1), not before"
       ]
     },
     {
@@ -502,35 +507,35 @@
       "id": "tiered-review-73",
       "present": true,
       "quotes": [
-        "Runs headless, never as a herdr pane: `opencode run --agent plan -m <model>`, read-only via\n`--agent plan` with `--auto` absent;"
+        "Runs headless, never as a herdr pane: `opencode run --agent plan -m <model>`, read-only via\n`--agent plan` with `--auto` absent; `readonly_displace` (`cli/src/config.rs:589`) runs first."
       ]
     },
     {
       "id": "tiered-review-74",
       "present": true,
       "quotes": [
-        "Runs headless, never as a herdr pane: `opencode run --agent plan -m <model>`, read-only via\n`--agent plan` with `--auto` absent; `readonly_displace` (`cli/src/config.rs:589`) runs first."
+        "`readonly_displace` (`cli/src/config.rs:589`) runs first."
       ]
     },
     {
       "id": "tiered-review-75",
       "present": true,
       "quotes": [
-        "Cascade stage in `cli/src/code_review.rs`, shipped behind `enabled = false`."
+        "7. Cascade stage in `cli/src/code_review.rs`, shipped behind `enabled = false`."
       ]
     },
     {
       "id": "tiered-review-76",
       "present": true,
       "quotes": [
-        "`docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n   (model \u00d7 stratum \u00d7 class), each gate's result in order, ship decisions, stated limitations,\n   aggregates only (no private-repo detail)."
+        "8. `docs/cascade-evidence/results.md`: controls, dev numbers, one held-out score per\n   (model \u00d7 stratum \u00d7 class), each gate's result in order, ship decisions, stated limitations,\n   aggregates only (no private-repo detail)."
       ]
     },
     {
       "id": "tiered-review-77",
       "present": true,
       "quotes": [
-        "Guard-with-artifact: every set this run extends (config keys, the `mode` enum, the cheap tier's\n  output vocabulary, ledger columns, MANIFEST rows, fixture list, the class enum) ships its guarding\n  test extended in the same change."
+        "- Guard-with-artifact: every set this run extends (config keys, the `mode` enum, the cheap tier's\n  output vocabulary, ledger columns, MANIFEST rows, fixture list, the class enum) ships its guarding\n  test extended in the same change."
       ]
     },
     {
@@ -565,7 +570,7 @@
       "id": "tiered-review-82",
       "present": true,
       "quotes": [
-        "Under every design, the cheap tier's output is either a routing decision or a context\nbundle \u2014 **never a finding that reaches a verdict** \u2014 noted explicitly because\n`ko-ag/qwen3.6-35b-abliterated` is an abliterated (safety-tuning-removed) build, and that fact must\nbe recorded rather than omitted."
+        "Cheap-as-explorer's output is a context bundle; angle/file/change routing's output is a routing\ndecision. Under every design, the cheap tier's output is either a routing decision or a context\nbundle \u2014 **never a finding that reaches a verdict** \u2014 noted explicitly because\n`ko-ag/qwen3.6-35b-abliterated` is an abliterated (safety-tuning-removed) build, and that fact must\nbe recorded rather than omitted."
       ]
     },
     {

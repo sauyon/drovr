@@ -21,15 +21,15 @@
       "id": "skill-stickiness-03",
       "present": true,
       "quotes": [
-        "No number, duration, frequency, or comparative is stated as\n  measured unless drovr measured it or a citation supports it."
+        "**No fabricated measurements.** No number, duration, frequency, or comparative is stated as\n  measured unless drovr measured it or a citation supports it."
       ]
     },
     {
       "id": "skill-stickiness-04",
       "present": true,
       "quotes": [
-        "Both projects are MIT; drovr still writes its own sentences.",
-        "A verbatim\n  survival gets the MIT notice and credit added."
+        "**No copied text.** Both projects are MIT; drovr still writes its own sentences. A verbatim\n  survival gets the MIT notice and credit added.",
+        "Ported in drovr's own wording from superpowers' `testing-skills-with-subagents.md:182-275`\n[tier 3 convention-follow]."
       ]
     },
     {
@@ -41,14 +41,14 @@
       "id": "skill-stickiness-06",
       "present": true,
       "quotes": [
-        "4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,\n                     each pairing the prohibition with the required action"
+        "each pairing the prohibition with the required action"
       ]
     },
     {
       "id": "skill-stickiness-07",
       "present": true,
       "quotes": [
-        "9. Rationalizations  thought → reality; reality column is an INSTRUCTION, not a rebuttal"
+        "Rationalizations  thought → reality; reality column is an INSTRUCTION, not a rebuttal"
       ]
     },
     {
@@ -60,8 +60,7 @@
       "id": "skill-stickiness-09",
       "present": true,
       "quotes": [
-        "6b. Cycle flowchart  fenced dot graph of the loop",
-        "Loop** (fenced `dot` flowchart):"
+        "Loop** (fenced `dot` flowchart): build scenario set → run baseline → transcribe every excuse\n  verbatim → write minimal counter-text → re-run on held-out scenarios → apply the four-part\n  closure to each new rationalization → repeat until a run produces no new rationalization **or**\n  the §7.3 REFACTOR ceiling is reached, whichever first."
       ]
     },
     {
@@ -96,8 +95,7 @@
       "id": "skill-stickiness-14",
       "present": true,
       "quotes": [
-        "`cargo test --test skills_valid` is the single authoritative size check.",
-        "`wc -l`/`wc -w`\n  are author guidance only, never asserted."
+        "`cargo test --test skills_valid` is the single authoritative size check.** `wc -l`/`wc -w`\n  are author guidance only, never asserted."
       ]
     },
     {
@@ -111,14 +109,15 @@
       "id": "skill-stickiness-16",
       "present": true,
       "quotes": [
-        "Decision: the four discipline skills' `description:` fields currently read as scoped to \"a drovr\nphase,\" while `using-drovr` makes inline work the default — so the trigger tells the agent the\nskill doesn't apply to what it's doing."
+        "Decision: the four discipline skills' `description:` fields currently read as scoped to \"a drovr\nphase,\" while `using-drovr` makes inline work the default — so the trigger tells the agent the\nskill doesn't apply to what it's doing.",
+        "Fixed by making all five descriptions unconditional\ntriggers (a description must be a trigger, not a summary — the highest-leverage line per\nAnthropic's skill-authoring guidance)."
       ]
     },
     {
       "id": "skill-stickiness-17",
       "present": true,
       "quotes": [
-        "Fixed by making all five descriptions unconditional\ntriggers (a description must be a trigger, not a summary — the highest-leverage line per\nAnthropic's skill-authoring guidance)."
+        "description:      trigger, not summary (fix 1)"
       ]
     },
     {
@@ -132,15 +131,14 @@
       "id": "skill-stickiness-19",
       "present": true,
       "quotes": [
-        "Body demotions** — every drovr-phase reference becomes a marked *additional* consequence, never\na precondition:"
+        "**Body demotions** — every drovr-phase reference becomes a marked *additional* consequence, never\na precondition:"
       ]
     },
     {
       "id": "skill-stickiness-20",
       "present": true,
       "quotes": [
-        "`docs/known-issues.md`**: one entry, file convention (`## <symptom> — FIXED <date>`,\n`**Status:**`, `**Severity:** medium`, `**Found:**`, `### Symptom`/`### Root cause`/`### Fix`),\nrecording the phase-scoping defect.",
-        "One entry only — the remaining fixes are design work, not\ndefect repair."
+        "**`docs/known-issues.md`**: one entry, file convention (`## <symptom> — FIXED <date>`,\n`**Status:**`, `**Severity:** medium`, `**Found:**`, `### Symptom`/`### Root cause`/`### Fix`),\nrecording the phase-scoping defect. One entry only — the remaining fixes are design work, not\ndefect repair."
       ]
     },
     {
@@ -161,7 +159,7 @@
       "id": "skill-stickiness-23",
       "present": true,
       "quotes": [
-        "Instruction-priority ladder** [tier 3]: human's explicit instructions > drovr skills >\n   default behaviour. Safety counterweight to the MUST language."
+        "Instruction-priority ladder** [tier 3]: human's explicit instructions > drovr skills >\n   default behaviour."
       ]
     },
     {
@@ -175,7 +173,8 @@
       "id": "skill-stickiness-25",
       "present": true,
       "quotes": [
-        "Red-flag table** for the router's own failure mode (invoking nothing). Candidate rows: \"this\n   is a one-line change,\" \"I'll just look at the file first,\" \"they asked a question, not for\n   work,\" \"I'm already mid-task, the router was for turn one,\" \"escalating would be overkill.\"\n   Final wording comes from RED (§7.1), not this list."
+        "Red-flag table** for the router's own failure mode (invoking nothing).",
+        "Final wording comes from RED (§7.1), not this list."
       ]
     },
     {
@@ -203,8 +202,7 @@
       "id": "skill-stickiness-29",
       "present": true,
       "quotes": [
-        "Byte budget** (not tokens — the CLI has no tokenizer): rendered `additionalContext` ≤ 600\n  bytes per injection; cumulative ceiling ~60 KB over a 100-turn session (`additionalContext` is\n  appended every turn and stays in the window).",
-        "Asserted in `cli/src/reflex.rs`'s test module."
+        "Byte budget** (not tokens — the CLI has no tokenizer): rendered `additionalContext` ≤ 600\n  bytes per injection; cumulative ceiling ~60 KB over a 100-turn session (`additionalContext` is\n  appended every turn and stays in the window). Asserted in `cli/src/reflex.rs`'s test module."
       ]
     },
     {
@@ -274,7 +272,7 @@
       "id": "skill-stickiness-39",
       "present": true,
       "quotes": [
-        "`PreToolUse` hard-denial of an `Edit` that skipped `drovr:tdd`, or a `git commit` with no\nverification evidence — enforcement rather than persuasion, a larger design with real\nfalse-positive risk."
+        "`PreToolUse` hard-denial of an `Edit` that skipped `drovr:tdd`, or a `git commit` with no\nverification evidence — enforcement rather than persuasion, a larger design with real\nfalse-positive risk. Not this run."
       ]
     },
     {
@@ -288,7 +286,7 @@
       "id": "skill-stickiness-41",
       "present": true,
       "quotes": [
-        "If the harness exposes no task tool, write the checklist to\n> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the repo\n> root otherwise, and tick items there."
+        "Mark each in-progress when you start it and complete when its evidence is in hand.\n> If the harness exposes no task tool, write the checklist to\n> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the repo\n> root otherwise, and tick items there."
       ]
     },
     {
@@ -302,7 +300,10 @@
       "id": "skill-stickiness-43",
       "present": true,
       "quotes": [
-        "1. description:      trigger, not summary (fix 1)\n2. Overview          core principle + spirit-vs-letter line + the WHY, ≤6 lines\n3. Unity line        \"the next phase agent is you, with your context gone\"\n4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,\n                     each pairing the prohibition with the required action\n5. Announce          exact sentence to emit when invoking the skill (commitment device)\n6. The procedure     numbered, preceded by the task-binding directive (fix 3)\n8. Red flags — STOP  inner-monologue fragments, closed by a catch-all bullet\n9. Rationalizations  thought → reality; reality column is an INSTRUCTION, not a rebuttal\n10. Worked example   one ✅/❌ pair of actual utterances\n11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
+        "`tdd`, `systematic-debugging`, `verification-before-completion`, `code-review` restructure to a\nfixed section order [tier 3 — superpowers' convention, adopted wholesale]:",
+        "1. description:      trigger, not summary (fix 1)\n2. Overview          core principle + spirit-vs-letter line + the WHY, ≤6 lines\n3. Unity line        \"the next phase agent is you, with your context gone\"\n4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,\n                     each pairing the prohibition with the required action\n5. Announce          exact sentence to emit when invoking the skill (commitment device)",
+        "6. The procedure     numbered, preceded by the task-binding directive (fix 3)",
+        "8. Red flags — STOP  inner-monologue fragments, closed by a catch-all bullet\n9. Rationalizations  thought → reality; reality column is an INSTRUCTION, not a rebuttal\n10. Worked example   one ✅/❌ pair of actual utterances\n11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
       ]
     },
     {
@@ -323,8 +324,11 @@
       "id": "skill-stickiness-46",
       "present": true,
       "quotes": [
-        "Announcement template**: `Using drovr:<skill> to <purpose>.` Shipped strings:",
-        "`tdd` — \"Using drovr:tdd — writing the failing test before the implementation.\""
+        "**Announcement template**: `Using drovr:<skill> to <purpose>.` Shipped strings:",
+        "`tdd` — \"Using drovr:tdd — writing the failing test before the implementation.\"",
+        "`systematic-debugging` — \"Using drovr:systematic-debugging — reproducing before fixing.\"",
+        "`verification-before-completion` — \"Using drovr:verification-before-completion — running the\n  checks before claiming done.\"",
+        "`code-review` — \"Using drovr:code-review — dispatching read-only reviewers before calling this\n  done.\""
       ]
     }
   ]

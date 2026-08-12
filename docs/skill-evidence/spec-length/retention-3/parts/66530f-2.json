@@ -20,8 +20,8 @@
       "id": "skill-stickiness-49",
       "present": true,
       "quotes": [
-        "`Use when encountering any bug, test failure, or unexpected behavior, before proposing or writing a fix — requires a reproduction and a mechanistic root cause before any code change`",
-        "**`systematic-debugging`** — Iron Law: no fix before a reproduction and a mechanistic cause."
+        "**`systematic-debugging`** — Iron Law: no fix before a reproduction and a mechanistic cause.",
+        "`Use when encountering any bug, test failure, or unexpected behavior, before proposing or writing a fix — requires a reproduction and a mechanistic root cause before any code change`"
       ]
     },
     {
@@ -56,7 +56,7 @@
       "id": "skill-stickiness-54",
       "present": true,
       "quotes": [
-        "8.1 New skill: `skills/writing-skills/SKILL.md`",
+        "### 8.1 New skill: `skills/writing-skills/SKILL.md`",
         "**The mapping**: pressure scenario ↔ test case; `SKILL.md` ↔ production code; RED ↔ the agent\n  violates the rule without the skill; GREEN ↔ it complies with the skill; REFACTOR ↔ close each\n  new loophole."
       ]
     },
@@ -64,14 +64,15 @@
       "id": "skill-stickiness-55",
       "present": true,
       "quotes": [
-        "**The loop** (fenced `dot` flowchart, a stop-too-early loop): build the scenario set → run the\n  baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on\n  held-out scenarios → apply the four-part closure to each new rationalization → repeat **until a\n  run produces no new rationalization or the §9 REFACTOR ceiling is reached, whichever comes\n  first.** The ceiling is not optional — an uncapped loop is the same unbounded-cost defect this\n  spec exists to fix."
+        "**The loop** (fenced `dot` flowchart, a stop-too-early loop): build the scenario set → run the\n  baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on\n  held-out scenarios → apply the four-part closure to each new rationalization → repeat **until a\n  run produces no new rationalization or the §9 REFACTOR ceiling is reached, whichever comes\n  first.**"
       ]
     },
     {
       "id": "skill-stickiness-56",
       "present": true,
       "quotes": [
-        "**The loop** (fenced `dot` flowchart, a stop-too-early loop): build the scenario set → run the\n  baseline → transcribe every excuse verbatim → write the minimal counter-text → re-run on\n  held-out scenarios → apply the four-part closure to each new rationalization → repeat **until a\n  run produces no new rationalization or the §9 REFACTOR ceiling is reached, whichever comes\n  first.**"
+        "**Decomposition.** 122 foreground subagent runs with verbatim transcription do not fit one\n`implement-task` context — the exact failure this spec targets.",
+        "| RED / baseline on dev set | 5 skills × 1 dev scenario × 2 samples | 10 | 10 |"
       ]
     },
     {
@@ -129,7 +130,9 @@
       "id": "skill-stickiness-64",
       "present": true,
       "quotes": [
-        "**Held-out design.** Authoring arm B from the scenarios that grade it would fit the text to the\ntest. Per skill: **3 scenarios — 1 development, 2 held-out.** RED transcription and all\ncounter-text authoring use the development scenario only. The pass bar is pre-registered and\nscored on the held-out pair, never read while writing arm B."
+        "Per skill: **3 scenarios — 1 development, 2 held-out.**",
+        "RED transcription and all\ncounter-text authoring use the development scenario only.",
+        "The pass bar is pre-registered and\nscored on the held-out pair, never read while writing arm B."
       ]
     },
     {
@@ -137,18 +140,17 @@
       "present": true,
       "quotes": [
         "**Arms** (three, so fix 1 and fix 4 are separable):",
-        "Current `SKILL.md` at the pre-fix `HEAD` (captured per §1 step 2)",
-        "Fix-1-only: descriptions un-scoped, no armor",
-        "Full rewrite (fixes 1 + 3 + 4)"
+        "| **A** | Current `SKILL.md` at the pre-fix `HEAD` (captured per §1 step 2) |",
+        "| **A′** | Fix-1-only: descriptions un-scoped, no armor |",
+        "| **B** | Full rewrite (fixes 1 + 3 + 4) |"
       ]
     },
     {
       "id": "skill-stickiness-66",
       "present": true,
       "quotes": [
-        "Stage | Scope | Runs | Ceiling |",
-        "**≈122**",
-        "**122 hard ceiling**"
+        "| Arm A on held-out | 5 skills × 2 held-out × 2 samples | 20 | 20 |",
+        "| **Total** | | **≈122** | **122 hard ceiling** |"
       ]
     },
     {
@@ -162,8 +164,7 @@
       "id": "skill-stickiness-68",
       "present": true,
       "quotes": [
-        "`using-drovr` no-skill-applies class",
-        "2 scenarios × 3 arms × 2 samples",
+        "| `using-drovr` no-skill-applies class | 2 scenarios × 3 arms × 2 samples | 12 | 12 |",
         "`using-drovr`'s extra scenario class checks the router's own failure mode (invoking nothing)\nwithout inducing the opposite failure (invoking everything reflexively); it is budgeted, not\nfree."
       ]
     },
@@ -171,7 +172,9 @@
       "id": "skill-stickiness-69",
       "present": true,
       "quotes": [
-        "**Decomposition.** 122 foreground subagent runs with verbatim transcription do not fit one\n`implement-task` context — the exact failure this spec targets. Decision: **one dedicated phase\nper skill**, `ab-<skill>` (5 phases), each running its own stages and writing\n`docs/skill-evidence/<skill>.md` plus raw transcripts, then exiting; the voice probe is a sixth\nphase, `ab-voice`. The driver aggregates results. No phase holds more than ~25 runs."
+        "Decision: **one dedicated phase\nper skill**, `ab-<skill>` (5 phases), each running its own stages and writing\n`docs/skill-evidence/<skill>.md` plus raw transcripts, then exiting; the voice probe is a sixth\nphase, `ab-voice`.",
+        "The driver aggregates results.",
+        "No phase holds more than ~25 runs."
       ]
     },
     {
@@ -221,7 +224,8 @@
       "id": "skill-stickiness-76",
       "present": true,
       "quotes": [
-        "**Consequence of failure.** A skill whose B fails after its REFACTOR ceiling **does not ship\n  its armor**: it reverts to arm A′ (fix-1-only), and `docs/skill-evidence/<skill>.md` records\n  the failure and the reverted state. Fix 1 ships regardless (it is a defect repair); fix 4 must\n  earn its bytes."
+        "**Consequence of failure.** A skill whose B fails after its REFACTOR ceiling **does not ship\n  its armor**: it reverts to arm A′ (fix-1-only), and `docs/skill-evidence/<skill>.md` records\n  the failure and the reverted state.",
+        "Fix 1 ships regardless (it is a defect repair); fix 4 must\n  earn its bytes."
       ]
     },
     {
@@ -250,10 +254,10 @@
       "present": true,
       "quotes": [
         "**Four variants**, identical structure (same Iron Law, procedure, tables, placement), each adding\nexactly one register device to the baseline so factors stay separable at this sample size:",
-        "Baseline: plain imperative; no all-caps, no absolutist \"no exceptions\"; operational consequence only",
-        "V0 + unity line",
-        "V0 + full authority register (`MUST`/`NEVER`, all-caps Iron Law, no-exceptions bullets)",
-        "V0 + moral framing, in superpowers' register"
+        "| **V0** | Baseline: plain imperative; no all-caps, no absolutist \"no exceptions\"; operational consequence only |",
+        "| **V1** | V0 + unity line |",
+        "| **V2** | V0 + full authority register (`MUST`/`NEVER`, all-caps Iron Law, no-exceptions bullets) |",
+        "| **V3** | V0 + moral framing, in superpowers' register |"
       ]
     },
     {
@@ -267,15 +271,15 @@
       "id": "skill-stickiness-82",
       "present": true,
       "quotes": [
-        "Variant beats V0 by ≥3 → that device ships across all five documents.",
-        "V0 beats the variant by ≥3 → that device is **dropped**, baseline register ships. (Explicit\n   branch: a plain-register win is a real, valid outcome.)"
+        "1. Variant beats V0 by ≥3 → that device ships across all five documents.",
+        "2. V0 beats the variant by ≥3 → that device is **dropped**, baseline register ships. (Explicit\n   branch: a plain-register win is a real, valid outcome.)"
       ]
     },
     {
       "id": "skill-stickiness-83",
       "present": true,
       "quotes": [
-        "No separation ≥3 (the likeliest outcome) → **tier 3: follow superpowers.** Authority ships,\n   moral framing ships, and unity ships anyway on the strength of the 2026 published ranking\n   (tier 1 outranks tier 3) even though superpowers itself withholds unity from discipline\n   skills. Each recorded in `docs/skill-evidence/voice.md` as convention-or-prior, with the null\n   attached."
+        "3. No separation ≥3 (the likeliest outcome) → **tier 3: follow superpowers.** Authority ships,\n   moral framing ships, and unity ships anyway on the strength of the 2026 published ranking\n   (tier 1 outranks tier 3) even though superpowers itself withholds unity from discipline\n   skills. Each recorded in `docs/skill-evidence/voice.md` as convention-or-prior, with the null\n   attached."
       ]
     },
     {
@@ -289,14 +293,13 @@
       "id": "skill-stickiness-85",
       "present": true,
       "quotes": [
-        "Whatever wins applies to the other four documents without re-testing each."
+        "4. Whatever wins applies to the other four documents without re-testing each."
       ]
     },
     {
       "id": "skill-stickiness-86",
       "present": true,
       "quotes": [
-        "Skill docs: all 8 `skills/*/SKILL.md`. Five get `description:` changes (§4); the four\n  discipline skills get the §7 rewrite; `handoff`, `pipeline`, `worktrees` receive **only** the\n  fix-3 task-binding directive (§6) and nothing else.",
         "Rewriting `handoff` / `pipeline` / `worktrees` as documents (only their task-binding directive\n  is in scope, §6)."
       ]
     },
@@ -304,7 +307,6 @@
       "id": "skill-stickiness-87",
       "present": true,
       "quotes": [
-        "**Out of scope:**",
         "Any change to the phase state machine, the review gate, or `drovr code-review` itself."
       ]
     },
@@ -333,7 +335,8 @@
       "id": "skill-stickiness-91",
       "present": true,
       "quotes": [
-        "**Integration**: a clean session, given a one-line bugfix request with no mention of drovr,\n   invokes `drovr:tdd` before writing code. Run against this worktree with\n   `CLAUDE_PLUGIN_ROOT=<worktree>` so it does not depend on the flake pin being bumped first."
+        "**Integration**: a clean session, given a one-line bugfix request with no mention of drovr,\n   invokes `drovr:tdd` before writing code.",
+        "Run against this worktree with\n   `CLAUDE_PLUGIN_ROOT=<worktree>` so it does not depend on the flake pin being bumped first."
       ]
     }
   ]

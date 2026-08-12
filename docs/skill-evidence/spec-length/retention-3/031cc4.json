@@ -46,7 +46,7 @@
       "id": "tui-dc-picker-07",
       "present": true,
       "quotes": [
-        "6. `enter` on a project or config branch toggles it and arms no confirm (`pick == nil`)."
+        "`enter` on a branch (project or\nconfig) just toggles it and arms no selection;"
       ]
     },
     {
@@ -60,21 +60,21 @@
       "id": "tui-dc-picker-09",
       "present": true,
       "quotes": [
-        "| projects | picker opens | `ListBenchmarkProjects` |"
+        "projects | picker opens | `ListBenchmarkProjects`"
       ]
     },
     {
       "id": "tui-dc-picker-10",
       "present": true,
       "quotes": [
-        "| configs of a project | that project first expanded | `ListDeployConfigs(project)` + `latestPerConfig` |"
+        "configs of a project | that project first expanded | `ListDeployConfigs(project)` + `latestPerConfig`"
       ]
     },
     {
       "id": "tui-dc-picker-11",
       "present": true,
       "quotes": [
-        "| versions of a config | that config first expanded | `fetchDeployConfigVersions(project, name)` |"
+        "versions of a config | that config first expanded | `fetchDeployConfigVersions(project, name)`"
       ]
     },
     {
@@ -116,7 +116,6 @@
       "id": "tui-dc-picker-17",
       "present": true,
       "quotes": [
-        "- Cross-project adoption via the tree's project level.",
         "Cross-project adoption follows directly: every project in the org is a root, so a\ndeployment can switch to a config in any project, not just its current one."
       ]
     },
@@ -166,7 +165,7 @@
       "id": "tui-dc-picker-24",
       "present": true,
       "quotes": [
-        "Adds one optional field: `pick any` \u2014 non-nil only on picker version leaves, nil on\nevery node existing (config/revision/diff) trees build."
+        "`fieldNode.pick` is nil on every node the existing config/revision/diff tree builders\n    produce (guards against the shared-widget change leaking into other panels)."
       ]
     },
     {
@@ -243,21 +242,21 @@
       "id": "tui-dc-picker-35",
       "present": true,
       "quotes": [
-        "- Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared`, plus\n  `\"  (current)\"` when it is the linked config."
+        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared`, plus\n  `\"  (current)\"` when it is the linked config."
       ]
     },
     {
       "id": "tui-dc-picker-36",
       "present": true,
       "quotes": [
-        "A shared config's node label carries `(shared)`;"
+        "3. A shared config's node label carries `(shared)`;"
       ]
     },
     {
       "id": "tui-dc-picker-37",
       "present": true,
       "quotes": [
-        "A shared config's node label carries `(shared)`; the linked one carries `(current)`;"
+        "Config node: `\"<name>  (latest v<N>)\"`, plus `\"  (shared)\"` when `Shared`, plus\n  `\"  (current)\"` when it is the linked config.\n- Version leaf: `\"v<N>  <created>  <description>\"` (reusing the label\n  `newDeployConfigVersionPicker` already builds), plus `\"  (latest)\"` on the newest and\n  `\"  (current)\"` on the deployment's current version."
       ]
     },
     {
@@ -292,8 +291,7 @@
       "id": "tui-dc-picker-42",
       "present": true,
       "quotes": [
-        "Implement as a distinct map-level helper (the\nmap twin of `mergeJSONPtr`) \u2014 reusing `threeWayMerge` with an empty-map baseline is\nwrong, because its \"value only current has\" branch takes `curVal` wholesale for any key\nabsent from the baseline, dropping nested keys the target contributes.",
-        "13. Nil baseline recurses: a nested key present in the target but absent from the\n    deployment's config is not dropped (guards against the wholesale-replace trap noted\n    in D6's implementation note)."
+        "Implement as a distinct map-level helper (the\nmap twin of `mergeJSONPtr`) \u2014 reusing `threeWayMerge` with an empty-map baseline is\nwrong, because its \"value only current has\" branch takes `curVal` wholesale for any key\nabsent from the baseline, dropping nested keys the target contributes."
       ]
     },
     {
@@ -314,14 +312,14 @@
       "id": "tui-dc-picker-45",
       "present": true,
       "quotes": [
-        "`actionSwitchDeployConfig` confirm states, one line each: (a) switching redeploys\n(already true today); (b) overrides are carried across (D6/D7);"
+        "Confirm copy states that overrides are carried across."
       ]
     },
     {
       "id": "tui-dc-picker-46",
       "present": true,
       "quotes": [
-        "`actionSwitchDeployConfig` confirm states, one line each: (a) switching redeploys\n(already true today); (b) overrides are carried across (D6/D7); (c) when the chosen\nconfig is shared, that its content is owned by the shared spec \u2014 the next `mcloud\ndeploy-config apply` creates a new version and moves the config's *latest*, but the\ndeployment stays pinned to the version selected here (versions are immutable rows)."
+        "config is shared, that its content is owned by the shared spec \u2014 the next `mcloud\ndeploy-config apply` creates a new version and moves the config's *latest*, but the\ndeployment stays pinned to the version selected here (versions are immutable rows)."
       ]
     },
     {
@@ -342,8 +340,8 @@
       "id": "tui-dc-picker-49",
       "present": true,
       "quotes": [
-        "### Transport \u2014 unchanged",
-        "- Any API-server or schema change \u2014 not needed (see *Problem*)."
+        "- Any API-server or schema change \u2014 not needed (see *Problem*).",
+        "### Transport \u2014 unchanged"
       ]
     },
     {
@@ -371,7 +369,8 @@
       "id": "tui-dc-picker-53",
       "present": true,
       "quotes": [
-        "Table-driven model tests (`browse_deploy_config_test.go`, driving `appModel.Update` with\nsynthetic messages and a nil client):"
+        "Table-driven model tests (`browse_deploy_config_test.go`, driving `appModel.Update` with\nsynthetic messages and a nil client):",
+        "`internal/mcloudcli/cli/deployment/browse_deploy_config_test.go` | Tests 1-11 (picker)"
       ]
     },
     {
@@ -379,7 +378,7 @@
       "present": true,
       "quotes": [
         "Merge-semantics tests on `preserveDeploymentDivergences` (pure functions, table-driven,\nno model):",
-        "| `internal/mcloudcli/cli/deployment/deploy_config_test.go` | Tests 12-14 (merge semantics) |"
+        "`internal/mcloudcli/cli/deployment/deploy_config_test.go` | Tests 12-14 (merge semantics)"
       ]
     },
     {
