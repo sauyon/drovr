@@ -1,7 +1,14 @@
 # Tier-2 and tier-3 provenance — the second attempt's relevance and escalation passes
 
-**What this file is.** The SHA-256 of every prompt as dispatched and every reply as read, for
-`PROTOCOL-2.md` item 8a's tier-2 pass and item 8b's tier-3 pass. It is the tier-2/3 equivalent of
+**What this file is.** The SHA-256 of every **prompt** as dispatched and every **reply** as read,
+for `PROTOCOL-2.md` item 8a's tier-2 pass and item 8b's tier-3 pass.
+
+**Prompts and replies are hashed; dispatches are counted, and the three numbers differ.** The two
+passes made **36 dispatches** over **35 prompts**, producing **35 replies**: 18 tier-2, and 18
+tier-3 over 17 prompts. `fe4059`'s tier-3 prompt was dispatched twice — its first dispatch **wrote
+no file, so there is no reply of it to hash**, and the hash below is the `R6` re-run's. A dispatch
+that produces nothing leaves nothing hashable, which is a limit of this record and is why the
+dispatch count is stated here rather than inferred from the number of rows. It is the tier-2/3 equivalent of
 `retention-3/parts/prompt-hashes.txt` and `parts/assemble-log.txt`, and it exists for the reason
 `PROTOCOL-3.md` §5 gives for hashing tier-1's shards: `SCORING-2-NOTES.md` §9.6 found one shard
 byte-identical to its own earlier attempt and could not tell a re-emission from a cached completion.

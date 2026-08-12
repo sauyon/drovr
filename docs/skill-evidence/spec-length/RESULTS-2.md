@@ -304,7 +304,14 @@ between generations. Each rule is a function of markup and of disposition, never
 identity, length, or content, and each was applied identically to all eighteen. `PROTOCOL-3.md` §0
 states this and §0's obligation 2 — *the moment arms become visible, iteration stops* — was
 honoured: **tiers 2 and 3 were complete and committed before anything in this run read the blind
-map** (commit `bb1ca14`, this file's is later).
+map** (commit `bb1ca14`; this file's is `92fea48`, later, and `adjudication-2/` and `escalation-2/`
+are byte-identical across that boundary).
+
+**Read that sentence with §8 deviation 0, which weakens it.** Plan tasks T6, T7 and T8 ran in one
+phase context rather than three, so the separation between scoring and seeing the arms is an
+**ordering claim checkable in `git log`**, not the structural impossibility the plan's decomposition
+would have made it. The commits are the evidence; **what no record can show is what a single context
+knew at what moment.**
 
 ### The uncitable-row diagnosis — `PROTOCOL-3.md` §7 item 5
 
@@ -461,8 +468,9 @@ cites `calibration-2.json` as evidence about an arm.
    tier 2, tier 3, and unblind-and-gate in separate contexts. This run's driver superseded that and
    directed one agent to run all three. **Why it matters, stated as the strongest version of the
    objection:** under the plan's decomposition the separation between *scoring* and *seeing the
-   arms* was **structural** — the tier-2 and tier-3 agents could not have read `blind-map-2.json`
-   because they did not exist yet when it was still unread. Collapsed into one context, that
+   arms* was **structural** — the tier-2 and tier-3 agents would have finished and been discarded
+   before the T8 context that opens `blind-map-2.json` existed, so no context that scored could
+   later have seen the map, and no context that saw it could have scored. Collapsed into one, that
    separation becomes an **ordering claim by the agent that made it**, and `plan.md` §0 and
    `PROTOCOL-2.md` item 11 both forbid a context that has opened the blind map from dispatching any
    tier.
@@ -473,8 +481,9 @@ cites `calibration-2.json` as evidence about an arm.
    at `92fea48`, a later commit. `adjudication-2/` and `escalation-2/` are byte-identical across
    that boundary. **A reader who does not take the agent's word for it can verify that the records
    existed before the unblinding commit; what no record can show is what a single context knew at
-   what moment.** `RESULTS.md` §5 deviation 2 is the precedent for logging exactly this kind of
-   collapsed separation rather than leaving it implicit.
+   what moment.** It is logged rather than left implicit because a separation that was
+   structural in the plan and procedural in execution is exactly the kind of difference a reader is
+   entitled to weigh for themselves.
 1. **The `wc` / `R5a` figures were published early.** `GENERATION-2-NOTES.md` committed the
    per-generation line and byte counts, the fixture percentages and both `R5a` flags at the
    generation task, before tiers 1–3 ran. Logged here because that file's open-items table requires
@@ -548,7 +557,39 @@ cites `calibration-2.json` as evidence about an arm.
    pre-registration should resolve the contradiction deliberately rather than inherit it**, by
    either freezing the protocol's *content* separately from its amendment log or dropping the
    window-2 permission it cannot honour.
-7. **Two changes were made to committed checks, and they run in OPPOSITE directions. Both are
+7. **Two of the 60 transmission questions were re-dispatched, and `transmission-2/README.md`
+   requires this list to carry it.** Item 14 has an independent question-writer subagent compose all
+   60; two came from a second such subagent. Both had stated a count their own row supplies —
+   `skill-stickiness-82`'s *"all five documents"* and `tiered-review-84`'s *"four"* — which item 14
+   forbids, because a probe that had never read its spec could return the number by copying the
+   question. Each was re-dispatched alone to a fresh writer under item 14's prompt **verbatim** and
+   the return spliced in unaltered; the other 58 are untouched, none was hand-authored, and the
+   selection of which two was made against the ledger rows alone, before any `generated-2/` spec
+   existed. **`README.md` classifies it as an `R6` re-run** — a return violating its own prompt's
+   explicit instruction is a malformed return — **so it belongs in deviation 2's count as well.**
+   `SCORING-2-NOTES.md` §9.5a item 12 leaves open *whether* it was the right call, and §12 carries
+   that question; this item records the deviation itself, which is a separate duty.
+   **It changed no result: `R7` skipped the transmission test entirely.**
+8. **`PROTOCOL-3.md` revised five of `PROTOCOL-2.md`'s governed items after `PROTOCOL-2.md`'s
+   window 3 had closed.** `PROTOCOL-2.md`'s window 3 reads *"after the first probe of item 5 is
+   dispatched: **no governed item may be revised at all***", and `PROTOCOL-3.md` §8's own departure
+   table lists five — item 8's span rule, item 8's disposition, item 10's template, `R6`'s trigger
+   list, and item 1's limitations. **`PROTOCOL-2.md` itself was not edited**, which is why §8a's
+   revision log shows one amendment and classifies it window 1; the rules moved in a second document
+   instead. **Stating only the first fact would be true about the file and misleading about the
+   rules**, so both are stated.
+
+   **The warrant, and its limit.** `PROTOCOL-3.md` §0 argues that revising a *tier-1 instrument*
+   while blind cannot be steered toward a result, because its author could not see which generation
+   belonged to which arm; it was committed before any `retention-3/` record existed, which `git log`
+   settles, and §5's revision count and reasons are on the record. **What that does not do is
+   satisfy window 3's letter, which admits no exception for a blind revision** — and routing a
+   revision through a new file rather than an edit is the kind of move a rule like window 3 exists
+   to prevent, whatever its merits here. This file names the conflict rather than resolving it;
+   deviation 6 records the parallel dead letter in `PROTOCOL-3.md`'s own window 2, and **a later
+   pre-registration should decide whether "no governed item may be revised" binds successor
+   documents, because as written it does not.**
+9. **Two changes were made to committed checks, and they run in OPPOSITE directions. Both are
    disclosed, because an earlier draft of this item named only the first and called the net effect
    "strictly harder", which is false of the second.**
    - **(a) The re-point, which tightens.** The tier-2, tier-3 and gate checks now read their tier-1
@@ -738,6 +779,13 @@ naming them. They are carried below instead.**
 sharding and are *"not a debt"*; the rest are open. An earlier draft's binary "stands except
 discharged" list wrongly re-opened 2 and 3.
 
+**Two open items are discharged elsewhere in this file and are named here so the list is complete
+rather than merely correct.** **§9.5 item 5** — that the tier-1 pass *rate* is itself a property of
+the instrument — is carried by §5's revision table (~1% → 3 of 12 → 18 of 18) and by the item 9
+paragraph below. **§9.5a item 11** — the four `GENERATION-2-NOTES.md` obligations owed to T8 — is
+discharged across §3 (both `R5a` flags, `fd2c24` not read as a win), §8 deviation 1 (the early `wc`
+publication) and §10 (the title join). Neither is left open; neither was previously named.
+
 **§9.5 item 7(a) — the duplicate-shard finding, owed here in as many words.** In the second
 attempt's tier-1 pass **one shard's attempt 4 was byte-identical to its attempt 2** — the only
 duplicate among 150 shard files. So *"six attempts per shard"* meant **six dispatches, not six
@@ -792,8 +840,10 @@ is concluded from its sign. What can be said without it: **a 98.9% present rate 
 raised the doubt does not retire the doubt.** A rate that high
 on the fixture that raised it is the same doubt limitation 7a states from the other direction, and
 the two should be read together. `tiered-review`'s 93.8% is the fixture where tier 1
-discriminated **most** — all three show real spread (`SCORING-3-NOTES.md` §4) — and it also carries
-**42 of the run's 59 class-B flags**.
+discriminated **most, and by a wide margin**: its six generations span 72–83 of 84, a range of 11
+rows, against `tui-dc-picker`'s 5 and `skill-stickiness`'s **2** — and a 2-row range is smaller than
+the noise floor this same section invokes, so `skill-stickiness` shows no spread this instrument can
+distinguish from noise. `tiered-review` also carries **42 of the run's 59 class-B flags**.
 
 **§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
 not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
@@ -924,4 +974,6 @@ reply as read.
   `S1` 219, `S3` 206 — but `S2`'s figure is contaminated by two copy-flagged generations and may not
   be read as a win.
 - **That blinding held perfectly.** §10's title channel separates `S3` completely within one
-  fixture. No stage that could exploit it ran.
+  fixture, and no stage that could exploit it ran. **§8 deviation 0 is the larger qualification:**
+  tiers 2, 3 and the unblind ran in one phase context, so the scoring/unblinding separation rests on
+  commit ordering rather than on structure. §8b's two file-access channels stay open.
