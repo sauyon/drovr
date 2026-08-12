@@ -155,8 +155,9 @@ def main(argv):
             # **verbatim**, and this run's own `SCORING-2-NOTES.md` §2a finding is
             # that prompt wording moves scorer behaviour measurably — so that
             # framing was an undisclosed intervention on both metrics the pass
-            # then reported. `SCORING-3-NOTES.md` §5.1 records it and §5.3
-            # records the re-run.
+            # then reported. `SCORING-3-NOTES.md` §5.1 records both the deviation
+            # and the re-run it forced; the hashes of the prompts actually
+            # dispatched are at `retention-3/parts/prompt-hashes.txt`.
             #
             # **What remains is not framing and is required.** Three frozen texts
             # are handed over and two of them disagree; a scorer that is not told
