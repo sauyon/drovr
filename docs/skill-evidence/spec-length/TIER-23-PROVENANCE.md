@@ -21,6 +21,19 @@ record directories are read by `read_json_records`, which refuses any entry that
 that a record no walk sees cannot exist. Dropping provenance in beside the records would break that
 guarantee, so it lives here and `RESULTS-2.md` points at it.
 
+**The dispatch discipline, recorded because `plan.md` §0 pins it on "every probe / scorer /
+adjudicator / escalator / calibrator" and because `RESULTS.md` §7.6 logged an unrecorded model as a
+first-attempt defect.** All 36 dispatches were **`model: sonnet`**, **`subagent_type:
+general-purpose`** — the same pin `SCORING-3-NOTES.md` §2 records for the tier-1 pass.
+
+**"Foreground" needs one honest qualification.** The harness's subagent tool returns immediately and
+runs the agent asynchronously whichever way it is invoked; there is no foreground mode to select.
+What the pin's purpose requires — that the dispatching context waits for the result rather than
+proceeding on a partial record — was met by blocking on completion before reading any output, and
+by re-hashing every output after a wait to confirm it had stopped changing (`SCORING-3-NOTES.md`
+§3.1's overwrite hazard). **That is the same discipline the pin names, obtained a different way, and
+it is stated rather than reported as literal compliance.**
+
 **These are not repository paths.** The prompts and the raw replies were written outside the
 repository, in the scoring session's scratchpad, exactly as the tier-1 pass wrote its prompts
 outside it: a scorer or adjudicator that could list its siblings is not blind. The scratchpad is
