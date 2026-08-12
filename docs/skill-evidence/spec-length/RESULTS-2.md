@@ -191,13 +191,22 @@ survives; it is largely evidence that two of its six probes did not compress.
 SKIPPED.** `R7` runs them only on a **candidate** arm (`S2` or `S3`) that clears `R2`. Neither did.
 `S1`'s own result does not change that — and `S1` did not clear either.
 
-**`R3a`: nothing ships.** The precise route matters, because `R3a` has two that reach the same
-place and only one applies. **`R3a` step 1 governs here:** *"The survivors are the CANDIDATES (`S2`,
-`S3`) that cleared R2 and T8 and T9. If there are none, the outcome is the null under `R7` and
-nothing ships."* There are none. **Step 2's phrasing — *"no candidate beat the control: ship nothing
-and record it"* — does NOT apply**, because its stated precondition is *"If `S1` cleared R2"*, and
-`S1` did not. The outcome is the same and the reasoning is not: nothing here says a candidate was
-weighed against the control and lost, because no candidate was ever in `R3`'s compared set.
+**`R3a`: nothing ships**, and the phrase *"no candidate beat the control"* is the pre-registered
+wording for this exact case — but it arrives via `R7`, not via `R3a` step 2, and the difference is
+worth one sentence.
+
+**`R3a` step 1 is what governs the arithmetic:** *"The survivors are the CANDIDATES (`S2`, `S3`)
+that cleared R2 and T8 and T9. If there are none, the outcome is the null under `R7` and nothing
+ships."* There are none. **`R7` then supplies the wording:** *"if no candidate clears R2, T8 and T9
+are both skipped, whatever `S1` did, and T10 records the outcome under `R3a` as **no candidate beat
+the control — ship nothing***. That is why this file's opening line uses that clause.
+
+**What it must not be read to mean.** `R3a` step 2 — which does say *"no candidate beat the control:
+ship nothing and record it"* — is **not** the route here: its stated precondition is *"If `S1`
+cleared R2"*, and `S1` did not. So nothing in this run weighed a candidate against the control and
+found it wanting; **no candidate was ever in `R3`'s compared set at all**, because that set is empty.
+"No candidate beat the control" is the pre-registered *label for the null*, not a finding about a
+comparison that happened.
 
 **`R4`'s symmetric null is what happened, and it was pre-registered as the likely outcome.** `R4`
 says the control is not exempt, that `R1` requires 460 clean row-judgements for one arm to pass and
@@ -205,13 +214,19 @@ says the control is not exempt, that `R1` requires 460 clean row-judgements for 
 arm clears, control included"*. It did. `R4a` — a candidate clearing where the control does not —
 did not arise.
 
-**What `R4` also requires — and the task number in its text is NOT `plan.md`'s.** `R4` says *"T10
-must state plainly when the null is attributable to the instrument rather than to the candidates"*,
-and that `T10` is `PROTOCOL-2.md`'s own numbering, which its role table maps to **whoever writes the
-write-up's second section** — not to `plan.md`'s T10, the item-14a gap test skipped three paragraphs
-above. The two documents number tasks differently, exactly as `GENERATION-2-NOTES.md` §1 warns. **So
-the obligation is live, it is this file's, and it is discharged here rather than skipped with the
-gap test.** The honest answer is **partly, and the split is visible.**
+**What `R4` also requires — and the task number in its text is NOT `plan.md`'s, and is not this
+file's either.** `R4` says *"T10 must state plainly when the null is attributable to the instrument
+rather than to the candidates"*. That `T10` is `PROTOCOL-2.md`'s own numbering, and its role table
+maps it to **"whoever writes `docs/skill-evidence/spec-length.md`'s second section"** — which is
+`plan.md`'s **T11**, the write-up. It is *not* `plan.md`'s T10, the item-14a gap test skipped three
+paragraphs above; the same table maps this file's author to `T7`, *"whoever unblinds, applies the
+gate, and writes `RESULTS-2.md`"*. Three documents number these tasks differently, exactly as
+`GENERATION-2-NOTES.md` §1 warns.
+
+**So the obligation is the write-up's, and it is answered here anyway rather than deferred.** The
+data to answer it exists nowhere else, and leaving it for T11 would risk its being read as skipped
+along with the gap test. **T11 still owes it in its own voice; what follows is this file's answer,
+not a discharge of T11's duty.** The honest answer is **partly, and the split is visible.**
 
 - **Not attributable to the instrument:** the instrument produced a defined disposition for every
   one of the 1380 cells, excluded no row as unciteable, and separated the arms by 23 rows
@@ -274,6 +289,9 @@ comparison could not have detected an inflation of `present` smaller than its ow
 the observed difference is smaller than that floor. It is not evidence that the framing left
 `present` alone; it is evidence that the experiment was not powered to say.**
 
+**And the two passes are not perfectly matched** — a different generation was re-run under `R6` in
+each — **so read the shared-span rows as the finding and the `present` row as the absence of one.**
+
 **The reason this iteration is not result-shaped is that it was blind**, and that is the whole
 warrant. Every instrument revision was authored by a context that had not opened
 `blind-map-2.json`, could not see which generation belonged to which arm, and made no comparison
@@ -309,7 +327,8 @@ that file quotes for comparison:
 > residual scoring risk run harder toward a **false pass** than it did in the first attempt. Two
 > things bound it, and neither closes it: tier 3 answers item 9's own question with more context
 > than a 46-row batch scorer had, and under `R2` a false `present: true` can only ever inflate
-> retention, never eliminate an arm.
+> retention, never eliminate an arm. **The write-up states this as a loosening, reports the tier-3
+> overturn rate, and does not describe the adjudication as complete.**
 
 **In this run 260 of 1334 `present: true` rows were sampled — 19.5%.** The other 80.5% were held to
 the mechanical check alone. Now 7a, quoted from `PROTOCOL-3.md` §4 and not softened:
@@ -322,7 +341,12 @@ the mechanical check alone. Now 7a, quoted from `PROTOCOL-3.md` §4 and not soft
 > It is also a further shift of the residual scoring risk toward a **false pass**, on top of the
 > shift limitation 7 already recorded, and the two compound: a lenient span now costs one flagged
 > row rather than a whole verdict, and under `R2` a false `present: true` can only ever inflate
-> retention, never eliminate an arm.
+> retention, never eliminate an arm. **Three things bound it and none of them closes it:**
+> fabrication is still fatal under class A; every class-B row is escalated to tier 3, which sees the
+> spec and answers item 9's question with more context than a batch scorer had; and the class-B flag
+> count is reported per generation, so a verdict that filed on many flags cannot be read as one that
+> filed on none. **The write-up states this as a loosening, reports the class-B flag rate and the
+> tier-3 overturn rate per generation, and does not describe tier 1 as a gate.**
 
 **And the sentence `PROTOCOL-3.md` §4 requires be carried in its own words:** *if every arm comes out
 at full retention under this instrument, the correct reading is that the instrument did not
@@ -362,6 +386,12 @@ problems, and the distinct set is what tier 3 received.
 | **total** | | **59** | **51** | **51** | **98** | **2** |
 
 **The overturn rate is `overturned / escalated` = 2 / 98 (2.0%)**, and `rescued = 96`.
+
+**Per generation** — required by `PROTOCOL-3.md` §7 item 4 — **the table's own `escalated` and
+`overturned` columns ARE the rate**, stated as a fraction rather than a percentage because on
+denominators of 2 to 23 a percentage would imply a precision the counts do not carry. Two
+generations have a non-zero rate: **`26d7a2` 1/9 and `2c4295` 1/6.** The other fifteen escalating
+generations are **0/n**, and `b2b8cf` escalated nothing, so its rate is undefined rather than zero.
 
 **Per arm, which `PROTOCOL-2.md` item 1 limitation 8 requires alongside the overall figure:**
 
@@ -446,6 +476,17 @@ cites `calibration-2.json` as evidence about an arm.
    `fd2c24` in the discarded pass, and it is not counted, because `SCORING-3-NOTES.md` §3.1 shows
    that catch was read from bytes a still-running scorer then overwrote, in a pass that no longer
    stands. One instance is thinner evidence than "twice" would have been.
+
+   **The full `R6` count, because `R6` says *every* re-run and an earlier draft of this item logged
+   only the tier-3 one.** In the **standing** tier-1 pass there is exactly **one**: `2d2629`, above
+   — `SCORING-3-NOTES.md` §2's table records 32 dispatches, 30 shards plus those 2 re-runs, and
+   **zero dispatches that wrote no file**. In the **discarded** pass there were **three more**:
+   `fd2c24`'s two shards, re-dispatched after a class-A refusal (§3.1's incident), and — implied by
+   §5's 34-dispatches-against-32-files reconciliation — **two dispatches that wrote no file**, which
+   is `R6`'s first trigger. Those three belong to a pass that no longer stands and no figure in this
+   file rests on them, **but they are re-runs and `R6` does not exempt a discarded pass from the
+   log.** Their reasons are on the record here; their per-dispatch detail is not recoverable from
+   the committed files, which is itself a gap and is stated rather than glossed.
 3. **One `R6` re-run, in tier 3.** `fe4059`'s first tier-3 dispatch **wrote no file** — `R6`'s first
    trigger verbatim — returning its answer as reply text instead. The dispatch was re-run whole
    against the byte-identical prompt and the re-run's reply is what `escalation-2/fe4059.json`
@@ -463,8 +504,17 @@ cites `calibration-2.json` as evidence about an arm.
    sentences move scorers. It is open.
 6. **Two defects in the frozen `PROTOCOL-3.md` were recorded and NOT fixed**
    (`SCORING-3-NOTES.md` §9.1), because editing a frozen file would force a rewritten `FREEZE-3.md`
-   hash row. A tool implementing a frozen rule may be fixed to match it; the frozen rule may not
-   move.
+   hash row — the exact breach `FREEZE.md`'s closing section records as the thing not to repeat — or
+   a second row for one path, which `spec_length_3_freeze_rows_still_hash_to_their_files` rejects. A
+   tool implementing a frozen rule may be fixed to match it; the frozen rule may not move.
+
+   **§9.1's conclusion, which is the transferable part and is owed here rather than the mechanism
+   alone: a protocol that says a window-2 edit is permitted-with-disclosure, frozen by a record that
+   makes any edit unrecordable, has one of the two rules doing nothing.** `PROTOCOL-3.md` §6's
+   window 2 is a dead letter. Here that fails safe — the file cannot move — but **a later
+   pre-registration should resolve the contradiction deliberately rather than inherit it**, by
+   either freezing the protocol's *content* separately from its amendment log or dropping the
+   window-2 permission it cannot honour.
 7. **Two changes were made to committed checks, and they run in OPPOSITE directions. Both are
    disclosed, because an earlier draft of this item named only the first and called the net effect
    "strictly harder", which is false of the second.**
@@ -476,10 +526,10 @@ cites `calibration-2.json` as evidence about an arm.
      `spec_length_2_final_disposition_is_the_recorded_join` previously required
      `escalation-2`'s rows to be exactly tier 2's `establishes: false` rows. It now requires them to
      be that set **union** `PROTOCOL-3.md` §3's class-B rows. In the *missing-escalation* direction
-     that is a tightening — 51 more rows must now be answered by tier 3 or the check fails. In the
-     `escalated.difference(&flagged)` direction it is a **loosening**: escalating a class-B row was
-     a hard error under the old check and is now required, so most of this run's escalations would
-     have failed the old form. **The change is mandated by frozen `PROTOCOL-3.md` §3**, which flags
+     that is a tightening — **47** more rows must now be answered by tier 3 or the check fails. In
+     the `escalated.difference(&flagged)` direction it is a **loosening**: escalating a class-B row
+     was a hard error under the old check and is now required, so **47 of this run's 98 escalations
+     (48.0%)** would have failed the old form. **The change is mandated by frozen `PROTOCOL-3.md` §3**, which flags
      a class-B row "exactly as an `establishes: false` flags a row under item 8a" and escalates it
      under item 8b — the old check simply predated §3 — but "strictly harder" was the wrong summary
      and is withdrawn.
@@ -525,6 +575,11 @@ figures are in the task report.
 
 **`FREEZE-3.md` deliberately does not freeze `retention-3/`.** Freezing an output would make an `R6`
 re-run a freeze breach rather than the remedy it is.
+
+**What none of these checks does, and §12 item 12.3 records it as open: nothing verifies that the
+freeze records are COMPLETE.** Every row that exists is re-hashed to its file; no check asks whether
+an artifact that should carry a row is missing one. A freeze record can be wrong by omission, and
+omission is the one failure mode nothing here looks for.
 
 **Pre-registration ordering, executed rather than asserted:**
 `spec_length_3_protocol_precedes_every_retention_3_record` requires `PROTOCOL-3.md`'s commit to
@@ -613,17 +668,67 @@ produced no verdict for any of the four.** The extended cap is why "3 of 12" is 
 denominator to remember and not "3 of 12 on a stingy budget": the budget was raised and the yield
 did not move. That is evidence about the instrument, not about the arms.
 
-**§9.5a item 10 — the present-rate doubt, which no tier-1 number may be published without.** The
-first attempt recorded a **99.8% `present` rate** at tier 1 (`RESULTS.md` §7.5), narrowed by
-`SCORING-2-NOTES.md` §9.3 to `skill-stickiness` and **not withdrawn**. A tier-1 pass that marks
-essentially everything present is measuring something other than retention. **This file publishes 18
-tier-1 counts (§2) and they run 1334/1380 = 96.7% present — lower than 99.8%, and still high enough
-that the doubt is live rather than retired.** It is the same doubt limitation 7a states from the
-other direction, and the two should be read together.
+**§9.5a item 10 — the present-rate doubt, which no tier-1 number may be published without.**
 
-**§9.5a item 12 is still open** — whether re-dispatching two transmission questions was right. It is
-now moot for the outcome, since `R7` skipped the transmission test entirely; it remains open as a
-record question.
+**Whose 99.8% it is, stated first, because this file has already got it wrong once and
+`SCORING-2-NOTES.md` §9.3 records an earlier draft of *that* file getting it wrong in the same
+way.** The **99.8%** figure is the **second** attempt's: §9.3's *"Every `skill-stickiness` round of
+this run sat at a 99.8% present rate (2543 of 2548)"*. **It is not the first attempt's, and `99.8%`
+appears nowhere in `RESULTS.md`.** What v1 recorded is the same *shape* and the same *doubt*
+qualitatively — §7.5's *"implausibly high … four of six generations scored 91/91"* — and §9.3
+forbids characterising v1's rate **at all, "not as higher, lower, or close"**, because such a phrase
+is a quantitative claim wearing a qualitative coat. **No v1 aggregate is derived here, so no
+comparison to v1 is drawn.**
+
+**The doubt itself, which stands undischarged:** a tier-1 pass that marks essentially everything
+present is measuring something other than retention, and §9.3 narrowed the observation to
+`skill-stickiness` without withdrawing it. **This file publishes 18 tier-1 counts (§2), and this
+run's rate is 1334/1380 = 96.7% present.** That is this pass's own figure, comparable to the second
+attempt's 99.8% and to nothing else. It is lower, and it is still high enough that the doubt is live
+rather than retired — which is the same doubt limitation 7a states from the other direction, and the
+two should be read together.
+
+**§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
+not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
+attempts per shard, by scorers handed the frozen rule verbatim** — is itself evidence about the
+instrument: **the tier-1 gate was measuring scorer compliance, and the discriminating load
+accordingly sits on tiers 2 and 3 and the `R2` gate**, exactly as `PROTOCOL-3.md` §4's own sentence
+puts it.
+
+**§9.5a item 12 is four questions, not one, and "nothing else keeps [them] alive" is its own
+wording.** All four, with their state:
+
+1. **The title-variance channel** — **discharged**, §10 of this file.
+2. **Whether re-dispatching two transmission questions was right** (*"decide before T9; the revert is
+   `git revert 6268365`"*) — **still open**, and now moot for the outcome, since `R7` skipped the
+   transmission test entirely. It remains open as a record question and the revert is still the
+   remedy if a later attempt runs that test.
+3. **The 20 `FREEZE-2.md` rows are not checked for completeness** — **still open**. §9 below
+   re-verifies that every row that *exists* hashes to its file; nothing checks that every artifact
+   that *should* have a row has one. A freeze record can be complete-and-wrong only by omission, and
+   omission is exactly what no check here looks for.
+4. **The leak check tells a reader to "re-run under `R6`" for a case `R6`'s closed trigger list does
+   not cover** — **still open**. A generated spec that leaks is not one of `R6`'s three triggers, so
+   the instruction is unactionable as written; `GENERATION-2-NOTES.md` reached the same conclusion
+   independently ("`R6` does not license a re-run either — its trigger list is closed"). Repairing
+   it would mean editing a frozen file, so it is recorded, not fixed.
+
+**§9.5a item 13 — a frozen-instrument inconsistency, and this run's third departure from item 10's
+template.** Item 9's first blockquote — handed verbatim to every scorer, **including all 96 of the
+second attempt's dispatches** — says a paraphrase *"may be evidenced by up to three spans"*, while
+the same prompt's item-8 rules say **1 to 5**. Scorers followed the rules. With `SCORING-2-NOTES.md`
+§2a this is the **second place item 10's template contradicts the items it claims to carry**, and
+the two belong together as one finding about item 10. **`PROTOCOL-3.md` §5 answered it by dropping
+the contradicting clause from the dispatched tier-1 prompt** — pre-registered, and asserted in
+`tools/build-tier1-prompts-3.py` so that a drift in the frozen text fails the build rather than
+silently shipping both numbers. **That drop is a third departure of the dispatched prompt from item
+10's frozen template**, alongside the two precedence sentences deviation 5 records; unlike those, it
+is pre-registered rather than residual. **Item 8b's tier-3 prompt is NOT amended**, so the clause is
+still handed to escalators verbatim — inert there, since an escalator is never shown a span.
+
+**§9.5 item 6 — `FREEZE-2.md` gained no row in this run.** It stands closed at its 20 rows (21 with
+T1's `PROTOCOL-2.md` row). The third freeze record is a separate file, `FREEZE-3.md`, with one row;
+nothing was appended to `FREEZE-2.md` and nothing in it was rewritten.
 
 ### `SCORING-3-NOTES.md` §3.1 — file-exists is not file-final
 

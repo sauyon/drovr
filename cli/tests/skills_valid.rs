@@ -7363,12 +7363,17 @@ fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
 /// other, because §3 replaced the v2 disposition that killed the whole verdict
 /// with one that "flags [the row], exactly as an `establishes: false` flags a
 /// row under `PROTOCOL-2.md` item 8a, and escalate[s it] to tier 3 under item
-/// 8b, whose call governs it". Requiring only tier 2's half would let **51
-/// distinct class-B rows** keep tier 1's call with nothing behind them — which
-/// is the entire consideration that made §3's loosening defensible. (51 rows,
-/// not 59: 59 is the number of `(row, problem)` flags, and a row carrying two
-/// problems is still one row to escalate. The distinct set is what tier 3
-/// receives.)
+/// 8b, whose call governs it". Requiring only tier 2's half would let **47
+/// rows** keep tier 1's call with nothing behind them — which is the entire
+/// consideration that made §3's loosening defensible.
+///
+/// **47, and the two wrong numbers it is easy to write here, because both have
+/// already been written.** 59 is the count of `(row, problem)` flags, and a row
+/// carrying two problems is still one row to escalate. 51 is the count of
+/// *distinct* class-B rows — but **4 of those 51 are also tier-2
+/// `establishes: false` rows**, so tier 2's half already escalates them. The
+/// rows this union actually adds are `classB \ tier2` = **47**, out of an
+/// escalated set of 98.
 ///
 /// **Vacuous while the tier-1 record does not exist.** An `escalation-2/` with
 /// no `retention-3/` is a hard error, not a vacuous case.
