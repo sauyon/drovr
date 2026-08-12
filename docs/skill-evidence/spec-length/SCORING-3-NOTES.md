@@ -91,14 +91,17 @@ convenience.** The class split was not a way of making everything pass. On a fir
 eighteen generations the check still refused a verdict outright, on the one ground that matters.
 Seventeen filed with class-B problems present and unhidden; the eighteenth was refused for inventing
 text. **A gate that refuses fabrication and files everything else is doing the job item 8 was written
-to do**; a gate that also discarded eighty-two sound rows because one span started mid-phrase was
-not.
+to do**; a gate that also discarded **every other row of the same verdict** because one span started
+mid-phrase was not. (An earlier draft put a number on "every other row". It was a figure carried over
+from a pass that had since been re-run, matching nothing in the current data — the same
+stale-by-neighbouring-edit failure §10 row 23 records, which is why the sentence now names no
+count.)
 
 **A class-A refusal also occurred in the discarded pass, on `fd2c24` — but do not count it as a
 second instance.** §3.1 shows that catch was read from bytes a still-running scorer then overwrote,
 and it belongs to a pass that no longer stands. **The honest count is one clean catch in eighteen**,
-and §8a rebuttal 1 says so in the same words. The fatal class is not decorative; it is also not
-demonstrated twice.
+and §8a rebuttal 1 reaches the same count and treats it as thinner evidence than "twice" would have
+been. The fatal class is not decorative; it is also not demonstrated twice.
 
 ### 3.1 A shard was overwritten by its own still-running scorer, after it had been graded
 
