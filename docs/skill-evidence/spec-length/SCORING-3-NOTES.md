@@ -94,8 +94,11 @@ text. **A gate that refuses fabrication and files everything else is doing the j
 to do**; a gate that also discarded eighty-two sound rows because one span started mid-phrase was
 not.
 
-**And it happened in both passes, on different generations** — `fd2c24` under the deviating prompt,
-`2d2629` under the corrected one. The fatal class is not decorative.
+**A class-A refusal also occurred in the discarded pass, on `fd2c24` — but do not count it as a
+second instance.** §3.1 shows that catch was read from bytes a still-running scorer then overwrote,
+and it belongs to a pass that no longer stands. **The honest count is one clean catch in eighteen**,
+and §8a rebuttal 1 says so in the same words. The fatal class is not decorative; it is also not
+demonstrated twice.
 
 ### 3.1 A shard was overwritten by its own still-running scorer, after it had been graded
 
@@ -408,8 +411,8 @@ be disclosed as one** — that it fires on nothing here does not retire the disc
    | §9.5a item 14 — commit the built prompts | **discharged** — `prompt-hashes.txt`; §5.1 |
    | §9.5a 10–13 | **all open**, including item 12's decision that **blocks T9** (whether re-dispatching two transmission questions was right; the revert is `git revert 6268365`) |
 
-   **This file adds to that list rather than shortening it**: §3.1, §5.1 and §5.2 are three new
-   obligations on `RESULTS-2.md`.
+   **This file adds to that list rather than shortening it**: §3.1, §5.1, §5.2 and §8a are new
+   obligations on `RESULTS-2.md`, and item 4 above is the authoritative list of them.
 9. **None of those obligations is test-enforced**, unlike the amendment log and the shard-concatenation
    check. They rely on the same unenforced-prose mechanism that produced most of §10 below. **A later
    task that wants them kept should make one of them executable rather than adding a tenth bullet.**
@@ -483,7 +486,9 @@ loophole a reviewer identified.
 
 **By that count, one has happened**: the corrected-prompt pass of §5.1, which re-dispatched all
 thirty shards. The `2d2629` and `fd2c24` re-dispatches are `R6` re-runs and are excluded by the
-definition; §10's other fourteen rows are edits to files, not dispatches. **A second must be escalated
+definition. **Every other row of §10 is an edit to a file, not a dispatch** — deliberately stated
+without a number, because §10 is append-only and a count written here would be stale the next time a
+row is added, which is how three separate figures in this file have already gone wrong. **A second must be escalated
 to the human driver rather than taken by an agent**, because at some point "the tool did not match
 the rule" stops being a repair and starts being a search.
 
@@ -570,6 +575,7 @@ file under review is false one round later.
 | 20 | **§8a's escalation bound had no countable definition** and could be gamed by calling a re-run a checker patch. A re-run is now defined against the files, the count is **one**, and a second must be escalated. |
 | 21 | §5.1's defence of the two precedence sentences was asserted against this file's own finding that one added sentence moves scorers. Now stated as an argument rather than a fact, with the verbatim third pass **left open for the driver** instead of closed. |
 | 22 | §5.1's noise-floor bound did not say the floor rests on **three** generations. |
+| 23 | **Round 5's own fixes introduced three more of the same defect**, all caught in round 6: §3 still asserted the class-A catch "happened in both passes" after §8a had been corrected to say the honest count is one; the new escalation-bound paragraph cited "§10's other fourteen rows" when this table already had more; and §8 item 8 still said "three new obligations" after item 4 was extended to four. **Every one was a figure or claim typed by hand that a neighbouring edit invalidated** — the failure `SCORING-2-NOTES.md` §9.7 names, repeating inside the corrections table meant to record it. |
 
 ### 10.1 The commit that claimed a green suite it had not run
 
