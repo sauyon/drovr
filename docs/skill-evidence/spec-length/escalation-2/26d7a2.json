@@ -1,0 +1,51 @@
+{
+  "spec_id": "26d7a2",
+  "ledger": "tui-dc-picker",
+  "rows": [
+    {
+      "id": "tui-dc-picker-09",
+      "present": true,
+      "reason": "D2's table states projects load 'when picker opens' via 'ListBenchmarkProjects'."
+    },
+    {
+      "id": "tui-dc-picker-24",
+      "present": false,
+      "reason": "The spec only generically names 'pick nilness on non-picker trees' in the test scope, never naming the specific config/revision/diff tree builders the row requires."
+    },
+    {
+      "id": "tui-dc-picker-34",
+      "present": true,
+      "reason": "D5 states verbatim that helpAdapter.dcLinked loses its DeployConfigID != nil condition so V is advertised on unlinked deployments."
+    },
+    {
+      "id": "tui-dc-picker-35",
+      "present": true,
+      "reason": "D9 gives the exact config node label '\"<name>  (latest v<N>)\"'."
+    },
+    {
+      "id": "tui-dc-picker-36",
+      "present": true,
+      "reason": "D9 states '(shared)' is appended when Shared is true."
+    },
+    {
+      "id": "tui-dc-picker-37",
+      "present": true,
+      "reason": "D9 states '(current)' marks the linked config node and the deployment's current version leaf."
+    },
+    {
+      "id": "tui-dc-picker-38",
+      "present": true,
+      "reason": "D9 gives the exact leaf format and says it reuses the label logic already in newDeployConfigVersionPicker at the cited location, which is sufficient to recover the trunc/sanitizeCell mechanism."
+    },
+    {
+      "id": "tui-dc-picker-39",
+      "present": true,
+      "reason": "D9 states '(latest)' marks the newest version."
+    },
+    {
+      "id": "tui-dc-picker-55",
+      "present": true,
+      "reason": "Scope boundaries explicitly list 'Plus mise run go:lint.' as required."
+    }
+  ]
+}

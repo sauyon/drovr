@@ -1,0 +1,77 @@
+{
+  "spec_id": "2d2629",
+  "ledger": "tiered-review",
+  "sample_rule": "every 5th present:true row in ledger order, 1-based among present:true rows",
+  "pairs": [
+    {
+      "n": 1,
+      "row": "tiered-review-06",
+      "establishes": false
+    },
+    {
+      "n": 2,
+      "row": "tiered-review-16",
+      "establishes": true
+    },
+    {
+      "n": 3,
+      "row": "tiered-review-21",
+      "establishes": false
+    },
+    {
+      "n": 4,
+      "row": "tiered-review-29",
+      "establishes": false
+    },
+    {
+      "n": 5,
+      "row": "tiered-review-36",
+      "establishes": false
+    },
+    {
+      "n": 6,
+      "row": "tiered-review-42",
+      "establishes": true
+    },
+    {
+      "n": 7,
+      "row": "tiered-review-47",
+      "establishes": true
+    },
+    {
+      "n": 8,
+      "row": "tiered-review-52",
+      "establishes": false
+    },
+    {
+      "n": 9,
+      "row": "tiered-review-57",
+      "establishes": false
+    },
+    {
+      "n": 10,
+      "row": "tiered-review-62",
+      "establishes": true
+    },
+    {
+      "n": 11,
+      "row": "tiered-review-67",
+      "establishes": true
+    },
+    {
+      "n": 12,
+      "row": "tiered-review-72",
+      "establishes": true
+    },
+    {
+      "n": 13,
+      "row": "tiered-review-77",
+      "establishes": true
+    },
+    {
+      "n": 14,
+      "row": "tiered-review-82",
+      "establishes": true
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "spec_id": "031cc4",
+  "ledger": "tui-dc-picker",
+  "sample_rule": "every 5th present:true row in ledger order, 1-based among present:true rows",
+  "pairs": [
+    {
+      "n": 1,
+      "row": "tui-dc-picker-07",
+      "establishes": true
+    },
+    {
+      "n": 2,
+      "row": "tui-dc-picker-12",
+      "establishes": false
+    },
+    {
+      "n": 3,
+      "row": "tui-dc-picker-17",
+      "establishes": true
+    },
+    {
+      "n": 4,
+      "row": "tui-dc-picker-22",
+      "establishes": false
+    },
+    {
+      "n": 5,
+      "row": "tui-dc-picker-27",
+      "establishes": true
+    },
+    {
+      "n": 6,
+      "row": "tui-dc-picker-32",
+      "establishes": true
+    },
+    {
+      "n": 7,
+      "row": "tui-dc-picker-37",
+      "establishes": true
+    },
+    {
+      "n": 8,
+      "row": "tui-dc-picker-42",
+      "establishes": true
+    },
+    {
+      "n": 9,
+      "row": "tui-dc-picker-47",
+      "establishes": true
+    },
+    {
+      "n": 10,
+      "row": "tui-dc-picker-52",
+      "establishes": true
+    }
+  ]
+}

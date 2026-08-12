@@ -1,0 +1,71 @@
+{
+  "spec_id": "48527b",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-13",
+      "present": true,
+      "reason": "\u00a73.3 states whole-change triage is 'a conservative rule (not a model judgement) on near-certain cases'."
+    },
+    {
+      "id": "tiered-review-24",
+      "present": true,
+      "reason": "\u00a74.3 explicitly lists 'Docs-only PRs excluded.'"
+    },
+    {
+      "id": "tiered-review-27",
+      "present": true,
+      "reason": "\u00a74.3 states 'a thin cell is recorded as thin, never merged into a neighbour.'"
+    },
+    {
+      "id": "tiered-review-29",
+      "present": true,
+      "reason": "\u00a74.4 step 3 requires a single introducing commit and rejects fan-out/non-clean attribution."
+    },
+    {
+      "id": "tiered-review-34",
+      "present": true,
+      "reason": "\u00a74.5 gives the exact three labels: verified-real, unverified, and rejected with reason recorded."
+    },
+    {
+      "id": "tiered-review-61",
+      "present": true,
+      "reason": "\u00a76.4 states per-stratum numbers are always reported alongside pooling."
+    },
+    {
+      "id": "tiered-review-62",
+      "present": true,
+      "reason": "\u00a76.4 states heterogeneous per-stratum recall means the pooled figure isn't the headline and the discrepant stratum is reported as the finding."
+    },
+    {
+      "id": "tiered-review-73",
+      "present": true,
+      "reason": "\u00a77 states read-only is enforced via '--agent plan' with '--auto' absent."
+    },
+    {
+      "id": "tiered-review-74",
+      "present": true,
+      "reason": "\u00a77 states readonly_displace (cli/src/config.rs:589) runs first, i.e. before the cheap tier launches."
+    },
+    {
+      "id": "tiered-review-78",
+      "present": true,
+      "reason": "\u00a79 lists changing the angle set, severity model, merge or resume path as out of scope, matching the row exactly."
+    },
+    {
+      "id": "tiered-review-79",
+      "present": true,
+      "reason": "\u00a79 lists 'a second measurement instrument' as out of scope."
+    },
+    {
+      "id": "tiered-review-80",
+      "present": true,
+      "reason": "\u00a79 states fixing docs/known-issues.md:3437 is out of scope, with the pane bug staying open and documented while the headless tier routes around it."
+    },
+    {
+      "id": "tiered-review-81",
+      "present": true,
+      "reason": "\u00a79 lists 'any tier between qwen and opus' as out of scope."
+    }
+  ]
+}

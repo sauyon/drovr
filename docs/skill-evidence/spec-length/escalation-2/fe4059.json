@@ -1,0 +1,41 @@
+{
+  "spec_id": "fe4059",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-09",
+      "present": true,
+      "reason": "Spec states flowcharts are fenced `dot` blocks and separately notes rendering them in the review UI is out of scope, which is the source of the 'legible unrendered' framing."
+    },
+    {
+      "id": "skill-stickiness-20",
+      "present": true,
+      "reason": "Spec says docs/known-issues.md gets exactly one entry, in the file's standard convention, recording the scoping defect described as all four discipline skills' descriptions being phase-scoped."
+    },
+    {
+      "id": "skill-stickiness-27",
+      "present": true,
+      "reason": "Spec states hooks/hooks.json gains a UserPromptSubmit entry running hooks/user-prompt, which execs `drovr reflex --gate`."
+    },
+    {
+      "id": "skill-stickiness-28",
+      "present": true,
+      "reason": "Spec explicitly says the UserPromptSubmit entry has no matcher, unlike SessionStart's startup|clear|compact, which must not be copied across."
+    },
+    {
+      "id": "skill-stickiness-55",
+      "present": true,
+      "reason": "Spec's loop repeats until a run produces no new rationalization or the \u00a76.3 REFACTOR ceiling is reached, whichever first; the section number differs but is a fixture-internal cross-reference and the pointed-at ceiling content is present."
+    },
+    {
+      "id": "skill-stickiness-66",
+      "present": true,
+      "reason": "Spec gives a per-stage ceiling table totaling approximately 122 runs and explicitly calls the budget a hard ceiling."
+    },
+    {
+      "id": "skill-stickiness-87",
+      "present": true,
+      "reason": "Spec's out-of-scope list explicitly excludes any change to the phase state machine, the review gate, or drovr code-review itself."
+    }
+  ]
+}

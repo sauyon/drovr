@@ -1,0 +1,26 @@
+{
+  "spec_id": "6e7393",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-26",
+      "present": true,
+      "reason": "\u00a74.1 states items 2\u20135 (1% rule, per-turn rule, priority ladder, gate function) sit outside every reflex:section marker, and only [reflex] enabled = false removes the routing core while [reflex.sections] cannot."
+    },
+    {
+      "id": "skill-stickiness-36",
+      "present": true,
+      "reason": "\u00a74.2 states step 1 of \u00a70 verifies empirically whether the hook fires for Agent-tool subagents, with the answer recorded in docs/skill-evidence/per-turn-gate.md."
+    },
+    {
+      "id": "skill-stickiness-46",
+      "present": true,
+      "reason": "\u00a76 gives the template 'Using drovr:<skill> to <purpose>.' followed by four shipped announcement sentences, one for each discipline skill."
+    },
+    {
+      "id": "skill-stickiness-56",
+      "present": true,
+      "reason": "\u00a77.1's loop and the root-cause description both specify transcribing every excuse/rationalization verbatim."
+    }
+  ]
+}

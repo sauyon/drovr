@@ -1,0 +1,87 @@
+{
+  "spec_id": "fd230c",
+  "ledger": "tiered-review",
+  "sample_rule": "every 5th present:true row in ledger order, 1-based among present:true rows",
+  "pairs": [
+    {
+      "n": 1,
+      "row": "tiered-review-05",
+      "establishes": false
+    },
+    {
+      "n": 2,
+      "row": "tiered-review-10",
+      "establishes": true
+    },
+    {
+      "n": 3,
+      "row": "tiered-review-15",
+      "establishes": true
+    },
+    {
+      "n": 4,
+      "row": "tiered-review-20",
+      "establishes": true
+    },
+    {
+      "n": 5,
+      "row": "tiered-review-25",
+      "establishes": false
+    },
+    {
+      "n": 6,
+      "row": "tiered-review-30",
+      "establishes": false
+    },
+    {
+      "n": 7,
+      "row": "tiered-review-35",
+      "establishes": true
+    },
+    {
+      "n": 8,
+      "row": "tiered-review-40",
+      "establishes": true
+    },
+    {
+      "n": 9,
+      "row": "tiered-review-45",
+      "establishes": true
+    },
+    {
+      "n": 10,
+      "row": "tiered-review-50",
+      "establishes": true
+    },
+    {
+      "n": 11,
+      "row": "tiered-review-55",
+      "establishes": true
+    },
+    {
+      "n": 12,
+      "row": "tiered-review-60",
+      "establishes": true
+    },
+    {
+      "n": 13,
+      "row": "tiered-review-65",
+      "establishes": true
+    },
+    {
+      "n": 14,
+      "row": "tiered-review-70",
+      "establishes": true
+    },
+    {
+      "n": 15,
+      "row": "tiered-review-75",
+      "establishes": true
+    },
+    {
+      "n": 16,
+      "row": "tiered-review-80",
+      "establishes": true
+    }
+  ]
+}

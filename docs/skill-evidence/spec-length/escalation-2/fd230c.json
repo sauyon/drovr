@@ -1,0 +1,21 @@
+{
+  "spec_id": "fd230c",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-05",
+      "present": true,
+      "reason": "The \u00a73 decision table gives exactly these three thresholds and design mappings."
+    },
+    {
+      "id": "tiered-review-25",
+      "present": true,
+      "reason": "\u00a75.4 states quite-app cannot carry class 1, and \u00a77.5 point 4 states class 1 rests on modular and neovim only."
+    },
+    {
+      "id": "tiered-review-30",
+      "present": true,
+      "reason": "\u00a75.5 step 4 states the introducing commit's pre-merge PR is the fixture and the fix commit's diff is the human-authored defect label."
+    }
+  ]
+}

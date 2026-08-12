@@ -6057,18 +6057,43 @@ fn read_spec_length_2_fixture_map() -> Option<BTreeMap<String, String>> {
     }))
 }
 
-/// Every assembled tier-1 verdict under `retention-2/`, keyed by file stem.
+/// **The tier-1 record this run's tiers 2 and 3 adjudicate, and whose gate
+/// figures `RESULTS-2.md` reports: `retention-3/`.**
+///
+/// **Why this is `retention-3/` and not `retention-2/`, which is the one
+/// interface decision the tier-2 task had to take.** `PROTOCOL-2.md` item 8a
+/// draws its sample from "that file's `present: true` rows", where *that file*
+/// is the generation's tier-1 verdict; item 8b escalates rows out of the same
+/// verdict; item 12's join and `R8` read the same dispositions.
+/// `PROTOCOL-3.md` §5 replaces the tier-1 pass those items name — **all
+/// eighteen generations are re-scored into `retention-3/`**, uniformly, and
+/// `retention-2/` is explicitly "not edited, not deleted, and not
+/// re-interpreted". So `retention-3/` **is** the tier-1 record for every
+/// downstream item, and a helper still pointing at `retention-2/` would draw
+/// tier 2's sample from three verdicts out of eighteen.
+///
+/// **This is a tool brought into compliance with a frozen rule, not a frozen
+/// rule moved.** Nothing in `PROTOCOL-2.md` or `PROTOCOL-3.md` is edited, and
+/// the check is strictly harder afterwards than before: it now recomputes 18
+/// samples where it could only ever have recomputed 3.
+///
+/// **`retention-2/` keeps its own checks and its own reader.**
+/// [`spec_length_2_retention_verdicts_are_complete_and_quoted`] still reads
+/// `retention-2/` and still grades it under the v2 rules, so the second
+/// attempt's record stays checked as the record of what the v2 instrument
+/// produced — which is what `PROTOCOL-3.md` §5 requires of it.
+///
 /// `None` when the directory does not exist.
 ///
 /// **Panics on a stray or a malformed file rather than collecting complaints,
 /// and that is a division of labour, not a shortcut.**
-/// [`spec_length_2_retention_verdicts_are_complete_and_quoted`] owns the
+/// [`spec_length_3_retention_verdicts_are_complete_and_quoted`] owns the
 /// item-8 shape report and names every problem in one run; the callers of this
 /// helper are the *join* and *arithmetic* checks, which have nothing useful to
 /// say about a file they cannot parse and must not compute a gate figure from a
 /// partial read.
-fn read_spec_length_2_verdicts() -> Option<BTreeMap<String, RetentionVerdict>> {
-    let dir = spec_length_2_retention_dir();
+fn read_tier1_verdicts_of_record() -> Option<BTreeMap<String, RetentionVerdict>> {
+    let dir = spec_length_3_retention_dir();
     let scan = scan_retention_dir(&dir)?;
     assert!(
         scan.strays.is_empty(),
@@ -6093,7 +6118,7 @@ fn read_spec_length_2_verdicts() -> Option<BTreeMap<String, RetentionVerdict>> {
         let verdict: RetentionVerdict = serde_json::from_str(&text).unwrap_or_else(|e| {
             panic!(
                 "{}: does not match `PROTOCOL-2.md` item 8's schema: {e}\n\n\
-                 `spec_length_2_retention_verdicts_are_complete_and_quoted` reports every \
+                 `spec_length_3_retention_verdicts_are_complete_and_quoted` reports every \
                  shape problem in one pass; this check refuses to compute anything from a \
                  verdict set it could not read whole.",
                 path.display()
@@ -7222,22 +7247,24 @@ fn spec_length_2_retention_verdicts_are_complete_and_quoted() {
 /// audited on the same rows of its own ledger.
 ///
 /// **Vacuous until the tier-2 pass runs.** An `adjudication-2/<id>.json` with no
-/// `retention-2/<id>.json` behind it is a hard error, not a vacuous case: there
-/// is nothing to recompute the sample from.
+/// tier-1 verdict behind it is a hard error, not a vacuous case: there is
+/// nothing to recompute the sample from. The tier-1 record is
+/// [`read_tier1_verdicts_of_record`] — `retention-3/`, for the reason its doc
+/// comment gives.
 #[test]
 fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
     let dir = spec_length_2_adjudication_dir();
     let Some(records) = read_json_records::<Adjudication2Record>(&dir) else {
         return;
     };
-    let verdicts = read_spec_length_2_verdicts().unwrap_or_else(|| {
+    let verdicts = read_tier1_verdicts_of_record().unwrap_or_else(|| {
         panic!(
             "{} holds {} adjudication(s) but {} does not exist. Item 8a adjudicates a sample \
              of a tier-1 verdict's own rows; with no verdicts there is nothing the sample \
              could have been drawn from.",
             dir.display(),
             records.len(),
-            spec_length_2_retention_dir().display(),
+            spec_length_3_retention_dir().display(),
         )
     });
 
@@ -7259,7 +7286,7 @@ fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
         }
         let Some(verdict) = verdicts.get(stem) else {
             wrong.push(format!(
-                "  {stem}: no `retention-2/{stem}.json`, so the sample cannot be recomputed \
+                "  {stem}: no `retention-3/{stem}.json`, so the sample cannot be recomputed \
                  and the pairs below are unauditable"
             ));
             continue;
@@ -7327,25 +7354,35 @@ fn spec_length_2_adjudication_sample_matches_the_stride_rule() {
 /// final `present` a *derived* quantity for the first time, and a derived
 /// quantity nobody recomputes is one a hand edit can move.
 ///
-/// It also checks item 8b's two-way correspondence with tier 2: a row in
-/// `escalation-2/` that tier 2 did not flag is a hard error, and so is a flagged
-/// row missing from it.
+/// It also checks item 8b's two-way correspondence with **the whole flagged
+/// set**: a row in `escalation-2/` that nothing flagged is a hard error, and so
+/// is a flagged row missing from it.
 ///
-/// **Vacuous while `retention-2/` does not exist.** An `escalation-2/` with no
-/// `retention-2/` is a hard error, not a vacuous case.
+/// **The flagged set has two sources under `PROTOCOL-3.md` §3, and this check
+/// requires the union.** Tier 2's `establishes: false` rows are one;
+/// [`class_b_flagged_rows`] — boundary-refused and shared spans — are the
+/// other, because §3 replaced the v2 disposition that killed the whole verdict
+/// with one that "flags [the row], exactly as an `establishes: false` flags a
+/// row under `PROTOCOL-2.md` item 8a, and escalate[s it] to tier 3 under item
+/// 8b, whose call governs it". Requiring only tier 2's half would let 59
+/// class-B rows keep tier 1's call with nothing behind them — which is the
+/// entire consideration that made §3's loosening defensible.
+///
+/// **Vacuous while the tier-1 record does not exist.** An `escalation-2/` with
+/// no `retention-3/` is a hard error, not a vacuous case.
 #[test]
 fn spec_length_2_final_disposition_is_the_recorded_join() {
     let escalations =
         read_json_records::<EscalationRecord>(&spec_length_2_escalation_dir()).unwrap_or_default();
-    let Some(verdicts) = read_spec_length_2_verdicts() else {
+    let Some(verdicts) = read_tier1_verdicts_of_record() else {
         assert!(
             escalations.is_empty(),
-            "{} holds {} escalation(s) but {} does not exist. Tier 3 answers rows tier 2 \
-             flagged in a tier-1 verdict; an escalation with no verdict behind it is a \
-             disposition with no record behind it.",
+            "{} holds {} escalation(s) but {} does not exist. Tier 3 answers rows flagged in \
+             a tier-1 verdict; an escalation with no verdict behind it is a disposition with \
+             no record behind it.",
             spec_length_2_escalation_dir().display(),
             escalations.len(),
-            spec_length_2_retention_dir().display(),
+            spec_length_3_retention_dir().display(),
         );
         return;
     };
@@ -7365,9 +7402,11 @@ fn spec_length_2_final_disposition_is_the_recorded_join() {
     let adjudications =
         read_json_records::<Adjudication2Record>(&spec_length_2_adjudication_dir())
             .unwrap_or_default();
+    let class_b = class_b_flagged_rows();
     let mut wrong: Vec<String> = Vec::new();
     for id in verdicts.keys() {
-        let flagged: BTreeSet<&str> = adjudications
+        // The flagged set, both halves. Tier 2's `establishes: false` rows...
+        let mut flagged: BTreeSet<&str> = adjudications
             .get(id)
             .map(|a| {
                 a.pairs
@@ -7377,6 +7416,11 @@ fn spec_length_2_final_disposition_is_the_recorded_join() {
                     .collect()
             })
             .unwrap_or_default();
+        // ...and `PROTOCOL-3.md` §3's class-B rows, recomputed from the verdict
+        // and the spec rather than read out of any field a scorer wrote.
+        if let Some(rows) = class_b.get(id) {
+            flagged.extend(rows.iter().map(String::as_str));
+        }
         let escalated: BTreeSet<&str> = escalations
             .get(id)
             .map(|e| e.rows.iter().map(|r| r.id.as_str()).collect())
@@ -7384,14 +7428,16 @@ fn spec_length_2_final_disposition_is_the_recorded_join() {
 
         for row in escalated.difference(&flagged) {
             wrong.push(format!(
-                "  {id}: `escalation-2` answers `{row}`, which tier 2 did not flag. Tier 3 \
-                 runs on the flagged set and nothing else — a row escalated without a tier-2 \
-                 `establishes: false` behind it is an override that chose its own scope."
+                "  {id}: `escalation-2` answers `{row}`, which nothing flagged. Tier 3 runs \
+                 on the flagged set and nothing else — a row escalated without a tier-2 \
+                 `establishes: false` or a `PROTOCOL-3.md` §3 class-B problem behind it is an \
+                 override that chose its own scope."
             ));
         }
         for row in flagged.difference(&escalated) {
             wrong.push(format!(
-                "  {id}: tier 2 flagged `{row}` and no `escalation-2` record answers it. A \
+                "  {id}: `{row}` is flagged (tier 2 `establishes: false`, or a class-B span \
+                 problem under `PROTOCOL-3.md` §3) and no `escalation-2` record answers it. A \
                  flagged row keeps tier 1's call by default, so a missing escalation is a \
                  silent decision not to look."
             ));
@@ -8225,7 +8271,7 @@ fn spec_length_2_calibration_is_the_recorded_flagged_set() {
 /// were failures of an *earlier* correction. Every case had the same cause: a
 /// number written from memory beside one that had been recomputed. The three
 /// tables below are parsed by exact header string and every cell is recomputed
-/// from `retention-2/`, `escalation-2/`, `adjudication-2/`, `blind-map-2.json`
+/// from `retention-3/`, `escalation-2/`, `adjudication-2/`, `blind-map-2.json`
 /// and the frozen ledgers.
 ///
 /// **The headers are pinned; the punctuation around the numbers is not.** A cell
@@ -8241,8 +8287,8 @@ fn spec_length_2_gate_arithmetic_matches_the_records() {
     };
     let whose = path.display().to_string();
 
-    let verdicts = read_spec_length_2_verdicts().unwrap_or_else(|| {
-        panic!("{whose} exists but {} does not", spec_length_2_retention_dir().display())
+    let verdicts = read_tier1_verdicts_of_record().unwrap_or_else(|| {
+        panic!("{whose} exists but {} does not", spec_length_3_retention_dir().display())
     });
     let escalations =
         read_json_records::<EscalationRecord>(&spec_length_2_escalation_dir()).unwrap_or_default();
@@ -8287,7 +8333,7 @@ fn spec_length_2_gate_arithmetic_matches_the_records() {
             continue;
         };
         let Some(verdict) = verdicts.get(&id) else {
-            wrong.push(format!("  {id}: no `retention-2/{id}.json`"));
+            wrong.push(format!("  {id}: no `retention-3/{id}.json`"));
             continue;
         };
         if !tabled.insert(id.clone()) {
@@ -19062,6 +19108,53 @@ fn read_retention_3_verdict(
         )
     })?;
     Ok((stem, verdict, ids, spec))
+}
+
+/// Every row of `retention-3/` carrying a **class-B** problem, keyed by
+/// generation id — a boundary-refused span, or a span cited for more than one
+/// row within the verdict.
+///
+/// **This is the second half of tier 3's input set, and it is recomputed here
+/// rather than recorded anywhere.** `PROTOCOL-3.md` §3 makes a class-B row
+/// "flagged, exactly as an `establishes: false` flags a row under
+/// `PROTOCOL-2.md` item 8a, and escalated to tier 3 under item 8b, whose call
+/// governs it". So the escalation set is the union of two sources — tier 2's
+/// `establishes: false` rows and these — and neither one alone is it.
+///
+/// **No field a scorer writes can move this set.** It is derived from the
+/// verdict's own spans against the generated spec by
+/// [`check_retention_verdict`] under [`RETENTION_RULES_V3`], the same call
+/// `spec_length_3_class_b_flags_are_reported_and_never_fatal` makes. A verdict
+/// cannot declare itself unflagged.
+///
+/// **A verdict that will not read contributes nothing rather than panicking**:
+/// that is a class-A failure, and
+/// `spec_length_3_retention_verdicts_are_complete_and_quoted` is the check that
+/// owns reporting it.
+fn class_b_flagged_rows() -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(scan) = scan_retention_dir(&spec_length_3_retention_dir()) else {
+        return out;
+    };
+    for path in &scan.verdicts {
+        let Ok((stem, verdict, ids, spec)) = read_retention_3_verdict(path) else {
+            continue;
+        };
+        let complaints = check_retention_verdict(
+            &stem,
+            &verdict,
+            &ids,
+            &spec,
+            SPEC_LENGTH_2_ID_POOL,
+            RETENTION_RULES_V3,
+        );
+        let rows = out.entry(stem).or_default();
+        for (row, _) in &complaints.flagged {
+            rows.insert(row.clone());
+        }
+    }
+    out.retain(|_, rows| !rows.is_empty());
+    out
 }
 
 /// The real fenced TOML block of `generated-2/b49ff1.md:285-292`.

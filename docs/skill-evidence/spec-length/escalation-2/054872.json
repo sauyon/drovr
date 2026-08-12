@@ -1,0 +1,46 @@
+{
+  "spec_id": "054872",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-14",
+      "present": true,
+      "reason": "The spec states per-file routing is retained as a measured control arm regardless of which design wins."
+    },
+    {
+      "id": "tiered-review-19",
+      "present": true,
+      "reason": "Stratum D is explicitly drovr's own skill-stickiness findings, M and Q are named as modularml/modular and quitesh/quite-app, and N is Neovim, together giving all four sourced strata."
+    },
+    {
+      "id": "tiered-review-20",
+      "present": true,
+      "reason": "The spec says every stratum (D, M, Q, N) is probed by every router model and that this removes the earlier two-legs structure entirely."
+    },
+    {
+      "id": "tiered-review-43",
+      "present": true,
+      "reason": "The spec names router_model options qwen and sonnet, strata D/M/Q/N, classes 1/2/3, and per-file routing as a control arm run alongside."
+    },
+    {
+      "id": "tiered-review-63",
+      "present": true,
+      "reason": "The spec gives the MANIFEST freezing detail for D and N nearly verbatim, including the shape reference, blob SHAs, commit cell, header-resolved columns, and re-checking test."
+    },
+    {
+      "id": "tiered-review-64",
+      "present": true,
+      "reason": "The spec states strata M and Q are frozen the same way in the private corpus directory with only row count and manifest digest committed publicly."
+    },
+    {
+      "id": "tiered-review-74",
+      "present": true,
+      "reason": "The spec states readonly_displace (cli/src/config.rs:589) runs first, in the context of the cheap tier execution contract, i.e. before it launches."
+    },
+    {
+      "id": "tiered-review-78",
+      "present": true,
+      "reason": "The spec's Out of scope section lists changing the angle set, severity model, or the merge/resume path."
+    }
+  ]
+}
