@@ -5,10 +5,11 @@ The running record of the tier-1 pass `PROTOCOL-3.md` governs. It is the **`R6` 
 **not orphaned**: `spec_length_3_protocol_stops_moving_after_the_first_verdict` reads this file for
 the SHA of every commit that amends `PROTOCOL-3.md`, so a run that deletes or empties it fails.
 
-**Read §3.1, §5.1 and §5.2 before quoting any number out of this file.** Each bounds what the numbers
-mean: a shard overwritten under the assembler, a scorer prompt that carried more than the
-pre-registration sanctioned and had to be corrected and the whole pass re-run, and a
-one-to-three-row noise floor between two dispatches of the same document.
+**Read §3.1, §5.1, §5.2 and §8a before quoting any number out of this file.** Each bounds what the
+numbers mean: a shard overwritten under the assembler, a scorer prompt that carried more than the
+pre-registration sanctioned and had to be corrected and the whole pass re-run, a one-to-three-row
+noise floor between two dispatches of the same document, and — the one a hostile reader will reach
+for first — the fact that **every revision of this check has loosened it**.
 
 `SCORING-2-NOTES.md` remains the record of the **second** instrument's pass and is not edited here.
 Nothing in this file re-interprets `retention-2/`.
@@ -248,13 +249,24 @@ saying only which text governs where that section and the frozen item-8 schema d
 > Where this section and the item-8 schema above differ on what a violation costs, this section
 > governs.
 
-**They are not nothing and they are not neutral by assertion.** The defence is that three frozen
-texts are handed over and two of them contradict each other on the page — item 8's closing sentence
-says a verdict whose spans violate the rule is malformed and re-run whole, which §3 replaces — so a
-scorer not told which governs has to guess, and a guess is a bigger intervention than a precedence
-statement. Neither sentence says what to score or how to cite. **But `PROTOCOL-3.md` §5 says
-"verbatim", and this is not verbatim; it is verbatim plus two sentences of precedence.** Recorded as
-the residual deviation rather than argued away, and **`RESULTS-2.md` inherits it**.
+**They are not nothing, and the defence of them is an argument, not a measurement.** The argument:
+three frozen texts are handed over and two contradict each other on the page — item 8's closing
+sentence says a verdict whose spans violate the rule is malformed and re-run whole, which §3 replaces
+— so a scorer not told which governs has to guess, and a guess is plausibly a bigger intervention
+than a precedence statement. Neither sentence says what to score or how to cite.
+
+**But that is asserted, not tested, and it runs against this file's own strongest finding.** §5.1's
+whole point is that *one* added framing sentence moved scorer behaviour measurably. Two added
+sentences are therefore exactly the kind of thing this file has just finished proving it cannot
+wave through, and **both of them point the scorer toward the newer, looser text** — which is
+indistinguishable in form from the pattern §8a is about. **`PROTOCOL-3.md` §5 says "verbatim", and
+this is not verbatim.**
+
+**A genuinely verbatim third pass was the more rigorous option and it was not run.** The reason is
+§8a's bound, not a claim that the sentences are harmless: a third full pass is a decision for the
+human driver, and taking it unilaterally after two passes is the search §8a exists to stop.
+**Recorded as the residual deviation rather than argued away**, flagged for `RESULTS-2.md`, and
+**left as a live option for the driver** rather than closed.
 
 **And it is no longer the author's word.** `retention-3/parts/prompt-hashes.txt` records the SHA-256
 of all thirty prompts as dispatched, and re-running the committed builder reproduces them byte for
@@ -282,8 +294,11 @@ different generation was re-run in each under `R6`), so read the shared-span row
 the `present` row as the absence of one.
 
 **And "not observed" must not be over-read into "not there", because §5.2 bounds it.** Eight rows
-across eighteen generations is **well inside** the one-to-three-rows-per-generation noise floor §5.2
-measures — a floor that would allow a swing of roughly ±18 to ±54 rows over a corpus this size. **The
+across eighteen generations is **inside** the one-to-three-rows-per-generation noise floor §5.2
+measures — a floor that would allow a swing of roughly ±18 to ±54 rows over a corpus this size, and
+8 is below even its lower end. **The floor itself rests on only three generations**, which is thin;
+the conclusion survives on the conservative end alone, and that is the only form in which it should
+be quoted. **The
 honest statement is that this comparison could not have detected an inflation of `present` smaller
 than its own noise floor, and the observed difference is smaller than that floor.** It is not
 evidence that the framing left `present` alone; it is evidence that the experiment was not powered to
@@ -369,9 +384,11 @@ be disclosed as one** — that it fires on nothing here does not retire the disc
 3. **Tier 3's input is item 8a's flagged rows PLUS the 59 class-B rows this pass produced.** The
    class-B set is **recomputed from the verdict and the spec** by the suite — there is no field a
    scorer could write to forge one.
-4. **`RESULTS-2.md` must carry `PROTOCOL-3.md` §7's seven items in full**, plus §3.1, §5.1 and §5.2 of
-   this file, limitation 7a beside limitation 7, the class-B flag rate per generation, and the tier-3
-   overturn rate per generation.
+4. **`RESULTS-2.md` must carry `PROTOCOL-3.md` §7's seven items in full**, plus **§3.1, §5.1, §5.2
+   and §8a** of this file, limitation 7a beside limitation 7, the class-B flag rate per generation,
+   and the tier-3 overturn rate per generation. **§8a is on this list deliberately**: it is the
+   strongest objection to the whole run, and a write-up author discharging this checklist
+   mechanically must not be able to omit it.
 5. **Three tier-1 instruments and two passes of the third**, and the write-up names all of them.
    *"We fixed it until data appeared"* is honest only with the count and the reasons attached.
 6. **Iteration stops at the join.** No further tier-1 instrument revision may be authored by, or on
@@ -388,7 +405,8 @@ be disclosed as one** — that it fires on nothing here does not retire the disc
    | 7(a) — `RESULTS-2.md` must carry the duplicate-shard finding | open, owed to T8 |
    | 2, 3 — the §2b cap and `tui-dc-picker`'s single shard | superseded by `PROTOCOL-3.md` §5's own cap and sharding; not a debt |
    | 5, 6, 8, 9 | open, all owed to `RESULTS-2.md` |
-   | §9.5a 10–14 | **all open**, including item 12's decision that **blocks T9** (whether re-dispatching two transmission questions was right; the revert is `git revert 6268365`) |
+   | §9.5a item 14 — commit the built prompts | **discharged** — `prompt-hashes.txt`; §5.1 |
+   | §9.5a 10–13 | **all open**, including item 12's decision that **blocks T9** (whether re-dispatching two transmission questions was right; the revert is `git revert 6268365`) |
 
    **This file adds to that list rather than shortening it**: §3.1, §5.1 and §5.2 are three new
    obligations on `RESULTS-2.md`.
@@ -415,20 +433,33 @@ upper bound rather than a measurement.
 **What is not true in it, and why the distinction is checkable rather than rhetorical.**
 
 1. **Fabrication was never loosened, and it still fires.** A span that is not in the document has been
-   fatal under all three instruments, and class A refused a verdict on that ground in **both** passes
-   of the third — `fd2c24`, then `2d2629` with twenty-nine invented spans. A tuned-until-it-passes
-   instrument does not refuse 1 in 18 on its strictest rule, twice.
+   fatal under all three instruments, and in the counted pass class A refused `2d2629` outright over
+   twenty-nine invented spans. **One clean catch in eighteen, not two** — an earlier draft of this
+   sentence also counted `fd2c24` from the discarded pass, and a reviewer was right that it should
+   not: §3.1 shows that catch was read from bytes a still-running scorer then overwrote, so it is
+   murky and it is in a pass that no longer stands. **The honest count is one.** A
+   tuned-until-it-passes instrument does not refuse 1 in 18 on its strictest rule; but one instance
+   is one instance, and it is thinner evidence than "twice" suggested.
 2. **Two changes this run TIGHTENED the checking**, and they are in the same diff as the loosenings:
    `spec_length_3_every_verdict_is_its_shards_concatenated` is a constraint that did not exist before
    (§3.1), and clause F's leading-whitespace rule was narrowed after review found it over-accepting.
-   The suite went from 109 checks to 121.
-3. **The loosenings were argued from a mechanism, before the outcome was known.** §1's diagnosis —
-   four configuration-key rows uncitable by construction — was derived from the *second* attempt's
-   committed refusal record and is re-executed by a test, and `PROTOCOL-3.md` was committed before any
-   `retention-3/` record existed, which `git log` settles.
+   **Only the second of those tightens what a generated spec must show to pass.** The suite grew from
+   109 checks to 121, but **that growth is mostly bookkeeping and provenance** — freeze hashes, commit
+   ordering, shard/verdict agreement — and citing the raw count as evidence of a tighter *gate*, as an
+   earlier draft did, conflates two different things. The gate-relevant tightening is one clause.
+3. **This round's loosenings were argued from a mechanism, before this round's outcome was known** —
+   §1's diagnosis of four uncitable configuration-key rows was derived from the *second* attempt's
+   committed refusal record, is re-executed by a test, and `PROTOCOL-3.md` was committed before any
+   `retention-3/` record existed, which `git log` settles. **This does not answer the accusation, and
+   an earlier draft implied it did.** The accusation is about **reactivity across revisions**: each
+   instrument was designed in response to the previous one's poor yield, which `PROTOCOL-3.md` §7 item
+   2 concedes in as many words. **Nothing in this file rebuts that, because it is true.** What the
+   pre-commit ordering rules out is the narrower and more damning charge — that a rule was chosen
+   after seeing the numbers it would produce.
 4. **The instrument still discriminates.** 26 of 230 rows are dropped by at least one generation, four
    of eighteen generations retain everything, and present rates run from 72/84 to 55/55. An
-   instrument tuned to pass would not leave that spread.
+   instrument tuned to pass would not leave that spread. **This is the strongest of the four**, and it
+   is a fact about the output rather than about the author's intentions.
 
 **What remains unanswered, and belongs to `RESULTS-2.md` rather than to this file.** *"Is 18 of 18
 the right yield, or merely a reachable one?"* Nothing here can answer that, because there is no
@@ -442,11 +473,24 @@ words.
 **The bound on further iteration, since §9.1's tool-versus-rule asymmetry does not supply one.** That
 asymmetry — a tool may be fixed to match a frozen rule, the rule may not move — is sound but it is
 **not a stopping condition**, and a reviewer was right that it plus §0's blindness warrant would
-license re-running indefinitely. So, explicitly: **the only re-run this pass permits is one that
-brings an implementation closer to a frozen rule, and every one is recorded in §10 with what
-changed.** Two have happened. **A third must be escalated to the human driver rather than taken by an
-agent**, because at some point "the tool did not match the rule" stops being a repair and starts
-being a search.
+license re-running indefinitely.
+
+**So it is defined countably rather than by intent.** A **re-run** is *any dispatch of a tier-1 scorer
+against a generation that already has a `retention-3/` verdict or a superseded shard on disk*, other
+than an `R6` re-run triggered by a class-A failure. That definition is checkable against the files —
+it does not turn on whether the author calls the change a "checker patch" or a "re-run", which is the
+loophole a reviewer identified.
+
+**By that count, one has happened**: the corrected-prompt pass of §5.1, which re-dispatched all
+thirty shards. The `2d2629` and `fd2c24` re-dispatches are `R6` re-runs and are excluded by the
+definition; §10's other fourteen rows are edits to files, not dispatches. **A second must be escalated
+to the human driver rather than taken by an agent**, because at some point "the tool did not match
+the rule" stops being a repair and starts being a search.
+
+**This bound is prose and nothing enforces it** — §8 item 9 says so of every obligation in this file,
+and it is as true here as anywhere. It is a constraint on the next agent's honesty, not on its
+capability. **Its only real teeth are that the count is derivable from `git log` and the contents of
+`retention-3/parts/superseded/`**, so a reader can check it even if no test does.
 
 ---
 
@@ -520,6 +564,12 @@ file under review is false one round later.
 | 14 | §5.1's "did not inflate `present`" was unbounded. Eight rows is **inside** §5.2's own noise floor, so the comparison could not have detected a smaller inflation; now stated as an absence of power, not an absence of effect. |
 | 15 | **§8a added: every revision of the check has loosened it and none has tightened the gate.** The pattern was disclosed only piecemeal; it is now confronted directly, with what is and is not true in it, and with an explicit bound on further re-runs — a third must be escalated to the human. |
 | 16 | A comment in `build-tier1-prompts-3.py` pointed at a `SCORING-3-NOTES.md` §5.3 that does not exist. |
+| 17 | **§8 item 8's table said `§9.5a 10–14` were "all open" while §5.1 and §10 claimed item 14 discharged** — one file asserting both of an identical item. |
+| 18 | **§8a was not on §8 item 4's `RESULTS-2.md` checklist, nor in the intro's read-first pointer.** The section written to confront the strongest objection could have been discharged by omission. Both now name it. |
+| 19 | **Three of §8a's four rebuttals overstated.** "Class A fired twice" counted a catch from the discarded pass that §3.1 shows was read from overwritten bytes — the honest count is **one**. "109 → 121 checks" conflated bookkeeping growth with a tighter gate — the gate-relevant tightening is **one clause**. "Argued before the outcome was known" answered a narrower charge than the one made — **cross-revision reactivity is real and is now conceded**, because it is true. |
+| 20 | **§8a's escalation bound had no countable definition** and could be gamed by calling a re-run a checker patch. A re-run is now defined against the files, the count is **one**, and a second must be escalated. |
+| 21 | §5.1's defence of the two precedence sentences was asserted against this file's own finding that one added sentence moves scorers. Now stated as an argument rather than a fact, with the verbatim third pass **left open for the driver** instead of closed. |
+| 22 | §5.1's noise-floor bound did not say the floor rests on **three** generations. |
 
 ### 10.1 The commit that claimed a green suite it had not run
 
