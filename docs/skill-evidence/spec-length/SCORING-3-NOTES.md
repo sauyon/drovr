@@ -5,6 +5,11 @@ The running record of the tier-1 pass `PROTOCOL-3.md` governs. It is the **`R6` 
 **not orphaned**: `spec_length_3_protocol_stops_moving_after_the_first_verdict` reads this file for
 the SHA of every commit that amends `PROTOCOL-3.md`, so a run that deletes or empties it fails.
 
+**Read §3.1, §5.1 and §5.2 before quoting any number out of this file.** Each records something that
+bounds what the numbers mean: a shard overwritten under the assembler, a scorer prompt that carried
+more than the pre-registration sanctioned, and a one-to-three-row noise floor between two dispatches
+of the same document.
+
 `SCORING-2-NOTES.md` remains the record of the **second** instrument's pass and is not edited here.
 Nothing in this file re-interprets `retention-2/`.
 
@@ -74,8 +79,26 @@ the shape a span takes when a scorer writes it from memory rather than copying i
 
 **Both shards were re-dispatched, not just the offending one.** `R6`'s remedy is a re-run of the
 **verdict**, and the verdict is the assembled file; re-running only shard 2 would have filed a
-verdict half of which was produced under a superseded attempt. The failing pair is preserved at
-`retention-3/parts/superseded/fd2c24-{1,2}-attempt1.json`.
+verdict half of which was produced under a superseded attempt.
+
+**The failing bytes are NOT preserved, and §3.1 is why.** `retention-3/parts/superseded/fd2c24-1-attempt1.json`
+is the shard 1 that was assembled and graded; **`…fd2c24-2-attempt1.json` is not the shard 2 that
+was.** Do not read it as the record of the fabrication — every one of its spans is a verbatim
+substring of the spec, which is exactly what a reviewer checking this section found.
+
+**What the class-A catch rests on, since the artifact does not.** Three things, none of them this
+file's word:
+
+1. The check's own failure names the span: `"When a ceiling is hit, work **halts and records a\n  null** in ..."`,
+   with **two spaces** after the line break.
+2. That string is **not in `generated-2/fd2c24.md`**. The one-space form is; the two-space form is
+   not. Anyone can run the substring test.
+3. `tools/assemble-retention-3.py` printed `134506266db33c51…` for `retention-3/parts/fd2c24-2.json`
+   at the moment it assembled the graded verdict. **No file on disk now has that hash** — the
+   superseded copy is `e4e0cb25…` and the live re-run is `9126f721…`.
+
+**So the catch happened and is checkable; the artifact carrying it was destroyed.** Both halves are
+stated because the second is the more useful one.
 
 **This is the load-bearing observation of the whole redesign, and it cuts against the redesign's own
 convenience.** The class split was not a way of making everything pass: the check still refused a
@@ -84,6 +107,34 @@ verdicts filed with class-B problems present and unhidden; the eighteenth was re
 text. **A gate that refuses fabrication and files everything else is doing the job item 8 was written
 to do**; a gate that also discarded eighty-three sound rows because one span started mid-phrase was
 not.
+
+### 3.1 A shard was overwritten by its own still-running scorer, after it had been graded
+
+**Found by review, not by me**, and it is the most transferable thing in this file.
+
+The scorer for `fd2c24-2` was re-dispatched after an earlier one crashed. A polling loop watched for
+`retention-3/parts/fd2c24-2.json` to appear, saw it, and treated it as final; the verdict was
+assembled and gated on those bytes. **The subagent was still running.** It then performed its own
+verification pass — its completion message says *"All 45 quotes verified as exact substrings"* —
+found the fabricated span itself, and **rewrote the same path** before its completion notification
+arrived. The graded bytes were gone by the time they were moved to `superseded/`.
+
+**The generalisable rule: file-exists is not file-final while the writer is still running.** Wait for
+the writer to *finish*, not for its output to *appear*. A polling loop over output paths is the wrong
+primitive when the producer can revise in place, and this run used one for 34 dispatches.
+
+**Two things bound the damage, and both were checked rather than assumed.**
+
+- **Only this one shard was affected.** Every one of the eighteen committed verdicts equals the
+  concatenation of its current shards, so no other verdict was assembled from bytes that later moved.
+- **The affected verdict was re-run anyway**, so nothing filed rests on the lost bytes.
+
+**And it is now guarded.** `spec_length_3_every_verdict_is_its_shards_concatenated` compares every
+`retention-3/<id>.json` against its own `parts/<id>-<k>.json` and against the ledger. Nothing did
+that before: the two are separate files and no check had ever compared them, which is why an
+overwrite could be silent. **The guard is new work this incident caused, not a rule change** —
+`PROTOCOL-2.md` item 10 already said the assembled file must be the shards concatenated; nothing
+executed it.
 
 ---
 
@@ -163,6 +214,60 @@ ledger rows** — `tiered-review-78`, `-79`, `-80`, `-81` of `48527b`; the three
 pair, not an equal one, and the wrong number was hiding it.
 
 **28 is the number a later task should test against**, and the spans and their rows are on disk.
+
+### 5.1 The scorer prompt was not §2 and §3 verbatim, and this figure is affected by that
+
+**A deviation from `PROTOCOL-3.md` §5, disclosed here because nothing else would.** §5 pre-registers
+that the prompt carries *"§2's three clauses and §3's two classes written into it verbatim"*.
+`tools/build-tier1-prompts-3.py` appends both sections verbatim — **and wraps them in framing of its
+own**, which §5 did not sanction. The §3 wrapper is the one that matters:
+
+> …a boundary refusal and a shared span are class B, they flag one row each and are never fatal, and
+> there is therefore NO reason to hide one, to drop a row you cannot cite cleanly, or to reuse a span
+> you have already used. Cite the best span you can and let the check flag what it flags.
+
+**Why this is a real problem and not a formality.** `SCORING-2-NOTES.md` §2a is this run's own finding
+that **prompt wording moves scorer behaviour measurably** — handing over the actual rule cut the
+boundary refusal rate by at least 1.9× on the matched probe. Having established that, telling scorers
+in the same breath that a shared span is not fatal is an intervention on the very behaviour §5 then
+measures. **Two scorers said so in their own words**, citing §3 as licence for a span they knew was
+shared.
+
+**So the 28 shared spans / 62 row-instances are NOT comparable with the second instrument's 141
+shared-span violations.** The prompts differ in exactly this respect. Any use of these numbers as a
+corpus property — a claim about the ledger, or about how separable its rows are — is unsupported, and
+`RESULTS-2.md` must say so where it reports them.
+
+**Why the pass was not re-run with a corrected prompt.** The framing was fixed **before the first
+dispatch** and applied **identically to all thirty shards of all eighteen generations**, so it is
+arm-symmetric and cannot have favoured an arm. Re-running now, having seen the result, would be
+changing the instrument after seeing an outcome — the one thing §0's warrant does not cover, and
+`PROTOCOL-3.md` §6 window 2 forbids it outright. **Disclosure is the correct remedy and a re-run is
+not**, but the deviation is real and it is the author's, not the scorers'.
+
+### 5.2 The three generations that have both a v2 and a v3 verdict — an inter-dispatch noise floor
+
+Also raised by review. `6e7393`, `e085f2` and `48527b` were scored under both instruments, so the
+same document was judged twice by independent dispatches. Comparing the two **for one generation
+against itself** is arm-blind and is the only such comparison in this file.
+
+| id | v2 `present` | v3 `present` | rows that flipped |
+|---|---|---|---|
+| `6e7393` | 91/91 | 90/91 | 1 — `-05` true→false |
+| `e085f2` | 90/91 | 89/91 | 3 — `-05`, `-08` true→false; `-56` false→true |
+| `48527b` | 80/84 | 77/84 | 3 — `-11`, `-23`, `-47` true→false |
+
+**One to three rows per generation move between two dispatches of the same document**, and
+`skill-stickiness-05` flipped the same way in two independent generations. The span rule only widened,
+so **this is not the rule** — it is scorer judgement on `present`, which is the item-9 question and
+was never mechanical.
+
+**That is a noise floor, and `RESULTS-2.md` must state it before quoting any per-generation retention
+difference.** A gap of one to three rows between two arms is inside it. **`R2` is a full-retention
+gate, so the noise floor does not corrupt the gate itself** — a row is retained or it is not, and an
+arm clears only by retaining every row — but it does bound what a *comparison of scores* could ever
+mean, and the drift runs slightly toward `false`, which under `R2` costs an arm rather than flattering
+it.
 
 **Seven of eighteen verdicts carry no class-B flag at all**, and the eleven that do carry between 2
 and 14. Under the second instrument every one of those eleven would have been discarded whole, and
@@ -248,11 +353,22 @@ be disclosed as one** — that it fires on nothing here does not retire the disc
    the advice of, any context that has read `blind-map-2.json` or seen a join.
 7. **`FREEZE-3.md` freezes `PROTOCOL-3.md` and nothing else.** `retention-3/` is deliberately not
    frozen: freezing an output would make an `R6` re-run a freeze breach rather than the remedy.
-8. **Everything `SCORING-2-NOTES.md` §9.5 items 1–9 and §9.5a items 10–14 carry is still open.**
-   This file discharges **items 1 and 4 of §9.5 only** — the missing-data problem is gone, and the
-   admissibility tool was not needed. Every other row, including §9.5a item 12's decision that
-   **blocks T9** (whether re-dispatching two transmission questions was right; the revert is
-   `git revert 6268365`), is undischarged and carried forward.
+8. **`SCORING-2-NOTES.md` §9.5 items 1–9 and §9.5a items 10–14, itemised** — an earlier draft said
+   "items 1 and 4 only" while §2.1 of this same file already described carrying out item 7(b), which
+   review caught as a flat self-contradiction.
+
+   | §9.5 / §9.5a item | state |
+   |---|---|
+   | 1 — the admissibility tool takes a fixture argument | **discharged** (noted; not needed this pass) |
+   | 4 — nine of twelve generations are missing data | **discharged** — 18 of 18 filed |
+   | 7(b) — hash the shards as they land | **discharged** — `tools/assemble-retention-3.py` prints a SHA-256 per shard; §2.1 |
+   | 7(a) — `RESULTS-2.md` must carry the duplicate-shard finding | open, owed to T8 |
+   | 2, 3 — the §2b cap and `tui-dc-picker`'s single shard | superseded by `PROTOCOL-3.md` §5's own cap and sharding; not a debt |
+   | 5, 6, 8, 9 | open, all owed to `RESULTS-2.md` |
+   | §9.5a 10–14 | **all open**, including item 12's decision that **blocks T9** (whether re-dispatching two transmission questions was right; the revert is `git revert 6268365`) |
+
+   **This file adds to that list rather than shortening it**: §5.1's prompt-framing deviation and
+   §5.2's noise floor are both new obligations on `RESULTS-2.md`.
 
 ---
 
@@ -293,12 +409,19 @@ not a file to adjust.* They are recorded here instead, where a reader of the res
    `retention_3_span_rule_still_refuses_the_db3e2d_clip`, which are what §6's own table says. **§6 is
    right and §2 is stale**, within one file.
 
-**Why not just edit it.** `FREEZE-3.md` hashes `PROTOCOL-3.md` and is append-only; an edit would force
-either a rewritten hash row — the exact breach `FREEZE.md`'s closing section records as the thing not
-to repeat — or a second row for one path, which
-`spec_length_3_freeze_rows_still_hash_to_their_files` rejects. **The design deliberately makes the
-frozen file unedittable, and that is working as intended here.** A reader who thinks this call is
-wrong can see the whole of it rather than a silently corrected file.
+**Why not just edit it, given that §6 window 2 explicitly allows an edit as a logged deviation.**
+Because that path is **foreclosed by a different mechanism**, not skipped. `FREEZE-3.md` hashes
+`PROTOCOL-3.md` and is append-only, so an edit forces one of two things: a **rewritten hash row** —
+the exact breach `FREEZE.md`'s closing section records as the thing not to repeat — or a **second row
+for one path**, which `spec_length_3_freeze_rows_still_hash_to_their_files` rejects outright. Window
+2's "edit and log it" and the freeze's "never rewrite a row" are in tension, and the freeze wins
+because it is the one with a check behind it.
+
+**That tension is itself a finding, and it belongs to `RESULTS-2.md`:** a protocol that says a
+window-2 edit is permitted-with-disclosure, frozen by a record that makes any edit unrecordable, has
+one of the two rules doing nothing. Here that is the safe direction — the file cannot move — but a
+later revision should resolve it deliberately rather than inherit it. A reader who thinks this call
+is wrong can see the whole of it rather than a silently corrected file.
 
 ---
 
@@ -312,6 +435,12 @@ recorded that a prose tally of review inside the file under review is false one 
 | 1 | **`spec_length_3_protocol_precedes_every_retention_3_record` had its `descends_from_in` arguments swapped**, and **the suite was red at `9c4860e`**. See §10.1 — this is the most serious thing review found and it is not a documentation defect. |
 | 2 | **§5 said the 62 shared-span row-instances were "31 shared spans."** They are **28**: the check emits `2(N-1)` instances for a span cited by `N` rows, and two spans are cited by three and four rows. The wrong number was hiding the four-row case. |
 | 3 | §9.1 added: two defects in `PROTOCOL-3.md`'s self-description, recorded rather than fixed because the file is frozen. |
+| 4 | **§3 cited `superseded/fd2c24-2-attempt1.json` as the record of the fabrication it is not.** Every span in that file is a verbatim substring of the spec. The catch was real; the artifact was overwritten by its own still-running scorer. §3 now rests on the three checkable things instead, and **§3.1 records the incident and the guard it caused** — `spec_length_3_every_verdict_is_its_shards_concatenated`. |
+| 5 | **§5.1 added: the scorer prompt was not §2/§3 verbatim.** `tools/build-tier1-prompts-3.py` wraps §3 in framing telling scorers a shared span is non-fatal, which is a deviation from `PROTOCOL-3.md` §5 and affects the shared-span figure the same section reports. |
+| 6 | §5.2 added: an inter-dispatch noise floor of one to three rows, from the three generations scored under both instruments. |
+| 7 | **§8 item 8 said only §9.5 items 1 and 4 were discharged while §2.1 described discharging item 7(b).** Replaced with a per-item table. |
+| 8 | Clause F refused a whole fenced line in a **CRLF** document and accepted a span starting inside a line's leading whitespace. Both fixed in `fenced_occurrence_is_whole_lines`, both now asserted. |
+| 9 | §9.1 did not say **why** `PROTOCOL-3.md` §6's "edit as a logged deviation" path is unavailable; it is foreclosed by the freeze, and the tension between the two rules is now recorded as a finding for `RESULTS-2.md`. |
 
 ### 10.1 The commit that claimed a green suite it had not run
 

@@ -3639,7 +3639,7 @@ fn spec_length_blind_map_precedes_every_retention_verdict() {
 /// 8 gives: an extra key, a missing key, a wrong type or a `null` is a hard
 /// error. Nothing here is `Option`, so a `null` fails to deserialize rather than
 /// arriving as an absence the checks below would have to remember to reject.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetentionRow {
     id: String,
@@ -3969,10 +3969,22 @@ fn fenced_occurrence_is_whole_lines(spec: &str, at: usize, end: usize) -> bool {
         return false;
     }
     let (line_start, _) = line_bounds(spec, at);
-    if !spec[line_start..at].chars().all(char::is_whitespace) {
+    // **The FIRST non-whitespace character of the line, not any position inside
+    // the leading run.** Everything before the span must be whitespace *and* the
+    // span must not itself begin in whitespace — otherwise a span starting one
+    // space into an indented block satisfies the first half and is a clip, which
+    // would widen the clause past what `PROTOCOL-3.md` §2 states.
+    if !spec[line_start..at].chars().all(char::is_whitespace)
+        || spec[at..].starts_with(char::is_whitespace)
+    {
         return false;
     }
-    end == spec.len() || spec[end..].starts_with('\n')
+    // **A line ending is `\r\n` as often as `\n`.** Reading only for `\n` would
+    // refuse a whole config line for the file's line-ending convention, which is
+    // the same class of defect as refusing it for its markup. No document in this
+    // corpus uses CRLF today; the clause is written over line endings, not over
+    // one spelling of them.
+    end == spec.len() || spec[end..].starts_with('\n') || spec[end..].starts_with("\r\n")
 }
 
 fn line_prefix_is_all_markers(prefix: &str) -> bool {
@@ -19141,6 +19153,39 @@ fn retention_3_span_rule_admits_a_fenced_config_line() {
         );
     }
 
+    // **CRLF.** Clause F says "ends at the end of a line", and a line ending is
+    // `\r\n` as often as `\n`. Reading only for `\n` would refuse a whole config
+    // line for the file's line-ending convention, which is the same class of
+    // defect as refusing it for its markup.
+    let crlf = "Intro.\r\n\r\n```toml\r\nenabled = false\r\ntimeout_ms = 120000\r\n```\r\n";
+    assert!(
+        span_is_self_contained(crlf, "enabled = false", SpanBoundaryRule::V3),
+        "clause F must accept a whole fenced line in a CRLF document",
+    );
+    assert!(
+        span_is_self_contained(crlf, "enabled = false\r\ntimeout_ms = 120000", SpanBoundaryRule::V3),
+        "and two whole lines of one",
+    );
+    assert!(
+        !span_is_self_contained(crlf, "enabled = fal", SpanBoundaryRule::V3),
+        "a mid-line clip is still a mid-line clip under CRLF",
+    );
+
+    // **Clause F requires the FIRST non-whitespace character of the line**, not
+    // any position inside the leading run. An indented block whose span starts
+    // one space in is a clip, and accepting it would widen the clause past what
+    // `PROTOCOL-3.md` §2 states.
+    let indented = "Intro.\n\n```toml\n    enabled = false\n    timeout_ms = 120000\n```\n";
+    assert!(
+        span_is_self_contained(indented, "enabled = false", SpanBoundaryRule::V3),
+        "the first non-whitespace character of an indented fenced line still opens a boundary",
+    );
+    assert!(
+        !span_is_self_contained(indented, "  enabled = false", SpanBoundaryRule::V3),
+        "a span starting mid-way through the leading whitespace is not at the first \
+         non-whitespace character, and clause F does not reach it",
+    );
+
     // The fence lines themselves are not inside the block, so a span that
     // straddles one is judged by the prose clauses exactly as before.
     let straddles = "```toml\n[review.cascade]";
@@ -20080,5 +20125,139 @@ fn retention_3_clears_the_uncitable_config_rows_of_the_v2_record() {
          that does not clear them is aimed at the wrong defect.",
         config_rows_still_refused.len(),
         config_rows_still_refused.join("\n"),
+    );
+}
+
+/// Item 10's shard table for one ledger — `(k, first, last)`, 1-based.
+///
+/// The same three lines as `tools/build-tier1-prompts-3.py` and
+/// `tools/assemble-retention-3.py`, and **that duplication is the point**: if the
+/// tools and the check disagreed about where a shard ends, the check would be
+/// grading a boundary nobody scored against.
+fn retention_shard_bounds(ledger: &str) -> Option<&'static [(usize, usize, usize)]> {
+    match ledger {
+        "skill-stickiness" => Some(&[(1, 1, 46), (2, 47, 91)]),
+        "tiered-review" => Some(&[(1, 1, 42), (2, 43, 84)]),
+        "tui-dc-picker" => Some(&[(1, 1, 55)]),
+        _ => None,
+    }
+}
+
+/// Every `retention-3/<id>.json` is exactly its shards concatenated in ledger
+/// order.
+///
+/// **This exists because a shard was overwritten under the assembler.** During
+/// this pass a scorer subagent wrote `retention-3/parts/fd2c24-2.json`, the
+/// polling loop saw the file appear and treated it as final, the verdict was
+/// assembled and gated — and the subagent then ran its own verification pass and
+/// **rewrote the same path** before its completion notification arrived. The
+/// bytes that were graded no longer exist, and nothing would have said so:
+/// `<id>.json` and `parts/<id>-<k>.json` are separate files and no check
+/// compared them.
+///
+/// **`SCORING-3-NOTES.md` §3.1 records the incident; this is the guard.** A
+/// verdict that disagrees with its own shards stands on bytes that are gone, and
+/// every figure computed from it is one nobody can re-derive. **File-exists is
+/// not file-final** while the writer is still running.
+///
+/// **Vacuous until `retention-3/` is committed.**
+#[test]
+fn spec_length_3_every_verdict_is_its_shards_concatenated() {
+    let retention = spec_length_3_retention_dir();
+    let Some(scan) = scan_retention_dir(&retention) else {
+        return;
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for path in &scan.verdicts {
+        let Ok((_, verdict, ids, _)) = read_retention_3_verdict(path) else {
+            // Unreadable verdicts are
+            // `spec_length_3_retention_verdicts_are_complete_and_quoted`'s to
+            // report; this check says nothing about one it could not parse.
+            continue;
+        };
+        let Some(bounds) = retention_shard_bounds(&verdict.ledger) else {
+            wrong.push(format!(
+                "  {}: names ledger `{}`, which item 10 does not shard",
+                path.display(),
+                verdict.ledger,
+            ));
+            continue;
+        };
+        let mut rows: Vec<RetentionRow> = Vec::new();
+        let mut readable = true;
+        for (k, _, _) in bounds {
+            let shard = retention
+                .join("parts")
+                .join(format!("{}-{k}.json", verdict.spec_id));
+            let text = match fs::read_to_string(&shard) {
+                Ok(t) => t,
+                Err(e) => {
+                    wrong.push(format!(
+                        "  {}: shard {} cannot be read: {e}. The assembled verdict is the \
+                         evidence, but one whose shards are gone cannot be re-derived.",
+                        path.display(),
+                        shard.display(),
+                    ));
+                    readable = false;
+                    break;
+                }
+            };
+            match serde_json::from_str::<RetentionVerdict>(&text) {
+                Ok(s) => rows.extend(s.rows),
+                Err(e) => {
+                    wrong.push(format!(
+                        "  {}: shard {} does not parse: {e}",
+                        path.display(),
+                        shard.display(),
+                    ));
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        if !readable {
+            continue;
+        }
+        checked += 1;
+        if rows != verdict.rows {
+            let first = rows.iter().zip(verdict.rows.iter()).position(|(a, b)| a != b);
+            wrong.push(format!(
+                "  {}: does not equal its shards concatenated ({} shard row(s) against {}; \
+                 first divergence at index {:?}, row `{}`). A shard rewritten after assembly \
+                 leaves the verdict standing on bytes that are gone.",
+                path.display(),
+                rows.len(),
+                verdict.rows.len(),
+                first,
+                first
+                    .and_then(|i| verdict.rows.get(i))
+                    .map(|r| r.id.as_str())
+                    .unwrap_or("?"),
+            ));
+        }
+        // And against the ledger's own ids, so a shard pair that agrees with the
+        // verdict but not with the ledger is caught here too.
+        if rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+            != ids.iter().map(String::as_str).collect::<Vec<_>>()
+        {
+            wrong.push(format!(
+                "  {}: its shards do not cover the `{}` ledger in order",
+                path.display(),
+                verdict.ledger,
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} verdict(s) in {} disagree with their shards:\n{}",
+        wrong.len(),
+        retention.display(),
+        wrong.join("\n"),
+    );
+    assert!(
+        scan.verdicts.is_empty() || checked > 0,
+        "{} holds verdicts but none was compared with its shards",
+        retention.display(),
     );
 }
