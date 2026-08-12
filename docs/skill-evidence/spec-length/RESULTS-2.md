@@ -276,8 +276,9 @@ The *files on disk* are 64: the discarded pass left 32 shard files
 difference** — see §8 deviation 2, which withdraws an earlier inference about what those two extra
 dispatches were; `SCORING-3-NOTES.md` §2 counts the standing pass at 32 dispatches / 32 files with
 **zero** that wrote no file. **66 is the dispatch total and 64 the file total.** An earlier draft of this paragraph said 62, which is neither and
-matches no record — it was `30 + 32`, the discarded pass's *shard* count added to the standing
-pass's *dispatch* count.
+matches no record — it was `30 + 32` — the discarded pass's count of `-shard.json` files (30, which is
+not its 32 shard files, the other two being the `attempt1` pair) added to the standing pass's
+*dispatch* count.
 
 The discard is `SCORING-3-NOTES.md` §5.1:
 review found the first pass had been dispatched under a prompt that wrapped the frozen sections in
@@ -647,8 +648,10 @@ would be a check with a judgement call in it.
 | `ea011be` | — | the first commit; the file itself. Not an amendment, and not required to be listed. |
 | `128a5f2d4af90a157f5557795395a5f94d99ed5d` | **1** | **Four claims the file made about itself, corrected. No governed rule was added, weakened or clarified.** (a) every `spec_length_2_*` citation was in the present tense and none of those tests existed yet — the preamble now says to read each name as an obligation on the next task rather than a report, `R8`'s arm-symmetry included. (b) Item 15's departure table claimed completeness and was not complete; item 6's id-lexicographic-rewrite constraint is a new rule, now row 12a. (c) A citation to `RESULTS.md` §5 deviation 5 corrected to deviation 4. (d) The preamble now states that the amendment log covers every commit beyond the first regardless of window, and item 15 warns that a seven-limitation `.contains()` would pass on the fenced copy of the superseded limitation 7. |
 
-**This was a window-1 correction — made before any probe of item 5 was dispatched, when even a
-weakening would have been legal — and it weakened nothing.** It is logged because the check does not
+**This was a window-1 correction — made before the first calibration probe of item 12a, which is
+where `PROTOCOL-2.md` puts window 1's boundary, and when even a weakening would have been legal —
+and it weakened nothing.** (Item 5's first probe is window **3**'s boundary; an earlier draft of
+this sentence named that one.) It is logged because the check does not
 care about the distinction, which is the right way round.
 
 **`FREEZE-2.md`'s row for `PROTOCOL-2.md` was corrected in the following commit**, having recorded
@@ -856,7 +859,9 @@ therefore **not** the same population. Per fixture, which is:
 | `tiered-review` | 473 / 504 | 93.8% |
 
 **The closest comparable figure is `skill-stickiness` at 98.9% against 99.8% — a gap of about five
-rows over 546, inside this file's own one-to-three-rows-per-generation noise floor.** It is
+rows over 546.** That is an **aggregate over six generations**, so the floor scales with it the way
+`SCORING-3-NOTES.md` §5.1 scales it for a corpus (18 generations → ±18 to ±54): six generations give
+**6 to 18 rows**, and five is **below even the lower end** — inside the floor on any reading. It is
 *closer*, not like-for-like: **one population difference remains**, since 99.8% is a rate over all
 of that task's shard dispatches, including superseded and re-run ones, while 540/546 is one filed
 verdict per generation. No arithmetic here removes that, so the comparison is indicative and nothing
@@ -865,20 +870,26 @@ raised the doubt does not retire the doubt.** A rate that high
 on the fixture that raised it is the same doubt limitation 7a states from the other direction, and
 the two should be read together. `tiered-review`'s 93.8% is the fixture where tier 1
 discriminated **most, and by a wide margin**: its six generations span 72–83 of 84, a range of 11
-rows, against `tui-dc-picker`'s 50–55 (5) and `skill-stickiness`'s 89–91 (**2**). **Applying the noise
-floor evenly, as it must be — and stating the scaling, because the comparison does not work
-without it.** §5.2's floor is *one to three rows per generation*. A fixture's range is a gap between
-**two** generations, so the floor on a range is **two to six rows**, not one to three. On that:
-`skill-stickiness`'s 2 and `tui-dc-picker`'s 5 are both **inside** it, and only `tiered-review`'s 11
-is outside — so `tiered-review` is the one fixture whose spread this instrument can distinguish from
-noise. **On the floor's conservative (upper) end alone, which is the only form `SCORING-3-NOTES.md`
-§5.1 permits it to be quoted in.**
+rows, against `tui-dc-picker`'s 50–55 (5) and `skill-stickiness`'s 89–91 (**2**). **Applying the noise floor as its own
+source applies it — undoubled.** §5.2 states the floor as *one to three rows per generation* and
+then applies it to exactly this kind of quantity in its own words: *"A gap of one to three rows
+between two arms is inside it."* On that rule, of the three ranges **only `skill-stickiness`'s 2 is
+inside the floor**; `tui-dc-picker`'s 5 and `tiered-review`'s 11 are outside it. So **two of the
+three fixtures show a spread this instrument can distinguish from noise, and `skill-stickiness` does
+not.**
 
-**That is a narrowing of `SCORING-3-NOTES.md` §4, and it is named rather than made silently.** §4
-says *"Present rates by fixture, and they have real spread"* of all three. On the ranges it lists,
-two of the three are inside the noise floor §5.2 of the same file measures. **§4 is not wrong about
-the numbers — they are the same numbers — and this file does not re-interpret `retention-3/`; it
-applies §5.2's own bound to §4's own figures and reports where that leaves them.** `tiered-review` also carries **42 of the run's 59 class-B flags**.
+**An earlier draft of this paragraph doubled the floor** — arguing that a range spans two
+generations so two measurements' noise compounds — **and concluded that only `tiered-review`'s
+spread was real. That doubling is an inference this file made, not a rule §5.2 states, and §5.2's
+own sentence applies the undoubled figure to a between-arm gap. It is withdrawn**, and with it the
+claim that `tui-dc-picker` shows no distinguishable spread.
+
+**That is a narrow qualification of `SCORING-3-NOTES.md` §4, named rather than made silently.** §4
+says *"Present rates by fixture, and they have real spread"* of all three. On the ranges §4 itself
+lists, that holds for two of the three; **`skill-stickiness`'s 2-row range is inside the floor §5.2
+of the same file measures.** §4 is not wrong about the numbers — they are the same numbers — and
+**this file does not re-interpret `retention-3/`; it applies §5.2's own bound to §4's own figures
+and reports where that leaves them.** `tiered-review` also carries **42 of the run's 59 class-B flags**.
 
 **§9.5 item 9 belongs beside it, because it points the same way.** That tier-1 well-formedness was
 not reliably reachable — **3 verdicts filed from 12 generations, each given up to six corrected
@@ -987,7 +998,10 @@ evidence §8a said would bear on it, and it points away from the accusation rath
 one.** A **re-run** is any tier-1 scorer dispatch against a generation that already has a
 `retention-3/` verdict or a superseded shard on disk, other than an `R6` re-run triggered by a
 class-A failure. **By that count one has happened** — §5.1's corrected-prompt pass. **A second must
-be escalated to the human driver rather than taken by an agent.** Nothing enforces this; its only
+be escalated to the human driver rather than taken by an agent.** (`SCORING-3-NOTES.md` §10 row 15
+says *a third*; row 20 of the same table supersedes it — the definition was tightened and the count
+recomputed to one — and §8a's operative text says *a second*. The stale row is that file's to
+correct, not this one's.) Nothing enforces this; its only
 teeth are that the count is derivable from `git log` and `retention-3/parts/superseded/`.
 
 **§5.2's inter-dispatch noise floor — one to three rows per generation between
