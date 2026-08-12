@@ -40,7 +40,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -51,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use crate::flock::FileLock;
 use crate::herdr::Herdr;
 use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
 
@@ -2108,7 +2108,10 @@ pub fn serve(host: &str, port: u16) -> io::Result<()> {
     // Single-writer for the discovery files: take the lock before touching the
     // socket or rewriting `server.addr`, so a live server keeps serving untouched.
     // Held until this function returns, which for a serving process means until it
-    // exits; the kernel drops it either way.
+    // exits. It must stay a NAMED binding: `let _ =` would drop the guard on this
+    // line and release the lock immediately. Release is the guard's `Drop`, an
+    // explicit unlock — the kernel closing the fds is only the fallback for a
+    // death that never unwinds (drovr#80; see `crate::flock`).
     let _lock = acquire_pid_lock()?;
 
     let addr = format!("{host}:{port}");
@@ -2229,7 +2232,9 @@ pub fn ensure_server() -> io::Result<String> {
     }
 }
 
-/// Take the single-server lock, held for as long as the returned file lives.
+/// Take the single-server lock, held for as long as the returned guard lives and
+/// released explicitly when it dies — see [`crate::flock`] for why a drop of the
+/// underlying `File` would not be a release (drovr#80).
 ///
 /// The lock is an advisory exclusive lock on `server.pid`, not the pid inside it:
 /// the kernel holds it for this process and drops it however the process dies, so
@@ -2238,9 +2243,17 @@ pub fn ensure_server() -> io::Result<String> {
 /// catches a duplicate on an *arbitrary* port, where the OS bind would not
 /// serialize two starts at all.
 ///
+/// "However the process dies" is the last fd on the open file description closing,
+/// which is all of them — so it covers a `SIGKILL` too, except in the microseconds
+/// between a `fork` and that child's `exec`, where the child still holds an
+/// inherited fd and `Drop` never got to run. That residue is drovr#80's, it is not
+/// reachable from a path drovr controls, and closing it would need the bounded
+/// retry this design rejects. Ordinary exits and panics go through `Drop`, which
+/// unlocks the description outright and does not care how many fds share it.
+///
 /// The pid written inside is for humans (`kill $(cat server.pid)`) and for the
 /// refusal message — never for the decision.
-fn acquire_pid_lock() -> io::Result<File> {
+fn acquire_pid_lock() -> io::Result<FileLock> {
     match try_take_lock(&server_pid_file())? {
         Some(lock) => Ok(lock),
         // Someone holds it: they are serving (or about to), so stand down.
@@ -2255,23 +2268,11 @@ fn acquire_pid_lock() -> io::Result<File> {
 /// The pid is written *after* the lock is taken, so for the moment between the two
 /// the file still names the previous holder — which is why the pid only ever
 /// informs the message, never a decision.
-fn try_take_lock(path: &Path) -> io::Result<Option<File>> {
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Error(e)) => return Err(e),
-    }
-
-    lock.set_len(0)?;
-    lock.write_all(std::process::id().to_string().as_bytes())?;
-    lock.flush()?;
+fn try_take_lock(path: &Path) -> io::Result<Option<FileLock>> {
+    let Some(mut lock) = crate::flock::try_take(path)? else {
+        return Ok(None);
+    };
+    lock.overwrite(std::process::id().to_string().as_bytes())?;
     Ok(Some(lock))
 }
 
@@ -4786,8 +4787,19 @@ mod tests {
     /// Exclusivity *between processes* is what matters, and it is pinned by
     /// `tests/serve_single.rs` (a second `drovr serve` is refused, and six racing
     /// starts leave one server). Taking the same lock twice inside one process is
-    /// explicitly unspecified in std, so this covers the rest of the contract: the
-    /// pid lands in the file for humans, and dropping releases the claim.
+    /// explicitly unspecified in std, so this covers the rest of the contract:
+    /// the pid lands in the file for humans, dropping releases the claim, and —
+    /// since drovr#80 — dropping still releases it when a second fd shares the
+    /// open file description. That third property is the whole point of the
+    /// `try_clone` staging in the body; it is not scaffolding, and removing it
+    /// retires the only drovr#80 regression guard in this module.
+    ///
+    /// It also means the re-claim below leans on that unspecified same-process
+    /// double-take: it is what makes the test red without the fix. Should a
+    /// platform ever grant it instead of refusing, this passes vacuously — the
+    /// primitive-level `flock::tests::a_shared_description_does_not_keep_the_lock_after_drop`
+    /// is the copy to trust, and `tests/serve_single.rs` is the cross-process
+    /// one that needs no such assumption.
     ///
     /// Deliberately path-based rather than data-dir based: nothing here touches
     /// `XDG_DATA_HOME`, so it cannot be knocked over by (or knock over) the tests
@@ -4798,12 +4810,21 @@ mod tests {
         let tmp = make_root("lock-claim");
         let path = tmp.path().join("server.pid");
 
-        // Every failure here reports the path and what the file held, because this test
-        // has flaked twice (2026-07-26, 2026-08-01) and neither sighting left enough to
-        // diagnose. It has never reproduced on demand — 14 full-suite runs — and the two
-        // obvious causes are ruled out: `make_root` is a unique `tempdir()`, so no other
-        // process shares this path, and `try_take_lock` is `flock` on a distinct file.
-        // If it fails again, the message below is the evidence to file.
+        // This flaked three times (2026-07-26; 2026-08-01; and 2026-08-02, in
+        // run `phase-reap`, which is the sighting that captured the evidence —
+        // "after drop: …/server.pid contains \"1123224\"; this pid is 1123224",
+        // OUR OWN pid, so the step that failed was the re-claim after
+        // `drop(held)`), plus once more during this run's T3 review. It never
+        // reproduced on demand, and the cause is now known: drovr#80, which is
+        // exactly what that captured message says. `close(2)` releases an
+        // `flock` only when it closes
+        // the LAST fd on the open file description, and any sibling test thread
+        // spawning `git` or `herdr` forks a child that inherits one — so a
+        // release-by-drop released nothing until that child exec'd, and this
+        // test's re-claim was refused with nothing holding the lock. The
+        // `try_clone` below stages exactly that inherited fd, so the property is
+        // now asserted rather than waited on. `whats_there` stays: it costs
+        // nothing and still names the path and contents if this ever fails.
         let whats_there = |when: &str| -> String {
             format!(
                 "{when}: {} contains {:?}; this pid is {}",
@@ -4830,16 +4851,32 @@ mod tests {
             whats_there("after claim")
         );
 
+        // The fd a `fork()` hands a child: a second fd on the SAME open file
+        // description, still open across the drop below. That `try_clone` is a
+        // `dup(2)` and not a re-`open` is the property this staging rests on,
+        // and it is pinned — by the shared file offset — in
+        // `flock::tests::a_shared_description_does_not_keep_the_lock_after_drop`,
+        // not assumed here. Reimplement `try_clone` as a re-`open` and that test
+        // fails; this one would quietly stop testing drovr#80.
+        let shared = held
+            .try_clone()
+            .expect("stage the fd a forked child inherits");
+
         // Nothing has to prove the holder died for the lock to be free again.
         drop(held);
         let _held = try_take_lock(&path)
             .unwrap_or_else(|e| panic!("re-claim failed: {e}; {}", whats_there("after drop")))
             .unwrap_or_else(|| {
                 panic!(
-                    "a lock released by dropping its File was still held. {}",
+                    "the lock was still held after its holder was dropped — closing our own \
+                     fd does not release an open file description another fd still shares, \
+                     so release has to be an explicit unlock (drovr#80). {}",
                     whats_there("after drop")
                 )
             });
+
+        // Last, so the staged fd outlives the re-claim it would otherwise block.
+        drop(shared);
     }
 
     /// A server that was killed leaves the file behind with its pid in it. The

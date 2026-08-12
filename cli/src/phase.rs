@@ -1,10 +1,10 @@
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{AgentLaunch, load_config};
+use crate::flock::FileLock;
 use crate::herdr::{AgentStatus, Herdr, PaneInfo, PaneState, PromptOutcome, SessionId};
 use crate::run::{
     NotReapable, NotRehydratable, PassToken, Phase, PhaseStatus, REVIEWER_PREFIX, RunState,
@@ -1366,7 +1366,7 @@ impl Unfinished {
 }
 
 /// Take the exclusive lock that serializes the commands which move a run's
-/// panes around, held for as long as the returned file lives.
+/// panes around, held for as long as the returned guard lives.
 ///
 /// **Two holders, one lock, on purpose.** `phase_rehydrate` brings a phase back
 /// on a new pane and `phase_reap` closes one and drops the registration — they
@@ -1383,6 +1383,34 @@ impl Unfinished {
 /// process dies, so a crashed holder never leaves a claim anyone has to judge
 /// stale.
 ///
+/// **Why release is EXPLICIT.** Read that last sentence precisely, because its
+/// loose half is the whole bug. An `flock` is not held "for a process": it
+/// belongs to the open file description, and "drops it however that process
+/// dies" is really the LAST fd on that description closing. Ordinarily that is
+/// all of them at once, so the crashed-holder argument does hold — but it is
+/// an argument about process DEATH, and it is exactly *not* what covers an
+/// ordinary drop. `close(2)` releases the lock only in that same last-fd case,
+/// and `fork(2)` hands a child a second fd on that very description, which
+/// `O_CLOEXEC` takes away at `exec` but not before. Inside that window a
+/// holder that "releases" by dropping its `File` has released nothing: the
+/// next `try_lock` on the inode refuses with `WouldBlock` while no one
+/// anywhere holds a claim. drovr shells out to `git` and `herdr` routinely, so
+/// the window is not hypothetical — this is forge.ko.ag/drovr/drovr#80.
+/// [`crate::flock`] states this invariant for both locks; it is restated here
+/// because the loose sentence it corrects is here. So this lock comes back as a
+/// [`crate::flock::FileLock`] — as does `server.pid`'s, which has the same
+/// shape — whose `Drop` unlocks the description outright and whose `File` is
+/// private, leaving a close-based release unspellable.
+///
+/// What that changed is the release **mechanism**, not the refusal policy:
+/// nothing below waits that did not wait before. And the fork window is the one
+/// exception to the crashed-holder argument above — a holder killed without
+/// unwinding (`SIGKILL`, `abort`) between a `fork` and that child's `exec`
+/// leaves the lock held until the child execs, microseconds later. `Drop` runs
+/// on every ordinary exit and on panic-unwind, so that is the only gap left, it
+/// is not reachable from a path drovr controls, and closing it would need the
+/// bounded retry this design rejects.
+///
 /// **Why it fails rather than waits.** The holder may be inside a 30-second
 /// readiness wait, and a queued second rehydrate would then either duplicate
 /// the first (if it did not re-read) or refuse anyway (if it did). Refusing now
@@ -1390,25 +1418,23 @@ impl Unfinished {
 /// refused this way is best-effort at every automatic trigger, so it warns and
 /// the phase is untouched.
 ///
-/// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped: a second
-/// `open` + lock in the SAME process blocks on itself. So no holder may call
-/// another — `phase_start`'s reap loop calls `phase_reap` per phase, each
-/// taking and dropping the lock, and never wraps the loop in one.
+/// ⚠️ **It is NOT re-entrant.** `File::try_lock` is `flock`-shaped, so the claim
+/// belongs to the open file description and not to the process: a second
+/// `open` + lock in the SAME process is a SECOND description, and it conflicts
+/// with the first exactly as a stranger's would. `try_lock` refuses it with
+/// `WouldBlock`: it does not block, and it does not quietly succeed the way a
+/// process-owned POSIX record lock would. So no holder may call another —
+/// `phase_start`'s reap loop calls `phase_reap` per phase, each taking and
+/// dropping the lock, and never wraps the loop in one.
 ///
 /// The lock alone does not close the race — see `phase_rehydrate` and
 /// `phase_reap`, which both re-read `state.json` under it. Serializing two
 /// launches without that just makes them consecutive rather than simultaneous.
-fn acquire_run_lock(run_name: &str) -> io::Result<File> {
+fn acquire_run_lock(run_name: &str) -> io::Result<FileLock> {
     let path = run_dir(run_name).join("run.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    match lock.try_lock() {
-        Ok(()) => Ok(lock),
-        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+    match crate::flock::try_take(&path)? {
+        Some(lock) => Ok(lock),
+        None => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
                 "another drovr command is moving run '{run_name}'s panes around (a \
@@ -1418,7 +1444,6 @@ fn acquire_run_lock(run_name: &str) -> io::Result<File> {
                  rehydrate is bringing back would close the pane it just opened."
             ),
         )),
-        Err(TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -1640,8 +1665,9 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // no different from being simultaneous. Held for the whole function.
     let _lock = acquire_run_lock(&run.name)?;
     // The caller's copy may predate the lock by any amount — the driver holds
-    // one across a whole run, and the winner of the race above wrote while this
-    // process was blocked. `state.json` under the lock is the only authority.
+    // one across a whole run, and the winner of the race above wrote before
+    // this process took the lock (never *while* it waited: acquisition refuses
+    // rather than blocks). `state.json` under the lock is the only authority.
     *run = RunState::load(&run.name)?;
     // ONE precondition, shared with the HTTP handler and the agent tree — see
     // `RunState::rehydratable`. Written as separate checks it drifted twice:
@@ -2516,7 +2542,11 @@ fn close_pane_preserving_focus<H: Herdr>(h: &H, pane: &str) -> io::Result<()> {
 ///
 /// The lock is taken and dropped per phase, inside [`phase_reap`]: the run lock
 /// is `flock`-shaped and not re-entrant, so wrapping this loop in one would
-/// deadlock against the first `phase_reap` it calls.
+/// break it — quietly, which is worse than the deadlock this once claimed.
+/// Nothing would hang: `try_lock` refuses rather than waits, so every
+/// [`phase_reap`] inside the wrapper would take its refused branch, warn, and
+/// leave the phase untouched. Reaping would simply stop happening while every
+/// command still reported success.
 fn reap_superseded<H: Herdr>(h: &H, run: &mut RunState, starting: &str) {
     for name in run.superseded_by(starting) {
         match phase_reap(h, run, &name) {
@@ -12023,6 +12053,57 @@ mod rehydrate_tests {
         );
     }
 
+    // drovr#80 — a lock "released" by dropping its `File` is not released at
+    // all while a second fd shares the open file description.
+    //
+    // `try_clone` is a faithful stand-in for `fork()`, and that is the whole
+    // design of this test: both produce a SECOND fd on ONE open file
+    // description. An `flock` belongs to the description, not to either fd, and
+    // `close(2)` releases it only when it closes the LAST fd on that
+    // description. So a holder that drops its `File` while any inherited copy
+    // is still open has released nothing, and the next `try_lock` on that inode
+    // refuses with `WouldBlock` while no other process claims it. In production
+    // the second fd is the one `fork()` hands a child drovr spawned (`git`,
+    // `herdr`); `O_CLOEXEC` drops it at `exec`, but not before, and the window
+    // is enough. `docs/run-lock-fork-race/lock-red.txt` is the measurement.
+    //
+    // `acquire_run_lock`'s doc comment now makes this argument itself, under
+    // "Why release is EXPLICIT", including why the kernel "drops [the lock]
+    // however that process dies" is about process death and is not what covers
+    // an ordinary drop. The two are meant to agree; if you change one, read the
+    // other.
+    //
+    // No fork, no sleep, no external binary, so the fault is staged
+    // deterministically rather than raced for, and this holds inside `nix
+    // build`'s sandbox as well as on a developer's machine.
+    #[test]
+    fn a_dropped_run_lock_releases_even_when_its_description_is_shared() {
+        let env = TestEnv::new();
+        let run = rehydrate_run(&env, "lock-dup");
+        // `acquire_run_lock` opens with `create(true)` but creates no parents,
+        // so the run dir has to exist before the first claim.
+        run.save().unwrap();
+
+        let held = acquire_run_lock("lock-dup").expect("first claim");
+        let shared = held
+            .try_clone()
+            .expect("a second fd on the SAME description — what fork() hands a child");
+        drop(held);
+
+        if let Err(err) = acquire_run_lock("lock-dup") {
+            panic!(
+                "the re-claim was refused with {:?} ({err}) — dropping the `File` closed \
+                 OUR fd, but a close-based release does not release an open file \
+                 description another fd still shares, so the lock outlived its holder \
+                 (drovr#80). Release has to be an explicit unlock.",
+                err.kind()
+            );
+        }
+
+        // Last, so the staging fd outlives the re-claim it is meant to block.
+        drop(shared);
+    }
+
     #[test]
     fn a_rehydrate_that_cannot_record_its_pane_does_not_leave_it_live() {
         // ⚠️ THE IMMORTAL-PANE BUG, third sighting. `launch_in_pane` succeeded,
@@ -12205,7 +12286,12 @@ mod rehydrate_tests {
         // Saved: `phase_rehydrate` re-reads `state.json` under its lock, so an
         // in-memory-only change is not a change at all.
         run.save().unwrap();
-        assert!(phase_rehydrate(&h, &mut run, "plan").is_ok());
+        // Surfaced, not discarded: a bare `.is_ok()` here reports only "false",
+        // and this call hard-errors on a refused run lock (drovr#80's
+        // `WouldBlock`) as readily as on a real regression. The kind is what
+        // tells the two apart.
+        phase_rehydrate(&h, &mut run, "plan")
+            .unwrap_or_else(|err| panic!("rehydrate must succeed, got {:?}: {err}", err.kind()));
         let launch = pane_run_call(&h);
         assert!(
             launch.contains("agent --workspace"),

@@ -4,6 +4,7 @@ mod code_review;
 mod config;
 mod env;
 mod findings;
+mod flock;
 mod herdr;
 mod interview;
 mod mcp_findings;

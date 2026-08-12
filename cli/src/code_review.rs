@@ -2844,10 +2844,17 @@ mod tests {
     /// `drovr cleanup`, which is exactly the accumulation reaping exists to
     /// stop.
     ///
-    /// ⚠ **CURRENTLY FAILING for the same reason as
-    /// [`a_finished_panel_reaps_its_reviewers`]** — a spurious `WouldBlock` out of
-    /// `acquire_run_lock`, not anything about the sweep. See that test's note,
-    /// forge.ko.ag/drovr/drovr#80 and `forge.ko.ag/drovr/drovr/issues`.
+    /// ⚠️ **Do not `#[ignore]` it and do not weaken its assertions on a flake.**
+    /// A flake here is evidence about the reap path — historically the run lock
+    /// (drovr#80) — not about what is asserted.
+    ///
+    /// With [`a_finished_panel_reaps_its_reviewers`] it is one of only two tests
+    /// in this module that assert the panel's reap actually HAPPENED — this one
+    /// through both the orphan's close and the panel's retirement count. Both go
+    /// through `acquire_run_lock`, so either fires on a refusal. In the ten runs
+    /// of `docs/run-lock-fork-race/lock-red.txt` §3a it was the retirement count
+    /// that fired here, not the close. drovr#80 is fixed at the mechanism; see
+    /// that test's note for what changed and for the red-baseline numbers.
     #[test]
     fn a_finished_panel_sweeps_the_pane_its_respawn_orphaned() {
         let env = TestEnv::new();
@@ -3166,16 +3173,31 @@ mod tests {
     /// panes are the largest thing a run accumulates — four per iteration, and a
     /// task can take several iterations.
     ///
-    /// ⚠ **CURRENTLY FAILING, and not because of what it asserts.** It counts
-    /// `pane_close` calls, so it is one of only two tests in the suite that turn a
-    /// *best-effort* reap refusal into a failure rather than a warning. The
-    /// refusal is a spurious `WouldBlock` out of `acquire_run_lock`, whose cause
-    /// is a live production fault — forge.ko.ag/drovr/drovr#80, written up in
-    /// `forge.ko.ag/drovr/drovr/issues` under "`acquire_run_lock` WouldBlock on a fixed
-    /// `/tmp/drovr-*-test-*` root". Deliberately **not**
-    /// `#[ignore]`d and deliberately not weakened: the assertion is right, the
-    /// lock is wrong, and hiding it would retire the only executable evidence
-    /// that the fault is real.
+    /// ⚠️ **Do not `#[ignore]` it and do not weaken its assertions on a flake.**
+    /// A flake here is evidence about the reap path — historically the run lock
+    /// (drovr#80) — not about what is asserted. The assertions in the body have
+    /// always been right, and the fix described below did not touch them.
+    ///
+    /// It and [`a_finished_panel_sweeps_the_pane_its_respawn_orphaned`] are the
+    /// only two tests in this module that assert the panel's reap actually
+    /// HAPPENED. Every other `closed_panes` caller here asserts emptiness, which
+    /// a refused reap satisfies vacuously — and a refused reap is *best-effort*
+    /// at every automatic trigger, so it warns and the run carries on reporting
+    /// success. (`drovr phase reap` does surface a refused phase reap, because an
+    /// operator asked for it.) So this pair is the only thing here that can
+    /// notice a close that never happened.
+    ///
+    /// That is why the pair failed hardest under a parallel suite while
+    /// forge.ko.ag/drovr/drovr#80 was live: this test in 7 of 10 runs and the
+    /// sweep test in 9, out of 18 failures across four tests
+    /// (`docs/run-lock-fork-race/lock-red.txt` §3 — the red baseline, taken
+    /// deliberately before the fix existed). drovr#80 is fixed at the mechanism:
+    /// every lock drovr takes is now released on drop by an explicit
+    /// `flock(LOCK_UN)` rather than by the drop itself — see `crate::flock`,
+    /// which owns that invariant for both `run.lock` and `server.pid` — so an fd
+    /// inherited across a `fork` can no longer hold a lock its owner has dropped.
+    /// The same measurement re-run against the fix belongs beside the baseline,
+    /// as `docs/run-lock-fork-race/lock-green.txt`.
     #[test]
     fn a_finished_panel_reaps_its_reviewers() {
         let env = TestEnv::new();
