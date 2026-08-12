@@ -697,7 +697,16 @@ fn write_stub(dir: &Path, name: &str, code: i32) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(
         &path,
-        format!("#!/usr/bin/env bash\necho boom >&2\nexit {code}\n"),
+        // `#!/bin/sh`, NOT `#!/usr/bin/env bash`. This stub is a fake `drovr`,
+        // not a shipped script, and its body is POSIX (`echo`, `exit`). A nix
+        // build sandbox has no `/usr/bin/env`, so an `env` shebang here made
+        // the stub unexecutable and the assertion below reported it as "drovr
+        // did not let its own stderr through" — a real packaging failure
+        // wearing the costume of a drovr defect. `/bin/sh` is present wherever
+        // this suite can run at all. The SHIPPED hooks keep their
+        // `#!/usr/bin/env bash` (pinned by `hook_shebangs_are_env_bash`); this
+        // is only the test's own throwaway binary.
+        format!("#!/bin/sh\necho boom >&2\nexit {code}\n"),
     )
     .unwrap();
     #[cfg(unix)]
@@ -818,6 +827,17 @@ fn user_prompt_hook_never_exits_two() {
         // and clap's message is the version-skew clue the entire
         // tolerate-the-noise argument rests on.
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // Separate "the stub never ran" from "drovr's stderr was swallowed".
+        // They fail this assertion identically, and conflating them cost a
+        // packaging outage: a nix sandbox with no `/usr/bin/env` made the stub
+        // unexecutable, and this assertion reported it as drovr suppressing
+        // stderr, so `main` was unbuildable while the message pointed at the
+        // wrong subsystem entirely.
+        assert!(
+            !stderr.contains("bad interpreter") && !stderr.contains("No such file or directory"),
+            "the stub itself failed to execute, so this test measured nothing about drovr's \
+             exit-code mapping — fix the stub's interpreter, not drovr: {stderr:?}"
+        );
         assert!(
             stderr.contains("boom"),
             "a drovr exiting {code} must let ITS OWN stderr reach the user, got: {stderr:?}"
