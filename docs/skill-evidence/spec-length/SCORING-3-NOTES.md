@@ -140,9 +140,29 @@ the arms or the scorers. **The join is T6's and T8's.**
 | a span with no occurrence beginning and ending on a boundary | **15** |
 | **total** | **77** |
 
-**A shared span contributes two row-instances**, one per row that cites it, because
-`PROTOCOL-3.md` §3 flags both: which of the two the span really establishes is a judgement and tier
-3 is where judgement lives. So the 62 are 31 shared spans.
+**A shared span contributes more than one row-instance**, because `PROTOCOL-3.md` §3 flags every row
+that cites it: which of them the span really establishes is a judgement, and tier 3 is where
+judgement lives.
+
+**The 62 row-instances are 28 distinct shared spans, not 31, and the arithmetic is not a halving.**
+The check keeps the first citing row in a map and emits a **pair** of flags each time a later row
+repeats the quote, so a span cited by `N` rows contributes `2(N-1)` row-instances. Grouping every
+verdict's quotes by exact text gives:
+
+| rows citing one span | such spans | row-instances |
+|---|---|---|
+| 2 | 26 | 52 |
+| 3 | 1 | 4 |
+| 4 | 1 | 6 |
+| **total** | **28** | **62** |
+
+**A first draft of this section divided 62 by 2 and said 31**, which silently assumes every shared
+span is cited by exactly two rows. Two are not, and **the worst of them is one span carrying four
+ledger rows** — `tiered-review-78`, `-79`, `-80`, `-81` of `48527b`; the three-row case is
+`tui-dc-picker-37`, `-38`, `-39` of `26d7a2`. That is a **worse** instance of the pathology than a
+pair, not an equal one, and the wrong number was hiding it.
+
+**28 is the number a later task should test against**, and the spans and their rows are on disk.
 
 **Seven of eighteen verdicts carry no class-B flag at all**, and the eleven that do carry between 2
 and 14. Under the second instrument every one of those eleven would have been discarded whole, and
@@ -157,7 +177,7 @@ the row to a judge either way, which is why the pass did not need the question a
 **One caution `PROTOCOL-3.md` §1 records and this file repeats**: §8.3 tested its hypothesis against
 the two *filed* verdicts, which by construction were the ones containing no shared span. That is a
 selection effect and it makes the withdrawal weaker than its wording suggests. Nothing here rests on
-it either way, and **the 31 shared spans are now on disk with their rows named**, so a later task can
+it either way, and **the 28 shared spans are now on disk with their rows named**, so a later task can
 test the question against a sample that was not selected for lacking them.
 
 ---
@@ -251,6 +271,35 @@ is cheaper than a check that would have to decide when the first dispatch happen
 the claim that `PROTOCOL-3.md` was pre-registered once and not touched again — and `git log --oneline
 -- docs/skill-evidence/spec-length/PROTOCOL-3.md` is what settles it, not this table.
 
+### 9.1 Two defects in `PROTOCOL-3.md`, found by review AFTER the dispatch, and deliberately NOT fixed
+
+Both are defects in how the frozen file **describes itself**. Neither is a rule error, neither
+changes what was measured, and **neither is corrected in the file**, because correcting either would
+mean editing a pre-registration in window 2 — the thing the whole structure exists to prevent. The
+driver's standing constraint says it plainly: *if the protocol is wrong, that is a finding to report,
+not a file to adjust.* They are recorded here instead, where a reader of the results meets them.
+
+1. **§6's check table lists nine tests; eleven exist.** Missing are
+   **`retention_3_span_rule_sees_past_markup`** — which is the **only** test exercising clauses M and
+   E in isolation, and they are the two most novel clauses of §2 — and
+   `retention_3_clears_the_uncitable_config_rows_of_the_v2_record`, §6 of this file's subject. Both
+   are in `cli/tests/skills_valid.rs` and both run in the suite. **A reader following §6 alone would
+   not find the test that proves clauses M and E do what §2 claims.** That is the real cost, and it
+   is why this is recorded as a finding rather than waved through.
+2. **§2's prose names two tests that do not exist under those names.** It writes
+   `retention_3_check_accepts_everything_v2_accepted` and
+   `retention_3_check_still_refuses_the_db3e2d_clip`; the real names are
+   `retention_3_span_rule_accepts_everything_v2_accepted` and
+   `retention_3_span_rule_still_refuses_the_db3e2d_clip`, which are what §6's own table says. **§6 is
+   right and §2 is stale**, within one file.
+
+**Why not just edit it.** `FREEZE-3.md` hashes `PROTOCOL-3.md` and is append-only; an edit would force
+either a rewritten hash row — the exact breach `FREEZE.md`'s closing section records as the thing not
+to repeat — or a second row for one path, which
+`spec_length_3_freeze_rows_still_hash_to_their_files` rejects. **The design deliberately makes the
+frozen file unedittable, and that is working as intended here.** A reader who thinks this call is
+wrong can see the whole of it rather than a silently corrected file.
+
 ---
 
 ## 10. Corrections made to this file during review
@@ -260,3 +309,30 @@ recorded that a prose tally of review inside the file under review is false one 
 
 | # | what was wrong |
 |---|---|
+| 1 | **`spec_length_3_protocol_precedes_every_retention_3_record` had its `descends_from_in` arguments swapped**, and **the suite was red at `9c4860e`**. See §10.1 — this is the most serious thing review found and it is not a documentation defect. |
+| 2 | **§5 said the 62 shared-span row-instances were "31 shared spans."** They are **28**: the check emits `2(N-1)` instances for a span cited by `N` rows, and two spans are cited by three and four rows. The wrong number was hiding the four-row case. |
+| 3 | §9.1 added: two defects in `PROTOCOL-3.md`'s self-description, recorded rather than fixed because the file is frozen. |
+
+### 10.1 The commit that claimed a green suite it had not run
+
+**Commit `9c4860e`'s message ends "Whole crate green: 809 / 9 / 28 / 2 / 6 / 120 / 1". That was false
+at that commit**, and it is corrected here rather than by rewriting the message.
+
+**What happened, exactly.** The suite was run green *before* `retention-3/` was staged. At that
+moment `spec_length_3_protocol_precedes_every_retention_3_record` was **vacuous** — its
+`Introduced::NotCommitted` arm returned early, because the directory it orders against did not exist
+in history yet. Committing the eighteen verdicts is what made that arm live, and the arm contained a
+swapped-argument call. The suite was not re-run after the commit, so a passing run of one program was
+reported as a passing run of a different one.
+
+**The generalisable form, and it is the one to carry forward:** *a test that is vacuous until an
+artifact exists is not verified by a run made before that artifact exists.* This suite is full of
+such tests — nearly every `spec_length_*` corpus check returns early on a missing directory — so the
+green run that matters is the one taken **after** the artifact is committed, not before. Two review
+angles caught it independently by simply running the suite at `HEAD`; neither had to reason about it.
+
+**The bug was worse than a red test.** On a linear history the swapped call returns `Yes` in exactly
+the case the check exists to catch — `retention-3/` committed *before* `PROTOCOL-3.md` — and `No` in
+the compliant case. It would have passed the violation and failed the compliance. The underlying
+ordering was and is compliant (`git merge-base --is-ancestor 2bee0ee 9c4860e` exits 0), so **nothing
+about the pre-registration is in doubt; the check that was supposed to prove it was.**

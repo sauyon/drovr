@@ -19916,7 +19916,16 @@ fn spec_length_3_protocol_precedes_every_retention_3_record() {
         Introduced::Undetermined { how } => panic!("cannot resolve the protocol's commit: {how}"),
     };
     match introducing_commit_in(&repo, &spec_length_3_retention_dir()) {
-        Introduced::At(records_at) => match descends_from_in(&repo, &records_at, &protocol_at) {
+        // `descends_from_in(repo, ancestor, descendant)` — the protocol is the
+        // ancestor and the records are the descendant, and **an earlier draft had
+        // these two the wrong way round**. It asked whether the protocol descends
+        // from the records, which is the inverse of the property, and the bug was
+        // invisible while `retention-3/` was uncommitted because this arm never
+        // ran. Worse than a red test: on a linear history the swapped call
+        // returns `Yes` in exactly the case this check exists to catch — records
+        // committed *before* the protocol — so it would have passed the
+        // violation and failed the compliant case.
+        Introduced::At(records_at) => match descends_from_in(&repo, &protocol_at, &records_at) {
             Descent::Yes => {}
             Descent::No => panic!(
                 "{} was introduced at {}, which does not descend from the commit introducing \
