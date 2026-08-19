@@ -2030,6 +2030,8 @@ fn cmd_review(sub: ReviewCmd) {
                 eprintln!("drovr: {e}");
                 process::exit(1);
             }
+            // Every arm exits via `WaitOutcome::exit_code()` — the mapping lives
+            // on the type so this command and `Status` below cannot drift apart.
             match review_wait(&run, timeout_ms) {
                 Ok(WaitOutcome::Approved) => {
                     // This used to add "(any answers to open questions are in
@@ -2043,21 +2045,20 @@ fn cmd_review(sub: ReviewCmd) {
                     // outright that question answers never land there.
                     println!("review approved for run '{run}'");
                 }
-                Ok(WaitOutcome::ChangesRequested) => {
-                    println!("review: changes requested for run '{run}' (see feedback.json)");
-                    process::exit(3);
-                }
-                Ok(WaitOutcome::Cancelled) => {
-                    println!(
-                        "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
-                    );
-                    process::exit(5);
-                }
-                Ok(WaitOutcome::Timeout) => {
-                    println!(
-                        "review: no reviewer action for run '{run}' within timeout (re-run to resume)"
-                    );
-                    process::exit(2);
+                Ok(other) => {
+                    match other {
+                        WaitOutcome::ChangesRequested => println!(
+                            "review: changes requested for run '{run}' (see feedback.json)"
+                        ),
+                        WaitOutcome::Cancelled => println!(
+                            "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
+                        ),
+                        WaitOutcome::Timeout => println!(
+                            "review: no reviewer action for run '{run}' within timeout (re-run to resume)"
+                        ),
+                        WaitOutcome::Approved => unreachable!("handled above"),
+                    }
+                    process::exit(other.exit_code());
                 }
                 Err(e) => {
                     eprintln!("drovr: review wait failed: {e}");
@@ -2074,21 +2075,22 @@ fn cmd_review(sub: ReviewCmd) {
             // Two surfaces reporting one gate must not describe it differently:
             // a driver comparing a lost `wait` code against this one is the
             // whole point, and it can only do that if they speak one language.
+            // The codes come from `WaitOutcome::exit_code()` for the same reason.
             match gate_status(&run) {
-                Ok(WaitOutcome::Approved) => println!("review approved for run '{run}'"),
-                Ok(WaitOutcome::ChangesRequested) => {
-                    println!("review: changes requested for run '{run}' (see feedback.json)");
-                    process::exit(3);
-                }
-                Ok(WaitOutcome::Cancelled) => {
-                    println!(
-                        "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
-                    );
-                    process::exit(5);
-                }
-                Ok(WaitOutcome::Timeout) => {
-                    println!("review: no reviewer decision yet for run '{run}'");
-                    process::exit(2);
+                Ok(outcome) => {
+                    match outcome {
+                        WaitOutcome::Approved => println!("review approved for run '{run}'"),
+                        WaitOutcome::ChangesRequested => println!(
+                            "review: changes requested for run '{run}' (see feedback.json)"
+                        ),
+                        WaitOutcome::Cancelled => println!(
+                            "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
+                        ),
+                        WaitOutcome::Timeout => {
+                            println!("review: no reviewer decision yet for run '{run}'")
+                        }
+                    }
+                    process::exit(outcome.exit_code());
                 }
                 Err(e) => {
                     eprintln!("drovr: review status failed: {e}");

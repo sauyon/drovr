@@ -792,6 +792,31 @@ fn ensure_workspace_reporting<H: Herdr>(h: &H, run: &mut RunState) -> io::Result
 }
 
 // ---------------------------------------------------------------------------
+/// Ask the spec gate whether `phase` may be launched, as an `io::Result`.
+///
+/// **Every path that launches a writer into a phase calls this** — `phase_start`
+/// and `phase_rehydrate_with_timeout` both. The first version of the forge#57 fix
+/// put the check in `phase_start` alone, reasoning that it was "the function
+/// every caller reaches"; review found that it is not. `phase_rehydrate` mints a
+/// pass, sweeps the marker and launches an agent — the same three steps — and is
+/// additionally reachable from the review server's `POST /rehydrate`, whose own
+/// doc records that the HTTP caller is unauthenticated.
+///
+/// The sequence that hole leaves open is the one the gate exists for: spec
+/// approved, `implement-task-1` starts, the reviewer then CANCELS the run, the
+/// pane dies or is reaped, and a rehydrate resumes the writer on a run a human
+/// abandoned. `RunState::rehydratable` bounds it to phases that ran once, but a
+/// cancellation *after* a legitimate start is precisely that transition.
+fn gate_refusal_error(run: &str, phase: &str) -> io::Result<()> {
+    match crate::review::gate_refusal(run, phase) {
+        None => Ok(()),
+        Some(refusal) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            refusal.message(run, phase),
+        )),
+    }
+}
+
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -846,9 +871,7 @@ pub fn phase_start<H: Herdr>(
     // wearing 0 — approved. `gate_refusal` asks the run dir instead, and it is
     // silent for any run that never opened a gate, so this refuses only the case
     // it was built for.
-    if let Some(refusal) = crate::review::gate_refusal(&run.name, phase) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, refusal));
-    }
+    gate_refusal_error(&run.name, phase)?;
     // Checked here as well as inside `ensure_workspace`, and for a different
     // reason: `project_dir` is this phase's cwd and its `--add-dir` guard, so it
     // is required even when the recorded workspace is perfectly alive. Both sites
@@ -1680,6 +1703,10 @@ fn phase_rehydrate_with_timeout<H: Herdr>(
     // this process took the lock (never *while* it waited: acquisition refuses
     // rather than blocks). `state.json` under the lock is the only authority.
     *run = RunState::load(&run.name)?;
+    // The spec gate, on the state just re-read under the lock. A resume is a
+    // launch: see `gate_refusal_error` for the cancel-then-rehydrate sequence
+    // this closes, and for why `phase_start` alone was not enough.
+    gate_refusal_error(&run.name, phase)?;
     // ONE precondition, shared with the HTTP handler and the agent tree — see
     // `RunState::rehydratable`. Written as separate checks it drifted twice:
     // first the handler checked two of the CLI's three, then the tree's
@@ -8221,18 +8248,18 @@ mod tests {
         );
     }
 
-    #[test]
-    /// forge#57's enforced half, at the only place a belief cannot substitute for
-    /// a check. `drovr review status` gives a driver a channel a pipe cannot
+    /// forge#57's enforced half, at a place a belief cannot substitute for a
+    /// check. `drovr review status` gives a driver a channel a pipe cannot
     /// destroy, but reading it is still a choice — and the driver that hit #57
     /// thought it *had* read one: `wait | tail` handed it a 0 and 0 means
     /// approved. So the gate is also asked here, where every gated phase must
     /// pass regardless of what the driver believes.
     ///
-    /// Deliberately in `phase_start` rather than in main.rs's dispatch: this is
-    /// the function every caller reaches (the CLI, and the re-entry path the
-    /// pipeline skill documents), so a check in the dispatch would be one a
-    /// second caller could walk around.
+    /// **Not the only such place**, which the first version of this fix got
+    /// wrong: it claimed `phase_start` was "the function every caller reaches".
+    /// `phase_rehydrate` launches an agent too, and is reachable from an
+    /// unauthenticated HTTP handler — see `gate_refusal_error`, which both call,
+    /// and `rehydrate_refuses_a_gated_phase_after_a_cancellation`.
     #[test]
     fn phase_start_refuses_a_gated_phase_whose_spec_is_not_approved() {
         let env = TestEnv::new();
@@ -10825,6 +10852,41 @@ mod rehydrate_tests {
             .into_iter()
             .find(|c| c.contains("pane_run"))
             .expect("rehydrate must launch something")
+    }
+
+    /// Review finding on the first version of the forge#57 gate: the refusal was
+    /// in `phase_start` only, on the claim that it was "the function every caller
+    /// reaches". It is not. This path mints a pass, sweeps the marker and
+    /// launches an agent — the same three steps — and the review server's
+    /// `POST /rehydrate` reaches it from an **unauthenticated** HTTP caller.
+    ///
+    /// The sequence: spec approved → the phase legitimately starts → the reviewer
+    /// CANCELS the run → the pane is reaped → a rehydrate brings the writer back
+    /// on a run a human abandoned. `rehydratable` bounds this to phases that ran
+    /// once, but a cancellation *after* a legitimate start is exactly the
+    /// transition the gate exists for.
+    #[test]
+    fn rehydrate_refuses_a_gated_phase_after_a_cancellation() {
+        let env = TestEnv::new();
+        let mut run = rehydrate_run(&env, "rh-cancelled");
+        run.phases
+            .push(reaped_phase("plan", "claude", None, Some("sess-abc")));
+        run.save().unwrap();
+        let dir = crate::run::run_dir("rh-cancelled");
+        std::fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+        let h = FakeHerdr::new();
+        script_resumed_session(&h, "sess-abc", "claude", 8);
+
+        let err = phase_rehydrate(&h, &mut run, "plan")
+            .expect_err("a cancelled run must not resume a writer");
+        assert!(
+            err.to_string().contains("CANCELLED"),
+            "the refusal must name the cancellation, got: {err}"
+        );
+        assert!(
+            !h.calls().iter().any(|c| c.contains("tab_create")),
+            "nothing may be spawned: a refusal after the launch is not a refusal"
+        );
     }
 
     #[test]

