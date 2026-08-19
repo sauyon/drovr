@@ -838,6 +838,17 @@ pub fn phase_start<H: Herdr>(
     } else {
         require_phase_name(phase)?;
     }
+    // The spec gate, asked before anything is spawned or appended (forge#57).
+    //
+    // A driver reaches here believing the gate is passed; the belief is the
+    // problem. `drovr review wait … | tail` reports the PIPE's exit status, so a
+    // timeout, an error, a request for changes and a cancellation all arrive
+    // wearing 0 — approved. `gate_refusal` asks the run dir instead, and it is
+    // silent for any run that never opened a gate, so this refuses only the case
+    // it was built for.
+    if let Some(refusal) = crate::review::gate_refusal(&run.name, phase) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, refusal));
+    }
     // Checked here as well as inside `ensure_workspace`, and for a different
     // reason: `project_dir` is this phase's cwd and its `--add-dir` guard, so it
     // is required even when the recorded workspace is perfectly alive. Both sites
@@ -8208,6 +8219,60 @@ mod tests {
             "the agent must not be launched when the marker could not be cleared: {:?}",
             h.calls()
         );
+    }
+
+    #[test]
+    /// forge#57's enforced half, at the only place a belief cannot substitute for
+    /// a check. `drovr review status` gives a driver a channel a pipe cannot
+    /// destroy, but reading it is still a choice — and the driver that hit #57
+    /// thought it *had* read one: `wait | tail` handed it a 0 and 0 means
+    /// approved. So the gate is also asked here, where every gated phase must
+    /// pass regardless of what the driver believes.
+    ///
+    /// Deliberately in `phase_start` rather than in main.rs's dispatch: this is
+    /// the function every caller reaches (the CLI, and the re-entry path the
+    /// pipeline skill documents), so a check in the dispatch would be one a
+    /// second caller could walk around.
+    #[test]
+    fn phase_start_refuses_a_gated_phase_whose_spec_is_not_approved() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "gated-start");
+
+        // Open a spec gate and leave it undecided — the exact state #57's run was
+        // in when its driver read a piped 0 and advanced.
+        let dir = crate::run::run_dir("gated-start");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        let err = phase_start(&h, &mut run, "implement-task-1", None)
+            .expect_err("an unapproved spec must not start an implement phase");
+        assert!(
+            err.to_string().contains("not approved"),
+            "the refusal must name the gate, got: {err}"
+        );
+        assert!(
+            run.phases.is_empty(),
+            "a refused phase must not be appended — a half-started gated phase is \
+             worse than none"
+        );
+
+        // Approve it and the same call goes through: the gate refuses a state, not
+        // a phase name.
+        std::fs::write(dir.join("approved"), b"approved\n").unwrap();
+        phase_start(&h, &mut run, "implement-task-1", None).expect("approved spec starts");
+    }
+
+    #[test]
+    fn phase_start_is_unaffected_by_a_run_that_never_opened_a_gate() {
+        // The compatibility half. Most runs in this suite never touch review, and
+        // if the gate fired on them it would refuse work that has always been
+        // legitimate — so this pins that the new check is silent by default.
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "ungated-start");
+        phase_start(&h, &mut run, "implement-task-1", None)
+            .expect("a run with no spec gate must start normally");
     }
 
     #[test]

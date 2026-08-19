@@ -2530,6 +2530,125 @@ pub enum WaitOutcome {
     Timeout,
 }
 
+/// Resolve the spec gate's outcome from the run dir alone — **no server**.
+///
+/// Answers exactly one question: *what would [`review_wait`] have returned had
+/// it stopped now?* Same [`WaitOutcome`], therefore the same exit codes, so a
+/// caller has one table to learn rather than two that can drift.
+///
+/// # Why this exists (forge#57)
+///
+/// A gate outcome used to travel on exactly one channel — the process exit
+/// status — and a shell pipeline overwrites that with its LAST command's
+/// status. So `drovr review wait <run> | tail -5` reports `tail`'s 0, and 0 is
+/// *approved*: a timeout, an error, a request for changes and an outright
+/// cancellation all arrive at the driver wearing an approval. `review_wait`
+/// could not help, because it polls the server over HTTP and never looks at the
+/// run dir, so an outcome lost in a pipe was lost for good.
+///
+/// This is the second channel. The markers it reads were always written — the
+/// `cancelled` write even says so in `handle_post_submit`: *"so a driver (or a
+/// human poking at the run dir) can see the outcome without the server"* —
+/// there was simply no command that read them back.
+///
+/// # Ordering
+///
+/// `cancelled` is checked before `approved`, and the marker files before the
+/// `review.state.json` state. Both orderings resolve a should-never-happen
+/// conflict toward *refusing to advance*: a run wrongly held at the gate costs
+/// a human a second look, while a run wrongly advanced past a cancellation is
+/// the failure this function exists to prevent. The markers outrank the state
+/// file because they are what the skills already call the source of truth, and
+/// because a marker is a single atomic create where the state file is a
+/// read-modify-write.
+///
+/// A missing run is an `Err` (exit 1), never an outcome. "Not decided yet" is a
+/// claim about a gate, and there is no gate here to make it about.
+pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
+    let dir = crate::run::run_dir(run);
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no run '{run}' at {}", dir.display()),
+        ));
+    }
+    let p = RunPaths::new(dir);
+    if p.cancelled().exists() {
+        return Ok(WaitOutcome::Cancelled);
+    }
+    if p.approved().exists() {
+        return Ok(WaitOutcome::Approved);
+    }
+    Ok(match ReviewState::load(&p.review_state()).state {
+        LoopState::Cancelled => WaitOutcome::Cancelled,
+        LoopState::Approved => WaitOutcome::Approved,
+        // `Waiting` alone is not a decision: it is also where a run sits before
+        // the agent has posted anything. The reviewer's turn is what makes it
+        // one, and `feedback.json` is that turn.
+        LoopState::Waiting if p.feedback().exists() => WaitOutcome::ChangesRequested,
+        _ => WaitOutcome::Timeout,
+    })
+}
+
+/// Is `phase_name` one the spec gate stands in front of?
+///
+/// `plan` and `implement-task-<N>` are the phases `drovr:pipeline` places AFTER
+/// approval — its own exit-0 row reads "proceed to plan". `brainstorm` is
+/// excluded because it *writes* the spec being judged, and gating it would
+/// deadlock the run: no spec, therefore no approval, therefore no spec. Review
+/// panel phases are the panel, not the pipeline, and are excluded for the same
+/// reason they are kept out of `RunState::phases`.
+fn is_gated_phase(phase_name: &str) -> bool {
+    phase_name == "plan" || phase_name.starts_with("implement-task-")
+}
+
+/// The refusal a gated phase must clear before it may start, or `None` to allow.
+///
+/// This is the enforced half of the forge#57 fix. [`gate_status`] hands a driver
+/// a channel that a pipe cannot destroy, but it is still a channel someone has
+/// to *choose* to read — and the driver that hit #57 was following instructions
+/// it believed it had satisfied. So the check also lives at the chokepoint, where
+/// no belief is required: `phase start` asks the disk before it spawns anything.
+///
+/// # It fires narrowly, on purpose
+///
+/// Only when the run actually opened a spec gate — `review.state.json` exists —
+/// and that gate is not approved. A run that never entered review has no gate to
+/// be un-approved by, and refusing it would break flows that have always been
+/// legitimate. That compatibility case has its own test, and it is the one worth
+/// breaking the build over.
+///
+/// An unreadable gate allows rather than refuses: `phase start` does its own
+/// loading and reports its own errors, and this function inventing a refusal out
+/// of an I/O failure would blame the gate for something else's fault.
+pub fn gate_refusal(run: &str, phase_name: &str) -> Option<String> {
+    if !is_gated_phase(phase_name) {
+        return None;
+    }
+    let p = RunPaths::new(crate::run::run_dir(run));
+    if !p.review_state().exists() {
+        return None;
+    }
+    match gate_status(run) {
+        Ok(WaitOutcome::Approved) | Err(_) => None,
+        Ok(WaitOutcome::Cancelled) => Some(format!(
+            "run '{run}' was CANCELLED by the reviewer — stop work and tear the run down \
+             (`drovr cleanup {run}`); '{phase_name}' will not start"
+        )),
+        Ok(WaitOutcome::ChangesRequested) => Some(format!(
+            "the spec for run '{run}' is not approved: the reviewer requested changes \
+             (see feedback.json). Revise the spec, re-post `drovr review summary`, and wait \
+             again before starting '{phase_name}'"
+        )),
+        Ok(WaitOutcome::Timeout) => Some(format!(
+            "the spec for run '{run}' is not approved: the reviewer has not decided yet. \
+             Wait on the gate (`drovr review wait {run}`) before starting '{phase_name}'. \
+             If a wait told you otherwise, check it with `drovr review status {run}` — a \
+             piped wait reports the pipe's exit code, not the gate's"
+        )),
+    }
+}
+
 /// GET `/api/runs/<run>/state` from the live server, returning the `state` str.
 fn fetch_state(addr: &str, run: &str) -> io::Result<String> {
     let mut stream = TcpStream::connect(addr).map_err(|e| {
@@ -5173,6 +5292,175 @@ mod tests {
                 .exists(),
             "cancelled marker must be on disk"
         );
+    }
+
+    /// The five `gate_status` tests below are the fix for forge#57, where a
+    /// piped `drovr review wait` reported exit 0 — "approved" — for a run the
+    /// reviewer had never decided. A shell pipeline's status is its LAST
+    /// command's, so `| tail` overwrites every outcome (1 error, 2 timeout,
+    /// 3 changes, 5 cancelled) with `tail`'s own 0.
+    ///
+    /// The exit code is therefore a channel that a caller can destroy by
+    /// accident, and `review wait` had no second one: it polls the server over
+    /// HTTP and never reads the run dir, so an outcome lost in a pipe was
+    /// unrecoverable. `gate_status` is that second channel — it answers
+    /// "what would `wait` have returned had it stopped now?" from the on-disk
+    /// markers alone.
+    ///
+    /// Each test asserts `TestEnv::new()` with NO server, which is the load-
+    /// bearing half: a driver reaches for this precisely when the server is
+    /// unreachable or the code was lost, and a resolver that needed the server
+    /// would be useless in exactly that case.
+    #[test]
+    fn status_reads_the_approved_marker_with_no_server_running() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-approved", b"# Spec");
+        fs::write(dir.join("approved"), b"approved\n").unwrap();
+
+        assert_eq!(gate_status("st-approved").expect("status"), WaitOutcome::Approved);
+    }
+
+    #[test]
+    fn status_reads_the_cancelled_marker_and_never_calls_it_approved() {
+        // The worst case #57 produces, and the one its own report does not
+        // mention: `cancel` exits 5 and means "tear the run down". Through a
+        // pipe that becomes 0 — approved — so the run marches on past a human
+        // who explicitly abandoned it.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-cancelled", b"# Spec");
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+
+        assert_eq!(
+            gate_status("st-cancelled").expect("status"),
+            WaitOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn status_reports_changes_requested_from_the_waiting_state() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-changes", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"waiting","turn":2}"#).unwrap();
+        fs::write(dir.join("feedback.json"), br#"{"turn":2,"decision":"request-changes"}"#)
+            .unwrap();
+
+        assert_eq!(
+            gate_status("st-changes").expect("status"),
+            WaitOutcome::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn status_reports_timeout_while_the_gate_is_still_ready() {
+        // `Timeout` is reused rather than given a new "pending" variant on
+        // purpose: it already means "no decision yet, re-run to resume", and
+        // ONE outcome table across both surfaces is the property being bought.
+        // A second enum would let the two drift, which is the class of defect
+        // this whole fix is about.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-ready", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        assert_eq!(gate_status("st-ready").expect("status"), WaitOutcome::Timeout);
+    }
+
+    #[test]
+    fn status_errors_on_a_run_that_does_not_exist() {
+        // Must be an Err (exit 1), never an outcome. The whole point is that a
+        // caller can trust this answer more than the exit code it lost; a
+        // missing run answering "not approved yet" would be a guess wearing a
+        // verdict.
+        let _env = TestEnv::new();
+        assert!(
+            gate_status("no-such-run").is_err(),
+            "a missing run must error, not report an outcome"
+        );
+    }
+
+    /// `gate_refusal` is the half of the forge#57 fix that survives a driver who
+    /// ignores every instruction. `review status` gives a lost exit code a second
+    /// channel, but a pipeline still reports 0 and a driver still has to *choose*
+    /// to check — so the docs and the new command both remain advisory, which is
+    /// the shape #37 retired ("a convention carried in a doc comment, enforced by
+    /// nothing"). This is the enforced one: the chokepoint every gated phase must
+    /// pass through asks the disk itself.
+    ///
+    /// The predicate is deliberately narrow, because a gate that blocks runs it
+    /// was never asked to guard is worse than the bug: it only fires when the run
+    /// **opened a spec gate** (`review.state.json` exists) and that gate has not
+    /// been approved. A run that never used the gate is untouched.
+    #[test]
+    fn the_gate_refuses_to_start_plan_while_the_spec_is_undecided() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-undecided", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        let refusal = gate_refusal("g-undecided", "plan").expect("plan must be refused");
+        assert!(
+            refusal.contains("not approved"),
+            "the refusal must say WHY, got: {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_gate_refuses_an_implement_task_after_a_cancellation() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-cancelled", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"cancelled","turn":1}"#).unwrap();
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+
+        let refusal =
+            gate_refusal("g-cancelled", "implement-task-3").expect("implement must be refused");
+        assert!(
+            refusal.contains("CANCELLED"),
+            "a cancellation must be named as one, not folded into 'not approved': {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_gate_allows_a_run_that_never_opened_a_spec_gate() {
+        // The compatibility case, and the one worth breaking the build over: not
+        // every run is a full gated pipeline. With no `review.state.json` there is
+        // no gate to be un-approved by, and inventing one would refuse work that
+        // has always been legitimate.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        make_run(&runs_root, "g-ungated", b"# Spec");
+
+        assert_eq!(gate_refusal("g-ungated", "implement-task-1"), None);
+        assert_eq!(gate_refusal("g-ungated", "plan"), None);
+    }
+
+    #[test]
+    fn the_gate_allows_every_gated_phase_once_approved() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-approved", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"approved","turn":1}"#).unwrap();
+        fs::write(dir.join("approved"), b"approved\n").unwrap();
+
+        assert_eq!(gate_refusal("g-approved", "plan"), None);
+        assert_eq!(gate_refusal("g-approved", "implement-task-7"), None);
+    }
+
+    #[test]
+    fn the_gate_never_blocks_the_phases_that_precede_it() {
+        // `brainstorm` is what PRODUCES the spec the gate judges, and `review`
+        // phases are the panel, not the pipeline. Gating either would deadlock the
+        // run: the spec could never be written, so it could never be approved.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-pre", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        assert_eq!(gate_refusal("g-pre", "brainstorm"), None);
+        assert_eq!(gate_refusal("g-pre", "review"), None);
     }
 
     #[test]

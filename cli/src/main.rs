@@ -32,7 +32,7 @@ use phase::{
     phase_done, phase_reap, phase_rehydrate, phase_send, phase_start, phase_wait, reap_retired,
     triage_blocked_phase,
 };
-use review::{WaitOutcome, display_addr, review_summary, review_wait, serve};
+use review::{WaitOutcome, display_addr, gate_status, review_summary, review_wait, serve};
 use run::{PhaseStatus, RunState, run_dir};
 use shell::shell_single_quote;
 use std::io;
@@ -380,6 +380,19 @@ enum ReviewCmd {
         #[arg(long, default_value_t = 1_800_000)]
         timeout_ms: u64,
     },
+    /// Report the gate's outcome from the run dir — non-blocking, no server.
+    ///
+    /// Answers "what would `wait` have returned had it stopped now?" and exits
+    /// with the SAME codes: 0 = approved, 3 = changes requested, 5 = cancelled,
+    /// 2 = no decision yet (the `wait`-timeout code, same meaning: re-run to
+    /// resume), 1 = error / no such run.
+    ///
+    /// Use it to confirm a `wait` whose exit code you may have lost. A shell
+    /// pipeline reports its LAST command's status, so `wait … | tail` reports
+    /// `tail`'s 0 — an approval — whatever the reviewer actually did. This
+    /// reads the on-disk markers instead, so the answer survives the pipe, a
+    /// dead server, and a driver that forgot `rc=$?`.
+    Status { run: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2048,6 +2061,37 @@ fn cmd_review(sub: ReviewCmd) {
                 }
                 Err(e) => {
                     eprintln!("drovr: review wait failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        ReviewCmd::Status { run } => {
+            if let Err(e) = validate_run_name(&run) {
+                eprintln!("drovr: {e}");
+                process::exit(1);
+            }
+            // Deliberately the same codes and the same wording as `Wait` above.
+            // Two surfaces reporting one gate must not describe it differently:
+            // a driver comparing a lost `wait` code against this one is the
+            // whole point, and it can only do that if they speak one language.
+            match gate_status(&run) {
+                Ok(WaitOutcome::Approved) => println!("review approved for run '{run}'"),
+                Ok(WaitOutcome::ChangesRequested) => {
+                    println!("review: changes requested for run '{run}' (see feedback.json)");
+                    process::exit(3);
+                }
+                Ok(WaitOutcome::Cancelled) => {
+                    println!(
+                        "review: run '{run}' was CANCELLED by the reviewer — stop work and tear the run down"
+                    );
+                    process::exit(5);
+                }
+                Ok(WaitOutcome::Timeout) => {
+                    println!("review: no reviewer decision yet for run '{run}'");
+                    process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("drovr: review status failed: {e}");
                     process::exit(1);
                 }
             }
@@ -3980,6 +4024,24 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn parse_review_status_takes_a_run_and_no_timeout() {
+        // Deliberately has no `--timeout-ms`: `status` never blocks, and an
+        // accepted-but-ignored timeout flag would invite the belief that it
+        // waits. It is the non-blocking half of `wait`'s contract (forge#57).
+        let cli = parse(&["drovr", "review", "status", "myrun"]).unwrap();
+        match cli.command {
+            Commands::Review {
+                sub: ReviewCmd::Status { run },
+            } => assert_eq!(run, "myrun"),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            parse(&["drovr", "review", "status", "myrun", "--timeout-ms", "5"]).is_err(),
+            "status must reject --timeout-ms rather than ignore it"
+        );
     }
 
     // -- ask --------------------------------------------------------------------

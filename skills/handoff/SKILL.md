@@ -115,6 +115,17 @@ Run name is `<run>`; the phase you are running is `<phase>`.
    | `5` | **superseded** — a newer `phase start` re-entered the phase while this wait ran, so it was watching a pass that no longer exists | Nothing is wrong with the phase. **Re-arm** to follow the live pass. Never triage this as a stuck agent. |
    | `1` | I/O error | STOP — see *Stop conditions*. |
 
+   ⚠️ **Do not pipe this command.** A shell pipeline's exit status is its **last** command's,
+   so `drovr phase wait … | tail -5` reports `tail`'s 0 and every row above reads as `0` —
+   done. Trimming output with `| tail`/`| head`/`| grep` is a natural habit and it voids this
+   table silently. Capture the status instead:
+   ```
+   drovr phase wait <run> <phase> --timeout-ms 3600000; rc=$?; echo "EXIT=$rc"; exit $rc
+   ```
+   The same trap applies to every drovr command with an exit-code contract — `review wait`
+   and `code-review run` most of all, where a swallowed status has already produced both a
+   false approval and a false clean review.
+
    **Re-arm** = run the exact same backgrounded `drovr phase wait` again and end the turn again.
    The wait is stateless and resumable: it polls an on-disk marker, so nothing is lost by
    re-issuing it and a phase that finished during the gap is detected immediately.
