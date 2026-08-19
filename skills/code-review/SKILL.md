@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Use when you have written any change, before calling it done or handing it forward — requires read-only reviewer subagents run in the foreground, with every Critical and Important finding resolved or explicitly recorded as deferred
+description: Use when you have written any change, before calling it done or handing it forward — including when you are about to review it by some other means, or to ask a human to authorize a reviewer; requires `drovr code-review run` in the foreground, with every Critical and Important finding resolved or explicitly recorded as deferred
 ---
 
 # Code Review
@@ -74,23 +74,24 @@ Re-create those items for each change you review, not once for the session.
    the range — in a drovr run, `<base>..HEAD` with `<base>` from
    `<task>-base.sha`, recorded before your first edit. Get it wrong and the
    reviewer reports clean on nothing.
-2. **Dispatch read-only reviewers, blocking, one per angle.** Agent tool,
-   `subagent_type: general-purpose`, model `sonnet`. Tell each to review as a
-   skeptic, not the author; to say whether the tests exercise the behaviour, not
-   just that they pass; to rate every finding **Critical, Important or nit** —
-   what the Iron Law gates on — and say so when it found none; and to write them
-   to a path you name, so step 3 has something to open. The lenses to cover:
+2. **Dispatch read-only reviewers, blocking, one per angle:** run
+   `drovr code-review run <run> <task>`, and nothing else.
+
+   It spawns one reviewer per **configured** angle — `config.angles`, which
+   defaults to correctness, security, error-handling, type-design — each writing
+   `<task>-review-<angle>.json`, merged into `<task>-review.json`. **Read the
+   config, not this page**, and cover any lens it omits yourself.
+
+   Tell each reviewer to review as a skeptic, not the author; to say whether the
+   tests exercise the behaviour, not just that they pass; to rate every finding
+   **Critical, Important or nit** — what the Iron Law gates on — and say so when
+   it found none; and to write them to a path you name, so step 3 has something
+   to open. The lenses to cover:
    - **Spec compliance** — what was agreed, no more, no less?
    - **Correctness** — real bugs, unhandled cases, broken invariants.
    - **Verification** — do the claimed tests exist, and would they fail on a
      regression?
    - **Quality** — reuse, simplification, consistency with the code around it.
-
-   In a drovr run, `drovr code-review run <run> <task>` dispatches one reviewer
-   per **configured** angle — `config.angles`, which defaults to correctness,
-   security, error-handling, type-design, not the list above — each writing
-   `<task>-review-<angle>.json`, merged into `<task>-review.json`. **Read the
-   config, not this page**, and cover any lens it omits yourself.
 3. **Wait for every reviewer, then read what each wrote.** Open the findings
    file by path. Exit codes: 0 clean, 3 findings, 2 timeout, 1 error — **only 0
    is clean**, and a reviewer that returned no verdict is none of the four.
@@ -197,7 +198,7 @@ exit 3
 ## Cross-refs
 
 - `drovr:verification-before-completion` — REQUIRED before you repeat a
-  verdict: a subagent's report is a claim, not evidence.
+  verdict: a reviewer's report is a claim, not evidence.
 - `drovr:systematic-debugging` — REQUIRED when a finding is a bug: it is a
   report, not a diagnosis. Reproduce before you fix.
 - `drovr:tdd` — REQUIRED when a finding needs new behaviour: the fix is new code
