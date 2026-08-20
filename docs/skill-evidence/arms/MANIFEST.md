@@ -106,3 +106,6 @@ Further rules follow from the parser being strict for the whole file at once:
 | voice | V2 | `docs/skill-evidence/arms/voice/V2.md` | `a8a3cb0292919aef53a3204a81b112991228e690` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
 | voice | V3 | `docs/skill-evidence/arms/voice/V3.md` | `24e204266831e89ccd8494ed0bb78aa50e304431` | `5cc741230d8b62f5917be6c83861a1f7ed240ffe` | 2026-08-04 |
 | spec-length | S0 | `docs/skill-evidence/arms/spec-length/S0.md` | `db89be9ee06913386afcb6f1053597fdb9728a3a` | `9accca813ba5f1ca42714c0bfb146788645d0aee` | 2026-08-06 |
+| spec-length | S1 | `docs/skill-evidence/arms/spec-length/S1.md` | `bb0d5cdcf2903e9d47e705820911a2464c73ab22` | `a9eef3a3de9303213cce4a689dee3133f75c2ac8` | 2026-08-08 |
+| spec-length | S2 | `docs/skill-evidence/arms/spec-length/S2.md` | `8126b24fabadf3aff9391afd132f79676a288459` | `6352ea1b65be6fc0c3039577234844b98db575c9` | 2026-08-08 |
+| spec-length | S3 | `docs/skill-evidence/arms/spec-length/S3.md` | `978f4c46c545e7d0df09158ad9cbfeca550c3eca` | `6a56a21f676c33f58a3936adaa25ca1d97129fee` | 2026-08-08 |

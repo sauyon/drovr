@@ -1,0 +1,693 @@
+{
+  "spec_id": "4a73ef",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-01",
+      "present": true,
+      "quotes": [
+        "Capture arm A / RED per skill (§6.3) at the pre-fix `HEAD`, before any skill file is touched.",
+        "once fix 1 lands, arm A is unrecoverable without a checkout."
+      ]
+    },
+    {
+      "id": "skill-stickiness-02",
+      "present": true,
+      "quotes": [
+        "1. **Published evidence exists** → the evidence decides; the citation stays in the shipped text.",
+        "Not reachable, or measurement inconclusive, and superpowers has a convention** → **follow",
+        "4. **No superpowers analogue** → **engineering judgement, marked `[tier 4]`.**"
+      ]
+    },
+    {
+      "id": "skill-stickiness-03",
+      "present": true,
+      "quotes": [
+        "- **No fabricated measurements.** No number, duration, frequency, or comparative is stated as"
+      ]
+    },
+    {
+      "id": "skill-stickiness-04",
+      "present": true,
+      "quotes": [
+        "- **No copied text.** Both projects are MIT; mechanisms are ported, sentences are drovr's own.",
+        "Any verbatim ≥8-word shingle found in review (§8's check) gets reworded or the MIT notice and"
+      ]
+    },
+    {
+      "id": "skill-stickiness-05",
+      "present": true,
+      "quotes": [
+        "- **Unity is adopted for the four discipline skills**, deviating from superpowers (which"
+      ]
+    },
+    {
+      "id": "skill-stickiness-06",
+      "present": true,
+      "quotes": [
+        "                     each bullet pairing the prohibition with the required action"
+      ]
+    },
+    {
+      "id": "skill-stickiness-07",
+      "present": true,
+      "quotes": [
+        "9. Rationalizations  thought → reality; the reality column is an INSTRUCTION, not a rebuttal"
+      ]
+    },
+    {
+      "id": "skill-stickiness-08",
+      "present": true,
+      "quotes": [
+        "fenced `dot` blocks **only** for genuine branching or a stop-too-early loop, never for linear"
+      ]
+    },
+    {
+      "id": "skill-stickiness-09",
+      "present": true,
+      "quotes": [
+        "- **Loop** (fenced `dot` flowchart — a stop-too-early loop, per §1): build the scenario set → run"
+      ]
+    },
+    {
+      "id": "skill-stickiness-10",
+      "present": true,
+      "quotes": [
+        "is `[tier 4]` product judgement for a different audience (a human orienting mid-run) — out of",
+        "scope for this run** (§7). Filed as a `docs/known-issues.md` follow-up note, not built here."
+      ]
+    },
+    {
+      "id": "skill-stickiness-11",
+      "present": true,
+      "quotes": [
+        "**Length budget, all four skills:** teaching content stays terse and is cross-referenced, never",
+        "the matching checklist item) is deliberately redundant, stated 3–4 times per skill, because"
+      ]
+    },
+    {
+      "id": "skill-stickiness-12",
+      "present": true,
+      "quotes": [
+        "redundancy is the compliance mechanism. `cli/tests/skills_valid.rs:17`'s `const BODY_BUDGET`",
+        "(currently `2200` bytes, checked over exactly these four skills at `:20-25`; `using-drovr`,",
+        "`handoff`, `pipeline` are deliberately unchecked) rises to **12000 bytes**. `using-drovr` gets its"
+      ]
+    },
+    {
+      "id": "skill-stickiness-13",
+      "present": true,
+      "quotes": [
+        "own new cap and joins the checked list at **9000 bytes** — it is the most expensive document in"
+      ]
+    },
+    {
+      "id": "skill-stickiness-14",
+      "present": true,
+      "quotes": [
+        "indefensible. Above cap, split into `references/`. `cli/tests/skills_valid.rs`'s byte check is the",
+        "**single authoritative size check**; `wc -l`/`wc -w` are author guidance only, never asserted."
+      ]
+    },
+    {
+      "id": "skill-stickiness-15",
+      "present": true,
+      "quotes": [
+        "Above cap, split into `references/`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-16",
+      "present": true,
+      "quotes": [
+        "Two defects, fixed together: (a) all four discipline skills scope themselves to drovr phases in",
+        "| `skills/tdd/SKILL.md:3` | `Use when implementing any feature or bugfix, before writing implementation code — requires a test you have watched fail before any implementation exists; no production code without a red test first` |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-17",
+      "present": true,
+      "quotes": [
+        "1. description:      trigger, not summary (fix 1)"
+      ]
+    },
+    {
+      "id": "skill-stickiness-18",
+      "present": true,
+      "quotes": [
+        "| `skills/using-drovr/SKILL.md:3` | `Use at the start of every session and before every response, including before clarifying questions and before reading any file — routes to the right drovr skill and requires invoking it whenever there is even a 1% chance one applies` |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-19",
+      "present": true,
+      "quotes": [
+        "**Body demotions** — every drovr-phase reference in these four skills becomes a clearly-marked"
+      ]
+    },
+    {
+      "id": "skill-stickiness-20",
+      "present": true,
+      "quotes": [
+        "**`docs/known-issues.md`:** one entry, in the file's existing convention (`## <symptom title> —",
+        "cause` / `### Fix`), recording that four descriptions scoped unconditional discipline to phases"
+      ]
+    },
+    {
+      "id": "skill-stickiness-21",
+      "present": true,
+      "quotes": [
+        "2. **The 1% rule** `[tier 3]`, placed above the H1 inside the existing `<EXTREMELY_IMPORTANT>`",
+        "clause — if it turns out not to fit, drop it; invoking costs almost nothing."
+      ]
+    },
+    {
+      "id": "skill-stickiness-22",
+      "present": true,
+      "quotes": [
+        "3. **The per-turn rule**: check before any response, including before a clarifying question and"
+      ]
+    },
+    {
+      "id": "skill-stickiness-23",
+      "present": true,
+      "quotes": [
+        "4. **Instruction-priority ladder** `[tier 3]`: the human's explicit instructions > drovr skills >"
+      ]
+    },
+    {
+      "id": "skill-stickiness-24",
+      "present": true,
+      "quotes": [
+        "5. **Gate function**, a fenced `dot` flowchart (branching, per §1's flowchart rule): message",
+        "received → does any skill apply (≥1%) → invoke → announce → does it have a checklist → create",
+        "one tracked item per step → follow it → only then respond."
+      ]
+    },
+    {
+      "id": "skill-stickiness-25",
+      "present": true,
+      "quotes": [
+        "6. **Red-flag table for the router's own failure mode** (invoking nothing at all — currently zero",
+        "Final wording comes"
+      ]
+    },
+    {
+      "id": "skill-stickiness-26",
+      "present": true,
+      "quotes": [
+        "**Placement contract:** items 2–5 sit outside every `<!-- reflex:section:NAME -->` marker",
+        "advisory sections but must never be able to silently delete the routing core; only",
+        "`[reflex] enabled = false` removes it."
+      ]
+    },
+    {
+      "id": "skill-stickiness-27",
+      "present": true,
+      "quotes": [
+        "- `hooks/hooks.json` gains a `UserPromptSubmit` entry running a new thin `hooks/user-prompt`",
+        "script that `exec`s `drovr reflex --gate`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-28",
+      "present": true,
+      "quotes": [
+        "`UserPromptSubmit` takes **no** `matcher` — the",
+        "existing `SessionStart` entry's `startup|clear|compact` matcher must not be copied across."
+      ]
+    },
+    {
+      "id": "skill-stickiness-29",
+      "present": true,
+      "quotes": [
+        "- **Byte budget**: rendered `additionalContext` ≤ 600 bytes per injection, and a cumulative",
+        "tokenizer); asserted in `cli/src/reflex.rs`'s test module."
+      ]
+    },
+    {
+      "id": "skill-stickiness-30",
+      "present": true,
+      "quotes": [
+        "- **Suppression rule** (bounds the cumulative cost): the card is emitted only when no `drovr:*`",
+        "skill was invoked in the previous turn. A session already running the discipline is not"
+      ]
+    },
+    {
+      "id": "skill-stickiness-31",
+      "present": true,
+      "quotes": [
+        "- **Card content**: the 1% rule, the per-turn check, the announcement string, the",
+        "checklist-binding line, a `<SUBAGENT-STOP>` line, and a pointer to `Skill drovr:using-drovr`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-32",
+      "present": true,
+      "quotes": [
+        "1. `reflex.rs:143-152`'s `envelope()` hardcodes `\"hookEventName\": \"SessionStart\"` — must be"
+      ]
+    },
+    {
+      "id": "skill-stickiness-33",
+      "present": true,
+      "quotes": [
+        "2. `main.rs:114-118` declares `Reflex { skill: PathBuf }` as required, and `main.rs:1276-1278`",
+        "asserts bare `drovr reflex` errors. Adding `--gate` requires `Option<PathBuf>`, a clap",
+        "arg-group rule (`--gate` xor `--skill`), and an update to that test."
+      ]
+    },
+    {
+      "id": "skill-stickiness-34",
+      "present": true,
+      "quotes": [
+        "- **Card text source**: a `const` in `reflex.rs`, not extraction from `SKILL.md` (extraction"
+      ]
+    },
+    {
+      "id": "skill-stickiness-35",
+      "present": true,
+      "quotes": [
+        "markers). Drift risk is mitigated by a test asserting the card's key phrases appear in",
+        "`using-drovr/SKILL.md`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-36",
+      "present": true,
+      "quotes": [
+        "unconditionally, and §0 step 1 verifies empirically whether the hook fires for Agent-tool",
+        "subagents in this harness, recording the answer in `docs/skill-evidence/per-turn-gate.md`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-37",
+      "present": true,
+      "quotes": [
+        "- **Config**: new `[reflex] per_turn` bool in `ReflexConfig` (`cli/src/config.rs:39-64`), default",
+        "`true` `[tier 4]`, suppressible per-user, via a named default fn (not bare"
+      ]
+    },
+    {
+      "id": "skill-stickiness-38",
+      "present": true,
+      "quotes": [
+        "- **Asymmetric suppression, deliberate.** The full `SessionStart` reflex stays suppressed inside",
+        "gate does **not** suppress in phases — a phase is exactly where the discipline must hold."
+      ]
+    },
+    {
+      "id": "skill-stickiness-39",
+      "present": true,
+      "quotes": [
+        "`PreToolUse` hard-denial (e.g. blocking an `Edit` that skipped `drovr:tdd`, or a `git commit`",
+        "false-positive risk. Not this run."
+      ]
+    },
+    {
+      "id": "skill-stickiness-40",
+      "present": true,
+      "quotes": [
+        "> When a skill or briefing gives you a numbered checklist, create **one tracked item per step**",
+        "> using whatever task tool this harness exposes — `TodoWrite`, or `TaskCreate`/`TaskUpdate` —",
+        "> before you start step 1."
+      ]
+    },
+    {
+      "id": "skill-stickiness-41",
+      "present": true,
+      "quotes": [
+        "the harness exposes no task tool, write the checklist to",
+        "> `~/.local/share/drovr/runs/<run>/checklist.md` when inside a run, or `CHECKLIST.md` at the repo"
+      ]
+    },
+    {
+      "id": "skill-stickiness-42",
+      "present": true,
+      "quotes": [
+        "1. `skills/using-drovr/SKILL.md` — the gate function's checklist branch (§3.1 item 5).",
+        "3. `skills/pipeline/phase-prompts/*.md` — the `## Do` lists (`implement-task.md:14-64`, 7 steps,",
+        "4. `skills/handoff/SKILL.md` and `skills/handoff/HANDOFF-template.md` — the 7-section handoff is"
+      ]
+    },
+    {
+      "id": "skill-stickiness-43",
+      "present": true,
+      "quotes": [
+        "1. description:      trigger, not summary (fix 1)\n2. Overview          core principle + spirit-vs-letter line + the WHY, ≤6 lines\n3. Unity line        \"the next phase agent is you, with your context gone\"",
+        "4. The Iron Law      one fenced all-caps line + \"No exceptions:\" bullets closing named loopholes,\n                     each bullet pairing the prohibition with the required action\n5. Announce          the exact sentence to emit when invoking the skill (commitment device)\n6. The procedure     numbered, preceded by the task-binding directive (fix 3)",
+        "8. Red flags — STOP  inner-monologue fragments, closed by a catch-all bullet\n9. Rationalizations  thought → reality; the reality column is an INSTRUCTION, not a rebuttal\n10. Worked example   one ✅/❌ pair of actual utterances. One good example, not five\n11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
+      ]
+    },
+    {
+      "id": "skill-stickiness-44",
+      "present": true,
+      "quotes": [
+        "7. Requirements      claim → required evidence → not sufficient",
+        "                     ONLY: verification-before-completion, code-review"
+      ]
+    },
+    {
+      "id": "skill-stickiness-45",
+      "present": true,
+      "quotes": [
+        "6b. Cycle flowchart  a fenced dot graph of the loop",
+        "                     ONLY: tdd, systematic-debugging   (§1 flowchart rule)"
+      ]
+    },
+    {
+      "id": "skill-stickiness-46",
+      "present": true,
+      "quotes": [
+        "**Announcement sentences** — template `Using drovr:<skill> to <purpose>.`:",
+        "- `tdd` — *\"Using drovr:tdd — writing the failing test before the implementation.\"*"
+      ]
+    },
+    {
+      "id": "skill-stickiness-47",
+      "present": true,
+      "quotes": [
+        "11. Cross-refs       bare skill names with REQUIRED markers; never @-links (they force-load)"
+      ]
+    },
+    {
+      "id": "skill-stickiness-48",
+      "present": true,
+      "quotes": [
+        "**`tdd`** — Iron Law: no implementation code before a test you have watched fail."
+      ]
+    },
+    {
+      "id": "skill-stickiness-49",
+      "present": true,
+      "quotes": [
+        "mechanistic root cause",
+        "**`systematic-debugging`** — Iron Law: no fix before a reproduction and a mechanistic cause."
+      ]
+    },
+    {
+      "id": "skill-stickiness-50",
+      "present": true,
+      "quotes": [
+        "Adds a numeric escalation trigger: after 3 failed fixes, stop and question the design; no\n  attempt at fix #4 without that conversation."
+      ]
+    },
+    {
+      "id": "skill-stickiness-51",
+      "present": true,
+      "quotes": [
+        "**`verification-before-completion`** — Iron Law: no completion claim without fresh evidence\n  produced in this message."
+      ]
+    },
+    {
+      "id": "skill-stickiness-52",
+      "present": true,
+      "quotes": [
+        "**`code-review`** — Iron Law: no change is done until a read-only reviewer has looked at it and\n  every Critical/Important finding is resolved or explicitly recorded as deferred."
+      ]
+    },
+    {
+      "id": "skill-stickiness-53",
+      "present": true,
+      "quotes": [
+        "The existing FOREGROUND rule (`code-review/SKILL.md:19-23`) is promoted\n  into the no-exceptions list — backgrounding a reviewer is the known way this skill silently\n  fails."
+      ]
+    },
+    {
+      "id": "skill-stickiness-54",
+      "present": true,
+      "quotes": [
+        "### 6.1 New skill: `skills/writing-skills/SKILL.md`, in drovr's voice",
+        "**Mapping**: pressure scenario ↔ test case; `SKILL.md` ↔ production code; RED ↔ agent violates\n  the rule without the skill; GREEN ↔ complies with the skill; REFACTOR ↔ close each new\n  loophole."
+      ]
+    },
+    {
+      "id": "skill-stickiness-55",
+      "present": true,
+      "quotes": [
+        "repeat until a\n  run produces no new rationalization **or** the §6.3 REFACTOR ceiling is reached, whichever\n  comes first."
+      ]
+    },
+    {
+      "id": "skill-stickiness-56",
+      "present": true,
+      "quotes": [
+        "transcribe every excuse verbatim"
+      ]
+    },
+    {
+      "id": "skill-stickiness-57",
+      "present": true,
+      "quotes": [
+        "**Four-part closure** (all four, every time): explicit negation inside the rule; a row in the\n  rationalization table; a bullet in red flags; a `description:` update adding the symptom of\n  being about to violate."
+      ]
+    },
+    {
+      "id": "skill-stickiness-58",
+      "present": true,
+      "quotes": [
+        "**Scenario construction rules**: real file paths, concrete numbers and deadlines, a forced\n  A/B/C choice, \"what do you do\" not \"what should you do\", no escape hatch to \"I'd ask the\n  human\", and ≥3 combined pressure types (time, sunk cost, authority, economic, exhaustion,\n  social, pragmatic)."
+      ]
+    },
+    {
+      "id": "skill-stickiness-59",
+      "present": true,
+      "quotes": [
+        "**Pass criteria** (all four): correct option under maximum pressure; agent cites a specific\n  section; names the temptation and complies anyway; meta-test (\"how should this have been\n  written?\") returns \"it was clear\"."
+      ]
+    },
+    {
+      "id": "skill-stickiness-60",
+      "present": true,
+      "quotes": [
+        "scenario subagents run in the FOREGROUND"
+      ]
+    },
+    {
+      "id": "skill-stickiness-61",
+      "present": true,
+      "quotes": [
+        "`skills/writing-skills/scenarios/<skill>-<n>.md` — checked-in scenario prompts, each tagged\n  `dev` or `holdout` (§6.3)."
+      ]
+    },
+    {
+      "id": "skill-stickiness-62",
+      "present": true,
+      "quotes": [
+        "`docs/skill-evidence/<skill>.md` — per skill: scenarios used, verbatim baseline\n  rationalizations, the counter-text, re-test results with dates."
+      ]
+    },
+    {
+      "id": "skill-stickiness-63",
+      "present": true,
+      "quotes": [
+        "`docs/skill-evidence/voice.md` — the §6.4 probe record.",
+        "`docs/skill-evidence/per-turn-gate.md` — §3.2's unmeasured-bet record and the subagent-firing\n  answer.",
+        "`docs/skill-evidence/transcripts/` — raw transcripts"
+      ]
+    },
+    {
+      "id": "skill-stickiness-64",
+      "present": true,
+      "quotes": [
+        "Per skill: 3 scenarios, 1 development + 2 held-out. RED transcription and counter-text\nauthoring use only the development scenario. The pass bar is pre-registered and scored on the\nheld-out pair, never read while writing arm B."
+      ]
+    },
+    {
+      "id": "skill-stickiness-65",
+      "present": true,
+      "quotes": [
+        "**Arms** (three, so fix 1 and fix 4 are separable):",
+        "| **A** | Current `SKILL.md` at the pre-fix `HEAD` (captured in §0 step 2) |",
+        "| **A′** | Fix-1-only: descriptions un-scoped, no armor |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-66",
+      "present": true,
+      "quotes": [
+        "**Budget table.** Every stage has a hard ceiling.",
+        "| **Total** | | **≈122** | **122 hard ceiling** |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-67",
+      "present": true,
+      "quotes": [
+        "Hitting a ceiling halts that stage and records a\nnull in `docs/skill-evidence/` — it does not silently extend."
+      ]
+    },
+    {
+      "id": "skill-stickiness-68",
+      "present": true,
+      "quotes": [
+        "| `using-drovr` no-skill-applies class | 2 scenarios × 3 arms × 2 samples | 12 | 12 |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-69",
+      "present": true,
+      "quotes": [
+        "Decomposition: one dedicated phase per skill, `ab-<skill>` (5 phases),\neach running its own stages, writing `docs/skill-evidence/<skill>.md` plus raw transcripts, then\nexiting. The voice probe is a sixth phase, `ab-voice`. The driver aggregates results. No phase\nholds more than ~25 runs."
+      ]
+    },
+    {
+      "id": "skill-stickiness-70",
+      "present": true,
+      "quotes": [
+        "**Rubric**: binary compliant/non-compliant on the scenario's forced choice, plus §6.1's four\n  pass criteria recorded separately as booleans."
+      ]
+    },
+    {
+      "id": "skill-stickiness-71",
+      "present": true,
+      "quotes": [
+        "**Scoring**, pre-registered and not done by arm B's author:",
+        "**Scorer**: a read-only reviewer subagent, given only the transcript and the rubric."
+      ]
+    },
+    {
+      "id": "skill-stickiness-72",
+      "present": true,
+      "quotes": [
+        "**Blinding**: arm labels stripped and transcripts shuffled before scoring; the mapping is\n  restored only after all scores are recorded."
+      ]
+    },
+    {
+      "id": "skill-stickiness-73",
+      "present": true,
+      "quotes": [
+        "**Model**: `sonnet` for both probe subagents and the scorer."
+      ]
+    },
+    {
+      "id": "skill-stickiness-74",
+      "present": true,
+      "quotes": [
+        "**Arm A \"already passes\" bar**: compliant on ≥3 of its 4 held-out runs (2 held-out scenarios ×\n  2 samples)."
+      ]
+    },
+    {
+      "id": "skill-stickiness-75",
+      "present": true,
+      "quotes": [
+        "**Arm B bar**: compliant on ≥3 of its 4 held-out runs for that skill, **and** strictly more\n  compliant runs than both A and A′."
+      ]
+    },
+    {
+      "id": "skill-stickiness-76",
+      "present": true,
+      "quotes": [
+        "a skill whose B fails after its REFACTOR ceiling does not ship its\n  armor — it reverts to arm A′ (fix-1-only), and `docs/skill-evidence/<skill>.md` records the\n  failure and the reverted state. Fix 1 ships regardless (it is defect repair); fix 4 must earn\n  its bytes."
+      ]
+    },
+    {
+      "id": "skill-stickiness-77",
+      "present": true,
+      "quotes": [
+        "**Falsifiability**: if arm A already passes for a skill, that skill's rewrite is not justified\n  and reverts to A′."
+      ]
+    },
+    {
+      "id": "skill-stickiness-78",
+      "present": true,
+      "quotes": [
+        "**A′ ≈ B**: if A′ performs comparably to B for a skill, the armor isn't carrying weight there\n  and that skill reverts to A′ even if B independently clears its own bar."
+      ]
+    },
+    {
+      "id": "skill-stickiness-79",
+      "present": true,
+      "quotes": [
+        "**Probe skill**: `verification-before-completion` (sharpest binary outcome — claimed done without\nrunning the command — shortest scenarios)."
+      ]
+    },
+    {
+      "id": "skill-stickiness-80",
+      "present": true,
+      "quotes": [
+        "**Variants**, identical in structure (same Iron Law, procedure, tables, placement), each adding\nexactly one register device to the baseline so factors stay separable at this sample size:",
+        "| **V0** | Baseline: plain imperative; no all-caps, no absolutist \"no exceptions\"; operational consequence only |",
+        "| **V1** | V0 + unity line |"
+      ]
+    },
+    {
+      "id": "skill-stickiness-81",
+      "present": true,
+      "quotes": [
+        "**Pre-registered decision rule** (separation margin ≥3 of 6, chosen to match stated power — a\n2-of-12 margin on binary outcomes is roughly one standard deviation and would fire on noise):"
+      ]
+    },
+    {
+      "id": "skill-stickiness-82",
+      "present": true,
+      "quotes": [
+        "1. Variant beats V0 by ≥3 → that device ships across all five skill documents.",
+        "2. V0 beats the variant by ≥3 → that device is dropped; baseline register ships for that\n   dimension."
+      ]
+    },
+    {
+      "id": "skill-stickiness-83",
+      "present": true,
+      "quotes": [
+        "No separation ≥3 (the likeliest outcome, given §1's expectation of small register effects on\n   frontier models) → tier 3, follow superpowers: authority ships (superpowers uses it), moral\n   framing ships (superpowers uses it throughout), unity ships anyway on the strength of the 2026\n   published ranking (tier 1 outranks tier 3). Each such outcome is recorded in\n   `docs/skill-evidence/voice.md` as convention-or-prior, with the null attached."
+      ]
+    },
+    {
+      "id": "skill-stickiness-84",
+      "present": true,
+      "quotes": [
+        "**No directional escape hatch**: if V1 loses to V0 by ≥3, that is recorded as a genuine conflict\nbetween the published prior and drovr's own data, and escalates to the human rather than being\nauto-resolved by this spec."
+      ]
+    },
+    {
+      "id": "skill-stickiness-85",
+      "present": true,
+      "quotes": [
+        "Whichever register wins applies to the other four documents without separately re-testing\n   each."
+      ]
+    },
+    {
+      "id": "skill-stickiness-86",
+      "present": true,
+      "quotes": [
+        "`handoff`, `pipeline`, `worktrees` receive **only** the §4 task-binding\n  directive and nothing else."
+      ]
+    },
+    {
+      "id": "skill-stickiness-87",
+      "present": true,
+      "quotes": [
+        "any change to the phase state machine, the review gate, or\n`drovr code-review` itself"
+      ]
+    },
+    {
+      "id": "skill-stickiness-88",
+      "present": true,
+      "quotes": [
+        "These skills ship via the nix flake; nothing here takes effect in the\nrunning session until the flake pin is bumped. The probe harness (§6) therefore feeds skill text\nto subagents explicitly rather than relying on ambient injection."
+      ]
+    },
+    {
+      "id": "skill-stickiness-89",
+      "present": true,
+      "quotes": [
+        "`grep -L -E 'in a drovr phase|a drovr task|a drovr phase has produced' skills/*/SKILL.md`\n     returns all 8 files — none of those literals survives anywhere."
+      ]
+    },
+    {
+      "id": "skill-stickiness-90",
+      "present": true,
+      "quotes": [
+        "Verbatim-overlap check against\n     `/home/sauyon/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/`: no\n     ≥8-word shingle shared with any drovr `SKILL.md`."
+      ]
+    },
+    {
+      "id": "skill-stickiness-91",
+      "present": true,
+      "quotes": [
+        "a clean session, given a one-line bugfix request with no mention of drovr,\n   invokes `drovr:tdd` before writing code. Run against this worktree with\n   `CLAUDE_PLUGIN_ROOT=<worktree>` so it does not depend on the flake pin being bumped first."
+      ]
+    }
+  ]
+}

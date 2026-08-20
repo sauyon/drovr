@@ -1,0 +1,44 @@
+# SHA-256 of every tier-1 scorer prompt DISPATCHED in the corrected-prompt pass.
+#
+# Why this file exists: SCORING-3-NOTES.md 5.1 compares scorer behaviour under two
+# prompts, and nothing recorded the prompt side of that comparison — the same
+# author's-word problem the shard hashes exist to solve, left unsolved on the input
+# side until review pointed at it. It also discharges SCORING-2-NOTES.md 9.5a item 14.
+#
+# The prompts are NOT committed: 30 files of ~25 KB, most of which is the frozen
+# item-8 schema and PROTOCOL-3 2 and 3 repeated thirty times. They are reproducible
+# instead. Re-run
+#   tools/build-tier1-prompts-3.py <out-dir> <fixture>
+# for each of the three fixtures and hash the results; the builder is deterministic
+# (it reads only committed frozen files) and reproduces these bytes exactly.
+
+6e6a0cb6ba79ec6d267ce6fc147f8b86c8adb26e8cc4e31c675a4de77528a0fd  031cc4-1/prompt.txt
+265a7e61e3d37f0310b09a8d351f2a3c54d3561d1caeaed0250d72d613b0717e  054872-1/prompt.txt
+8b367e5ea984cb0a01cc40750ae452b953cafa6f39958eedf7e209fd8e99587b  054872-2/prompt.txt
+bad664cd6a7908b7b95223b497aba41fe6ccdfeff35506f17d35c571a32ab892  08ae18-1/prompt.txt
+a61ad710bb69877423c914a6e5959bb7e64ddbdb0c610452187bc0abc3d7021b  26d7a2-1/prompt.txt
+232f04987703b38d8c6aee4c7affa90b0c6983188e3932cbd023610407ed96a8  2c4295-1/prompt.txt
+6d38bf9c09f7436353cdb36f93548f3ae19cb4dc6630327f67cd45ed62966c2c  2c4295-2/prompt.txt
+ed45ccd04b660c4b995c451602d61de0c4d5e4b3c43bd19c10a834f62735e647  2d2629-1/prompt.txt
+a671f0bf0e008563e954ed8fa65910ab5cd5257b4eba7d8d27cfcae2a1a27f53  2d2629-2/prompt.txt
+4c9ca8bd0bdf15f3d55790bb61f420478062d1ceb851ecc12498cdf3c10ef3aa  47173f-1/prompt.txt
+f66d05ed72f26b23800d18fe7e955a02a3c94de03b0ee85ccbc353450e252e9a  48527b-1/prompt.txt
+7ea7dacd024d36e757aa195e41e6d9ae8d3621dfc1b49bbb8bc85e9e4c3b4740  48527b-2/prompt.txt
+4fc4a98c86730af2d78d2e02e5cfa3d44b099792c392cc0e483d286225602117  66530f-1/prompt.txt
+15522359ef28ea387969562e0bb4a444bd0bac601d01d125ce42c039d93447a6  66530f-2/prompt.txt
+39030526bcfbb40654c01c3b00f6d53ec628f51e49fb7cd6df3630b49fe65f1d  6e7393-1/prompt.txt
+e90e73ee89289b6af7012f43e1356e69957a99f6106630a04e50d37fcc1d2b0c  6e7393-2/prompt.txt
+08b28399620e3d487e838acf57efb2f66fb622344e4a4503bbf750cffe989455  a9fcf9-1/prompt.txt
+2e372e3073d7e611bb3d533832de1a3c3aeb154b6756b5f17f42630608eb4a0d  b2b8cf-1/prompt.txt
+6f6dd1327ec6048dedd789afc1bc0bd14133892a0c8e3d66cedd344e5291d59a  b49ff1-1/prompt.txt
+8cf5ede3f09f69ba9a544f46881ec9d23b42739f66120cd91877763789ab822f  b49ff1-2/prompt.txt
+bcab28ce2738f54baf31de34960e64935fd343d286c4f35d68f42c713fc86fc8  e085f2-1/prompt.txt
+44d1a2de8176c50ddc3ad260e6ee9e6f8b8ef79b91eaf0f181aebda4019051b5  e085f2-2/prompt.txt
+aa0a534c486aa3dd164deee7f7661458d625059151560f8a2a2f3d42b12c2334  e790f5-1/prompt.txt
+f69a59986f2f5691adc04fb8525bb478b731227ec0a07c78813e23e5d28e13c8  e790f5-2/prompt.txt
+61eb1247ac2ad0ba5e44548b50e7823de3879cf81a52c3bf4325e4fec601c910  fd230c-1/prompt.txt
+174be6cfaa39a2e8784885f3a8cf33d8fbb080386f47e93ebff3dc9ab5a0a09f  fd230c-2/prompt.txt
+68679fab752a18cd1a629de4c94ff2fbdf5e9c2dd49b46fe479473d46e2d0c0b  fd2c24-1/prompt.txt
+f5843b8fe9dafd08c831527f18dba09cdf77d3df1cdd67070c68b006de8fa261  fd2c24-2/prompt.txt
+9bf6c7264a28b76eab12825a915cb0f860f9e85eb52e1c39ca69e16edcafb57d  fe4059-1/prompt.txt
+1e49420db0e98b526b535db07f1ad24fdf6d7b277cabc552f0db33c2bad876c0  fe4059-2/prompt.txt

@@ -1,0 +1,16 @@
+{
+  "spec_id": "47173f",
+  "ledger": "tui-dc-picker",
+  "rows": [
+    {
+      "id": "tui-dc-picker-35",
+      "present": true,
+      "reason": "The spec states the config node label format verbatim: \"<name>  (latest v<N>)\"."
+    },
+    {
+      "id": "tui-dc-picker-55",
+      "present": true,
+      "reason": "The Testing section ends with \"Plus `mise run go:lint`.\", stating it as a required step."
+    }
+  ]
+}

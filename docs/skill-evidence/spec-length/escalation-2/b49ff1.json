@@ -1,0 +1,21 @@
+{
+  "spec_id": "b49ff1",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-25",
+      "present": true,
+      "reason": "Section 5.4 states quite-app cannot carry class 1 and section 7.5 limitation 4 states class 1 rests on modular and neovim only, matching the row exactly."
+    },
+    {
+      "id": "tiered-review-30",
+      "present": true,
+      "reason": "Section 5.5 step 4 states the introducing commit's PR at pre-merge state is the fixture and the fix commit's diff states the defect, matching the row's operative content."
+    },
+    {
+      "id": "tiered-review-35",
+      "present": true,
+      "reason": "Section 5.6 explicitly labels verified-real as 'the only set that feeds the ship bar'."
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+# tools/assemble-retention-3.py output for the corrected-prompt pass.
+# Committed because SCORING-3-NOTES.md cites a shard hash as evidence, and a hash
+# that exists only in a transcript is the author's word. This file is that record.
+
+  shard 1: sha256 af9ed36eaca30b844c40bd8ab676353cc772ccc2447281d5041ae57da9dc9b95  66530f-1.json
+  shard 2: sha256 b9e73063943264fb03a8ffee82d293c8724029b10832905110a0b59725d71258  66530f-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/66530f.json  rows=91  present=91  spans=128
+  shard 1: sha256 6539592a50ef0410637d84a5eef3b170d649020242854c871f9e0b2fefaf8313  6e7393-1.json
+  shard 2: sha256 a61572b3e50b98ed7e887821269a3fb6ee34475835b82b04ec089c1b684bfed5  6e7393-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/6e7393.json  rows=91  present=90  spans=119
+  shard 1: sha256 908fbc1478b571236231031ae75f503327c62457e662178117c2236551a59c41  e085f2-1.json
+  shard 2: sha256 74bd119a50d9542986896735c0a7d981fbbc11f3d48c4c73f36605d00e9079d0  e085f2-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/e085f2.json  rows=91  present=89  spans=114
+  shard 1: sha256 4ccb4837883a5e7b1a99d7011d1968242424c0f7d19be1e5d2bc47cab1712789  e790f5-1.json
+  shard 2: sha256 5d525eadf557ba7a93d4b1cc12451710503bda1d34744d235d67701202615187  e790f5-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/e790f5.json  rows=91  present=90  spans=139
+  shard 1: sha256 58311db383dc01eb252bd1ef610b5b903b8fa2ae14b1ea1abca557022872dd22  fd2c24-1.json
+  shard 2: sha256 f9f2b0e7bde79c552b636110fd8c02721e9d806d69a588b57aadd60f7d5f37c8  fd2c24-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/fd2c24.json  rows=91  present=91  spans=127
+  shard 1: sha256 cb63a5e93e1cad4c6afd07fd63ec8c742d25ff7342d0bf6aa98528b2c1789a0e  fe4059-1.json
+  shard 2: sha256 b2b4553c6f4fc785e7c8251d1161f8405de5aebdaa4e8486e9da9bfd84dfef5c  fe4059-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/fe4059.json  rows=91  present=89  spans=127
+  shard 1: sha256 f995ad10d6222214273814489bf852057907d3d4be4f3151d8b35841fd244b75  054872-1.json
+  shard 2: sha256 437bb3a7a03949ab68b154ef92c09cb1648e78eaa8b69da367420339217dee1a  054872-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/054872.json  rows=84  present=76  spans=89
+  shard 1: sha256 69b2df18ad975199a0d9da23629c79463005c60c96270071cad86a018f0fd797  2c4295-1.json
+  shard 2: sha256 362c6ae5d778a7990a23c8ce9f38a6361bd4148ebea7925a38ddb8c6f726f641  2c4295-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/2c4295.json  rows=84  present=81  spans=99
+  shard 1: sha256 d08134c3c97266e60733baeb4564bc361ec7f2e397459d0dfaf0e74598c85460  2d2629-1.json
+  shard 2: sha256 ae9a990c2ac9b90d6c876e2cedce65ee805c1bc68042314c9e1f23eef636f9fe  2d2629-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/2d2629.json  rows=84  present=71  spans=86
+  shard 1: sha256 7f011c4bf5db351fb3a19c7d58c3c57454d529d6affe3f85bf80d9df0522ebcc  48527b-1.json
+  shard 2: sha256 5db31cafb86aee30ffa76810e67edbf7cfe574734e0125fbef97df1d900f33d7  48527b-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/48527b.json  rows=84  present=78  spans=96
+  shard 1: sha256 8fffeec0b372bbace935227ab75e7997b1b223e2bb124b6fc3be657e7a1fa285  b49ff1-1.json
+  shard 2: sha256 8c8a70ec4cbd07dc52311040331e025374a14d66dfd59b9c389cd9a1cda1f855  b49ff1-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/b49ff1.json  rows=84  present=83  spans=103
+  shard 1: sha256 3f91c90c95e0dc577ad947b315828dabf19f3c0ccf55a47ef41a5b5cddbc652f  fd230c-1.json
+  shard 2: sha256 cc8ed9b916cc8df29762e1f196cdc8e720a6f15edb5231c89b64c649fca943df  fd230c-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/fd230c.json  rows=84  present=83  spans=105
+  shard 1: sha256 6adf901b12ac153604e682971b1215b85ca143f467697bdaadef1cec016e9332  031cc4-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/031cc4.json  rows=55  present=53  spans=58
+  shard 1: sha256 4528d6bf547a8708c3e63d12404efaba603719f332e17258dd545974c07cd7fb  08ae18-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/08ae18.json  rows=55  present=54  spans=57
+  shard 1: sha256 6ac90318c18e38637953edd6aa806366769acb495f48221c790d95a384d007d1  26d7a2-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/26d7a2.json  rows=55  present=50  spans=54
+  shard 1: sha256 76ece1b7457b864692d2911874b5eadbf52adea18636d26c0fc123051f957911  47173f-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/47173f.json  rows=55  present=55  spans=65
+  shard 1: sha256 fc5041208c1222ecd2b65ecbb0e529aabf2505fab626ea719db4d6980b413548  a9fcf9-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/a9fcf9.json  rows=55  present=55  spans=60
+  shard 1: sha256 c10b0fbfb59c1217a98ad0ad163533855ab540d155043ba05d8d6a9aaf765de7  b2b8cf-1.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/b2b8cf.json  rows=55  present=54  spans=66
+  shard 1: sha256 bc0412887dc107929a06b575996afb8ef058a67520e24292b248a5be856c42f9  2d2629-1.json
+  shard 2: sha256 8bcce3e556cad19aa6c74cf9d42aa679572aba85fb554636f72b1fec318712d5  2d2629-2.json
+/home/sauyon/devel/drovr/.drovr/wt/spec-length-ab2/docs/skill-evidence/spec-length/retention-3/2d2629.json  rows=84  present=72  spans=82

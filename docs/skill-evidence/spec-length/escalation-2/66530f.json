@@ -1,0 +1,21 @@
+{
+  "spec_id": "66530f",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-16",
+      "present": true,
+      "reason": "Section 4's new description: table strips every 'in a drovr phase' style scoping from all four discipline skills and states the skill itself reads as unconditional discipline."
+    },
+    {
+      "id": "skill-stickiness-55",
+      "present": true,
+      "reason": "Section 8.1's loop states it repeats 'until a run produces no new rationalization or the \u00a79 REFACTOR ceiling is reached, whichever comes first' \u2014 the section number differs from the row's \u00a77.3 but that is a non-operative cross-reference, and the ceiling itself is defined in the budget table."
+    },
+    {
+      "id": "skill-stickiness-89",
+      "present": true,
+      "reason": "Section 11's mechanical verification lists the exact grep command 'grep -L -E 'in a drovr phase|a drovr task|a drovr phase has produced' skills/*/SKILL.md returns all 8 files.'"
+    }
+  ]
+}

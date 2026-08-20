@@ -137,6 +137,9 @@ candidate arm is `S1`, the mandated rewrite — beating `S0` is not an achieveme
 | `docs/skill-evidence/spec-length/ledger/tiered-review.md` | `c0e58fa4467b7a3714b250812cfae289c4fe2c02` | `370e211174fcb23cfc48a9732fc528754e9b02c6` | 2026-08-06 |
 | `docs/skill-evidence/spec-length/ledger/tui-dc-picker.md` | `477b32b340e7bb3373fb80d623a9c1b897bc4d03` | `370e211174fcb23cfc48a9732fc528754e9b02c6` | 2026-08-06 |
 | `docs/skill-evidence/arms/spec-length/S0.md` | `db89be9ee06913386afcb6f1053597fdb9728a3a` | `370e211174fcb23cfc48a9732fc528754e9b02c6` | 2026-08-06 |
+| `docs/skill-evidence/arms/spec-length/S1.md` | `bb0d5cdcf2903e9d47e705820911a2464c73ab22` | `a9eef3a3de9303213cce4a689dee3133f75c2ac8` | 2026-08-08 |
+| `docs/skill-evidence/arms/spec-length/S2.md` | `8126b24fabadf3aff9391afd132f79676a288459` | `6352ea1b65be6fc0c3039577234844b98db575c9` | 2026-08-08 |
+| `docs/skill-evidence/arms/spec-length/S3.md` | `978f4c46c545e7d0df09158ad9cbfeca550c3eca` | `6a56a21f676c33f58a3936adaa25ca1d97129fee` | 2026-08-08 |
 
 ## Who appends what, and when
 
@@ -177,3 +180,51 @@ Re-verifying by hand is still what a task owes at a gate rather than at CI time 
 `git hash-object --no-filters <path>` for each row. T8's start gate does exactly this before its
 first probe, so the freeze is confirmed at the moment it is relied on and not merely at some point
 since.
+
+## Recorded breach of the append-only rule — `S3`'s row, T3, 2026-08-08
+
+**This section is appended, not an edit.** It records the one time the rule at the top of this file
+was broken, because the alternative was to leave the breach discoverable only by reading `git log -p`
+— and a freeze record whose violations are invisible in the record is no better than no record.
+
+**What happened.** T3 authored `S2` and `S3`, committed them (`6352ea1b`), and appended both rows
+(`06ff6702`). Its own review then found that `S3` violated `PROTOCOL.md` item 13: it dropped the
+exclusivity half of `S1`'s first ask — *"a decision record, **not a discussion**"* — entirely rather
+than stating it briefly, so it was not "the shortest text that still **states** the three things
+`S1` asks for". T3 corrected `S3` (`6a56a21f`, adding the three words *"and nothing else"*) and then
+**rewrote `S3`'s existing row in place** (`2845f11d`) instead of leaving it. That in-place rewrite is
+what this file forbids: *"a wrong hash is a finding, not an edit."*
+
+**The other resolution, and why it was rejected.** T3 could have reverted `S3` to its originally
+frozen bytes and filed the item-13 violation as a finding for a later task, leaving this file
+untouched. That was considered and rejected: it would have left an arm that fails item 13's own
+definition of what `S3` is — and the experiment would then measure a text the protocol says is not a
+valid arm. `PROTOCOL.md`'s window 2 (*"arm text exists but no result does … corrections are still
+legitimate, because nothing has been measured"*) makes the correction the sanctioned move, not the
+irregular one. **What broke the rule was the manner of recording it, not the correction itself.**
+
+**Root cause, stated plainly: the freeze happened before the checking finished.** Had T3 completed
+item 13's review *before* committing the rows, one commit would have carried the right bytes and no
+row would ever have needed rewriting. The lesson is sequencing, not a choice between two edit
+styles. **T4 onward: finish every check the protocol names, then freeze.**
+
+**Why it was not resolved the other way.** Appending a corrected row is impossible here —
+`freeze_rows_still_hash_to_their_files` re-hashes **every** row on every run, so a superseded row
+would sit permanently red, and history may not be rewritten on this branch. The choice was
+therefore between an undisclosed in-place edit and a disclosed one. `MANIFEST.md` faces the same
+situation and resolves it explicitly (*"re-snapshotting an arm means correcting its row, not
+appending another … a duplicate would leave two hashes claiming the same identity, which is worse
+than an edit with a reason"*); this file has no such carve-out, so the edit is a deviation and is
+labelled one rather than smoothed over.
+
+**What it does and does not cost.** It does **not** contaminate any measurement: no probe had run,
+`generated/`, `blind-map.json` and `retention/` did not exist, and the corrected arm is still
+committed strictly after `PROTOCOL.md` (`7cfd07a8`) and after this file (`9accca81`), so the
+freeze-before-probe guarantee is intact. What it does cost is auditability — no test can detect that
+a row's value was swapped rather than appended, which is precisely why it is written down here.
+
+**The rule is not weakened.** It binds T4 onward unchanged: once the first probe runs, a wrong hash
+is a finding and STOP, never an edit. This entry is a record of one breach, not a precedent for a
+second. **T10 repeats it in the write-up alongside the other three deviations in `PROTOCOL.md` item 2**,
+where this breach is itself recorded as deviation 4 — so item 2's list is the complete one, and it
+says four, not three.

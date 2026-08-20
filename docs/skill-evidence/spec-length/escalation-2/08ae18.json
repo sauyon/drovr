@@ -1,0 +1,21 @@
+{
+  "spec_id": "08ae18",
+  "ledger": "tui-dc-picker",
+  "rows": [
+    {
+      "id": "tui-dc-picker-11",
+      "present": true,
+      "reason": "The lazy-loading table states versions of a config load only when that config is first expanded, via fetchDeployConfigVersions(project, name)."
+    },
+    {
+      "id": "tui-dc-picker-21",
+      "present": true,
+      "reason": "The appModel state block declares dcLoading map[string]bool with the exact key scheme \"\" for projects, \"<project>\", and \"<project>\\x00<config>\"."
+    },
+    {
+      "id": "tui-dc-picker-36",
+      "present": true,
+      "reason": "The labelling section states the config node gets \"  (shared)\" appended when Shared is true."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "spec_id": "e085f2",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-67",
+      "present": true,
+      "reason": "The budget table's parenthetical states hard ceilings, and a hit ceiling halts and records a null, never silently extends."
+    },
+    {
+      "id": "skill-stickiness-87",
+      "present": true,
+      "reason": "The Out of scope list states any change to the phase state machine, the review gate, or drovr code-review is out of scope."
+    }
+  ]
+}

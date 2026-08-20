@@ -1,0 +1,21 @@
+{
+  "spec_id": "031cc4",
+  "ledger": "tui-dc-picker",
+  "rows": [
+    {
+      "id": "tui-dc-picker-12",
+      "present": true,
+      "reason": "D3 states a never-expanded branch shows a placeholder child rendering 'loading\u2026' or '(none)' if empty, matching the row."
+    },
+    {
+      "id": "tui-dc-picker-22",
+      "present": true,
+      "reason": "The Interfaces section explicitly states dcForm, dcVersions, dcCurrent, dcChoice are REPLACED by the tree and dcVersLoading is replaced by len(dcLoading) > 0."
+    },
+    {
+      "id": "tui-dc-picker-46",
+      "present": true,
+      "reason": "D8(c) states the confirm copy explains that when the config is shared, the next 'mcloud deploy-config apply' creates a new version and moves the config's latest while the deployment stays pinned to the version selected."
+    }
+  ]
+}

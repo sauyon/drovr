@@ -1,0 +1,21 @@
+{
+  "spec_id": "e790f5",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-15",
+      "present": true,
+      "reason": "Spec states \"Above cap, split into references/\" and separately marks binding content as deliberately redundant while teaching content is what stays terse/cross-referenced, so an implementer would move overflow to references/ without cutting binding content."
+    },
+    {
+      "id": "skill-stickiness-55",
+      "present": true,
+      "reason": "The spec's own text reads \"the \u00a76.3 REFACTOR ceiling is reached, whichever comes first\" and \u00a76.3's budget table gives the REFACTOR re-tests ceiling of 20 with \u2264\"2 iterations each\"; the row's \"\u00a77.3\" is a mismatched cross-reference number, not operative detail, and the pointed-at content is present."
+    },
+    {
+      "id": "skill-stickiness-81",
+      "present": true,
+      "reason": "\u00a76.4's decision rule states \"separation margin \u22653 of 6 per side\" comparing each variant to V0, matching the row's \"at least 3 of 6 runs against V0\"."
+    }
+  ]
+}

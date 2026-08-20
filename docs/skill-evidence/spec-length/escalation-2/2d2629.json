@@ -1,0 +1,121 @@
+{
+  "spec_id": "2d2629",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-02",
+      "present": true,
+      "reason": "Decision 1 has Task 0 instrument expensive-tier reviews to report E/(E+D) per fixture, with committing to a design before that number exists explicitly rejected."
+    },
+    {
+      "id": "tiered-review-06",
+      "present": true,
+      "reason": "Decision 1 states angle routing is additionally evaluated as a composable second stage 'regardless of which primary design is selected', i.e. in all three branches."
+    },
+    {
+      "id": "tiered-review-08",
+      "present": true,
+      "reason": "Decision 5 gives cheap-as-explorer (the explorer design) non-inferiority recall LB \u2265 0.90 vs the unaided panel, and decision 5's closing line makes context completeness reported-only, not a gate."
+    },
+    {
+      "id": "tiered-review-17",
+      "present": true,
+      "reason": "Decision 3 states the three ground-truth classes are 'never pooled into one recall figure'."
+    },
+    {
+      "id": "tiered-review-18",
+      "present": true,
+      "reason": "Decision 3 defines class 2 as 'accepted bot review comment that caused a change... a human agreed and changed the code'."
+    },
+    {
+      "id": "tiered-review-20",
+      "present": true,
+      "reason": "Decision 8's 'Full factorial, no legs: router_model \u2208 {qwen, sonnet} \u00d7 stratum \u2208 {D, M, Q, N} \u00d7 class \u2208 {1, 2, 3}' is exactly this cross product with legs explicitly withdrawn in decision 7."
+    },
+    {
+      "id": "tiered-review-21",
+      "present": true,
+      "reason": "Decision 8 states 'commits == 1 disqualifies a PR (a single-commit PR cannot contain a comment-driven fix commit)'."
+    },
+    {
+      "id": "tiered-review-22",
+      "present": true,
+      "reason": "Decision 8 requires 'a later commit in the same PR must touch the commented file'; the core actionable rule matches even though the soft 'ideally the commented lines' nuance is not spelled out."
+    },
+    {
+      "id": "tiered-review-24",
+      "present": true,
+      "reason": "Decision 8 states 'docs-only PRs are excluded'."
+    },
+    {
+      "id": "tiered-review-28",
+      "present": true,
+      "reason": "Decision 8's class-3 pipeline matches verbatim: 'candidate fix commits found via git log -i --grep for revert|regression|broke; git blame the lines the fix deleted or replaced, at fix^'."
+    },
+    {
+      "id": "tiered-review-29",
+      "present": true,
+      "reason": "Decision 8 requires 'a single introducing commit (fan-out is rejected as not cleanly attributable)'."
+    },
+    {
+      "id": "tiered-review-30",
+      "present": true,
+      "reason": "Decision 8 states 'that commit's PR at pre-merge state is the fixture, the fix commit's diff states the defect'."
+    },
+    {
+      "id": "tiered-review-32",
+      "present": true,
+      "reason": "Decision 4 splits D into D-rs and D-md 'measured and reported separately', and its reasoning about Rust vs prose being different tasks makes clear pooling into one number is avoided."
+    },
+    {
+      "id": "tiered-review-36",
+      "present": true,
+      "reason": "Decision 7 states 'Private fixtures and probe transcripts live outside any checkout (~/.local/share/drovr/cascade-corpus/)'."
+    },
+    {
+      "id": "tiered-review-39",
+      "present": true,
+      "reason": "Decision 7 states the write guard 'refuses to write Private-derived content to any path resolving inside a git checkout after canonicalisation (closes the symlink-out-and-back-in case)'."
+    },
+    {
+      "id": "tiered-review-43",
+      "present": true,
+      "reason": "Decision 8 gives the exact same factorial arms plus 'per-file routing as a control arm'."
+    },
+    {
+      "id": "tiered-review-44",
+      "present": true,
+      "reason": "The config surface section states router_agent/router_model are separate keys 'because the ship decision is per router model (decision 8)'."
+    },
+    {
+      "id": "tiered-review-52",
+      "present": true,
+      "reason": "Decision 6 states there is 'deliberately no blind-map.json' and 'the split alone is the control' since scoring is set membership with no human judgement."
+    },
+    {
+      "id": "tiered-review-54",
+      "present": true,
+      "reason": "Decision 5's second bullet matches verbatim: LB \u2265 0.90 of the unaided panel's point estimate, target N \u2265 69, for designs degrading to baseline."
+    },
+    {
+      "id": "tiered-review-57",
+      "present": true,
+      "reason": "Decision 5's gate order lists '4. Measured end-to-end cost < 0.80\u00d7 the non-cascade panel.'"
+    },
+    {
+      "id": "tiered-review-59",
+      "present": true,
+      "reason": "Decision 5 states 'Precision, hint quality, context completeness, and class-3 absolute detection are reported but are not decision inputs.'"
+    },
+    {
+      "id": "tiered-review-60",
+      "present": true,
+      "reason": "Decision 5 states N is 'pooled across strata within one (model \u00d7 class) cell (not per (model \u00d7 stratum \u00d7 class), which would be 24 unreachable cells)'."
+    },
+    {
+      "id": "tiered-review-76",
+      "present": true,
+      "reason": "Deliverable (8) lists results.md contents matching the row: controls, dev numbers, one held-out score per (model \u00d7 stratum \u00d7 class), each gate in order, ship decisions, stated limitations, aggregates only."
+    }
+  ]
+}

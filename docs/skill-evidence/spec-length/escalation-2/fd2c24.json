@@ -1,0 +1,21 @@
+{
+  "spec_id": "fd2c24",
+  "ledger": "skill-stickiness",
+  "rows": [
+    {
+      "id": "skill-stickiness-16",
+      "present": true,
+      "reason": "\u00a73's table gives all five new description strings with no drovr-phase scoping, and the 'Rule for all five' states the skill reads as unconditional discipline with phase references demoted to additional consequences, never preconditions."
+    },
+    {
+      "id": "skill-stickiness-52",
+      "present": true,
+      "reason": "\u00a76's per-skill specifics states the code-review Iron Law nearly verbatim: no change is done until a read-only reviewer has looked at it and every Critical/Important finding is resolved or explicitly recorded as deferred."
+    },
+    {
+      "id": "skill-stickiness-75",
+      "present": true,
+      "reason": "\u00a77.3 states the Arm B bar verbatim: compliant on \u22653 of its 4 held-out runs for that skill, AND strictly more compliant runs than both A and A\u2032."
+    }
+  ]
+}

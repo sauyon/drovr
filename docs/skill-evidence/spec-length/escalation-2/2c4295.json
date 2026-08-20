@@ -1,0 +1,36 @@
+{
+  "spec_id": "2c4295",
+  "ledger": "tiered-review",
+  "rows": [
+    {
+      "id": "tiered-review-14",
+      "present": true,
+      "reason": "\u00a73.4 states per-file routing is 'Run in every branch regardless of which design \u00a73's rule selects,' matching the row exactly."
+    },
+    {
+      "id": "tiered-review-22",
+      "present": false,
+      "reason": "\u00a74.1 only requires the later commit to 'touch the commented file'; the spec never says it should ideally touch the commented lines, so that operative detail is not recoverable."
+    },
+    {
+      "id": "tiered-review-43",
+      "present": true,
+      "reason": "\u00a76.1 gives the identical arms \u2014 router_model \u00d7 stratum \u00d7 class \u2014 with per-file routing run as a control arm alongside."
+    },
+    {
+      "id": "tiered-review-48",
+      "present": true,
+      "reason": "\u00a76.3 states a real cheap tier must land strictly inside the NULL/FLOOD bracket per stratum and class or fixtures are rebuilt before scoring."
+    },
+    {
+      "id": "tiered-review-73",
+      "present": true,
+      "reason": "\u00a78's contract states the cheap tier is 'Read-only via --agent plan with --auto absent.'"
+    },
+    {
+      "id": "tiered-review-78",
+      "present": true,
+      "reason": "\u00a711 lists 'Changing the angle set, severity model, or the merge/resume path' as out of scope, matching the row's paraphrase."
+    }
+  ]
+}

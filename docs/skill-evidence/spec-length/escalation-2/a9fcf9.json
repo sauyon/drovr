@@ -1,0 +1,21 @@
+{
+  "spec_id": "a9fcf9",
+  "ledger": "tui-dc-picker",
+  "rows": [
+    {
+      "id": "tui-dc-picker-10",
+      "present": true,
+      "reason": "The lazy-loading table states configs of a project load 'that project is first expanded' via ListDeployConfigs(project) + latestPerConfig."
+    },
+    {
+      "id": "tui-dc-picker-20",
+      "present": true,
+      "reason": "The New state block declares dcLinked *schemasv1.DeployConfigSchema with comment stating it drives auto-expand, cursor placement, and is the merge baseline handed to the confirm."
+    },
+    {
+      "id": "tui-dc-picker-45",
+      "present": true,
+      "reason": "The Confirm copy section lists 'that the deployment's overrides are carried across (decision A/B)' as one of the confirm's stated lines."
+    }
+  ]
+}

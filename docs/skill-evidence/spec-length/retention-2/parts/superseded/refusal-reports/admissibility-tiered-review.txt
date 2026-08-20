@@ -1,0 +1,5 @@
+fixture          gens  rows  lines   adm    all%    prose   adm  prose%
+tiered-review       6    84   1462   386   26.4%     1181   119   10.1%
+
+`prose` excludes table rows, headings, separators, breaks and fences — admissible furniture no scorer would cite. 84 rows must be evidenced per generation.
+Summed over 6 generations; per-id figures are deliberately not printed (`SCORING-2-NOTES.md` §6).
