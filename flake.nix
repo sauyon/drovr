@@ -46,23 +46,51 @@
           nativeCheckInputs = [ pkgs.git ];
 
           # `src = ./.` copies the tree; it does NOT bring `.git`. So `git` is
-          # resolvable here (above) but there is no REPOSITORY, and the two
-          # checks that read history cannot pass in this sandbox no matter what
-          # the code says:
+          # resolvable here (above) but there is no REPOSITORY, and the checks
+          # that read history cannot pass in this sandbox no matter what the
+          # code says:
           #
           #   freeze_precedes_every_candidate_arm      — arm-vs-freeze ancestry
           #   manifest_commits_contain_their_snapshots — `git rev-parse <sha>:<path>`
           #
-          # Both deliberately FAIL rather than skip when they cannot verify
+          # and, from the spec-length A/B corpus, six pre-registration ordering
+          # checks built on the same `introducing_commit_in` / `commits_touching`
+          # helpers:
+          #
+          #   spec_length_blind_map_precedes_every_retention_verdict
+          #   spec_length_2_blind_map_precedes_every_retention_verdict
+          #   spec_length_2_protocol_precedes_every_generation
+          #   spec_length_2_protocol_stops_moving_before_the_first_probe
+          #   spec_length_3_protocol_precedes_every_retention_3_record
+          #   spec_length_3_protocol_stops_moving_after_the_first_verdict
+          #
+          # They deliberately FAIL rather than skip when they cannot verify
           # ("a skip prints `ok` having checked nothing"), which is correct on a
           # developer machine and in CI, where history exists and a missing
           # commit is a real defect. It is not correct here, where history is
           # absent by construction. Skipping them in the PACKAGE keeps them
           # strict everywhere they are meaningful — do not weaken the tests to
           # make this build pass.
+          #
+          # This list is load-bearing and is NOT self-maintaining: a new check
+          # that reads git history breaks `nix build` — and `home-manager
+          # switch` still exits 0 on that, silently keeping the old binary
+          # installed (forge#86). The way to find them is to reproduce the
+          # sandbox rather than to reason about it:
+          #
+          #   git archive HEAD | tar -x -C /tmp/nixsim && cd /tmp/nixsim/cli \
+          #     && cargo test --test skills_valid -- --test-threads=1
+          #
+          # Anything that panics with "not a git repository" belongs here.
           checkFlags = [
             "--skip=freeze_precedes_every_candidate_arm"
             "--skip=manifest_commits_contain_their_snapshots"
+            "--skip=spec_length_blind_map_precedes_every_retention_verdict"
+            "--skip=spec_length_2_blind_map_precedes_every_retention_verdict"
+            "--skip=spec_length_2_protocol_precedes_every_generation"
+            "--skip=spec_length_2_protocol_stops_moving_before_the_first_probe"
+            "--skip=spec_length_3_protocol_precedes_every_retention_3_record"
+            "--skip=spec_length_3_protocol_stops_moving_after_the_first_verdict"
           ];
 
           # The superpowers-overlap check compares drovr's skills against a
