@@ -1804,19 +1804,29 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // turns the answer into a refusal, so a marker that never reached disk is
         // an approval the run cannot act on. Report the failure instead of
         // answering 200 to a reviewer whose decision is not durable.
-        if let Err(e) = fs::write(p.approved(), b"approved\n").and_then(|()| {
-            rs.state = LoopState::Approved;
-            rs.save(&p.review_state())
-        }) {
+        // THE MARKER DECIDES. `gate_status` reads it first and `gate_refusal`
+        // turns it into a refusal, so the marker reaching disk *is* the approval
+        // taking effect — and a state-file write that fails afterwards does not
+        // undo it. An earlier version wrote both in one `and_then` and reported
+        // 500 on either failure, which told the reviewer "not durable" about an
+        // approval already in force, already terminal, and already 409 on retry.
+        if let Err(e) = fs::write(p.approved(), b"approved\n") {
             eprintln!("drovr review: approval for '{run}' did not reach disk: {e}");
             drop(rs);
             respond_str(
                 req,
                 500,
                 "application/json",
-                format!(r#"{{"ok":false,"error":"approval not durable: {e}"}}"#),
+                serde_json::json!({"ok": false, "error": format!("approval not durable: {e}")})
+                    .to_string(),
             );
             return;
+        }
+        rs.state = LoopState::Approved;
+        if let Err(e) = rs.save(&p.review_state()) {
+            // Not fatal and not a 500: the marker is on disk, so every reader
+            // that matters already answers "approved". Say so and carry on.
+            eprintln!("drovr review: '{run}' approved, but review.state.json did not save: {e}");
         }
         drop(rs);
         respond_str(
@@ -1829,9 +1839,27 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // Terminal like approve, but the opposite verdict: the human is
         // abandoning the run. The marker mirrors `approved` so a driver (or a
         // human poking at the run dir) can see the outcome without the server.
-        let _ = fs::write(p.cancelled(), b"cancelled\n");
+        // Symmetric to approve above, and for a sharper reason: `gate_refusal`
+        // answers a cancellation from this marker ALONE, with no state file
+        // required, so the marker is the gate's sole authority here. A swallowed
+        // write would leave a reviewer told "cancelled" over a run the gate keeps
+        // launching phases for — the exact failure the gate exists to prevent.
+        if let Err(e) = fs::write(p.cancelled(), b"cancelled\n") {
+            eprintln!("drovr review: cancellation for '{run}' did not reach disk: {e}");
+            drop(rs);
+            respond_str(
+                req,
+                500,
+                "application/json",
+                serde_json::json!({"ok": false, "error": format!("cancellation not durable: {e}")})
+                    .to_string(),
+            );
+            return;
+        }
         rs.state = LoopState::Cancelled;
-        let _ = rs.save(&p.review_state());
+        if let Err(e) = rs.save(&p.review_state()) {
+            eprintln!("drovr review: '{run}' cancelled, but review.state.json did not save: {e}");
+        }
         drop(rs);
         respond_str(
             req,
@@ -2614,14 +2642,23 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
             format!("no run '{run}' at {}", dir.display()),
         ));
     }
-    let p = RunPaths::new(dir);
+    Ok(gate_status_in(&dir))
+}
+
+/// [`gate_status`] against a run directory that is already known to exist.
+///
+/// Split out so the resolution is testable against a bare temp dir — the server
+/// tests build one rather than a `TestEnv` data root — and so the name-to-path
+/// step has exactly one home.
+fn gate_status_in(dir: &Path) -> WaitOutcome {
+    let p = RunPaths::new(dir.to_path_buf());
     if p.cancelled().exists() {
-        return Ok(WaitOutcome::Cancelled);
+        return WaitOutcome::Cancelled;
     }
     if p.approved().exists() {
-        return Ok(WaitOutcome::Approved);
+        return WaitOutcome::Approved;
     }
-    Ok(match ReviewState::load(&p.review_state()).state {
+    match ReviewState::load(&p.review_state()).state {
         LoopState::Cancelled => WaitOutcome::Cancelled,
         LoopState::Approved => WaitOutcome::Approved,
         // `Waiting` has exactly one writer — the request-changes branch of
@@ -2633,7 +2670,7 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
         // run, which is the "two tables" failure this whole change is against.
         LoopState::Waiting => WaitOutcome::ChangesRequested,
         _ => WaitOutcome::Timeout,
-    })
+    }
 }
 
 /// Does the spec gate stand in front of `phase_name`?
@@ -2740,16 +2777,27 @@ impl GateRefusal {
 /// [`gate_status`] only errors when the run dir is not a directory, in which case
 /// the launch is going to fail on its own a moment later.
 pub fn gate_refusal(run: &str, phase_name: &str) -> Option<GateRefusal> {
+    let outcome = gate_status(run).ok()?;
+    // A CANCELLATION OUTRANKS EVERY EXEMPTION, and is therefore asked first.
+    //
+    // The exemptions below are argued from deadlock — `brainstorm` writes the
+    // spec, so gating it would mean the spec could never be approved — and that
+    // is an argument about *approval*. It does not transfer: a cancelled run can
+    // never be approved again, because `LoopState::is_terminal` makes both
+    // `POST /summary` and `POST /submit` 409 forever. There is no deadlock to
+    // avoid, so exempting anything here buys nothing and costs the whole point.
+    // A cancelled run launches nothing.
+    if outcome == WaitOutcome::Cancelled {
+        return Some(GateRefusal::Cancelled);
+    }
     if !is_gated_phase(phase_name) {
         return None;
     }
-    let outcome = gate_status(run).ok()?;
     let gate_was_opened = RunPaths::new(crate::run::run_dir(run))
         .review_state()
         .exists();
     match outcome {
-        // Marker alone, deliberately: see "What counts as a gate" above.
-        WaitOutcome::Cancelled => Some(GateRefusal::Cancelled),
+        WaitOutcome::Cancelled => unreachable!("handled above"),
         WaitOutcome::Approved => None,
         WaitOutcome::ChangesRequested => Some(GateRefusal::ChangesRequested),
         WaitOutcome::Timeout if gate_was_opened => Some(GateRefusal::Undecided),
@@ -4876,6 +4924,73 @@ mod tests {
         assert!(state_body.contains(r#""state":"approved""#));
     }
 
+    /// Round-3 review finding, on the round-2 fix. The approve branch began
+    /// reporting 500 when its durable writes failed — correct in intent, wrong in
+    /// shape: it wrote the marker and mutated `rs.state` inside one `and_then`,
+    /// so a failure of the *state-file* write left the marker on disk and the
+    /// server holding `Approved` while the client was told the approval was not
+    /// durable. Every retry then 409s, because `Approved` is terminal.
+    ///
+    /// The marker is what `gate_status` reads, so the marker is what decides:
+    /// marker written = approved, whatever the state file did. Only a failed
+    /// MARKER write is a failed approval.
+    #[test]
+    fn an_approval_survives_a_state_file_write_it_could_not_make() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_root("approve-partial");
+        let dir = make_run(tmp.path(), "r", b"# Done");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        // Pre-create review.state.json read-only: the marker write (a fresh
+        // create) still succeeds, the state-file rewrite cannot.
+        let state_file = dir.join("review.state.json");
+        fs::write(&state_file, br#"{"state":"ready","turn":0}"#).unwrap();
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let payload = r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            status, 200,
+            "the marker reached disk, so the approval is in force: {body}"
+        );
+        assert!(dir.join("approved").exists(), "marker must be on disk");
+        assert_eq!(
+            gate_status_in(&dir),
+            WaitOutcome::Approved,
+            "the gate must agree with what the reviewer was told"
+        );
+    }
+
+    /// Round-3 review finding: the round-2 fix hardened the APPROVE branch and
+    /// left the cancel branch on `let _ = fs::write(...)` plus an unconditional
+    /// 200 — while the same change made the `cancelled` marker the gate's *sole*
+    /// authority for a cancellation, since `gate_refusal` now answers from the
+    /// marker alone with no state file required.
+    ///
+    /// So a cancellation whose marker never reached disk is a reviewer told
+    /// "cancelled" over a run the gate will happily keep launching.
+    #[test]
+    fn a_cancellation_that_could_not_reach_disk_is_not_answered_200() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_root("cancel-undurable");
+        let dir = make_run(tmp.path(), "r", b"# Done");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let orig = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let payload = r#"{"decision":"cancel","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        fs::set_permissions(&dir, orig).unwrap();
+
+        assert_eq!(
+            status, 500,
+            "a cancellation the gate will never see must not read as accepted: {body}"
+        );
+        assert!(!dir.join("cancelled").exists(), "no marker was writable");
+    }
+
     #[test]
     fn submit_approve_persists_question_answers() {
         // A WIRE-SHAPE test, not a workflow one. The reviewer cannot answer
@@ -5459,6 +5574,18 @@ mod tests {
             gate_status("st-changes").expect("status"),
             WaitOutcome::ChangesRequested
         );
+
+        // `waiting` ALONE is the answer, with no `feedback.json` alongside it —
+        // pinned because an earlier version required both, which made this
+        // surface answer 2 where `review_wait` answers 3 about one run. Without
+        // this line the fixture writes both files and the requirement could be
+        // re-added with every test still green.
+        fs::remove_file(dir.join("feedback.json")).unwrap();
+        assert_eq!(
+            gate_status("st-changes").expect("status"),
+            WaitOutcome::ChangesRequested,
+            "`review_wait` maps `waiting` unconditionally; this must agree"
+        );
     }
 
     #[test]
@@ -5586,6 +5713,43 @@ mod tests {
                 gate_refusal("g-deny", gated),
                 Some(GateRefusal::Undecided),
                 "phase {gated:?} must be gated: an unrecognised name is refused, not waved through"
+            );
+        }
+    }
+
+    /// Round-3 review finding, and the sharpest one: the exemptions were argued
+    /// from **deadlock** — "`brainstorm` writes the spec, so gating it means the
+    /// spec can never be approved" — and that argument is about APPROVAL only. It
+    /// does not transfer to cancellation, because a cancelled run can never be
+    /// approved again: `LoopState::is_terminal` makes `POST /summary` and
+    /// `POST /submit` 409 forever. There is no deadlock to avoid, so the
+    /// exemption bought nothing and cost the whole point of the gate.
+    ///
+    /// The sequence is the one `gate_refusal_error`'s own doc claimed to have
+    /// closed, under a different phase name: brainstorm runs → the reviewer
+    /// cancels → the pane is reaped → an unauthenticated
+    /// `POST /api/runs/<run>/rehydrate?phase=brainstorm` brings the writer back.
+    ///
+    /// A cancelled run launches **nothing**.
+    #[test]
+    fn a_cancelled_run_launches_nothing_not_even_the_exempt_phases() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "g-cancel-all", b"# Spec");
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+
+        for phase in [
+            "brainstorm",
+            "review",
+            "plan",
+            "implement",
+            "implement-task-1",
+            &crate::run::reviewer_phase_name("task-1", 1, "correctness"),
+        ] {
+            assert_eq!(
+                gate_refusal("g-cancel-all", phase),
+                Some(GateRefusal::Cancelled),
+                "phase {phase:?} must not start on a cancelled run"
             );
         }
     }

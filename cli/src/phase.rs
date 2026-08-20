@@ -8274,14 +8274,23 @@ mod tests {
 
         let err = phase_start(&h, &mut run, "implement-task-1", None)
             .expect_err("an unapproved spec must not start an implement phase");
-        assert!(
-            err.to_string().contains("not approved"),
-            "the refusal must name the gate, got: {err}"
+        // Assert the DECISION, not a substring — "not approved" appears in both
+        // the `Undecided` and `ChangesRequested` messages, so matching on it
+        // passes on exactly the mix-up this test exists to catch. The typed
+        // decision is what the gate actually produced.
+        assert_eq!(
+            crate::review::gate_refusal("gated-start", "implement-task-1"),
+            Some(crate::review::GateRefusal::Undecided),
         );
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "got: {err}");
         assert!(
             run.phases.is_empty(),
             "a refused phase must not be appended — a half-started gated phase is \
              worse than none"
+        );
+        assert!(
+            h.calls().iter().all(|c| !c.contains("tab_create")),
+            "nothing may be spawned: a refusal after the launch is not a refusal"
         );
 
         // Approve it and the same call goes through: the gate refuses a state, not

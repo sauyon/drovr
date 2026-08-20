@@ -147,9 +147,11 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    `cancelled` markers and `review.state.json`. Use it whenever you are about to act on an
    approval — especially a 0 you did not read with your own `rc=$?`.
 
-   You do not have to get this right for the run to be safe: `drovr phase start` refuses to
-   start `plan` or `implement-task-<N>` while an opened spec gate is unapproved, and says so.
-   That refusal is the backstop, not the plan — a run that hits it has already wasted a turn.
+   You do not have to get this right for the run to be safe. While an opened spec gate is
+   unapproved, `drovr phase start` and `drovr phase rehydrate` refuse every phase except
+   `brainstorm` and `review`, and say why; a **cancelled** run refuses those two as well, since
+   nothing on it can ever be approved again. That refusal is the backstop, not the plan — a run
+   that hits it has already wasted a turn.
 
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
