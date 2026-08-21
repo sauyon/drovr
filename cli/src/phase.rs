@@ -1102,6 +1102,13 @@ pub fn spawn_reviewer<H: Herdr>(
     launch: &AgentLaunch,
 ) -> io::Result<()> {
     require_new_phase_name(phase)?;
+    // The third launch path, and the third time "every path calls the gate" was
+    // an over-claim — review round 4. A panel is four agents in the run's
+    // project_dir, so a cancelled run spawning one is exactly what the gate is
+    // for. `gate_refusal` exempts reviewer NAMES from the unapproved-spec case
+    // (a panel reviews code, not the spec, so it must run before approval), but
+    // a cancellation outranks every exemption, so this refuses only that.
+    gate_refusal_error(&run.name, phase)?;
     // Reviewers always APPEND, so BOTH lists must be clear: `next_iter` keeps
     // reviewer names unique across passes, but a resume re-spawning in place must
     // de-register first (main's does).
@@ -5516,6 +5523,41 @@ mod tests {
     /// Reviewers need their own tab, so they need a workspace just as much —
     /// `code-review run` spawns several in a loop and must not be the one command
     /// that still dies on a vanished one.
+    /// Round-4 review finding: "a cancelled run launches nothing" was enforced at
+    /// two of THREE launch paths. `spawn_reviewer` — the only thing that starts a
+    /// review panel, four agents in the run's `project_dir` — never asked, so the
+    /// reviewer arm of round 3's cancellation test was inert in production.
+    ///
+    /// A panel must still run BEFORE the spec is approved (it reviews code, not
+    /// the spec), which is why reviewer names stay exempt from the unapproved
+    /// case. A cancellation is the one verdict that outranks that exemption.
+    #[test]
+    fn spawn_reviewer_refuses_on_a_cancelled_run() {
+        let env = TestEnv::new();
+        let h = FakeHerdr::new();
+        let mut run = make_run(&env, "rev-cancelled");
+        let dir = crate::run::run_dir("rev-cancelled");
+        std::fs::create_dir_all(&dir).unwrap();
+        let phase = crate::run::reviewer_phase_name("task-1", 1, "correctness");
+
+        // Before the cancellation the panel is free to run: an unapproved spec
+        // must never stop a CODE review.
+        std::fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+        assert!(
+            crate::review::gate_refusal("rev-cancelled", &phase).is_none(),
+            "an unapproved spec must not block a code-review panel"
+        );
+
+        std::fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+        let err = spawn_reviewer(&h, &mut run, &phase, None, &AgentLaunch::for_test("claude", "claude --permission-mode plan"))
+            .expect_err("a cancelled run must not spawn a panel");
+        assert!(err.to_string().contains("CANCELLED"), "got: {err}");
+        assert!(
+            run.review_phases.is_empty(),
+            "a refused reviewer must not be registered"
+        );
+    }
+
     #[test]
     fn spawn_reviewer_reprovisions_a_vanished_workspace() {
         let env = TestEnv::new();

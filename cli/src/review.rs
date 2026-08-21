@@ -145,8 +145,22 @@ impl ReviewState {
     /// Load from `review.state.json`; a missing/garbled file is treated as a
     /// fresh `idle` run (the server may start after `drovr new` but before the
     /// run ever enters review).
+    ///
+    /// **The `approved`/`cancelled` markers outrank the file, and are reconciled
+    /// here so that one authority exists rather than two.** Each marker is a
+    /// single atomic create; this file is a read-modify-write that can fail after
+    /// the marker has landed. Without this, the two disagree permanently: the
+    /// server loads its cell from the file once per process, `GET /state` answers
+    /// from that cell and `review_wait` polls only that endpoint — so a restarted
+    /// server reported `ready` for a run `review status` and the spec gate both
+    /// called decided, and the `is_terminal` guard that makes a verdict final was
+    /// simply gone.
+    ///
+    /// `cancelled` outranks `approved` for the same reason it does everywhere
+    /// else here: of the two should-never-happen readings, refusing to advance is
+    /// the safe one.
     fn load(path: &Path) -> Self {
-        match fs::read_to_string(path) {
+        let mut rs = match fs::read_to_string(path) {
             Ok(s) => {
                 let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
                 let state = LoopState::from_str(v["state"].as_str().unwrap_or("idle"));
@@ -154,7 +168,15 @@ impl ReviewState {
                 ReviewState { state, turn }
             }
             Err(_) => ReviewState::idle(),
+        };
+        if let Some(dir) = path.parent() {
+            if dir.join("cancelled").exists() {
+                rs.state = LoopState::Cancelled;
+            } else if dir.join("approved").exists() {
+                rs.state = LoopState::Approved;
+            }
         }
+        rs
     }
 
     fn save(&self, path: &Path) -> io::Result<()> {
@@ -1335,6 +1357,15 @@ fn handle_post_rehydrate(req: Request, p: &RunPaths, run_name: &str, url: &str) 
     // — and `safe_component` permits `:` and is a path check, NOT an
     // authorization one). Every other arm names a real phase drovr is refusing
     // to act on, which is a 409.
+    // The spec gate, asked here for the same reason `rehydratable` is: so the
+    // button a human clicks is not more permissive than the command it shells
+    // out to. Without it the UI offered ⟳ on a cancelled run and the CLI's
+    // refusal came back as a 500 — an unexplained server error where every
+    // sibling refusal is a named 409. Round-4 review finding.
+    if let Some(refusal) = gate_refusal_in(&p.dir, &phase) {
+        respond_str(req, 409, "text/plain", refusal.message(run_name, &phase));
+        return;
+    }
     if let Err(why) = state.rehydratable(&phase) {
         use crate::run::NotRehydratable as Why;
         let msg = match &why {
@@ -1789,21 +1820,10 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // Questions go out through `drovr ask` and are answered into
         // `interview.jsonl`, never here. The field and its write stay so the wire
         // shape is guaranteed rather than conditional; nothing should read them.
-        rs.turn += 1;
-        let fb_json = serde_json::json!({
-            "turn": rs.turn,
-            "decision": "approve",
-            "feedback": feedback,
-            "answers": answers,
-            "annotations": annotations,
-        });
-        let _ = fs::write(p.feedback(), fb_json.to_string());
-        // These two writes were advisory — "so a human poking at the run dir can
-        // see the outcome" — while the server's own state was the authority. They
-        // are load-bearing now: `gate_status` reads them first and `phase_start`
-        // turns the answer into a refusal, so a marker that never reached disk is
-        // an approval the run cannot act on. Report the failure instead of
-        // answering 200 to a reviewer whose decision is not durable.
+        // THE MARKER FIRST, and `feedback.json` only once the decision is durable.
+        // Written the other way round, a refused approval still left
+        // `feedback.json` claiming `"decision":"approve"` with a turn number the
+        // server never persisted — a record of a decision that did not happen.
         // THE MARKER DECIDES. `gate_status` reads it first and `gate_refusal`
         // turns it into a refusal, so the marker reaching disk *is* the approval
         // taking effect — and a state-file write that fails afterwards does not
@@ -1822,10 +1842,24 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
             );
             return;
         }
+        rs.turn += 1;
+        let _ = fs::write(
+            p.feedback(),
+            serde_json::json!({
+                "turn": rs.turn,
+                "decision": "approve",
+                "feedback": feedback,
+                "answers": answers,
+                "annotations": annotations,
+            })
+            .to_string(),
+        );
         rs.state = LoopState::Approved;
         if let Err(e) = rs.save(&p.review_state()) {
-            // Not fatal and not a 500: the marker is on disk, so every reader
-            // that matters already answers "approved". Say so and carry on.
+            // Not fatal and not a 500: the marker is on disk and
+            // `ReviewState::load` reconciles it, so every reader — this server,
+            // a restarted one, `review status` and the gate — already answers
+            // "approved". Say so and carry on.
             eprintln!("drovr review: '{run}' approved, but review.state.json did not save: {e}");
         }
         drop(rs);
@@ -2652,12 +2686,9 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
 /// step has exactly one home.
 fn gate_status_in(dir: &Path) -> WaitOutcome {
     let p = RunPaths::new(dir.to_path_buf());
-    if p.cancelled().exists() {
-        return WaitOutcome::Cancelled;
-    }
-    if p.approved().exists() {
-        return WaitOutcome::Approved;
-    }
+    // No marker checks here any more: `ReviewState::load` reconciles them, so
+    // this and the server read one authority. Duplicating the precedence at both
+    // sites is how they came to disagree in the first place.
     match ReviewState::load(&p.review_state()).state {
         LoopState::Cancelled => WaitOutcome::Cancelled,
         LoopState::Approved => WaitOutcome::Approved,
@@ -2777,7 +2808,22 @@ impl GateRefusal {
 /// [`gate_status`] only errors when the run dir is not a directory, in which case
 /// the launch is going to fail on its own a moment later.
 pub fn gate_refusal(run: &str, phase_name: &str) -> Option<GateRefusal> {
-    let outcome = gate_status(run).ok()?;
+    let dir = crate::run::run_dir(run);
+    if !dir.is_dir() {
+        return None;
+    }
+    gate_refusal_in(&dir, phase_name)
+}
+
+/// [`gate_refusal`] against a run directory, for callers that already have one.
+///
+/// The server is such a caller and MUST use it: its runs root is injected
+/// (`Ctx::runs_root`), so resolving the run by name through `data_dir()` would
+/// ask the ambient environment instead of the server's own configuration — and
+/// under `cfg(test)` that is a panic rather than a wrong answer, which is how
+/// this was caught.
+fn gate_refusal_in(dir: &Path, phase_name: &str) -> Option<GateRefusal> {
+    let outcome = gate_status_in(dir);
     // A CANCELLATION OUTRANKS EVERY EXEMPTION, and is therefore asked first.
     //
     // The exemptions below are argued from deadlock — `brainstorm` writes the
@@ -2793,9 +2839,7 @@ pub fn gate_refusal(run: &str, phase_name: &str) -> Option<GateRefusal> {
     if !is_gated_phase(phase_name) {
         return None;
     }
-    let gate_was_opened = RunPaths::new(crate::run::run_dir(run))
-        .review_state()
-        .exists();
+    let gate_was_opened = RunPaths::new(dir.to_path_buf()).review_state().exists();
     match outcome {
         WaitOutcome::Cancelled => unreachable!("handled above"),
         WaitOutcome::Approved => None,
@@ -5715,6 +5759,41 @@ mod tests {
                 "phase {gated:?} must be gated: an unrecognised name is refused, not waved through"
             );
         }
+    }
+
+    /// Round-4 review finding, and the one the round asked for: round 3's fix
+    /// *blessed* a divergence between the markers and `review.state.json`, on the
+    /// reasoning that "the marker is on disk, so every reader that matters
+    /// answers approved". False for the reader `drovr:pipeline` mandates —
+    /// `ReviewState::load` read only the file, `Ctx::cell` loads through it once
+    /// per server process, `GET /state` answers from that cell, and `review_wait`
+    /// polls only that endpoint. So a state-file write that failed after the
+    /// marker landed left a restarted server answering `ready` for a run the gate
+    /// called decided, with `is_terminal` — the guard that makes a verdict final
+    /// — gone with it.
+    ///
+    /// One authority now: the markers are reconciled in `load`.
+    #[test]
+    fn a_marker_outranks_a_state_file_that_disagrees_with_it() {
+        let tmp = make_root("reconcile");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let state_file = dir.join("review.state.json");
+
+        // The exact shape a failed `rs.save` leaves behind: marker written, file
+        // still saying the run is merely open for review.
+        fs::write(&state_file, br#"{"state":"ready","turn":1}"#).unwrap();
+        fs::write(dir.join("approved"), b"approved\n").unwrap();
+
+        let rs = ReviewState::load(&state_file);
+        assert_eq!(rs.state, LoopState::Approved, "the marker decides");
+        assert!(rs.state.is_terminal(), "and the verdict must still be final");
+        assert_eq!(rs.turn, 1, "the turn count survives reconciliation");
+        assert_eq!(gate_status_in(&dir), WaitOutcome::Approved);
+
+        // A cancellation on top outranks it — the safe reading of two verdicts.
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+        assert_eq!(ReviewState::load(&state_file).state, LoopState::Cancelled);
+        assert_eq!(gate_status_in(&dir), WaitOutcome::Cancelled);
     }
 
     /// Round-3 review finding, and the sharpest one: the exemptions were argued
