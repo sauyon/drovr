@@ -2527,7 +2527,103 @@ pub enum WaitOutcome {
     /// the driver should tear the run down, not revise the spec.
     Cancelled,
     /// No reviewer action within the timeout; the caller may re-run to resume.
+    ///
+    /// [`gate_status`] reuses this for "no decision yet" — the same meaning
+    /// ("re-run to resume") reached without waiting. Two producers, one variant,
+    /// deliberately: a second enum is how the two tables start to disagree.
     Timeout,
+}
+
+impl WaitOutcome {
+    /// The process exit code for this outcome.
+    ///
+    /// **On the type because the invariant is.** Both `review wait` and `review
+    /// status` promise one table a caller learns once; while the mapping was
+    /// hand-written in each command's match arm, the only thing keeping them
+    /// equal was that they had been copy-pasted, and a later edit to one would
+    /// have silently restored the two-tables-that-drift failure forge#57 is
+    /// about. `one_outcome_table_lives_on_the_type` pins the values.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            WaitOutcome::Approved => 0,
+            WaitOutcome::Timeout => 2,
+            WaitOutcome::ChangesRequested => 3,
+            WaitOutcome::Cancelled => 5,
+        }
+    }
+}
+
+/// Resolve the spec gate's outcome from the run dir alone — **no server**.
+///
+/// Answers exactly one question: *what would [`review_wait`] have returned had
+/// it stopped now?* Same [`WaitOutcome`], therefore the same exit codes, so a
+/// caller has one table to learn rather than two that can drift.
+///
+/// # Why this exists (forge#57)
+///
+/// A gate outcome used to travel on exactly one channel — the process exit
+/// status — and a shell pipeline overwrites that with its LAST command's
+/// status. So `drovr review wait <run> | tail -5` reports `tail`'s 0, and 0 is
+/// *approved*: a timeout, an error, a request for changes and an outright
+/// cancellation all arrive at the driver wearing an approval. `review_wait`
+/// could not help, because it polls the server over HTTP and never looks at the
+/// run dir, so an outcome lost in a pipe was lost for good.
+///
+/// This is the second channel. The markers it reads were always written — the
+/// `cancelled` write even says so in `handle_post_submit`: *"so a driver (or a
+/// human poking at the run dir) can see the outcome without the server"* —
+/// there was simply no command that read them back.
+///
+/// # Ordering
+///
+/// `cancelled` is checked before `approved`, and the marker files before the
+/// `review.state.json` state. Both orderings resolve a should-never-happen
+/// conflict toward *refusing to advance*: a run wrongly held at the gate costs
+/// a human a second look, while a run wrongly advanced past a cancellation is
+/// the failure this function exists to prevent. The markers outrank the state
+/// file because they are what the skills already call the source of truth, and
+/// because a marker is a single atomic create where the state file is a
+/// read-modify-write.
+///
+/// A missing run is an `Err` (exit 1), never an outcome. "Not decided yet" is a
+/// claim about a gate, and there is no gate here to make it about.
+pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
+    let dir = crate::run::run_dir(run);
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no run '{run}' at {}", dir.display()),
+        ));
+    }
+    Ok(gate_status_in(&dir))
+}
+
+/// [`gate_status`] against a run directory that is already known to exist.
+///
+/// Split out so the resolution is testable against a bare temp dir — the server
+/// tests build one rather than a `TestEnv` data root — and so the name-to-path
+/// step has exactly one home.
+fn gate_status_in(dir: &Path) -> WaitOutcome {
+    let p = RunPaths::new(dir.to_path_buf());
+    if p.cancelled().exists() {
+        return WaitOutcome::Cancelled;
+    }
+    if p.approved().exists() {
+        return WaitOutcome::Approved;
+    }
+    match ReviewState::load(&p.review_state()).state {
+        LoopState::Cancelled => WaitOutcome::Cancelled,
+        LoopState::Approved => WaitOutcome::Approved,
+        // `Waiting` has exactly one writer — the request-changes branch of
+        // `handle_post_submit`, which writes `feedback.json` immediately before
+        // it — so the state alone IS the reviewer's turn. An earlier version also
+        // required `feedback.json` to exist, which read as belt-and-braces and
+        // was really a drift: `review_wait` maps `waiting` to ChangesRequested
+        // unconditionally, so the two surfaces could answer 2 and 3 about one
+        // run, which is the "two tables" failure this whole change is against.
+        LoopState::Waiting => WaitOutcome::ChangesRequested,
+        _ => WaitOutcome::Timeout,
+    }
 }
 
 /// GET `/api/runs/<run>/state` from the live server, returning the `state` str.
@@ -5172,6 +5268,105 @@ mod tests {
                 .join("cancelled")
                 .exists(),
             "cancelled marker must be on disk"
+        );
+    }
+
+    /// The five `gate_status` tests below are the fix for forge#57, where a
+    /// piped `drovr review wait` reported exit 0 — "approved" — for a run the
+    /// reviewer had never decided. A shell pipeline's status is its LAST
+    /// command's, so `| tail` overwrites every outcome (1 error, 2 timeout,
+    /// 3 changes, 5 cancelled) with `tail`'s own 0.
+    ///
+    /// The exit code is therefore a channel that a caller can destroy by
+    /// accident, and `review wait` had no second one: it polls the server over
+    /// HTTP and never reads the run dir, so an outcome lost in a pipe was
+    /// unrecoverable. `gate_status` is that second channel — it answers
+    /// "what would `wait` have returned had it stopped now?" from the on-disk
+    /// markers alone.
+    ///
+    /// Each test asserts `TestEnv::new()` with NO server, which is the load-
+    /// bearing half: a driver reaches for this precisely when the server is
+    /// unreachable or the code was lost, and a resolver that needed the server
+    /// would be useless in exactly that case.
+    #[test]
+    fn status_reads_the_approved_marker_with_no_server_running() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-approved", b"# Spec");
+        fs::write(dir.join("approved"), b"approved\n").unwrap();
+
+        assert_eq!(gate_status("st-approved").expect("status"), WaitOutcome::Approved);
+    }
+
+    #[test]
+    fn status_reads_the_cancelled_marker_and_never_calls_it_approved() {
+        // The worst case #57 produces, and the one its own report does not
+        // mention: `cancel` exits 5 and means "tear the run down". Through a
+        // pipe that becomes 0 — approved — so the run marches on past a human
+        // who explicitly abandoned it.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-cancelled", b"# Spec");
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+
+        assert_eq!(
+            gate_status("st-cancelled").expect("status"),
+            WaitOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn status_reports_changes_requested_from_the_waiting_state() {
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-changes", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"waiting","turn":2}"#).unwrap();
+        fs::write(dir.join("feedback.json"), br#"{"turn":2,"decision":"request-changes"}"#)
+            .unwrap();
+
+        assert_eq!(
+            gate_status("st-changes").expect("status"),
+            WaitOutcome::ChangesRequested
+        );
+
+        // `waiting` ALONE is the answer, with no `feedback.json` alongside it —
+        // pinned because an earlier version required both, which made this
+        // surface answer 2 where `review_wait` answers 3 about one run. Without
+        // this line the fixture writes both files and the requirement could be
+        // re-added with every test still green.
+        fs::remove_file(dir.join("feedback.json")).unwrap();
+        assert_eq!(
+            gate_status("st-changes").expect("status"),
+            WaitOutcome::ChangesRequested,
+            "`review_wait` maps `waiting` unconditionally; this must agree"
+        );
+    }
+
+    #[test]
+    fn status_reports_timeout_while_the_gate_is_still_ready() {
+        // `Timeout` is reused rather than given a new "pending" variant on
+        // purpose: it already means "no decision yet, re-run to resume", and
+        // ONE outcome table across both surfaces is the property being bought.
+        // A second enum would let the two drift, which is the class of defect
+        // this whole fix is about.
+        let env = TestEnv::new();
+        let runs_root = env.data_root().join("drovr/runs");
+        let dir = make_run(&runs_root, "st-ready", b"# Spec");
+        fs::write(dir.join("review.state.json"), br#"{"state":"ready","turn":0}"#).unwrap();
+
+        assert_eq!(gate_status("st-ready").expect("status"), WaitOutcome::Timeout);
+    }
+
+    #[test]
+    fn status_errors_on_a_run_that_does_not_exist() {
+        // Must be an Err (exit 1), never an outcome. The whole point is that a
+        // caller can trust this answer more than the exit code it lost; a
+        // missing run answering "not approved yet" would be a guess wearing a
+        // verdict.
+        let _env = TestEnv::new();
+        assert!(
+            gate_status("no-such-run").is_err(),
+            "a missing run must error, not report an outcome"
         );
     }
 

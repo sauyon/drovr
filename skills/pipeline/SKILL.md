@@ -126,6 +126,31 @@ single writer of `spec.md`; you convey the reviewer's decisions. The run's page 
    means the wait *failed* (e.g. connection refused), not that the reviewer said yes. If you
    cannot read a clean 0, re-run the wait rather than proceeding.
 
+   ⚠️ **NEVER PIPE A COMMAND WHOSE EXIT CODE YOU DEPEND ON.** A shell pipeline's status is
+   its **last** command's, so `drovr review wait <run> | tail -5` reports `tail`'s 0 — and 0
+   is *approved*. Every row above collapses into "approved": timeout, error, changes
+   requested, and an outright cancellation. Adding `| tail`, `| head`, `| grep` or `| jq` to
+   trim output is a natural thing to do and it silently voids this whole table. It has
+   already happened twice — an unapproved spec walked into the implement phase, and a
+   `code-review run` that had reviewed *nothing* was reported to a human as clean.
+
+   Capture the status instead, which both preserves it and records it in the output:
+   ```
+   drovr review wait <run>; rc=$?; echo "EXIT=$rc"; exit $rc
+   ```
+
+   **And confirm it against disk, which no pipe can rewrite:**
+   ```
+   drovr review status <run>   # non-blocking, needs no server; same exit codes as `wait`
+   ```
+   It answers "what would `wait` have returned had it stopped now?" from the `approved` /
+   `cancelled` markers and `review.state.json`. Use it whenever you are about to act on an
+   approval — especially a 0 you did not read with your own `rc=$?`.
+
+   **Nothing downstream re-checks this for you.** `drovr phase start` does not ask the gate
+   before launching an implement phase, so a misread approval is acted on, not caught. Confirm
+   with `review status` and act on what it says.
+
 5. **Forward feedback.** On exit 3 the reviewer's turn is in
    `~/.local/share/drovr/runs/<run>/feedback.json`:
    `{turn, decision, feedback, annotations}`, plus a vestigial `answers` the review page no
@@ -216,6 +241,10 @@ drovr code-review run <run> task-<N> --context "<what this task changed>"
                                               # blocking; spawns one reviewer per angle.
                                               # BACKGROUND it and end the turn — the panel
                                               # runs well past the 600 000 ms foreground cap.
+                                              # NEVER pipe it (no `| tail`): the pipeline's
+                                              # status is the pipe's, and 0 here means
+                                              # "reviewed and clean" — a piped timeout has
+                                              # already certified code no angle ever read.
 case $? in
   0)  # clean — proceed to task N+1
   3)  # findings — re-enter implement, forward the review, re-run the panel (loop)
