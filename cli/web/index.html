@@ -685,6 +685,9 @@
   .run-dot.state-approved { background: #3ec46d; }   /* spec approved, run proceeding */
   .run-dot.state-cancelled { background: #e5534b; }  /* abandoned */
   .run-dot.state-idle { background: #888; }
+  /* The run's review.state.json would not parse, so no verdict is known. Hollow
+     rather than any solid colour: every filled dot above is a claim. */
+  .run-dot.state-unknown { background: transparent; box-shadow: inset 0 0 0 2px #888; }
 
   /* ---- Blocked agents ----
      Two weights, because the two facts are not equally urgent: `needs-human` is
@@ -2619,7 +2622,11 @@ async function submitDecision(forced) {
     });
     var data = await r.json();
     if (!data.ok) {
-      showError('Submit failed.');
+      // Prefer the server's reason. A refusal here can mean the decision could
+      // NOT be written to disk, and a reviewer who reads a bare "Submit failed."
+      // has no way to tell that from a transient hiccup worth ignoring — they
+      // walk away believing they approved. The server's text says which.
+      showError(data.error ? 'Submit failed: ' + data.error : 'Submit failed.');
       btn.disabled = false; cancelBtn.disabled = false; disarmCancel();
       return;
     }
