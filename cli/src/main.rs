@@ -2,6 +2,7 @@ mod blocked;
 mod brief;
 mod code_review;
 mod config;
+mod durable;
 mod env;
 mod findings;
 mod flock;
@@ -2213,14 +2214,32 @@ fn validate_ask_request(
 
 /// Whether the reviewer has cancelled this run.
 ///
-/// The marker `handle_post_submit` writes (`cli/src/review.rs`), read off disk rather
-/// than from the server, so `ask wait` needs nothing running to see it. One predicate
-/// for the four places that ask — `cmd_ask`, `cmd_ask_wait` before and inside its loop,
-/// and the server's `POST answer` — because a condition spelled out per call site is one
-/// that drifts. `pub(crate)` for that last caller, running the same direction
-/// `close_run_panes` already does: crate root down into `review`.
+/// Read off disk rather than from the server, so `ask wait` needs nothing running to
+/// see it. One predicate for the four places that ask — `cmd_ask`, `cmd_ask_wait`
+/// before and inside its loop, and the server's `POST answer` — because a condition
+/// spelled out per call site is one that drifts. `pub(crate)` for that last caller,
+/// running the same direction `close_run_panes` already does: crate root down into
+/// `review`.
+///
+/// **It asks [`review::gate_status_in`] rather than testing the `cancelled` marker
+/// itself.** This used to be `dir.join("cancelled").exists()`, which made the marker
+/// the sole evidence a run was abandoned — so a cancellation that reached
+/// `review.state.json` but whose redundant marker write failed was invisible here,
+/// and `ask wait` would keep waiting on a run whose human had walked away. Sharing
+/// the gate's resolution means the marker is genuinely redundant, which is what
+/// `handle_post_submit` writing it last depends on. `gate_status_in` checks the
+/// marker first, so the common path is the same single `exists()` it always was.
+///
+/// An unreadable `review.state.json` answers `false`: the marker has already been
+/// ruled out by then, so the honest reading is "no evidence of a cancellation", which
+/// is what this returned before the fallback existed. The gate surfaces that file's
+/// corruption loudly on its own surfaces (`GET /state`, `drovr review status`); a
+/// question channel is not the place to discover it.
 pub(crate) fn run_is_cancelled(dir: &std::path::Path) -> bool {
-    dir.join("cancelled").exists()
+    matches!(
+        review::gate_status_in(dir),
+        Ok(review::WaitOutcome::Cancelled)
+    )
 }
 
 /// Print the cancellation message both `ask` and `ask wait` use, and exit 5.

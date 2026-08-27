@@ -105,13 +105,23 @@ impl LoopState {
         }
     }
 
-    fn from_str(s: &str) -> LoopState {
+    /// `None` for anything this build does not know.
+    ///
+    /// It used to fall through to `Idle`, which reads as a harmless default and
+    /// is not one: `idle` is a real state meaning "this run has not reached the
+    /// gate", so an unrecognised string — a torn write, a hand-edit, a file
+    /// written by a newer drovr — was laundered into a confident claim that no
+    /// decision had been made. Every terminal verdict degrades that way, and
+    /// silently. The caller now has to decide what an unreadable record means,
+    /// which is the point.
+    fn from_str(s: &str) -> Option<LoopState> {
         match s {
-            "waiting" => LoopState::Waiting,
-            "ready" => LoopState::Ready,
-            "approved" => LoopState::Approved,
-            "cancelled" => LoopState::Cancelled,
-            _ => LoopState::Idle,
+            "idle" => Some(LoopState::Idle),
+            "waiting" => Some(LoopState::Waiting),
+            "ready" => Some(LoopState::Ready),
+            "approved" => Some(LoopState::Approved),
+            "cancelled" => Some(LoopState::Cancelled),
+            _ => None,
         }
     }
 
@@ -140,30 +150,120 @@ impl ReviewState {
         }
     }
 
-    /// Load from `review.state.json`; a missing/garbled file is treated as a
-    /// fresh `idle` run (the server may start after `drovr new` but before the
-    /// run ever enters review).
-    fn load(path: &Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(s) => {
-                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
-                let state = LoopState::from_str(v["state"].as_str().unwrap_or("idle"));
-                let turn = v["turn"].as_u64().unwrap_or(0) as u32;
-                ReviewState { state, turn }
+    /// Load from `review.state.json`.
+    ///
+    /// **Absent and garbled are different answers, and conflating them lost
+    /// verdicts.** An absent file really is a fresh `idle` run — the server may
+    /// start after `drovr new` but before the run ever enters review — so that
+    /// stays `Ok(idle)`. A file that is *present but unparseable* is a corrupt
+    /// record of a decision that may well have been made, and the old code fed
+    /// it to `unwrap_or_default()` and produced `idle, turn 0`: a fabricated
+    /// fresh run. The verdict was gone, the turn counter that lets a driver tell
+    /// this turn's `feedback.json` from a stale one was reset, and the very next
+    /// write overwrote the evidence that anything had ever been wrong.
+    ///
+    /// So a corrupt file is an `Err`, and the caller has to say what it means.
+    /// The file is left exactly where it is: it is the only remaining trace of
+    /// the decision, and a human can read it.
+    ///
+    /// Every field is required rather than defaulted, for the same reason:
+    /// [`save`](Self::save) always writes both, so a file missing one did not
+    /// come from a completed `save`.
+    fn load(path: &Path) -> io::Result<Self> {
+        let raw = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReviewState::idle()),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot read {}: {e}", path.display()),
+                ))
             }
-            Err(_) => ReviewState::idle(),
-        }
+        };
+        let corrupt = |why: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is corrupt ({why})", path.display()),
+            )
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| corrupt(&format!("not JSON: {e}")))?;
+        let state = v
+            .get("state")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| corrupt("no `state` string"))?;
+        let state =
+            LoopState::from_str(state).ok_or_else(|| corrupt(&format!("unknown state {state:?}")))?;
+        let turn = v
+            .get("turn")
+            .and_then(|t| t.as_u64())
+            .ok_or_else(|| corrupt("no `turn` number"))?;
+        let turn = u32::try_from(turn).map_err(|_| corrupt("`turn` is out of range"))?;
+        Ok(ReviewState { state, turn })
     }
 
-    fn save(&self, path: &Path) -> io::Result<()> {
-        fs::write(
+    /// Persist, atomically and durably — see [`crate::durable`] for why this
+    /// file does not get `run.rs`'s deliberately non-fsyncing treatment.
+    ///
+    /// A `fs::write` here truncated in place, so a server killed mid-write left
+    /// the torn file [`load`](Self::load) now refuses. A rename cannot produce
+    /// one.
+    fn save(&self, path: &Path) -> Result<(), crate::durable::WriteFailed> {
+        crate::durable::write(
             path,
             format!(
                 r#"{{"state":"{}","turn":{}}}"#,
                 self.state.as_str(),
                 self.turn
-            ),
+            )
+            .as_bytes(),
         )
+    }
+
+    /// Persist `next`, and adopt it into the live cell **only if it reached
+    /// disk**. The one sanctioned way to move a run's review state.
+    ///
+    /// # Why this is a function and not four careful blocks
+    ///
+    /// The invariant — *never advance the in-memory cell past a write that did
+    /// not land* — is the whole point of the change this belongs to, and it was
+    /// first written as `*cell = next;` hand-copied at four call sites under a
+    /// `// COMMIT` comment. Review found the tell: a doc comment pointing at a
+    /// shared helper that had never existed. Four textually identical blocks
+    /// enforced by a grep-able marker is the shape that drifts, and a copy-paste
+    /// putting the assignment above the check would still compile.
+    ///
+    /// Here it cannot: the caller hands over `next` and never sees a path where
+    /// the cell is assigned without a successful save.
+    ///
+    /// # A landed-but-unsynced write still commits
+    ///
+    /// [`WriteFailed::NotDurable`](crate::durable::WriteFailed::NotDurable)
+    /// means the rename succeeded and only the directory `fsync` failed. The
+    /// bytes ARE the file — a restart reads them back — so refusing to commit
+    /// would leave the live server contradicting its own disk, which is the
+    /// divergence this is all against. It commits and says so loudly instead;
+    /// what was actually lost is protection against a *power* loss, and that is
+    /// an operator's problem, not a reason to drop a human's decision.
+    fn commit(
+        cell: &mut ReviewState,
+        next: ReviewState,
+        path: &Path,
+        run: &str,
+    ) -> io::Result<()> {
+        match next.save(path) {
+            Ok(()) => {}
+            Err(f) if f.landed() => {
+                eprintln!(
+                    "drovr review: run '{run}': the state IS on disk and survives a restart, \
+                     but {}: {f}",
+                    path.display()
+                );
+            }
+            Err(f) => return Err(f.into_error()),
+        }
+        *cell = next;
+        Ok(())
     }
 }
 
@@ -323,19 +423,30 @@ impl Ctx {
 
     /// The per-run state cell, lazily loaded from `review.state.json` on first
     /// touch. The brief outer-map lock recovers from poisoning.
-    fn cell(&self, run: &str, p: &RunPaths) -> Arc<Mutex<ReviewState>> {
+    ///
+    /// A load failure is **not cached**. Caching it would freeze a transient
+    /// unreadability — a corrupt file a human then repairs, an `EACCES` during a
+    /// permission fix — for the whole life of an always-on server, so the repair
+    /// would not take effect until the next restart. Nothing is inserted unless
+    /// there is a real state to insert.
+    fn cell(&self, run: &str, p: &RunPaths) -> io::Result<Arc<Mutex<ReviewState>>> {
         let mut map = self.cells.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(run.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(ReviewState::load(&p.review_state()))))
-            .clone()
+        if let Some(existing) = map.get(run) {
+            return Ok(existing.clone());
+        }
+        let loaded = ReviewState::load(&p.review_state())?;
+        Ok(map
+            .entry(run.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(loaded)))
+            .clone())
     }
 
     /// Current review state for `run` (cache hit, else lazy-load from disk).
-    fn state_of(&self, run: &str) -> ReviewState {
+    fn state_of(&self, run: &str) -> io::Result<ReviewState> {
         let p = self.paths(run);
-        let cell = self.cell(run, &p);
+        let cell = self.cell(run, &p)?;
         let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-        *guard
+        Ok(*guard)
     }
 }
 
@@ -704,15 +815,24 @@ fn handle_run(req: Request, ctx: &Arc<Ctx>, method: Method, url: &str, run: &str
 
     match (&method, sub) {
         // GET state — JSON {state, turn}
-        (Method::Get, "state") => {
-            let rs = ctx.state_of(run);
-            respond_str(
+        (Method::Get, "state") => match ctx.state_of(run) {
+            Ok(rs) => respond_str(
                 req,
                 200,
                 "application/json",
                 format!(r#"{{"state":"{}","turn":{}}}"#, rs.state.as_str(), rs.turn),
-            );
-        }
+            ),
+            // An unreadable record is a 500, never a state. This endpoint is
+            // what `review_wait` polls, and `review_wait` maps `approved` to
+            // exit 0 — so an invented `idle` here would merely block, but any
+            // laundering of a corrupt file into a confident answer is how a
+            // decision gets replaced by a different one. Erroring makes
+            // `review_wait` fail loudly (exit 1, "never an approval") instead.
+            Err(e) => {
+                eprintln!("drovr review: run '{run}': {e}");
+                respond_json_err(req, 500, "review state is unreadable");
+            }
+        },
 
         // GET doc — raw spec markdown (graceful fallback if absent)
         (Method::Get, "doc") => match fs::read(p.spec()) {
@@ -1760,7 +1880,14 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         .cloned()
         .unwrap_or(serde_json::json!([]));
 
-    let cell = ctx.cell(run, p);
+    let cell = match ctx.cell(run, p) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("drovr review: run '{run}': {e}");
+            respond_json_err(req, 500, "review state is unreadable");
+            return;
+        }
+    };
     let mut rs = cell.lock().unwrap_or_else(|e| e.into_inner());
 
     if rs.state.is_terminal() {
@@ -1787,19 +1914,35 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // Questions go out through `drovr ask` and are answered into
         // `interview.jsonl`, never here. The field and its write stay so the wire
         // shape is guaranteed rather than conditional; nothing should read them.
-        rs.turn += 1;
+        let next = ReviewState {
+            state: LoopState::Approved,
+            turn: rs.turn + 1,
+        };
         let fb_json = serde_json::json!({
-            "turn": rs.turn,
+            "turn": next.turn,
             "decision": "approve",
             "feedback": feedback,
             "answers": answers,
             "annotations": annotations,
         });
-        let _ = fs::write(p.feedback(), fb_json.to_string());
-        let _ = fs::write(p.approved(), b"approved\n");
-        rs.state = LoopState::Approved;
-        let _ = rs.save(&p.review_state());
+        let staged = match Staged::write(p.feedback(), fb_json.to_string().as_bytes()) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(rs);
+                refuse_undurable(req, run, "approval", "feedback.json", &e);
+                return;
+            }
+        };
+        if let Err(e) = ReviewState::commit(&mut rs, next, &p.review_state(), run) {
+            staged.roll_back(run);
+            drop(rs);
+            refuse_undurable(req, run, "approval", "review.state.json", &e);
+            return;
+        }
+        staged.keep();
+        let marker = crate::durable::write(&p.approved(), b"approved\n");
         drop(rs);
+        report_marker(run, "approved", marker);
         respond_str(
             req,
             200,
@@ -1810,10 +1953,18 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // Terminal like approve, but the opposite verdict: the human is
         // abandoning the run. The marker mirrors `approved` so a driver (or a
         // human poking at the run dir) can see the outcome without the server.
-        let _ = fs::write(p.cancelled(), b"cancelled\n");
-        rs.state = LoopState::Cancelled;
-        let _ = rs.save(&p.review_state());
+        let next = ReviewState {
+            state: LoopState::Cancelled,
+            turn: rs.turn,
+        };
+        if let Err(e) = ReviewState::commit(&mut rs, next, &p.review_state(), run) {
+            drop(rs);
+            refuse_undurable(req, run, "cancellation", "review.state.json", &e);
+            return;
+        }
+        let marker = crate::durable::write(&p.cancelled(), b"cancelled\n");
         drop(rs);
+        report_marker(run, "cancelled", marker);
         respond_str(
             req,
             200,
@@ -1826,27 +1977,48 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
         // prior = current spec. We also re-anchor last_summarized to the same
         // value: without it, the next `/summary` would promote a stale
         // last_summarized over this prior.
+        //
+        // Still logged rather than fatal, unlike the two writes below: these are
+        // diff BASELINES, not the verdict. Losing one costs the reviewer a wider
+        // diff next turn; losing the verdict loses the decision. They are durable
+        // writes all the same, so a torn baseline cannot be mistaken for a spec.
         let spec_bytes = fs::read(p.spec()).unwrap_or_default();
-        if let Err(e) = fs::write(p.prior(), &spec_bytes) {
+        if let Err(e) = crate::durable::write(&p.prior(), &spec_bytes) {
             eprintln!("drovr review: failed to snapshot prior.md: {e}");
         }
-        if let Err(e) = fs::write(p.last_summarized(), &spec_bytes) {
+        if let Err(e) = crate::durable::write(&p.last_summarized(), &spec_bytes) {
             eprintln!("drovr review: failed to snapshot last_summarized.md: {e}");
         }
 
-        rs.turn += 1;
-        let turn = rs.turn;
-
+        // The one verdict with NO marker to fall back on: `review.state.json`
+        // and `feedback.json` are the entire record, which is why neither write
+        // may be swallowed here.
+        let next = ReviewState {
+            state: LoopState::Waiting,
+            turn: rs.turn + 1,
+        };
         let fb_json = serde_json::json!({
-            "turn": turn,
+            "turn": next.turn,
             "decision": decision,
             "feedback": feedback,
             "answers": answers,
             "annotations": annotations,
         });
-        let _ = fs::write(p.feedback(), fb_json.to_string());
-        rs.state = LoopState::Waiting;
-        let _ = rs.save(&p.review_state());
+        let staged = match Staged::write(p.feedback(), fb_json.to_string().as_bytes()) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(rs);
+                refuse_undurable(req, run, "request for changes", "feedback.json", &e);
+                return;
+            }
+        };
+        if let Err(e) = ReviewState::commit(&mut rs, next, &p.review_state(), run) {
+            staged.roll_back(run);
+            drop(rs);
+            refuse_undurable(req, run, "request for changes", "review.state.json", &e);
+            return;
+        }
+        staged.keep();
         drop(rs);
         respond_str(
             req,
@@ -1857,11 +2029,163 @@ fn handle_post_submit(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths)
     }
 }
 
+/// Refuse a verdict that could not be made durable, and say which file refused.
+///
+/// The reviewer gets a 500 and the in-memory cell is left untouched, so the
+/// live server keeps answering exactly what a restarted one would. That
+/// agreement is the whole contract: the previous code answered
+/// `200 {"ok":true,"state":"approved"}` off a write that had returned `EACCES`,
+/// advanced the cell to match, and the next `drovr serve` — which the human
+/// never thinks of as an event — quietly withdrew the approval.
+///
+/// The path goes to stderr for the operator; the client gets fixed text, as
+/// every other error in this file does.
+fn refuse_undurable<E: std::fmt::Display>(
+    req: Request,
+    run: &str,
+    verdict: &str,
+    file: &str,
+    e: &E,
+) {
+    eprintln!("drovr review: run '{run}': cannot persist {verdict} to {file}: {e}");
+    respond_json_err(
+        req,
+        500,
+        "the decision could not be written to disk and was NOT recorded",
+    );
+}
+
+/// A detail file written *before* the decision it describes is committed, kept
+/// with whatever it displaced so the write can be undone if the commit fails.
+///
+/// # Why the write cannot simply move after the commit
+///
+/// `feedback.json` and `summary.txt` carry the substance of a turn; the state
+/// file carries the fact of it. Writing the state first and the detail second
+/// would mean a failed detail write leaves `waiting`/`ready` pointing at the
+/// PREVIOUS turn's text — an agent revising against feedback nobody gave, or a
+/// reviewer reading a stale summary as if it were the new one. Acting on the
+/// wrong content is worse than not acting, so the detail goes first.
+///
+/// # Why that then needs undoing
+///
+/// Detail-first has its own residue, and review found it: if the detail lands
+/// and the commit fails, the file is durably ahead of a decision that was never
+/// made. For `summary.txt` that is immediately visible — `GET /summary` serves
+/// it with no gate on state, and the page's summary banner is deliberately
+/// keyed on the text alone — so a reviewer sees a fresh summary beside a stale
+/// `waiting` badge. Two readers disagreeing about whether a turn landed is the
+/// defect this whole change exists to remove, so the refusal path puts the file
+/// back.
+///
+/// Restoring is best-effort by necessity: it is another write, and the failure
+/// that killed the commit may well kill this too. That leaves the old residue
+/// in the rare double-failure — strictly better than leaving it always, and the
+/// log says which file to look at.
+struct Staged {
+    path: PathBuf,
+    /// What the file held before, or `None` if it did not exist.
+    prior: Option<Vec<u8>>,
+}
+
+impl Staged {
+    /// Durably write `bytes` to `path`, remembering what it displaced.
+    ///
+    /// A [`WriteFailed::NotDurable`](crate::durable::WriteFailed::NotDurable) is
+    /// still an `Err` to the caller — the caller asked for a durable detail file
+    /// and did not get one — but the bytes landed, so the previous contents are
+    /// put back before returning rather than left ahead of a refused decision.
+    fn write(path: PathBuf, bytes: &[u8]) -> Result<Staged, crate::durable::WriteFailed> {
+        let prior = fs::read(&path).ok();
+        let staged = Staged { path, prior };
+        match crate::durable::write(&staged.path, bytes) {
+            Ok(()) => Ok(staged),
+            Err(f) => {
+                if f.landed() {
+                    staged.roll_back("");
+                }
+                Err(f)
+            }
+        }
+    }
+
+    /// The decision committed: the file stays as written.
+    ///
+    /// Exists so the success path is a statement rather than a fallthrough — the
+    /// two outcomes should be equally visible at the call site.
+    fn keep(self) {}
+
+    /// The decision was refused: put back what was there.
+    fn roll_back(&self, run: &str) {
+        let restored = match &self.prior {
+            Some(bytes) => {
+                crate::durable::write(&self.path, bytes).map_err(|f| f.into_error())
+            }
+            // Nothing was there, so "restore" is "remove". A concurrent removal
+            // is the outcome we wanted, not an error.
+            None => match fs::remove_file(&self.path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(e) = restored {
+            eprintln!(
+                "drovr review: run '{run}': the decision was refused, but {} could not be put \
+                 back and now describes a turn that never committed: {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Report a marker write that happened *after* the verdict was already durable.
+///
+/// # Why this one is not fatal
+///
+/// The commit point is `review.state.json`, and the marker is written after it.
+/// That order is forced by [`gate_status_in`], which reads the markers FIRST and
+/// falls back to the state file: a marker written before a state file that then
+/// failed would leave `drovr review status` reporting an approval the server had
+/// just refused — a second channel running *ahead* of the decision, which is the
+/// exact failure #57 was about. In this order the residue of a failed marker
+/// write is a state file that already holds the verdict, which `gate_status_in`
+/// finds on its fallback, so both channels still agree and nothing is lost on a
+/// restart.
+///
+/// That argument only holds while **every** marker reader goes through
+/// `gate_status_in`. It did not: [`crate::run_is_cancelled`] tested the
+/// `cancelled` marker directly, so making the marker best-effort here would have
+/// quietly promoted that untouched call site into the one place a cancellation
+/// could still vanish. It now shares the gate's resolution. A new reader that
+/// tests a marker by hand re-opens this, and the fix is to send it here rather
+/// than to make the marker fatal.
+///
+/// So the marker is redundancy, and a 500 here would be a lie in the other
+/// direction — telling the reviewer their decision was not recorded when it was,
+/// and inviting a retry that can only answer 409. It is logged loudly instead,
+/// because a run dir missing a marker it should have is worth an operator's
+/// attention even when nothing is broken.
+fn report_marker(run: &str, marker: &str, result: Result<(), crate::durable::WriteFailed>) {
+    if let Err(e) = result {
+        eprintln!(
+            "drovr review: run '{run}': the verdict is durable in review.state.json, but the \
+             redundant '{marker}' marker could not be written: {e}"
+        );
+    }
+}
+
 /// `POST /api/runs/<run>/summary` — agent posts a change summary; state → ready.
 fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths) {
     let body = read_body(&mut req);
 
-    let cell = ctx.cell(run, p);
+    let cell = match ctx.cell(run, p) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("drovr review: run '{run}': {e}");
+            respond_json_err(req, 500, "review state is unreadable");
+            return;
+        }
+    };
     let mut rs = cell.lock().unwrap_or_else(|e| e.into_inner());
 
     // A decided run is closed: reject the summary rather than reviving it.
@@ -1884,25 +2208,53 @@ fn handle_post_summary(mut req: Request, ctx: &Arc<Ctx>, run: &str, p: &RunPaths
     // the pre-revision spec here — instead the server keeps a rolling copy in
     // last_summarized.md: promote it to prior.md, then re-snapshot the
     // now-current spec as the baseline for the next revision.
+    //
+    // Baselines, so a failure is logged rather than fatal — see the same
+    // reasoning on the request-changes branch of `handle_post_submit`.
     match fs::read(p.last_summarized()) {
         Ok(prev) if !prev.is_empty() => {
-            if let Err(e) = fs::write(p.prior(), &prev) {
+            if let Err(e) = crate::durable::write(&p.prior(), &prev) {
                 eprintln!("drovr review: failed to write prior.md: {e}");
             }
         }
         _ => {}
     }
     // spec unreadable → keep the existing last_summarized baseline.
-    if let Ok(current) = fs::read(p.spec()) {
-        let refreshed = fs::write(p.last_summarized(), &current);
-        if let Err(e) = refreshed {
-            eprintln!("drovr review: failed to write last_summarized.md: {e}");
-        }
+    if let Ok(current) = fs::read(p.spec())
+        && let Err(e) = crate::durable::write(&p.last_summarized(), &current)
+    {
+        eprintln!("drovr review: failed to write last_summarized.md: {e}");
     }
 
-    let _ = fs::write(p.summary(), body.as_bytes());
-    rs.state = LoopState::Ready;
-    let _ = rs.save(&p.review_state());
+    // `summary.txt` is what the gate page shows the human as the reason to look
+    // again, and `review.state.json` is the ONLY record that this run ever
+    // reached `ready` — there is no marker for the open gate the way there is
+    // for a verdict. A swallowed failure on either left the server and the agent
+    // both saying `ready` over a disk that still said `idle`, so the next
+    // restart closed a gate nobody had answered.
+    //
+    // Staged rather than written outright, because `GET /summary` serves this
+    // file with no gate on state at all: a summary that landed beside a commit
+    // that did not is visible in the live page immediately. See [`Staged`].
+    let staged = match Staged::write(p.summary(), body.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            drop(rs);
+            refuse_undurable(req, run, "summary", "summary.txt", &e);
+            return;
+        }
+    };
+    let next = ReviewState {
+        state: LoopState::Ready,
+        turn: rs.turn,
+    };
+    if let Err(e) = ReviewState::commit(&mut rs, next, &p.review_state(), run) {
+        staged.roll_back(run);
+        drop(rs);
+        refuse_undurable(req, run, "summary", "review.state.json", &e);
+        return;
+    }
+    staged.keep();
     drop(rs);
     respond_str(
         req,
@@ -1927,7 +2279,19 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
     let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
     for name in list_runs_in(&ctx.runs_root) {
         let dir = ctx.runs_root.join(&name);
-        let rs = ctx.state_of(&name);
+        // `None` when the review record is unreadable. The list is a fleet view
+        // over every run, so one corrupt file must not 500 the whole page the
+        // way it rightly does on that run's own `GET /state` — but it must not
+        // be shown as `idle` either, which is a claim that no decision was made.
+        // This row joins the file's other unknowns (`live`, `blocked`) and says
+        // so on the wire.
+        let rs = match ctx.state_of(&name) {
+            Ok(rs) => Some(rs),
+            Err(e) => {
+                eprintln!("drovr review: run '{name}': {e}");
+                None
+            }
+        };
         let run_state = load_run_state(&dir);
         let (task, gate) = run_state
             .as_ref()
@@ -1996,7 +2360,7 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
         // liveness is unknown rather than let them read the grouping as fact.
         let zombie = archived && live == Some(true);
         let complete = (run_state.as_ref().is_some_and(|s| s.is_complete())
-            || rs.state == LoopState::Cancelled)
+            || rs.is_some_and(|r| r.state == LoopState::Cancelled))
             && !zombie;
         // Blocked agents, for the row's badge. The scan is TTL-cached
         // (`Ctx::blocked_of`), so the 2s list poll costs at most one herdr sweep
@@ -2046,8 +2410,11 @@ fn list_runs_json<H: Herdr>(ctx: &Arc<Ctx>, h: &H, live_workspaces: Option<&[Str
                 "name": name,
                 "task": task,
                 "gate": gate,
-                "state": rs.state.as_str(),
-                "turn": rs.turn,
+                // `"unknown"` matches no `state === '…'` branch in the page and
+                // no `.run-dot.state-…` rule, so the row renders as undecided
+                // rather than as any particular verdict — which is what it is.
+                "state": rs.map(|r| r.state.as_str()).unwrap_or("unknown"),
+                "turn": rs.map(|r| r.turn).unwrap_or(0),
                 "updated": updated,
                 "complete": complete,
                 "done": done,
@@ -2595,7 +2962,7 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
             format!("no run '{run}' at {}", dir.display()),
         ));
     }
-    Ok(gate_status_in(&dir))
+    gate_status_in(&dir)
 }
 
 /// [`gate_status`] against a run directory that is already known to exist.
@@ -2603,15 +2970,22 @@ pub fn gate_status(run: &str) -> io::Result<WaitOutcome> {
 /// Split out so the resolution is testable against a bare temp dir — the server
 /// tests build one rather than a `TestEnv` data root — and so the name-to-path
 /// step has exactly one home.
-fn gate_status_in(dir: &Path) -> WaitOutcome {
+/// An unreadable state file is an `Err` — exit 1, which the exit-code table
+/// calls "error" and which is *never* an approval. It is reached only after both
+/// markers have been ruled out, so a decided run still answers from the marker
+/// and never has to care. What is left is a run whose only record of a possible
+/// decision cannot be read, and there is no honest outcome for that: `Timeout`
+/// would say "not decided yet", which is the fabricated-`idle` answer this
+/// change exists to delete, one surface over.
+pub(crate) fn gate_status_in(dir: &Path) -> io::Result<WaitOutcome> {
     let p = RunPaths::new(dir.to_path_buf());
     if p.cancelled().exists() {
-        return WaitOutcome::Cancelled;
+        return Ok(WaitOutcome::Cancelled);
     }
     if p.approved().exists() {
-        return WaitOutcome::Approved;
+        return Ok(WaitOutcome::Approved);
     }
-    match ReviewState::load(&p.review_state()).state {
+    Ok(match ReviewState::load(&p.review_state())?.state {
         LoopState::Cancelled => WaitOutcome::Cancelled,
         LoopState::Approved => WaitOutcome::Approved,
         // `Waiting` has exactly one writer — the request-changes branch of
@@ -2622,8 +2996,12 @@ fn gate_status_in(dir: &Path) -> WaitOutcome {
         // unconditionally, so the two surfaces could answer 2 and 3 about one
         // run, which is the "two tables" failure this whole change is against.
         LoopState::Waiting => WaitOutcome::ChangesRequested,
-        _ => WaitOutcome::Timeout,
-    }
+        // Exhaustive rather than a `_` wildcard: a future `LoopState` variant
+        // silently becoming "no decision yet" is the same class of defect as the
+        // fabricated `idle` above, and a wildcard is what would let it happen
+        // without a compile error.
+        LoopState::Idle | LoopState::Ready => WaitOutcome::Timeout,
+    })
 }
 
 /// GET `/api/runs/<run>/state` from the live server, returning the `state` str.
@@ -4801,6 +5179,371 @@ mod tests {
         assert!(persisted.contains(r#""state":"cancelled""#), "{persisted}");
     }
 
+    /// Restore a directory's permissions even if the test panics, so an
+    /// unwritable tree is never leaked into the system temp root — `TempDir`'s
+    /// own cleanup is best-effort and silent. Same shape as the guard in
+    /// `phase.rs`'s unremovable-marker tests.
+    struct RestorePerms(PathBuf, fs::Permissions);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+
+    /// Make `dir` unwritable and return the restore guard plus whether writes
+    /// are still possible anyway — running as root ignores directory
+    /// permissions, and a test that cannot produce the failure must skip rather
+    /// than assert something the environment will not do.
+    #[cfg(unix)]
+    fn seal_dir(dir: &Path) -> (RestorePerms, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let orig = fs::metadata(dir).unwrap().permissions();
+        let guard = RestorePerms(dir.to_path_buf(), orig);
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let writable_anyway = fs::write(dir.join(".probe"), b"").is_ok();
+        (guard, writable_anyway)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undurable_approval_is_refused_rather_than_acknowledged() {
+        // The reviewer's verdict travels on two channels that must not diverge:
+        // the HTTP response they see, and the run dir a RESTARTED server reads.
+        // Every write in the submit path was `let _ = fs::write(..)`, so a
+        // failed write still answered 200 "approved" and still advanced the
+        // in-memory cell. The human is told their approval landed; the disk
+        // never heard of it; the next `drovr serve` reports the run undecided.
+        //
+        // The rule this pins: the server may not acknowledge a verdict it could
+        // not make durable.
+        let tmp = make_root("approve-undurable");
+        let dir = make_run(tmp.path(), "r", b"# Done");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (guard, writable_anyway) = seal_dir(&dir);
+        if writable_anyway {
+            return; // root: the environment cannot produce the failure.
+        }
+
+        let payload = r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(
+            status, 500,
+            "an approval that could not be written must not be acknowledged: body={body}"
+        );
+        assert!(
+            !body.contains(r#""state":"approved""#),
+            "the response must not claim the verdict landed: body={body}"
+        );
+
+        // And the live server must not be holding a verdict the disk does not,
+        // or `GET /state` keeps serving the approval right up until a restart
+        // silently withdraws it.
+        let (_, live) = http_get(&addr, "/api/runs/r/state");
+        assert!(
+            !live.contains(r#""state":"approved""#),
+            "the in-memory cell must not advance past a failed write: {live}"
+        );
+
+        drop(guard);
+
+        // The restart itself: a fresh Ctx over the same root, which is what the
+        // next `drovr serve` is. It must agree with what the reviewer was told.
+        let restarted = start_server(tmp.path().to_path_buf());
+        let (_, after) = http_get(&restarted, "/api/runs/r/state");
+        assert!(
+            !after.contains(r#""state":"approved""#),
+            "a restart must agree with the response the reviewer got: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undurable_request_changes_is_refused_rather_than_acknowledged() {
+        // Request-changes is the verdict with NO marker file to fall back on --
+        // `review.state.json` and `feedback.json` are the whole record. So a
+        // swallowed write here loses the reviewer's decision outright, and the
+        // turn counter with it: `feedback.json` consumers use `turn` to tell
+        // this turn from a stale previous one.
+        let tmp = make_root("changes-undurable");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (guard, writable_anyway) = seal_dir(&dir);
+        if writable_anyway {
+            return;
+        }
+
+        let payload =
+            r#"{"decision":"request-changes","feedback":"needs work","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(
+            status, 500,
+            "a request-changes that could not be written must not be acknowledged: body={body}"
+        );
+        assert!(
+            !body.contains(r#""state":"waiting""#),
+            "the response must not claim the verdict landed: body={body}"
+        );
+
+        // The LIVE server, before any restart. Without this the test passes even
+        // if the failed write advanced the cell, because the restart below
+        // throws that cell away — and a cell advanced past its disk is exactly
+        // the divergence being tested for.
+        let (_, live) = http_get(&addr, "/api/runs/r/state");
+        assert!(
+            !live.contains(r#""state":"waiting""#),
+            "the in-memory cell must not advance past a failed write: {live}"
+        );
+
+        drop(guard);
+
+        let restarted = start_server(tmp.path().to_path_buf());
+        let (_, after) = http_get(&restarted, "/api/runs/r/state");
+        assert!(
+            after.contains(r#""turn":0"#),
+            "a turn the reviewer was never told about must not have been counted: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undurable_summary_is_refused_rather_than_acknowledged() {
+        // `review.state.json` is the ONLY record that a run reached `ready`.
+        // A swallowed `rs.save` leaves the disk saying `idle` while the server
+        // and the agent both say `ready`, so the gate the human is supposed to
+        // act on vanishes at the next restart.
+        let tmp = make_root("summary-undurable");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (guard, writable_anyway) = seal_dir(&dir);
+        if writable_anyway {
+            return;
+        }
+
+        let (status, body) = http_post(&addr, "/api/runs/r/summary", "text/plain", "rewrote §2");
+        assert_eq!(
+            status, 500,
+            "a summary that could not be written must not be acknowledged: body={body}"
+        );
+
+        // As above: the live cell, before the restart discards it.
+        let (_, live) = http_get(&addr, "/api/runs/r/state");
+        assert!(
+            !live.contains(r#""state":"ready""#),
+            "the in-memory cell must not advance past a failed write: {live}"
+        );
+
+        drop(guard);
+
+        let restarted = start_server(tmp.path().to_path_buf());
+        let (_, after) = http_get(&restarted, "/api/runs/r/state");
+        assert!(
+            !after.contains(r#""state":"ready""#),
+            "a restart must agree with the response the agent got: {after}"
+        );
+    }
+
+    #[test]
+    fn a_torn_state_file_is_not_read_as_a_fresh_run() {
+        // `fs::write` truncates in place, so a server killed mid-write leaves a
+        // half-written `review.state.json`. `load` fed that to
+        // `unwrap_or_default()` and got back `idle, turn 0` -- a FABRICATED
+        // fresh run. The verdict is gone and so is the turn counter, and the
+        // next write overwrites the evidence that anything was ever wrong.
+        //
+        // Absent is different from torn and stays a legitimate fresh idle: the
+        // server may start after `drovr new` but before the run enters review.
+        // Present-but-unparseable is a corrupt record, and the one thing the
+        // server must not do with it is invent a state.
+        let tmp = make_root("torn-state");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("review.state.json"), r#"{"state":"appro"#).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, body) = http_get(&addr, "/api/runs/r/state");
+        assert_ne!(
+            status, 200,
+            "a corrupt review state must not be served as a state: body={body}"
+        );
+        assert!(
+            !body.contains(r#""state":"idle""#),
+            "a torn file must not be laundered into a fresh idle run: body={body}"
+        );
+
+        // The corrupt file is evidence. It must still be there for a human.
+        let still = fs::read_to_string(dir.join("review.state.json")).unwrap();
+        assert_eq!(still, r#"{"state":"appro"#, "the corrupt record was overwritten");
+    }
+
+    #[test]
+    fn a_repaired_state_file_takes_effect_without_a_restart() {
+        // `Ctx::cell` deliberately does not cache a load failure. That is a
+        // behavioural promise — a human who repairs a corrupt record should see
+        // it work immediately, not after hunting down an always-on daemon and
+        // restarting it — and it is invisible to every other test here, all of
+        // which either load cleanly or check one failing request and then move
+        // to a fresh `Ctx`. A regression that memoised the error to "avoid
+        // re-reading a broken file" would compile and pass everything else.
+        let tmp = make_root("cell-not-cached");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("review.state.json"), r#"{"state":"appro"#).unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let (status, _) = http_get(&addr, "/api/runs/r/state");
+        assert_eq!(status, 500, "a corrupt record must refuse first");
+
+        fs::write(
+            dir.join("review.state.json"),
+            r#"{"state":"ready","turn":4}"#,
+        )
+        .unwrap();
+
+        // The SAME server. No restart.
+        let (status, body) = http_get(&addr, "/api/runs/r/state");
+        assert_eq!(status, 200, "a repair must not need a restart: {body}");
+        assert!(body.contains(r#""state":"ready""#), "{body}");
+        assert!(body.contains(r#""turn":4"#), "{body}");
+    }
+
+    #[test]
+    fn an_approval_whose_marker_fails_is_still_approved() {
+        // `report_marker`'s argument in full: the commit point is
+        // `review.state.json`, the marker is written after it and is redundant,
+        // so a marker failure must NOT refuse an approval that is already
+        // durable. Nothing exercised that branch — a regression making it fatal
+        // would 500 a reviewer whose approval had in fact landed, and inviting
+        // the retry that can only answer 409.
+        let tmp = make_root("marker-fails");
+        let dir = make_run(tmp.path(), "r", b"# Done");
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let _armed = crate::durable::fault::arm(
+            &dir.join("approved"),
+            crate::durable::fault::Fault::FailBeforeRename,
+        );
+
+        let payload = r#"{"decision":"approve","feedback":"","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(
+            status, 200,
+            "a durable approval must not be refused over its redundant marker: body={body}"
+        );
+        assert!(
+            !dir.join("approved").exists(),
+            "the marker was armed to fail, so this test proves nothing if it exists"
+        );
+
+        // The half that makes the marker safe to lose: `gate_status_in` — what
+        // `drovr review status` answers from — falls back to the state file.
+        assert_eq!(
+            gate_status_in(&dir).expect("gate status"),
+            WaitOutcome::Approved,
+            "the second channel must still find the verdict without the marker"
+        );
+
+        // And a restart agrees, which is the property the whole change is for.
+        let restarted = start_server(tmp.path().to_path_buf());
+        let (_, after) = http_get(&restarted, "/api/runs/r/state");
+        assert!(after.contains(r#""state":"approved""#), "{after}");
+    }
+
+    #[test]
+    fn a_refused_commit_puts_feedback_json_back() {
+        // The interleaving no `chmod` test can reach: the FIRST write lands and
+        // the commit then fails. Sealing the run dir fails both together, so
+        // this residue — a durable detail file describing a decision that was
+        // never committed — went untested in every earlier version.
+        let tmp = make_root("rollback-feedback");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(
+            dir.join("review.state.json"),
+            r#"{"state":"ready","turn":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("feedback.json"),
+            r#"{"turn":1,"decision":"request-changes","feedback":"the old turn"}"#,
+        )
+        .unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let _armed = crate::durable::fault::arm(
+            &dir.join("review.state.json"),
+            crate::durable::fault::Fault::FailBeforeRename,
+        );
+
+        let payload = r#"{"decision":"approve","feedback":"ship it","answers":{},"annotations":[]}"#;
+        let (status, body) = http_post(&addr, "/api/runs/r/submit", "application/json", payload);
+        assert_eq!(status, 500, "the commit failed, so the verdict must be refused: {body}");
+
+        let fb = fs::read_to_string(dir.join("feedback.json")).expect("feedback.json");
+        assert!(
+            fb.contains("the old turn"),
+            "feedback.json must be put back, not left describing a refused approval: {fb}"
+        );
+        assert!(
+            !fb.contains("ship it"),
+            "feedback.json is ahead of a decision that never committed: {fb}"
+        );
+
+        let (_, live) = http_get(&addr, "/api/runs/r/state");
+        assert!(live.contains(r#""state":"ready""#), "{live}");
+        assert!(live.contains(r#""turn":1"#), "the turn must not have advanced: {live}");
+    }
+
+    #[test]
+    fn a_refused_commit_puts_summary_txt_back() {
+        // The same interleaving on the path where it is directly visible:
+        // `GET /summary` serves this file with no gate on state at all, so a
+        // summary left ahead of a refused commit shows up in the live page
+        // beside a stale state badge.
+        let tmp = make_root("rollback-summary");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("summary.txt"), b"the previous summary").unwrap();
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let _armed = crate::durable::fault::arm(
+            &dir.join("review.state.json"),
+            crate::durable::fault::Fault::FailBeforeRename,
+        );
+
+        let (status, _) = http_post(&addr, "/api/runs/r/summary", "text/plain", "a new summary");
+        assert_eq!(status, 500);
+
+        let (_, served) = http_get(&addr, "/api/runs/r/summary");
+        assert_eq!(
+            served.trim(),
+            "the previous summary",
+            "the page must not show a summary whose turn never committed"
+        );
+    }
+
+    #[test]
+    fn a_refused_first_summary_leaves_no_summary_at_all() {
+        // The `prior: None` half of the roll-back: there was no summary.txt to
+        // restore, so "put it back" means remove it. Without this, the very
+        // first summary on a run leaves its residue even though the roll-back
+        // ran.
+        let tmp = make_root("rollback-first-summary");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        assert!(!dir.join("summary.txt").exists());
+        let addr = start_server(tmp.path().to_path_buf());
+
+        let _armed = crate::durable::fault::arm(
+            &dir.join("review.state.json"),
+            crate::durable::fault::Fault::FailBeforeRename,
+        );
+
+        let (status, _) = http_post(&addr, "/api/runs/r/summary", "text/plain", "a new summary");
+        assert_eq!(status, 500);
+        assert!(
+            !dir.join("summary.txt").exists(),
+            "a refused first summary must leave nothing behind"
+        );
+    }
+
     #[test]
     fn doc_graceful_when_spec_absent() {
         let tmp = make_root("no-spec");
@@ -5441,7 +6184,75 @@ mod tests {
     fn cancelled_state_round_trips() {
         // The wire/persistence spelling the driver and the UI both key off.
         assert_eq!(LoopState::Cancelled.as_str(), "cancelled");
-        assert_eq!(LoopState::from_str("cancelled"), LoopState::Cancelled);
+        assert_eq!(LoopState::from_str("cancelled"), Some(LoopState::Cancelled));
+    }
+
+    #[test]
+    fn a_cancellation_without_its_marker_is_still_a_cancellation() {
+        // `handle_post_submit` commits the verdict to `review.state.json` and
+        // writes the marker AFTER, so the one durable-but-marker-less state is
+        // reachable. `run_is_cancelled` used to test the marker by hand, which
+        // made that residue read as "not cancelled" — `ask wait` would keep
+        // waiting on a run whose human had walked away.
+        let tmp = make_root("cancel-no-marker");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(
+            dir.join("review.state.json"),
+            r#"{"state":"cancelled","turn":2}"#,
+        )
+        .unwrap();
+        assert!(!dir.join("cancelled").exists(), "no marker, by construction");
+
+        assert!(
+            crate::run_is_cancelled(&dir),
+            "a durable cancellation must not depend on its redundant marker"
+        );
+    }
+
+    #[test]
+    fn the_marker_alone_still_answers_cancelled() {
+        // The other half of the same predicate, and the common path: the marker
+        // is checked first precisely so this costs one `exists()`.
+        let tmp = make_root("cancel-marker-only");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        fs::write(dir.join("cancelled"), b"cancelled\n").unwrap();
+        assert!(!dir.join("review.state.json").exists());
+
+        assert!(crate::run_is_cancelled(&dir));
+    }
+
+    #[test]
+    fn an_undecided_run_is_not_cancelled() {
+        let tmp = make_root("cancel-neither");
+        let dir = make_run(tmp.path(), "r", b"# Spec");
+        assert!(!crate::run_is_cancelled(&dir));
+
+        // Nor is a corrupt record: the marker has been ruled out by then, so
+        // "no evidence of a cancellation" is the honest answer, and the gate's
+        // own surfaces are where that file's corruption gets reported.
+        fs::write(dir.join("review.state.json"), r#"{"state":"canc"#).unwrap();
+        assert!(!crate::run_is_cancelled(&dir));
+    }
+
+    #[test]
+    fn every_state_round_trips_and_nothing_else_parses() {
+        // `as_str` is the only writer of the spelling `from_str` has to accept,
+        // so a variant added to one and not the other is a state that persists
+        // and then refuses to load. Checking the pair together is what catches
+        // that; checking one variant by hand is what let `from_str`'s old
+        // `_ => Idle` hide it.
+        for st in [
+            LoopState::Idle,
+            LoopState::Waiting,
+            LoopState::Ready,
+            LoopState::Approved,
+            LoopState::Cancelled,
+        ] {
+            assert_eq!(LoopState::from_str(st.as_str()), Some(st), "{st:?}");
+        }
+        assert_eq!(LoopState::from_str(""), None);
+        assert_eq!(LoopState::from_str("appro"), None);
+        assert_eq!(LoopState::from_str("APPROVED"), None);
     }
 
     // -- code-review surface (/review/findings, /review/diff) ----------------
